@@ -51,6 +51,17 @@ jobs:
       - name: Generate Xcode project
         run: make project
 
+      # The macos-15 runner image ships with a stale SwiftPM artifact cache
+      # that causes `xcodebuild` to fail with
+      #   "whisper-...-xcframework.zip already exists in file system"
+      # before it can even resolve the WhisperBinary dependency. Wipe the
+      # caches so package resolution starts from a clean state.
+      - name: Clear SwiftPM caches
+        run: |
+          rm -rf ~/Library/Caches/org.swift.swiftpm
+          rm -rf ~/Library/org.swift.swiftpm
+          rm -rf ~/Library/Developer/Xcode/DerivedData/SourcePackages
+
       - name: Build Release
         run: make release-build
 
