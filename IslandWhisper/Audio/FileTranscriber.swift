@@ -7,7 +7,9 @@ import AVFoundation
 @MainActor
 enum FileTranscriber {
 
-    static func importFile(at sourceURL: URL, into store: RecordingStore) async throws -> Recording {
+    static func importFile(at sourceURL: URL,
+                           into store: RecordingStore,
+                           language: RecordingLanguage = .hebrew) async throws -> Recording {
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
 
@@ -21,7 +23,7 @@ enum FileTranscriber {
             duration: duration,
             source: .systemAudio, // imported file: counts as "from app/system"
             audioFileName: destURL.lastPathComponent,
-            language: "he"
+            language: language.rawValue
         )
         store.add(recording)
         return recording

@@ -47,15 +47,28 @@ struct RecordingDetailView: View {
     }
 
     private var actionButtons: some View {
-        HStack {
-            Button {
-                transcription.enqueue(recording)
+        let currentLang = RecordingLanguage.fromCode(recording.language)
+        let busy = transcription.activeRecordingID == recording.id
+                   || transcription.pendingIDs.contains(recording.id)
+        return HStack {
+            Menu {
+                Button {
+                    transcription.enqueue(recording)
+                } label: {
+                    Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
+                          systemImage: "arrow.clockwise")
+                }
+                Button {
+                    retranscribe(in: currentLang.other)
+                } label: {
+                    Label("\(currentLang.other.flagEmoji) \(currentLang.other.displayName)",
+                          systemImage: "arrow.triangle.2.circlepath")
+                }
             } label: {
                 Label(recording.status == .completed ? "Re-transcribe" : "Transcribe",
                       systemImage: "text.badge.checkmark")
             }
-            .disabled(transcription.activeRecordingID == recording.id
-                      || transcription.pendingIDs.contains(recording.id))
+            .disabled(busy)
 
             ShareLink(item: store.audioURL(for: recording)) {
                 Label("Share audio", systemImage: "square.and.arrow.up")
@@ -68,6 +81,17 @@ struct RecordingDetailView: View {
             }
             .disabled(recording.fullText.isEmpty)
         }
+    }
+
+    /// Re-run the transcription pipeline with a different language model.
+    /// Updates the persisted `Recording.language` so the downstream
+    /// `TranscriptionService` picks the right model on its own.
+    private func retranscribe(in language: RecordingLanguage) {
+        var copy = recording
+        copy.language = language.rawValue
+        copy.status = .pending
+        store.update(copy)
+        transcription.enqueue(copy)
     }
 
     @ViewBuilder
@@ -102,6 +126,14 @@ struct RecordingDetailView: View {
                 }
                 .padding()
                 .environment(\.layoutDirection, recording.language == "he" ? .rightToLeft : .leftToRight)
+            }
+            .contextMenu {
+                let other = RecordingLanguage.fromCode(recording.language).other
+                Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
+                    retranscribe(in: other)
+                }
+                Button("Copy transcript") { copyTranscript() }
+                    .disabled(recording.fullText.isEmpty)
             }
         }
     }

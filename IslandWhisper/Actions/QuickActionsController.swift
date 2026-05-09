@@ -27,13 +27,16 @@ final class QuickActionsController: ObservableObject {
     let session: RecordingSession
     let store: RecordingStore
     let transcription: TranscriptionService
+    let languageSettings: RecordingLanguageSettings
 
     init(session: RecordingSession,
          store: RecordingStore,
-         transcription: TranscriptionService) {
+         transcription: TranscriptionService,
+         languageSettings: RecordingLanguageSettings) {
         self.session = session
         self.store = store
         self.transcription = transcription
+        self.languageSettings = languageSettings
     }
 
     // MARK: - Voice memo (mic only)
@@ -120,7 +123,7 @@ final class QuickActionsController: ObservableObject {
             duration: duration,
             source: source,
             audioFileName: outputURL.lastPathComponent,
-            language: "he"
+            language: languageSettings.current.rawValue
         )
         store.add(recording)
         activeJob = .none
@@ -149,7 +152,11 @@ final class QuickActionsController: ObservableObject {
     func transcribeFile(_ url: URL) async {
         activeJob = .importingFile(url)
         do {
-            let recording = try await FileTranscriber.importFile(at: url, into: store)
+            let recording = try await FileTranscriber.importFile(
+                at: url,
+                into: store,
+                language: languageSettings.current
+            )
             activeJob = .none
             transcription.enqueue(recording)
         } catch {

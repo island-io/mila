@@ -12,13 +12,18 @@ struct IslandWhisperApp: App {
     @StateObject private var actions: QuickActionsController
     @StateObject private var session: RecordingSession
     @StateObject private var hotkeySettings: HotkeySettings
+    @StateObject private var languageSettings: RecordingLanguageSettings
 
     init() {
         let store = RecordingStore()
         let mgr = ModelManager(modelsDirectory: store.modelsDirectory)
         let svc = TranscriptionService(store: store, modelManager: mgr)
         let session = RecordingSession()
-        let actions = QuickActionsController(session: session, store: store, transcription: svc)
+        let langSettings = RecordingLanguageSettings()
+        let actions = QuickActionsController(session: session,
+                                             store: store,
+                                             transcription: svc,
+                                             languageSettings: langSettings)
         let hotkeys = HotkeySettings()
         _store = StateObject(wrappedValue: store)
         _modelManager = StateObject(wrappedValue: mgr)
@@ -26,6 +31,7 @@ struct IslandWhisperApp: App {
         _session = StateObject(wrappedValue: session)
         _actions = StateObject(wrappedValue: actions)
         _hotkeySettings = StateObject(wrappedValue: hotkeys)
+        _languageSettings = StateObject(wrappedValue: langSettings)
         _dictation = StateObject(wrappedValue: DictationController(store: store,
                                                                     transcription: svc,
                                                                     hotkeySettings: hotkeys))
@@ -41,6 +47,7 @@ struct IslandWhisperApp: App {
                 .environmentObject(actions)
                 .environmentObject(session)
                 .environmentObject(hotkeySettings)
+                .environmentObject(languageSettings)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .onAppear { wireDelegate() }

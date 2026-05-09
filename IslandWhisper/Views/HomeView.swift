@@ -3,15 +3,22 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject private var actions: QuickActionsController
     @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var hotkeySettings: HotkeySettings
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     @Binding var selection: SidebarSelection?
     let search: String
+
+    /// Persisted across launches so the user's privacy choice (hide the
+    /// Recent list while screen-sharing) sticks.
+    @AppStorage("home.hideRecent") private var hideRecent: Bool = false
 
     var body: some View {
         ScrollView {
             VStack(spacing: 28) {
                 header
                 tiles
+                hotkeysCard
                 recent
             }
             .padding(.horizontal, 24)
@@ -39,7 +46,8 @@ struct HomeView: View {
             HomeTile(
                 icon: "mic.fill",
                 label: isRecordingMic ? "Recording…" : "Voice Memo",
-                isActive: isRecordingMic
+                isActive: isRecordingMic,
+                badge: languageSettings.current.flagEmoji
             ) {
                 Task { await actions.toggleVoiceMemo() }
             }
@@ -54,20 +62,97 @@ struct HomeView: View {
         }
     }
 
+    /// Always-visible card that documents the two dictation hotkeys so the
+    /// user doesn't have to open Settings to remember which ⌘ combo does
+    /// what. The bindings stay live — if a user rebinds in Settings the
+    /// glyphs here update immediately.
+    private var hotkeysCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "command.circle.fill")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(.tint)
+                Text("Dictation hotkeys")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Text("Press anywhere in macOS")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 12) {
+                HotkeyChip(flag: "🇬🇧",
+                           label: "English dictation",
+                           binding: hotkeySettings.binding(for: .dictateEnglish).displayName)
+                HotkeyChip(flag: "🇮🇱",
+                           label: "Hebrew dictation",
+                           binding: hotkeySettings.binding(for: .dictateHebrew).displayName)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .strokeBorder(Color.primary.opacity(0.07), lineWidth: 1)
+        )
+    }
+
     private var recent: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text("Recent")
                     .font(.title3.weight(.semibold))
                 Spacer()
+                Button {
+                    withAnimation(.easeInOut(duration: 0.18)) {
+                        hideRecent.toggle()
+                    }
+                } label: {
+                    Label(hideRecent ? "Show" : "Hide",
+                          systemImage: hideRecent ? "eye.slash" : "eye")
+                        .labelStyle(.titleAndIcon)
+                        .font(.callout)
+                }
+                .buttonStyle(.borderless)
+                .help(hideRecent
+                      ? "Show recent recordings"
+                      : "Hide recent recordings (useful when sharing your screen)")
             }
 
-            BucketedRecordingsView(
-                recordings: recentRecordings,
-                search: search,
-                selection: $selection
-            )
+            if hideRecent {
+                hiddenPlaceholder
+            } else {
+                BucketedRecordingsView(
+                    recordings: recentRecordings,
+                    search: search,
+                    selection: $selection
+                )
+            }
         }
+    }
+
+    /// Empty-state replacement when the user has hidden the Recent list.
+    /// Keeps a visible affordance so it's obvious the list is hidden, not
+    /// just empty.
+    private var hiddenPlaceholder: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "eye.slash.fill")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.secondary)
+            Text("Recent recordings hidden")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.05), lineWidth: 1)
+        )
     }
 
     private var isRecordingMic: Bool {
@@ -83,6 +168,9 @@ private struct HomeTile: View {
     let icon: String
     let label: String
     var isActive: Bool = false
+    /// Optional emoji shown in the upper-right of the tile (we use it to
+    /// expose the active recording language flag on the Voice Memo tile).
+    var badge: String? = nil
     let action: () -> Void
 
     @State private var hovering = false
@@ -114,6 +202,16 @@ private struct HomeTile: View {
             .frame(maxWidth: .infinity)
             .frame(height: 100)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(alignment: .topTrailing) {
+                if let badge {
+                    Text(badge)
+                        .font(.system(size: 16))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.thinMaterial, in: Capsule())
+                        .padding(8)
+                }
+            }
             .overlay(
                 RoundedRectangle(cornerRadius: 14)
                     .strokeBorder(borderColor, lineWidth: 1)
@@ -137,5 +235,36 @@ private struct HomeTile: View {
         withAnimation(.easeOut(duration: 0.9).repeatForever(autoreverses: false)) {
             pulse = true
         }
+    }
+}
+
+/// Visual chip used inside `hotkeysCard` to show one (flag, label, hotkey)
+/// triple in a compact row.
+private struct HotkeyChip: View {
+    let flag: String
+    let label: String
+    let binding: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Text(flag)
+                .font(.system(size: 22))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label)
+                    .font(.callout.weight(.medium))
+                Text(binding)
+                    .font(.system(.callout, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(.tint)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.04), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.primary.opacity(0.06), lineWidth: 1)
+        )
     }
 }

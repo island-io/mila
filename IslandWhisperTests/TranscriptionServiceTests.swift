@@ -348,4 +348,46 @@ final class TranscriptionServiceTests: XCTestCase {
         let text = await service.transcribeOnce(samples: samples, language: "he")
         XCTAssertEqual(text, "")
     }
+
+    // MARK: - Re-transcribe with the other language
+
+    /// Drives the right-click "Re-transcribe in [other language]" path: the
+    /// caller flips `recording.language` from `"he"` to `"en"` and re-enqueues.
+    /// The service must pick that up and load the OpenAI model on the second
+    /// pass instead of the ivrit.ai one used on the first.
+    func test_changing_recording_language_routes_to_other_model_on_reenqueue() async throws {
+        try TestSupport.installFakeModel(into: manager, model: .openaiTurbo)
+
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Was Hebrew",
+                                                    language: "he")
+        await stub.setCannedQueue([
+            [TranscriptSegment(start: 0, end: 1, text: "first pass")],
+            [TranscriptSegment(start: 0, end: 1, text: "second pass")]
+        ])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+        let firstLoad = await stub.loadedModel
+        XCTAssertEqual(firstLoad?.lastPathComponent,
+                       manager.url(for: .ivritTurbo).lastPathComponent,
+                       "First pass should hit the Hebrew model")
+
+        var swapped = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        swapped.language = "en"
+        swapped.status = .pending
+        store.update(swapped)
+        service.enqueue(swapped)
+        await service.waitForIdle()
+
+        let secondLoad = await stub.loadedModel
+        XCTAssertEqual(secondLoad?.lastPathComponent,
+                       manager.url(for: .openaiTurbo).lastPathComponent,
+                       "Second pass should hit the English model after the language swap")
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.fullText, "second pass")
+        XCTAssertEqual(stored.language, "en")
+        XCTAssertEqual(stored.status, .completed)
+    }
 }

@@ -8,6 +8,7 @@ struct ContentView: View {
     @EnvironmentObject private var session: RecordingSession
     @EnvironmentObject private var dictation: DictationController
     @EnvironmentObject private var modelManager: ModelManager
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     @State private var selection: SidebarSelection? = .home
     @State private var search: String = ""
@@ -38,9 +39,8 @@ struct ContentView: View {
                 }
             }
             .toolbar {
-                ToolbarItemGroup(placement: .primaryAction) {
-                    DictationToolbarButton(action: .dictateEnglish)
-                    DictationToolbarButton(action: .dictateHebrew)
+                ToolbarItem(placement: .primaryAction) {
+                    LanguagePickerToolbarItem()
                 }
             }
         }
@@ -131,34 +131,32 @@ private struct ModelDownloadBanner: View {
     }
 }
 
-private struct DictationToolbarButton: View {
-    @EnvironmentObject private var dictation: DictationController
-    @EnvironmentObject private var hotkeySettings: HotkeySettings
-
-    let action: HotkeyAction
+/// Toolbar dropdown that picks the language used for the next voice memo /
+/// app-audio recording. Shows the flag of the active language as the menu
+/// label so it stays scannable even when the toolbar is narrow.
+private struct LanguagePickerToolbarItem: View {
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     var body: some View {
-        Button {
-            Task { await dictation.toggle(action: action) }
+        Menu {
+            Picker("Recording language", selection: $languageSettings.current) {
+                ForEach(RecordingLanguage.allCases) { lang in
+                    Text("\(lang.flagEmoji)  \(lang.displayName)")
+                        .tag(lang)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
         } label: {
-            switch dictation.state {
-            case .recording(let active) where active == action:
-                Label("Stop", systemImage: "stop.circle.fill")
-                    .foregroundStyle(.red)
-            case .transcribing(let active) where active == action:
-                ProgressView().controlSize(.small)
-            default:
-                Label(label, systemImage: "mic.circle")
+            HStack(spacing: 6) {
+                Text(languageSettings.current.flagEmoji)
+                    .font(.system(size: 16))
+                Text(languageSettings.current.displayName)
+                    .font(.callout.weight(.medium))
             }
         }
-        .help("\(action.displayLabel) (\(hotkeySettings.binding(for: action).displayName))")
-    }
-
-    private var label: String {
-        switch action {
-        case .dictateEnglish: return "EN"
-        case .dictateHebrew:  return "HE"
-        }
+        .menuStyle(.borderlessButton)
+        .help("Language used for new voice memos and app-audio recordings")
     }
 }
 

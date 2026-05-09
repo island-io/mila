@@ -17,7 +17,10 @@ final class QuickActionsControllerTests: XCTestCase {
     private var stub: StubWhisperEngine!
     private var service: TranscriptionService!
     private var session: RecordingSession!
+    private var languageSettings: RecordingLanguageSettings!
     private var controller: QuickActionsController!
+    private var languageDefaults: UserDefaults!
+    private let languageSuite = "QuickActionsControllerTests.language"
 
     private var savedSelection: String?
 
@@ -34,9 +37,13 @@ final class QuickActionsControllerTests: XCTestCase {
         stub = StubWhisperEngine()
         service = TranscriptionService(store: store, modelManager: manager, engine: stub)
         session = RecordingSession()
+        UserDefaults().removePersistentDomain(forName: languageSuite)
+        languageDefaults = UserDefaults(suiteName: languageSuite)
+        languageSettings = RecordingLanguageSettings(defaults: languageDefaults)
         controller = QuickActionsController(session: session,
                                             store: store,
-                                            transcription: service)
+                                            transcription: service,
+                                            languageSettings: languageSettings)
     }
 
     override func tearDown() async throws {
@@ -46,6 +53,7 @@ final class QuickActionsControllerTests: XCTestCase {
         } else {
             UserDefaults.standard.removeObject(forKey: "selectedModelName")
         }
+        languageDefaults?.removePersistentDomain(forName: languageSuite)
         try await super.tearDown()
     }
 
@@ -111,6 +119,31 @@ final class QuickActionsControllerTests: XCTestCase {
         await controller.transcribeFile(bogus)
         XCTAssertEqual(controller.activeJob, .none)
         XCTAssertNotNil(service.lastError)
+    }
+
+    /// File imports must adopt whatever language is currently selected in
+    /// the toolbar dropdown — otherwise the user picks "English" but their
+    /// dragged-in WAV gets routed to the Hebrew model.
+    func test_imported_file_uses_language_from_settings() async throws {
+        try TestSupport.installFakeModel(into: manager, model: .openaiTurbo)
+        let source = tempRoot.appendingPathComponent("english-source.wav")
+        try TestSupport.writeStereo48kSineWav(at: source, durationSeconds: 0.4)
+
+        languageSettings.current = .english
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "english import")
+        ])
+
+        await controller.transcribeFile(source)
+        await service.waitForIdle()
+
+        let imported = try XCTUnwrap(store.recordings.first { $0.title == "english-source" })
+        XCTAssertEqual(imported.language, "en",
+                       "Imported recording must reflect the user-selected language")
+        let loaded = await stub.loadedModel
+        XCTAssertEqual(loaded?.lastPathComponent,
+                       manager.url(for: .openaiTurbo).lastPathComponent,
+                       "English-tagged recording must be transcribed with the OpenAI model")
     }
 
     /// Explicit reproduction of the user-reported bug: enqueue, then

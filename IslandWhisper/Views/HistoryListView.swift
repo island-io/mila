@@ -172,9 +172,14 @@ private struct HistoryRow: View {
                 }
             }
         } else {
-            Button("Re-transcribe") {
+            let currentLang = RecordingLanguage.fromCode(recording.language)
+            Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
                 transcription.enqueue(recording)
             }
+            Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
+                retranscribe(recording, in: currentLang.other)
+            }
+            Divider()
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([store.audioURL(for: recording)])
             }
@@ -186,6 +191,18 @@ private struct HistoryRow: View {
                 }
             }
         }
+    }
+
+    /// Switch the recording's stored language and re-enqueue it. The
+    /// `TranscriptionService` reads `recording.language` to pick the right
+    /// model (ivrit.ai for Hebrew, OpenAI for English), so updating the
+    /// store before enqueueing is enough to re-run with the other model.
+    private func retranscribe(_ recording: Recording, in language: RecordingLanguage) {
+        var copy = recording
+        copy.language = language.rawValue
+        copy.status = .pending
+        store.update(copy)
+        transcription.enqueue(copy)
     }
 
     private var preview: String {
