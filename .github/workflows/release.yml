@@ -1,0 +1,83 @@
+name: Release
+
+# Triggered by pushing a SemVer tag (e.g. v1.0.0). Builds a Release-config
+# .app, packages it into a DMG via scripts/make-dmg.sh, and attaches the
+# resulting IslandWhisper-<version>.dmg to a GitHub Release.
+#
+# To cut a release manually from a clean tree:
+#   git tag v1.2.3 && git push origin v1.2.3
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (e.g. 1.0.0). Required when run manually."
+        required: true
+
+permissions:
+  contents: write   # required to upload release assets
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Building version: ${VERSION}"
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          sw_vers
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Build Release
+        run: make release-build
+
+      - name: Package DMG
+        id: dmg
+        run: |
+          DMG="IslandWhisper-${{ steps.version.outputs.version }}.dmg"
+          ./scripts/make-dmg.sh \
+            build-release/Build/Products/Release/IslandWhisper.app \
+            "${DMG}" \
+            "${{ steps.version.outputs.version }}"
+          ls -la "${DMG}"
+          echo "dmg=${DMG}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release and upload DMG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ steps.version.outputs.tag }}"
+          DMG="${{ steps.dmg.outputs.dmg }}"
+          # If a release for this tag already exists (e.g. from a manual run),
+          # just upload the asset to it; otherwise create a new draft release.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$DMG" --clobber
+          else
+            gh release create "$TAG" "$DMG" \
+              --title "IslandWhisper ${{ steps.version.outputs.version }}" \
+              --generate-notes
+          fi

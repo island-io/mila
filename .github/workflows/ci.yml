@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Avoid stacking redundant runs on the same branch — newer pushes cancel
+# in-flight runs of the same workflow.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          sw_vers
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Resolve Swift Package dependencies
+        run: |
+          xcodebuild \
+            -project IslandWhisper.xcodeproj \
+            -scheme IslandWhisper \
+            -destination 'platform=macOS' \
+            -resolvePackageDependencies
+
+      - name: Build (Debug)
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project IslandWhisper.xcodeproj \
+            -scheme IslandWhisper \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            build | xcpretty || true
+
+      - name: Run unit tests
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project IslandWhisper.xcodeproj \
+            -scheme IslandWhisper \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            test

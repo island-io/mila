@@ -1,0 +1,88 @@
+---
+description: Cut a new IslandWhisper release (build, tag, upload DMG to GitHub).
+globs:
+alwaysApply: false
+---
+
+# Releasing IslandWhisper
+
+This is the canonical release SOP. Follow it whenever the user asks for a new
+release ("release v1.2.0", "cut a new version", "ship the latest as v…").
+
+## Versioning
+
+- **SemVer.** `MAJOR.MINOR.PATCH`.
+  - `MAJOR` — incompatible model / file-format changes that break older
+    installs without a migration. Bump with care.
+  - `MINOR` — new features (new hotkey, new model, new view).
+  - `PATCH` — bug fixes, dependency bumps, polish.
+- Tags are **always** prefixed with `v`: `v1.0.0`, `v1.2.3`. The release
+  workflow looks for `refs/tags/v*.*.*`.
+- Internal build pre-1.0 already shipped to internal testers as v1.0.0; first
+  external release should bump to **v1.1.0** (MINOR) at the earliest.
+
+## Pre-flight checklist
+
+Before tagging:
+
+- [ ] `main` is green in CI (`gh run list --workflow=CI.yml --branch=main --limit=1`).
+- [ ] `make test` passes locally.
+- [ ] Version in `IslandWhisper/Resources/Info.plist`
+      (`CFBundleShortVersionString`) **and** `project.yml` (`MARKETING_VERSION`,
+      `CFBundleShortVersionString`) is bumped to the target version.
+- [ ] `CFBundleVersion` is incremented (monotonic build number).
+- [ ] If the model catalog changed, the size + URL fields in
+      `IslandWhisper/Transcription/ModelManager.swift` reflect reality.
+
+## Cutting the release
+
+Two paths — pick the one that matches the situation.
+
+### A. Tag-driven (preferred for routine releases)
+
+```bash
+# Bump version files first (project.yml + Info.plist).
+git add project.yml IslandWhisper/Resources/Info.plist
+git commit -m "Release v<NEW_VERSION>"
+git push origin main
+
+git tag v<NEW_VERSION>
+git push origin v<NEW_VERSION>
+```
+
+The `release.yml` workflow then builds, packages, and uploads the DMG
+automatically. Watch it via `gh run watch`.
+
+### B. Manual local build (when CI is unavailable)
+
+```bash
+# 1. Bump version files (same as above).
+make clean
+make dmg                       # produces IslandWhisper-<version>.dmg
+
+# 2. Tag and push:
+git tag v<NEW_VERSION>
+git push origin v<NEW_VERSION>
+
+# 3. Create the release and attach the DMG.
+gh release create v<NEW_VERSION> \
+    "IslandWhisper-<NEW_VERSION>.dmg" \
+    --title "IslandWhisper <NEW_VERSION>" \
+    --generate-notes
+```
+
+## DMG details
+
+- Built by `scripts/make-dmg.sh` from a Release config build.
+- Ad-hoc signed (`codesign -s -`). On first launch macOS shows the standard
+  Gatekeeper prompt — **right-click → Open** the first time, or notarize.
+- For App Store / external distribution, set `DEVELOPMENT_TEAM` in
+  `project.yml`, re-enable `com.apple.security.app-sandbox` in the
+  entitlements file, and sign with a Developer ID Application certificate.
+
+## After the release
+
+- Verify the DMG at the release page mounts cleanly and the .app launches.
+- Update any internal channel pointing at the latest version.
+- For internal-only releases (default for this repo) post the link in the
+  team Slack channel.

@@ -1,0 +1,351 @@
+import XCTest
+@testable import IslandWhisper
+
+@MainActor
+final class TranscriptionServiceTests: XCTestCase {
+
+    private var tempRoot: URL!
+    private var store: RecordingStore!
+    private var manager: ModelManager!
+    private var stub: StubWhisperEngine!
+    private var service: TranscriptionService!
+
+    private var savedSelection: String?
+
+    override func setUp() async throws {
+        try await super.setUp()
+        tempRoot = TestSupport.makeTempRoot(label: "TranscriptionServiceTests")
+        try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
+
+        store = RecordingStore(rootDirectory: tempRoot)
+        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
+        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        try TestSupport.installFakeModel(into: manager)
+
+        stub = StubWhisperEngine()
+        service = TranscriptionService(store: store, modelManager: manager, engine: stub)
+    }
+
+    override func tearDown() async throws {
+        if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
+        if let savedSelection {
+            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "selectedModelName")
+        }
+        try await super.tearDown()
+    }
+
+    // MARK: - Single recording happy path
+
+    func test_enqueue_single_recording_marks_running_then_completed() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Hello")
+        let canned = [TranscriptSegment(start: 0, end: 0.5, text: "שלום")]
+        await stub.setDefaultCanned(canned)
+
+        XCTAssertNil(service.activeRecordingID)
+        service.enqueue(fixture.recording)
+        XCTAssertTrue(service.pendingIDs.contains(fixture.recording.id) ||
+                      service.activeRecordingID == fixture.recording.id,
+                      "Just-enqueued recording must be either active or pending")
+
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.fullText, "שלום")
+        XCTAssertEqual(stored.segments.count, 1)
+        XCTAssertEqual(stored.modelName, WhisperModel.ivritTurbo.displayName)
+        XCTAssertNil(service.activeRecordingID)
+        XCTAssertTrue(service.pendingIDs.isEmpty)
+    }
+
+    // MARK: - The bug we're fixing
+
+    /// REGRESSION: Before the queue refactor, calling enqueue twice while the
+    /// first transcription was still running would stomp on `activeRecordingID`
+    /// and `progress`, making the UI think the OLD recording was being
+    /// transcribed even after the NEW one started.
+    func test_enqueueing_second_recording_during_first_does_not_drop_either() async throws {
+        let a = try TestRecordingFixture.make(in: store, title: "A")
+        let b = try TestRecordingFixture.make(in: store, title: "B")
+
+        await stub.setDefaultDelay(0.25)
+        await stub.setCannedQueue([
+            [TranscriptSegment(start: 0, end: 1, text: "from A")],
+            [TranscriptSegment(start: 0, end: 1, text: "from B")]
+        ])
+
+        service.enqueue(a.recording)
+        service.enqueue(b.recording)
+
+        await service.waitForIdle()
+
+        let storedA = try XCTUnwrap(store.recordings.first { $0.id == a.recording.id })
+        let storedB = try XCTUnwrap(store.recordings.first { $0.id == b.recording.id })
+
+        XCTAssertEqual(storedA.status, .completed)
+        XCTAssertEqual(storedA.fullText, "from A")
+
+        XCTAssertEqual(storedB.status, .completed)
+        XCTAssertEqual(storedB.fullText, "from B")
+
+        let maxConcurrent = await stub.maxConcurrentInFlight
+        XCTAssertEqual(maxConcurrent, 1,
+                       "The queue must serialize work; we never want two transcriptions live at once")
+    }
+
+    // MARK: - Strict FIFO ordering
+
+    func test_three_recordings_process_in_FIFO_order() async throws {
+        let a = try TestRecordingFixture.make(in: store, title: "Alpha")
+        let b = try TestRecordingFixture.make(in: store, title: "Bravo")
+        let c = try TestRecordingFixture.make(in: store, title: "Charlie")
+
+        await stub.setDefaultDelay(0.05)
+        await stub.setCannedQueue([
+            [TranscriptSegment(start: 0, end: 1, text: "alpha-text")],
+            [TranscriptSegment(start: 0, end: 1, text: "bravo-text")],
+            [TranscriptSegment(start: 0, end: 1, text: "charlie-text")]
+        ])
+
+        service.enqueue(a.recording)
+        service.enqueue(b.recording)
+        service.enqueue(c.recording)
+
+        // While the worker is working we should see the right queue depth.
+        XCTAssertEqual(service.pendingIDs.count + (service.activeRecordingID == nil ? 0 : 1), 3)
+
+        await service.waitForIdle()
+
+        let map = Dictionary(uniqueKeysWithValues: store.recordings.map { ($0.id, $0) })
+        XCTAssertEqual(map[a.recording.id]?.fullText, "alpha-text")
+        XCTAssertEqual(map[b.recording.id]?.fullText, "bravo-text")
+        XCTAssertEqual(map[c.recording.id]?.fullText, "charlie-text")
+
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 3)
+    }
+
+    // MARK: - Progress updates only the active recording
+
+    func test_progress_updates_only_apply_to_active_recording() async throws {
+        let a = try TestRecordingFixture.make(in: store, title: "First")
+        let b = try TestRecordingFixture.make(in: store, title: "Second")
+
+        await stub.setDefaultDelay(0.15)
+        await stub.setCannedQueue([
+            [TranscriptSegment(start: 0, end: 1, text: "ok")],
+            [TranscriptSegment(start: 0, end: 1, text: "ok")]
+        ])
+
+        service.enqueue(a.recording)
+        service.enqueue(b.recording)
+
+        // Sample progress while running. activeRecordingID and progress must
+        // refer to the same job at every observation.
+        var observations: [(UUID?, Double)] = []
+        let deadline = Date().addingTimeInterval(2.0)
+        while Date() < deadline,
+              service.activeRecordingID != nil || !service.pendingIDs.isEmpty {
+            observations.append((service.activeRecordingID, service.progress))
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await service.waitForIdle()
+
+        // Whenever progress was non-zero, activeRecordingID had to be non-nil.
+        for (id, prog) in observations where prog > 0 {
+            XCTAssertNotNil(id, "progress=\(prog) but no activeRecordingID")
+        }
+        // We must have seen both recordings serve as active at some point.
+        let seen = Set(observations.compactMap(\.0))
+        XCTAssertTrue(seen.contains(a.recording.id), "First recording never became active")
+        XCTAssertTrue(seen.contains(b.recording.id), "Second recording never became active")
+    }
+
+    // MARK: - Idempotent enqueue
+
+    func test_enqueue_is_idempotent_for_same_recording_id() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Once")
+        await stub.setDefaultDelay(0.1)
+
+        service.enqueue(fixture.recording)
+        service.enqueue(fixture.recording)
+        service.enqueue(fixture.recording)
+
+        await service.waitForIdle()
+
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 1, "Duplicate enqueues should be ignored")
+    }
+
+    // MARK: - Failure path
+
+    func test_engine_failure_marks_recording_as_failed_and_continues_queue() async throws {
+        let a = try TestRecordingFixture.make(in: store, title: "Will fail")
+        let b = try TestRecordingFixture.make(in: store, title: "Should still run")
+
+        await stub.setNextError(NSError(domain: "TestEngine", code: 42,
+                                        userInfo: [NSLocalizedDescriptionKey: "fake whisper crash"]))
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "second one fine")
+        ])
+
+        service.enqueue(a.recording)
+        service.enqueue(b.recording)
+
+        await service.waitForIdle()
+
+        let storedA = try XCTUnwrap(store.recordings.first { $0.id == a.recording.id })
+        let storedB = try XCTUnwrap(store.recordings.first { $0.id == b.recording.id })
+
+        XCTAssertEqual(storedA.status, .failed)
+        XCTAssertEqual(storedA.fullText, "")
+        XCTAssertEqual(storedB.status, .completed)
+        XCTAssertEqual(storedB.fullText, "second one fine")
+        XCTAssertNotNil(service.lastError)
+    }
+
+    // MARK: - Empty transcript counts as failure
+
+    func test_empty_transcript_is_marked_failed() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Silent")
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .failed)
+        XCTAssertEqual(stored.fullText, "")
+    }
+
+    // MARK: - User-reported "every empty recording shows the same transcript"
+
+    /// REGRESSION: When the second/third Voice Memo captures almost no audio
+    /// (because of an `AVAudioEngine` restart bug), the auto-gain in
+    /// WhisperEngine amplifies that ~60ms of mic noise to clipping levels and
+    /// Whisper hallucinates a confident-looking Hebrew test phrase like
+    /// "1, 2, 3, בדיקה, בדיקה, 4, 5" — the SAME phrase for every silent
+    /// recording. From the user's POV it looks like the new recording is
+    /// "stuck on the previous one's transcript".
+    ///
+    /// The transcription service must short-circuit on essentially-silent /
+    /// extremely short audio so we never hand it to Whisper at all.
+    func test_silent_or_too_short_audio_is_rejected_without_calling_whisper() async throws {
+        let url = store.freshAudioURL(suggestedName: "Silent")
+        try TestSupport.writeSineWav(at: url,
+                                     durationSeconds: 0.06,
+                                     amplitude: 0.0001)
+        let recording = Recording(
+            title: "Silent",
+            duration: 0.06,
+            source: .microphone,
+            audioFileName: url.lastPathComponent,
+            language: "he"
+        )
+        store.add(recording)
+
+        // If the guard is missing, the stub will return this and the user will
+        // see it as a "ghost transcript" on the empty recording — exactly the
+        // bug being fixed.
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1,
+                              text: "GHOST TRANSCRIPT THAT MUST NEVER APPEAR")
+        ])
+
+        service.enqueue(recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(stored.status, .failed)
+        XCTAssertEqual(stored.fullText, "")
+        XCTAssertTrue(stored.segments.isEmpty)
+
+        let calls = await stub.transcribeCalls
+        XCTAssertTrue(calls.isEmpty,
+                      "Whisper must NOT be called on essentially-silent / extremely short audio")
+    }
+
+    /// Companion to the above: a normal audio file (>= the duration threshold,
+    /// non-trivial peak) MUST go through Whisper as expected. We don't want to
+    /// over-correct and start dropping legitimate quiet recordings.
+    func test_quiet_but_audible_recording_still_reaches_whisper() async throws {
+        let url = store.freshAudioURL(suggestedName: "Quiet but audible")
+        try TestSupport.writeSineWav(at: url,
+                                     durationSeconds: 1.0,
+                                     amplitude: 0.05)
+        let recording = Recording(
+            title: "Quiet but audible",
+            duration: 1.0,
+            source: .microphone,
+            audioFileName: url.lastPathComponent,
+            language: "he"
+        )
+        store.add(recording)
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "should be transcribed")
+        ])
+
+        service.enqueue(recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.fullText, "should be transcribed")
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 1)
+    }
+
+    // MARK: - Soft-deleted recordings are skipped
+
+    func test_soft_deleted_recording_is_not_transcribed() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Trashed")
+        store.softDelete(fixture.recording)
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let calls = await stub.transcribeCalls
+        XCTAssertTrue(calls.isEmpty, "Should not run whisper on a deleted recording")
+    }
+
+    // MARK: - Model gating
+
+    func test_no_model_installed_marks_recording_failed() async throws {
+        try manager.delete(.ivritTurbo)
+        XCTAssertFalse(manager.isInstalled(.ivritTurbo))
+
+        let fixture = try TestRecordingFixture.make(in: store, title: "Skipped")
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .failed)
+
+        let calls = await stub.transcribeCalls
+        XCTAssertTrue(calls.isEmpty)
+    }
+
+    // MARK: - transcribeOnce (dictation path)
+
+    func test_transcribe_once_returns_concatenated_segment_text() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 0.5, text: "שלום "),
+            TranscriptSegment(start: 0.5, end: 1.0, text: "עולם")
+        ])
+
+        let samples = [Float](repeating: 0.1, count: 16_000)
+        let text = await service.transcribeOnce(samples: samples, language: "he")
+
+        XCTAssertEqual(text, "שלום עולם")
+    }
+
+    func test_transcribe_once_returns_empty_when_engine_throws() async {
+        await stub.setNextError(NSError(domain: "TestEngine", code: 7))
+
+        let samples = [Float](repeating: 0.1, count: 16_000)
+        let text = await service.transcribeOnce(samples: samples, language: "he")
+        XCTAssertEqual(text, "")
+    }
+}
