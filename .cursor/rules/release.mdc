@@ -27,10 +27,17 @@ Before tagging:
 
 - [ ] `main` is green in CI (`gh run list --workflow=CI.yml --branch=main --limit=1`).
 - [ ] `make test` passes locally.
-- [ ] Version in `IslandWhisper/Resources/Info.plist`
-      (`CFBundleShortVersionString`) **and** `project.yml` (`MARKETING_VERSION`,
-      `CFBundleShortVersionString`) is bumped to the target version.
-- [ ] `CFBundleVersion` is incremented (monotonic build number).
+- [ ] Version is bumped in **two** places only — `project.yml`'s
+      top-level `settings.base.MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`,
+      plus `IslandWhisper/Resources/Info.plist`'s `CFBundleShortVersionString`
+      and `CFBundleVersion`. The target's `info.properties` block uses
+      `$(MARKETING_VERSION)` / `$(CURRENT_PROJECT_VERSION)` so it inherits
+      automatically — do **not** hardcode literals there (caused build-number
+      drift in v1.2.4 → would silently ship the wrong build to Sparkle).
+- [ ] `CFBundleVersion` (build number) is monotonically incremented — Sparkle
+      keys updates by this value, so a stale build number means existing
+      installs won't see the update even when `CFBundleShortVersionString`
+      bumps.
 - [ ] If the model catalog changed, the size + URL fields in
       `IslandWhisper/Transcription/ModelManager.swift` reflect reality.
 

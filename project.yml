@@ -44,8 +44,13 @@ targets:
       properties:
         CFBundleName: IslandWhisper
         CFBundleDisplayName: Island Whisper
-        CFBundleShortVersionString: "1.2.4"
-        CFBundleVersion: "6"
+        # Inherit from settings.MARKETING_VERSION / CURRENT_PROJECT_VERSION above
+        # so a release bump only has to change those two fields. Hardcoding here
+        # caused v1.2.4 to ship with build 6 instead of 7 — Sparkle's appcast
+        # advertised 7 (correct), but the bundle's CFBundleVersion stayed at
+        # the stale literal until the next release picked up the inheritance.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         LSMinimumSystemVersion: "14.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSHumanReadableCopyright: ""
