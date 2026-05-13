@@ -13,7 +13,7 @@ final class DiarizationSettings: ObservableObject {
     }
     @Published var hfToken: String {
         didSet {
-            defaults.set(hfToken, forKey: "diarization.hfToken")
+            KeychainHelper.save(key: "diarization.hfToken", value: hfToken)
             invalidateIfChanged()
         }
     }
@@ -31,7 +31,14 @@ final class DiarizationSettings: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.isEnabled = defaults.bool(forKey: "diarization.enabled")
-        self.hfToken = defaults.string(forKey: "diarization.hfToken") ?? ""
+        let token = KeychainHelper.load(key: "diarization.hfToken")
+            ?? defaults.string(forKey: "diarization.hfToken")
+            ?? ""
+        self.hfToken = token
+        if !token.isEmpty && defaults.string(forKey: "diarization.hfToken") != nil {
+            KeychainHelper.save(key: "diarization.hfToken", value: token)
+            defaults.removeObject(forKey: "diarization.hfToken")
+        }
         let path = defaults.string(forKey: "diarization.pythonPath") ?? "/usr/bin/python3"
         self.pythonPath = path
         self._pythonFound = Published(initialValue: FileManager.default.fileExists(atPath: path))
@@ -44,18 +51,18 @@ final class DiarizationSettings: ObservableObject {
 
     private func persistVerified() {
         defaults.set(true, forKey: "diarization.verified")
-        defaults.set(hfToken, forKey: "diarization.verifiedToken")
+        KeychainHelper.save(key: "diarization.verifiedToken", value: hfToken)
         defaults.set(pythonPath, forKey: "diarization.verifiedPythonPath")
     }
 
     private func clearVerified() {
         defaults.set(false, forKey: "diarization.verified")
-        defaults.removeObject(forKey: "diarization.verifiedToken")
+        KeychainHelper.delete(key: "diarization.verifiedToken")
         defaults.removeObject(forKey: "diarization.verifiedPythonPath")
     }
 
     private func invalidateIfChanged() {
-        let savedToken = defaults.string(forKey: "diarization.verifiedToken") ?? ""
+        let savedToken = KeychainHelper.load(key: "diarization.verifiedToken") ?? ""
         let savedPath = defaults.string(forKey: "diarization.verifiedPythonPath") ?? ""
         if hfToken != savedToken || pythonPath != savedPath {
             clearVerified()
@@ -66,7 +73,7 @@ final class DiarizationSettings: ObservableObject {
 
     private func restoreVerifiedState() {
         guard isEnabled && isVerified else { return }
-        let savedToken = defaults.string(forKey: "diarization.verifiedToken") ?? ""
+        let savedToken = KeychainHelper.load(key: "diarization.verifiedToken") ?? ""
         let savedPath = defaults.string(forKey: "diarization.verifiedPythonPath") ?? ""
         if hfToken == savedToken && pythonPath == savedPath
             && !hfToken.isEmpty && pythonFound {

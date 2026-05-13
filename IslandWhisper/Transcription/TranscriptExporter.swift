@@ -12,12 +12,13 @@ enum TranscriptExporter {
         }
 
         var entries: [String] = []
-        for (idx, seg) in segments.enumerated() {
+        for seg in segments {
             let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
 
+            let seqNum = entries.count + 1
             let prefix = seg.speaker.map { $0 + ": " } ?? ""
-            entries.append("\(idx + 1)\n\(formatSRTTime(seg.start)) --> \(formatSRTTime(seg.end))\n\(prefix)\(text)")
+            entries.append("\(seqNum)\n\(formatSRTTime(seg.start)) --> \(formatSRTTime(seg.end))\n\(prefix)\(text)")
         }
         let srt = entries.joined(separator: "\n\n") + (entries.isEmpty ? "" : "\n\n")
 

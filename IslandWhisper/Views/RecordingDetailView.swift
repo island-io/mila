@@ -239,8 +239,8 @@ private struct SegmentRow: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 56, alignment: .trailing)
-            if showSpeaker, let speaker = segment.speaker {
-                Text(speaker)
+            if showSpeaker {
+                Text(segment.speaker ?? "")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.tint)
                     .frame(width: 72, alignment: .leading)
