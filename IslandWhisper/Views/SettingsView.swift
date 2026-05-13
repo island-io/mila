@@ -14,8 +14,10 @@ struct SettingsView: View {
                 .tabItem { Label("Models", systemImage: "cube.box") }
             LLMSettingsTab()
                 .tabItem { Label("LLM", systemImage: "sparkles") }
+            DiarizationSettingsTab()
+                .tabItem { Label("Speakers", systemImage: "person.2") }
         }
-        .frame(width: 560, height: 520)
+        .frame(width: 560, height: 560)
         .padding(20)
     }
 }
@@ -469,6 +471,277 @@ private struct ExamplesView: View {
                 }
                 .buttonStyle(.plain)
                 .contentShape(Rectangle())
+            }
+        }
+    }
+}
+
+// MARK: - Speaker Diarization
+
+private struct DiarizationSettingsTab: View {
+    @EnvironmentObject private var diarization: DiarizationSettings
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Speaker diarization")
+                        .font(.title3.weight(.semibold))
+                    Spacer()
+                    statusBadge
+                }
+
+                Text("Identify who is speaking in your recordings. Everything runs on your Mac — no audio leaves your machine.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle("Enable speaker diarization", isOn: $diarization.isEnabled)
+
+                if diarization.isEnabled {
+                    // Step 1: deps — auto-checked, install button if missing
+                    depsSection
+
+                    // Step 2: token + model access — only after deps are OK
+                    if !diarization.needsDepsInstall,
+                       let result = diarization.lastVerifyResult,
+                       result.pyannoteInstalled && result.torchInstalled {
+                        Divider()
+                        tokenSection
+                    }
+
+                    // Step 3: full verify — only when token is entered
+                    if diarization.canVerify {
+                        Divider()
+                        verifySection
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.default, value: diarization.isEnabled)
+        .animation(.default, value: diarization.status)
+    }
+
+    private var statusBadge: some View {
+        let status = diarization.status
+        return Label(status.label, systemImage: status.sfSymbol)
+            .font(.callout.weight(.medium))
+            .foregroundStyle(statusColor(status))
+    }
+
+    private func statusColor(_ status: DiarizationSettings.SetupStatus) -> some ShapeStyle {
+        switch status.color {
+        case .green:     return AnyShapeStyle(.green)
+        case .orange:    return AnyShapeStyle(.orange)
+        case .red:       return AnyShapeStyle(.red)
+        case .secondary: return AnyShapeStyle(.secondary)
+        }
+    }
+
+    // MARK: - Step 1: Dependencies
+
+    @ViewBuilder
+    private var depsSection: some View {
+        let status = diarization.status
+        if case .checking = status {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Checking Python dependencies…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        } else if diarization.needsDepsInstall {
+            VStack(alignment: .leading, spacing: 8) {
+                Label("Python dependencies needed", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.orange)
+
+                Button {
+                    Task { await diarization.installDependencies() }
+                } label: {
+                    if diarization.isInstalling {
+                        ProgressView()
+                            .controlSize(.small)
+                            .padding(.trailing, 2)
+                        Text("Installing (this may take a few minutes)…")
+                    } else {
+                        Label("Install pyannote.audio + torch", systemImage: "arrow.down.circle.fill")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(diarization.isInstalling)
+
+                if let log = diarization.installLog {
+                    ScrollView {
+                        Text(log)
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 80)
+                    .padding(6)
+                    .background(.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 4))
+                }
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        } else if let result = diarization.lastVerifyResult,
+                  result.pyannoteInstalled && result.torchInstalled {
+            Label("Python dependencies installed", systemImage: "checkmark.circle.fill")
+                .font(.callout)
+                .foregroundStyle(.green)
+        }
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text("Python path")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if diarization.pythonFound {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .font(.caption2)
+                } else {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.red)
+                        .font(.caption2)
+                }
+            }
+            TextField("/usr/bin/python3", text: $diarization.pythonPath)
+                .textFieldStyle(.roundedBorder)
+                .font(.callout)
+        }
+    }
+
+    // MARK: - Step 2: Token
+
+    @ViewBuilder
+    private var tokenSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Hugging Face token")
+                .font(.callout.weight(.medium))
+            Text("A free token is needed to download the speaker model. Create an account, accept the model licenses, then paste a token with Read scope.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 6) {
+                SecureField("hf_...", text: $diarization.hfToken)
+                    .textFieldStyle(.roundedBorder)
+                if !diarization.hfToken.isEmpty {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text("1. Accept both model licenses:")
+                    .font(.caption).foregroundStyle(.secondary)
+                Text("   huggingface.co/pyannote/speaker-diarization-3.1")
+                    .font(.caption).foregroundStyle(.tertiary)
+                Text("   huggingface.co/pyannote/segmentation-3.0")
+                    .font(.caption).foregroundStyle(.tertiary)
+                Text("2. Create token: huggingface.co/settings/tokens")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    // MARK: - Step 3: Verify
+
+    @ViewBuilder
+    private var verifySection: some View {
+        let status = diarization.status
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                Task { await diarization.verify() }
+            } label: {
+                if case .verifying = status {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(.trailing, 2)
+                    Text("Verifying…")
+                } else {
+                    Label("Verify setup", systemImage: "checkmark.shield")
+                }
+            }
+            .disabled(status == .verifying)
+
+            if let result = diarization.lastVerifyResult, !diarization.needsDepsInstall {
+                verifyResultChecklist(result)
+            }
+
+            if diarization.needsDepsUpgrade {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Package version mismatch", systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout.weight(.medium))
+                        .foregroundStyle(.orange)
+                    Button {
+                        Task { await diarization.installDependencies() }
+                    } label: {
+                        if diarization.isInstalling {
+                            ProgressView()
+                                .controlSize(.small)
+                                .padding(.trailing, 2)
+                            Text("Upgrading…")
+                        } else {
+                            Label("Upgrade dependencies", systemImage: "arrow.up.circle.fill")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(diarization.isInstalling)
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+            } else if case .verificationFailed(let msg) = status, msg.contains("not accepted") {
+                Text("Open the model links above and click \"Agree and access repository\" on each page.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func verifyResultChecklist(_ result: SpeakerDiarizer.VerifyResult) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(result.models, id: \.name) { model in
+                let shortName = model.name.components(separatedBy: "/").last ?? model.name
+                if model.accessible {
+                    verifyCheckRow(shortName, ok: true)
+                } else {
+                    verifyCheckRow(shortName, ok: false,
+                                   detail: model.error == "terms_not_accepted"
+                                       ? "Accept terms at huggingface.co/\(model.name)"
+                                       : model.error == "invalid_token"
+                                           ? "Token is invalid or missing read scope"
+                                           : model.error)
+                }
+            }
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(result.allGood ? .green.opacity(0.08) : .red.opacity(0.08),
+                     in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private func verifyCheckRow(_ label: String, ok: Bool, detail: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Label(label, systemImage: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(ok ? .green : .red)
+            if let detail {
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 22)
             }
         }
     }

@@ -36,6 +36,7 @@ struct TranscriptSegment: Codable, Identifiable, Hashable {
     var start: Double
     var end: Double
     var text: String
+    var speaker: String?
 }
 
 struct Recording: Identifiable, Codable, Hashable {

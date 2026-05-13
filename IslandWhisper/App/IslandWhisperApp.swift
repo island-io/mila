@@ -44,12 +44,14 @@ struct IslandWhisperApp: App {
     @StateObject private var audioInputSettings: AudioInputSettings
     @StateObject private var llmSettings: LLMSettings
     @StateObject private var postRecording: PostRecordingCoordinator
+    @StateObject private var diarizationSettings: DiarizationSettings
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
         let store = RecordingStore()
         let mgr = ModelManager(modelsDirectory: store.modelsDirectory)
-        let svc = TranscriptionService(store: store, modelManager: mgr)
+        let diarSettings = DiarizationSettings()
+        let svc = TranscriptionService(store: store, modelManager: mgr, diarizationSettings: diarSettings)
         let session = RecordingSession()
         let langSettings = RecordingLanguageSettings()
         let audioSettings = AudioInputSettings()
@@ -64,6 +66,7 @@ struct IslandWhisperApp: App {
         _store = StateObject(wrappedValue: store)
         _modelManager = StateObject(wrappedValue: mgr)
         _transcription = StateObject(wrappedValue: svc)
+        _diarizationSettings = StateObject(wrappedValue: diarSettings)
         _session = StateObject(wrappedValue: session)
         _actions = StateObject(wrappedValue: actions)
         _hotkeySettings = StateObject(wrappedValue: hotkeys)
@@ -90,6 +93,7 @@ struct IslandWhisperApp: App {
                 .environmentObject(audioInputSettings)
                 .environmentObject(llmSettings)
                 .environmentObject(postRecording)
+                .environmentObject(diarizationSettings)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .onAppear { wireDelegate() }
@@ -128,6 +132,7 @@ struct IslandWhisperApp: App {
                 .environmentObject(transcription)
                 .environmentObject(audioInputSettings)
                 .environmentObject(llmSettings)
+                .environmentObject(diarizationSettings)
         }
     }
 

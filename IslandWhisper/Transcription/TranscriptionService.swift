@@ -26,15 +26,18 @@ final class TranscriptionService: ObservableObject {
     private let engine: any TranscribingEngine
     private let store: RecordingStore
     private let modelManager: ModelManager
+    private let diarizationSettings: DiarizationSettings
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
 
     init(store: RecordingStore,
          modelManager: ModelManager,
+         diarizationSettings: DiarizationSettings,
          engine: any TranscribingEngine = WhisperEngine()) {
         self.store = store
         self.modelManager = modelManager
+        self.diarizationSettings = diarizationSettings
         self.engine = engine
     }
 
@@ -194,7 +197,33 @@ final class TranscriptionService: ObservableObject {
                 return
             }
 
-            let segments = try await engine.transcribe(
+            // Run diarization (Python subprocess) concurrently with whisper
+            // transcription (in-process via ggml). They use independent
+            // compute paths (Python/MPS vs whisper.cpp/Metal) and both read
+            // from the same WAV file, so parallelism is safe and saves time.
+            let shouldDiarize = diarizationSettings.isConfigured
+            let diarHfToken = diarizationSettings.hfToken
+            let diarPythonPath = diarizationSettings.pythonPath
+
+            async let diarizeTask: [SpeakerTurn] = {
+                guard shouldDiarize else { return [] }
+                print("Transcribe: running speaker diarization...")
+                do {
+                    let turns = try await SpeakerDiarizer.diarize(
+                        wavURL: audioURL,
+                        hfToken: diarHfToken,
+                        pythonPath: diarPythonPath
+                    )
+                    let speakerCount = Set(turns.map(\.speaker)).count
+                    print("Transcribe: diarization found \(speakerCount) speakers across \(turns.count) turns")
+                    return turns
+                } catch {
+                    print("Transcribe: diarization failed (continuing without speakers): \(error)")
+                    return []
+                }
+            }()
+
+            async let transcribeTask = engine.transcribe(
                 samples: samples,
                 language: working.language,
                 progress: { [weak self] p in
@@ -206,18 +235,35 @@ final class TranscriptionService: ObservableObject {
                 }
             )
 
-            let text = segments.map(\.text)
+            let (speakerTurns, segments) = try await (diarizeTask, transcribeTask)
+
+            var enrichedSegments = segments
+            if !speakerTurns.isEmpty {
+                for i in enrichedSegments.indices {
+                    enrichedSegments[i].speaker = SpeakerDiarizer.assignSpeaker(
+                        segmentStart: enrichedSegments[i].start,
+                        segmentEnd: enrichedSegments[i].end,
+                        turns: speakerTurns
+                    )
+                }
+            }
+
+            let text = enrichedSegments.map(\.text)
                 .joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            print("Transcribe done: \(working.title) -> \(segments.count) segments, \(text.count) chars")
+            print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
 
-            working.segments = segments
+            working.segments = enrichedSegments
             working.fullText = text
-            if let lastEnd = segments.last?.end, lastEnd > 0 {
+            if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
                 working.duration = lastEnd
             }
             working.status = text.isEmpty ? .failed : .completed
             store.update(working)
+
+            if working.status == .completed {
+                TranscriptExporter.writeSRT(for: working, in: store.recordingsDirectory)
+            }
         } catch {
             print("Transcribe error for \(working.title): \(error)")
             working.status = .failed
