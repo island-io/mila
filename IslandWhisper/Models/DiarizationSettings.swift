@@ -154,21 +154,17 @@ final class DiarizationSettings: ObservableObject {
         guard isEnabled else { return .disabled }
         guard pythonFound else { return .pythonNotFound }
         if case .checking = verificationStatus { return .checking }
-        if needsDepsInstall { return .missingDeps }
+        if case .verifying = verificationStatus { return .verifying }
         if isInstalling { return .checking }
+        if case .verified = verificationStatus { return .verified }
+        if needsDepsInstall { return .missingDeps }
         if let result = lastVerifyResult, result.pyannoteInstalled && result.torchInstalled {
             if hfToken.isEmpty { return .depsInstalled }
-            if case .verified = verificationStatus { return .verified }
-            if case .verifying = verificationStatus { return .verifying }
             if case .verificationFailed(let msg) = verificationStatus {
                 return .verificationFailed(msg)
             }
             return .notVerified
         }
-        if lastVerifyResult == nil && verificationStatus == .disabled {
-            return .notVerified
-        }
-        if case .verifying = verificationStatus { return .verifying }
         if case .verificationFailed(let msg) = verificationStatus {
             return .verificationFailed(msg)
         }

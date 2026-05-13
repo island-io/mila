@@ -63,7 +63,25 @@ enum SpeakerDiarizer {
             }
 
             let diarizeScript = """
-            import json, sys, os
+            import json, sys, os, types
+
+            # speechbrain uses LazyModule for optional integrations. When
+            # pytorch_lightning inspects the call stack, it triggers these
+            # lazy imports and crashes if the optional packages aren't
+            # installed. Patch LazyModule.__getattr__ to return a dummy
+            # instead of raising ImportError.
+            try:
+                import speechbrain.utils.importutils as _sbiu
+                _orig_ensure = _sbiu.LazyModule.ensure_module
+                def _safe_ensure(self, *a, **kw):
+                    try:
+                        return _orig_ensure(self, *a, **kw)
+                    except ImportError:
+                        self.lazy_module = types.ModuleType(self.target)
+                        return self.lazy_module
+                _sbiu.LazyModule.ensure_module = _safe_ensure
+            except Exception:
+                pass
 
             import torch
             _orig_torch_load = torch.load
@@ -75,10 +93,13 @@ enum SpeakerDiarizer {
             from pyannote.audio import Pipeline
 
             wav_path = sys.argv[1]
+            print(f"diarize: loading pipeline...", file=sys.stderr)
             pipeline = Pipeline.from_pretrained("pyannote/speaker-diarization-3.1")
             if torch.backends.mps.is_available():
                 pipeline.to(torch.device("mps"))
+                print(f"diarize: using MPS", file=sys.stderr)
 
+            print(f"diarize: running on {wav_path}", file=sys.stderr)
             diar = pipeline(wav_path)
             annotation = getattr(diar, "speaker_diarization", diar)
 
@@ -90,6 +111,7 @@ enum SpeakerDiarizer {
                     "speaker": speaker,
                 })
 
+            print(f"diarize: found {len(set(t['speaker'] for t in turns))} speakers, {len(turns)} turns", file=sys.stderr)
             json.dump(turns, sys.stdout)
             """
 
