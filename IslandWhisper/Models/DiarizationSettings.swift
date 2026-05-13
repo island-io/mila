@@ -20,17 +20,21 @@ final class DiarizationSettings: ObservableObject {
     @Published var pythonPath: String {
         didSet {
             defaults.set(pythonPath, forKey: "diarization.pythonPath")
+            pythonFound = FileManager.default.fileExists(atPath: pythonPath)
             invalidateIfChanged()
         }
     }
 
     private let defaults: UserDefaults
+    @Published private(set) var pythonFound: Bool
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         self.isEnabled = defaults.bool(forKey: "diarization.enabled")
         self.hfToken = defaults.string(forKey: "diarization.hfToken") ?? ""
-        self.pythonPath = defaults.string(forKey: "diarization.pythonPath") ?? "/usr/bin/python3"
+        let path = defaults.string(forKey: "diarization.pythonPath") ?? "/usr/bin/python3"
+        self.pythonPath = path
+        self._pythonFound = Published(initialValue: FileManager.default.fileExists(atPath: path))
         restoreVerifiedState()
     }
 
@@ -72,10 +76,6 @@ final class DiarizationSettings: ObservableObject {
 
     var isConfigured: Bool {
         isEnabled && !hfToken.isEmpty
-    }
-
-    var pythonFound: Bool {
-        FileManager.default.fileExists(atPath: pythonPath)
     }
 
     enum SetupStatus: Equatable {

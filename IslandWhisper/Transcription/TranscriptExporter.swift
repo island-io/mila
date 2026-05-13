@@ -11,16 +11,15 @@ enum TranscriptExporter {
             return
         }
 
-        var srt = ""
+        var entries: [String] = []
         for (idx, seg) in segments.enumerated() {
             let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
 
             let prefix = seg.speaker.map { $0 + ": " } ?? ""
-            srt += "\(idx + 1)\n"
-            srt += "\(formatSRTTime(seg.start)) --> \(formatSRTTime(seg.end))\n"
-            srt += "\(prefix)\(text)\n\n"
+            entries.append("\(idx + 1)\n\(formatSRTTime(seg.start)) --> \(formatSRTTime(seg.end))\n\(prefix)\(text)")
         }
+        let srt = entries.joined(separator: "\n\n") + (entries.isEmpty ? "" : "\n\n")
 
         do {
             try srt.write(to: url, atomically: true, encoding: .utf8)

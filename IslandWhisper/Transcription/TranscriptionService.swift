@@ -197,24 +197,33 @@ final class TranscriptionService: ObservableObject {
                 return
             }
 
-            // Speaker diarization (optional, runs before transcription)
-            var speakerTurns: [SpeakerTurn] = []
-            if diarizationSettings.isConfigured {
+            // Run diarization (Python subprocess) concurrently with whisper
+            // transcription (in-process via ggml). They use independent
+            // compute paths (Python/MPS vs whisper.cpp/Metal) and both read
+            // from the same WAV file, so parallelism is safe and saves time.
+            let shouldDiarize = diarizationSettings.isConfigured
+            let diarHfToken = diarizationSettings.hfToken
+            let diarPythonPath = diarizationSettings.pythonPath
+
+            async let diarizeTask: [SpeakerTurn] = {
+                guard shouldDiarize else { return [] }
                 print("Transcribe: running speaker diarization...")
                 do {
-                    speakerTurns = try await SpeakerDiarizer.diarize(
+                    let turns = try await SpeakerDiarizer.diarize(
                         wavURL: audioURL,
-                        hfToken: diarizationSettings.hfToken,
-                        pythonPath: diarizationSettings.pythonPath
+                        hfToken: diarHfToken,
+                        pythonPath: diarPythonPath
                     )
-                    let speakerCount = Set(speakerTurns.map(\.speaker)).count
-                    print("Transcribe: diarization found \(speakerCount) speakers across \(speakerTurns.count) turns")
+                    let speakerCount = Set(turns.map(\.speaker)).count
+                    print("Transcribe: diarization found \(speakerCount) speakers across \(turns.count) turns")
+                    return turns
                 } catch {
                     print("Transcribe: diarization failed (continuing without speakers): \(error)")
+                    return []
                 }
-            }
+            }()
 
-            let segments = try await engine.transcribe(
+            async let transcribeTask = engine.transcribe(
                 samples: samples,
                 language: working.language,
                 progress: { [weak self] p in
@@ -225,6 +234,8 @@ final class TranscriptionService: ObservableObject {
                     }
                 }
             )
+
+            let (speakerTurns, segments) = try await (diarizeTask, transcribeTask)
 
             var enrichedSegments = segments
             if !speakerTurns.isEmpty {
