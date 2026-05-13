@@ -9,27 +9,73 @@ enum SidebarSelection: Hashable {
 
 struct SidebarView: View {
     @Binding var selection: SidebarSelection?
+    @EnvironmentObject private var diarization: DiarizationSettings
 
     var body: some View {
-        VStack(spacing: 0) {
-            List(selection: $selection) {
-                Section {
-                    Label("Home", systemImage: "house")
-                        .tag(SidebarSelection.home)
-                    Label("Queue", systemImage: "list.bullet.rectangle")
-                        .tag(SidebarSelection.queue)
-                }
+        List(selection: $selection) {
+            Section {
+                Label("Home", systemImage: "house")
+                    .tag(SidebarSelection.home)
+                Label("Queue", systemImage: "list.bullet.rectangle")
+                    .tag(SidebarSelection.queue)
+            }
 
-                Section("History") {
-                    ForEach(HistoryCategory.allCases) { cat in
-                        Label(cat.displayName, systemImage: cat.sfSymbol)
-                            .tag(SidebarSelection.category(cat))
-                    }
+            Section("History") {
+                ForEach(HistoryCategory.allCases) { cat in
+                    Label(cat.displayName, systemImage: cat.sfSymbol)
+                        .tag(SidebarSelection.category(cat))
                 }
             }
-            .listStyle(.sidebar)
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            VStack(spacing: 0) {
+                Divider()
+                SidebarFooter(diarizationStatus: diarization.status)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+            }
+            .background(.bar)
+        }
+    }
+}
 
-            Spacer(minLength: 0)
+private struct SidebarFooter: View {
+    let diarizationStatus: DiarizationSettings.SetupStatus
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "person.2")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Speakers")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Image(systemName: diarizationStatus.sfSymbol)
+                    .font(.caption)
+                    .foregroundStyle(footerStatusColor)
+                Text(diarizationStatus.label)
+                    .font(.caption)
+                    .foregroundStyle(footerStatusColor)
+            }
+
+            SettingsLink {
+                Label("Settings…", systemImage: "gear")
+                    .font(.callout)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+        }
+    }
+
+    private var footerStatusColor: Color {
+        switch diarizationStatus.color {
+        case .green:     return .green
+        case .orange:    return .orange
+        case .red:       return .red
+        case .secondary: return .secondary
         }
     }
 }

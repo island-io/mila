@@ -26,15 +26,18 @@ final class TranscriptionService: ObservableObject {
     private let engine: any TranscribingEngine
     private let store: RecordingStore
     private let modelManager: ModelManager
+    private let diarizationSettings: DiarizationSettings
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
 
     init(store: RecordingStore,
          modelManager: ModelManager,
+         diarizationSettings: DiarizationSettings,
          engine: any TranscribingEngine = WhisperEngine()) {
         self.store = store
         self.modelManager = modelManager
+        self.diarizationSettings = diarizationSettings
         self.engine = engine
     }
 
@@ -194,6 +197,23 @@ final class TranscriptionService: ObservableObject {
                 return
             }
 
+            // Speaker diarization (optional, runs before transcription)
+            var speakerTurns: [SpeakerTurn] = []
+            if diarizationSettings.isConfigured {
+                print("Transcribe: running speaker diarization...")
+                do {
+                    speakerTurns = try await SpeakerDiarizer.diarize(
+                        wavURL: audioURL,
+                        hfToken: diarizationSettings.hfToken,
+                        pythonPath: diarizationSettings.pythonPath
+                    )
+                    let speakerCount = Set(speakerTurns.map(\.speaker)).count
+                    print("Transcribe: diarization found \(speakerCount) speakers across \(speakerTurns.count) turns")
+                } catch {
+                    print("Transcribe: diarization failed (continuing without speakers): \(error)")
+                }
+            }
+
             let segments = try await engine.transcribe(
                 samples: samples,
                 language: working.language,
@@ -206,18 +226,33 @@ final class TranscriptionService: ObservableObject {
                 }
             )
 
-            let text = segments.map(\.text)
+            var enrichedSegments = segments
+            if !speakerTurns.isEmpty {
+                for i in enrichedSegments.indices {
+                    enrichedSegments[i].speaker = SpeakerDiarizer.assignSpeaker(
+                        segmentStart: enrichedSegments[i].start,
+                        segmentEnd: enrichedSegments[i].end,
+                        turns: speakerTurns
+                    )
+                }
+            }
+
+            let text = enrichedSegments.map(\.text)
                 .joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            print("Transcribe done: \(working.title) -> \(segments.count) segments, \(text.count) chars")
+            print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
 
-            working.segments = segments
+            working.segments = enrichedSegments
             working.fullText = text
-            if let lastEnd = segments.last?.end, lastEnd > 0 {
+            if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
                 working.duration = lastEnd
             }
             working.status = text.isEmpty ? .failed : .completed
             store.update(working)
+
+            if working.status == .completed {
+                TranscriptExporter.writeSRT(for: working, in: store.recordingsDirectory)
+            }
         } catch {
             print("Transcribe error for \(working.title): \(error)")
             working.status = .failed

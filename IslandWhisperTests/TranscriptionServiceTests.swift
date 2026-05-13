@@ -23,7 +23,7 @@ final class TranscriptionServiceTests: XCTestCase {
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
-        service = TranscriptionService(store: store, modelManager: manager, engine: stub)
+        service = TranscriptionService(store: store, modelManager: manager, diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.diarization")!), engine: stub)
     }
 
     override func tearDown() async throws {

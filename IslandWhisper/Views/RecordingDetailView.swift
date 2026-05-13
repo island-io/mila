@@ -118,9 +118,11 @@ struct RecordingDetailView: View {
         } else {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
+                    let hasSpeakers = recording.segments.contains { $0.speaker != nil }
                     ForEach(recording.segments) { seg in
                         SegmentRow(segment: seg,
                                    isActive: currentTime >= seg.start && currentTime < seg.end,
+                                   showSpeaker: hasSpeakers,
                                    onTap: { seek(to: seg.start) })
                     }
                 }
@@ -228,6 +230,7 @@ private final class PlayerBridge: ObservableObject {
 private struct SegmentRow: View {
     let segment: TranscriptSegment
     let isActive: Bool
+    let showSpeaker: Bool
     let onTap: () -> Void
 
     var body: some View {
@@ -236,6 +239,12 @@ private struct SegmentRow: View {
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .frame(width: 56, alignment: .trailing)
+            if showSpeaker, let speaker = segment.speaker {
+                Text(speaker)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tint)
+                    .frame(width: 72, alignment: .leading)
+            }
             Text(segment.text)
                 .font(.body)
                 .multilineTextAlignment(.leading)
