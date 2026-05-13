@@ -25,8 +25,8 @@ packages:
     path: Packages/WhisperBinary
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
-    from: 2.9.1
-
+    revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
+    
 targets:
   IslandWhisper:
     type: application
