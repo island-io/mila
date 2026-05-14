@@ -22,6 +22,15 @@ These monkey-patches are required as of pyannote.audio 3.x + PyTorch >= 2.6 + sp
 
 If a future pyannote or speechbrain release fixes these, the patches can be removed. Check on each dependency upgrade.
 
+## Bundled Model Path Naming
+When bundling ML models that are normally loaded via HuggingFace model IDs (e.g., `pyannote/wespeaker-voxceleb-resnet34-LM`), the local directory names must preserve the original model ID structure. ML frameworks like pyannote use **substring matching on the file path** to dispatch to different backends:
+- A path containing `"pyannote"` routes to the **torch** backend
+- A path containing `"wespeaker"` (without `"pyannote"`) routes to the **ONNX** backend (requires onnxruntime)
+
+The bundled directory must be named to match the same substring the framework expects. For example, `pyannote-wespeaker-voxceleb-resnet34-LM` (preserving the `pyannote` prefix) -- not just `wespeaker-voxceleb-resnet34-LM`. This applies to any model where the framework infers behavior from the path string rather than from metadata inside the model files.
+
+**Why:** This caused a production bug (PR #14) where diarization silently failed because the wrong embedding backend was selected based on the directory name.
+
 ## Dependency Installation
 - Use `python3 -m pip install` (not bare `pip`) to ensure the correct Python environment
 - Pin `huggingface_hub<1.0` to avoid breaking changes in the HF API

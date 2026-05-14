@@ -31,6 +31,7 @@ When calling Python ML pipelines from Swift via `Process`:
 - Always separate stdout (JSON data) from stderr (diagnostic logs) -- pyannote and torch emit warnings to stderr that corrupt JSON parsing
 - Run Python processes on `Task.detached(priority: .userInitiated)` to avoid blocking the main actor
 - Diarization models are bundled in the app (no HuggingFace token needed). The inline script receives the bundle models path as a CLI argument and loads the pipeline from a local config.yaml with `Pipeline.from_pretrained()`
+- **Bundled model directory names must preserve the original HuggingFace model ID structure.** pyannote dispatches embedding backends via substring matching on the path (e.g., `"pyannote"` -> torch, `"wespeaker"` -> ONNX). See `.claude/rules/python-subprocess.md` for details.
 
 ### Python / PyTorch Compatibility Patches
 The pyannote.audio + speechbrain stack requires two runtime monkey-patches (applied in the inline script):
