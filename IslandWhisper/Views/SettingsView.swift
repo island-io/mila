@@ -36,13 +36,7 @@ struct SettingsView: View {
         }
         .frame(width: 560, height: 560)
         .padding(20)
-        .onAppear {
-            if let tab = SettingsNavigation.shared.pendingTab {
-                selectedTab = tab
-                SettingsNavigation.shared.pendingTab = nil
-            }
-        }
-        .onChange(of: SettingsNavigation.shared.pendingTab) { _, newTab in
+        .onChange(of: SettingsNavigation.shared.pendingTab, initial: true) { _, newTab in
             if let tab = newTab {
                 selectedTab = tab
                 SettingsNavigation.shared.pendingTab = nil
