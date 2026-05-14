@@ -1,4 +1,5 @@
 import Foundation
+import TranscriptionCore
 
 enum RecordingSource: String, Codable, CaseIterable, Identifiable {
     case microphone
@@ -29,14 +30,6 @@ enum TranscriptionStatus: String, Codable {
     case running
     case completed
     case failed
-}
-
-struct TranscriptSegment: Codable, Identifiable, Hashable {
-    var id = UUID()
-    var start: Double
-    var end: Double
-    var text: String
-    var speaker: String?
 }
 
 struct Recording: Identifiable, Codable, Hashable {

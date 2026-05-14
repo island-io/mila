@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import Combine
 import AVFoundation
+import TranscriptionCore
 
 /// Press the bound hotkey to start a dictation in that language. Press the same
 /// hotkey again to stop, transcribe, and paste at the cursor.

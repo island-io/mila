@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Combine
 import ScreenCaptureKit
+import TranscriptionCore
 
 /// Orchestrates microphone + system audio capture into a single mono 16kHz WAV file.
 @MainActor

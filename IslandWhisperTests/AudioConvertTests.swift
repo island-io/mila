@@ -1,5 +1,6 @@
 import XCTest
 import AVFoundation
+import TranscriptionCore
 @testable import IslandWhisper
 
 final class AudioConvertTests: XCTestCase {

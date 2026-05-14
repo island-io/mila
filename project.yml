@@ -21,8 +21,8 @@ settings:
     CURRENT_PROJECT_VERSION: "13"
 
 packages:
-  WhisperBinary:
-    path: Packages/WhisperBinary
+  TranscriptionCore:
+    path: Packages/TranscriptionCore
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
@@ -75,8 +75,8 @@ targets:
         com.apple.security.cs.allow-jit: true
         com.apple.security.cs.disable-library-validation: true
     dependencies:
-      - package: WhisperBinary
-        product: Whisper
+      - package: TranscriptionCore
+        product: TranscriptionCore
       - package: Sparkle
         product: Sparkle
     settings:
@@ -91,6 +91,8 @@ targets:
       - path: IslandWhisperTests
     dependencies:
       - target: IslandWhisper
+      - package: TranscriptionCore
+        product: TranscriptionCore
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"

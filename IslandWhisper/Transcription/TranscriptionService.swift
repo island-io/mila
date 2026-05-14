@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import TranscriptionCore
 
 /// Coordinates batch transcription of recordings + one-shot transcription
 /// for dictation.

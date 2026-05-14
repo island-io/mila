@@ -1,4 +1,5 @@
 import XCTest
+import TranscriptionCore
 @testable import IslandWhisper
 
 @MainActor

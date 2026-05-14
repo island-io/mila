@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import TranscriptionCore
 
 /// Imports an arbitrary audio / video file (m4a, mp3, mp4, wav, mov, …),
 /// re-encodes it to whisper-format mono 16 kHz Float32 WAV inside the

@@ -3,12 +3,12 @@ import whisper
 
 /// Thin Swift wrapper around the whisper.cpp C API.
 /// All work happens off the main actor.
-actor WhisperEngine {
-    enum Error: Swift.Error, LocalizedError {
+public actor WhisperEngine {
+    public enum Error: Swift.Error, LocalizedError {
         case modelLoadFailed(String)
         case transcribeFailed(Int32)
 
-        var errorDescription: String? {
+        public var errorDescription: String? {
             switch self {
             case .modelLoadFailed(let path): return "Failed to load Whisper model at \(path)"
             case .transcribeFailed(let code): return "whisper_full failed (code \(code))"
@@ -18,15 +18,15 @@ actor WhisperEngine {
 
     private var ctx: OpaquePointer?
     private var loadedPath: String?
-    private(set) var modelName: String?
+    public private(set) var modelName: String?
 
-    init() {}
+    public init() {}
 
     deinit {
         if let ctx { whisper_free(ctx) }
     }
 
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {
+    public func loadIfNeeded(modelURL: URL, displayName: String) async throws {
         if loadedPath == modelURL.path { return }
         if let ctx {
             whisper_free(ctx)
@@ -34,16 +34,24 @@ actor WhisperEngine {
             self.loadedPath = nil
         }
         var params = whisper_context_default_params()
+        #if canImport(Metal)
         params.use_gpu = true
         params.flash_attn = true
-        let path = (modelURL.path as NSString).utf8String
-        guard let newCtx = whisper_init_from_file_with_params(path, params) else {
+        #else
+        params.use_gpu = false
+        params.flash_attn = false
+        #endif
+
+        guard let newCtx = modelURL.path.withCString({ cPath in
+            whisper_init_from_file_with_params(cPath, params)
+        }) else {
             throw Error.modelLoadFailed(modelURL.path)
         }
         self.ctx = newCtx
         self.loadedPath = modelURL.path
         self.modelName = displayName
 
+        #if canImport(Metal)
         // Force ggml-metal to finish its async resource-set init right now.
         //
         // Without this, the user can quit the app while ggml-metal's
@@ -56,14 +64,15 @@ actor WhisperEngine {
         // on 1s of silence makes the kernels actually execute, which forces
         // the init block to run synchronously to completion.
         warmup(ctx: newCtx)
+        #endif
     }
 
     /// Synchronous transcription of a complete sample buffer.
     /// `progress` is invoked with values in `0...1` from inside the C callback.
-    func transcribe(samples rawSamples: [Float],
+    public func transcribe(samples rawSamples: [Float],
                     language: String,
                     progress: (@Sendable (Float) -> Void)?,
-                    isCancelled: (@Sendable () -> Bool)?) throws -> [TranscriptSegment] {
+                    isCancelled: (@Sendable () -> Bool)? = nil) throws -> [TranscriptSegment] {
         guard let ctx else {
             throw Error.modelLoadFailed("(no model loaded)")
         }
@@ -105,10 +114,6 @@ actor WhisperEngine {
         }
         params.progress_callback_user_data = userPtr
 
-        // Wire ggml's abort_callback to our cancellation flag. ggml polls this
-        // between every compute step, so when the user hits Cancel mid-run
-        // whisper_full unwinds within ~100ms instead of running to completion
-        // and burning CPU on a transcript we're about to throw away.
         params.abort_callback = { userData in
             guard let userData else { return false }
             let box = Unmanaged<CallbackBox>.fromOpaque(userData).takeUnretainedValue()
@@ -124,9 +129,6 @@ actor WhisperEngine {
         let result: Int32 = samples.withUnsafeBufferPointer { ptr in
             whisper_full(ctx, params, ptr.baseAddress, Int32(ptr.count))
         }
-        // The user cancelled mid-run. whisper_full returns non-zero when the
-        // abort_callback fires — swallow that as cancellation, not as a
-        // surprise engine failure the UI should surface to the user.
         if isCancelled?() == true {
             throw CancellationError()
         }
@@ -151,7 +153,7 @@ actor WhisperEngine {
     /// `applicationShouldTerminate` lets ggml-metal tear down its devices
     /// while the app is still in a normal state (rather than during static
     /// destruction at `exit()`-time, which is what triggered the crash).
-    func shutdown() {
+    public func shutdown() {
         if let ctx {
             whisper_free(ctx)
             self.ctx = nil
@@ -162,6 +164,7 @@ actor WhisperEngine {
 
     // MARK: - Internal
 
+    #if canImport(Metal)
     /// One-shot dummy `whisper_full` on 1 second of silence. Throws are
     /// silently swallowed — warmup is best-effort, and even a non-zero return
     /// has already done what we need (forced ggml-metal kernels to compile +
@@ -184,16 +187,13 @@ actor WhisperEngine {
         let r = silence.withUnsafeBufferPointer { ptr in
             whisper_full(ctx, params, ptr.baseAddress, Int32(ptr.count))
         }
-        print("WhisperEngine: metal warmup completed (whisper_full returned \(r))")
+        print("WhisperEngine: warmup completed (whisper_full returned \(r))")
     }
-}
+    #endif
 
-extension WhisperEngine: TranscribingEngine {}
-
-extension WhisperEngine {
     /// Apply auto-gain so quiet recordings still hit Whisper's speech threshold.
     /// Targets a peak around 0.5 (≈ -6 dB), capped so we never amplify noise more than 20×.
-    fileprivate static func normalize(_ samples: [Float]) -> [Float] {
+    static func normalize(_ samples: [Float]) -> [Float] {
         guard !samples.isEmpty else { return samples }
         var peak: Float = 0
         for s in samples { let a = abs(s); if a > peak { peak = a } }
@@ -206,6 +206,8 @@ extension WhisperEngine {
         return out
     }
 }
+
+extension WhisperEngine: TranscribingEngine {}
 
 /// Boxed callback closure for the C bridging layer.
 private final class CallbackBox: @unchecked Sendable {

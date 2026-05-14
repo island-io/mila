@@ -3,6 +3,7 @@ import AVFoundation
 @preconcurrency import ScreenCaptureKit
 import CoreMedia
 import Combine
+import TranscriptionCore
 
 /// Captures system audio (optionally limited to a single application like Zoom) via ScreenCaptureKit.
 ///

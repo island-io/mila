@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import TranscriptionCore
 @testable import IslandWhisper
 
 /// Shared helpers for the test bundle.

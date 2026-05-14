@@ -1,4 +1,4 @@
-.PHONY: all bootstrap project open build test run clean models help dmg release-build
+.PHONY: all bootstrap project open build test run clean models help dmg release-build e2e package-test
 
 XCODEPROJ := IslandWhisper.xcodeproj
 SCHEME := IslandWhisper
@@ -24,6 +24,8 @@ help:
 	@echo "  run           - Build and launch the app"
 	@echo "  models        - Pre-download both ggml models into ~/Library/Application Support/IslandWhisper/Models"
 	@echo "  dmg           - Build a release DMG ($(DMG)) suitable for upload"
+	@echo "  e2e           - Run E2E transcription tests (requires ggml-tiny.bin)"
+	@echo "  package-test  - Run TranscriptionCore package unit tests"
 	@echo "  clean         - Remove generated project and build artifacts"
 
 bootstrap:
@@ -64,6 +66,15 @@ models:
 
 dmg: release-build
 	@./scripts/make-dmg.sh "$(RELEASE_APP)" "$(DMG)" "$(VERSION)"
+
+e2e:
+	cd Packages/TranscriptionCore && swift run whisper-e2e \
+		--model $(HOME)/.cache/whisper-models/ggml-tiny.bin \
+		--fixtures Fixtures \
+		--max-wer 0.3
+
+package-test:
+	cd Packages/TranscriptionCore && swift test
 
 clean:
 	rm -rf $(XCODEPROJ) $(DERIVED) $(RELEASE_DERIVED) IslandWhisper-*.dmg

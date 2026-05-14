@@ -1,5 +1,6 @@
 import SwiftUI
 import AVKit
+import TranscriptionCore
 
 struct RecordingDetailView: View {
     let recording: Recording

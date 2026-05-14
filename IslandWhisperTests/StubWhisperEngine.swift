@@ -1,4 +1,5 @@
 import Foundation
+import TranscriptionCore
 @testable import IslandWhisper
 
 /// In-memory stand-in for `WhisperEngine` so transcription tests don't have to

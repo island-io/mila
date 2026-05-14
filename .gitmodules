@@ -1,0 +1,3 @@
+[submodule "Packages/TranscriptionCore/vendor/whisper.cpp"]
+	path = Packages/TranscriptionCore/vendor/whisper.cpp
+	url = https://github.com/ggerganov/whisper.cpp.git

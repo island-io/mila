@@ -1,16 +1,13 @@
 import Foundation
 import AVFoundation
 import Accelerate
+import TranscriptionCore
 
-/// The format Whisper expects: 16kHz, mono, 32-bit float PCM.
-enum WhisperAudioFormat {
-    static let sampleRate: Double = 16_000
-    static let channels: AVAudioChannelCount = 1
-
+extension WhisperAudioFormat {
     static var pcmFloat32: AVAudioFormat {
         AVAudioFormat(commonFormat: .pcmFormatFloat32,
                       sampleRate: sampleRate,
-                      channels: channels,
+                      channels: AVAudioChannelCount(channelCount),
                       interleaved: false)!
     }
 }

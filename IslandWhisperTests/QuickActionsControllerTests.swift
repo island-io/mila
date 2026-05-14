@@ -1,4 +1,5 @@
 import XCTest
+import TranscriptionCore
 @testable import IslandWhisper
 
 /// Integration tests for the file-import + transcribe pipeline that runs when
