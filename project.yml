@@ -37,6 +37,10 @@ targets:
         excludes:
           - "Resources/Info.plist"
           - "Resources/IslandWhisper.entitlements"
+          - "Resources/DiarizationModels"
+      - path: IslandWhisper/Resources/DiarizationModels
+        type: folder
+        buildPhase: resources
     resources:
       - path: IslandWhisper/Assets.xcassets
     info:
