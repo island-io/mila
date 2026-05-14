@@ -66,7 +66,7 @@ final class DiarizationSettings: ObservableObject {
     }
 
     var isConfigured: Bool {
-        isEnabled
+        isEnabled && status.isGood
     }
 
     enum SetupStatus: Equatable {
