@@ -6,7 +6,7 @@ A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optio
 
 - **Build system:** XcodeGen (`project.yml` is the source of truth, not the .xcodeproj)
 - **Minimum deployment target:** macOS 14.0, Swift 5.10
-- **Key dependencies:** WhisperBinary (local Swift package wrapping whisper.cpp), Sparkle (auto-updates)
+- **Key dependencies:** TranscriptionCore (local Swift package wrapping whisper.cpp), Sparkle (auto-updates)
 - **Project layout:**
   - `IslandWhisper/Models/` — data models and settings (`Recording`, `DiarizationSettings`, etc.)
   - `IslandWhisper/Transcription/` — transcription engine, speaker diarizer, exporter
@@ -14,7 +14,7 @@ A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optio
   - `IslandWhisper/Resources/` — Info.plist, entitlements, bundled diarization models
   - `IslandWhisper/Resources/DiarizationModels/` — bundled pyannote speaker diarization model weights (~31 MB)
   - `IslandWhisperTests/` — unit tests
-  - `Packages/WhisperBinary/` — local Swift package for whisper.cpp C bindings
+  - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp bindings), WAVReader, WER calculator, and E2E transcription test fixtures
   - `scripts/` — release/build scripts (make-dmg.sh, etc.)
 
 ## Conventions

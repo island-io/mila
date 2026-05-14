@@ -49,11 +49,16 @@ Before tagging:
 
 Two paths — pick the one that matches the situation.
 
+**Common first step:** If the release includes work from a feature branch /
+PR, merge it to `main` first (`gh pr merge --squash` or merge via GitHub),
+then `git pull origin main` locally before tagging. The version bump should
+already be in the merged commits; if not, bump it now in `project.yml`.
+
 ### A. Tag-driven (preferred for routine releases)
 
 ```bash
-# Bump version files first (project.yml + Info.plist).
-git add project.yml IslandWhisper/Resources/Info.plist
+# Version is bumped only in project.yml (Info.plist inherits via build settings).
+git add project.yml
 git commit -m "Release v<NEW_VERSION>"
 git push origin main
 
