@@ -282,6 +282,20 @@ final class DiarizationSettings: ObservableObject {
                 remediator = { [weak self] _ in
                     await self?.bootstrap.bootstrapIfNeeded()
                 }
+            } else if isEnabled, first.code == "missing_module", let module = first.module {
+                // A transitive pyannote dep got excluded from the bundle (or
+                // was bundled but won't import for some reason). Pip the
+                // exact missing module into the user-writable site-packages
+                // so PYTHONPATH picks it up on the retry. No torch reinstall,
+                // no full pyannote reinstall — minimal, targeted.
+                isInstalling = true
+                remediator = { python in
+                    _ = try await SpeakerDiarizer.installMissingModule(
+                        pythonPath: python,
+                        userSitePackages: DiarizationBootstrap.userSitePackages.path,
+                        module: module
+                    )
+                }
             } else {
                 remediator = nil
             }

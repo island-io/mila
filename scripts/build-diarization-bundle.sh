@@ -240,11 +240,19 @@ FROZEN_FILE="$TMPDIR_ROOT/frozen.txt"
 /usr/bin/python3 - "$FROZEN_RAW" "$FROZEN_FILE" <<'PYEOF'
 import sys, re, pathlib
 src = pathlib.Path(sys.argv[1]).read_text().splitlines()
+# DROP only the packages we install at runtime (torch+torchaudio) plus
+# inert metadata packages. The previous "torch-" catch-all was too greedy:
+# it matched torch-audiomentations and torch-pitch-shift, which pyannote.
+# audio's __init__ imports unconditionally. Build a bundle without them
+# and `from pyannote.audio import Pipeline` ModuleNotFoundErrors at run
+# time. Be explicit about what's stripped.
+DROP_EXACT = {
+    "torch", "torchaudio",   # pinned + downloaded at runtime by DiarizationBootstrap
+    "triton",                # CUDA-only; not used on macOS
+    "pip", "wheel", "setuptools",
+}
 DROP_PREFIXES = (
-    "torch==", "torchaudio==", "torch-",  # torch family handled at runtime
-    "nvidia-",                              # CUDA wheels (linux/win only anyway)
-    "triton==",                             # CUDA-adjacent
-    "pip==", "wheel==", "setuptools==",
+    "nvidia-",               # CUDA wheels (linux/win only anyway)
 )
 # Also drop anything named "torch" exactly (some pip versions emit base form)
 out = []
@@ -253,6 +261,11 @@ for line in src:
     if not s or s.startswith("#"):
         continue
     low = s.lower()
+    # pip freeze emits "name==version"; check the name portion specifically
+    # so we don't accidentally drop sibling packages like torch-audiomentations.
+    name = re.split(r"[=<>!~ ]", low, 1)[0]
+    if name in DROP_EXACT:
+        continue
     if any(low.startswith(p) for p in DROP_PREFIXES):
         continue
     out.append(s)

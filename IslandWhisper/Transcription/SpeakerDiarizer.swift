@@ -110,6 +110,32 @@ enum SpeakerDiarizer {
         return output
     }
 
+    /// Targeted remediation when the bundled site-packages is missing a
+    /// transitive pyannote dep (e.g. `torch_audiomentations` was excluded
+    /// by an over-greedy filter in a prior bundle build). Installs the
+    /// named module into the user-writable site-packages so the next
+    /// `import pyannote.audio` succeeds. Module names with underscores
+    /// are passed as-is to pip — most pyannote deps use the same name on
+    /// PyPI; pip resolves the canonical project name automatically.
+    @discardableResult
+    static func installMissingModule(pythonPath: String,
+                                     userSitePackages: String,
+                                     module: String) async throws -> String {
+        let result = try await runPython(
+            path: pythonPath,
+            arguments: ["-m", "pip", "install",
+                        "--target", userSitePackages,
+                        "--no-deps", "--only-binary=:all:",
+                        module]
+        )
+        let output = String(data: result.stdout, encoding: .utf8) ?? ""
+        guard result.exitCode == 0 else {
+            let errOutput = String(data: result.stderr, encoding: .utf8) ?? ""
+            throw Error.diarizationFailed(errOutput.isEmpty ? output : errOutput)
+        }
+        return output
+    }
+
     /// Targeted remediation for `code == "missing_audio_backend"`. We don't
     /// want a generic "install all dependencies" run to fix one missing
     /// wheel — that'd risk upgrading torch/pyannote unexpectedly. This just
@@ -238,15 +264,19 @@ enum SpeakerDiarizer {
     /// `code` is a stable identifier for recoverable failure modes so the
     /// Swift side can attempt targeted remediation (e.g. install soundfile
     /// on missing_audio_backend) instead of free-text matching.
+    /// `module` is set when `code == "missing_module"` — the specific
+    /// import path that failed — so Swift can pip-install it.
     struct HealthCheckResult: Codable {
         let ok: Bool
         let error: String?
         let code: String?
+        let module: String?
 
-        init(ok: Bool, error: String? = nil, code: String? = nil) {
+        init(ok: Bool, error: String? = nil, code: String? = nil, module: String? = nil) {
             self.ok = ok
             self.error = error
             self.code = code
+            self.module = module
         }
     }
 
@@ -276,7 +306,7 @@ enum SpeakerDiarizer {
         let script = """
         import json, sys, os, types, tempfile
 
-        result = {"ok": False, "error": None, "code": None}
+        result = {"ok": False, "error": None, "code": None, "module": None}
 
         def _emit(code, error):
             result["code"] = code
@@ -321,6 +351,17 @@ enum SpeakerDiarizer {
 
             try:
                 from pyannote.audio import Pipeline
+            except ModuleNotFoundError as e:
+                # ModuleNotFoundError exposes `.name` — the import that
+                # actually failed. We surface it separately from
+                # "pyannote.audio missing entirely" so the Swift side can
+                # auto-pip-install the specific missing transitive dep
+                # (e.g. a wheel the bundle build filtered out by mistake).
+                if e.name and e.name != "pyannote" and not e.name.startswith("pyannote."):
+                    result["module"] = e.name
+                    _emit("missing_module", f"pyannote.audio import chain missing: {e.name}")
+                else:
+                    _emit("missing_pyannote", f"pyannote.audio not installed: {e}")
             except ImportError as e:
                 _emit("missing_pyannote", f"pyannote.audio not installed: {e}")
 
