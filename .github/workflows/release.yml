@@ -160,6 +160,26 @@ jobs:
             "${{ steps.version.outputs.version }}"
           ls -la "${DMG}"
           echo "dmg=${DMG}" >> "$GITHUB_OUTPUT"
+          # Sanity check: every release MUST be signed by our self-signed
+          # identity, otherwise TCC permissions will reset for users on
+          # upgrade — the entire point of the cert. We verify the *shipped*
+          # bundle (the one inside the DMG, post-make-dmg.sh re-sign), not
+          # the pre-DMG xcodebuild output which is still ad-hoc by design.
+          #
+          # `grep -oE '/Volumes/.*$'` over the human-readable hdiutil output
+          # captures the entire mount path verbatim, including any spaces in
+          # the volume name (make-dmg.sh sets it to "IslandWhisper $VERSION").
+          # The previous `awk '{print $NF}'` parsing only captured the trailing
+          # token and looked for the app bundle on a nonexistent path.
+          # (per Cursor Bugbot review on PR #1)
+          MOUNT=$(hdiutil attach "${DMG}" -nobrowse -noautoopen | grep -oE '/Volumes/.*$' | tail -n1)
+          if [ -z "$MOUNT" ] || [ ! -d "$MOUNT/IslandWhisper.app" ]; then
+            echo "error: failed to resolve DMG mount point (got: '$MOUNT')" >&2
+            exit 1
+          fi
+          codesign -dvvv "${MOUNT}/IslandWhisper.app" 2>&1 | grep -E "Authority|TeamIdentifier|CDHash"
+          codesign -d -r- "${MOUNT}/IslandWhisper.app" 2>&1 | grep designated
+          hdiutil detach "${MOUNT}" -quiet
 
       - name: Package Sparkle ZIP
         id: zip
@@ -183,26 +203,6 @@ jobs:
           ditto -c -k --keepParent "$APP" "$ZIP"
           ls -la "$ZIP"
           echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
-          # Sanity check: every release MUST be signed by our self-signed
-          # identity, otherwise TCC permissions will reset for users on
-          # upgrade — the entire point of the cert. We verify the *shipped*
-          # bundle (the one inside the DMG, post-make-dmg.sh re-sign), not
-          # the pre-DMG xcodebuild output which is still ad-hoc by design.
-          #
-          # `grep -oE '/Volumes/.*$'` over the human-readable hdiutil output
-          # captures the entire mount path verbatim, including any spaces in
-          # the volume name (make-dmg.sh sets it to "IslandWhisper $VERSION").
-          # The previous `awk '{print $NF}'` parsing only captured the trailing
-          # token and looked for the app bundle on a nonexistent path.
-          # (per Cursor Bugbot review on PR #1)
-          MOUNT=$(hdiutil attach "${DMG}" -nobrowse -noautoopen | grep -oE '/Volumes/.*$' | tail -n1)
-          if [ -z "$MOUNT" ] || [ ! -d "$MOUNT/IslandWhisper.app" ]; then
-            echo "error: failed to resolve DMG mount point (got: '$MOUNT')" >&2
-            exit 1
-          fi
-          codesign -dvvv "${MOUNT}/IslandWhisper.app" 2>&1 | grep -E "Authority|TeamIdentifier|CDHash"
-          codesign -d -r- "${MOUNT}/IslandWhisper.app" 2>&1 | grep designated
-          hdiutil detach "${MOUNT}" -quiet
 
       - name: Clean up keychain
         if: always()
