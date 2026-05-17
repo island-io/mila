@@ -1,4 +1,4 @@
-.PHONY: all bootstrap project open build test run clean models help dmg release-build e2e package-test
+.PHONY: all bootstrap project open build test run clean models help dmg release-build e2e package-test bundle-diarization
 
 XCODEPROJ := IslandWhisper.xcodeproj
 SCHEME := IslandWhisper
@@ -26,6 +26,7 @@ help:
 	@echo "  dmg           - Build a release DMG ($(DMG)) suitable for upload"
 	@echo "  e2e           - Run E2E transcription tests (requires ggml-tiny.bin)"
 	@echo "  package-test  - Run TranscriptionCore package unit tests"
+	@echo "  bundle-diarization - Produce the bundled Python + pyannote.audio runtime under IslandWhisper/Resources/PythonRuntime/"
 	@echo "  clean         - Remove generated project and build artifacts"
 
 bootstrap:
@@ -75,6 +76,16 @@ e2e:
 
 package-test:
 	cd Packages/TranscriptionCore && swift test
+
+# Produces IslandWhisper/Resources/PythonRuntime/ — a relocatable Python
+# 3.11 with pyannote.audio (and deps) pre-installed, minus torch which
+# DiarizationBootstrap downloads at first launch. Cached: re-running is
+# fast if `python-bundle-cache/` is populated. The output is ~150-200 MB
+# uncompressed and is NOT checked into git (see .gitignore). CI fetches
+# the produced bundle from an actions/cache entry keyed on the script
+# hash; dev machines run this once.
+bundle-diarization:
+	@bash scripts/build-diarization-bundle.sh
 
 clean:
 	rm -rf $(XCODEPROJ) $(DERIVED) $(RELEASE_DERIVED) IslandWhisper-*.dmg

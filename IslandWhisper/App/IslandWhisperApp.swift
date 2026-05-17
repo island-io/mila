@@ -96,6 +96,7 @@ struct IslandWhisperApp: App {
                 .environmentObject(diarizationSettings)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
+                .task { await diarizationSettings.runHealthCheck() }
                 .onAppear { wireDelegate() }
         }
         .commands {

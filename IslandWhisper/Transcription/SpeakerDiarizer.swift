@@ -12,6 +12,24 @@ enum SpeakerDiarizer {
         Bundle.main.path(forResource: "DiarizationModels", ofType: nil)
     }
 
+    /// Effective Python the subprocesses should launch. Bundle path wins if
+    /// it exists (built via `make bundle-diarization` and bundled in
+    /// Resources/PythonRuntime/); otherwise we fall back to whatever path
+    /// the user has configured in DiarizationSettings (typically
+    /// /usr/bin/python3). The bundle path is preferred because it lets the
+    /// app run on machines without a working system pyannote install.
+    static func resolvePython(userConfigured: String) -> String {
+        DiarizationBootstrap.bundledPythonPath ?? userConfigured
+    }
+
+    /// Environment additions to make bundled site-packages visible.
+    /// Returns an empty dict when no bundle is present, so behaviour for
+    /// users on the legacy system-python flow is unchanged.
+    static func pythonEnvironment() -> [String: String] {
+        let path = DiarizationBootstrap.combinedPythonPath
+        return path.isEmpty ? [:] : ["PYTHONPATH": path]
+    }
+
     enum Error: Swift.Error, LocalizedError {
         case pythonNotFound(String)
         case diarizationFailed(String)
@@ -76,9 +94,45 @@ enum SpeakerDiarizer {
     // MARK: - Public API
 
     static func installDependencies(pythonPath: String) async throws -> String {
+        // `soundfile` is required as an audio backend — pyannote.audio
+        // crashes at import time with IndexError if torchaudio finds no
+        // backend, and `soundfile` is the most reliable one on macOS.
         let result = try await runPython(
             path: pythonPath,
-            arguments: ["-m", "pip", "install", "--upgrade", "pyannote.audio", "torch", "huggingface_hub<1.0"]
+            arguments: ["-m", "pip", "install", "--upgrade",
+                        "pyannote.audio", "torch", "soundfile", "huggingface_hub<1.0"]
+        )
+        let output = String(data: result.stdout, encoding: .utf8) ?? ""
+        guard result.exitCode == 0 else {
+            let errOutput = String(data: result.stderr, encoding: .utf8) ?? ""
+            throw Error.diarizationFailed(errOutput.isEmpty ? output : errOutput)
+        }
+        return output
+    }
+
+    /// Targeted remediation for `code == "missing_audio_backend"`. We don't
+    /// want a generic "install all dependencies" run to fix one missing
+    /// wheel — that'd risk upgrading torch/pyannote unexpectedly. This just
+    /// adds `soundfile` (the pyannote-recommended backend on macOS) and
+    /// leaves everything else alone.
+    ///
+    /// `--force-reinstall --no-cache-dir` is intentional, not paranoid: the
+    /// real-world failure mode here is *not* "soundfile missing", it's
+    /// "soundfile installed but its `_cffi_backend.so` is for the wrong
+    /// architecture" (typically a leftover x86_64 wheel on an arm64 Mac).
+    /// A plain install in that state is a no-op — pip happily reports
+    /// "Requirement already satisfied" — so the next health check would
+    /// still fail. Forcing a reinstall of cffi alongside soundfile is the
+    /// smallest hammer that actually fixes it. Path is gated on the
+    /// missing_audio_backend code, so we only ever take it when audio
+    /// backends are demonstrably empty, never when things are working.
+    @discardableResult
+    static func installAudioBackend(pythonPath: String) async throws -> String {
+        let result = try await runPython(
+            path: pythonPath,
+            arguments: ["-m", "pip", "install", "--user",
+                        "--force-reinstall", "--no-cache-dir",
+                        "cffi", "soundfile"]
         )
         let output = String(data: result.stdout, encoding: .utf8) ?? ""
         guard result.exitCode == 0 else {
@@ -92,6 +146,8 @@ enum SpeakerDiarizer {
         guard let modelsPath = bundledModelsPath else {
             throw Error.diarizationFailed("Bundled diarization models not found in app")
         }
+        let resolvedPython = resolvePython(userConfigured: pythonPath)
+        let extraEnv = pythonEnvironment()
 
         let script = """
         import json, sys, os, types, tempfile
@@ -155,9 +211,9 @@ enum SpeakerDiarizer {
         """
 
         let result = try await runPython(
-            path: pythonPath,
+            path: resolvedPython,
             arguments: ["-c", script, wavURL.path, modelsPath],
-            environment: [:]
+            environment: extraEnv
         )
         guard result.exitCode == 0 else {
             let errMsg = String(data: result.stderr, encoding: .utf8) ?? "exit code \(result.exitCode)"
@@ -173,6 +229,132 @@ enum SpeakerDiarizer {
         var allGood: Bool {
             pyannoteInstalled && torchInstalled
         }
+    }
+
+    /// Outcome of `healthCheck`. `ok == true` means torch + pyannote import,
+    /// the bundled config.yaml parses, AND the pipeline instantiates from
+    /// the bundled weights — i.e. real diarization runs will work without
+    /// any first-call setup penalty surprising the user mid-recording.
+    /// `code` is a stable identifier for recoverable failure modes so the
+    /// Swift side can attempt targeted remediation (e.g. install soundfile
+    /// on missing_audio_backend) instead of free-text matching.
+    struct HealthCheckResult: Codable {
+        let ok: Bool
+        let error: String?
+        let code: String?
+
+        init(ok: Bool, error: String? = nil, code: String? = nil) {
+            self.ok = ok
+            self.error = error
+            self.code = code
+        }
+    }
+
+    /// Lightweight diagnostic that runs at app launch (and on demand from
+    /// Settings). Imports the Python stack, loads the bundled config, and
+    /// instantiates `Pipeline.from_pretrained` against the bundled model
+    /// weights, but does NOT process any audio. Typical run time is a
+    /// couple of seconds — fast enough to fire on every launch without
+    /// blocking the UI thread (callers should await it on a background
+    /// task and surface the result async).
+    static func healthCheck(pythonPath: String) async throws -> HealthCheckResult {
+        guard let modelsPath = bundledModelsPath else {
+            return HealthCheckResult(ok: false, error: "Bundled diarization models not found in app")
+        }
+
+        // Same speechbrain LazyModule + torch.load weights_only patches as
+        // `diarize()` — without them pyannote crashes during pipeline init
+        // because the pytorch_lightning stack inspection triggers optional
+        // import paths we don't actually use.
+        //
+        // The torchaudio pre-flight is the one structural addition: pyannote
+        // crashes at *import time* with IndexError if torchaudio reports zero
+        // audio backends (pyannote/audio/core/io.py does `backends[0]`).
+        // Catching this before the pyannote import lets us return a stable
+        // `missing_audio_backend` code that Swift can recover from by
+        // `pip install soundfile`-ing on the user's behalf.
+        let script = """
+        import json, sys, os, types, tempfile
+
+        result = {"ok": False, "error": None, "code": None}
+
+        def _emit(code, error):
+            result["code"] = code
+            result["error"] = error
+            json.dump(result, sys.stdout)
+            sys.exit(0)
+
+        try:
+            try:
+                import speechbrain.utils.importutils as _sbiu
+                _orig_ensure = _sbiu.LazyModule.ensure_module
+                def _safe_ensure(self, *a, **kw):
+                    try:
+                        return _orig_ensure(self, *a, **kw)
+                    except ImportError:
+                        self.lazy_module = types.ModuleType(self.target)
+                        return self.lazy_module
+                _sbiu.LazyModule.ensure_module = _safe_ensure
+            except Exception:
+                pass
+
+            try:
+                import torch
+            except ImportError as e:
+                _emit("missing_torch", f"torch not installed: {e}")
+
+            try:
+                import torchaudio
+                backends = torchaudio.list_audio_backends()
+            except ImportError as e:
+                _emit("missing_torchaudio", f"torchaudio not installed: {e}")
+
+            if not backends:
+                _emit("missing_audio_backend",
+                      "torchaudio reports zero audio backends; soundfile needed")
+
+            _orig_torch_load = torch.load
+            def _patched_torch_load(*args, **kwargs):
+                kwargs["weights_only"] = False
+                return _orig_torch_load(*args, **kwargs)
+            torch.load = _patched_torch_load
+
+            try:
+                from pyannote.audio import Pipeline
+            except ImportError as e:
+                _emit("missing_pyannote", f"pyannote.audio not installed: {e}")
+
+            models_dir = sys.argv[1]
+            config_path = os.path.join(models_dir, "config.yaml")
+            with open(config_path) as f:
+                config_text = f.read().replace("__MODELS_DIR__", models_dir)
+
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+            tmp.write(config_text)
+            tmp.close()
+
+            try:
+                Pipeline.from_pretrained(tmp.name)
+                result["ok"] = True
+            finally:
+                os.unlink(tmp.name)
+        except Exception as e:
+            result["code"] = "unknown"
+            result["error"] = f"{type(e).__name__}: {e}"
+
+        json.dump(result, sys.stdout)
+        """
+
+        let result = try await runPython(
+            path: resolvePython(userConfigured: pythonPath),
+            arguments: ["-c", script, modelsPath],
+            environment: pythonEnvironment()
+        )
+        guard !result.stdout.isEmpty else {
+            let errMsg = String(data: result.stderr, encoding: .utf8) ?? "no output"
+            return HealthCheckResult(ok: false, error: errMsg)
+        }
+        return try JSONDecoder().decode(HealthCheckResult.self, from: result.stdout)
     }
 
     static func verifySetup(pythonPath: String) async throws -> VerifyResult {
@@ -200,8 +382,9 @@ enum SpeakerDiarizer {
         """
 
         let result = try await runPython(
-            path: pythonPath,
-            arguments: ["-c", script]
+            path: resolvePython(userConfigured: pythonPath),
+            arguments: ["-c", script],
+            environment: pythonEnvironment()
         )
         guard !result.stdout.isEmpty else {
             let errMsg = String(data: result.stderr, encoding: .utf8) ?? "no output"

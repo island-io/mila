@@ -50,6 +50,8 @@ struct Recording: Identifiable, Codable, Hashable {
     var fullText: String
     /// When non-nil the recording is in the "Recently Deleted" trash.
     var deletedAt: Date?
+    /// User-assigned folder. nil = unfiled. Flat namespace (no nesting).
+    var folder: String?
 
     init(id: UUID = UUID(),
          title: String,
@@ -62,7 +64,8 @@ struct Recording: Identifiable, Codable, Hashable {
          modelName: String? = nil,
          segments: [TranscriptSegment] = [],
          fullText: String = "",
-         deletedAt: Date? = nil) {
+         deletedAt: Date? = nil,
+         folder: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -75,6 +78,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.segments = segments
         self.fullText = fullText
         self.deletedAt = deletedAt
+        self.folder = folder
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -88,7 +92,7 @@ struct Recording: Identifiable, Codable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
-             status, language, modelName, segments, deletedAt
+             status, language, modelName, segments, deletedAt, folder
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -107,6 +111,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.modelName = try c.decodeIfPresent(String.self, forKey: .modelName)
         self.segments = try c.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
         self.deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
+        self.folder = try c.decodeIfPresent(String.self, forKey: .folder)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -125,6 +130,7 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(modelName, forKey: .modelName)
         try c.encode(segments, forKey: .segments)
         try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
+        try c.encodeIfPresent(folder, forKey: .folder)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 }

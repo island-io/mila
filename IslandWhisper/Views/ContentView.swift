@@ -106,9 +106,17 @@ struct ContentView: View {
             QueueView(selection: $selection)
         case .category(let cat):
             HistoryListView(category: cat, search: search, selection: $selection)
+        case .folder(let name):
+            FolderListView(folderName: name, search: search, selection: $selection)
         case .recording(let id):
             if let rec = store.recordings.first(where: { $0.id == id }) {
+                // .id(rec.id) forces SwiftUI to discard and rebuild the view
+                // when the user navigates between recordings. Without it,
+                // @State like isEditingTitle / titleDraft survives, and the
+                // focus-loss commit on the next view would rename the new
+                // recording with the previous one's draft.
                 RecordingDetailView(recording: rec)
+                    .id(rec.id)
             } else {
                 ContentUnavailableView(
                     "Recording not found",

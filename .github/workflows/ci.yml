@@ -31,6 +31,22 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
+      # The bundled-python diarization resource needs to exist before
+      # xcodegen+xcodebuild run, because the .xcodeproj references the
+      # folder. Build (or restore) the bundle first. Cache key matches
+      # the same one used in ios-tests.yml so a single cache entry
+      # services both workflows.
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: IslandWhisper/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
       - name: Generate Xcode project
         run: make project
 

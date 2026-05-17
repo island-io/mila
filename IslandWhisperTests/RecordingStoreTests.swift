@@ -95,4 +95,175 @@ final class RecordingStoreTests: XCTestCase {
             isDirectory: &isDir))
         XCTAssertTrue(isDir.boolValue)
     }
+
+    // MARK: - Rename
+
+    func test_rename_updates_title_and_persists_across_instances() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Original", source: .microphone, audioFileName: "x.wav")
+        store.add(rec)
+
+        store.rename(rec, to: "Renamed")
+        XCTAssertEqual(store.recordings.first?.title, "Renamed")
+
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.first?.title, "Renamed")
+    }
+
+    func test_rename_trims_whitespace_and_ignores_empty_input() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Original", source: .microphone, audioFileName: "x.wav")
+        store.add(rec)
+
+        store.rename(rec, to: "  Trimmed  ")
+        XCTAssertEqual(store.recordings.first?.title, "Trimmed")
+
+        // Blank-only input must be a no-op so we never leave an empty row.
+        store.rename(rec, to: "   ")
+        XCTAssertEqual(store.recordings.first?.title, "Trimmed")
+    }
+
+    // MARK: - Folder CRUD
+
+    func test_create_folder_adds_and_sorts_alphabetically() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.createFolder("Zebra")
+        store.createFolder("apple")
+        store.createFolder("Mango")
+        XCTAssertEqual(store.folders, ["apple", "Mango", "Zebra"])
+    }
+
+    func test_create_folder_dedupes_case_insensitive_and_rejects_blank() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(store.createFolder("Work"), "Work")
+        XCTAssertEqual(store.createFolder("work"), "Work")  // dedupe — returns canonical
+        XCTAssertEqual(store.folders, ["Work"])
+        XCTAssertNil(store.createFolder("   "))
+        XCTAssertEqual(store.folders, ["Work"])
+    }
+
+    func test_folders_persist_across_store_instances() {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.createFolder("Work")
+        first.createFolder("Personal")
+
+        let second = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(second.folders, ["Personal", "Work"])
+    }
+
+    func test_assign_recording_to_folder_filters_correctly() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec1 = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        let rec2 = Recording(title: "B", source: .microphone, audioFileName: "b.wav")
+        store.add(rec1); store.add(rec2)
+        store.createFolder("Work")
+
+        store.assign(rec1, toFolder: "Work")
+        XCTAssertEqual(store.recordings(inFolder: "Work").map(\.id), [rec1.id])
+        XCTAssertTrue(store.recordings(inFolder: "Personal").isEmpty)
+    }
+
+    /// Regression: `assign` used to compare folder names case-sensitively
+    /// when its auto-create branch checked for an existing entry, which
+    /// let "work" + "Work" coexist depending on which path created each.
+    func test_assign_with_case_variant_reuses_existing_folder() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.createFolder("Work")
+        let rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        store.add(rec)
+
+        store.assign(rec, toFolder: "work")
+        XCTAssertEqual(store.folders, ["Work"])
+        XCTAssertEqual(store.recordings.first?.folder, "Work")
+    }
+
+    func test_assign_to_new_folder_auto_creates_it() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        store.add(rec)
+        XCTAssertTrue(store.folders.isEmpty)
+
+        store.assign(rec, toFolder: "Drafts")
+        XCTAssertEqual(store.folders, ["Drafts"])
+        XCTAssertEqual(store.recordings(inFolder: "Drafts").map(\.id), [rec.id])
+    }
+
+    func test_assign_nil_unfiles_recording() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        store.add(rec)
+        store.assign(rec, toFolder: "Work")
+        XCTAssertEqual(store.recordings.first?.folder, "Work")
+
+        store.assign(rec, toFolder: nil)
+        XCTAssertNil(store.recordings.first?.folder)
+        XCTAssertTrue(store.recordings(inFolder: "Work").isEmpty)
+        // The empty folder itself sticks around for the sidebar.
+        XCTAssertEqual(store.folders, ["Work"])
+    }
+
+    func test_rename_folder_retags_recordings() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        store.add(rec)
+        store.assign(rec, toFolder: "Work")
+
+        XCTAssertEqual(store.renameFolder("Work", to: "Office"), "Office")
+        XCTAssertEqual(store.folders, ["Office"])
+        XCTAssertEqual(store.recordings.first?.folder, "Office")
+    }
+
+    func test_rename_folder_rejects_collision() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.createFolder("Work")
+        store.createFolder("Personal")
+
+        XCTAssertNil(store.renameFolder("Work", to: "Personal"))
+        XCTAssertEqual(store.folders, ["Personal", "Work"])
+    }
+
+    /// Regression: a case-only rename ("work" -> "Work") used to false-positive
+    /// the case-insensitive collision check against the folder being renamed.
+    func test_rename_folder_allows_case_only_change() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.createFolder("work")
+        let rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        store.add(rec)
+        store.assign(rec, toFolder: "work")
+
+        XCTAssertEqual(store.renameFolder("work", to: "Work"), "Work")
+        XCTAssertEqual(store.folders, ["Work"])
+        XCTAssertEqual(store.recordings.first?.folder, "Work")
+    }
+
+    func test_delete_folder_unfiles_recordings_and_persists() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        store.add(rec)
+        store.assign(rec, toFolder: "Work")
+
+        store.deleteFolder("Work")
+        XCTAssertTrue(store.folders.isEmpty)
+        XCTAssertNil(store.recordings.first?.folder)
+
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertTrue(reloaded.folders.isEmpty)
+        XCTAssertNil(reloaded.recordings.first?.folder)
+    }
+
+    func test_load_seeds_folders_from_recordings_when_folders_file_missing() throws {
+        // Simulates a recordings.json that already references a folder name
+        // (e.g. after restoring from backup, or hand-editing the JSON).
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        rec.folder = "Imported"
+        store.add(rec)
+
+        // Wipe folders.json to mimic a partial import.
+        let foldersURL = tempRoot.appendingPathComponent("folders.json")
+        try? FileManager.default.removeItem(at: foldersURL)
+
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.folders, ["Imported"])
+    }
 }

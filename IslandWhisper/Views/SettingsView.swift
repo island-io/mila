@@ -499,214 +499,184 @@ private struct ExamplesView: View {
     }
 }
 
-// MARK: - Speaker Diarization
+// MARK: - Speakers
 
+/// Slim Speakers tab. Surface area is: enable/disable checkbox, a single
+/// health-status pill, and a "Run health check" button. When the bundled
+/// PythonRuntime is shipping but torch hasn't been runtime-downloaded yet,
+/// a bootstrap progress card takes priority over the health pill.
 private struct DiarizationSettingsTab: View {
     @EnvironmentObject private var diarization: DiarizationSettings
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack(alignment: .firstTextBaseline) {
-                    Text("Speaker diarization")
-                        .font(.title3.weight(.semibold))
-                    Spacer()
-                    statusBadge
-                }
+        // Indirect through a content view so we can attach an ObservedObject
+        // to the bootstrap instance — @EnvironmentObject isn't visible in
+        // init() so we can't bind the ObservedObject there.
+        DiarizationSettingsTabContent(
+            diarization: diarization,
+            bootstrap: diarization.bootstrap
+        )
+    }
+}
 
-                Text("Identify who is speaking in your recordings. Speaker models are included — just install Python dependencies to get started.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+private struct DiarizationSettingsTabContent: View {
+    @ObservedObject var diarization: DiarizationSettings
+    @ObservedObject var bootstrap: DiarizationBootstrap
 
-                Toggle("Enable speaker diarization", isOn: $diarization.isEnabled)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Speaker diarization")
+                .font(.title3.weight(.semibold))
 
-                if diarization.isEnabled {
-                    depsSection
+            Text("Identify who's speaking in your recordings. Required components install automatically on first enable; the check below confirms the local pipeline is ready.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
-                    if !diarization.needsDepsInstall,
-                       let result = diarization.lastVerifyResult,
-                       result.pyannoteInstalled && result.torchInstalled {
-                        Divider()
-                        verifySection
-                    }
-                }
+            Toggle("Enable speaker diarization", isOn: $diarization.isEnabled)
+
+            if showingBootstrapCard {
+                bootstrapCard
+            } else {
+                healthCard
             }
+
+            if let error = diarization.healthCheckResult?.error,
+               diarization.healthCheckResult?.ok == false,
+               !showingBootstrapCard {
+                ScrollView {
+                    Text(error)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 100)
+                .padding(8)
+                .background(.red.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .animation(.default, value: diarization.isEnabled)
-        .animation(.default, value: diarization.status)
     }
 
-    private var statusBadge: some View {
-        let status = diarization.status
-        return Label(status.label, systemImage: status.sfSymbol)
-            .font(.callout.weight(.medium))
-            .foregroundStyle(statusColor(status))
-    }
-
-    private func statusColor(_ status: DiarizationSettings.SetupStatus) -> some ShapeStyle {
-        switch status.color {
-        case .green:     return AnyShapeStyle(.green)
-        case .orange:    return AnyShapeStyle(.orange)
-        case .red:       return AnyShapeStyle(.red)
-        case .secondary: return AnyShapeStyle(.secondary)
+    /// Show the bootstrap progress card whenever a bundled runtime exists
+    /// AND it's still in flight or has failed. Once ready (or if no
+    /// bundle is present at all), we go back to the regular health pill.
+    private var showingBootstrapCard: Bool {
+        guard diarization.hasBundledRuntime else { return false }
+        switch bootstrap.stage {
+        case .ready, .notStarted:
+            return false
+        default:
+            return true
         }
     }
 
-    // MARK: - Step 1: Dependencies
-
-    @ViewBuilder
-    private var depsSection: some View {
-        let status = diarization.status
-        if case .checking = status {
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Checking Python dependencies…")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-        } else if diarization.needsDepsInstall {
-            VStack(alignment: .leading, spacing: 8) {
-                Label("Python dependencies needed", systemImage: "exclamationmark.triangle.fill")
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(.orange)
-
-                Button {
-                    Task { await diarization.installDependencies() }
-                } label: {
-                    if diarization.isInstalling {
-                        ProgressView()
-                            .controlSize(.small)
-                            .padding(.trailing, 2)
-                        Text("Installing (this may take a few minutes)…")
-                    } else {
-                        Label("Install pyannote.audio + torch", systemImage: "arrow.down.circle.fill")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(diarization.isInstalling)
-
-                if let log = diarization.installLog {
-                    ScrollView {
-                        Text(log)
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .textSelection(.enabled)
-                    }
-                    .frame(maxHeight: 80)
-                    .padding(6)
-                    .background(.black.opacity(0.05), in: RoundedRectangle(cornerRadius: 4))
-                }
-            }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
-        } else if let result = diarization.lastVerifyResult,
-                  result.pyannoteInstalled && result.torchInstalled {
-            Label("Python dependencies installed", systemImage: "checkmark.circle.fill")
-                .font(.callout)
-                .foregroundStyle(.green)
-        }
-
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Python path")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if diarization.pythonFound {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                        .font(.caption2)
-                } else {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .font(.caption2)
-                }
-            }
-            TextField("/usr/bin/python3", text: $diarization.pythonPath)
-                .textFieldStyle(.roundedBorder)
-                .font(.callout)
-        }
-    }
-
-    // MARK: - Step 2: Check Setup
-
-    @ViewBuilder
-    private var verifySection: some View {
-        let status = diarization.status
+    private var bootstrapCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button {
-                Task { await diarization.verify() }
-            } label: {
-                if case .verifying = status {
-                    ProgressView()
-                        .controlSize(.small)
-                        .padding(.trailing, 2)
-                    Text("Checking…")
-                } else {
-                    Label("Check setup", systemImage: "checkmark.shield")
-                }
-            }
-            .disabled(status == .verifying)
-
-            if let result = diarization.lastVerifyResult, !diarization.needsDepsInstall {
-                verifyResultChecklist(result)
-            }
-
-            if diarization.needsDepsUpgrade {
-                VStack(alignment: .leading, spacing: 6) {
-                    Label("Package version mismatch", systemImage: "exclamationmark.triangle.fill")
+            HStack(spacing: 10) {
+                bootstrapIcon
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(bootstrapTitle)
                         .font(.callout.weight(.medium))
-                        .foregroundStyle(.orange)
-                    Button {
-                        Task { await diarization.installDependencies() }
-                    } label: {
-                        if diarization.isInstalling {
-                            ProgressView()
-                                .controlSize(.small)
-                                .padding(.trailing, 2)
-                            Text("Upgrading…")
-                        } else {
-                            Label("Upgrade dependencies", systemImage: "arrow.up.circle.fill")
-                        }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(diarization.isInstalling)
+                    Text(bootstrapSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                Spacer()
             }
+            if case .downloadingTorch(let progress) = bootstrap.stage {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+            }
+            if case .failed = bootstrap.stage {
+                Button("Retry") {
+                    Task { await bootstrap.bootstrapIfNeeded() }
+                }
+            }
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var healthCard: some View {
+        HStack(spacing: 10) {
+            healthIcon
+            Text(healthLabel)
+                .font(.callout)
+            Spacer()
+            Button {
+                Task { await diarization.runHealthCheck() }
+            } label: {
+                if diarization.isHealthChecking {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("Run health check")
+                }
+            }
+            .disabled(diarization.isHealthChecking)
+        }
+        .padding(10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private var bootstrapIcon: some View {
+        switch bootstrap.stage {
+        case .downloadingTorch, .installingTorch, .signing, .checking:
+            ProgressView().controlSize(.small)
+        case .failed:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        default:
+            Image(systemName: "arrow.down.circle").foregroundStyle(.tint)
+        }
+    }
+
+    private var bootstrapTitle: String {
+        switch bootstrap.stage {
+        case .notStarted:          return "Preparing speaker detection…"
+        case .checking:            return "Checking…"
+        case .downloadingTorch:    return "Downloading torch runtime"
+        case .installingTorch:     return "Installing torch"
+        case .signing:             return "Finalizing install"
+        case .ready:               return "Ready"
+        case .failed(let msg):     return "Setup failed: \(msg)"
+        }
+    }
+
+    private var bootstrapSubtitle: String {
+        switch bootstrap.stage {
+        case .downloadingTorch(let p):
+            return "\(Int(p * 100))% — torch is one-time, ~60 MB"
+        case .installingTorch, .signing:
+            return "Almost done — installing into the speaker runtime"
+        case .failed:
+            return "Retry to try the download again"
+        default:
+            return "First-time setup runs once; subsequent launches skip it"
         }
     }
 
     @ViewBuilder
-    private func verifyResultChecklist(_ result: SpeakerDiarizer.VerifyResult) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            verifyCheckRow("pyannote.audio", ok: result.pyannoteInstalled,
-                           detail: result.pyannoteInstalled ? nil : "Run 'Install dependencies' above")
-            verifyCheckRow("torch", ok: result.torchInstalled,
-                           detail: result.torchInstalled ? nil : "Run 'Install dependencies' above")
+    private var healthIcon: some View {
+        if diarization.isHealthChecking {
+            ProgressView().controlSize(.small)
+        } else if let result = diarization.healthCheckResult {
+            if result.ok {
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+            }
+        } else {
+            Image(systemName: "questionmark.circle").foregroundStyle(.secondary)
         }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(result.allGood ? .green.opacity(0.08) : .red.opacity(0.08),
-                     in: RoundedRectangle(cornerRadius: 6))
     }
 
-    private func verifyCheckRow(_ label: String, ok: Bool, detail: String? = nil) -> some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Label(label, systemImage: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(ok ? .green : .red)
-            if let detail {
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.leading, 22)
-            }
-        }
+    private var healthLabel: String {
+        if diarization.isHealthChecking { return "Checking…" }
+        guard let result = diarization.healthCheckResult else { return "Not checked yet" }
+        return result.ok ? "Speaker detection is working" : "Speaker detection unavailable"
     }
 }

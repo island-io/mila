@@ -1,0 +1,61 @@
+name: E2E Diarization
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'IslandWhisper/Transcription/SpeakerDiarizer.swift'
+      - 'IslandWhisper/Resources/DiarizationModels/**'
+      - 'scripts/diarize-e2e.py'
+      - '.github/workflows/e2e-diarization.yml'
+  pull_request:
+    paths:
+      - 'IslandWhisper/Transcription/SpeakerDiarizer.swift'
+      - 'IslandWhisper/Resources/DiarizationModels/**'
+      - 'scripts/diarize-e2e.py'
+      - '.github/workflows/e2e-diarization.yml'
+
+# The bulk of CI time on a cold cache is the torch wheel download (~150 MB)
+# and pyannote.audio + numpy/scipy/etc (~50 MB more). Cache the entire venv
+# keyed on a manifest hash — bump VENV_VERSION below to force a rebuild
+# (e.g. after a pyannote major-version bump). The hot-cache path runs in
+# ~3-5 min; cold cache is ~15-20 min.
+env:
+  VENV_VERSION: v1
+
+jobs:
+  diarize:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache pyannote venv
+        id: venv-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/diar-venv
+          key: diar-venv-${{ runner.os }}-py3.11-${{ env.VENV_VERSION }}
+
+      - name: Set up Python venv (cold path only)
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        run: |
+          /usr/bin/python3 -m venv ~/diar-venv
+          ~/diar-venv/bin/pip install --upgrade pip
+          ~/diar-venv/bin/pip install \
+            'pyannote.audio' \
+            'torch' \
+            'torchaudio' \
+            'soundfile' \
+            'cffi' \
+            'huggingface_hub<1.0'
+
+      - name: Diarize fixture
+        run: |
+          ~/diar-venv/bin/python scripts/diarize-e2e.py \
+            IslandWhisper/Resources/DiarizationModels \
+            Packages/TranscriptionCore/Fixtures/en_meeting_notes.wav \
+            --min-turns 1

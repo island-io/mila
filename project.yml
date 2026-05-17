@@ -38,9 +38,21 @@ targets:
           - "Resources/Info.plist"
           - "Resources/IslandWhisper.entitlements"
           - "Resources/DiarizationModels"
+          - "Resources/PythonRuntime"
       - path: IslandWhisper/Resources/DiarizationModels
         type: folder
         buildPhase: resources
+      # PythonRuntime is produced by `make bundle-diarization`. Treated as
+      # a folder reference (not a recursive source scan) so XcodeGen copies
+      # the entire directory tree into Contents/Resources/PythonRuntime/.
+      # The directory is .gitignored; CI is expected to fetch/build it
+      # before invoking xcodebuild. If it's missing, the build proceeds
+      # without bundled diarization — SpeakerDiarizer.resolvePython falls
+      # back to the user-configured python automatically.
+      - path: IslandWhisper/Resources/PythonRuntime
+        type: folder
+        buildPhase: resources
+        optional: true
     resources:
       - path: IslandWhisper/Assets.xcassets
     info:
@@ -103,3 +115,24 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/IslandWhisper.app/Contents/MacOS/IslandWhisper"
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperTests
+
+  IslandWhisperUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: IslandWhisperUITests
+    dependencies:
+      - target: IslandWhisper
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperUITests
+        TEST_TARGET_NAME: IslandWhisper
+        # Match the host app's ad-hoc signing so the runner app and the
+        # injected xctest bundle have the same (empty) Team ID — otherwise
+        # macOS rejects the dlopen at test-time with "different Team IDs".
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO

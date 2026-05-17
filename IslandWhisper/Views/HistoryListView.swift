@@ -37,6 +37,39 @@ struct HistoryListView: View {
     }
 }
 
+/// Detail view for the sidebar's `.folder(name)` selection. Reuses the same
+/// bucketed history layout so folder views look like the built-in categories.
+struct FolderListView: View {
+    let folderName: String
+    let search: String
+    @Binding var selection: SidebarSelection?
+
+    @EnvironmentObject private var store: RecordingStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 8) {
+                    Image(systemName: "folder.fill").foregroundStyle(.tint)
+                    Text(folderName).font(.title2.weight(.semibold))
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+
+                BucketedRecordingsView(
+                    recordings: store.recordings(inFolder: folderName),
+                    search: search,
+                    selection: $selection
+                )
+                .padding(.horizontal, 24)
+            }
+            .padding(.bottom, 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityIdentifier("folder.list.\(folderName)")
+    }
+}
+
 struct BucketedRecordingsView: View {
     let recordings: [Recording]
     let search: String
@@ -99,6 +132,9 @@ private struct HistoryRow: View {
     @EnvironmentObject private var transcription: TranscriptionService
 
     @State private var hovering = false
+    @State private var renameRequest: String?
+    @State private var promptForNewFolder = false
+    @State private var newFolderDraft = ""
 
     var body: some View {
         let isSelected: Bool = {
@@ -158,6 +194,35 @@ private struct HistoryRow: View {
         .onHover { hovering = $0 }
         .onTapGesture { selection = .recording(recording.id) }
         .contextMenu { contextMenu }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("history.row.\(recording.title)")
+        .sheet(item: Binding(
+            get: { renameRequest.map(RenameDraft.init) },
+            set: { if $0 == nil { renameRequest = nil } }
+        )) { draft in
+            RenameSheet(
+                initialTitle: draft.title,
+                onConfirm: { newTitle in
+                    store.rename(recording, to: newTitle)
+                    renameRequest = nil
+                },
+                onCancel: { renameRequest = nil }
+            )
+        }
+        .sheet(isPresented: $promptForNewFolder) {
+            FolderNameSheet(
+                title: "New Folder",
+                confirmLabel: "Create",
+                name: $newFolderDraft,
+                onConfirm: {
+                    if let created = store.createFolder(newFolderDraft) {
+                        store.assign(recording, toFolder: created)
+                    }
+                    promptForNewFolder = false
+                },
+                onCancel: { promptForNewFolder = false }
+            )
+        }
     }
 
     @ViewBuilder
@@ -172,6 +237,28 @@ private struct HistoryRow: View {
                 }
             }
         } else {
+            Button("Rename…") {
+                renameRequest = recording.title
+            }
+            Menu("Move to Folder") {
+                Button(recording.folder == nil ? "✓ None" : "None") {
+                    store.assign(recording, toFolder: nil)
+                }
+                if !store.folders.isEmpty {
+                    Divider()
+                    ForEach(store.folders, id: \.self) { folder in
+                        Button(recording.folder == folder ? "✓ \(folder)" : folder) {
+                            store.assign(recording, toFolder: folder)
+                        }
+                    }
+                }
+                Divider()
+                Button("New Folder…") {
+                    newFolderDraft = ""
+                    promptForNewFolder = true
+                }
+            }
+            Divider()
             let currentLang = RecordingLanguage.fromCode(recording.language)
             Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
                 transcription.enqueue(recording)
@@ -210,6 +297,50 @@ private struct HistoryRow: View {
         if t.count <= 140 { return t }
         let end = t.index(t.startIndex, offsetBy: 140)
         return String(t[..<end]) + "…"
+    }
+}
+
+private struct RenameDraft: Identifiable {
+    let title: String
+    var id: String { title }
+}
+
+struct RenameSheet: View {
+    let initialTitle: String
+    let onConfirm: (String) -> Void
+    let onCancel: () -> Void
+
+    @State private var draft: String
+
+    init(initialTitle: String,
+         onConfirm: @escaping (String) -> Void,
+         onCancel: @escaping () -> Void) {
+        self.initialTitle = initialTitle
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+        _draft = State(initialValue: initialTitle)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Rename Recording").font(.title3.weight(.semibold))
+            TextField("Title", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { onConfirm(draft) }
+                .accessibilityIdentifier("rename.title.field")
+            HStack {
+                Spacer()
+                Button("Cancel", action: onCancel)
+                    .keyboardShortcut(.cancelAction)
+                Button("Save") { onConfirm(draft) }
+                    .keyboardShortcut(.defaultAction)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .accessibilityIdentifier("rename.title.save")
+            }
+        }
+        .padding(20)
+        .frame(width: 400)
     }
 }
 

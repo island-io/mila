@@ -1,0 +1,121 @@
+name: App Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'IslandWhisper/**'
+      - 'IslandWhisperTests/**'
+      - 'IslandWhisperUITests/**'
+      - 'project.yml'
+      - '.github/workflows/ios-tests.yml'
+  pull_request:
+    paths:
+      - 'IslandWhisper/**'
+      - 'IslandWhisperTests/**'
+      - 'IslandWhisperUITests/**'
+      - 'project.yml'
+      - '.github/workflows/ios-tests.yml'
+
+jobs:
+  unit-and-ui-tests:
+    # macos-15 ships Xcode 16, which matches the project file format
+    # xcodegen produces locally. macos-14 (Xcode 15.4) rejects it as
+    # "future project file format (77)".
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # Build (or restore from cache) the bundled Python runtime so the
+      # produced .app contains it and the bundled-python flow is
+      # exercised end-to-end. Cache key on the script SHA — change to
+      # the script invalidates the cache. Cold runs add ~10 min; hot
+      # restores are seconds.
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: IslandWhisper/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
+      - name: Smoke-test bundled python
+        run: |
+          # We deliberately don't bundle torch (it gets runtime-downloaded
+          # by DiarizationBootstrap), and pyannote.audio's __init__.py
+          # imports torch unconditionally. So `import pyannote.audio`
+          # fails by design until the user enables diarization. Verify
+          # via dist-info metadata instead — it confirms pyannote was
+          # installed without triggering the torch import.
+          BUNDLED=IslandWhisper/Resources/PythonRuntime/python/bin/python3.11
+          "$BUNDLED" --version
+          PYTHONPATH=IslandWhisper/Resources/PythonRuntime/python/site-packages \
+            "$BUNDLED" -c "from importlib.metadata import version; print('pyannote.audio:', version('pyannote.audio')); print('numpy:', version('numpy')); print('scipy:', version('scipy'))"
+          # pyannote.core is a separate package without a torch dep, so
+          # importing it does work and confirms the path is correct.
+          PYTHONPATH=IslandWhisper/Resources/PythonRuntime/python/site-packages \
+            "$BUNDLED" -c "import pyannote.core; print('pyannote.core importable')"
+
+      - name: Generate Xcode project
+        run: make project
+
+      # The macos-15 image ships with a stale SwiftPM artifact cache that
+      # occasionally rejects fresh downloads with "...zip already exists
+      # in file system" — wipe it to keep package resolution deterministic.
+      # Same workaround as .github/workflows/ci.yml.
+      - name: Clear SwiftPM caches
+        run: |
+          rm -rf ~/Library/Caches/org.swift.swiftpm
+          rm -rf ~/Library/org.swift.swiftpm
+          rm -rf ~/Library/Developer/Xcode/DerivedData/SourcePackages
+
+      - name: Resolve SwiftPM dependencies
+        run: |
+          xcodebuild -project IslandWhisper.xcodeproj \
+            -scheme IslandWhisper \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            -resolvePackageDependencies
+
+      - name: Run unit tests
+        run: |
+          set -o pipefail
+          xcodebuild -project IslandWhisper.xcodeproj \
+            -scheme IslandWhisper \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            -only-testing:IslandWhisperTests \
+            test 2>&1 | tail -200
+
+      - name: Run UI tests
+        # UI tests drive the actual app process — they need to run in a
+        # foreground session. macos-14 runners provide one by default.
+        run: |
+          set -o pipefail
+          xcodebuild -project IslandWhisper.xcodeproj \
+            -scheme IslandWhisper \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            -only-testing:IslandWhisperUITests \
+            test 2>&1 | tail -300
+
+      - name: Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcresult
+          path: build/Logs/Test/*.xcresult
+          retention-days: 7

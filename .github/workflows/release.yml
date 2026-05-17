@@ -82,6 +82,22 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
 
+      # Speaker-diarization runtime bundle: ~150 MB of relocatable Python
+      # + pyannote.audio + deps. Cached on the GitHub Actions cache so
+      # subsequent releases skip the ~10 min pip install. Cache key is
+      # the SHA of the build script — bump it (or the script's content)
+      # to force a rebuild.
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: IslandWhisper/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
       - name: Generate Xcode project
         run: make project
 

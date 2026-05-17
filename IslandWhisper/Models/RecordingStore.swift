@@ -9,13 +9,40 @@ import Combine
 @MainActor
 final class RecordingStore: ObservableObject {
     @Published private(set) var recordings: [Recording] = []
+    /// Folder names the user has explicitly created. Kept separate from the
+    /// set derived from `recordings[*].folder` so an empty folder still shows
+    /// up in the sidebar and survives moving its last recording elsewhere.
+    @Published private(set) var folders: [String] = []
 
     private let fileManager = FileManager.default
     private let storeURL: URL
+    private let foldersURL: URL
     let recordingsDirectory: URL
     let modelsDirectory: URL
 
     convenience init() {
+        // UI tests pass --ui-test-clean-store to bypass the user's real
+        // Application Support directory and start from a fresh, deterministic
+        // state. We honor it before touching the real path so a test run
+        // never reads or writes the user's recordings.
+        if CommandLine.arguments.contains("--ui-test-clean-store") {
+            let tmpRoot = FileManager.default.temporaryDirectory
+                .appendingPathComponent("IslandWhisper-UITest-\(UUID())", isDirectory: true)
+            self.init(rootDirectory: tmpRoot)
+            if CommandLine.arguments.contains("--ui-test-seed-recording") {
+                let seed = Recording(
+                    title: "Seed Recording",
+                    duration: 1.5,
+                    source: .microphone,
+                    audioFileName: "seed.wav",
+                    status: .completed,
+                    language: "en",
+                    fullText: "Hello from the UI test seed recording."
+                )
+                self.add(seed)
+            }
+            return
+        }
         let appSupport = try! FileManager.default.url(for: .applicationSupportDirectory,
                                                       in: .userDomainMask,
                                                       appropriateFor: nil,
@@ -39,10 +66,12 @@ final class RecordingStore: ObservableObject {
         self.recordingsDirectory = rootDirectory.appendingPathComponent("Recordings", isDirectory: true)
         self.modelsDirectory = rootDirectory.appendingPathComponent("Models", isDirectory: true)
         self.storeURL = rootDirectory.appendingPathComponent("recordings.json")
+        self.foldersURL = rootDirectory.appendingPathComponent("folders.json")
 
         try? fileManager.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         load()
+        loadFolders()
     }
 
     func audioURL(for recording: Recording) -> URL {
@@ -75,6 +104,38 @@ final class RecordingStore: ObservableObject {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         recordings[idx] = recording
         writeTranscript(for: recording)
+        persist()
+    }
+
+    /// Rename a recording's user-facing title. No-op if the trimmed title is
+    /// empty (we never want a blank entry in the sidebar) or unchanged.
+    func rename(_ recording: Recording, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard recordings[idx].title != trimmed else { return }
+        recordings[idx].title = trimmed
+        persist()
+    }
+
+    /// Move a recording into a folder (or unfile it with nil). Auto-creates
+    /// the folder so callers can drag into a brand-new name without a
+    /// separate `createFolder` round-trip. Dedup is case-insensitive — if
+    /// the caller passes "work" but "Work" already exists, the recording is
+    /// filed under the existing "Work" rather than spawning a duplicate.
+    func assign(_ recording: Recording, toFolder folderName: String?) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        let normalized = folderName?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = (normalized?.isEmpty ?? true) ? nil : normalized
+        let target: String? = trimmed.map { input in
+            folders.first { $0.caseInsensitiveCompare(input) == .orderedSame } ?? input
+        }
+        recordings[idx].folder = target
+        if let target, !folders.contains(target) {
+            folders.append(target)
+            folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+            persistFolders()
+        }
         persist()
     }
 
@@ -142,6 +203,66 @@ final class RecordingStore: ObservableObject {
         }
     }
 
+    /// All non-trashed recordings filed under `folderName`.
+    func recordings(inFolder folderName: String) -> [Recording] {
+        recordings.filter { !$0.isTrashed && $0.folder == folderName }
+    }
+
+    // MARK: - Folders
+
+    /// Create an empty folder. No-op if the trimmed name is empty or already
+    /// exists. Returns the normalized name that ended up in `folders` (or nil
+    /// if the input was rejected) so callers can immediately select it.
+    @discardableResult
+    func createFolder(_ name: String) -> String? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if folders.contains(where: { $0.caseInsensitiveCompare(trimmed) == .orderedSame }) {
+            return folders.first { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
+        }
+        folders.append(trimmed)
+        folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        persistFolders()
+        return trimmed
+    }
+
+    /// Rename a folder and re-tag every recording filed under it. Returns
+    /// the normalized new name on success, nil if the rename was rejected
+    /// (blank name, source missing, or collision with an existing folder).
+    @discardableResult
+    func renameFolder(_ oldName: String, to newName: String) -> String? {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, folders.contains(oldName) else { return nil }
+        if trimmed == oldName { return oldName }
+        // Collision check must exclude the folder we're renaming — otherwise
+        // a case-only rewrite ("work" -> "Work") falsely collides with itself.
+        if folders.contains(where: {
+            $0 != oldName && $0.caseInsensitiveCompare(trimmed) == .orderedSame
+        }) {
+            return nil
+        }
+        folders.removeAll { $0 == oldName }
+        folders.append(trimmed)
+        folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+        for i in recordings.indices where recordings[i].folder == oldName {
+            recordings[i].folder = trimmed
+        }
+        persistFolders()
+        persist()
+        return trimmed
+    }
+
+    /// Delete a folder. Recordings filed under it become unfiled (folder = nil).
+    func deleteFolder(_ name: String) {
+        guard folders.contains(name) else { return }
+        folders.removeAll { $0 == name }
+        for i in recordings.indices where recordings[i].folder == name {
+            recordings[i].folder = nil
+        }
+        persistFolders()
+        persist()
+    }
+
     private func load() {
         guard let data = try? Data(contentsOf: storeURL) else { return }
         let decoder = JSONDecoder()
@@ -186,6 +307,33 @@ final class RecordingStore: ObservableObject {
             try data.write(to: storeURL, options: .atomic)
         } catch {
             print("RecordingStore persist error: \(error)")
+        }
+    }
+
+    private func loadFolders() {
+        // Folders stored as a plain JSON array of strings. Seed the union of
+        // (persisted list, any folder names already referenced by recordings)
+        // so we never lose a folder even if folders.json wasn't written yet
+        // — e.g. tests that build a Recording with `folder: "Work"` directly.
+        var union = Set<String>()
+        if let data = try? Data(contentsOf: foldersURL),
+           let decoded = try? JSONDecoder().decode([String].self, from: data) {
+            union.formUnion(decoded)
+        }
+        for r in recordings {
+            if let f = r.folder, !f.isEmpty { union.insert(f) }
+        }
+        self.folders = union.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    private func persistFolders() {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        do {
+            let data = try encoder.encode(folders)
+            try data.write(to: foldersURL, options: .atomic)
+        } catch {
+            print("RecordingStore persistFolders error: \(error)")
         }
     }
 }

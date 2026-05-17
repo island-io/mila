@@ -9,7 +9,22 @@ final class DiarizationSettings: ObservableObject {
             if isEnabled && pythonFound && lastVerifyResult == nil && !isVerified {
                 Task { await checkDeps() }
             }
+            if isEnabled, hasBundledRuntime {
+                Task { await bootstrap.bootstrapIfNeeded() }
+            }
         }
+    }
+
+    /// Orchestrates the bundled-python + runtime-torch-install flow. The
+    /// instance is alive for the lifetime of DiarizationSettings so the
+    /// Settings UI can observe its `stage` directly via .environmentObject.
+    let bootstrap = DiarizationBootstrap()
+
+    /// True iff the .app shipped with a bundled PythonRuntime — when true
+    /// we run the bundled-python flow exclusively (no pip-install onto
+    /// system python), otherwise we fall back to the legacy auto-recover.
+    var hasBundledRuntime: Bool {
+        DiarizationBootstrap.bundledPythonPath != nil
     }
     @Published var pythonPath: String {
         didSet {
@@ -66,7 +81,14 @@ final class DiarizationSettings: ObservableObject {
     }
 
     var isConfigured: Bool {
-        isEnabled && status.isGood
+        guard isEnabled else { return false }
+        // On the bundled-runtime flow, "configured" means torch has been
+        // runtime-downloaded too. Until then, transcription proceeds
+        // without speaker labels rather than failing or blocking — the
+        // user keeps using the app while bootstrap completes; later
+        // recordings get speakers automatically.
+        if hasBundledRuntime { return bootstrap.isReady }
+        return status.isGood
     }
 
     enum SetupStatus: Equatable {
@@ -135,6 +157,12 @@ final class DiarizationSettings: ObservableObject {
     @Published private(set) var isInstalling = false
     @Published private(set) var installLog: String?
 
+    /// Result of the most recent lightweight `SpeakerDiarizer.healthCheck`,
+    /// or nil if it hasn't run yet this session. Drives the "Speaker
+    /// detection: Ready / Unavailable" badge in Settings.
+    @Published private(set) var healthCheckResult: SpeakerDiarizer.HealthCheckResult?
+    @Published private(set) var isHealthChecking = false
+
     var status: SetupStatus {
         guard isEnabled else { return .disabled }
         guard pythonFound else { return .pythonNotFound }
@@ -196,6 +224,110 @@ final class DiarizationSettings: ObservableObject {
             installLog = "Install failed: \(error.localizedDescription)"
         }
         isInstalling = false
+    }
+
+    /// Lightweight launch-time + on-demand diagnostic. Verifies that the
+    /// Python stack imports AND the bundled diarization pipeline can be
+    /// instantiated. Result is exposed via `healthCheckResult` and shown
+    /// in Settings as a single ready/unavailable badge — the user never
+    /// has to look at a multi-step setup flow.
+    ///
+    /// Auto-recovery: if the check returns `missing_audio_backend`, we
+    /// pip-install `soundfile` (the smallest fix) and re-run once. This is
+    /// the most common reason a working pyannote install still fails:
+    /// `pip install pyannote.audio` doesn't pull a torchaudio backend, so
+    /// pyannote crashes at import with `IndexError` deep inside its IO
+    /// initialisation. We don't want the user staring at that.
+    func runHealthCheck() async {
+        // The bundled python3.11 ships with the .app and is always
+        // present on release builds — only fail the precondition when
+        // we have neither the bundle nor a working user-configured
+        // python. (`pythonFound` only checks the user-configured path
+        // and would otherwise mask the bundled-runtime case where the
+        // user's /usr/bin/python3 has been removed or misconfigured.)
+        guard pythonFound || hasBundledRuntime else {
+            healthCheckResult = SpeakerDiarizer.HealthCheckResult(
+                ok: false, error: "Python not found at \(pythonPath) and no bundled runtime present"
+            )
+            return
+        }
+        isHealthChecking = true
+        defer { isHealthChecking = false }
+
+        let first = await runHealthCheckOnce()
+        if first.ok {
+            healthCheckResult = first
+            return
+        }
+
+        // Self-heal recoverable failures: the app installs what it needs
+        // rather than asking the user to. We only re-run installation when
+        // the structured error code says it's worth trying — random
+        // pip-install loops on unknown errors would be worse than just
+        // surfacing the error.
+        //
+        // Two flows:
+        //  • Bundled runtime present → all deps except torch ship in the
+        //    .app; missing_torch means "run DiarizationBootstrap to fetch
+        //    the wheel". Other codes shouldn't happen on the bundled path;
+        //    if they do, surface the error rather than pip-installing
+        //    into a read-only bundle.
+        //  • No bundle (legacy) → pip into the user's system python.
+        //    Gated on isEnabled so fresh users don't get a multi-GB
+        //    download for a feature they never opted in to.
+        let remediator: ((String) async throws -> Void)?
+        if hasBundledRuntime {
+            if isEnabled, first.code == "missing_torch" || first.code == "missing_torchaudio" {
+                isInstalling = true
+                remediator = { [weak self] _ in
+                    await self?.bootstrap.bootstrapIfNeeded()
+                }
+            } else {
+                remediator = nil
+            }
+        } else {
+            switch first.code {
+            case "missing_audio_backend" where isEnabled:
+                remediator = { _ = try await SpeakerDiarizer.installAudioBackend(pythonPath: $0) }
+            case "missing_torch", "missing_torchaudio", "missing_pyannote":
+                guard isEnabled else {
+                    remediator = nil
+                    break
+                }
+                isInstalling = true
+                remediator = { _ = try await SpeakerDiarizer.installDependencies(pythonPath: $0) }
+            default:
+                remediator = nil
+            }
+        }
+
+        guard let remediator else {
+            healthCheckResult = first
+            return
+        }
+
+        defer { isInstalling = false }
+        do {
+            try await remediator(pythonPath)
+        } catch {
+            healthCheckResult = SpeakerDiarizer.HealthCheckResult(
+                ok: false,
+                error: "Auto-install failed: \(error.localizedDescription)",
+                code: first.code
+            )
+            return
+        }
+        healthCheckResult = await runHealthCheckOnce()
+    }
+
+    private func runHealthCheckOnce() async -> SpeakerDiarizer.HealthCheckResult {
+        do {
+            return try await SpeakerDiarizer.healthCheck(pythonPath: pythonPath)
+        } catch {
+            return SpeakerDiarizer.HealthCheckResult(
+                ok: false, error: error.localizedDescription
+            )
+        }
     }
 
     func verify() async {
