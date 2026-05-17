@@ -254,6 +254,41 @@ final class DiarizationSettings: ObservableObject {
         isHealthChecking = true
         defer { isHealthChecking = false }
 
+        // Iteratively self-heal `missing_module` failures up to a cap.
+        // Each pass installs the one specific module the script reports,
+        // then re-runs the check. New module name on the next pass means
+        // the import chain advanced past the previous one; the cap exists
+        // so a genuinely-broken state can't pip-loop forever.
+        if hasBundledRuntime, isEnabled {
+            var installed: Set<String> = []
+            for _ in 0..<8 {
+                let result = await runHealthCheckOnce()
+                if result.ok { healthCheckResult = result; return }
+                guard result.code == "missing_module",
+                      let module = result.module,
+                      !installed.contains(module) else { break }
+                isInstalling = true
+                installed.insert(module)
+                do {
+                    _ = try await SpeakerDiarizer.installMissingModule(
+                        pythonPath: pythonPath,
+                        userSitePackages: DiarizationBootstrap.userSitePackages.path,
+                        module: module
+                    )
+                } catch {
+                    healthCheckResult = SpeakerDiarizer.HealthCheckResult(
+                        ok: false,
+                        error: "Auto-install of \(module) failed: \(error.localizedDescription)",
+                        code: result.code,
+                        module: module
+                    )
+                    isInstalling = false
+                    return
+                }
+                isInstalling = false
+            }
+        }
+
         let first = await runHealthCheckOnce()
         if first.ok {
             healthCheckResult = first

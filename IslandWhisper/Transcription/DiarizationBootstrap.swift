@@ -34,6 +34,20 @@ final class DiarizationBootstrap: ObservableObject {
         URL(string: "https://download.pytorch.org/whl/cpu/torchaudio-\(torchaudioVersion)-cp311-cp311-macosx_11_0_arm64.whl")!,
     ]
 
+    /// Extra PyPI specs to install into the user-writable site-packages
+    /// after the wheels download. These don't have a fixed wheel URL we
+    /// pin; pip resolves them at install time.
+    ///
+    /// `numpy<2`: torch 2.2.x was compiled against the numpy 1.x C ABI.
+    /// The bundled site-packages ships numpy 2.4 because that's what
+    /// pyannote's transitive deps resolve to today, but torch can't
+    /// consume it at runtime — first call raises
+    /// `RuntimeError: Numpy is not available`. Installing numpy 1.26.x
+    /// into the user dir works because PYTHONPATH puts user FIRST.
+    static let extraInstallSpecs: [String] = [
+        "numpy<2",
+    ]
+
     enum Stage: Equatable {
         case notStarted
         case checking
@@ -90,14 +104,20 @@ final class DiarizationBootstrap: ObservableObject {
     }
 
     /// Returns the PYTHONPATH the SpeakerDiarizer subprocess should run
-    /// with — bundled site-packages first (so pyannote resolves there),
-    /// user-installed torch second. Returns an empty string when no
-    /// bundle is present, so legacy users keep whatever PYTHONPATH the
-    /// system gave them. `pythonEnvironment()` then omits the variable
-    /// entirely rather than clobbering it.
+    /// with — **user dir first**, bundled site-packages second. Order
+    /// matters: when the bundle ships a package that has a runtime ABI
+    /// mismatch (e.g. numpy 2.x with torch 2.2.x which needs numpy <2),
+    /// the runtime self-heal pip-installs the correct version into the
+    /// user dir and we want that to win on import lookup. The bundle is
+    /// the fallback for everything we DIDN'T need to override.
+    ///
+    /// Returns an empty string when no bundle is present, so legacy
+    /// users keep whatever PYTHONPATH the system gave them.
+    /// `pythonEnvironment()` then omits the variable entirely rather
+    /// than clobbering it.
     nonisolated static var combinedPythonPath: String {
         guard let bundled = bundledSitePackages else { return "" }
-        return "\(bundled):\(userSitePackages.path)"
+        return "\(userSitePackages.path):\(bundled)"
     }
 
     /// True iff `torch/__init__.py` AND `torchaudio/__init__.py` exist in
@@ -153,6 +173,13 @@ final class DiarizationBootstrap: ObservableObject {
             try await runPipInstall(python: python, wheels: downloaded)
             for path in downloaded { try? fileManager.removeItem(at: path) }
 
+            // Install the extra PyPI specs (numpy<2 etc.) into the same
+            // user-writable site-packages. These can't be pinned to a wheel
+            // URL the way torch is, but pip resolves them fine at runtime.
+            for spec in Self.extraInstallSpecs {
+                try await runPipInstallSpec(python: python, spec: spec)
+            }
+
             stage = .signing
             try await signFreshDylibs()
 
@@ -191,6 +218,39 @@ final class DiarizationBootstrap: ObservableObject {
         try? fileManager.removeItem(at: dest)
         try fileManager.moveItem(at: downloadURL, to: dest)
         return dest
+    }
+
+    /// Pip-install a PyPI spec (e.g. "numpy<2") into the user-writable
+    /// site-packages. Same `--no-deps --only-binary` flags as the wheel
+    /// install path — we don't want pip pulling in adjacent packages we
+    /// haven't planned for.
+    private func runPipInstallSpec(python: String, spec: String) async throws {
+        let targetPath = Self.userSitePackages.path
+        try await Task.detached(priority: .userInitiated) {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: python)
+            process.arguments = [
+                "-m", "pip", "install",
+                "--target", targetPath,
+                "--upgrade",
+                "--no-deps",
+                "--only-binary=:all:",
+                spec,
+            ]
+            let stderr = Pipe()
+            process.standardError = stderr
+            process.standardOutput = Pipe()
+            try process.run()
+            let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
+            process.waitUntilExit()
+            let stderrData = await stderrRead.value
+            if process.terminationStatus != 0 {
+                let msg = String(data: stderrData, encoding: .utf8) ?? "exit \(process.terminationStatus)"
+                throw NSError(domain: "DiarizationBootstrap", code: 4, userInfo: [
+                    NSLocalizedDescriptionKey: "pip install \(spec) failed: \(msg.prefix(500))"
+                ])
+            }
+        }.value
     }
 
     private func runPipInstall(python: String, wheels: [URL]) async throws {

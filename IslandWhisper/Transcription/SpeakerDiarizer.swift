@@ -110,23 +110,35 @@ enum SpeakerDiarizer {
         return output
     }
 
+    /// Python module name → PyPI package name overrides. Most pyannote
+    /// deps name themselves the same on PyPI as in import statements,
+    /// but a few classic mismatches need translation: pip would fail
+    /// otherwise ("Could not find a version that satisfies the
+    /// requirement PIL"). Extend this list as new mismatches surface.
+    private static let moduleToPackage: [String: String] = [
+        "PIL": "Pillow",
+        "sklearn": "scikit-learn",
+        "yaml": "PyYAML",
+        "cv2": "opencv-python-headless",
+        "bs4": "beautifulsoup4",
+    ]
+
     /// Targeted remediation when the bundled site-packages is missing a
     /// transitive pyannote dep (e.g. `torch_audiomentations` was excluded
     /// by an over-greedy filter in a prior bundle build). Installs the
     /// named module into the user-writable site-packages so the next
-    /// `import pyannote.audio` succeeds. Module names with underscores
-    /// are passed as-is to pip — most pyannote deps use the same name on
-    /// PyPI; pip resolves the canonical project name automatically.
+    /// `import pyannote.audio` succeeds.
     @discardableResult
     static func installMissingModule(pythonPath: String,
                                      userSitePackages: String,
                                      module: String) async throws -> String {
+        let packageName = moduleToPackage[module] ?? module
         let result = try await runPython(
             path: pythonPath,
             arguments: ["-m", "pip", "install",
                         "--target", userSitePackages,
                         "--no-deps", "--only-binary=:all:",
-                        module]
+                        packageName]
         )
         let output = String(data: result.stdout, encoding: .utf8) ?? ""
         guard result.exitCode == 0 else {
@@ -351,19 +363,11 @@ enum SpeakerDiarizer {
 
             try:
                 from pyannote.audio import Pipeline
-            except ModuleNotFoundError as e:
-                # ModuleNotFoundError exposes `.name` — the import that
-                # actually failed. We surface it separately from
-                # "pyannote.audio missing entirely" so the Swift side can
-                # auto-pip-install the specific missing transitive dep
-                # (e.g. a wheel the bundle build filtered out by mistake).
-                if e.name and e.name != "pyannote" and not e.name.startswith("pyannote."):
-                    result["module"] = e.name
-                    _emit("missing_module", f"pyannote.audio import chain missing: {e.name}")
-                else:
-                    _emit("missing_pyannote", f"pyannote.audio not installed: {e}")
             except ImportError as e:
-                _emit("missing_pyannote", f"pyannote.audio not installed: {e}")
+                # Re-raised below by the outer handler; both top-level
+                # "pyannote not installed" and "transitive dep X missing"
+                # land there with consistent code/module population.
+                raise
 
             models_dir = sys.argv[1]
             config_path = os.path.join(models_dir, "config.yaml")
@@ -379,6 +383,22 @@ enum SpeakerDiarizer {
                 result["ok"] = True
             finally:
                 os.unlink(tmp.name)
+        except ModuleNotFoundError as e:
+            # ModuleNotFoundError can surface anywhere — during the
+            # `from pyannote.audio` import OR later inside
+            # Pipeline.from_pretrained when a sub-pipeline lazily imports
+            # something (matplotlib, pandas, sklearn extras). `.name` is
+            # always the offending top-level package. We promote this to a
+            # stable `missing_module` code so Swift can pip-install just
+            # that wheel into the user-writable site-packages and retry.
+            mod = getattr(e, "name", None) or ""
+            if mod and mod != "pyannote" and not mod.startswith("pyannote."):
+                result["module"] = mod
+                result["code"] = "missing_module"
+                result["error"] = f"pyannote dep missing: {mod}"
+            else:
+                result["code"] = "missing_pyannote"
+                result["error"] = f"pyannote.audio not installed: {e}"
         except Exception as e:
             result["code"] = "unknown"
             result["error"] = f"{type(e).__name__}: {e}"
