@@ -1,7 +1,7 @@
 #!/bin/bash
-# Build a distribution DMG from a Release-built IslandWhisper.app.
+# Build a distribution DMG from a Release-built Mila.app.
 #
-# Usage: scripts/make-dmg.sh path/to/IslandWhisper.app IslandWhisper-1.0.0.dmg 1.0.0
+# Usage: scripts/make-dmg.sh path/to/Mila.app Mila-1.0.0.dmg 1.0.0
 #
 # Output: $DMG_PATH (relative or absolute) ready to upload as a GitHub release
 # asset. The app is ad-hoc signed (no Apple Developer ID required) so on first
@@ -38,8 +38,8 @@ ln -s /Applications "$STAGE/Applications"
 CODESIGN_IDENTITY="${CODESIGN_IDENTITY:--}"
 codesign --force --deep --sign "$CODESIGN_IDENTITY" "$STAGE/$(basename "$APP_PATH")"
 
-VOLNAME="IslandWhisper $VERSION"
-TMP_DMG="$(mktemp -t IslandWhisperDMG.XXXXXX).dmg"
+VOLNAME="Mila $VERSION"
+TMP_DMG="$(mktemp -t MilaDMG.XXXXXX).dmg"
 
 rm -f "$DMG_PATH" "$TMP_DMG"
 

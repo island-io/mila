@@ -1,6 +1,6 @@
-name: IslandWhisper
+name: Mila
 options:
-  bundleIdPrefix: io.island.whisper
+  bundleIdPrefix: io.island.mila
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -16,7 +16,7 @@ settings:
     ENABLE_HARDENED_RUNTIME: YES
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
-    PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
+    PRODUCT_BUNDLE_IDENTIFIER: io.island.mila.Mila
     MARKETING_VERSION: "1.3.11"
     CURRENT_PROJECT_VERSION: "23"
 
@@ -28,18 +28,18 @@ packages:
     revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
     
 targets:
-  IslandWhisper:
+  Mila:
     type: application
     platform: macOS
     deploymentTarget: "14.0"
     sources:
-      - path: IslandWhisper
+      - path: Mila
         excludes:
           - "Resources/Info.plist"
-          - "Resources/IslandWhisper.entitlements"
+          - "Resources/Mila.entitlements"
           - "Resources/DiarizationModels"
           - "Resources/PythonRuntime"
-      - path: IslandWhisper/Resources/DiarizationModels
+      - path: Mila/Resources/DiarizationModels
         type: folder
         buildPhase: resources
       # PythonRuntime is produced by `make bundle-diarization`. Treated as
@@ -49,17 +49,17 @@ targets:
       # before invoking xcodebuild. If it's missing, the build proceeds
       # without bundled diarization — SpeakerDiarizer.resolvePython falls
       # back to the user-configured python automatically.
-      - path: IslandWhisper/Resources/PythonRuntime
+      - path: Mila/Resources/PythonRuntime
         type: folder
         buildPhase: resources
         optional: true
     resources:
-      - path: IslandWhisper/Assets.xcassets
+      - path: Mila/Assets.xcassets
     info:
-      path: IslandWhisper/Resources/Info.plist
+      path: Mila/Resources/Info.plist
       properties:
-        CFBundleName: IslandWhisper
-        CFBundleDisplayName: Island Whisper
+        CFBundleName: Mila
+        CFBundleDisplayName: Mila
         # Inherit from settings.MARKETING_VERSION / CURRENT_PROJECT_VERSION above
         # so a release bump only has to change those two fields. Hardcoding here
         # caused v1.2.4 to ship with build 6 instead of 7 — Sparkle's appcast
@@ -70,10 +70,10 @@ targets:
         LSMinimumSystemVersion: "14.0"
         LSApplicationCategoryType: public.app-category.productivity
         NSHumanReadableCopyright: ""
-        NSMicrophoneUsageDescription: "IslandWhisper needs microphone access to record audio for transcription and dictation."
-        NSScreenCaptureUsageDescription: "IslandWhisper needs screen recording permission to capture audio from apps like Zoom."
-        NSAppleEventsUsageDescription: "IslandWhisper uses AppleEvents to paste dictated text into the active app."
-        NSSpeechRecognitionUsageDescription: "IslandWhisper transcribes locally on your Mac; no audio is sent to the cloud."
+        NSMicrophoneUsageDescription: "Mila needs microphone access to record audio for transcription and dictation."
+        NSScreenCaptureUsageDescription: "Mila needs screen recording permission to capture audio from apps like Zoom."
+        NSAppleEventsUsageDescription: "Mila uses AppleEvents to paste dictated text into the active app."
+        NSSpeechRecognitionUsageDescription: "Mila transcribes locally on your Mac; no audio is sent to the cloud."
         NSPrincipalClass: NSApplication
         LSUIElement: false
         # Custom UTI used by the in-app drag-and-drop payload that moves a
@@ -83,17 +83,17 @@ targets:
         # registers nothing at runtime and drops silently no-op (the folder
         # never highlights as a drop target).
         UTExportedTypeDeclarations:
-          - UTTypeIdentifier: io.island.whisper.recording
-            UTTypeDescription: Island Whisper Recording
+          - UTTypeIdentifier: io.island.mila.recording
+            UTTypeDescription: Mila Recording
             UTTypeConformsTo:
               - public.data
             UTTypeTagSpecification: {}
-        SUFeedURL: https://island-whisper-updates.internal.island.io/appcast.xml
+        SUFeedURL: https://island-mila-updates.internal.island.io/appcast.xml
         SUPublicEDKey: iF35blPidKUXIaLr59fJgGGdXtI8AgVNxOx5w+eTieY=
         SUEnableAutomaticChecks: true
         SUScheduledCheckInterval: 86400
     entitlements:
-      path: IslandWhisper/Resources/IslandWhisper.entitlements
+      path: Mila/Resources/Mila.entitlements
       properties:
         com.apple.security.app-sandbox: false
         com.apple.security.device.audio-input: true
@@ -111,36 +111,36 @@ targets:
       base:
         OTHER_LDFLAGS: "$(inherited) -framework Accelerate -framework Metal -framework MetalKit"
 
-  IslandWhisperTests:
+  MilaTests:
     type: bundle.unit-test
     platform: macOS
     deploymentTarget: "14.0"
     sources:
-      - path: IslandWhisperTests
+      - path: MilaTests
     dependencies:
-      - target: IslandWhisper
+      - target: Mila
       - package: TranscriptionCore
         product: TranscriptionCore
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/IslandWhisper.app/Contents/MacOS/IslandWhisper"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Mila.app/Contents/MacOS/Mila"
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperTests
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.mila.MilaTests
 
-  IslandWhisperUITests:
+  MilaUITests:
     type: bundle.ui-testing
     platform: macOS
     deploymentTarget: "14.0"
     sources:
-      - path: IslandWhisperUITests
+      - path: MilaUITests
     dependencies:
-      - target: IslandWhisper
+      - target: Mila
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperUITests
-        TEST_TARGET_NAME: IslandWhisper
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.mila.MilaUITests
+        TEST_TARGET_NAME: Mila
         # Match the host app's ad-hoc signing so the runner app and the
         # injected xctest bundle have the same (empty) Team ID — otherwise
         # macOS rejects the dlopen at test-time with "different Team IDs".

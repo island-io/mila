@@ -40,7 +40,7 @@ jobs:
         id: diar-bundle-cache
         uses: actions/cache@v4
         with:
-          path: IslandWhisper/Resources/PythonRuntime
+          path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
 
       - name: Build diarization bundle (cold path only)
@@ -63,8 +63,8 @@ jobs:
       - name: Resolve Swift Package dependencies
         run: |
           xcodebuild \
-            -project IslandWhisper.xcodeproj \
-            -scheme IslandWhisper \
+            -project Mila.xcodeproj \
+            -scheme Mila \
             -destination 'platform=macOS' \
             -resolvePackageDependencies
 
@@ -72,8 +72,8 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild \
-            -project IslandWhisper.xcodeproj \
-            -scheme IslandWhisper \
+            -project Mila.xcodeproj \
+            -scheme Mila \
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \
@@ -83,8 +83,8 @@ jobs:
         run: |
           set -o pipefail
           xcodebuild \
-            -project IslandWhisper.xcodeproj \
-            -scheme IslandWhisper \
+            -project Mila.xcodeproj \
+            -scheme Mila \
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \

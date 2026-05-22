@@ -1,13 +1,13 @@
 .PHONY: all bootstrap project open build test run clean models help dmg release-build e2e package-test bundle-diarization
 
-XCODEPROJ := IslandWhisper.xcodeproj
-SCHEME := IslandWhisper
+XCODEPROJ := Mila.xcodeproj
+SCHEME := Mila
 DERIVED := build
 RELEASE_DERIVED := build-release
-APP := $(DERIVED)/Build/Products/Debug/IslandWhisper.app
-RELEASE_APP := $(RELEASE_DERIVED)/Build/Products/Release/IslandWhisper.app
-VERSION ?= $(shell /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" IslandWhisper/Resources/Info.plist 2>/dev/null || echo "0.0.0")
-DMG := IslandWhisper-$(VERSION).dmg
+APP := $(DERIVED)/Build/Products/Debug/Mila.app
+RELEASE_APP := $(RELEASE_DERIVED)/Build/Products/Release/Mila.app
+VERSION ?= $(shell /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Mila/Resources/Info.plist 2>/dev/null || echo "0.0.0")
+DMG := Mila-$(VERSION).dmg
 DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
 export DEVELOPER_DIR
 
@@ -20,13 +20,13 @@ help:
 	@echo "  open          - Open the Xcode project"
 	@echo "  build         - Debug build via xcodebuild"
 	@echo "  release-build - Release build into $(RELEASE_DERIVED)"
-	@echo "  test          - Run the IslandWhisperTests XCTest target"
+	@echo "  test          - Run the MilaTests XCTest target"
 	@echo "  run           - Build and launch the app"
-	@echo "  models        - Pre-download both ggml models into ~/Library/Application Support/IslandWhisper/Models"
+	@echo "  models        - Pre-download both ggml models into ~/Library/Application Support/Mila/Models"
 	@echo "  dmg           - Build a release DMG ($(DMG)) suitable for upload"
 	@echo "  e2e           - Run E2E transcription tests (requires ggml-tiny.bin)"
 	@echo "  package-test  - Run TranscriptionCore package unit tests"
-	@echo "  bundle-diarization - Produce the bundled Python + pyannote.audio runtime under IslandWhisper/Resources/PythonRuntime/"
+	@echo "  bundle-diarization - Produce the bundled Python + pyannote.audio runtime under Mila/Resources/PythonRuntime/"
 	@echo "  clean         - Remove generated project and build artifacts"
 
 bootstrap:
@@ -54,15 +54,15 @@ run: build
 	open $(APP)
 
 models:
-	@mkdir -p "$(HOME)/Library/Application Support/IslandWhisper/Models"
+	@mkdir -p "$(HOME)/Library/Application Support/Mila/Models"
 	@echo "Downloading ivrit-ai/whisper-large-v3-ggml (~3GB). Press Ctrl-C to abort."
 	curl -L --fail --progress-bar \
 		"https://huggingface.co/ivrit-ai/whisper-large-v3-ggml/resolve/main/ggml-model.bin" \
-		-o "$(HOME)/Library/Application Support/IslandWhisper/Models/ivrit-ai-whisper-large-v3.bin"
+		-o "$(HOME)/Library/Application Support/Mila/Models/ivrit-ai-whisper-large-v3.bin"
 	@echo "Downloading openai/whisper-large-v3-turbo (~1.6GB). Press Ctrl-C to abort."
 	curl -L --fail --progress-bar \
 		"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin" \
-		-o "$(HOME)/Library/Application Support/IslandWhisper/Models/openai-whisper-large-v3-turbo.bin"
+		-o "$(HOME)/Library/Application Support/Mila/Models/openai-whisper-large-v3-turbo.bin"
 	@echo "Done. Models installed."
 
 dmg: release-build
@@ -77,7 +77,7 @@ e2e:
 package-test:
 	cd Packages/TranscriptionCore && swift test
 
-# Produces IslandWhisper/Resources/PythonRuntime/ — a relocatable Python
+# Produces Mila/Resources/PythonRuntime/ — a relocatable Python
 # 3.11 with pyannote.audio (and deps) pre-installed, minus torch which
 # DiarizationBootstrap downloads at first launch. Cached: re-running is
 # fast if `python-bundle-cache/` is populated. The output is ~150-200 MB
@@ -88,4 +88,4 @@ bundle-diarization:
 	@bash scripts/build-diarization-bundle.sh
 
 clean:
-	rm -rf $(XCODEPROJ) $(DERIVED) $(RELEASE_DERIVED) IslandWhisper-*.dmg
+	rm -rf $(XCODEPROJ) $(DERIVED) $(RELEASE_DERIVED) Mila-*.dmg

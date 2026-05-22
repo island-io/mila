@@ -2,7 +2,7 @@ name: Release
 
 # Triggered by pushing a SemVer tag (e.g. v1.0.0). Builds a Release-config
 # .app, packages it into a DMG via scripts/make-dmg.sh, and attaches the
-# resulting IslandWhisper-<version>.dmg to a GitHub Release.
+# resulting Mila-<version>.dmg to a GitHub Release.
 #
 # To cut a release manually from a clean tree:
 #   git tag v1.2.3 && git push origin v1.2.3
@@ -91,7 +91,7 @@ jobs:
         id: diar-bundle-cache
         uses: actions/cache@v4
         with:
-          path: IslandWhisper/Resources/PythonRuntime
+          path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
 
       - name: Build diarization bundle (cold path only)
@@ -153,9 +153,9 @@ jobs:
         env:
           CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
         run: |
-          DMG="IslandWhisper-${{ steps.version.outputs.version }}.dmg"
+          DMG="Mila-${{ steps.version.outputs.version }}.dmg"
           ./scripts/make-dmg.sh \
-            build-release/Build/Products/Release/IslandWhisper.app \
+            build-release/Build/Products/Release/Mila.app \
             "${DMG}" \
             "${{ steps.version.outputs.version }}"
           ls -la "${DMG}"
@@ -168,17 +168,17 @@ jobs:
           #
           # `grep -oE '/Volumes/.*$'` over the human-readable hdiutil output
           # captures the entire mount path verbatim, including any spaces in
-          # the volume name (make-dmg.sh sets it to "IslandWhisper $VERSION").
+          # the volume name (make-dmg.sh sets it to "Mila $VERSION").
           # The previous `awk '{print $NF}'` parsing only captured the trailing
           # token and looked for the app bundle on a nonexistent path.
           # (per Cursor Bugbot review on PR #1)
           MOUNT=$(hdiutil attach "${DMG}" -nobrowse -noautoopen | grep -oE '/Volumes/.*$' | tail -n1)
-          if [ -z "$MOUNT" ] || [ ! -d "$MOUNT/IslandWhisper.app" ]; then
+          if [ -z "$MOUNT" ] || [ ! -d "$MOUNT/Mila.app" ]; then
             echo "error: failed to resolve DMG mount point (got: '$MOUNT')" >&2
             exit 1
           fi
-          codesign -dvvv "${MOUNT}/IslandWhisper.app" 2>&1 | grep -E "Authority|TeamIdentifier|CDHash"
-          codesign -d -r- "${MOUNT}/IslandWhisper.app" 2>&1 | grep designated
+          codesign -dvvv "${MOUNT}/Mila.app" 2>&1 | grep -E "Authority|TeamIdentifier|CDHash"
+          codesign -d -r- "${MOUNT}/Mila.app" 2>&1 | grep designated
           hdiutil detach "${MOUNT}" -quiet
 
       - name: Package Sparkle ZIP
@@ -198,8 +198,8 @@ jobs:
           # archiver that preserves extended attributes, symlinks, hard
           # links, and resource forks. zip silently drops xattrs which
           # breaks code signatures.
-          APP="build-release/Build/Products/Release/IslandWhisper.app"
-          ZIP="IslandWhisper-${{ steps.version.outputs.version }}.zip"
+          APP="build-release/Build/Products/Release/Mila.app"
+          ZIP="Mila-${{ steps.version.outputs.version }}.zip"
           ditto -c -k --keepParent "$APP" "$ZIP"
           ls -la "$ZIP"
           echo "zip=${ZIP}" >> "$GITHUB_OUTPUT"
@@ -218,15 +218,15 @@ jobs:
       - name: Sign ZIP with Sparkle EdDSA + publish to update server
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-          BUCKET: island-whisper-updates
-          FEED_URL_BASE: https://island-whisper-updates.internal.island.io
+          BUCKET: island-mila-updates
+          FEED_URL_BASE: https://island-mila-updates.internal.island.io
         run: |
           set -euo pipefail
           DMG="${{ steps.dmg.outputs.dmg }}"
           ZIP="${{ steps.zip.outputs.zip }}"
           # Sparkle's CLI tools are checked out by SPM during the release
           # build above, into the derived-data SourcePackages/artifacts/
-          # tree. They are not part of the IslandWhisper.app bundle.
+          # tree. They are not part of the Mila.app bundle.
           SPARKLE_BIN="build-release/SourcePackages/artifacts/sparkle/Sparkle/bin"
 
           # `sign_update --ed-key-file -` reads the EdDSA private key from
@@ -270,11 +270,11 @@ jobs:
           aws s3 cp "$DMG" "s3://${BUCKET}/${DMG}" \
             --content-type application/octet-stream
           # Also publish under a stable "latest" name so people can link to
-          # https://island-whisper-updates.internal.island.io/IslandWhisper-latest.dmg
+          # https://island-mila-updates.internal.island.io/Mila-latest.dmg
           # and always get the newest build without infra changes (no
           # CloudFront redirect, no S3 website routing). Server-side copy
           # so we don't pay to upload twice.
-          aws s3 cp "s3://${BUCKET}/${DMG}" "s3://${BUCKET}/IslandWhisper-latest.dmg" \
+          aws s3 cp "s3://${BUCKET}/${DMG}" "s3://${BUCKET}/Mila-latest.dmg" \
             --content-type application/octet-stream \
             --cache-control "max-age=300, must-revalidate" \
             --metadata "source-version=${{ steps.version.outputs.version }}" \
@@ -296,6 +296,6 @@ jobs:
             gh release upload "$TAG" "$DMG" --clobber
           else
             gh release create "$TAG" "$DMG" \
-              --title "IslandWhisper ${{ steps.version.outputs.version }}" \
+              --title "Mila ${{ steps.version.outputs.version }}" \
               --generate-notes
           fi

@@ -2,7 +2,7 @@
 # build-diarization-bundle.sh
 #
 # Build a self-contained Python + pyannote.audio runtime tree that can be
-# bundled into IslandWhisper.app/Contents/Resources/PythonRuntime/ for offline
+# bundled into Mila.app/Contents/Resources/PythonRuntime/ for offline
 # speaker diarization.
 #
 # Strategy:
@@ -56,7 +56,7 @@ PIP_IMPLEMENTATION="cp"
 # ---- Paths -----------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-DEFAULT_OUTPUT_DIR="$REPO_ROOT/IslandWhisper/Resources/PythonRuntime"
+DEFAULT_OUTPUT_DIR="$REPO_ROOT/Mila/Resources/PythonRuntime"
 CACHE_DIR="$REPO_ROOT/build/python-bundle-cache"
 
 OUTPUT_DIR="$DEFAULT_OUTPUT_DIR"
@@ -456,7 +456,7 @@ log "writing MANIFEST.txt"
 # trees with many files (avoids argv limits in stat/xargs).
 TOTAL_BYTES="$(/usr/bin/du -k -s "$STAGING_DIR/python" | awk '{print $1 * 1024}')"
 {
-    echo "IslandWhisper PythonRuntime bundle"
+    echo "Mila PythonRuntime bundle"
     echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
     echo "Build host arch: $(uname -m)"
     echo "Build host macOS: $(sw_vers -productVersion 2>/dev/null || echo unknown)"

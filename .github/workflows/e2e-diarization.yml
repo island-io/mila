@@ -4,14 +4,14 @@ on:
   push:
     branches: [main]
     paths:
-      - 'IslandWhisper/Transcription/SpeakerDiarizer.swift'
-      - 'IslandWhisper/Resources/DiarizationModels/**'
+      - 'Mila/Transcription/SpeakerDiarizer.swift'
+      - 'Mila/Resources/DiarizationModels/**'
       - 'scripts/diarize-e2e.py'
       - '.github/workflows/e2e-diarization.yml'
   pull_request:
     paths:
-      - 'IslandWhisper/Transcription/SpeakerDiarizer.swift'
-      - 'IslandWhisper/Resources/DiarizationModels/**'
+      - 'Mila/Transcription/SpeakerDiarizer.swift'
+      - 'Mila/Resources/DiarizationModels/**'
       - 'scripts/diarize-e2e.py'
       - '.github/workflows/e2e-diarization.yml'
 
@@ -56,6 +56,6 @@ jobs:
       - name: Diarize fixture
         run: |
           ~/diar-venv/bin/python scripts/diarize-e2e.py \
-            IslandWhisper/Resources/DiarizationModels \
+            Mila/Resources/DiarizationModels \
             Packages/TranscriptionCore/Fixtures/en_meeting_notes.wav \
             --min-turns 1

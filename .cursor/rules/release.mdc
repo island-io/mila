@@ -1,10 +1,10 @@
 ---
-description: Cut a new IslandWhisper release (build, tag, upload DMG to GitHub).
+description: Cut a new Mila release (build, tag, upload DMG to GitHub).
 globs:
 alwaysApply: false
 ---
 
-# Releasing IslandWhisper
+# Releasing Mila
 
 This is the canonical release SOP. Follow it whenever the user asks for a new
 release ("release v1.2.0", "cut a new version", "ship the latest as v…").
@@ -29,7 +29,7 @@ Before tagging:
 - [ ] `make test` passes locally.
 - [ ] Version is bumped in **one** place: `project.yml`'s top-level
       `settings.base.MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`. Both
-      `IslandWhisper/Resources/Info.plist` and the target's `info.properties`
+      `Mila/Resources/Info.plist` and the target's `info.properties`
       block use `$(MARKETING_VERSION)` / `$(CURRENT_PROJECT_VERSION)` so they
       inherit automatically — do **not** hardcode literals in either place
       (a stale literal caused v1.2.4 to ship with build 6 instead of 7,
@@ -43,7 +43,7 @@ Before tagging:
       it) — keep it that way; reading the unprocessed plist gave us
       `sparkle:version=""` for v1.2.5 and broke the appcast.
 - [ ] If the model catalog changed, the size + URL fields in
-      `IslandWhisper/Transcription/ModelManager.swift` reflect reality.
+      `Mila/Transcription/ModelManager.swift` reflect reality.
 
 ## Cutting the release
 
@@ -74,7 +74,7 @@ automatically. Watch it via `gh run watch`.
 ```bash
 # 1. Bump version files (same as above).
 make clean
-make dmg                       # produces IslandWhisper-<version>.dmg
+make dmg                       # produces Mila-<version>.dmg
 
 # 2. Tag and push:
 git tag v<NEW_VERSION>
@@ -82,8 +82,8 @@ git push origin v<NEW_VERSION>
 
 # 3. Create the release and attach the DMG.
 gh release create v<NEW_VERSION> \
-    "IslandWhisper-<NEW_VERSION>.dmg" \
-    --title "IslandWhisper <NEW_VERSION>" \
+    "Mila-<NEW_VERSION>.dmg" \
+    --title "Mila <NEW_VERSION>" \
     --generate-notes
 ```
 

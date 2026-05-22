@@ -1,4 +1,4 @@
-# Island Whisper
+# Mila
 
 A native macOS app that records, dictates, and transcribes locally on your Mac
 — no audio leaves the device. Hebrew transcription is powered by the
@@ -35,7 +35,7 @@ From the project root:
 
 ```bash
 make bootstrap   # one time: installs xcodegen via brew if missing
-make project     # generates IslandWhisper.xcodeproj from project.yml
+make project     # generates Mila.xcodeproj from project.yml
 make open        # opens Xcode
 ```
 
@@ -69,7 +69,7 @@ make models
 Models live at:
 
 ```
-~/Library/Application Support/IslandWhisper/Models/
+~/Library/Application Support/Mila/Models/
     ivrit-ai-whisper-large-v3.bin
     openai-whisper-large-v3-turbo.bin
 ```
@@ -99,8 +99,8 @@ placeholder is configured and discarded.
 ## Project layout
 
 ```
-IslandWhisper/
-├── App/IslandWhisperApp.swift          # SwiftUI @main entry + AppDelegate
+Mila/
+├── App/MilaApp.swift          # SwiftUI @main entry + AppDelegate
 ├── Audio/
 │   ├── AudioUtilities.swift            # Conversion to 16k mono Float32
 │   ├── MicrophoneRecorder.swift        # AVAudioEngine input tap
@@ -117,7 +117,7 @@ IslandWhisper/
 ├── Models/Recording*.swift             # Persisted recording metadata
 └── Resources/
     ├── Info.plist
-    └── IslandWhisper.entitlements
+    └── Mila.entitlements
 Packages/WhisperBinary/                 # SPM wrapper for whisper.cpp xcframework
 scripts/make-dmg.sh                     # Builds a release DMG for distribution
 ```
@@ -129,9 +129,9 @@ SOP for cutting a new release. TL;DR:
 
 ```bash
 # 1. Bump the version in project.yml + Info.plist
-# 2. make dmg                       # builds IslandWhisper-<version>.dmg
+# 2. make dmg                       # builds Mila-<version>.dmg
 # 3. git tag v<version> && git push origin v<version>
-# 4. gh release create v<version> IslandWhisper-<version>.dmg
+# 4. gh release create v<version> Mila-<version>.dmg
 ```
 
 ## Code signing notes

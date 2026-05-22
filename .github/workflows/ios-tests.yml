@@ -4,16 +4,16 @@ on:
   push:
     branches: [main]
     paths:
-      - 'IslandWhisper/**'
-      - 'IslandWhisperTests/**'
-      - 'IslandWhisperUITests/**'
+      - 'Mila/**'
+      - 'MilaTests/**'
+      - 'MilaUITests/**'
       - 'project.yml'
       - '.github/workflows/ios-tests.yml'
   pull_request:
     paths:
-      - 'IslandWhisper/**'
-      - 'IslandWhisperTests/**'
-      - 'IslandWhisperUITests/**'
+      - 'Mila/**'
+      - 'MilaTests/**'
+      - 'MilaUITests/**'
       - 'project.yml'
       - '.github/workflows/ios-tests.yml'
 
@@ -43,7 +43,7 @@ jobs:
         id: diar-bundle-cache
         uses: actions/cache@v4
         with:
-          path: IslandWhisper/Resources/PythonRuntime
+          path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
 
       - name: Build diarization bundle (cold path only)
@@ -58,13 +58,13 @@ jobs:
           # fails by design until the user enables diarization. Verify
           # via dist-info metadata instead — it confirms pyannote was
           # installed without triggering the torch import.
-          BUNDLED=IslandWhisper/Resources/PythonRuntime/python/bin/python3.11
+          BUNDLED=Mila/Resources/PythonRuntime/python/bin/python3.11
           "$BUNDLED" --version
-          PYTHONPATH=IslandWhisper/Resources/PythonRuntime/python/site-packages \
+          PYTHONPATH=Mila/Resources/PythonRuntime/python/site-packages \
             "$BUNDLED" -c "from importlib.metadata import version; print('pyannote.audio:', version('pyannote.audio')); print('numpy:', version('numpy')); print('scipy:', version('scipy'))"
           # pyannote.core is a separate package without a torch dep, so
           # importing it does work and confirms the path is correct.
-          PYTHONPATH=IslandWhisper/Resources/PythonRuntime/python/site-packages \
+          PYTHONPATH=Mila/Resources/PythonRuntime/python/site-packages \
             "$BUNDLED" -c "import pyannote.core; print('pyannote.core importable')"
 
       - name: Generate Xcode project
@@ -82,8 +82,8 @@ jobs:
 
       - name: Resolve SwiftPM dependencies
         run: |
-          xcodebuild -project IslandWhisper.xcodeproj \
-            -scheme IslandWhisper \
+          xcodebuild -project Mila.xcodeproj \
+            -scheme Mila \
             -derivedDataPath build \
             -destination 'platform=macOS' \
             -resolvePackageDependencies
@@ -91,12 +91,12 @@ jobs:
       - name: Run unit tests
         run: |
           set -o pipefail
-          xcodebuild -project IslandWhisper.xcodeproj \
-            -scheme IslandWhisper \
+          xcodebuild -project Mila.xcodeproj \
+            -scheme Mila \
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \
-            -only-testing:IslandWhisperTests \
+            -only-testing:MilaTests \
             test 2>&1 | tail -200
 
       - name: Run UI tests
@@ -104,12 +104,12 @@ jobs:
         # foreground session. macos-14 runners provide one by default.
         run: |
           set -o pipefail
-          xcodebuild -project IslandWhisper.xcodeproj \
-            -scheme IslandWhisper \
+          xcodebuild -project Mila.xcodeproj \
+            -scheme Mila \
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \
-            -only-testing:IslandWhisperUITests \
+            -only-testing:MilaUITests \
             test 2>&1 | tail -300
 
       - name: Upload test results on failure

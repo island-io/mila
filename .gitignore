@@ -16,11 +16,11 @@ default.profraw
 *.profdata
 
 # Distribution
-IslandWhisper-*.dmg
+Mila-*.dmg
 
 # Generated diarization Python runtime bundle (built by scripts/build-diarization-bundle.sh,
 # distributed via GitHub release asset; do NOT commit ~150 MB into git)
-IslandWhisper/Resources/PythonRuntime/
+Mila/Resources/PythonRuntime/
 
 # macOS
 .DS_Store

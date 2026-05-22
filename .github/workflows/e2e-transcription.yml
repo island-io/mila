@@ -5,13 +5,13 @@ on:
     branches: [main]
     paths:
       - 'Packages/TranscriptionCore/**'
-      - 'IslandWhisper/Transcription/**'
+      - 'Mila/Transcription/**'
       - '.github/workflows/e2e-transcription.yml'
       - '.github/whisper-cpp-pin.txt'
   pull_request:
     paths:
       - 'Packages/TranscriptionCore/**'
-      - 'IslandWhisper/Transcription/**'
+      - 'Mila/Transcription/**'
       - '.github/workflows/e2e-transcription.yml'
       - '.github/whisper-cpp-pin.txt'
 

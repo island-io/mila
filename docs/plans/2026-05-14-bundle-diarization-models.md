@@ -13,29 +13,29 @@
 ### Task 1: Copy model files into Resources
 
 **Files:**
-- Create: `IslandWhisper/Resources/DiarizationModels/config.yaml`
-- Create: `IslandWhisper/Resources/DiarizationModels/segmentation-3.0/pytorch_model.bin`
-- Create: `IslandWhisper/Resources/DiarizationModels/wespeaker-voxceleb-resnet34-LM/pytorch_model.bin`
+- Create: `Mila/Resources/DiarizationModels/config.yaml`
+- Create: `Mila/Resources/DiarizationModels/segmentation-3.0/pytorch_model.bin`
+- Create: `Mila/Resources/DiarizationModels/wespeaker-voxceleb-resnet34-LM/pytorch_model.bin`
 
 **Step 1: Create the directory structure and copy files**
 
 ```bash
-mkdir -p IslandWhisper/Resources/DiarizationModels/segmentation-3.0
-mkdir -p IslandWhisper/Resources/DiarizationModels/wespeaker-voxceleb-resnet34-LM
+mkdir -p Mila/Resources/DiarizationModels/segmentation-3.0
+mkdir -p Mila/Resources/DiarizationModels/wespeaker-voxceleb-resnet34-LM
 
 # Copy model weights from HF cache
 cp ~/.cache/huggingface/hub/models--pyannote--segmentation-3.0/snapshots/*/pytorch_model.bin \
-   IslandWhisper/Resources/DiarizationModels/segmentation-3.0/
+   Mila/Resources/DiarizationModels/segmentation-3.0/
 
 cp ~/.cache/huggingface/hub/models--pyannote--wespeaker-voxceleb-resnet34-LM/snapshots/*/pytorch_model.bin \
-   IslandWhisper/Resources/DiarizationModels/wespeaker-voxceleb-resnet34-LM/
+   Mila/Resources/DiarizationModels/wespeaker-voxceleb-resnet34-LM/
 ```
 
 **Step 2: Create modified config.yaml**
 
 The original config.yaml references sub-models by HF ID (`pyannote/segmentation-3.0`, `pyannote/wespeaker-voxceleb-resnet34-LM`). We need placeholders that the Python script will replace at runtime with the actual bundle paths.
 
-Write `IslandWhisper/Resources/DiarizationModels/config.yaml`:
+Write `Mila/Resources/DiarizationModels/config.yaml`:
 
 ```yaml
 version: 3.1.0
@@ -62,7 +62,7 @@ params:
 **Step 3: Commit**
 
 ```bash
-git add IslandWhisper/Resources/DiarizationModels/
+git add Mila/Resources/DiarizationModels/
 git commit -m "feat: add bundled pyannote diarization model weights"
 ```
 
@@ -75,12 +75,12 @@ git commit -m "feat: add bundled pyannote diarization model weights"
 
 **Step 1: Add the DiarizationModels resource path**
 
-In `project.yml`, under the `resources:` key for the IslandWhisper target, add:
+In `project.yml`, under the `resources:` key for the Mila target, add:
 
 ```yaml
     resources:
-      - path: IslandWhisper/Assets.xcassets
-      - path: IslandWhisper/Resources/DiarizationModels
+      - path: Mila/Assets.xcassets
+      - path: Mila/Resources/DiarizationModels
 ```
 
 **Step 2: Regenerate the Xcode project**
@@ -92,7 +92,7 @@ xcodegen generate
 **Step 3: Verify the models appear in the generated project**
 
 ```bash
-grep -r "DiarizationModels" IslandWhisper.xcodeproj/project.pbxproj | head -5
+grep -r "DiarizationModels" Mila.xcodeproj/project.pbxproj | head -5
 ```
 
 Expected: lines showing DiarizationModels files in the build resources.
@@ -100,7 +100,7 @@ Expected: lines showing DiarizationModels files in the build resources.
 **Step 4: Commit**
 
 ```bash
-git add project.yml IslandWhisper.xcodeproj/
+git add project.yml Mila.xcodeproj/
 git commit -m "build: include diarization models in app bundle resources"
 ```
 
@@ -109,7 +109,7 @@ git commit -m "build: include diarization models in app bundle resources"
 ### Task 3: Update SpeakerDiarizer.diarize to load from bundle
 
 **Files:**
-- Modify: `IslandWhisper/Transcription/SpeakerDiarizer.swift:79-138`
+- Modify: `Mila/Transcription/SpeakerDiarizer.swift:79-138`
 
 **Step 1: Add a helper to resolve the bundle models path**
 
@@ -217,7 +217,7 @@ Note: no `HF_TOKEN` in environment any more.
 **Step 5: Commit**
 
 ```bash
-git add IslandWhisper/Transcription/SpeakerDiarizer.swift
+git add Mila/Transcription/SpeakerDiarizer.swift
 git commit -m "feat: load diarization pipeline from bundled models"
 ```
 
@@ -226,7 +226,7 @@ git commit -m "feat: load diarization pipeline from bundled models"
 ### Task 4: Remove HF token from DiarizationSettings
 
 **Files:**
-- Modify: `IslandWhisper/Models/DiarizationSettings.swift`
+- Modify: `Mila/Models/DiarizationSettings.swift`
 
 **Step 1: Remove the hfToken property and all token-related logic**
 
@@ -290,7 +290,7 @@ private func restoreVerifiedState() {
 **Step 3: Commit**
 
 ```bash
-git add IslandWhisper/Models/DiarizationSettings.swift
+git add Mila/Models/DiarizationSettings.swift
 git commit -m "refactor: remove HF token from diarization settings"
 ```
 
@@ -299,7 +299,7 @@ git commit -m "refactor: remove HF token from diarization settings"
 ### Task 5: Update SpeakerDiarizer.verifySetup to skip model access checks
 
 **Files:**
-- Modify: `IslandWhisper/Transcription/SpeakerDiarizer.swift:140-210`
+- Modify: `Mila/Transcription/SpeakerDiarizer.swift:140-210`
 
 **Step 1: Remove hfToken parameter and model access checks**
 
@@ -368,7 +368,7 @@ let result = try await SpeakerDiarizer.verifySetup(pythonPath: pythonPath)
 **Step 4: Commit**
 
 ```bash
-git add IslandWhisper/Transcription/SpeakerDiarizer.swift IslandWhisper/Models/DiarizationSettings.swift
+git add Mila/Transcription/SpeakerDiarizer.swift Mila/Models/DiarizationSettings.swift
 git commit -m "refactor: simplify verifySetup — models are bundled"
 ```
 
@@ -377,7 +377,7 @@ git commit -m "refactor: simplify verifySetup — models are bundled"
 ### Task 6: Remove token UI from SettingsView
 
 **Files:**
-- Modify: `IslandWhisper/Views/SettingsView.swift:479-748`
+- Modify: `Mila/Views/SettingsView.swift:479-748`
 
 **Step 1: Remove the entire tokenSection view**
 
@@ -453,7 +453,7 @@ Text("Identify who is speaking in your recordings. Speaker models are included �
 **Step 7: Commit**
 
 ```bash
-git add IslandWhisper/Views/SettingsView.swift
+git add Mila/Views/SettingsView.swift
 git commit -m "ui: remove HF token from diarization settings, simplify setup flow"
 ```
 
@@ -462,7 +462,7 @@ git commit -m "ui: remove HF token from diarization settings, simplify setup flo
 ### Task 7: Update TranscriptionService caller
 
 **Files:**
-- Modify: `IslandWhisper/Transcription/TranscriptionService.swift:236-248`
+- Modify: `Mila/Transcription/TranscriptionService.swift:236-248`
 
 **Step 1: Remove hfToken from the diarize call**
 
@@ -503,7 +503,7 @@ let turns = try await SpeakerDiarizer.diarize(
 **Step 2: Commit**
 
 ```bash
-git add IslandWhisper/Transcription/TranscriptionService.swift
+git add Mila/Transcription/TranscriptionService.swift
 git commit -m "refactor: remove hfToken from diarize call"
 ```
 
@@ -512,12 +512,12 @@ git commit -m "refactor: remove hfToken from diarize call"
 ### Task 8: Update tests
 
 **Files:**
-- Modify: `IslandWhisperTests/` — any tests referencing `hfToken`
+- Modify: `MilaTests/` — any tests referencing `hfToken`
 
 **Step 1: Find and update test references**
 
 ```bash
-grep -rn "hfToken\|hf_token\|HF_TOKEN" IslandWhisperTests/
+grep -rn "hfToken\|hf_token\|HF_TOKEN" MilaTests/
 ```
 
 Update any test that passes `hfToken` to `DiarizationSettings` or `SpeakerDiarizer` methods to remove that parameter.
@@ -533,7 +533,7 @@ Expected: all tests pass.
 **Step 3: Commit**
 
 ```bash
-git add IslandWhisperTests/
+git add MilaTests/
 git commit -m "test: update tests for token-free diarization"
 ```
 
@@ -542,13 +542,13 @@ git commit -m "test: update tests for token-free diarization"
 ### Task 9: Clean up KeychainHelper token references
 
 **Files:**
-- Modify: `IslandWhisper/Models/DiarizationSettings.swift` (already done in Task 4)
+- Modify: `Mila/Models/DiarizationSettings.swift` (already done in Task 4)
 - Check: Any other files referencing `diarization.hfToken` or `diarization.verifiedToken` keychain keys
 
 **Step 1: Search for remaining token references**
 
 ```bash
-grep -rn "hfToken\|hf_token\|HF_TOKEN\|verifiedToken" IslandWhisper/
+grep -rn "hfToken\|hf_token\|HF_TOKEN\|verifiedToken" Mila/
 ```
 
 Remove any remaining references not caught in earlier tasks.
@@ -556,7 +556,7 @@ Remove any remaining references not caught in earlier tasks.
 **Step 2: Build and run**
 
 ```bash
-xcodegen generate && xcodebuild -scheme IslandWhisper build
+xcodegen generate && xcodebuild -scheme Mila build
 ```
 
 **Step 3: Commit if changes**
@@ -576,7 +576,7 @@ git add -A && git commit -m "chore: clean up remaining HF token references"
 
 - Remove mention of `HF_TOKEN` env var in Python Subprocess Integration section
 - Update the Python / PyTorch Compatibility Patches section if needed
-- Note that diarization models are bundled in `IslandWhisper/Resources/DiarizationModels/`
+- Note that diarization models are bundled in `Mila/Resources/DiarizationModels/`
 
 **Step 2: Commit**
 

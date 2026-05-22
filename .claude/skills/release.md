@@ -1,11 +1,11 @@
 ---
 name: release-islandwhisper
-description: Use when the user asks to release, ship, cut a version, or tag a release of IslandWhisper. Triggers on "release", "cut a release", "ship it", "tag a version", "make a DMG", "push a release". Only applies when working directory is the IslandWhisper repo.
+description: Use when the user asks to release, ship, cut a version, or tag a release of Mila. Triggers on "release", "cut a release", "ship it", "tag a version", "make a DMG", "push a release". Only applies when working directory is the Mila repo.
 ---
 
-# Release IslandWhisper
+# Release Mila
 
-Automates the full release SOP for IslandWhisper. Handles pre-flight checks, PR merge, tagging, and release workflow monitoring.
+Automates the full release SOP for Mila. Handles pre-flight checks, PR merge, tagging, and release workflow monitoring.
 
 ## Pre-flight
 
@@ -46,7 +46,7 @@ If CI is unavailable, build locally:
 ```
 make clean && make dmg
 git tag v<VERSION> && git push origin v<VERSION>
-gh release create v<VERSION> "IslandWhisper-<VERSION>.dmg" --title "IslandWhisper <VERSION>" --generate-notes
+gh release create v<VERSION> "Mila-<VERSION>.dmg" --title "Mila <VERSION>" --generate-notes
 ```
 
 ## Important
