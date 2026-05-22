@@ -59,6 +59,10 @@ struct HomeView: View {
             HomeTile(icon: "speaker.wave.3.fill", label: "App Audio") {
                 Task { await actions.presentAppPicker() }
             }
+
+            HomeTile(icon: "captions.bubble", label: "Subtitle Video…") {
+                Task { await actions.subtitleVideo() }
+            }
         }
     }
 

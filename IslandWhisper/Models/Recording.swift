@@ -52,6 +52,11 @@ struct Recording: Identifiable, Codable, Hashable {
     var deletedAt: Date?
     /// User-assigned folder. nil = unfiled. Flat namespace (no nesting).
     var folder: String?
+    /// The captured app's name when the recording came from an app-audio
+    /// (or meeting) capture — used to surface a Zoom-specific badge for
+    /// Zoom recordings without re-deriving from the title. nil for
+    /// microphone-only or system-wide system-audio captures.
+    var appName: String?
 
     init(id: UUID = UUID(),
          title: String,
@@ -65,7 +70,8 @@ struct Recording: Identifiable, Codable, Hashable {
          segments: [TranscriptSegment] = [],
          fullText: String = "",
          deletedAt: Date? = nil,
-         folder: String? = nil) {
+         folder: String? = nil,
+         appName: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -79,6 +85,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.fullText = fullText
         self.deletedAt = deletedAt
         self.folder = folder
+        self.appName = appName
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -92,7 +99,7 @@ struct Recording: Identifiable, Codable, Hashable {
 
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
-             status, language, modelName, segments, deletedAt, folder
+             status, language, modelName, segments, deletedAt, folder, appName
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -112,6 +119,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.segments = try c.decodeIfPresent([TranscriptSegment].self, forKey: .segments) ?? []
         self.deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         self.folder = try c.decodeIfPresent(String.self, forKey: .folder)
+        self.appName = try c.decodeIfPresent(String.self, forKey: .appName)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -131,11 +139,23 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encode(segments, forKey: .segments)
         try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
         try c.encodeIfPresent(folder, forKey: .folder)
+        try c.encodeIfPresent(appName, forKey: .appName)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
+    }
+
+    /// True when the captured app appears to be Zoom (zoom.us / Zoom).
+    /// Used by list rows to surface a Zoom-specific badge. Falls back to a
+    /// title-substring check so app-audio recordings imported before we
+    /// started persisting `appName` still get the badge.
+    var isZoomRecording: Bool {
+        if let name = appName?.lowercased(), name.contains("zoom") {
+            return true
+        }
+        return title.lowercased().contains("zoom")
     }
 }
 
-/// Categories used by the sidebar. Matches the History grouping.
+/// Categories used by the sidebar.
 enum HistoryCategory: String, CaseIterable, Identifiable, Hashable {
     case transcriptions   // any non-deleted recording with a transcript
     case meetings         // source == .meeting

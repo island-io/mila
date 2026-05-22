@@ -46,5 +46,20 @@
 	<string>iF35blPidKUXIaLr59fJgGGdXtI8AgVNxOx5w+eTieY=</string>
 	<key>SUScheduledCheckInterval</key>
 	<integer>86400</integer>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.data</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Island Whisper Recording</string>
+			<key>UTTypeIdentifier</key>
+			<string>io.island.whisper.recording</string>
+			<key>UTTypeTagSpecification</key>
+			<dict/>
+		</dict>
+	</array>
 </dict>
 </plist>

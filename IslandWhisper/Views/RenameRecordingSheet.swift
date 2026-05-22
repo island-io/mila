@@ -19,6 +19,11 @@ struct RenameRecordingSheet: View {
     /// One-shot guard so the auto-suggest doesn't re-fire every time the
     /// store publishes (transcript edits, status flips, etc.).
     @State private var didAutoSuggest = false
+    /// Persists the user's "show prompts" preference across sheet sessions.
+    /// Most people glance at the prompt once and then collapse it; we
+    /// remember that choice so the disclosure doesn't snap open every time
+    /// the rename sheet appears.
+    @AppStorage("rename.showLLMPrompts") private var showLLMPrompts: Bool = false
 
     init(initialRecording: Recording) {
         self.initialRecording = initialRecording
@@ -89,6 +94,10 @@ struct RenameRecordingSheet: View {
 
             transcriptionStatus
 
+            if llm.isConfigured {
+                llmPromptDisclosure
+            }
+
             if let llmError {
                 Text(llmError)
                     .font(.callout)
@@ -151,6 +160,76 @@ struct RenameRecordingSheet: View {
             coordinator.clearLLM(for: recordingID)
         }
         coordinator.trackLLM(task, for: recordingID)
+    }
+
+    /// Collapsible block that shows the LLM prompt(s) the buttons in this
+    /// sheet will send. Surfaces what's about to be done with the transcript
+    /// (helpful for first-time users + when you forget what prompt you saved
+    /// in Settings) without cluttering the sheet for daily-driver users —
+    /// they keep it collapsed and the chevron rotates as a hint.
+    private var llmPromptDisclosure: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    showLLMPrompts.toggle()
+                }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .rotationEffect(.degrees(showLLMPrompts ? 90 : 0))
+                    Image(systemName: "sparkles")
+                        .font(.caption)
+                        .foregroundStyle(.tint)
+                    Text(showLLMPrompts
+                         ? "Hide \(llm.tool.displayName) prompt"
+                         : "Show \(llm.tool.displayName) prompt")
+                        .font(.callout.weight(.medium))
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("rename.llmprompt.toggle")
+
+            if showLLMPrompts {
+                VStack(alignment: .leading, spacing: 10) {
+                    if llm.nameGenerationEnabled {
+                        promptBlock(label: "Suggest name",
+                                    text: llm.namePrompt)
+                    }
+                    if llm.postActionEnabled {
+                        promptBlock(label: "Send to \(llm.tool.displayName)",
+                                    text: llm.postActionPrompt)
+                    }
+                    if !llm.nameGenerationEnabled && !llm.postActionEnabled {
+                        Text("No prompts enabled. Turn on Suggest a name or Run an action in Settings → LLM.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.leading, 18)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
+    }
+
+    private func promptBlock(label: String, text: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text(text.isEmpty ? "(empty)" : text)
+                .font(.system(.callout, design: .monospaced))
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.primary.opacity(0.04),
+                            in: RoundedRectangle(cornerRadius: 6))
+                .textSelection(.enabled)
+        }
     }
 
     private var header: some View {

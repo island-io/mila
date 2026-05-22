@@ -150,10 +150,64 @@ final class QuickActionsControllerTests: XCTestCase {
                        "English-tagged recording must be transcribed with the OpenAI model")
     }
 
+    // MARK: - Silence watch
+
+    func test_silence_watch_returns_true_when_level_never_crosses_threshold() async {
+        let result = await QuickActionsController.silenceWatch(
+            totalSeconds: 0.2,
+            threshold: 0.5,
+            pollIntervalSeconds: 0.02,
+            levelProvider: { 0.0 }
+        )
+        XCTAssertTrue(result, "Constant-zero level over the full window should report silent")
+    }
+
+    func test_silence_watch_returns_false_as_soon_as_level_crosses_threshold() async {
+        // Counter increases each poll; level crosses threshold on poll #3.
+        let counter = SilenceCounter()
+        let result = await QuickActionsController.silenceWatch(
+            totalSeconds: 0.5,
+            threshold: 0.5,
+            pollIntervalSeconds: 0.02,
+            levelProvider: { @MainActor in
+                let i = counter.tick()
+                return i >= 3 ? 0.9 : 0.1
+            }
+        )
+        XCTAssertFalse(result,
+                       "A level reading at or above threshold should break out without warning")
+    }
+
+    func test_silence_watch_returns_false_when_threshold_is_met_exactly() async {
+        let result = await QuickActionsController.silenceWatch(
+            totalSeconds: 0.1,
+            threshold: 0.05,
+            pollIntervalSeconds: 0.02,
+            levelProvider: { 0.05 }
+        )
+        XCTAssertFalse(result, "level >= threshold (not strictly greater) must satisfy")
+    }
+
+    func test_controller_starts_with_warning_flag_false() {
+        XCTAssertFalse(controller.noSoundWarningShown)
+        XCTAssertEqual(controller.silenceWatchSeconds, 10)
+        XCTAssertGreaterThan(controller.silenceWatchLevelThreshold, 0)
+    }
+
     /// Explicit reproduction of the user-reported bug: enqueue, then
     /// "make a new recording" while the first is still transcribing — the
     /// second must end up with its own transcript, not stay stuck on the
     /// previous one.
+    /// MainActor-isolated counter for the silence-watch test — the
+    /// levelProvider closure runs on the main actor so the counter has to
+    /// be reachable from there. Plain `var` on the test would fire an
+    /// isolation warning under strict concurrency.
+    @MainActor
+    private final class SilenceCounter {
+        private var value = 0
+        func tick() -> Int { value += 1; return value }
+    }
+
     func test_user_bug_repro_second_recording_after_first_started_transcribing() async throws {
         let first = tempRoot.appendingPathComponent("recording-A.wav")
         let second = tempRoot.appendingPathComponent("recording-B.wav")

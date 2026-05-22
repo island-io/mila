@@ -251,6 +251,19 @@ final class RecordingStoreTests: XCTestCase {
         XCTAssertNil(reloaded.recordings.first?.folder)
     }
 
+    func test_unfiled_recordings_returns_only_unfiled_non_trashed() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let unfiled = Recording(title: "A", source: .microphone, audioFileName: "a.wav")
+        let filed = Recording(title: "B", source: .microphone, audioFileName: "b.wav")
+        let trashed = Recording(title: "C", source: .microphone, audioFileName: "c.wav")
+        store.add(unfiled); store.add(filed); store.add(trashed)
+        store.assign(filed, toFolder: "Work")
+        store.softDelete(trashed)
+
+        let result = store.unfiledRecordings()
+        XCTAssertEqual(result.map(\.id), [unfiled.id])
+    }
+
     func test_load_seeds_folders_from_recordings_when_folders_file_missing() throws {
         // Simulates a recordings.json that already references a folder name
         // (e.g. after restoring from backup, or hand-editing the JSON).

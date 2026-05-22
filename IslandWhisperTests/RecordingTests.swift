@@ -75,6 +75,70 @@ final class RecordingTests: XCTestCase {
         }
     }
 
+    func test_is_zoom_recording_detects_app_name() {
+        let zoomByApp = Recording(
+            title: "Standup · Apr 1",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "zoom.us"
+        )
+        XCTAssertTrue(zoomByApp.isZoomRecording)
+
+        let zoomByTitle = Recording(
+            title: "Zoom · Yesterday",
+            source: .systemAudio,
+            audioFileName: "x.wav"
+        )
+        XCTAssertTrue(zoomByTitle.isZoomRecording,
+                      "Legacy recordings without appName should still match via title prefix")
+
+        let unrelated = Recording(
+            title: "Voice Memo",
+            source: .microphone,
+            audioFileName: "x.wav"
+        )
+        XCTAssertFalse(unrelated.isZoomRecording)
+    }
+
+    func test_appName_round_trips_through_codable() throws {
+        let original = Recording(
+            title: "Standup",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "zoom.us"
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(original)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Recording.self, from: data)
+        XCTAssertEqual(decoded.appName, "zoom.us")
+    }
+
+    func test_legacy_records_without_appName_decode_with_nil() throws {
+        // Existing on-disk recordings predate `appName`; decoding must
+        // treat the missing key as nil rather than throwing.
+        let legacy = """
+        {
+          "id": "11111111-2222-3333-4444-555555555555",
+          "title": "Old",
+          "createdAt": "2025-01-01T00:00:00Z",
+          "duration": 1.0,
+          "source": "systemAudio",
+          "audioFileName": "Old.wav",
+          "status": "completed",
+          "language": "en",
+          "segments": []
+        }
+        """.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Recording.self, from: legacy)
+        XCTAssertNil(decoded.appName)
+    }
+
     func test_format_duration_pads_minutes_and_seconds() {
         XCTAssertEqual(formatDuration(0), "0:00")
         XCTAssertEqual(formatDuration(9), "0:09")

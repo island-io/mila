@@ -208,6 +208,14 @@ final class RecordingStore: ObservableObject {
         recordings.filter { !$0.isTrashed && $0.folder == folderName }
     }
 
+    /// Non-trashed recordings that haven't been filed anywhere yet. These
+    /// surface in the sidebar's "Default" view. Replaces the old
+    /// Transcriptions/Meetings/Dictations category split — we now have one
+    /// catch-all bucket and named folders, period.
+    func unfiledRecordings() -> [Recording] {
+        recordings.filter { !$0.isTrashed && $0.folder == nil }
+    }
+
     // MARK: - Folders
 
     /// Create an empty folder. No-op if the trimmed name is empty or already

@@ -49,6 +49,8 @@ struct SettingsView: View {
 
 private struct AudioSettingsTab: View {
     @EnvironmentObject private var settings: AudioInputSettings
+    @EnvironmentObject private var monitor: InputLevelMonitor
+    @EnvironmentObject private var actions: QuickActionsController
     @State private var devices: [AudioDeviceManager.Device] = []
 
     /// Sentinel UID that means "follow the system default input". Picker's
@@ -83,10 +85,66 @@ private struct AudioSettingsTab: View {
 
             Button("Refresh device list") { refresh() }
                 .buttonStyle(.borderless)
+
+            Divider().padding(.vertical, 4)
+
+            // Live VU meter for the currently-selected input. Lets users
+            // confirm the chosen device is actually hearing them before
+            // they record — the most common "why is my transcript empty"
+            // failure mode comes from picking the wrong (or muted) input.
+            // Paused during active recording so we don't fight the real
+            // MicrophoneRecorder for the device.
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "waveform")
+                        .foregroundStyle(.tint)
+                    Text("Input level")
+                        .font(.callout.weight(.semibold))
+                    Spacer()
+                    Text(meterStatusText)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                LevelMeterView(level: monitor.level,
+                               isLive: monitor.isRunning && !actions.isRecording)
+                    .frame(maxWidth: 360)
+            }
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .onAppear(perform: refresh)
+        .task {
+            // Bring up (or refresh) the monitor when the user opens this tab.
+            // Settings is a separate window so we can't rely on Home's
+            // lifecycle — each window manages its own start/stop.
+            await refreshMonitor()
+        }
+        .onDisappear {
+            Task { await monitor.stop() }
+        }
+        .onChange(of: settings.preferredUID) { _, newValue in
+            monitor.preferredUID = newValue
+            Task { await monitor.restart() }
+        }
+        .onChange(of: actions.isRecording) { _, _ in
+            Task { await refreshMonitor() }
+        }
+    }
+
+    private func refreshMonitor() async {
+        if actions.isRecording {
+            await monitor.stop()
+        } else {
+            await monitor.start()
+        }
+    }
+
+    private var meterStatusText: String {
+        if actions.isRecording {
+            return "Paused — recording in progress"
+        }
+        return monitor.isRunning ? "Live" : "Starting…"
     }
 
     private var binding: Binding<String> {

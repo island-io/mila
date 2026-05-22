@@ -1,11 +1,31 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum SidebarSelection: Hashable {
     case home
     case queue
     case category(HistoryCategory)
+    /// Items the user hasn't filed anywhere yet. Replaces the old History
+    /// categories (Transcriptions / Meetings / Dictations) as the catch-all
+    /// view — everything starts here and the user drags into named folders.
+    case defaultFolder
     case folder(String)
     case recording(Recording.ID)
+}
+
+/// Wire payload for drag-and-drop of recordings from a list row onto a
+/// sidebar folder. Transferable-conforming so SwiftUI's `.draggable` /
+/// `.dropDestination` can carry it without manual NSItemProvider plumbing.
+struct RecordingDragPayload: Codable, Transferable, Hashable {
+    let id: UUID
+
+    static var transferRepresentation: some TransferRepresentation {
+        CodableRepresentation(contentType: .islandWhisperRecording)
+    }
+}
+
+extension UTType {
+    static let islandWhisperRecording = UTType(exportedAs: "io.island.whisper.recording")
 }
 
 struct SidebarView: View {
@@ -26,31 +46,44 @@ struct SidebarView: View {
                     .tag(SidebarSelection.queue)
             }
 
-            Section("History") {
-                ForEach(HistoryCategory.allCases) { cat in
-                    Label(cat.displayName, systemImage: cat.sfSymbol)
-                        .tag(SidebarSelection.category(cat))
-                        .accessibilityIdentifier("sidebar.category.\(cat.rawValue)")
-                }
-            }
-
             Section("Folders") {
+                // "Default" is a virtual folder for unfiled recordings (the
+                // ones with folder == nil). Replaces the old History
+                // section so the user only has to learn one concept:
+                // everything lives in a folder, and Default is where new
+                // recordings show up until you drag them somewhere else.
+                folderRow(label: "Default",
+                          systemImage: "tray",
+                          selection: .defaultFolder,
+                          identifier: "sidebar.folder.default") { payload in
+                    if let id = payload?.id,
+                       let rec = store.recordings.first(where: { $0.id == id }) {
+                        store.assign(rec, toFolder: nil)
+                    }
+                }
+
                 ForEach(store.folders, id: \.self) { name in
-                    Label(name, systemImage: "folder")
-                        .tag(SidebarSelection.folder(name))
-                        .contextMenu {
-                            Button("Rename Folder…") {
-                                renameDraft = name
-                                renameTarget = name
-                            }
-                            Button("Delete Folder", role: .destructive) {
-                                store.deleteFolder(name)
-                                if case .folder(let sel) = selection, sel == name {
-                                    selection = .home
-                                }
+                    folderRow(label: name,
+                              systemImage: "folder",
+                              selection: .folder(name),
+                              identifier: "sidebar.folder.\(name)") { payload in
+                        if let id = payload?.id,
+                           let rec = store.recordings.first(where: { $0.id == id }) {
+                            store.assign(rec, toFolder: name)
+                        }
+                    }
+                    .contextMenu {
+                        Button("Rename Folder…") {
+                            renameDraft = name
+                            renameTarget = name
+                        }
+                        Button("Delete Folder", role: .destructive) {
+                            store.deleteFolder(name)
+                            if case .folder(let sel) = selection, sel == name {
+                                selection = .defaultFolder
                             }
                         }
-                        .accessibilityIdentifier("sidebar.folder.\(name)")
+                    }
                 }
 
                 // The new-folder trigger lives as a plain List row instead of
@@ -72,7 +105,8 @@ struct SidebarView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             VStack(spacing: 0) {
                 Divider()
-                SidebarFooter()
+                SidebarFooter(selection: $selection,
+                              trashCount: store.recordings(in: .recentlyDeleted).count)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 10)
             }
@@ -119,6 +153,67 @@ private struct FolderRenameTarget: Identifiable {
     var id: String { name }
 }
 
+extension SidebarView {
+    /// Builds one folder row that's both selectable (drives the detail
+    /// view) and a drop destination for dragged recording rows. Tagging
+    /// the underlying `Label` is what lets SwiftUI's List selection
+    /// recognise it; the `.dropDestination` modifier carries the assign
+    /// callback so each folder knows what to do when something lands on
+    /// it. The `isTargeted` parameter on `.dropDestination` is wired into
+    /// a subtle background tint so the user gets feedback while dragging.
+    @ViewBuilder
+    func folderRow(label: String,
+                   systemImage: String,
+                   selection: SidebarSelection,
+                   identifier: String,
+                   onDrop: @escaping (RecordingDragPayload?) -> Void) -> some View {
+        FolderRow(label: label,
+                  systemImage: systemImage,
+                  selection: selection,
+                  identifier: identifier,
+                  onDrop: onDrop)
+    }
+}
+
+/// Stateful inner view so each row owns its own `isTargeted` flag — putting
+/// the flag on `SidebarView` would make every folder light up at once.
+///
+/// **Layout note:** SwiftUI's `.dropDestination` on a bare `Label` inside a
+/// `List` only registers a hit area the size of the icon + text glyphs,
+/// which is impossible to land on with a real drag. Wrapping the label in
+/// an HStack with a full-width spacer + an explicit `.contentShape` makes
+/// the entire row width the drop target, which is what users expect from
+/// a sidebar.
+private struct FolderRow: View {
+    let label: String
+    let systemImage: String
+    let selection: SidebarSelection
+    let identifier: String
+    let onDrop: (RecordingDragPayload?) -> Void
+
+    @State private var isTargeted = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Label(label, systemImage: systemImage)
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .dropDestination(for: RecordingDragPayload.self) { items, _ in
+            guard let first = items.first else { return false }
+            onDrop(first)
+            return true
+        } isTargeted: { isTargeted = $0 }
+        .tag(selection)
+        .accessibilityIdentifier(identifier)
+        .listRowBackground(
+            isTargeted
+                ? Color.accentColor.opacity(0.18)
+                : Color.clear
+        )
+    }
+}
+
 /// Shared sheet for both creating and renaming folders. Title and confirm
 /// button label are parameterized so the same control serves the sidebar
 /// "+ New Folder" flow, the per-recording "Move to Folder → New Folder…"
@@ -153,14 +248,81 @@ struct FolderNameSheet: View {
     }
 }
 
+/// Footer pinned to the bottom-left of the sidebar. Hosts the "Trash"
+/// entry (moved out of the main folder list so it's never in the way) and
+/// the Settings link. Trash is also a drop destination — dragging a row
+/// onto it soft-deletes the recording.
 private struct SidebarFooter: View {
+    @Binding var selection: SidebarSelection?
+    let trashCount: Int
+
+    @EnvironmentObject private var store: RecordingStore
+    @State private var trashTargeted = false
+
     var body: some View {
-        SettingsLink {
-            Label("Settings…", systemImage: "gear")
-                .font(.callout)
+        VStack(alignment: .leading, spacing: 4) {
+            Button {
+                selection = .category(.recentlyDeleted)
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "trash")
+                        .frame(width: 18)
+                    Text("Trash")
+                        .font(.callout)
+                    Spacer()
+                    if trashCount > 0 {
+                        Text("\(trashCount)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Color.primary.opacity(0.08), in: Capsule())
+                    }
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    trashTargeted
+                        ? Color.red.opacity(0.18)
+                        : (isSelectingTrash
+                           ? Color.accentColor.opacity(0.18)
+                           : Color.clear),
+                    in: RoundedRectangle(cornerRadius: 6)
+                )
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            .accessibilityIdentifier("sidebar.trash")
+            .dropDestination(for: RecordingDragPayload.self) { items, _ in
+                if let id = items.first?.id,
+                   let rec = store.recordings.first(where: { $0.id == id }) {
+                    store.softDelete(rec)
+                    return true
+                }
+                return false
+            } isTargeted: { trashTargeted = $0 }
+
+            SettingsLink {
+                HStack(spacing: 8) {
+                    Image(systemName: "gear")
+                        .frame(width: 18)
+                    Text("Settings…")
+                        .font(.callout)
+                    Spacer()
+                }
+                .padding(.vertical, 4)
+                .padding(.horizontal, 6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+    }
+
+    private var isSelectingTrash: Bool {
+        if case .category(.recentlyDeleted) = selection { return true }
+        return false
     }
 }
 

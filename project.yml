@@ -76,6 +76,18 @@ targets:
         NSSpeechRecognitionUsageDescription: "IslandWhisper transcribes locally on your Mac; no audio is sent to the cloud."
         NSPrincipalClass: NSApplication
         LSUIElement: false
+        # Custom UTI used by the in-app drag-and-drop payload that moves a
+        # recording from a list row onto a sidebar folder. Declaring it as
+        # an *exported* type is what lets SwiftUI's .dropDestination match
+        # the payload — without this entry, `UTType(exportedAs: …)` in code
+        # registers nothing at runtime and drops silently no-op (the folder
+        # never highlights as a drop target).
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: io.island.whisper.recording
+            UTTypeDescription: Island Whisper Recording
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification: {}
         SUFeedURL: https://island-whisper-updates.internal.island.io/appcast.xml
         SUPublicEDKey: iF35blPidKUXIaLr59fJgGGdXtI8AgVNxOx5w+eTieY=
         SUEnableAutomaticChecks: true

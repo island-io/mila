@@ -1,6 +1,8 @@
 import SwiftUI
 import AVKit
+import AppKit
 import TranscriptionCore
+import UniformTypeIdentifiers
 
 struct RecordingDetailView: View {
     let recording: Recording
@@ -134,6 +136,30 @@ struct RecordingDetailView: View {
                 Label("Copy transcript", systemImage: "doc.on.doc")
             }
             .disabled(recording.fullText.isEmpty)
+
+            Button {
+                exportSRT()
+            } label: {
+                Label("Export Subtitles", systemImage: "captions.bubble")
+            }
+            .disabled(recording.segments.isEmpty)
+            .help("Save subtitles (.srt) for the original video/audio")
+        }
+    }
+
+    /// Save the SRT file to a user-chosen location. Defaulting the filename
+    /// to the recording title makes the common case (drag video in → save
+    /// `MyVideo.srt` next to `MyVideo.mp4`) one click.
+    private func exportSRT() {
+        let panel = NSSavePanel()
+        panel.title = "Export Subtitles"
+        panel.allowedContentTypes = [.init(filenameExtension: "srt") ?? .data]
+        panel.nameFieldStringValue = recording.title + ".srt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TranscriptExporter.writeSRT(for: recording, to: url)
+        } catch {
+            NSAlert(error: error).runModal()
         }
     }
 

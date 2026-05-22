@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct HistoryListView: View {
     let category: HistoryCategory
@@ -70,6 +71,39 @@ struct FolderListView: View {
     }
 }
 
+/// Detail view for the sidebar's `.defaultFolder` selection. Shows
+/// everything the user hasn't filed away yet — the catch-all bucket that
+/// replaces the old History categories.
+struct DefaultFolderListView: View {
+    let search: String
+    @Binding var selection: SidebarSelection?
+
+    @EnvironmentObject private var store: RecordingStore
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(spacing: 8) {
+                    Image(systemName: "tray.fill").foregroundStyle(.tint)
+                    Text("Default").font(.title2.weight(.semibold))
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
+
+                BucketedRecordingsView(
+                    recordings: store.unfiledRecordings(),
+                    search: search,
+                    selection: $selection
+                )
+                .padding(.horizontal, 24)
+            }
+            .padding(.bottom, 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityIdentifier("folder.list.default")
+    }
+}
+
 struct BucketedRecordingsView: View {
     let recordings: [Recording]
     let search: String
@@ -130,11 +164,13 @@ private struct HistoryRow: View {
 
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
+    @EnvironmentObject private var llm: LLMSettings
 
     @State private var hovering = false
     @State private var renameRequest: String?
     @State private var promptForNewFolder = false
     @State private var newFolderDraft = ""
+    @State private var showingSendSheet = false
 
     var body: some View {
         let isSelected: Bool = {
@@ -143,11 +179,22 @@ private struct HistoryRow: View {
         }()
 
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: recording.source.sfSymbol)
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(.tint)
-                .frame(width: 22, height: 22)
-                .padding(.top, 2)
+            ZStack(alignment: .bottomTrailing) {
+                Image(systemName: recording.source.sfSymbol)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.tint)
+                    .frame(width: 22, height: 22)
+                if recording.isZoomRecording {
+                    Image(systemName: "video.fill")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white)
+                        .padding(2)
+                        .background(Color(red: 0.18, green: 0.55, blue: 0.93),
+                                    in: Circle())
+                        .help("Recorded from Zoom")
+                }
+            }
+            .padding(.top, 2)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
@@ -193,6 +240,13 @@ private struct HistoryRow: View {
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         .onTapGesture { selection = .recording(recording.id) }
+        // Trashed rows can't be dragged into a folder — they're already in
+        // the bin, restoring them via drag would be a UX surprise. Other
+        // rows carry their id as a `RecordingDragPayload` so the sidebar
+        // folder rows can pick them up via `.dropDestination`.
+        .draggable(recording.isTrashed
+                   ? RecordingDragPayload(id: UUID())   // unused — won't be matched
+                   : RecordingDragPayload(id: recording.id))
         .contextMenu { contextMenu }
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("history.row.\(recording.title)")
@@ -222,6 +276,9 @@ private struct HistoryRow: View {
                 },
                 onCancel: { promptForNewFolder = false }
             )
+        }
+        .sheet(isPresented: $showingSendSheet) {
+            SendToLLMSheet(recording: recording)
         }
     }
 
@@ -266,7 +323,18 @@ private struct HistoryRow: View {
             Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
                 retranscribe(recording, in: currentLang.other)
             }
+            if llm.isConfigured {
+                Divider()
+                Button("Send to \(llm.tool.displayName)…") {
+                    showingSendSheet = true
+                }
+                .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
+            }
             Divider()
+            Button("Export Subtitles (.srt)…") {
+                exportSRT()
+            }
+            .disabled(recording.segments.isEmpty)
             Button("Reveal in Finder") {
                 NSWorkspace.shared.activateFileViewerSelecting([store.audioURL(for: recording)])
             }
@@ -290,6 +358,24 @@ private struct HistoryRow: View {
         copy.status = .pending
         store.update(copy)
         transcription.enqueue(copy)
+    }
+
+    /// Save the recording's SRT to a user-chosen location. NSSavePanel lets
+    /// the user place subtitles next to the original video file (the main
+    /// "video → SRT" use case) or anywhere else they like. We use the
+    /// title as the suggested filename so dragging a video produces
+    /// `MyVideo.srt` next to `MyVideo.mp4` by default.
+    private func exportSRT() {
+        let panel = NSSavePanel()
+        panel.title = "Export Subtitles"
+        panel.allowedContentTypes = [.init(filenameExtension: "srt") ?? .data]
+        panel.nameFieldStringValue = recording.title + ".srt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TranscriptExporter.writeSRT(for: recording, to: url)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 
     private var preview: String {

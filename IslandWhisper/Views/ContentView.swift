@@ -41,6 +41,9 @@ struct ContentView: View {
             }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
+                    InputDevicePickerToolbarItem()
+                }
+                ToolbarItem(placement: .primaryAction) {
                     LanguagePickerToolbarItem()
                 }
             }
@@ -54,6 +57,22 @@ struct ContentView: View {
             ),
             actions: { Button("OK") { transcription.lastError = nil } },
             message: { Text(transcription.lastError ?? "") }
+        )
+        .alert(
+            "No sound detected",
+            isPresented: $actions.noSoundWarningShown,
+            actions: {
+                Button("Keep recording") {
+                    actions.noSoundWarningShown = false
+                }
+                Button("Stop recording", role: .destructive) {
+                    actions.noSoundWarningShown = false
+                    Task { await actions.stopRecording() }
+                }
+            },
+            message: {
+                Text("Island Whisper hasn't heard any audio in the last 10 seconds. Check that the right microphone is selected (in the toolbar or Settings → Audio) and that it isn't muted.")
+            }
         )
         .alert(
             "Screen & System Audio Recording permission needed",
@@ -106,6 +125,8 @@ struct ContentView: View {
             QueueView(selection: $selection)
         case .category(let cat):
             HistoryListView(category: cat, search: search, selection: $selection)
+        case .defaultFolder:
+            DefaultFolderListView(search: search, selection: $selection)
         case .folder(let name):
             FolderListView(folderName: name, search: search, selection: $selection)
         case .recording(let id):
@@ -152,6 +173,79 @@ private struct ModelDownloadBanner: View {
         .padding(.vertical, 10)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+}
+
+/// Compact toolbar dropdown that pins the input device used for the next
+/// recording / dictation. Mirrors the Settings → Audio "Input source"
+/// picker but lives next to the language picker so the user can swap to
+/// a different mic without opening Settings. Label is just the mic icon
+/// (plus the active device name when there's room) so the toolbar stays
+/// narrow.
+private struct InputDevicePickerToolbarItem: View {
+    @EnvironmentObject private var settings: AudioInputSettings
+    @State private var devices: [AudioDeviceManager.Device] = []
+
+    /// Sentinel UID for "follow the system default".
+    private static let autoTag = "__auto__"
+
+    var body: some View {
+        Menu {
+            Picker("Input", selection: binding) {
+                Text("Automatic (system default)").tag(Self.autoTag)
+                ForEach(devices, id: \.uid) { device in
+                    Text(label(for: device)).tag(device.uid)
+                }
+                if let pinned = settings.preferredUID,
+                   devices.first(where: { $0.uid == pinned }) == nil {
+                    Text("Saved device (unplugged)").tag(pinned)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+            Divider()
+            Button("Refresh device list") { refresh() }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "mic")
+                    .font(.system(size: 14, weight: .medium))
+                Text(displayName)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .help("Microphone used for new recordings and dictation")
+        .onAppear(perform: refresh)
+    }
+
+    private var binding: Binding<String> {
+        Binding(
+            get: { settings.preferredUID ?? Self.autoTag },
+            set: { settings.preferredUID = ($0 == Self.autoTag) ? nil : $0 }
+        )
+    }
+
+    /// Short label shown in the closed menu. Picks the pinned device's
+    /// name if there is one, else "Auto" so users always see *something*
+    /// (an empty-looking toolbar item is easy to miss).
+    private var displayName: String {
+        guard let uid = settings.preferredUID,
+              let device = devices.first(where: { $0.uid == uid }) else {
+            return "Auto"
+        }
+        return device.name
+    }
+
+    private func label(for device: AudioDeviceManager.Device) -> String {
+        var parts: [String] = [device.name]
+        if device.isBuiltIn { parts.append("built-in") }
+        if device.isVirtual { parts.append("virtual") }
+        return parts.joined(separator: " — ")
+    }
+
+    private func refresh() {
+        devices = AudioDeviceManager.inputDevices()
     }
 }
 

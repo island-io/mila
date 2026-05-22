@@ -36,7 +36,7 @@ struct WhisperModel: Identifiable, Hashable, Codable {
     /// English (and any other multilingual) default. As of mid-2026 this is
     /// the open-weights state of the art for English at this size class —
     /// faster than full `large-v3` for essentially identical English WER, and
-    /// it's the same checkpoint Whisper.cpp ship by default.
+    /// it's the same checkpoint Whisper.cpp ships by default.
     static let openaiTurbo = WhisperModel(
         name: "openai-whisper-large-v3-turbo",
         displayName: "OpenAI · large-v3-turbo (English / multilingual)",

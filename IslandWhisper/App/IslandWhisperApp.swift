@@ -42,6 +42,7 @@ struct IslandWhisperApp: App {
     @StateObject private var hotkeySettings: HotkeySettings
     @StateObject private var languageSettings: RecordingLanguageSettings
     @StateObject private var audioInputSettings: AudioInputSettings
+    @StateObject private var inputLevelMonitor: InputLevelMonitor
     @StateObject private var llmSettings: LLMSettings
     @StateObject private var postRecording: PostRecordingCoordinator
     @StateObject private var diarizationSettings: DiarizationSettings
@@ -55,6 +56,8 @@ struct IslandWhisperApp: App {
         let session = RecordingSession()
         let langSettings = RecordingLanguageSettings()
         let audioSettings = AudioInputSettings()
+        let inputMonitor = InputLevelMonitor()
+        inputMonitor.preferredUID = audioSettings.preferredUID
         let llm = LLMSettings()
         let coordinator = PostRecordingCoordinator(store: store, transcription: svc)
         let actions = QuickActionsController(session: session,
@@ -72,6 +75,7 @@ struct IslandWhisperApp: App {
         _hotkeySettings = StateObject(wrappedValue: hotkeys)
         _languageSettings = StateObject(wrappedValue: langSettings)
         _audioInputSettings = StateObject(wrappedValue: audioSettings)
+        _inputLevelMonitor = StateObject(wrappedValue: inputMonitor)
         _llmSettings = StateObject(wrappedValue: llm)
         _postRecording = StateObject(wrappedValue: coordinator)
         _dictation = StateObject(wrappedValue: DictationController(store: store,
@@ -91,6 +95,7 @@ struct IslandWhisperApp: App {
                 .environmentObject(hotkeySettings)
                 .environmentObject(languageSettings)
                 .environmentObject(audioInputSettings)
+                .environmentObject(inputLevelMonitor)
                 .environmentObject(llmSettings)
                 .environmentObject(postRecording)
                 .environmentObject(diarizationSettings)
@@ -132,6 +137,8 @@ struct IslandWhisperApp: App {
                 .environmentObject(hotkeySettings)
                 .environmentObject(transcription)
                 .environmentObject(audioInputSettings)
+                .environmentObject(inputLevelMonitor)
+                .environmentObject(actions)
                 .environmentObject(llmSettings)
                 .environmentObject(diarizationSettings)
         }
