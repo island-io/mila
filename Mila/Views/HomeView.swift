@@ -28,23 +28,13 @@ struct HomeView: View {
         }
     }
 
-    /// Wordmark: circular app icon, then "Mila", then a small "by Island"
-    /// credit on the right side. The icon is clipped to a circle so any
-    /// transparent padding around the artwork doesn't leak as a white
-    /// gap; "by Island" sits at the .lastTextBaseline so the small caps
-    /// align with the bottom of the wordmark instead of floating at the
+    /// Wordmark: "Mila" + small "by Island" credit to the right.
+    /// "by Island" uses .lastTextBaseline so the small caps sit flush
+    /// with the bottom of the big wordmark instead of floating at the
     /// big-text baseline.
     private var header: some View {
         VStack(spacing: 6) {
-            HStack(alignment: .lastTextBaseline, spacing: 10) {
-                Image("Wordmark")
-                    .resizable()
-                    .interpolation(.high)
-                    .aspectRatio(contentMode: .fill)
-                    .frame(width: 40, height: 40)
-                    .clipShape(Circle())
-                    .alignmentGuide(.lastTextBaseline) { d in d[VerticalAlignment.bottom] - 6 }
-                    .accessibilityHidden(true)
+            HStack(alignment: .lastTextBaseline, spacing: 8) {
                 Text("Mila")
                     .font(.system(size: 32, weight: .semibold))
                 Text("by Island")
