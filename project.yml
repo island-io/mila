@@ -1,6 +1,6 @@
 name: Mila
 options:
-  bundleIdPrefix: io.island.mila
+  bundleIdPrefix: io.island.whisper
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -16,9 +16,15 @@ settings:
     ENABLE_HARDENED_RUNTIME: YES
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
-    PRODUCT_BUNDLE_IDENTIFIER: io.island.mila.Mila
+    PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
     MARKETING_VERSION: "1.4.0"
-    CURRENT_PROJECT_VERSION: "24"
+    # Build 24 (v1.4.0 with the io.island.mila.Mila bundle ID) failed
+    # auto-update from existing IslandWhisper installs because Sparkle
+    # rejects cross-bundle-ID updates ("improperly signed and could not
+    # be validated"). Reverting the bundle ID back to
+    # io.island.whisper.IslandWhisper; bumping the build so Sparkle
+    # sees a newer entry and re-attempts past its cached failure.
+    CURRENT_PROJECT_VERSION: "25"
 
 packages:
   TranscriptionCore:
@@ -83,7 +89,7 @@ targets:
         # registers nothing at runtime and drops silently no-op (the folder
         # never highlights as a drop target).
         UTExportedTypeDeclarations:
-          - UTTypeIdentifier: io.island.mila.recording
+          - UTTypeIdentifier: io.island.whisper.recording
             UTTypeDescription: Mila Recording
             UTTypeConformsTo:
               - public.data
@@ -131,7 +137,7 @@ targets:
         BUNDLE_LOADER: "$(TEST_HOST)"
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Mila.app/Contents/MacOS/Mila"
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: io.island.mila.MilaTests
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperTests
 
   MilaUITests:
     type: bundle.ui-testing
@@ -144,7 +150,7 @@ targets:
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: io.island.mila.MilaUITests
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperUITests
         TEST_TARGET_NAME: Mila
         # Match the host app's ad-hoc signing so the runner app and the
         # injected xctest bundle have the same (empty) Team ID — otherwise

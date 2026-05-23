@@ -56,7 +56,7 @@
 			<key>UTTypeDescription</key>
 			<string>Mila Recording</string>
 			<key>UTTypeIdentifier</key>
-			<string>io.island.mila.recording</string>
+			<string>io.island.whisper.recording</string>
 			<key>UTTypeTagSpecification</key>
 			<dict/>
 		</dict>

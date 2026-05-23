@@ -29,7 +29,7 @@ struct RecordingDragPayload: Codable, Transferable, Hashable {
 }
 
 extension UTType {
-    static let islandWhisperRecording = UTType(exportedAs: "io.island.mila.recording")
+    static let islandWhisperRecording = UTType(exportedAs: "io.island.whisper.recording")
 }
 
 struct SidebarView: View {
