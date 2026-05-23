@@ -22,7 +22,7 @@ jobs:
     # macos-15 ships Xcode 16, which matches the project file format
     # xcodegen produces locally. macos-14 (Xcode 15.4) rejects it as
     # "future project file format (77)".
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 30
 
     steps:

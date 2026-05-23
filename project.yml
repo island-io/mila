@@ -18,7 +18,14 @@ settings:
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
     MARKETING_VERSION: "1.4.3"
-    # 1.4.3 just updates the About-panel credit line.
+    # 1.4.3 updates the About-panel credit line + moves CI to the
+    # macos-26 runner. The runner change matters because the macOS
+    # Tahoe floating-sidebar SwiftUI layout only activates for apps
+    # linked against the macOS 26 SDK; the previous macos-15 runner
+    # built against the macOS 15 SDK and the published binary opted
+    # out of the new chrome (sidebar rendered flush with the window
+    # edges instead of as a floating card). Building on macos-26
+    # gets the right SDK and the floating card appears as designed.
     CURRENT_PROJECT_VERSION: "28"
 
 packages:
