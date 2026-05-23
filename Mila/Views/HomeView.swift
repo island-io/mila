@@ -9,6 +9,7 @@ import SwiftUI
 struct HomeView: View {
     @EnvironmentObject private var actions: QuickActionsController
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
+    @EnvironmentObject private var hotkeys: HotkeySettings
 
     @Binding var selection: SidebarSelection?
     let search: String
@@ -22,10 +23,11 @@ struct HomeView: View {
     var body: some View {
         VStack {
             Spacer(minLength: 0)
-            VStack(spacing: 28) {
+            VStack(spacing: 24) {
                 header
                 heroAction
                 appAudioToggle
+                dictationHint
             }
             .padding(.horizontal, 24)
             Spacer(minLength: 0)
@@ -88,6 +90,37 @@ struct HomeView: View {
         .accessibilityIdentifier("home.record.appaudio.toggle")
     }
 
+    /// Discrete reminder of the two global dictation hotkeys. Reads live
+    /// from HotkeySettings so a rebind in Settings is reflected here
+    /// without a restart. Visually low-key — secondary color, small
+    /// caption font, no background pill / button affordance — because
+    /// this is a hint about something the user does OUTSIDE the app via
+    /// the system-wide hotkey, not a button to click.
+    private var dictationHint: some View {
+        HStack(spacing: 14) {
+            HStack(spacing: 4) {
+                Text("🇬🇧")
+                Text("dictate")
+                Text(hotkeys.binding(for: .dictateEnglish).displayName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.primary.opacity(0.7))
+            }
+            Text("·")
+                .foregroundStyle(.tertiary)
+            HStack(spacing: 4) {
+                Text("🇮🇱")
+                Text("dictate")
+                Text(hotkeys.binding(for: .dictateHebrew).displayName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.primary.opacity(0.7))
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → Hotkeys.")
+        .accessibilityIdentifier("home.dictation.hint")
+    }
+
     private var isRecording: Bool {
         actions.isRecording
     }
@@ -131,11 +164,9 @@ private struct HeroRecordButton: View {
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(.white)
                     HStack(spacing: 6) {
-                        Text(languageFlag)
-                            .font(.callout)
                         Text(captionText)
                             .font(.callout)
-                            .foregroundStyle(.white.opacity(0.85))
+                            .foregroundStyle(.white.opacity(0.9))
                     }
                 }
 
@@ -169,8 +200,7 @@ private struct HeroRecordButton: View {
         if isRecording {
             return "Tap to stop"
         }
-        let mode = withSystemAudio ? "Mic + app audio" : "Mic only"
-        return "\(mode) · \(languageName)"
+        return "\(languageFlag) \(languageName)"
     }
 
     private var backgroundColors: [Color] {
