@@ -29,7 +29,7 @@
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Mila uses AppleEvents to paste dictated text into the active app.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string></string>
+	<string>By Uri &amp; Noa Harduf</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Mila needs microphone access to record audio for transcription and dictation.</string>
 	<key>NSPrincipalClass</key>

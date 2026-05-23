@@ -85,7 +85,7 @@ struct DefaultFolderListView: View {
             VStack(alignment: .leading, spacing: 18) {
                 HStack(spacing: 8) {
                     Image(systemName: "tray.fill").foregroundStyle(.tint)
-                    Text("Default").font(.title2.weight(.semibold))
+                    Text("All Transcriptions").font(.title2.weight(.semibold))
                 }
                 .padding(.horizontal, 24)
                 .padding(.top, 16)

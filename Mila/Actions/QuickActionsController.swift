@@ -12,6 +12,12 @@ final class QuickActionsController: ObservableObject {
     enum ActiveJob: Equatable {
         case none
         case recordingMic
+        /// Unified "Record" job — mic + optionally the entire system's
+        /// audio. Replaces the old separation between Voice Memo and
+        /// App Audio in the UI. `withSystemAudio` controls whether the
+        /// system-audio mix is layered in (driven by the home-screen
+        /// checkbox).
+        case recording(withSystemAudio: Bool)
         case recordingApp(processID: pid_t?, includeMic: Bool)
         case importingFile(URL)
     }
@@ -67,30 +73,67 @@ final class QuickActionsController: ObservableObject {
         self.postRecording = postRecording
     }
 
-    // MARK: - Voice memo (mic only)
+    // MARK: - Unified Record
 
-    func toggleVoiceMemo() async {
-        if case .recordingMic = activeJob {
+    /// One entry point for the big "Record" button on Home. Captures
+    /// the mic, and optionally layers the entire system's audio on top
+    /// when `withSystemAudio` is true. Tapping a second time stops the
+    /// in-progress recording. The "include app audio" preference is
+    /// held by the caller (HomeView's @AppStorage toggle) so we can
+    /// stay stateless about it here.
+    func toggleRecord(withSystemAudio: Bool) async {
+        if case .recording = activeJob {
+            await stopRecording()
+        } else if case .recordingMic = activeJob {
+            // Legacy state — shouldn't happen now that Home only routes
+            // through this method, but covers a stale ActiveJob from an
+            // in-flight session that started under an older code path.
             await stopRecording()
         } else if activeJob == .none {
-            await startVoiceMemo()
+            await startRecording(withSystemAudio: withSystemAudio)
         }
     }
 
-    private func startVoiceMemo() async {
+    private func startRecording(withSystemAudio: Bool) async {
         // Pre-flight the mic auth check — if denied we want to point the
         // user at System Settings (like we do for screen recording),
         // not surface a vague "operation couldn't be completed" error
         // from deep inside AVAudioEngine.
         guard await ensureMicrophonePermission() else { return }
-        let url = store.freshAudioURL(suggestedName: "Voice Memo")
-        do {
-            try await session.start(source: .microphone, outputURL: url)
-            activeJob = .recordingMic
-            startSilenceWatch(watching: .microphone)
-        } catch {
-            transcription.lastError = "Could not start voice memo: \(error.localizedDescription)"
+        let prefix = withSystemAudio ? "Recording" : "Voice Memo"
+        let url = store.freshAudioURL(suggestedName: prefix)
+        // `.meeting` mixes mic + system audio; `.microphone` is mic only.
+        // The pure system-audio case (`.systemAudio`) is now reachable
+        // only via the More page's "App Audio" entry — Home's Record
+        // button always captures the mic so the user can talk on top
+        // of whatever's playing.
+        let source: RecordingSource = withSystemAudio ? .meeting : .microphone
+        // For system-audio-inclusive captures, the SystemAudioRecorder
+        // also needs to know we want "everything" (no specific app).
+        if withSystemAudio {
+            session.selectApp(nil)
         }
+        do {
+            try await session.start(source: source, outputURL: url)
+            activeJob = .recording(withSystemAudio: withSystemAudio)
+            startSilenceWatch(watching: source)
+        } catch SystemAudioRecorder.CaptureError.permissionDenied {
+            screenRecordingPermissionMissing = true
+        } catch {
+            if withSystemAudio, SystemAudioRecorder.isPermissionError(error) {
+                screenRecordingPermissionMissing = true
+            } else {
+                transcription.lastError = "Could not start recording: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    // Back-compat shim so existing call sites + tests that toggle a
+    // microphone-only recording keep working. The new Home routes
+    // through toggleRecord(withSystemAudio:) instead; this thin wrapper
+    // exists for the menu command + UI tests.
+    func toggleVoiceMemo() async {
+        await toggleRecord(withSystemAudio: false)
     }
 
     /// Returns true iff microphone access is granted (or was just granted
@@ -188,6 +231,14 @@ final class QuickActionsController: ObservableObject {
             switch captured {
             case .recordingMic:
                 return (defaultTitle(prefix: "Voice Memo"), .microphone, nil)
+            case .recording(let withSystemAudio):
+                // Unified Record: mic only when checkbox is off, or
+                // mic + system mix when on. The title stays generic —
+                // every recording is just "a recording" in the new UI.
+                let prefix = "Recording"
+                return (defaultTitle(prefix: prefix),
+                        withSystemAudio ? .meeting : .microphone,
+                        nil)
             case .recordingApp(let pid, let includeMic):
                 let app = availableApps.first(where: { $0.processID == pid })?.applicationName
                 let prefix = app ?? "System Audio"
@@ -346,9 +397,12 @@ final class QuickActionsController: ObservableObject {
     // MARK: - Helpers
 
     var isRecording: Bool {
-        if case .recordingMic = activeJob { return true }
-        if case .recordingApp = activeJob { return true }
-        return false
+        switch activeJob {
+        case .recordingMic, .recording, .recordingApp:
+            return true
+        default:
+            return false
+        }
     }
 
     var elapsed: TimeInterval { session.elapsed }

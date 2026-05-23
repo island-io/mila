@@ -4,10 +4,14 @@ import UniformTypeIdentifiers
 enum SidebarSelection: Hashable {
     case home
     case queue
+    /// Lower-priority entry points (Open Files / App Audio / Subtitle
+    /// Video) live behind a single "More" page so Home stays focused
+    /// on the one big Record button.
+    case more
     case category(HistoryCategory)
-    /// Items the user hasn't filed anywhere yet. Replaces the old History
-    /// categories (Transcriptions / Meetings / Dictations) as the catch-all
-    /// view — everything starts here and the user drags into named folders.
+    /// Catch-all view for recordings the user hasn't filed anywhere
+    /// yet — labelled "All Transcriptions" in the sidebar so users
+    /// immediately know it's the place to look for transcripts.
     case defaultFolder
     case folder(String)
     case recording(Recording.ID)
@@ -44,16 +48,17 @@ struct SidebarView: View {
                     .tag(SidebarSelection.home)
                 Label("Queue", systemImage: "list.bullet.rectangle")
                     .tag(SidebarSelection.queue)
+                Label("More", systemImage: "ellipsis.circle")
+                    .tag(SidebarSelection.more)
             }
 
             Section("Folders") {
-                // "Default" is a virtual folder for unfiled recordings (the
-                // ones with folder == nil). Replaces the old History
-                // section so the user only has to learn one concept:
-                // everything lives in a folder, and Default is where new
-                // recordings show up until you drag them somewhere else.
-                folderRow(label: "Default",
-                          systemImage: "tray",
+                // "All Transcriptions" is a virtual folder for unfiled
+                // recordings (folder == nil). Lives under "Folders" but is
+                // labeled descriptively so first-time users know that's
+                // where their transcripts show up.
+                folderRow(label: "All Transcriptions",
+                          systemImage: "tray.full",
                           selection: .defaultFolder,
                           identifier: "sidebar.folder.default") { payload in
                     if let id = payload?.id,
@@ -307,7 +312,7 @@ private struct SidebarFooter: View {
                 HStack(spacing: 8) {
                     Image(systemName: "gear")
                         .frame(width: 18)
-                    Text("Settings…")
+                    Text("Settings")
                         .font(.callout)
                     Spacer()
                 }

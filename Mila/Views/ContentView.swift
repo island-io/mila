@@ -46,6 +46,9 @@ struct ContentView: View {
                 ToolbarItem(placement: .primaryAction) {
                     LanguagePickerToolbarItem()
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    DictationHotkeyToolbarItem()
+                }
             }
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Search")
@@ -139,6 +142,8 @@ struct ContentView: View {
             HomeView(selection: $selection, search: search)
         case .queue:
             QueueView(selection: $selection)
+        case .more:
+            MoreView()
         case .category(let cat):
             HistoryListView(category: cat, search: search, selection: $selection)
         case .defaultFolder:
@@ -291,6 +296,53 @@ private struct LanguagePickerToolbarItem: View {
         }
         .menuStyle(.borderlessButton)
         .help("Language used for new voice memos and app-audio recordings")
+    }
+}
+
+/// Compact toolbar pill showing the two dictation hotkeys (English /
+/// Hebrew). Replaces the bulky "Dictation hotkeys" card that used to sit
+/// on Home — toolbar real estate is cheaper and the bindings live closer
+/// to the input-device + language pickers they relate to.
+///
+/// Each chip shows the flag + the configured shortcut. Clicking the chip
+/// jumps to Settings → Hotkeys so users can rebind. Bindings are read
+/// live via @EnvironmentObject so a rebind in Settings is reflected here
+/// immediately.
+private struct DictationHotkeyToolbarItem: View {
+    @EnvironmentObject private var hotkeys: HotkeySettings
+
+    var body: some View {
+        HStack(spacing: 6) {
+            HotkeyPill(flag: "🇬🇧",
+                       binding: hotkeys.binding(for: .dictateEnglish).displayName)
+            HotkeyPill(flag: "🇮🇱",
+                       binding: hotkeys.binding(for: .dictateHebrew).displayName)
+        }
+        .help("Dictation hotkeys — press anywhere in macOS to dictate. Click to edit in Settings → Hotkeys.")
+    }
+}
+
+private struct HotkeyPill: View {
+    let flag: String
+    let binding: String
+
+    var body: some View {
+        Button {
+            SettingsNavigation.shared.pendingTab = .hotkeys
+            NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        } label: {
+            HStack(spacing: 4) {
+                Text(flag)
+                    .font(.system(size: 14))
+                Text(binding)
+                    .font(.system(.caption, design: .monospaced).weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(Color.primary.opacity(0.06), in: Capsule())
+        }
+        .buttonStyle(.plain)
     }
 }
 
