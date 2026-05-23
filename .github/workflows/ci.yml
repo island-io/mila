@@ -94,3 +94,5 @@ jobs:
             -destination 'platform=macOS' \
             -only-testing:MilaTests \
             test
+
+# (trivial change to force a fresh CI dispatch on 2026-05-23)
