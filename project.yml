@@ -17,16 +17,17 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.4.3"
-    # 1.4.3 updates the About-panel credit line + moves CI to the
-    # macos-26 runner. The runner change matters because the macOS
-    # Tahoe floating-sidebar SwiftUI layout only activates for apps
-    # linked against the macOS 26 SDK; the previous macos-15 runner
-    # built against the macOS 15 SDK and the published binary opted
-    # out of the new chrome (sidebar rendered flush with the window
-    # edges instead of as a floating card). Building on macos-26
-    # gets the right SDK and the floating card appears as designed.
-    CURRENT_PROJECT_VERSION: "28"
+    MARKETING_VERSION: "1.5.0"
+    # 1.5.0 ships the first publishable open-source release: speaker
+    # diarization is now on by default on fresh installs (the bundled
+    # Python runtime auto-downloads its torch wheels on first launch),
+    # the repo gains a PolyForm Noncommercial 1.0.0 LICENSE.md plus a
+    # THIRD_PARTY_NOTICES.md, and the macOS About panel auto-loads a
+    # bundled Credits.html with full third-party attribution. SemVer
+    # MINOR because the default-on behavior is a user-visible feature
+    # addition; existing users with an explicit diarization preference
+    # are unaffected (register-via-ctor-arg, not UserDefaults.standard).
+    CURRENT_PROJECT_VERSION: "29"
 
 packages:
   TranscriptionCore:
