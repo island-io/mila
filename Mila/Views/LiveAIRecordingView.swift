@@ -275,10 +275,7 @@ struct LiveAIRecordingView: View {
                                 .accessibilityIdentifier("liveTranscript.listening")
                         } else {
                             ForEach(transcriber.segments) { seg in
-                                Text(seg.text)
-                                    .font(.callout)
-                                    .foregroundStyle(.primary)
-                                    .multilineTextAlignment(multilineAlignment)
+                                TranscriptLineView(segment: seg, language: language)
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                     .accessibilityIdentifier("liveTranscript.segment")
                             }

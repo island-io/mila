@@ -58,6 +58,13 @@ final class LiveTranscriber: ObservableObject {
     /// `chunkSeconds` timer. Set by `MilaApp.wireLiveAIPipeline` from
     /// `LiveAISettings.useVAD` before `start()`.
     var useVAD: Bool = false
+    /// Fires alongside each VAD utterance transcribe with the same
+    /// samples and absolute time range. Wired in `MilaApp` to feed
+    /// `LiveSpeakerDiarizer.process(samples:startSeconds:endSeconds:)`
+    /// — the diarizer needs utterance-shaped chunks to embed against
+    /// its speaker pool. Each chunk should contain one speaker;
+    /// VAD-bounded utterances satisfy that by construction.
+    var onUtteranceCaptured: (([Float], Double, Double) -> Void)?
     private let sampleRate: Double = 16_000
 
     private let transcription: TranscriptionService
@@ -232,6 +239,12 @@ final class LiveTranscriber: ObservableObject {
     private func transcribeUtterance(samples: [Float], startSec: Double) async {
         isTranscribing = true
         defer { isTranscribing = false }
+        // Hand the same utterance to the speaker diarizer in parallel
+        // with whisper. The diarizer maintains its own pool of speaker
+        // centroids; the matching back to segments happens via
+        // `applySpeakerLabels` on the next $segments tick.
+        let utteranceEnd = startSec + Double(samples.count) / sampleRate
+        onUtteranceCaptured?(samples, startSec, utteranceEnd)
         // Pad short utterances to a minimum length with trailing silence.
         // Whisper.cpp's beam-search decoding (with our suppress_blank +
         // patience=-1 params) goes into an infinite loop on inputs much

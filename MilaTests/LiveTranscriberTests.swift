@@ -102,6 +102,44 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// VAD-path test: each utterance transcribe must fan out to the
+    /// `onUtteranceCaptured` callback so the live speaker diarizer
+    /// actually receives samples to embed. Earlier the daemon was
+    /// spawned + "ready" but no caller ever fed it, so speaker labels
+    /// never appeared. This is the seam that catches that regression.
+    func test_VAD_utterance_fires_onUtteranceCaptured_with_same_samples() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "hi")])
+
+        var capturedSamples: [Float] = []
+        var capturedStart: Double = -1
+        var capturedEnd: Double = -1
+        let expectation = XCTestExpectation(description: "onUtteranceCaptured fired")
+
+        transcriber.useVAD = true
+        transcriber.onUtteranceCaptured = { samples, start, end in
+            capturedSamples = samples
+            capturedStart = start
+            capturedEnd = end
+            expectation.fulfill()
+        }
+        transcriber.start(language: "en")
+
+        // Synthesize 1.2s of speech-energy audio (well above the VAD
+        // threshold) followed by 1s of silence so the detector emits.
+        let speech = Array(repeating: Float(0.05), count: 16_000 * 12 / 10)
+        let silence = Array(repeating: Float(0.0), count: 16_000)
+        transcriber.ingest(ArraySlice(speech + silence))
+
+        await fulfillment(of: [expectation], timeout: 2.0)
+
+        XCTAssertGreaterThan(capturedSamples.count, 0,
+                             "callback fired with empty samples — would feed the diarizer nothing")
+        XCTAssertGreaterThanOrEqual(capturedStart, 0)
+        XCTAssertGreaterThan(capturedEnd, capturedStart,
+                             "end (\(capturedEnd)) should be after start (\(capturedStart))")
+        _ = transcriber.stop()
+    }
+
     func test_formattedTranscript_uses_timestamps_one_line_per_segment() async {
         await stub.setDefaultCanned([
             TranscriptSegment(start: 0, end: 1, text: "first"),

@@ -4,6 +4,7 @@ import Combine
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 import AVFoundation
+import TranscriptionCore
 
 /// Single entry point used by the Home tiles + sidebar buttons.
 /// Hides recording/transcription orchestration from the UI layer.
@@ -93,6 +94,15 @@ final class QuickActionsController: ObservableObject {
     var llmSettings: LLMSettings?
     var liveAISettings: LiveAISettings?
     var liveAISession: LiveAISession?
+    /// Set after init by MilaApp. When non-nil and the recording
+    /// produced live segments, `stopRecording` saves the live
+    /// transcript directly and skips the post-stop whisper +
+    /// diarization re-run.
+    var liveTranscriber: LiveTranscriber?
+    /// Set after init by MilaApp. `stopRecording` awaits any pending
+    /// diarizer work so the final utterance's speaker label lands
+    /// before the transcript is saved.
+    var liveDiarizer: LiveSpeakerDiarizer?
 
     /// Active silence-watch task — cancelled when the recording stops so
     /// we never fire the warning for a recording that's already over.
@@ -307,17 +317,73 @@ final class QuickActionsController: ObservableObject {
         // this method and fires one last `feed()` to flush the
         // recording's tail. If we read `.summary` before that tick
         // completes, the saved Recording misses the final update.
+        //
+        // Same race exists for the live transcript: the `.idle`
+        // handler calls `transcriber.transcribeNow()` to emit any
+        // utterance still sitting in the VAD buffer, but it runs in
+        // a separate task. Without an explicit flush here, reading
+        // `liveTranscriber?.segments` below would race the final
+        // utterance and `useLiveTranscript=true` would skip enqueue,
+        // permanently dropping the tail. Calling `transcribeNow()`
+        // is idempotent (detector.flush + await lastUtteranceTask),
+        // so racing the `.idle` handler is fine — whichever runs
+        // second is a no-op.
+        await liveTranscriber?.transcribeNow()
+        // Drain the diarizer's chained background work so the final
+        // utterance's embedding lands in `intervals` before we save.
+        // Then re-apply labels — `feedTask` (the loop that normally
+        // calls applySpeakerLabels on each $segments tick) is
+        // cancelled by the `.idle` handler, so without this the
+        // final utterance would have its segment but no speaker.
+        // Pre-PR the post-record batch diarizer caught this gap; with
+        // useLiveTranscript=true skipping enqueue, that safety net is
+        // gone.
+        await liveDiarizer?.awaitPending()
+        if let diar = liveDiarizer {
+            liveTranscriber?.applySpeakerLabels(diar.intervals)
+        }
         await liveAISession?.awaitFinalTick()
         let liveSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let liveItems = liveAISession?.actionItems ?? []
+
+        // If the VAD path was active and produced segments, ship them
+        // as the saved transcript directly instead of waiting for
+        // whisper to re-process the WAV. The live diarizer has
+        // already attached speaker labels to each segment via
+        // `LiveTranscriber.applySpeakerLabels`, so we get diarization
+        // for free too. This collapses the post-stop "transcribing…"
+        // sheet from ~30-120s down to instant.
+        //
+        // Scope this skip to VAD specifically: the chunk-based path
+        // (useVAD=false) also produces segments via `runOnce`, but
+        // it never fires `onUtteranceCaptured` so the live diarizer
+        // is never fed — those segments have no speaker labels and
+        // need the post-record batch diarizer to attach them. Falling
+        // back to `enqueue` in that mode preserves the existing
+        // speaker-label experience for users who opted out of VAD.
+        let liveSegments = liveTranscriber?.segments ?? []
+        let vadActive = liveTranscriber?.useVAD == true
+        let useLiveTranscript = !liveSegments.isEmpty && vadActive
+        let transcriptSegments: [TranscriptSegment] = liveSegments.map { ls in
+            TranscriptSegment(
+                start: ls.startSeconds,
+                end: ls.endSeconds,
+                text: ls.text,
+                speaker: ls.speaker
+            )
+        }
+        let liveFullText = transcriptSegments.map(\.text).joined(separator: " ")
 
         let recording = Recording(
             title: title,
             duration: duration,
             source: source,
             audioFileName: outputURL.lastPathComponent,
+            status: useLiveTranscript ? .completed : .pending,
             language: languageSettings.current.rawValue,
+            segments: transcriptSegments,
+            fullText: useLiveTranscript ? liveFullText : "",
             appName: appName,
             summary: liveSummary.isEmpty ? nil : liveSummary,
             actionItems: liveItems.isEmpty ? nil : liveItems
@@ -350,7 +416,19 @@ final class QuickActionsController: ObservableObject {
         if sleepReason == nil {
             postRecording.present(recording)
         }
-        transcription.enqueue(recording)
+        // Only kick the queue if we don't have a live transcript
+        // ready to go. With useLiveTranscript=true the Recording was
+        // saved with status=.completed and a transcript already
+        // attached — the rename sheet shows the text immediately
+        // and there's no "Transcribing…" progress bar.
+        if useLiveTranscript {
+            // Mirror the enqueue path's post-success side effect:
+            // write a `.srt` sidecar alongside the WAV so video
+            // export / subtitle workflows still find it.
+            TranscriptExporter.writeSRT(for: recording, in: store.recordingsDirectory)
+        } else {
+            transcription.enqueue(recording)
+        }
     }
 
     // MARK: - Sleep interruption

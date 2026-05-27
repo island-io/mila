@@ -135,6 +135,8 @@ struct MilaApp: App {
         actions.llmSettings = llm
         actions.liveAISettings = liveAI
         actions.liveAISession = liveSession
+        actions.liveTranscriber = liveTrans
+        actions.liveDiarizer = liveDiar
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -328,6 +330,18 @@ struct MilaApp: App {
                 // up (default 5s, settable in Settings → Live AI).
                 transcriber.chunkSeconds = aiSettings.chunkSeconds
                 transcriber.useVAD = aiSettings.useVAD
+                // Wire each VAD-bounded utterance into the speaker
+                // diarizer. Without this, diarizer.process is never
+                // called, intervals stays empty, and segments never
+                // get a speaker label.
+                transcriber.onUtteranceCaptured = { [weak diarizer] samples, start, end in
+                    // Use `submit` (chained, trackable) rather than a
+                    // detached task — at end-of-recording we need to
+                    // `awaitPending()` so the final utterance's
+                    // speaker label is attached before the transcript
+                    // is saved.
+                    diarizer?.submit(samples: samples, startSeconds: start, endSeconds: end)
+                }
                 transcriber.start(language: langSettings.current.rawValue)
                 print("wireLiveAIPipeline: .recording — installing onLiveSamples → liveTranscriber.ingest")
                 sessionRef.onLiveSamples = { [weak transcriber] samples in
@@ -383,7 +397,12 @@ struct MilaApp: App {
                         // flipped off → ticks stop; the LLM session
                         // preserves whatever it has produced so far.
                         let aiActive = aiSettings.enabled && llmSettingsRef.isConfigured
-                        if aiActive, let diarizer {
+                        // Speaker labels are a transcription feature,
+                        // not an LLM feature — apply them whenever the
+                        // diarizer has produced intervals, regardless
+                        // of whether the user has the LLM CLI
+                        // configured.
+                        if let diarizer {
                             transcriber.applySpeakerLabels(diarizer.intervals)
                         }
                         if aiActive {
@@ -426,6 +445,19 @@ struct MilaApp: App {
                     }
                 }
                 _ = transcriber.stop()
+                // Drain the diarizer's chained background work BEFORE
+                // killing the daemon. `stopRecording` also awaits this,
+                // but it runs concurrently on the @MainActor — if the
+                // `.idle` handler reaches `diarizer.stop()` first, the
+                // daemon process is terminated and the in-flight
+                // continuation in `pending` resumes with
+                // `error: "stopped"`, so `process(...)` skips
+                // appending the final utterance's interval and the
+                // final speaker label is permanently lost. Awaiting
+                // the queue here means the daemon stays alive until
+                // every queued embed has landed; stopRecording's
+                // duplicate `awaitPending` is then a no-op.
+                await diarizer.awaitPending()
                 diarizer.stop()
                 // Note: don't cancel aiSession here — QuickActionsController
                 // still needs to read .summary and .actionItems out of

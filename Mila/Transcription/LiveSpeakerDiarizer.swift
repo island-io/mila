@@ -1,5 +1,8 @@
 import Foundation
 import Combine
+import OSLog
+
+private let diarLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LiveSpeakerDiarizer")
 
 /// Streams speaker labels during a live recording by sending 5 s WAV chunks
 /// to a long-running Python daemon that computes a pyannote/wespeaker
@@ -46,6 +49,11 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// response so first-in-first-out.
     private var pending: [CheckedContinuation<EmbedResponse, Never>] = []
     private var stderrTask: Task<Void, Never>?
+    /// Tail of the chained background-diarize tasks. Each `submit(...)`
+    /// chains a new Task that awaits the previous one before running
+    /// `process(...)`, so the chain enforces FIFO over the daemon and
+    /// `awaitPending()` can join the final tail at end-of-recording.
+    private var processQueue: Task<Void, Never>?
 
     struct SpeakerProfile {
         let id: String
@@ -63,20 +71,27 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// failure becomes a `lastError` so callers don't have to wrap try/
     /// catch around every recording start.
     func start(diarization: DiarizationSettings) async {
-        guard process == nil else { return }
+        guard process == nil else {
+            diarLog.log("start skipped — daemon already running")
+            return
+        }
         guard diarization.isConfigured else {
             lastError = "Diarization is not configured"
+            diarLog.log("NOT starting — isConfigured=false (isEnabled=\(diarization.isEnabled, privacy: .public) hasBundledRuntime=\(diarization.hasBundledRuntime, privacy: .public) bootstrap.isReady=\(diarization.bootstrap.isReady, privacy: .public))")
             return
         }
         guard let modelsPath = Bundle.main.path(forResource: "DiarizationModels", ofType: nil) else {
             lastError = "Bundled diarization models not found in app"
+            diarLog.log("NOT starting — DiarizationModels not in app bundle")
             return
         }
         let pythonPath = SpeakerDiarizer.resolvePython(userConfigured: diarization.pythonPath)
         guard FileManager.default.fileExists(atPath: pythonPath) else {
             lastError = "Python not found at \(pythonPath)"
+            diarLog.log("NOT starting — python not at \(pythonPath, privacy: .public)")
             return
         }
+        diarLog.log("starting daemon python=\(pythonPath, privacy: .public)")
 
         let script = Self.daemonScript
         let stdin = Pipe()
@@ -113,6 +128,7 @@ final class LiveSpeakerDiarizer: ObservableObject {
         // embedding inference are loaded.
         let ready = await waitForReady(timeoutSeconds: 30)
         isReady = ready
+        diarLog.log("daemon ready=\(ready, privacy: .public)")
         if !ready {
             lastError = lastError ?? "Diarization daemon did not become ready"
         }
@@ -147,13 +163,39 @@ final class LiveSpeakerDiarizer: ObservableObject {
         intervals.removeAll()
     }
 
+    /// Fire-and-track variant of `process(...)`. Chains the call onto
+    /// `processQueue` so the FIFO order matches the daemon's, and
+    /// `awaitPending()` can join the tail. Use this from the live-
+    /// recording pipeline; use `process(...)` directly only for tests.
+    func submit(samples: [Float], startSeconds: Double, endSeconds: Double, sampleRate: Double = 16_000) {
+        let prev = processQueue
+        processQueue = Task { @MainActor [weak self] in
+            await prev?.value
+            await self?.process(samples: samples,
+                                startSeconds: startSeconds,
+                                endSeconds: endSeconds,
+                                sampleRate: sampleRate)
+        }
+    }
+
+    /// Wait for every queued `submit(...)` call to finish. Used at
+    /// end-of-recording so the final utterance's interval lands in
+    /// `intervals` before the saved transcript is read.
+    func awaitPending() async {
+        await processQueue?.value
+    }
+
     /// Diarize one chunk of samples covering [`startSeconds`, `endSeconds`]
     /// of the recording's timeline. Writes the slice to a temp WAV and
     /// sends the path to the daemon. Returns nothing — appends to
     /// `intervals` for the live transcriber to pick up via
     /// `applySpeakerLabels(_:)`.
     func process(samples: [Float], startSeconds: Double, endSeconds: Double, sampleRate: Double = 16_000) async {
-        guard isReady, !samples.isEmpty else { return }
+        diarLog.log("process called: samples=\(samples.count, privacy: .public) start=\(startSeconds, privacy: .public) end=\(endSeconds, privacy: .public) isReady=\(self.isReady, privacy: .public)")
+        guard isReady, !samples.isEmpty else {
+            diarLog.log("process SKIPPED isReady=\(self.isReady, privacy: .public) samplesEmpty=\(samples.isEmpty, privacy: .public)")
+            return
+        }
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("mila-live-diar-\(UUID().uuidString).wav")
         do {
@@ -167,13 +209,18 @@ final class LiveSpeakerDiarizer: ObservableObject {
         let payload: [String: Any] = ["cmd": "embed", "wav": tempURL.path]
         guard let data = try? JSONSerialization.data(withJSONObject: payload),
               let line = String(data: data, encoding: .utf8) else { return }
+        let sendStart = Date()
+        diarLog.log("sending embed cmd to daemon, wav=\(tempURL.path, privacy: .public)")
         let response = await sendCommand("\(line)\n")
+        let elapsed = Date().timeIntervalSince(sendStart)
+        diarLog.log("daemon response after \(elapsed, privacy: .public)s: embedding=\(response.embedding?.count ?? 0, privacy: .public) error=\(response.error ?? "(none)", privacy: .public)")
         guard let embedding = response.embedding, !embedding.isEmpty else {
             if let err = response.error { lastError = "Diar daemon: \(err)" }
             return
         }
         let speakerID = assign(embedding: embedding)
         intervals.append((start: startSeconds, end: endSeconds, speaker: speakerID))
+        diarLog.log("interval added: \(startSeconds, privacy: .public)..\(endSeconds, privacy: .public) → \(speakerID, privacy: .public) (poolSize=\(self.pool.count, privacy: .public) totalIntervals=\(self.intervals.count, privacy: .public))")
     }
 
     /// Match a new embedding against the pool by cosine similarity. If no
@@ -296,7 +343,16 @@ final class LiveSpeakerDiarizer: ObservableObject {
                 let data = handle.availableData
                 if data.isEmpty { break }
                 if let text = String(data: data, encoding: .utf8) {
-                    print("LiveDiar stderr: \(text)", terminator: "")
+                    // Route stderr through os.Logger so we can read
+                    // Python progress + tracebacks via `log show`.
+                    // The daemon's `print(..., file=sys.stderr,
+                    // flush=True)` lines land here, including the
+                    // "live-diar: embed error" traceback we'd
+                    // otherwise miss on silent failures.
+                    let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !stripped.isEmpty {
+                        diarLog.log("daemon stderr: \(stripped, privacy: .public)")
+                    }
                 }
                 _ = self  // keep reference alive
             }
@@ -424,8 +480,17 @@ def main():
             samples, sr = sf.read(wav_path, dtype="float32")
             if samples.ndim > 1:
                 samples = samples.mean(axis=1)
-            wave = torch.from_numpy(samples).unsqueeze(0)
-            emb = embedder({"waveform": wave, "sample_rate": int(sr)})
+            # pyannote 3.x's `pipeline._embedding` is a
+            # `PretrainedSpeakerEmbedding`, NOT an `Inference` wrapper —
+            # so it takes a torch.Tensor of shape
+            #   (batch_size, num_channels, num_samples)
+            # directly. Passing a `{"waveform": ..., "sample_rate": ...}`
+            # dict (the file-input shape for `Inference`) made pyannote
+            # try `.to(device)` on the dict and crash with
+            # "'dict' object has no attribute 'to'" — silently swallowing
+            # every embed request.
+            wave = torch.from_numpy(samples).unsqueeze(0).unsqueeze(0)
+            emb = embedder(wave)
             arr = emb.detach().cpu().numpy().flatten() if hasattr(emb, "detach") else np.array(emb).flatten()
             emit({"embedding": arr.tolist()})
         except Exception as e:
