@@ -17,24 +17,27 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.6.3"
-    # 1.6.3 tunes the 1.6.2 VAD against real conversations:
-    #   * silenceMs 700 → 500 (natural pauses were merging 4-5 lines
-    #     into one 13s emit; CI fixture test caught this).
-    #   * minUtteranceMs 400 → 200 — single-word responses no longer
-    #     dropped as too short.
-    #   * Capped cutoff + deep-silence-only noise floor adaptation +
-    #     hysteresis (0.5× enter cutoff) so quiet syllables don't kick
-    #     the detector back to silence mid-word.
-    #   * Pad VAD utterances to 5s before sending to whisper — its
-    #     beam search hung at 100% CPU on sub-2s clips.
-    #   * Live AI: timeouts bumped for Sonnet (45→90s follow-up,
-    #     90→180s first-call); regen session UUID on first-call
-    #     failure to avoid getting stuck on a wedged claude
-    #     --session-id state.
-    #   * New CI test pumps a multi-speaker fixture WAV through the
-    #     VAD and asserts emit count + coverage.
-    CURRENT_PROJECT_VERSION: "33"
+    MARKETING_VERSION: "1.6.4"
+    # 1.6.4 ships live speaker labels + instant save:
+    #   * Wired the LiveSpeakerDiarizer feed — pyannote daemon was
+    #     spawning but no one was calling diarizer.process; speaker
+    #     labels never appeared in the live pane.
+    #   * Fixed the daemon's embedder call — pyannote 3.x's
+    #     `pipeline._embedding` takes a torch.Tensor directly, not a
+    #     `{"waveform":, "sample_rate":}` dict, so every embed call
+    #     was crashing silently with 'dict has no attribute to'.
+    #   * applySpeakerLabels matches segments to intervals by max
+    #     overlap; runs on every recording (not LLM-gated) and stays
+    #     under 50ms even at 2-min scale.
+    #   * Live pane renders `SPEAKER_00:` prefix inline as labels
+    #     arrive.
+    #   * When VAD ran successfully, post-record skips re-transcribe
+    #     + re-diarize entirely — rename sheet pops up with the
+    #     transcript already populated. Drains diarizer + reapplies
+    #     labels at stop time so the final utterance gets its
+    #     speaker label before saving (4 race fixes from Bugbot
+    #     review). Still writes the .srt sidecar.
+    CURRENT_PROJECT_VERSION: "34"
 
 packages:
   TranscriptionCore:
