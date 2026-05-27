@@ -136,7 +136,13 @@ jobs:
 
       - name: Run audio loopback UI test
         env:
-          MILA_LOOPBACK_E2E: "1"
+          # xcodebuild strips the `TEST_RUNNER_` prefix and exposes the
+          # remaining name as an env var inside the test process — that's
+          # how we feed MILA_LOOPBACK_E2E=1 to `ProcessInfo.processInfo
+          # .environment` inside the XCTest target. Plain shell env vars
+          # do NOT propagate through to the test runner. See:
+          # https://developer.apple.com/documentation/xcode/running-tests-and-interpreting-results
+          TEST_RUNNER_MILA_LOOPBACK_E2E: "1"
         run: |
           xcodebuild test \
             -project Mila.xcodeproj \
