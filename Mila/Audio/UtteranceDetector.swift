@@ -76,7 +76,7 @@ final class UtteranceDetector {
         sampleRate: Double = 16_000,
         frameMs: Double = 30,
         rmsThreshold: Float = 0.008,
-        silenceMs: Double = 700,
+        silenceMs: Double = 500,
         minUtteranceMs: Double = 200,
         maxUtteranceMs: Double = 20_000,
         preRollMs: Double = 200,
