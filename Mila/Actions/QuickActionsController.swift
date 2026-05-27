@@ -311,7 +311,6 @@ final class QuickActionsController: ObservableObject {
         let liveSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let liveItems = liveAISession?.actionItems ?? []
-        let liveAIWasActive = !liveSummary.isEmpty || !liveItems.isEmpty
 
         let recording = Recording(
             title: title,
@@ -341,16 +340,14 @@ final class QuickActionsController: ObservableObject {
         // enables LLM-suggest / Send-to-Claude once it's ready. Dictations
         // and imported files deliberately skip this — naming a 3-second
         // dictation would be more friction than the auto-title is worth.
-        // Suppress in two more cases:
-        //   * The stop was forced by sleep — the user isn't at the
-        //     machine; stacking a modal behind the wake-up alert would
-        //     force them to dismiss two prompts in a row.
-        //   * Live AI was running — the split-pane already gave the user
-        //     a summary, action items, and a live transcript while the
-        //     call was happening, so re-prompting for a title on top
-        //     would be busywork. They can still rename via the detail
-        //     view if the default timestamped title isn't enough.
-        if sleepReason == nil, !liveAIWasActive {
+        // Only suppress when the stop was forced by sleep: stacking a
+        // modal behind the wake-up alert would force the user to dismiss
+        // two prompts in a row. We used to also skip when Live AI was
+        // active (reasoning: the split-pane already gave the user a
+        // summary), but the rename sheet is also where Send-to-Claude
+        // lives for follow-up actions — so it should always appear,
+        // Live AI or not.
+        if sleepReason == nil {
             postRecording.present(recording)
         }
         transcription.enqueue(recording)

@@ -986,6 +986,15 @@ private struct LiveAISettingsTab: View {
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Auto-segment by silence (beta)", isOn: $settings.useVAD)
+                        .font(.callout.weight(.semibold))
+                    Text("Detect natural pauses (≥400ms silence) and run whisper once per utterance instead of on a fixed timer. Lower latency, cleaner word boundaries. Force-cut at 25s for monologue speakers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
                     HStack {
                         Text("Update every").font(.callout.weight(.semibold))
                         Spacer()
@@ -994,7 +1003,8 @@ private struct LiveAISettingsTab: View {
                             .foregroundStyle(.secondary)
                     }
                     Slider(value: $settings.chunkSeconds, in: 15...60, step: 5)
-                    Text("How often Mila re-transcribes and re-prompts. 30s is the default — matches the whisper window so words don't get cut mid-utterance. Lower = more responsive but more garbled boundaries.")
+                        .disabled(settings.useVAD)
+                    Text("How often Mila re-transcribes and re-prompts when auto-segment is off. 30s is the default — matches the whisper window so words don't get cut mid-utterance.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)

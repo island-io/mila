@@ -53,9 +53,20 @@ final class LiveTranscriber: ObservableObject {
 
     var chunkSeconds: Double = 30.0
     var windowSeconds: Double = 30.0
+    /// When true, route incoming audio through `UtteranceDetector` and
+    /// transcribe once per detected utterance instead of on the fixed
+    /// `chunkSeconds` timer. Set by `MilaApp.wireLiveAIPipeline` from
+    /// `LiveAISettings.useVAD` before `start()`.
+    var useVAD: Bool = false
     private let sampleRate: Double = 16_000
 
     private let transcription: TranscriptionService
+    private var detector: UtteranceDetector?
+    /// VAD path serialises transcribes via task chaining: each new
+    /// utterance creates a Task that awaits the previous one before
+    /// running whisper. We never null this — Swift's runtime drops the
+    /// chain naturally once each Task body completes.
+    private var lastUtteranceTask: Task<Void, Never>?
     /// Rolling window of recent samples — we keep only the last
     /// `windowSeconds` worth (plus a small headroom; see `trimBuffer`)
     /// because anything older was already transcribed and merged. For
@@ -92,7 +103,16 @@ final class LiveTranscriber: ObservableObject {
         self.fullText = ""
         self.segments = []
         self.lastError = nil
-        liveLog.log("LiveTranscriber.start lang=\(language, privacy: .public) chunk=\(self.chunkSeconds, privacy: .public)s window=\(self.windowSeconds, privacy: .public)s")
+        liveLog.log("LiveTranscriber.start lang=\(language, privacy: .public) chunk=\(self.chunkSeconds, privacy: .public)s window=\(self.windowSeconds, privacy: .public)s useVAD=\(self.useVAD, privacy: .public)")
+
+        if useVAD {
+            let det = UtteranceDetector()
+            det.onUtterance = { [weak self] samples, startSec in
+                self?.scheduleUtteranceTranscribe(samples: samples, startSec: startSec)
+            }
+            self.detector = det
+            return
+        }
 
         tickTask = Task { @MainActor [weak self] in
             while let self, !Task.isCancelled {
@@ -109,14 +129,29 @@ final class LiveTranscriber: ObservableObject {
         tickTask = nil
         inFlight?.cancel()
         inFlight = nil
+        detector = nil
+        lastUtteranceTask?.cancel()
+        lastUtteranceTask = nil
         return fullText
     }
 
     func ingest(_ samples: ArraySlice<Float>) {
-        buffer.append(contentsOf: samples)
+        if let detector {
+            detector.ingest(samples)
+        } else {
+            buffer.append(contentsOf: samples)
+        }
     }
 
     func transcribeNow() async {
+        if let detector {
+            // End-of-recording flush: force-emit any in-progress
+            // utterance (which schedules onto lastUtteranceTask), then
+            // await it so the saved transcript includes the tail.
+            detector.flush()
+            await lastUtteranceTask?.value
+            return
+        }
         await runOnce()
     }
 
@@ -142,6 +177,44 @@ final class LiveTranscriber: ObservableObject {
             let ss = Int(seg.startSeconds) % 60
             return String(format: "[%02d:%02d] %@", mm, ss, seg.text)
         }.joined(separator: "\n")
+    }
+
+    /// VAD path: enqueue a transcribe for a complete utterance. New
+    /// utterances chain on top of the previous task so whisper runs
+    /// strictly serially (the engine actor enforces this anyway, but
+    /// the chain also keeps the publish order stable).
+    private func scheduleUtteranceTranscribe(samples: [Float], startSec: Double) {
+        let prev = lastUtteranceTask
+        lastUtteranceTask = Task { @MainActor [weak self] in
+            await prev?.value
+            await self?.transcribeUtterance(samples: samples, startSec: startSec)
+        }
+    }
+
+    private func transcribeUtterance(samples: [Float], startSec: Double) async {
+        isTranscribing = true
+        defer { isTranscribing = false }
+        let startedAt = Date()
+        let whisperSegs = await transcription.transcribeOnceSegments(samples: samples, language: language)
+        let elapsed = Date().timeIntervalSince(startedAt)
+        liveLog.log("LiveTranscriber utterance: samples=\(samples.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) startSec=\(startSec, privacy: .public)")
+        guard !whisperSegs.isEmpty else { return }
+
+        // VAD utterances are non-overlapping by construction, so we
+        // just append — no merge dedup needed.
+        for s in whisperSegs {
+            let text = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            segments.append(LiveSegment(
+                id: UUID(),
+                startSeconds: startSec + s.start,
+                endSeconds: startSec + s.end,
+                text: text,
+                speaker: nil,
+                stable: true
+            ))
+        }
+        fullText = segments.map(\.text).joined(separator: " ")
     }
 
     private func kickIfIdle() {

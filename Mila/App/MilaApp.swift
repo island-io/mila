@@ -327,6 +327,7 @@ struct MilaApp: App {
                 // setting before start() so the running loop picks it
                 // up (default 5s, settable in Settings → Live AI).
                 transcriber.chunkSeconds = aiSettings.chunkSeconds
+                transcriber.useVAD = aiSettings.useVAD
                 transcriber.start(language: langSettings.current.rawValue)
                 print("wireLiveAIPipeline: .recording — installing onLiveSamples → liveTranscriber.ingest")
                 sessionRef.onLiveSamples = { [weak transcriber] samples in
@@ -759,10 +760,14 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // Free whisper.cpp context (and via it, the ggml-metal devices) BEFORE
         // libc++ static destructors run. See class doc for the why.
         await transcription?.shutdown()
-        // Yield once so any pending dispatch blocks queued by ggml-metal
-        // during the warmup pass have a chance to drain. 50ms is empirically
-        // enough on Apple Silicon.
-        try? await Task.sleep(nanoseconds: 50_000_000)
+        // Yield so pending dispatch blocks queued by ggml-metal
+        // (rsets-init, etc.) have a chance to drain before libc++
+        // static destructors run. 50ms was enough for the
+        // chunk-based path; with VAD's higher transcribe frequency
+        // we observed SIGABRT in ggml_metal_rsets_free at exit on
+        // macOS 26 — bumping to 500ms gives the init blocks more
+        // breathing room. Cost: quit takes ~half a second longer.
+        try? await Task.sleep(nanoseconds: 500_000_000)
         HotkeyManager.shared.shutdown()
     }
 }

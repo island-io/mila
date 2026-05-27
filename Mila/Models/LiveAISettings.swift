@@ -29,6 +29,15 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(chunkSeconds, forKey: Keys.chunkSeconds) }
     }
 
+    /// When true, the live transcriber routes audio through a VAD
+    /// instead of cutting on a fixed time interval. Whisper runs once
+    /// per detected utterance (on silence ≥400ms), capped at 25s for
+    /// monologues. Off by default for now — opt-in beta until we've
+    /// tuned the RMS threshold against real recordings.
+    @Published var useVAD: Bool {
+        didSet { defaults.set(useVAD, forKey: Keys.useVAD) }
+    }
+
     /// Speaker-similarity cosine threshold. ≥ this is the same speaker;
     /// below is a new speaker. 0.75 is a reasonable starting point for
     /// pyannote/embedding output.
@@ -94,7 +103,11 @@ final class LiveAISettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.enabled = defaults.bool(forKey: Keys.enabled)
+        // Default ON: users who never touched the toggle should get
+        // the LLM summary/action-items pane. If their LLM CLI isn't
+        // configured, `isLiveAIReady` still gates everything down to
+        // a no-op, so this is safe.
+        self.enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
         self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
         // Migrate pre-1.6.1 persisted values (default was 5s, range 3-20s).
         // 5s windows cut words mid-utterance and made the trailing-window
@@ -102,6 +115,9 @@ final class LiveAISettings: ObservableObject {
         // window per tick, non-overlapping, clean boundaries.
         let raw = defaults.double(forKey: Keys.chunkSeconds)
         self.chunkSeconds = raw >= 25.0 ? raw : 30.0
+        // Default ON: users who never touched the toggle get the
+        // cleaner-boundary VAD path. Explicit false is preserved.
+        self.useVAD = defaults.object(forKey: Keys.useVAD) as? Bool ?? true
         let sim = defaults.double(forKey: Keys.simThreshold)
         self.speakerSimilarityThreshold = sim > 0 ? sim : 0.75
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
@@ -109,10 +125,11 @@ final class LiveAISettings: ObservableObject {
         self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto
     }
 
-    /// Default "cheap" model. Currently `claude-haiku-4-5` — the smallest
-    /// member of the 4.5 generation. Users on cursor-agent can override
-    /// in Settings if their CLI accepts a different model name.
-    static let defaultModel = "claude-haiku-4-5"
+    /// Default model. Currently `claude-sonnet-4-6` — better
+    /// summarisation quality than Haiku at modest extra cost. Users
+    /// on cursor-agent can override in Settings if their CLI accepts
+    /// a different model name.
+    static let defaultModel = "claude-sonnet-4-6"
 
     /// The default prompt. Idempotent: we re-send the full growing
     /// transcript on every tick and the model re-emits the FULL list
@@ -162,6 +179,7 @@ If the call has just started and there is no transcript yet, output \
         static let enabled = "liveAI.enabled"
         static let model = "liveAI.model"
         static let chunkSeconds = "liveAI.chunkSeconds"
+        static let useVAD = "liveAI.useVAD"
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
         static let prompt = "liveAI.prompt"
         static let outputLanguage = "liveAI.outputLanguage"

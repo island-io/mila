@@ -17,15 +17,20 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.6.1"
-    # 1.6.1 quick remediation: Live AI transcript was cutting words
-    # mid-utterance because the 5s sliding tick re-spliced overlapping
-    # whisper outputs whose segment boundaries didn't line up. Default
-    # chunk bumped from 5s to 30s so each tick transcribes one whole
-    # non-overlapping whisper window — clean boundaries, less garbled
-    # text, and no risk of the transcribe call outpacing the tick.
-    # Persisted values below 25s are migrated up automatically.
-    CURRENT_PROJECT_VERSION: "31"
+    MARKETING_VERSION: "1.6.2"
+    # 1.6.2 ships:
+    #   * VAD-based live transcription: utterance detection on natural
+    #     pauses (RMS state machine + adaptive noise floor, capped to
+    #     avoid runaway thresholds in quiet rooms). On by default; can
+    #     be turned off in Settings → Live AI → Advanced.
+    #   * Default LLM model is now Sonnet 4.6 (was Haiku 4.5) for
+    #     summary quality, and Live AI is on by default.
+    #   * Rename / Send-to-Claude sheet is no longer suppressed when
+    #     Live AI was running — the popup is back regardless of mode.
+    #   * Bumped the post-shutdown drain from 50ms → 500ms to reduce
+    #     SIGABRT in ggml_metal_rsets_free at quit time under VAD's
+    #     higher transcribe frequency on macOS 26.
+    CURRENT_PROJECT_VERSION: "32"
 
 packages:
   TranscriptionCore:
