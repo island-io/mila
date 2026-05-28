@@ -75,14 +75,26 @@ final class AudioLoopbackUITests: XCTestCase {
         app.launchArguments = args
         app.launch()
 
-        // Wait for the first VAD-emitted segment to land. CI macos-26
-        // runners have no fast GPU, so whisper's first call has to
-        // cold-load the 1.5GB model + Metal warmup + first real
-        // transcribe — all in serial. That's 60-90s on a fresh
-        // runner. Local dev machines manage 5-10s. Generous timeout.
+        // Snapshot the launch state so we can see whether
+        // LiveAIRecordingView is rendering at all when the test
+        // starts (vs Home / blank screen).
+        Thread.sleep(forTimeInterval: 5.0)
+        snap(app: app, name: "[\(language)] t=5s post-launch")
+        let containerVisible = app.descendants(matching: .any)
+            .matching(identifier: "liveTranscript.container").firstMatch.exists
+        let listeningVisible = app.descendants(matching: .any)
+            .matching(identifier: "liveTranscript.listening").firstMatch.exists
+        print("FixtureE2E[\(language)]: post-launch container=\(containerVisible) listening=\(listeningVisible)")
+
+        // Wait for the first VAD-emitted segment. CI macos-26 runners
+        // have no fast GPU, so whisper's first call cold-loads the
+        // 1.5GB model + Metal warmup + first transcribe ~60-90s.
+        // Subsequent calls are 20-30s each. Generous timeout.
         let firstSegment = app.staticTexts.matching(identifier: "liveTranscript.segment").firstMatch
-        XCTAssertTrue(firstSegment.waitForExistence(timeout: 120),
-                      "[\(language)] No live segment after 120s — injection or VAD broken")
+        let appeared = firstSegment.waitForExistence(timeout: 150)
+        snap(app: app, name: "[\(language)] after first-segment wait (appeared=\(appeared))")
+        XCTAssertTrue(appeared,
+                      "[\(language)] No live segment after 150s — see post-launch snapshot for whether the view rendered at all")
 
         // 12 snapshots × 10s = 120s of recording. Track segment counts
         // and screenshot each.
