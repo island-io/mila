@@ -69,16 +69,22 @@ final class UtteranceDetector {
     /// single click/pop doesn't trigger an utterance.
     private var pendingSpeechFrames: Int = 0
     private var pendingSpeechBuffer: [[Float]] = []
+    /// Peak frame RMS seen since the previous tick log. Logged + reset
+    /// every ~1s so we can see actual energy levels in real environments
+    /// when speech vs silence detection misbehaves.
+    private var peakRmsSinceTick: Float = 0
+    private var sumRmsSinceTick: Float = 0
+    private var framesSinceTick: Int = 0
 
     private enum State { case silence, speech }
 
     init(
         sampleRate: Double = 16_000,
         frameMs: Double = 30,
-        rmsThreshold: Float = 0.008,
+        rmsThreshold: Float = 0.012,
         silenceMs: Double = 500,
         minUtteranceMs: Double = 200,
-        maxUtteranceMs: Double = 20_000,
+        maxUtteranceMs: Double = 10_000,
         preRollMs: Double = 200,
         noiseFloorAlpha: Float = 0.02,
         noiseFloorMultiplier: Float = 3.0,
@@ -140,13 +146,20 @@ final class UtteranceDetector {
         // "nothing happens" reports without spamming the log.
         if samplesIngested % Int(sampleRate) < frameSize {
             let s = state == .speech ? "speech" : "silence"
-            let cutoff = max(rmsThreshold, noiseFloor * noiseFloorMultiplier)
-            vadLog.log("VAD tick: state=\(s, privacy: .public) noiseFloor=\(self.noiseFloor, privacy: .public) cutoff=\(cutoff, privacy: .public) speechFrames=\(self.speechFramesInCurrent, privacy: .public)")
+            let cutoff = max(rmsThreshold, min(rmsThreshold * 2.5, noiseFloor * noiseFloorMultiplier))
+            let avg = framesSinceTick > 0 ? sumRmsSinceTick / Float(framesSinceTick) : 0
+            vadLog.log("VAD tick: state=\(s, privacy: .public) noiseFloor=\(self.noiseFloor, privacy: .public) cutoff=\(cutoff, privacy: .public) peakRms=\(self.peakRmsSinceTick, privacy: .public) avgRms=\(avg, privacy: .public) speechFrames=\(self.speechFramesInCurrent, privacy: .public)")
+            peakRmsSinceTick = 0
+            sumRmsSinceTick = 0
+            framesSinceTick = 0
         }
     }
 
     private func handle(frame: [Float]) {
         let energy = rms(frame)
+        if energy > peakRmsSinceTick { peakRmsSinceTick = energy }
+        sumRmsSinceTick += energy
+        framesSinceTick += 1
         // Enter-speech cutoff: capped dynamic threshold (room noise can
         // raise it, but only up to 2.5× the static floor).
         let enterCutoff = max(rmsThreshold, min(rmsThreshold * 2.5, noiseFloor * noiseFloorMultiplier))

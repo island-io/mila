@@ -119,7 +119,11 @@ final class LiveAISettings: ObservableObject {
         // cleaner-boundary VAD path. Explicit false is preserved.
         self.useVAD = defaults.object(forKey: Keys.useVAD) as? Bool ?? true
         let sim = defaults.double(forKey: Keys.simThreshold)
-        self.speakerSimilarityThreshold = sim > 0 ? sim : 0.75
+        // Migrate the old 0.75 default — too strict for wespeaker on
+        // 1-5s VAD utterances; same-speaker cosine sim at that length
+        // sits in 0.5-0.7, so 0.75 split every utterance into a new
+        // SPEAKER_NN. Treat values >= 0.7 as "old default, migrate".
+        self.speakerSimilarityThreshold = (sim > 0 && sim < 0.7) ? sim : 0.55
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
         let langRaw = defaults.string(forKey: Keys.outputLanguage) ?? OutputLanguage.auto.rawValue
         self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto

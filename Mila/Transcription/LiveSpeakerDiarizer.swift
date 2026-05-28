@@ -34,9 +34,13 @@ final class LiveSpeakerDiarizer: ObservableObject {
     @Published private(set) var isReady: Bool = false
 
     /// Cosine threshold above which an incoming embedding is considered
-    /// the same speaker as an existing pool entry. 0.75 is a reasonable
-    /// starting point for the wespeaker model. Tunable in Settings.
-    var similarityThreshold: Double = 0.75
+    /// the same speaker as an existing pool entry. 0.55 fits wespeaker's
+    /// short-utterance embeddings — VAD emits 1-5s clips and same-
+    /// speaker cosine similarity at that length typically lands in
+    /// 0.5-0.7 (not 0.75-0.95 which is the long-clip range). Anything
+    /// tighter splits the same person across many SPEAKER_NN IDs.
+    /// Tunable in Settings.
+    var similarityThreshold: Double = 0.55
 
     private var pool: [SpeakerProfile] = []
     private var process: Process?
@@ -235,6 +239,9 @@ final class LiveSpeakerDiarizer: ObservableObject {
                 best = (idx, sim)
             }
         }
+        let bestSim = best?.sim ?? -1.0
+        let bestId = best.map { pool[$0.idx].id } ?? "(none)"
+        diarLog.log("assign: poolSize=\(self.pool.count, privacy: .public) bestMatch=\(bestId, privacy: .public) bestSim=\(bestSim, privacy: .public) threshold=\(self.similarityThreshold, privacy: .public)")
         if let chosen = best, chosen.sim >= similarityThreshold {
             // Update centroid as running mean.
             let n = pool[chosen.idx].sampleCount
