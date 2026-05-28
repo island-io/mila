@@ -108,6 +108,12 @@ struct SendToLLMSheet: View {
         let toolName = llm.tool.displayName
         let promptSnapshot = prompt
         let transcriptSnapshot = transcript
+        // Include any Live-AI summary so the LLM sees the gist before the
+        // raw transcript. Empty when this recording ran without Live AI —
+        // LLMRunner.composedPrompt then collapses to the old transcript-only
+        // wire format.
+        let summarySnapshot = (liveRecording.summary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let tool = llm.tool
         dismiss()
@@ -118,6 +124,7 @@ struct SendToLLMSheet: View {
                     tool: tool,
                     prompt: promptSnapshot,
                     transcript: transcriptSnapshot,
+                    summary: summarySnapshot,
                     executablePathOverride: executableOverride,
                     timeout: LLMRunner.defaultTimeout
                 )

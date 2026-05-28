@@ -54,13 +54,31 @@ enum LLMRunner {
     /// long.
     static let defaultTimeout: TimeInterval = 300
 
-    /// Format the transcript into a prompt the CLI will see. Kept as a
-    /// distinct function so tests can assert on the exact wire format.
-    static func composedPrompt(_ userPrompt: String, transcript: String) -> String {
+    /// Format the prompt + optional Live-AI summary + transcript into the
+    /// single arg-vector blob the CLI sees. Kept as a distinct function so
+    /// tests can assert on the exact wire format.
+    ///
+    /// The summary lives **above** the transcript (and the transcript is
+    /// labelled "Full transcript") so the LLM reads the gist before the
+    /// raw text — that improves answer quality on long recordings where
+    /// the model would otherwise lose the thread halfway through the
+    /// transcript. Empty / whitespace-only `summary` is omitted entirely
+    /// (we don't want "Summary: (empty)" confusing the model when Live AI
+    /// wasn't configured for this recording).
+    static func composedPrompt(_ userPrompt: String,
+                               transcript: String,
+                               summary: String = "") -> String {
         let prompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         let body = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-        if body.isEmpty { return prompt }
-        return "\(prompt)\n\n---\nTranscript:\n\(body)"
+        let gist = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if body.isEmpty && gist.isEmpty { return prompt }
+        if gist.isEmpty {
+            return "\(prompt)\n\n---\nTranscript:\n\(body)"
+        }
+        if body.isEmpty {
+            return "\(prompt)\n\n---\nSummary:\n\(gist)"
+        }
+        return "\(prompt)\n\n---\nSummary:\n\(gist)\n\nFull transcript:\n\(body)"
     }
 
     /// Run `tool` with `prompt` + `transcript`. Returns stdout, trimmed.
@@ -69,11 +87,18 @@ enum LLMRunner {
     /// `executablePathOverride` lets the user point at a binary in a
     /// non-PATH location (e.g. `/Users/foo/.local/bin/claude`).
     ///
+    /// `summary` (optional) prepends a Live-AI summary section above the
+    /// transcript so the LLM has the gist before it reads the raw text.
+    /// Pass empty string when there is no summary (e.g. Live AI not
+    /// configured) — the wire format collapses to the old transcript-only
+    /// shape in that case.
+    ///
     /// `timeout` defaults to 5 minutes. Pass a smaller value for foreground
     /// callers that block UI (e.g. the Suggest button).
     static func run(tool: LLMTool,
                     prompt: String,
                     transcript: String,
+                    summary: String = "",
                     executablePathOverride: String?,
                     model: String? = nil,
                     session: LLMSession = .none,
@@ -82,7 +107,7 @@ enum LLMRunner {
 
         let executable = try resolveExecutable(tool: tool,
                                                override: executablePathOverride)
-        let fullPrompt = composedPrompt(prompt, transcript: transcript)
+        let fullPrompt = composedPrompt(prompt, transcript: transcript, summary: summary)
         let modelTag = (model?.isEmpty ?? true) ? "(default)" : (model ?? "")
         let sessionTag: String = {
             switch session {

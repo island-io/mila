@@ -21,7 +21,7 @@ struct RecordingDetailView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            AIOverviewSection(
+            AIOverviewBanner(
                 summary: recording.summary,
                 items: recording.actionItems ?? [],
                 recordingLanguage: recording.language
@@ -372,53 +372,28 @@ private struct PlayPauseButton: View {
 /// blanks the rest of the detail screen, which is the symptom the user
 /// was hitting when both the sidebar and the detail pane went empty
 /// after transcription completed.
-private struct AIOverviewSection: View {
+/// Detail-screen wrapper around the shared `AIOverviewSection` (which
+/// renders Summary + Action items). The wrapper caps the section at
+/// 240 pt inside a `ScrollView` and adds a trailing `Divider` so a
+/// recording with many action items or a long summary can NEVER push
+/// the transcript / playback bar off-screen.
+private struct AIOverviewBanner: View {
     let summary: String?
     let items: [ActionItem]
     let recordingLanguage: String
 
-    /// Hide the whole section when there's nothing to show. Old
-    /// recordings + non-Live-AI recordings simply collapse this to an
-    /// EmptyView so the detail screen doesn't have an empty gap above
-    /// the transcript.
-    private var hasContent: Bool {
-        (summary?.isEmpty == false) || !items.isEmpty
-    }
-
-    /// Section-level RTL decision: prefer the actual text content
-    /// because the language dropdown may have been left on English
-    /// while the conversation happened in Hebrew.
-    private var sectionIsRTL: Bool {
-        let blob = (summary ?? "") + " " + items.map(\.text).joined(separator: " ")
-        return blob.isPredominantlyHebrew || recordingLanguage == "he"
-    }
-
     var body: some View {
-        if hasContent {
-            // Use explicit `.trailing` alignment for Hebrew rather than
-            // flipping `\.layoutDirection`. The environment approach
-            // made the ScrollView mis-measure its frame when the
-            // sidebar was open — the Hebrew block ended up shifted
-            // LEFT of the pane by the sidebar's width. Same fix
-            // pattern as `LiveAIRecordingView.liveTranscriptPane`.
-            let alignmentValue: Alignment = sectionIsRTL ? .trailing : .leading
-            let multilineAlignment: TextAlignment = sectionIsRTL ? .trailing : .leading
+        let section = AIOverviewSection(
+            summary: summary,
+            items: items,
+            recordingLanguage: recordingLanguage
+        )
+        if section.hasContent {
             VStack(spacing: 0) {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 12) {
-                        if let summary, !summary.isEmpty {
-                            summaryView(summary,
-                                        alignment: alignmentValue,
-                                        multiline: multilineAlignment)
-                        }
-                        if !items.isEmpty {
-                            actionItemsView(alignment: alignmentValue,
-                                            multiline: multilineAlignment)
-                        }
-                    }
-                    .padding(.horizontal)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, alignment: alignmentValue)
+                    section
+                        .padding(.horizontal)
+                        .padding(.vertical, 12)
                 }
                 // Hard cap so a recording with many action items or a
                 // long summary can NEVER push the transcript /
@@ -427,54 +402,6 @@ private struct AIOverviewSection: View {
                 .frame(maxHeight: 240)
                 Divider()
             }
-        }
-    }
-
-    private func summaryView(_ text: String,
-                             alignment: Alignment,
-                             multiline: TextAlignment) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Summary", systemImage: "sparkles")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.tint)
-            Text(text)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: alignment)
-                .multilineTextAlignment(multiline)
-        }
-    }
-
-    private func actionItemsView(alignment: Alignment,
-                                 multiline: TextAlignment) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Label("Action items", systemImage: "checklist")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.tint)
-            VStack(alignment: .leading, spacing: 4) {
-                ForEach(items) { item in
-                    ActionItemDetailRow(text: item.text,
-                                        alignment: alignment,
-                                        multiline: multiline)
-                }
-            }
-        }
-    }
-}
-
-private struct ActionItemDetailRow: View {
-    let text: String
-    let alignment: Alignment
-    let multiline: TextAlignment
-
-    var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Text("•").foregroundStyle(.secondary)
-            Text(text)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: alignment)
-                .multilineTextAlignment(multiline)
         }
     }
 }

@@ -1,0 +1,134 @@
+import SwiftUI
+import AppKit
+
+/// Live-AI overview block — summary + action items — rendered the same
+/// way in two places: the recording detail screen
+/// (`RecordingDetailView`) and the post-record rename sheet
+/// (`RenameRecordingSheet`). Kept in a single internal type so a layout
+/// tweak in one place can't silently desync from the other (Bugbot
+/// finding on PR #25).
+///
+/// The two call sites differ only in the *outer* chrome — the detail
+/// view caps the section at 240 pt inside a `ScrollView` and adds a
+/// trailing `Divider`; the rename sheet wraps it in a
+/// `.regularMaterial` card. Both use `AIOverviewSection` below for the
+/// inner content (Summary header + body, Action items header + list).
+///
+/// RTL: section-level decision matches the live view — prefer the
+/// actual text content (`isPredominantlyHebrew` over the summary +
+/// items blob) over `recordingLanguage`, so a conversation that
+/// happened in Hebrew with the dropdown stuck on English still aligns
+/// to the right edge.
+struct AIOverviewSection: View {
+    let summary: String?
+    let items: [ActionItem]
+    let recordingLanguage: String
+
+    /// True iff there's at least one non-empty piece to show. Callers
+    /// can use this to collapse their wrapper (avoiding an empty card
+    /// in the rename sheet or an empty header strip in the detail
+    /// view).
+    var hasContent: Bool {
+        (summary?.isEmpty == false) || !items.isEmpty
+    }
+
+    private var sectionIsRTL: Bool {
+        let blob = (summary ?? "") + " " + items.map(\.text).joined(separator: " ")
+        return blob.isPredominantlyHebrew || recordingLanguage == "he"
+    }
+
+    var body: some View {
+        if hasContent {
+            let alignmentValue: Alignment = sectionIsRTL ? .trailing : .leading
+            let multilineAlignment: TextAlignment = sectionIsRTL ? .trailing : .leading
+            VStack(alignment: .leading, spacing: 12) {
+                if let summary, !summary.isEmpty {
+                    summaryView(summary,
+                                alignment: alignmentValue,
+                                multiline: multilineAlignment)
+                }
+                if !items.isEmpty {
+                    actionItemsView(alignment: alignmentValue,
+                                    multiline: multilineAlignment)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: alignmentValue)
+        }
+    }
+
+    private func summaryView(_ text: String,
+                             alignment: Alignment,
+                             multiline: TextAlignment) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Summary", systemImage: "sparkles")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.tint)
+            // Selectable + right-clickable so users can grab the summary
+            // into another doc / chat. `textSelection(.enabled)` gives
+            // drag-select; the context menu mirrors the macOS-native
+            // "Copy" affordance plus a labelled "Copy summary" option.
+            Text(text)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: alignment)
+                .multilineTextAlignment(multiline)
+                .textSelection(.enabled)
+                .contextMenu {
+                    Button("Copy summary") {
+                        AIOverviewSection.copyToPasteboard(text)
+                    }
+                }
+        }
+    }
+
+    private func actionItemsView(alignment: Alignment,
+                                 multiline: TextAlignment) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Action items", systemImage: "checklist")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(items) { item in
+                    ActionItemRow(text: item.text,
+                                  alignment: alignment,
+                                  multiline: multiline)
+                }
+            }
+        }
+    }
+
+    fileprivate static func copyToPasteboard(_ text: String) {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(text, forType: .string)
+    }
+}
+
+/// Single bullet line for an action item — selectable text plus a
+/// right-click "Copy" affordance. Internal so both the detail view
+/// and the rename sheet share the exact row layout.
+private struct ActionItemRow: View {
+    let text: String
+    let alignment: Alignment
+    let multiline: TextAlignment
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Text("•").foregroundStyle(.secondary)
+            // Selectable so the user can drag-select the row's text;
+            // right-click surfaces a one-click "Copy" for the whole
+            // item (the most common ask — paste it into a TODO list).
+            Text(text)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: alignment)
+                .multilineTextAlignment(multiline)
+                .textSelection(.enabled)
+                .contextMenu {
+                    Button("Copy") {
+                        AIOverviewSection.copyToPasteboard(text)
+                    }
+                }
+        }
+    }
+}

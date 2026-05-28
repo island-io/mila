@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 /// Shown the moment a recording is added — i.e. as soon as recording stops,
 /// in parallel with transcription. The user can type a title and Save at any
@@ -54,6 +55,22 @@ struct RenameRecordingSheet: View {
         !transcript.isEmpty && liveRecording.status != .running && liveRecording.status != .pending
     }
 
+    /// Live-AI summary attached to the recording (captured at stop time).
+    /// Empty string when Live AI wasn't running for this recording — the
+    /// summary block below renders nothing in that case.
+    private var summary: String {
+        (liveRecording.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Action items captured by Live AI. Empty list collapses the section.
+    private var actionItems: [ActionItem] {
+        liveRecording.actionItems ?? []
+    }
+
+    private var hasAIOverview: Bool {
+        !summary.isEmpty || !actionItems.isEmpty
+    }
+
     /// "Transcribing…", "Done", "Failed", "Waiting in queue" — drives the
     /// progress indicator inside the sheet.
     private var transcriptionLabel: String {
@@ -99,6 +116,10 @@ struct RenameRecordingSheet: View {
             }
 
             transcriptionStatus
+
+            if hasAIOverview {
+                aiOverviewSection
+            }
 
             if llm.isConfigured {
                 llmPromptDisclosure
@@ -274,6 +295,27 @@ struct RenameRecordingSheet: View {
         }
     }
 
+    /// Summary + action items captured by Live AI during the recording.
+    /// Wraps the shared `AIOverviewSection` (used by RecordingDetailView
+    /// too) in a `.regularMaterial` card so the rename sheet's
+    /// post-record summary feels distinct from the form fields above
+    /// it without diverging from the detail screen's content layout.
+    /// Bugbot finding on PR #25 — the inner content used to be a
+    /// duplicated near-copy of `AIOverviewSection`; both call sites
+    /// now feed the same view, only the chrome differs.
+    @ViewBuilder
+    private var aiOverviewSection: some View {
+        AIOverviewSection(
+            summary: summary,
+            items: actionItems,
+            recordingLanguage: liveRecording.language
+        )
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
     @ViewBuilder
     private var transcriptionStatus: some View {
         HStack(spacing: 10) {
@@ -317,6 +359,12 @@ struct RenameRecordingSheet: View {
         let toolName = llm.tool.displayName
         let prompt = llm.postActionPrompt
         let transcriptSnapshot = transcript
+        // Summary travels alongside the transcript so the LLM sees the
+        // gist (already condensed by Live AI) before the raw text. When
+        // Live AI wasn't running this is "" and LLMRunner.composedPrompt
+        // omits the Summary section entirely — back-compat with the old
+        // transcript-only callers.
+        let summarySnapshot = summary
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let tool = llm.tool
         coordinator.dismiss(savingTitle: title)
@@ -327,6 +375,7 @@ struct RenameRecordingSheet: View {
                     tool: tool,
                     prompt: prompt,
                     transcript: transcriptSnapshot,
+                    summary: summarySnapshot,
                     executablePathOverride: executableOverride,
                     timeout: LLMRunner.defaultTimeout
                 )

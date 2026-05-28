@@ -140,6 +140,44 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(composed, "Say hi.")
     }
 
+    /// When a Live-AI summary is provided, the wire format prepends a
+    /// Summary section and labels the transcript "Full transcript:". The
+    /// summary lives ABOVE the transcript so the model reads the gist
+    /// first — that visibly improves the answer quality on long recordings
+    /// (see PR notes on the post-record popup work).
+    func test_composed_prompt_includes_summary_above_transcript() {
+        let composed = LLMRunner.composedPrompt(
+            "Make a tweet from this.",
+            transcript: "Hello world.",
+            summary: "We discussed the new schema.")
+        XCTAssertEqual(composed,
+                       "Make a tweet from this.\n\n---\nSummary:\nWe discussed the new schema.\n\nFull transcript:\nHello world.")
+    }
+
+    /// Empty / whitespace-only summary collapses back to the original
+    /// transcript-only wire format — back-compat guarantee for callers that
+    /// don't pass a summary (e.g. recordings that ran without Live AI).
+    func test_composed_prompt_with_empty_summary_is_transcript_only() {
+        let composed = LLMRunner.composedPrompt(
+            "Summarize this.",
+            transcript: "Hello world.",
+            summary: "   ")
+        XCTAssertEqual(composed,
+                       "Summarize this.\n\n---\nTranscript:\nHello world.")
+    }
+
+    /// Summary-only (no transcript) is still valid — useful when the user
+    /// hits Send before the transcript lands and we only have the rolling
+    /// summary to ship.
+    func test_composed_prompt_with_only_summary_uses_summary_section() {
+        let composed = LLMRunner.composedPrompt(
+            "Make a doc.",
+            transcript: "",
+            summary: "Migration is done.")
+        XCTAssertEqual(composed,
+                       "Make a doc.\n\n---\nSummary:\nMigration is done.")
+    }
+
     func test_timeout_fires_when_process_exceeds_limit() async {
         // Script ignores its args and sleeps 5s. Runner times out at 1s.
         // The contract verified here is "the timeout error fires" — wall
