@@ -176,6 +176,14 @@ final class RecordingStore: ObservableObject {
         recordingsDirectory.appendingPathComponent(recording.transcriptFileName)
     }
 
+    /// Path of the per-recording `.summary.txt` sidecar holding the
+    /// LLM-generated summary. Absent on disk whenever `recording.summary`
+    /// is nil/empty — `writeSummary(for:)` removes the file in that case
+    /// so an old summary doesn't outlive being cleared.
+    func summaryURL(for recording: Recording) -> URL {
+        recordingsDirectory.appendingPathComponent(recording.summaryFileName)
+    }
+
     func freshAudioURL(suggestedName: String? = nil) -> URL {
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
@@ -188,6 +196,7 @@ final class RecordingStore: ObservableObject {
     func add(_ recording: Recording) {
         recordings.insert(recording, at: 0)
         writeTranscript(for: recording)
+        writeSummary(for: recording)
         persist()
     }
 
@@ -195,6 +204,7 @@ final class RecordingStore: ObservableObject {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         recordings[idx] = recording
         writeTranscript(for: recording)
+        writeSummary(for: recording)
         persist()
     }
 
@@ -249,6 +259,30 @@ final class RecordingStore: ObservableObject {
         }
     }
 
+    /// Persist (or clear) the `.summary.txt` sidecar holding the LLM
+    /// summary. Mirrors `writeTranscript` — an empty/cleared summary
+    /// removes the file so a recording whose summary the user wiped (or
+    /// that the LLM regenerated as empty) doesn't keep showing the old
+    /// text in finder / external tools. `summary` lives in
+    /// `recordings.json` too, so the sidecar is an extra surface, not
+    /// the source of truth.
+    private func writeSummary(for recording: Recording) {
+        let url = summaryURL(for: recording)
+        let text = (recording.summary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            if text.isEmpty {
+                if fileManager.fileExists(atPath: url.path) {
+                    try fileManager.removeItem(at: url)
+                }
+            } else {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            print("RecordingStore: failed to write summary \(url.lastPathComponent): \(error)")
+        }
+    }
+
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
     func softDelete(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
@@ -268,6 +302,7 @@ final class RecordingStore: ObservableObject {
         recordings.removeAll { $0.id == recording.id }
         try? fileManager.removeItem(at: audioURL(for: recording))
         try? fileManager.removeItem(at: transcriptURL(for: recording))
+        try? fileManager.removeItem(at: summaryURL(for: recording))
         persist()
     }
 

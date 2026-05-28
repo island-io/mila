@@ -104,6 +104,14 @@ final class QuickActionsController: ObservableObject {
     /// before the transcript is saved.
     var liveDiarizer: LiveSpeakerDiarizer?
 
+    /// Late-bound by MilaApp. When the live-transcript path saves a
+    /// recording directly (skipping `transcription.enqueue` because the
+    /// VAD path already produced segments), TranscriptionService's
+    /// `onTranscriptionCompleted` hook never fires — so the summary
+    /// trigger has to run from here instead. The enqueue path leans on
+    /// the hook in TranscriptionService and doesn't touch this.
+    var summarizer: RecordingSummarizer?
+
     /// Active silence-watch task — cancelled when the recording stops so
     /// we never fire the warning for a recording that's already over.
     private var silenceWatchTask: Task<Void, Never>?
@@ -426,6 +434,13 @@ final class QuickActionsController: ObservableObject {
             // write a `.srt` sidecar alongside the WAV so video
             // export / subtitle workflows still find it.
             TranscriptExporter.writeSRT(for: recording, in: store.recordingsDirectory)
+            // The enqueue path runs the summary trigger via
+            // TranscriptionService's onTranscriptionCompleted hook,
+            // but this branch saved the recording directly so the
+            // hook never fires. Fire it here instead — the
+            // summarizer's own gate skips work when a live summary
+            // already landed during the recording.
+            summarizer?.summarizeIfNeeded(recording)
         } else {
             transcription.enqueue(recording)
         }

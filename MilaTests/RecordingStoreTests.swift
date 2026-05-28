@@ -264,6 +264,93 @@ final class RecordingStoreTests: XCTestCase {
         XCTAssertEqual(result.map(\.id), [unfiled.id])
     }
 
+    // MARK: - Summary sidecar
+
+    func test_summary_sidecar_written_when_recording_has_summary() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        rec.summary = "Decisions: ship it."
+        store.add(rec)
+
+        let url = store.summaryURL(for: rec)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path),
+                      "Expected sidecar at \(url.path)")
+        let onDisk = try String(contentsOf: url, encoding: .utf8)
+        XCTAssertEqual(onDisk, "Decisions: ship it.")
+    }
+
+    func test_summary_sidecar_absent_when_summary_is_nil() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        store.add(rec)
+        let url = store.summaryURL(for: rec)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                       "Nil summary should not leave a stub file")
+    }
+
+    func test_summary_sidecar_deleted_when_summary_cleared_to_empty() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        rec.summary = "Original summary"
+        store.add(rec)
+        let url = store.summaryURL(for: rec)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        rec.summary = ""
+        store.update(rec)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                       "Clearing summary to empty must remove the sidecar")
+
+        rec.summary = nil
+        store.update(rec)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                       "Setting summary to nil must remove the sidecar")
+    }
+
+    func test_summary_sidecar_updated_on_update() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        rec.summary = "v1"
+        store.add(rec)
+
+        rec.summary = "v2 with more detail"
+        store.update(rec)
+        let onDisk = try String(contentsOf: store.summaryURL(for: rec), encoding: .utf8)
+        XCTAssertEqual(onDisk, "v2 with more detail")
+    }
+
+    func test_permanently_delete_removes_summary_sidecar() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        rec.summary = "Going away"
+        store.add(rec)
+        let url = store.summaryURL(for: rec)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+
+        store.permanentlyDelete(rec)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                       "permanentlyDelete must remove the summary sidecar too")
+    }
+
+    func test_summary_filename_derived_from_audio_filename() {
+        let rec = Recording(title: "X",
+                            source: .microphone,
+                            audioFileName: "Voice Memo 2024-01-01.wav")
+        XCTAssertEqual(rec.summaryFileName, "Voice Memo 2024-01-01.summary.txt")
+    }
+
+    func test_summary_sidecar_trims_whitespace() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        // Whitespace-only summaries are effectively empty — the sidecar
+        // should NOT be written for those.
+        rec.summary = "   \n\n  "
+        store.add(rec)
+        let url = store.summaryURL(for: rec)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                       "Whitespace-only summary must be treated as empty")
+    }
+
     func test_load_seeds_folders_from_recordings_when_folders_file_missing() throws {
         // Simulates a recordings.json that already references a folder name
         // (e.g. after restoring from backup, or hand-editing the JSON).

@@ -102,6 +102,19 @@ final class LiveAISettings: ObservableObject {
         llmConfigured && isLiveAIAvailable
     }
 
+    /// Prompt used for the post-recording one-shot summary. This fires
+    /// after a recording finishes whenever the LLM CLI is configured —
+    /// not just when Live AI mode was on during the recording — so every
+    /// recording ends up with a summary even if the user never opted
+    /// into the live split-pane UI. Kept separate from `prompt` (the
+    /// Live AI tick prompt) because the live prompt asks for a JSON
+    /// envelope with action items, which is overkill for a one-shot
+    /// plain-text summary. `{{LANGUAGE}}` is substituted at send time
+    /// the same way `prompt` does.
+    @Published var summaryPrompt: String {
+        didSet { defaults.set(summaryPrompt, forKey: Keys.summaryPrompt) }
+    }
+
     enum OutputLanguage: String, CaseIterable, Identifiable {
         case auto = "auto"
         case english = "en"
@@ -161,6 +174,7 @@ final class LiveAISettings: ObservableObject {
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
         let langRaw = defaults.string(forKey: Keys.outputLanguage) ?? OutputLanguage.auto.rawValue
         self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto
+        self.summaryPrompt = defaults.string(forKey: Keys.summaryPrompt) ?? Self.defaultSummaryPrompt
     }
 
     /// Default model. Currently `claude-sonnet-4-6` — better
@@ -213,6 +227,26 @@ If the call has just started and there is no transcript yet, output \
 {"summary": "", "items": []}.
 """
 
+    /// Default one-shot summary prompt. Plain-text, meeting-style — no
+    /// JSON envelope, no action items, no "you've been called repeatedly"
+    /// framing. This runs ONCE against the full transcript after a
+    /// recording finishes, so the prompt can assume the model has the
+    /// complete picture and just needs to produce a concise human-readable
+    /// summary. `{{LANGUAGE}}` is substituted at send time.
+    static let defaultSummaryPrompt = """
+You are summarizing a meeting transcript. Output everything in {{LANGUAGE}}.
+
+Read the transcript below and produce a concise summary suitable for
+someone who didn't attend the meeting. Cover:
+  • What was discussed (the main topics).
+  • Any decisions that were made.
+  • Any action items or follow-ups that came up.
+
+Keep it short — a few bullet points or a short paragraph is fine. Do
+NOT include a preamble like "Here is the summary"; start directly with
+the content.
+"""
+
     private enum Keys {
         static let enabled = "liveAI.enabled"
         static let model = "liveAI.model"
@@ -221,6 +255,7 @@ If the call has just started and there is no transcript yet, output \
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
         static let prompt = "liveAI.prompt"
         static let outputLanguage = "liveAI.outputLanguage"
+        static let summaryPrompt = "liveAI.summaryPrompt"
     }
 }
 

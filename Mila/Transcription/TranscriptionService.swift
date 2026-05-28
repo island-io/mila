@@ -32,6 +32,17 @@ final class TranscriptionService: ObservableObject {
     private let modelManager: ModelManager
     private let diarizationSettings: DiarizationSettings
 
+    /// Hook fired once per recording that finished transcription
+    /// successfully (status == .completed, non-empty text). MilaApp
+    /// wires this to `RecordingSummarizer.summarizeIfNeeded` so every
+    /// completed recording auto-generates a summary when the LLM CLI
+    /// is configured — independent of whether Live AI mode was on
+    /// during the recording. The hook lives here (rather than inside
+    /// the summarizer subscribing to store changes) so it fires
+    /// exactly once per transcription, NOT on every subsequent
+    /// `store.update` that touches the same recording.
+    var onTranscriptionCompleted: ((Recording) -> Void)?
+
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
 
@@ -347,6 +358,7 @@ final class TranscriptionService: ObservableObject {
 
             if working.status == .completed {
                 TranscriptExporter.writeSRT(for: working, in: store.recordingsDirectory)
+                onTranscriptionCompleted?(working)
             }
         } catch is CancellationError {
             // The user hit Cancel mid-run. The rename sheet's coordinator is

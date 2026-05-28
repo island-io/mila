@@ -66,6 +66,12 @@ struct MilaApp: App {
     @StateObject private var liveTranscriber: LiveTranscriber
     @StateObject private var liveSpeakerDiarizer: LiveSpeakerDiarizer
     @StateObject private var liveAISession: LiveAISession
+    /// Generates a one-shot LLM summary for every finished recording
+    /// whenever the user's LLM CLI is configured (Live AI mode no
+    /// longer gates this). Held as a `@StateObject` so it survives
+    /// SwiftUI redraws and so its in-flight task table survives
+    /// alongside everything else.
+    @StateObject private var recordingSummarizer: RecordingSummarizer
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -216,6 +222,17 @@ struct MilaApp: App {
         }
         let liveDiar = LiveSpeakerDiarizer()
         let liveSession = LiveAISession(llmSettings: llm, liveAISettings: liveAI)
+        let summarizer = RecordingSummarizer(store: store,
+                                             llmSettings: llm,
+                                             liveAISettings: liveAI)
+        // Wire the post-transcription summary hook. Fires for every
+        // recording that the queue successfully completes — the
+        // summarizer's own `shouldSummarize` gate skips work if a
+        // live summary already landed, if the LLM CLI isn't
+        // configured, or if the transcript came up empty.
+        svc.onTranscriptionCompleted = { [weak summarizer] rec in
+            summarizer?.summarizeIfNeeded(rec)
+        }
         // Late-bind the live-AI dependencies onto `actions` so it can
         // attach summary/items to the saved Recording and skip the
         // rename sheet when Live AI was running.
@@ -224,6 +241,7 @@ struct MilaApp: App {
         actions.liveAISession = liveSession
         actions.liveTranscriber = liveTrans
         actions.liveDiarizer = liveDiar
+        actions.summarizer = summarizer
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -251,6 +269,7 @@ struct MilaApp: App {
         _liveTranscriber = StateObject(wrappedValue: liveTrans)
         _liveSpeakerDiarizer = StateObject(wrappedValue: liveDiar)
         _liveAISession = StateObject(wrappedValue: liveSession)
+        _recordingSummarizer = StateObject(wrappedValue: summarizer)
         _dictation = StateObject(wrappedValue: DictationController(store: store,
                                                                     transcription: svc,
                                                                     hotkeySettings: hotkeys,

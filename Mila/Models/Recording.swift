@@ -110,6 +110,17 @@ struct Recording: Identifiable, Codable, Hashable {
         (audioFileName as NSString).deletingPathExtension + ".txt"
     }
 
+    /// File name (relative to recordings directory) of the sidecar
+    /// `.summary.txt` holding the LLM-generated meeting summary. Same
+    /// derive-from-audio convention as `transcriptFileName` so a user
+    /// browsing the recordings directory sees `Foo.wav` + `Foo.txt` +
+    /// `Foo.summary.txt` clustered together. Absent on disk whenever
+    /// `summary` is nil/empty — the store deletes the sidecar in that
+    /// case so we never leave a stale summary around.
+    var summaryFileName: String {
+        (audioFileName as NSString).deletingPathExtension + ".summary.txt"
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
