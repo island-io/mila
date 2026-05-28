@@ -132,6 +132,15 @@ struct MilaApp: App {
             llm.tool = .claude
             llm.executablePath = path
         }
+        // CI E2E: swap whichever language-best model the catalog would
+        // normally pick out for a small `ggml-tiny.bin` so cold-load +
+        // transcribe stays under ~10s instead of 60-200s.
+        if let arg = CommandLine.arguments.first(where: {
+            $0.hasPrefix("--ui-test-tiny-model-path=")
+        }) {
+            let path = String(arg.dropFirst("--ui-test-tiny-model-path=".count))
+            mgr.setTestModelOverride(URL(fileURLWithPath: path))
+        }
         if CommandLine.arguments.contains("--ui-test-rtl-live-hebrew") {
             liveTrans.seedForTesting([
                 LiveSegment(id: UUID(), startSeconds: 0, endSeconds: 2,

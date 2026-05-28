@@ -1,16 +1,17 @@
 name: Audio Loopback E2E
 
-# CI E2E that exercises the full live-recording pipeline (VAD →
-# whisper → diarizer → LiveAISession) using a fixture-injection
-# seam, NOT a virtual audio device. BlackHole was unreliable on
-# macos-26 runners — the driver fails to actually route audio after
-# install. The injection seam (`MilaApp.injectFixtureWavIfRequested`)
-# pumps a WAV through `session.onLiveSamples` at real-time 16kHz,
-# which exercises every code path downstream of audio capture.
+# Two-track E2E that exercises the full live-recording pipeline:
+#   1. PIPELINE: unit-level test (MilaTests/LiveTranscriberPipelineE2ETests)
+#      drives a real LiveTranscriber + real WhisperEngine with the full
+#      production models (turbo / ivrit-large) for BOTH languages. No UI,
+#      no XCUITest a11y — direct API assertion of `transcriber.segments`.
+#   2. UI: AudioLoopbackUITests drives the actual SwiftUI view via the
+#      WAV-injection seam — English-only with ggml-tiny.bin (small,
+#      fast, English-trained). Verifies rendering + a11y path. Hebrew
+#      transcription quality is covered by the unit test instead.
 #
-# Cadence: workflow_dispatch only. Whisper models (~1.5 GB) +
-# Claude CLI install take a while cold; cache makes subsequent runs
-# ~2 min to "test starts running".
+# Cadence: workflow_dispatch only. Cold path is slow (~4 GB of models
+# + Claude CLI install); warm cache run is ~3-5 min per matrix language.
 
 on:
   workflow_dispatch:
@@ -22,13 +23,9 @@ on:
 
 jobs:
   e2e:
-    name: Fixture E2E (${{ matrix.language }})
+    name: Live pipeline E2E
     runs-on: macos-26
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [en, he]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -38,9 +35,6 @@ jobs:
         run: brew install xcodegen
 
       - name: Pre-grant microphone TCC (defensive)
-        # The fixture-injection path doesn't actually call AVAudioEngine,
-        # but TCC still gates first-time launches. Pre-grant so the
-        # XCUITest launch doesn't dead-end on a prompt.
         run: |
           TCC_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
           for client in \
@@ -62,26 +56,39 @@ jobs:
         if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
         run: make bundle-diarization
 
-      - name: Cache whisper models
+      - name: Cache whisper models (full + tiny)
         id: whisper-models-cache
         uses: actions/cache@v4
         with:
-          # `make models` populates this directory.
-          path: ~/Library/Application Support/Mila/Models
-          key: whisper-models-v1-${{ runner.os }}
+          path: |
+            ~/Library/Application Support/Mila/Models
+            ~/.cache/whisper-models
+          key: whisper-models-v2-${{ runner.os }}
 
-      - name: Download whisper models (cold path only)
+      - name: Download full whisper models (cold path only)
         if: steps.whisper-models-cache.outputs.cache-hit != 'true'
         run: make models
+
+      - name: Download ggml-tiny.bin (cold path only)
+        if: steps.whisper-models-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.cache/whisper-models"
+          curl -L --fail --progress-bar \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin" \
+            -o "$HOME/.cache/whisper-models/ggml-tiny.bin"
+
+      - name: Verify models on disk
+        run: |
+          echo "=== Full models ==="
+          ls -la "$HOME/Library/Application Support/Mila/Models" || true
+          echo "=== Tiny ==="
+          ls -la "$HOME/.cache/whisper-models" || true
 
       - name: Install Claude CLI (when LLM E2E requested)
         id: claude-cli
         if: ${{ github.event.inputs.include_llm_summary == 'true' || github.event.inputs.include_llm_summary == null }}
         run: |
-          # Claude Code: supports ANTHROPIC_API_KEY for non-interactive
-          # auth, which is what LiveAISession needs in CI.
           curl -fsSL https://claude.ai/install.sh | bash || true
-          # Try common install locations.
           for p in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
             if [ -x "$p" ]; then
               echo "claude_path=$p" >> "$GITHUB_OUTPUT"
@@ -93,74 +100,82 @@ jobs:
       - name: Generate Xcode project
         run: make project
 
-      - name: Verify whisper models on disk
+      - name: Generate audio fixtures (en + he)
         run: |
-          DIR="$HOME/Library/Application Support/Mila/Models"
-          echo "Models dir: $DIR"
-          ls -la "$DIR" || true
-          du -sh "$DIR"/* 2>/dev/null || true
-
-      - name: Generate audio fixture (${{ matrix.language }})
-        run: ./scripts/generate-audio-fixture.sh /tmp/mila-fixture-${{ matrix.language }}.wav ${{ matrix.language }}
+          ./scripts/generate-audio-fixture.sh /tmp/mila-fixture-en.wav en
+          ./scripts/generate-audio-fixture.sh /tmp/mila-fixture-he.wav he
 
       - name: Mark log capture start
         run: |
           date -u +"%Y-%m-%d %H:%M:%S" > /tmp/mila-log-start.txt
-          cat /tmp/mila-log-start.txt
 
-      - name: Run fixture-injection E2E (${{ matrix.language }})
+      - name: Run pipeline E2E unit tests (en + he, full models)
         env:
-          # TEST_RUNNER_ prefix → xcodebuild strips it and passes the
-          # rest to the XCTest process. Without this prefix the env
-          # var doesn't propagate.
-          TEST_RUNNER_MILA_FIXTURE_E2E: "1"
-          TEST_RUNNER_MILA_FIXTURE_WAV_PATH: /tmp/mila-fixture-${{ matrix.language }}.wav
-          TEST_RUNNER_MILA_CLAUDE_PATH: ${{ steps.claude-cli.outputs.claude_path }}
-          # Mila's LiveAISession reads ANTHROPIC_API_KEY indirectly
-          # through the Claude CLI it shells out to.
-          TEST_RUNNER_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Unit tests run inside the MilaTests target; xcodebuild passes
+          # plain env vars to the test process (no TEST_RUNNER_ prefix
+          # needed for non-UI tests).
+          MILA_PIPELINE_E2E: "1"
+          MILA_FIXTURE_WAV_EN: /tmp/mila-fixture-en.wav
+          MILA_FIXTURE_WAV_HE: /tmp/mila-fixture-he.wav
         run: |
-          case "${{ matrix.language }}" in
-            en) TEST="test_english_two_minute_recording_progresses" ;;
-            he) TEST="test_hebrew_two_minute_recording_progresses" ;;
-          esac
           xcodebuild test \
             -project Mila.xcodeproj \
             -scheme Mila \
             -destination 'platform=macOS' \
-            -only-testing:MilaUITests/AudioLoopbackUITests/$TEST \
-            -derivedDataPath build-uitests \
+            -only-testing:MilaTests/LiveTranscriberPipelineE2ETests \
+            -derivedDataPath build-pipeline \
             CODE_SIGNING_ALLOWED=NO \
-            -resultBundlePath build-uitests/loopback.xcresult
+            -resultBundlePath build-pipeline/pipeline.xcresult
 
-      - name: Capture VAD + LiveTranscriber + LiveSpeakerDiarizer os_log
+      - name: Run UI E2E (English, ggml-tiny.bin)
+        env:
+          # XCUITest needs the TEST_RUNNER_ prefix to propagate env vars
+          # through xcodebuild to the test runner process.
+          TEST_RUNNER_MILA_FIXTURE_E2E: "1"
+          TEST_RUNNER_MILA_FIXTURE_WAV_PATH: /tmp/mila-fixture-en.wav
+          TEST_RUNNER_MILA_TINY_MODEL_PATH: /Users/runner/.cache/whisper-models/ggml-tiny.bin
+          TEST_RUNNER_MILA_CLAUDE_PATH: ${{ steps.claude-cli.outputs.claude_path }}
+          TEST_RUNNER_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          xcodebuild test \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -destination 'platform=macOS' \
+            -only-testing:MilaUITests/AudioLoopbackUITests/test_english_two_minute_recording_progresses \
+            -derivedDataPath build-ui \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath build-ui/ui.xcresult
+
+      - name: Capture os_log (pipeline + UI)
         if: always()
         run: |
           set +e
-          mkdir -p build-uitests/logs
+          mkdir -p logs
           if [ -f /tmp/mila-log-start.txt ]; then
             START="$(cat /tmp/mila-log-start.txt)"
             /usr/bin/log show \
               --start "$START" \
               --style compact \
               --predicate 'subsystem == "io.island.whisper.IslandWhisper" OR subsystem == "io.island.mila.Mila"' \
-              > build-uitests/logs/vad-transcriber.log 2>&1
+              > logs/vad-transcriber.log 2>&1
           fi
-          echo "## VAD emits + diarizer intervals (${{ matrix.language }})" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Pipeline + UI activity" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
-          grep -E "VAD emit utterance|LiveTranscriber utterance:|interval added|inject-fixture" \
-            build-uitests/logs/vad-transcriber.log 2>/dev/null \
-            | head -60 \
-            >> "$GITHUB_STEP_SUMMARY" || echo "(no relevant lines)" >> "$GITHUB_STEP_SUMMARY"
+          grep -E "VAD emit|LiveTranscriber utterance|transcribeOnceSegments|interval added|inject-fixture|PipelineE2E|FixtureE2E" \
+            logs/vad-transcriber.log 2>/dev/null \
+            | head -80 \
+            >> "$GITHUB_STEP_SUMMARY" || echo "(nothing captured)" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: e2e-${{ matrix.language }}
+          name: e2e-results
           path: |
-            build-uitests/loopback.xcresult
-            build-uitests/logs
-            /tmp/mila-fixture-${{ matrix.language }}.wav
+            build-pipeline/pipeline.xcresult
+            build-ui/ui.xcresult
+            logs
+            /tmp/mila-fixture-en.wav
+            /tmp/mila-fixture-he.wav
           if-no-files-found: warn

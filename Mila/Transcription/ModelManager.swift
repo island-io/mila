@@ -105,12 +105,27 @@ final class ModelManager: NSObject, ObservableObject {
         return selectedModel().flatMap { isInstalled($0) ? $0 : nil } ?? best
     }
 
+    /// Test-only override that makes every model's `url(for:)` return the
+    /// same path (typically a small `ggml-tiny.bin` on disk). Lets CI
+    /// run the real WhisperEngine on a fast model without rebuilding
+    /// the production catalog. `isInstalled` returns true while the
+    /// override is set so callers don't gate on the catalog filename
+    /// existing.
+    func setTestModelOverride(_ url: URL?) {
+        testModelOverride = url
+        modelLogger.log("setTestModelOverride: \(url?.path ?? "nil", privacy: .public)")
+    }
+
+    private var testModelOverride: URL?
+
     func url(for model: WhisperModel) -> URL {
-        modelsDirectory.appendingPathComponent("\(model.name).bin")
+        if let override = testModelOverride { return override }
+        return modelsDirectory.appendingPathComponent("\(model.name).bin")
     }
 
     func isInstalled(_ model: WhisperModel) -> Bool {
-        installed.contains(model.name)
+        if testModelOverride != nil { return true }
+        return installed.contains(model.name)
     }
 
     func refreshInstalled() {
