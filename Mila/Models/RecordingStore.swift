@@ -20,10 +20,23 @@ final class RecordingStore: ObservableObject {
     @Published private(set) var folders: [String] = []
 
     private let fileManager = FileManager.default
-    private let storeURL: URL
-    private let foldersURL: URL
-    let recordingsDirectory: URL
+    /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
+    /// every `relocateRecordings` call. On the default path they live
+    /// alongside the `Recordings/` subdir (legacy layout); on a custom
+    /// path they live inside the chosen folder so the user-picked
+    /// directory is self-contained (one folder == recordings + their
+    /// metadata, portable across machines / cloud sync).
+    private(set) var storeURL: URL
+    private(set) var foldersURL: URL
+    /// Published so the Settings UI's "Current location" row updates the
+    /// moment the user picks a different folder.
+    @Published private(set) var recordingsDirectory: URL
     let modelsDirectory: URL
+    /// The default recordings location (always inside Application
+    /// Support/Mila/Recordings). Used by Settings to label the
+    /// "Reset to default" button and to detect when a custom path is in
+    /// effect.
+    let defaultRecordingsDirectory: URL
 
     convenience init() {
         // UI tests pass --ui-test-clean-store to bypass the user's real
@@ -72,16 +85,82 @@ final class RecordingStore: ObservableObject {
             }
         }
         self.init(rootDirectory: newRoot)
+        // The user override (if any) is applied by MilaApp after the
+        // store + the storage-settings instance it owns are both wired
+        // up — we don't observe the bookmark from inside the store so
+        // the test path (`init(rootDirectory:)`) stays cleanly isolated
+        // from UserDefaults.
     }
 
+    /// Production-style init. `rootDirectory` is where the model cache
+    /// and the default recordings folder live. `customRecordingsDirectory`
+    /// is the user override — when non-nil, recordings + their json
+    /// sidecars live there instead of `<rootDirectory>/Recordings`.
+    /// Used by tests that need to verify the relocated-at-construction
+    /// path; production wires the override via `relocateRecordings(to:)`
+    /// from MilaApp.
+    convenience init(rootDirectory: URL, customRecordingsDirectory: URL?) {
+        self.init(rootDirectory: rootDirectory)
+        if let custom = customRecordingsDirectory {
+            relocateRecordings(to: custom)
+        }
+    }
+
+    /// Root passed into `init(rootDirectory:)`. Cached so
+    /// `relocateRecordings(to: nil)` can revert to the original
+    /// default-path layout (json files sit alongside the `Recordings/`
+    /// subdir, matching the historical shape that pre-v1.7 builds
+    /// shipped).
+    private let originalRootDirectory: URL
+
     init(rootDirectory: URL) {
-        self.recordingsDirectory = rootDirectory.appendingPathComponent("Recordings", isDirectory: true)
+        self.originalRootDirectory = rootDirectory
+        let defaultRecs = rootDirectory.appendingPathComponent("Recordings", isDirectory: true)
+        self.defaultRecordingsDirectory = defaultRecs
+        self.recordingsDirectory = defaultRecs
         self.modelsDirectory = rootDirectory.appendingPathComponent("Models", isDirectory: true)
         self.storeURL = rootDirectory.appendingPathComponent("recordings.json")
         self.foldersURL = rootDirectory.appendingPathComponent("folders.json")
 
-        try? fileManager.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true)
+        try? fileManager.createDirectory(at: defaultRecs, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
+        load()
+        loadFolders()
+    }
+
+    /// Switch the recordings directory to `newDirectory`. Clears the
+    /// in-memory state and re-loads from the new location's
+    /// `recordings.json` + `folders.json` (if any). Existing recordings
+    /// at the old location stay on disk; this is intentionally a
+    /// "point at the new folder" operation, not a "move my data" one
+    /// — moving content is a separate action.
+    ///
+    /// Layout:
+    ///   * Default (newDirectory == nil): json files at
+    ///     `<originalRoot>/recordings.json` (sibling of the
+    ///     `Recordings/` subdir), wavs inside the subdir. Matches the
+    ///     historical layout.
+    ///   * Custom: json files at `<newDirectory>/recordings.json`,
+    ///     wavs in the same directory. Makes the chosen folder
+    ///     self-contained so the user can hand it to backup software
+    ///     / a cloud-sync app without picking up the model cache.
+    func relocateRecordings(to newDirectory: URL?) {
+        if let custom = newDirectory {
+            try? fileManager.createDirectory(at: custom, withIntermediateDirectories: true)
+            self.recordingsDirectory = custom
+            self.storeURL = custom.appendingPathComponent("recordings.json")
+            self.foldersURL = custom.appendingPathComponent("folders.json")
+        } else {
+            self.recordingsDirectory = defaultRecordingsDirectory
+            self.storeURL = originalRootDirectory.appendingPathComponent("recordings.json")
+            self.foldersURL = originalRootDirectory.appendingPathComponent("folders.json")
+            try? fileManager.createDirectory(at: defaultRecordingsDirectory, withIntermediateDirectories: true)
+        }
+        // Reset published state before reload so subscribers don't
+        // briefly see the old recordings under the new location label.
+        self.recordings = []
+        self.folders = []
+        self.pendingRecoveryIDs = []
         load()
         loadFolders()
     }

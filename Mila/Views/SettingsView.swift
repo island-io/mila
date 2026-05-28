@@ -3,7 +3,7 @@ import AppKit
 import Carbon.HIToolbox
 
 enum SettingsTab: Int, Hashable {
-    case hotkeys, audio, models, llm, speakers, meetings, liveAI
+    case hotkeys, audio, models, llm, speakers, meetings, liveAI, storage
 }
 
 @Observable
@@ -39,6 +39,9 @@ struct SettingsView: View {
             LiveAISettingsTab()
                 .tabItem { Label("Live AI", systemImage: "sparkles.tv") }
                 .tag(SettingsTab.liveAI)
+            StorageSettingsTab()
+                .tabItem { Label("Storage", systemImage: "externaldrive") }
+                .tag(SettingsTab.storage)
         }
         .frame(width: 560, height: 560)
         .padding(20)

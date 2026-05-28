@@ -46,6 +46,7 @@ struct MilaApp: App {
     @NSApplicationDelegateAdaptor(MilaAppDelegate.self) private var appDelegate
 
     @StateObject private var store: RecordingStore
+    @StateObject private var storageSettings: RecordingStorageSettings
     @StateObject private var modelManager: ModelManager
     @StateObject private var transcription: TranscriptionService
     @StateObject private var dictation: DictationController
@@ -68,7 +69,16 @@ struct MilaApp: App {
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
+        // RecordingStore's no-arg init handles the legacy migration and
+        // opens at the default Application Support location. The
+        // storage-settings instance owns the security-scoped bookmark
+        // resolution; we apply any user override by calling
+        // `relocateRecordings(to:)` once both are constructed.
         let store = RecordingStore()
+        let storage = RecordingStorageSettings()
+        if let custom = storage.customDirectory {
+            store.relocateRecordings(to: custom)
+        }
         let mgr = ModelManager(modelsDirectory: store.modelsDirectory)
         // Diarization is on by default for fresh installs so the bundled
         // Python runtime auto-downloads its torch wheels on first launch
@@ -222,6 +232,7 @@ struct MilaApp: App {
             actions: actions
         )
         _store = StateObject(wrappedValue: store)
+        _storageSettings = StateObject(wrappedValue: storage)
         _modelManager = StateObject(wrappedValue: mgr)
         _transcription = StateObject(wrappedValue: svc)
         _diarizationSettings = StateObject(wrappedValue: diarSettings)
@@ -250,6 +261,7 @@ struct MilaApp: App {
         WindowGroup("Mila") {
             ContentView()
                 .environmentObject(store)
+                .environmentObject(storageSettings)
                 .environmentObject(modelManager)
                 .environmentObject(transcription)
                 .environmentObject(dictation)
@@ -317,6 +329,8 @@ struct MilaApp: App {
 
         Settings {
             SettingsView()
+                .environmentObject(store)
+                .environmentObject(storageSettings)
                 .environmentObject(modelManager)
                 .environmentObject(hotkeySettings)
                 .environmentObject(transcription)
