@@ -1,0 +1,107 @@
+name: Silence Auto-Drop E2E
+
+# Lightweight UI-test E2E for the "app-record auto-drop on silence"
+# feature: confirms that a meeting recording targeting an app with no
+# audio for the silence window has its system-audio leg torn down (and
+# stays alive when the app does produce audio).
+#
+# The test uses the fake-meeting launch-arg seam in MilaApp instead of
+# ScreenCaptureKit, so it needs no TCC grants and no virtual loopback —
+# both branches run in ~25s on top of the build. No whisper models, no
+# diarization bundle, no Claude CLI.
+#
+# Runs on PRs that touch the silence-monitor surface area, plus
+# workflow_dispatch for manual verification.
+
+on:
+  pull_request:
+    paths:
+      - "Mila/Audio/AppAudioSilenceMonitor.swift"
+      - "Mila/Audio/RecordingSession.swift"
+      - "Mila/App/MilaApp.swift"
+      - "MilaUITests/RecordingSilenceUITests.swift"
+      - ".github/workflows/silence-drop-e2e.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: silence-drop-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  silence-drop:
+    name: Silence auto-drop UI E2E
+    runs-on: macos-26
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # The .xcodeproj references the bundled Python runtime folder.
+      # Restore from cache (same key as ci.yml) so we don't have to
+      # rebuild the diarization bundle just to satisfy xcodegen.
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: Mila/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Mark log capture start
+        run: date -u +"%Y-%m-%d %H:%M:%S" > /tmp/mila-log-start.txt
+
+      - name: Run silence-drop UI tests
+        env:
+          # XCUITest needs the TEST_RUNNER_ prefix for env vars to
+          # propagate from xcodebuild into the test runner process —
+          # this is the same plumbing used by AudioLoopbackUITests.
+          TEST_RUNNER_MILA_SILENCE_E2E: "1"
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -destination 'platform=macOS' \
+            -only-testing:MilaUITests/RecordingSilenceUITests \
+            -derivedDataPath build-silence \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath build-silence/silence.xcresult
+
+      - name: Capture os_log
+        if: always()
+        run: |
+          set +e
+          mkdir -p logs
+          if [ -f /tmp/mila-log-start.txt ]; then
+            START="$(cat /tmp/mila-log-start.txt)"
+            /usr/bin/log show \
+              --start "$START" \
+              --style compact \
+              --predicate 'subsystem == "io.island.whisper.IslandWhisper"' \
+              > logs/silence-monitor.log 2>&1
+          fi
+          echo "## Silence monitor activity" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "AppAudioSilenceMonitor|RecordingSession|fake-meeting|silence-window" \
+            logs/silence-monitor.log 2>/dev/null \
+            | head -60 \
+            >> "$GITHUB_STEP_SUMMARY" || echo "(nothing captured)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: silence-drop-results
+          path: |
+            build-silence/silence.xcresult
+            logs
+          if-no-files-found: warn
