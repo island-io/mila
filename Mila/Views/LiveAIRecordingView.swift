@@ -177,6 +177,10 @@ struct LiveAIRecordingView: View {
                 }
             }
             .environment(\.layoutDirection, isRTL ? .rightToLeft : .leftToRight)
+            // Aggregate accessibility node — the UI test reads this
+            // single element's label to verify LLM summary populated.
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("liveAI.summary")
         }
     }
 

@@ -112,6 +112,14 @@ struct MilaApp: App {
         // CommandLine population — putting it here makes it deterministic.
         os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
             .log("MilaApp.init args=\(CommandLine.arguments.joined(separator: " "), privacy: .public)")
+        // UI-test launch args that override persisted settings so the
+        // workflow can pick the recording language without depending on
+        // whatever the host's UserDefaults happens to have.
+        if CommandLine.arguments.contains("--ui-test-recording-lang-en") {
+            langSettings.current = .english
+        } else if CommandLine.arguments.contains("--ui-test-recording-lang-he") {
+            langSettings.current = .hebrew
+        }
         if CommandLine.arguments.contains("--ui-test-rtl-live-hebrew") {
             liveTrans.seedForTesting([
                 LiveSegment(id: UUID(), startSeconds: 0, endSeconds: 2,

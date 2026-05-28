@@ -22,9 +22,16 @@ on:
 
 jobs:
   audio-loopback:
-    name: Real audio capture E2E
+    name: Real audio capture E2E (${{ matrix.language }})
     runs-on: macos-26
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # One job per recording language. Hebrew uses `say -v Carmit`,
+        # English uses Allison/Tom. Same conversation shape so the
+        # transcript-token assertions can verify per-language coverage.
+        language: [en, he]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -107,8 +114,8 @@ jobs:
       - name: Generate Xcode project
         run: make project
 
-      - name: Generate audio fixture
-        run: ./scripts/generate-audio-fixture.sh /tmp/mila-loopback-fixture.wav
+      - name: Generate audio fixture (${{ matrix.language }})
+        run: ./scripts/generate-audio-fixture.sh /tmp/mila-loopback-fixture.wav ${{ matrix.language }}
 
       - name: Start audio playback (background)
         # Loop the fixture so it keeps feeding BlackHole for the entire
@@ -134,7 +141,7 @@ jobs:
           date -u +"%Y-%m-%d %H:%M:%S" > /tmp/mila-log-start.txt
           cat /tmp/mila-log-start.txt
 
-      - name: Run audio loopback UI test
+      - name: Run audio loopback UI test (${{ matrix.language }})
         env:
           # xcodebuild strips the `TEST_RUNNER_` prefix and exposes the
           # remaining name as an env var inside the test process — that's
@@ -144,11 +151,15 @@ jobs:
           # https://developer.apple.com/documentation/xcode/running-tests-and-interpreting-results
           TEST_RUNNER_MILA_LOOPBACK_E2E: "1"
         run: |
+          case "${{ matrix.language }}" in
+            en) TEST="test_english_two_minute_recording_progresses" ;;
+            he) TEST="test_hebrew_two_minute_recording_progresses" ;;
+          esac
           xcodebuild test \
             -project Mila.xcodeproj \
             -scheme Mila \
             -destination 'platform=macOS' \
-            -only-testing:MilaUITests/AudioLoopbackUITests \
+            -only-testing:MilaUITests/AudioLoopbackUITests/$TEST \
             -derivedDataPath build-uitests \
             CODE_SIGNING_ALLOWED=NO \
             -resultBundlePath build-uitests/loopback.xcresult
@@ -198,7 +209,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: loopback-xcresult
+          name: loopback-xcresult-${{ matrix.language }}
           path: |
             build-uitests/loopback.xcresult
             build-uitests/logs
