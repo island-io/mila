@@ -199,6 +199,127 @@ final class RecordingSummarizerTests: XCTestCase {
                        "Late-arriving CLI output must not overwrite a summary that already exists")
     }
 
+    // MARK: - Force / regenerate path
+
+    /// `regenerate(_:)` must overwrite an existing summary — that's the
+    /// whole point of the affordance. Without this the "Regenerate
+    /// summary" context-menu item and the re-transcribe hook would both
+    /// silently no-op.
+    func test_regenerate_overwrites_existing_summary() async throws {
+        let script = makeScript("""
+            #!/bin/sh
+            printf 'REGENERATED'
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        llm.tool = .claude
+        llm.executablePath = script.path
+
+        let audioURL = store.freshAudioURL(suggestedName: "Regen")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "Regen",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the new transcript text"
+        )
+        rec.summary = "stale summary from a previous run"
+        store.add(rec)
+
+        // `summarizeIfNeeded` would bail because a summary already
+        // exists; `regenerate` bypasses that gate.
+        summarizer.regenerate(rec)
+        try await waitForSummary(recordingID: rec.id,
+                                 timeoutSeconds: 30,
+                                 expected: "REGENERATED")
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "REGENERATED")
+    }
+
+    /// `regenerate` still respects the two hard requirements:
+    /// LLM configured + non-empty transcript.
+    func test_regenerate_noops_when_llm_not_configured() async throws {
+        llm.tool = .none
+        let audioURL = store.freshAudioURL(suggestedName: "NoLLM")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "NoLLM",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "transcript text"
+        )
+        rec.summary = "old summary"
+        store.add(rec)
+
+        summarizer.regenerate(rec)
+        // Give it a beat — nothing should have happened.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "old summary")
+    }
+
+    func test_regenerate_noops_when_transcript_empty() async throws {
+        llm.tool = .claude
+        let script = makeScript("""
+            #!/bin/sh
+            printf 'should not reach here'
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        llm.executablePath = script.path
+
+        let audioURL = store.freshAudioURL(suggestedName: "Empty")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "Empty",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: ""
+        )
+        rec.summary = "old"
+        store.add(rec)
+
+        summarizer.regenerate(rec)
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "old",
+                       "Empty transcript must not trigger a CLI call")
+    }
+
+    /// `isSummarizing(_:)` flips true while a call is in flight and back
+    /// to false when it lands. The detail view's spinner depends on this.
+    func test_is_summarizing_tracks_in_flight_state() async throws {
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 0.3
+            printf 'done'
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        llm.tool = .claude
+        llm.executablePath = script.path
+
+        let audioURL = store.freshAudioURL(suggestedName: "Spin")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Spin",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "transcript text"
+        )
+        store.add(rec)
+
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        summarizer.summarizeIfNeeded(rec)
+        // Yield so the Task body actually starts and registers itself.
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id),
+                      "isSummarizing should be true while CLI is running")
+
+        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 10)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id),
+                       "isSummarizing should clear after CLI returns")
+    }
+
     // MARK: - Helpers
 
     /// Poll the store until the recording's `summary` is non-nil, or fail
@@ -206,12 +327,22 @@ final class RecordingSummarizerTests: XCTestCase {
     /// take a couple of seconds on a cold runner (subprocess spawn +
     /// pipe drain) so the default 30s budget is generous.
     private func waitForSummary(recordingID: UUID,
-                                timeoutSeconds: TimeInterval) async throws {
+                                timeoutSeconds: TimeInterval,
+                                expected: String? = nil) async throws {
         let deadline = Date().addingTimeInterval(timeoutSeconds)
         while Date() < deadline {
             if let rec = store.recordings.first(where: { $0.id == recordingID }),
                let s = rec.summary, !s.isEmpty {
-                return
+                if let expected {
+                    // Caller wants to wait for a specific replacement
+                    // value (regenerate path) rather than "any non-empty
+                    // summary" (initial run path). Without this the
+                    // regenerate test would short-circuit on the OLD
+                    // summary present before regenerate() even started.
+                    if s == expected { return }
+                } else {
+                    return
+                }
             }
             try await Task.sleep(nanoseconds: 50_000_000)
         }

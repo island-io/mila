@@ -23,13 +23,24 @@ struct AIOverviewSection: View {
     let summary: String?
     let items: [ActionItem]
     let recordingLanguage: String
+    /// When set, the summary block exposes a "Regenerate summary"
+    /// context-menu action that calls this closure. Hidden in the
+    /// rename sheet (which doesn't have a summarizer to call) and
+    /// in views that don't pass it through.
+    var onRegenerateSummary: (() -> Void)? = nil
+    /// Forces the "Summarizing…" spinner UI without requiring an
+    /// existing summary string — used while a regenerate / backfill
+    /// is in flight on a recording that has nothing yet (so
+    /// `summary` is nil but we still want feedback that work is
+    /// happening).
+    var isSummarizing: Bool = false
 
     /// True iff there's at least one non-empty piece to show. Callers
     /// can use this to collapse their wrapper (avoiding an empty card
     /// in the rename sheet or an empty header strip in the detail
     /// view).
     var hasContent: Bool {
-        (summary?.isEmpty == false) || !items.isEmpty
+        (summary?.isEmpty == false) || !items.isEmpty || isSummarizing
     }
 
     private var sectionIsRTL: Bool {
@@ -42,8 +53,9 @@ struct AIOverviewSection: View {
             let alignmentValue: Alignment = sectionIsRTL ? .trailing : .leading
             let multilineAlignment: TextAlignment = sectionIsRTL ? .trailing : .leading
             VStack(alignment: .leading, spacing: 12) {
-                if let summary, !summary.isEmpty {
-                    summaryView(summary,
+                let summaryText = summary ?? ""
+                if !summaryText.isEmpty || isSummarizing {
+                    summaryView(summaryText,
                                 alignment: alignmentValue,
                                 multiline: multilineAlignment)
                 }
@@ -60,24 +72,60 @@ struct AIOverviewSection: View {
                              alignment: Alignment,
                              multiline: TextAlignment) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("Summary", systemImage: "sparkles")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.tint)
+            HStack(spacing: 6) {
+                Label("Summary", systemImage: "sparkles")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.tint)
+                if isSummarizing {
+                    // Spinner sits next to the section title so a
+                    // regenerate / backfill is visible without
+                    // obscuring the (still-valid) previous summary
+                    // text below.
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityIdentifier("detail.summary.spinner")
+                    Text("Summarizing…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
             // Selectable + right-clickable so users can grab the summary
             // into another doc / chat. `textSelection(.enabled)` gives
             // drag-select; the context menu mirrors the macOS-native
-            // "Copy" affordance plus a labelled "Copy summary" option.
-            Text(text)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: alignment)
-                .multilineTextAlignment(multiline)
-                .textSelection(.enabled)
-                .contextMenu {
-                    Button("Copy summary") {
-                        AIOverviewSection.copyToPasteboard(text)
+            // "Copy" affordance plus a labelled "Copy summary" option,
+            // and — when the caller wired it — a "Regenerate summary"
+            // entry that re-runs the LLM against the current transcript.
+            if !text.isEmpty {
+                Text(text)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: alignment)
+                    .multilineTextAlignment(multiline)
+                    .textSelection(.enabled)
+                    .contextMenu {
+                        Button("Copy summary") {
+                            AIOverviewSection.copyToPasteboard(text)
+                        }
+                        if let onRegenerateSummary {
+                            Divider()
+                            Button("Regenerate summary") {
+                                onRegenerateSummary()
+                            }
+                            .disabled(isSummarizing)
+                            .accessibilityIdentifier("detail.summary.regenerate")
+                        }
                     }
-                }
+            } else if isSummarizing {
+                // Backfill case: no summary text yet, but a CLI call
+                // is in flight. A placeholder line gives the user
+                // something to point at while waiting.
+                Text("Generating summary…")
+                    .font(.callout)
+                    .italic()
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: alignment)
+                    .multilineTextAlignment(multiline)
+            }
         }
     }
 

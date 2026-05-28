@@ -230,8 +230,17 @@ struct MilaApp: App {
         // summarizer's own `shouldSummarize` gate skips work if a
         // live summary already landed, if the LLM CLI isn't
         // configured, or if the transcript came up empty.
-        svc.onTranscriptionCompleted = { [weak summarizer] rec in
-            summarizer?.summarizeIfNeeded(rec)
+        //
+        // When `wasRetranscription` is true the recording had an old
+        // summary referring to the previous transcript; we force-
+        // regenerate so the user doesn't end up with a stale summary
+        // that disagrees with what the segments now say.
+        svc.onTranscriptionCompleted = { [weak summarizer] rec, wasRetranscription in
+            if wasRetranscription {
+                summarizer?.regenerate(rec)
+            } else {
+                summarizer?.summarizeIfNeeded(rec)
+            }
         }
         // Late-bind the live-AI dependencies onto `actions` so it can
         // attach summary/items to the saved Recording and skip the
@@ -309,6 +318,8 @@ struct MilaApp: App {
                 .task { await wireLiveAIPipeline() }
                 .task { await injectFixtureWavIfRequested() }
                 .task { await startFakeMeetingIfRequested() }
+                .task { recordingSummarizer.backfillIfNeeded() }
+                .environmentObject(recordingSummarizer)
                 .environmentObject(meetingDetectionSettings)
         }
         .commands {

@@ -41,7 +41,14 @@ final class TranscriptionService: ObservableObject {
     /// the summarizer subscribing to store changes) so it fires
     /// exactly once per transcription, NOT on every subsequent
     /// `store.update` that touches the same recording.
-    var onTranscriptionCompleted: ((Recording) -> Void)?
+    ///
+    /// The second argument is `true` when the recording already had a
+    /// non-empty `summary` at the moment the transcription started —
+    /// i.e. the user explicitly re-transcribed an already-finished
+    /// recording. Callers use that signal to force-regenerate the
+    /// summary (the old one now refers to a transcript that no longer
+    /// exists). For first-time transcription it's `false`.
+    var onTranscriptionCompleted: ((Recording, _ wasRetranscription: Bool) -> Void)?
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
@@ -214,6 +221,17 @@ final class TranscriptionService: ObservableObject {
             return
         }
 
+        // Snapshot pre-run summary state so the completion hook can tell
+        // the summarizer "this was a re-transcription, force-regenerate."
+        // We intentionally do NOT clear `summary` here — leaving the old
+        // value visible during the re-run is less jarring than blanking
+        // it for the ~30-60s the model takes; the post-completion
+        // regenerate path replaces it atomically when the new transcript
+        // is in hand. See PR body for the UX rationale.
+        let hadSummaryBeforeRun = !(working.summary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+
         working.status = .running
         working.modelName = model.displayName
         store.update(working)
@@ -358,7 +376,7 @@ final class TranscriptionService: ObservableObject {
 
             if working.status == .completed {
                 TranscriptExporter.writeSRT(for: working, in: store.recordingsDirectory)
-                onTranscriptionCompleted?(working)
+                onTranscriptionCompleted?(working, hadSummaryBeforeRun)
             }
         } catch is CancellationError {
             // The user hit Cancel mid-run. The rename sheet's coordinator is

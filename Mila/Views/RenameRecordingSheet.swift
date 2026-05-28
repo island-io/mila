@@ -13,6 +13,7 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var llm: LLMSettings
     @EnvironmentObject private var transcription: TranscriptionService
+    @EnvironmentObject private var summarizer: RecordingSummarizer
 
     @State private var title: String
     @State private var isFetchingName = false
@@ -68,7 +69,12 @@ struct RenameRecordingSheet: View {
     }
 
     private var hasAIOverview: Bool {
-        !summary.isEmpty || !actionItems.isEmpty
+        !summary.isEmpty
+            || !actionItems.isEmpty
+            // Still surface the section while a backfill / regenerate
+            // call is in flight so the user sees the "Summarizing…"
+            // spinner instead of an empty card.
+            || summarizer.isSummarizing(liveRecording.id)
     }
 
     /// "Transcribing…", "Done", "Failed", "Waiting in queue" — drives the
@@ -308,12 +314,26 @@ struct RenameRecordingSheet: View {
         AIOverviewSection(
             summary: summary,
             items: actionItems,
-            recordingLanguage: liveRecording.language
+            recordingLanguage: liveRecording.language,
+            onRegenerateSummary: canRegenerateSummary
+                ? { summarizer.regenerate(liveRecording) }
+                : nil,
+            isSummarizing: summarizer.isSummarizing(liveRecording.id)
         )
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Same gating logic as the detail view's: the user can ask for a
+    /// fresh summary as long as their LLM CLI is configured and we
+    /// have a non-empty transcript to feed it.
+    private var canRegenerateSummary: Bool {
+        guard llm.isConfigured else { return false }
+        return !liveRecording.fullText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
     }
 
     @ViewBuilder

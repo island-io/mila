@@ -9,6 +9,8 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var modelManager: ModelManager
+    @EnvironmentObject private var llmSettings: LLMSettings
+    @EnvironmentObject private var summarizer: RecordingSummarizer
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -24,7 +26,11 @@ struct RecordingDetailView: View {
             AIOverviewBanner(
                 summary: recording.summary,
                 items: recording.actionItems ?? [],
-                recordingLanguage: recording.language
+                recordingLanguage: recording.language,
+                isSummarizing: summarizer.isSummarizing(recording.id),
+                onRegenerateSummary: canRegenerateSummary
+                    ? { summarizer.regenerate(recording) }
+                    : nil
             )
             transcriptArea
                 // Force the transcript area to take the remaining
@@ -192,6 +198,19 @@ struct RecordingDetailView: View {
         transcription.enqueue(copy)
     }
 
+
+    /// Whether the user can ask for a fresh summary right now. Gates the
+    /// "Regenerate summary" context-menu entry in `AIOverviewBanner` so
+    /// it never shows up for recordings without an LLM CLI configured
+    /// or without anything to summarise. Mirrors `RecordingSummarizer`'s
+    /// own predicate but adds the "force-allowed even if a summary
+    /// exists" piece — that's the whole point of the affordance.
+    private var canRegenerateSummary: Bool {
+        guard llmSettings.isConfigured else { return false }
+        return !recording.fullText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
 
     /// Human-readable name of the whisper model that will run for the
     /// recording's CURRENT language. Prefers `recording.modelName` once
@@ -381,12 +400,22 @@ private struct AIOverviewBanner: View {
     let summary: String?
     let items: [ActionItem]
     let recordingLanguage: String
+    /// Forwarded to `AIOverviewSection` so the summary block shows a
+    /// "Summarizing…" spinner while a regenerate / backfill call is in
+    /// flight.
+    var isSummarizing: Bool = false
+    /// Forwarded to `AIOverviewSection`'s context-menu wiring. nil
+    /// hides the "Regenerate summary" item (e.g. when no LLM is
+    /// configured or the transcript is empty).
+    var onRegenerateSummary: (() -> Void)? = nil
 
     var body: some View {
         let section = AIOverviewSection(
             summary: summary,
             items: items,
-            recordingLanguage: recordingLanguage
+            recordingLanguage: recordingLanguage,
+            onRegenerateSummary: onRegenerateSummary,
+            isSummarizing: isSummarizing
         )
         if section.hasContent {
             VStack(spacing: 0) {
