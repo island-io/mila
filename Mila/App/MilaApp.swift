@@ -95,7 +95,29 @@ struct MilaApp: App {
                                              languageSettings: langSettings,
                                              postRecording: coordinator)
         let hotkeys = HotkeySettings()
-        let liveAI = LiveAISettings()
+        // UI-test bypass for the hardware gate: hosted macos-26 runners
+        // sometimes report as MacBook Air via `hw.model`, which trips
+        // the Live AI gate and stops the live-transcript fixture/RTL
+        // routes from rendering. When the UI-test flags are set, force
+        // a non-Air capability so `isLiveAIAvailable` returns true for
+        // every downstream check (ContentView routing,
+        // wireLiveAIPipeline, etc.) — the production hardware gate is
+        // untouched in real launches. Centralising the bypass here is
+        // simpler and less error-prone than sprinkling
+        // `CommandLine.arguments` checks at every gate.
+        let uiTestForcesLiveAI =
+            CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
+            || CommandLine.arguments.contains(where: { $0.hasPrefix("--ui-test-inject-fixture-wav=") })
+        let liveAICapabilities: SystemCapabilities = uiTestForcesLiveAI
+            ? SystemCapabilities(
+                modelIdentifier: SystemCapabilities.live.modelIdentifier,
+                marketingName: "MacBook Pro",
+                isMacBookAir: false,
+                physicalRamGB: SystemCapabilities.live.physicalRamGB,
+                performanceCoreCount: SystemCapabilities.live.performanceCoreCount
+            )
+            : .live
+        let liveAI = LiveAISettings(capabilities: liveAICapabilities)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
         // a dictation overlay while a meeting recording is in flight
@@ -520,6 +542,28 @@ struct MilaApp: App {
 
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
+
+        // Hardware gate: on Macs below the Live AI bar (currently:
+        // MacBook Air), skip the entire live pipeline. The recording
+        // itself still runs — `RecordingSession` writes the WAV
+        // regardless — and `QuickActionsController` enqueues a
+        // post-record transcription on stop, so the user gets a
+        // normal recording + background transcribe. We just don't
+        // spin up the live transcriber, diarizer, or AI session,
+        // which would burn CPU on a machine that can't keep up with
+        // them in real time. The early return is safe because the
+        // hardware decision is fixed for the lifetime of the
+        // process — sysctl values don't change at runtime.
+        //
+        // UI-test exception: handled centrally in `MilaApp.init()` by
+        // injecting a non-Air `SystemCapabilities` into `LiveAISettings`
+        // when the relevant launch arg is present, so
+        // `isLiveAIAvailable` is already true here.
+        guard aiSettings.isLiveAIAvailable else {
+            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                .log("wireLiveAIPipeline: skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
+            return
+        }
 
         for await state in sessionRef.$state.values {
             switch state {

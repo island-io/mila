@@ -203,6 +203,22 @@ struct ContentView: View {
             && actions.isRecording
             && liveAISettings.enabled
             && llmSettings.isConfigured
+            && liveAISettings.isLiveAIAvailable
+    }
+
+    /// Whether the home pane should swap to `LiveAIRecordingView`.
+    /// The UI-test bypass for the hardware gate lives centrally in
+    /// `MilaApp.init()` (it injects a non-Air `SystemCapabilities`
+    /// into `LiveAISettings`), so checking `isLiveAIAvailable` here
+    /// works in both production and UI-test launches. The
+    /// `--ui-test-rtl-live-hebrew` route additionally forces the
+    /// view even when no recording is in progress so the layout
+    /// regression test can assert without driving real audio.
+    private var shouldShowLiveAIRecordingView: Bool {
+        let uiTestForcesLiveView =
+            CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
+        if uiTestForcesLiveView { return true }
+        return actions.isRecording && liveAISettings.isLiveAIAvailable
     }
 
     /// Compose the wake-up alert body. Always shows the captured length so
@@ -236,20 +252,17 @@ struct ContentView: View {
     private var detailContent: some View {
         switch selection ?? .home {
         case .home:
-            if actions.isRecording
-                || CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
-                || CommandLine.arguments.contains(where: { $0.hasPrefix("--ui-test-inject-fixture-wav=") }) {
+            if shouldShowLiveAIRecordingView {
                 // Live transcription is always on during a recording —
                 // the AI summarization layer (action items / final
                 // summary) only activates when Live AI is enabled +
                 // a CLI is configured. The view itself handles the
                 // gating; we just route here based on "are we recording".
                 //
-                // The UI-test flag bypasses the recording requirement
-                // so a regression test can assert the layout of the
-                // live transcript pane (specifically Hebrew RTL
-                // alignment with the sidebar open) without driving a
-                // real audio recording.
+                // The UI-test flags bypass both the recording AND
+                // hardware gates so the live-transcript regression
+                // tests can run on any CI machine regardless of how
+                // its `hw.model` is reported.
                 LiveAIRecordingView()
             } else {
                 HomeView(selection: $selection, search: search)

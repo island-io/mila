@@ -878,8 +878,11 @@ private struct LiveAISettingsTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 header
+                if !settings.isLiveAIAvailable {
+                    hardwareDisabledNotice
+                }
                 masterToggle
-                if !llm.isConfigured {
+                if !llm.isConfigured && settings.isLiveAIAvailable {
                     notConfiguredHint
                 }
                 Divider()
@@ -890,6 +893,30 @@ private struct LiveAISettingsTab: View {
             .padding(.vertical, 4)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+    }
+
+    /// Banner shown when this Mac is below the hardware bar for Live
+    /// AI (currently: any MacBook Air). The toggle stays visible but
+    /// is greyed out — the persisted preference still round-trips,
+    /// so taking the user's settings back to a fast Mac restores the
+    /// previous state without surprises.
+    private var hardwareDisabledNotice: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Disabled on this Mac")
+                    .font(.callout.weight(.semibold))
+                Text("MacBook Air — Live AI is too slow on Air-class chips. Recordings will still transcribe in the background.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 6))
     }
 
     private var header: some View {
@@ -915,6 +942,11 @@ private struct LiveAISettingsTab: View {
                 }
             }
             .toggleStyle(.switch)
+            // Hardware gate: keep the toggle visible (so the user
+            // knows the feature exists) but block interaction on Macs
+            // where Live AI is too slow to be useful. The persisted
+            // value still round-trips.
+            .disabled(!settings.isLiveAIAvailable)
 
             HStack {
                 Text("Output language")
@@ -929,6 +961,7 @@ private struct LiveAISettingsTab: View {
                 .labelsHidden()
                 .frame(maxWidth: 220)
             }
+            .disabled(!settings.isLiveAIAvailable)
         }
     }
 

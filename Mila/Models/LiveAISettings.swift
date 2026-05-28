@@ -16,6 +16,13 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(enabled, forKey: Keys.enabled) }
     }
 
+    /// Snapshot of the host Mac's hardware identity. Injected in tests
+    /// (so `isLiveAIAvailable` can be exercised without a real
+    /// MacBook Air); defaults to `SystemCapabilities.live` in
+    /// production. The choice is made at init time and never
+    /// reassigned — hardware doesn't change at runtime.
+    let capabilities: SystemCapabilities
+
     /// Model name passed to the CLI as `--model <value>`. Empty string ==
     /// "let the CLI pick" — typically the CLI's last-configured model. The
     /// UI nudges the user toward a cheap model via the placeholder.
@@ -70,6 +77,31 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(outputLanguage.rawValue, forKey: Keys.outputLanguage) }
     }
 
+    /// Whether Live AI's live-transcript / action-items pane should be
+    /// offered on this hardware. False on MacBook Air (whisper +
+    /// pyannote together are too slow on Air-class chips to feel
+    /// real-time); true on every other Mac. Independent of the user's
+    /// `enabled` toggle and of whether the LLM CLI is configured —
+    /// this is purely "is the feature reachable on this machine."
+    ///
+    /// The user's `enabled` preference is still persisted across
+    /// launches (it round-trips even when unavailable), so taking the
+    /// app from a slow Mac back to a fast Mac restores the previous
+    /// state without surprises.
+    var isLiveAIAvailable: Bool {
+        capabilities.isLiveAIRecommended
+    }
+
+    /// Whether Live AI is currently ready to actually run — i.e. the
+    /// hardware supports it AND the user has an LLM CLI configured.
+    /// The user's `enabled` toggle is intentionally NOT part of this
+    /// gate: callers compose `isLiveAIReady && enabled` themselves so
+    /// the readiness signal can also be used to grey out the toggle
+    /// in Settings without flipping the persisted preference.
+    func isLiveAIReady(llmConfigured: Bool) -> Bool {
+        llmConfigured && isLiveAIAvailable
+    }
+
     enum OutputLanguage: String, CaseIterable, Identifiable {
         case auto = "auto"
         case english = "en"
@@ -101,8 +133,10 @@ final class LiveAISettings: ObservableObject {
 
     private let defaults: UserDefaults
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard,
+         capabilities: SystemCapabilities = .live) {
         self.defaults = defaults
+        self.capabilities = capabilities
         // Default ON: users who never touched the toggle should get
         // the LLM summary/action-items pane. If their LLM CLI isn't
         // configured, `isLiveAIReady` still gates everything down to
