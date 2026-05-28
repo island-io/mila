@@ -75,12 +75,14 @@ final class AudioLoopbackUITests: XCTestCase {
         app.launchArguments = args
         app.launch()
 
-        // Wait for the first VAD-emitted segment to land. The
-        // injection task gives wireLiveAIPipeline 1.5s to mount then
-        // starts pumping; first emit lands ~3-8s after that.
+        // Wait for the first VAD-emitted segment to land. CI macos-26
+        // runners have no fast GPU, so whisper's first call has to
+        // cold-load the 1.5GB model + Metal warmup + first real
+        // transcribe — all in serial. That's 60-90s on a fresh
+        // runner. Local dev machines manage 5-10s. Generous timeout.
         let firstSegment = app.staticTexts.matching(identifier: "liveTranscript.segment").firstMatch
-        XCTAssertTrue(firstSegment.waitForExistence(timeout: 30),
-                      "[\(language)] No live segment after 30s — injection or VAD broken")
+        XCTAssertTrue(firstSegment.waitForExistence(timeout: 120),
+                      "[\(language)] No live segment after 120s — injection or VAD broken")
 
         // 12 snapshots × 10s = 120s of recording. Track segment counts
         // and screenshot each.
