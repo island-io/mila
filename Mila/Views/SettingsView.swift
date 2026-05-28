@@ -119,6 +119,24 @@ private struct AudioSettingsTab: View {
                     .frame(maxWidth: 360)
             }
 
+            Divider().padding(.vertical, 4)
+
+            // Adaptive digital gain. Default ON — most users with a built-in
+            // MacBook mic have their system input volume well below
+            // unity, which puts speech below the live VAD cutoff (0.012)
+            // and starves the live transcript pane. The gain controller
+            // boosts low-volume capture to a target observed RMS uniformly
+            // across the saved WAV and the live feed.
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Automatic mic gain adjustment",
+                       isOn: $settings.adaptiveGainEnabled)
+                    .toggleStyle(.switch)
+                Text("Boosts low-volume microphone input automatically when speech is captured. Disable if you prefer manual control of input levels.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)

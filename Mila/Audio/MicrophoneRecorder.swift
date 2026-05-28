@@ -46,6 +46,14 @@ final class MicrophoneRecorder: ObservableObject {
     /// CoreAudio without needing a real microphone or fragile timing in CI.
     var bringUpOverride: (@Sendable () async throws -> Void)?
 
+    /// Smoothed digital gain applied to every captured float frame before
+    /// it's yielded to consumers. Built fresh on each `start()` so a low-
+    /// volume mic doesn't inherit a stale gain from a previous session.
+    /// Held here (rather than rebuilt inside the tap closure) so tests and
+    /// the level meter can observe `currentGain` while a recording is in
+    /// flight.
+    private(set) var gain: AdaptiveGainController?
+
     init() {
         var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation!
         self.audioStream = AsyncStream { continuation = $0 }
@@ -94,20 +102,37 @@ final class MicrophoneRecorder: ObservableObject {
             Task { @MainActor in self?.level = lvl }
         }
 
+        // Build a fresh AGC for this session. Pulls the persisted toggle
+        // straight from UserDefaults so the recorder doesn't need to capture
+        // a main-actor settings object onto the audio thread. Matches the
+        // pattern already used here for `audio.input.preferredUID`.
+        let agcEnabled: Bool = {
+            if UserDefaults.standard.object(forKey: AudioInputSettings.adaptiveGainEnabledKey) == nil {
+                return true
+            }
+            return UserDefaults.standard.bool(forKey: AudioInputSettings.adaptiveGainEnabledKey)
+        }()
+        let agc = AdaptiveGainController(enabled: agcEnabled)
+        self.gain = agc
+
         let result = try await Self.withTimeout(seconds: bringUpTimeout) {
             try await Self.realBringUp(continuation: continuationForTap,
-                                       onLevel: onLevel)
+                                       onLevel: onLevel,
+                                       gain: agc)
         }
         self.engine = result.engine
         isRunning = true
-        print(String(format: "Mic: started (%.0fHz, %d ch)",
-                     result.format.sampleRate, Int(result.format.channelCount)))
+        print(String(format: "Mic: started (%.0fHz, %d ch, agc=%@)",
+                     result.format.sampleRate,
+                     Int(result.format.channelCount),
+                     agcEnabled ? "on" : "off"))
     }
 
     func stop() async {
         guard isRunning else { return }
         let toTeardown = engine
         engine = nil
+        gain = nil
         audioContinuation.finish()
         isRunning = false
         level = 0
@@ -139,7 +164,8 @@ final class MicrophoneRecorder: ObservableObject {
 
     private static func realBringUp(
         continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
-        onLevel: @escaping @Sendable (Float) -> Void
+        onLevel: @escaping @Sendable (Float) -> Void,
+        gain: AdaptiveGainController
     ) async throws -> EngineBox {
         // Read the user's pinned input UID off the main actor — UserDefaults
         // is thread-safe and Settings writes via a @MainActor object, so the
@@ -166,7 +192,25 @@ final class MicrophoneRecorder: ObservableObject {
                 onLevel(AudioMeter.level(from: buffer))
                 do {
                     let converted = try AudioConvert.toWhisperFormat(buffer)
-                    continuation.yield(converted)
+                    // Apply adaptive digital gain in-place on the whisper-
+                    // format buffer so the WAV writer AND the live VAD/
+                    // whisper feed both see the same boosted signal —
+                    // single source of truth. `toWhisperFormat` allocates
+                    // a fresh buffer in every real-mic path (mics never
+                    // come up at native 16kHz mono float), so writing into
+                    // it doesn't touch the engine-owned source buffer.
+                    // The defensive `aliasesInput` check covers the rare
+                    // exotic-device case where the formats happen to match.
+                    let toMutate: AVAudioPCMBuffer
+                    if converted === buffer {
+                        toMutate = Self.copyBuffer(buffer) ?? converted
+                    } else {
+                        toMutate = converted
+                    }
+                    if let channel = toMutate.floatChannelData?[0] {
+                        gain.process(channel, count: Int(toMutate.frameLength))
+                    }
+                    continuation.yield(toMutate)
                 } catch {
                     print("Mic conversion error: \(error)")
                 }
@@ -175,6 +219,26 @@ final class MicrophoneRecorder: ObservableObject {
             try engine.start()
             return EngineBox(engine: engine, format: nativeFormat)
         }.value
+    }
+
+    /// Deep-copy a Float32 PCM buffer so we can apply in-place gain without
+    /// mutating an engine-owned source buffer. Only used on the rare path
+    /// where the input device already delivers whisper-format audio.
+    private static func copyBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+        guard let copy = AVAudioPCMBuffer(pcmFormat: source.format,
+                                          frameCapacity: source.frameCapacity) else {
+            return nil
+        }
+        copy.frameLength = source.frameLength
+        let channels = Int(source.format.channelCount)
+        guard let src = source.floatChannelData, let dst = copy.floatChannelData else {
+            return nil
+        }
+        let count = Int(source.frameLength)
+        for ch in 0..<channels {
+            dst[ch].update(from: src[ch], count: count)
+        }
+        return copy
     }
 
     /// Race `operation` against a sleep; whichever completes first wins.
