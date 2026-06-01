@@ -713,6 +713,15 @@ struct MilaApp: App {
                     // transcription. Cursor flagged on 62e1c3b.
                     _ = transcriber.stop()
                     sessionRef.onLiveSamples = nil
+                    // Also clear LiveAISession so its rolling `summary`
+                    // and `actionItems` from a previous override-enabled
+                    // recording don't leak onto this gated capture.
+                    // `stopRecording` reads aiSession.summary /
+                    // actionItems unconditionally; without this reset,
+                    // a previous Live AI session's output would attach
+                    // to a recording that never ran the LLM loop.
+                    // Cursor flagged on c95d2bb.
+                    aiSession.cancel()
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
