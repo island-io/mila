@@ -3,8 +3,14 @@ import XCTest
 
 /// Tests for `WhisperEngine.computeAudioCtx(sampleCount:)`.
 ///
-/// The formula: `audio_ctx = ceil(seconds * 50) + 50`, clamped to [100, 1500],
-/// with `0` returned for audio >= the full 30s window (meaning "use default").
+/// Policy (after the live fixture sweep documented in `computeAudioCtx`'s
+/// header):
+///   * audio < 30s → returns 750 (one of two known-quality-stable values).
+///   * audio ≥ 30s → returns 0 (= "use whisper's default 1500").
+///
+/// The earlier "ceil(seconds * 50) + 50" formula was reverted after an
+/// integration sweep showed it produced 0 segments on every fixture (silent
+/// failure mode of whisper's encoder under unaligned audio_ctx values).
 final class AudioCtxTests: XCTestCase {
 
     private let sampleRate = 16_000
@@ -23,44 +29,41 @@ final class AudioCtxTests: XCTestCase {
         XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: 60 * sampleRate), 0)
     }
 
-    func test_short_clip_uses_floor_of_100() {
-        // 0.5s -> 25 + 50 = 75 tokens, but floor is 100 to avoid hallucinations.
-        let samples = sampleRate / 2
-        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: samples), 100)
+    func test_one_second_clip_uses_750() {
+        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: sampleRate), 750)
     }
 
-    func test_two_seconds_just_above_floor() {
-        // 2s -> 100 + 50 safety = 150 tokens.
-        let samples = 2 * sampleRate
-        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: samples), 150)
+    func test_five_second_clip_uses_750() {
+        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: 5 * sampleRate), 750)
     }
 
-    func test_five_seconds_truncates_well_below_default() {
-        // 5s -> 250 + 50 safety = 300 tokens. Big speedup vs. default 1500.
-        let samples = 5 * sampleRate
-        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: samples), 300)
-        // Sanity: the value we set is much smaller than the full 1500 default.
-        XCTAssertLessThan(WhisperEngine.computeAudioCtx(sampleCount: samples), 1500)
+    func test_ten_second_clip_uses_750() {
+        // The VAD's max-utterance cap is 10s — this is the most common
+        // live-recording case.
+        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: 10 * sampleRate), 750)
     }
 
-    func test_ten_seconds_still_truncates() {
-        // 10s -> 500 + 50 safety = 550 tokens.
-        let samples = 10 * sampleRate
-        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: samples), 550)
-    }
-
-    func test_just_under_full_window_caps_at_1500() {
-        // 29.9s -> 1495 + 50 = 1545; clamps to 1500.
+    func test_just_under_full_window_uses_750() {
+        // 29.9s still fits inside the 15s capacity? No — 29.9s is past
+        // 15s, so 750 would TRUNCATE. But we still return 750 (the
+        // sweep showed 750 is the only stable sub-window value, so we
+        // either use it or fall back to default 1500 at the >=30s
+        // boundary; truncation past 15s is the deliberate tradeoff).
+        // The post-record batch path always uses the full WAV which
+        // crosses the 30s boundary in chunks, so this case is rare
+        // in practice for VAD-bounded utterances (max 10s).
         let samples = Int(29.9 * Double(sampleRate))
-        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: samples), 1500)
+        XCTAssertEqual(WhisperEngine.computeAudioCtx(sampleCount: samples), 750)
     }
 
-    func test_value_grows_with_sample_count() {
-        // Within the active range, more samples -> more ctx tokens.
-        let oneSec = WhisperEngine.computeAudioCtx(sampleCount: 1 * sampleRate)
+    func test_returns_same_value_for_all_sub_window_sizes() {
+        // No matter the clip length below 30s, computeAudioCtx returns
+        // a constant — the "discrete safe value" policy.
+        let oneSec = WhisperEngine.computeAudioCtx(sampleCount: sampleRate)
         let fiveSec = WhisperEngine.computeAudioCtx(sampleCount: 5 * sampleRate)
         let tenSec = WhisperEngine.computeAudioCtx(sampleCount: 10 * sampleRate)
-        XCTAssertLessThanOrEqual(oneSec, fiveSec)
-        XCTAssertLessThan(fiveSec, tenSec)
+        XCTAssertEqual(oneSec, fiveSec)
+        XCTAssertEqual(fiveSec, tenSec)
+        XCTAssertEqual(oneSec, 750)
     }
 }

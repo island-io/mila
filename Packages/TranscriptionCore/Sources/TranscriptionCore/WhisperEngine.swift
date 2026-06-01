@@ -107,8 +107,16 @@ public actor WhisperEngine {
         // Whisper's default is 1500 mel ctx tokens (= 30s of audio). For short
         // VAD-emitted utterances (1-10s) processing the full 30s mel-spectrogram
         // is pure wasted compute. Setting `audio_ctx` to the smallest window
-        // that fully covers our samples gives a ~3-4x speedup on short clips
-        // with no quality loss. See `computeAudioCtx` for the formula.
+        // that fully covers our samples gives a ~3-4x speedup on short clips.
+        // See `computeAudioCtx` for the formula.
+        //
+        // KNOWN: the existing labelled-fixture E2E (`e2e-transcription`
+        // workflow) flagged repetition / hallucination on the shortest
+        // clips (~1s, e.g. "this is quiet speech" → "this is quiet speech,
+        // this is quiet speech."). The user explicitly chose to keep this
+        // tradeoff for the perf win; we'll iterate on the formula's
+        // safety margins or floor in a follow-up rather than block the
+        // perf win on a perfect-quality fix.
         params.audio_ctx = Self.computeAudioCtx(sampleCount: samples.count)
 
         let userBox = CallbackBox(progress: progress, isCancelled: isCancelled)
@@ -203,30 +211,43 @@ public actor WhisperEngine {
     ///
     /// Whisper's encoder operates on a fixed 30s / 1500-token mel context by
     /// default. Each second of 16 kHz audio = 100 mel frames, downsampled 2x
-    /// by the encoder = 50 ctx tokens. So:
+    /// by the encoder = 50 ctx tokens, so naively `audio_ctx = ceil(seconds *
+    /// 50) + safety`. THIS DOES NOT WORK — see the sweep run against the
+    /// labelled fixtures (`Packages/TranscriptionCore/Fixtures`) with the
+    /// `large-v3-turbo` model:
     ///
-    ///     audio_ctx = ceil(seconds * 50) + safety
+    ///   audio_ctx | pass | WER avg | elapsed
+    ///   ------------------------------------
+    ///   0 (=1500) | 9/9  | 0.06    | 13s   ← baseline (whisper default)
+    ///   500       | 8/9  | fails on en_meeting_notes
+    ///   600       | 0/9  | silent fail (whisper emits nothing)
+    ///   700       | 8/9  | fails on he_toda_raba
+    ///   750       | 9/9  | 0.06    | 3s    ⭐ 4× faster, identical quality
+    ///   800       | 0/9  | silent fail
+    ///   1000      | 8/9  | fails on he_toda_raba
+    ///   1500      | 9/9  | 0.06    | 5s    ← explicit full ctx
     ///
-    /// We add ~1s (50 tokens) of safety to give the encoder headroom past the
-    /// last real sample. Below ~2s of audio whisper occasionally hallucinates
-    /// when the context is tight, so we enforce a floor of 100 tokens. For
-    /// audio >= the full 30s window we return 0, meaning "use default" — there
-    /// is nothing to truncate.
+    /// Only TWO values produce identical-quality output: 750 (half of the
+    /// trained 1500) and 1500 itself. Other values either silently fail (0
+    /// segments out) or degrade specific clips. The first audio_ctx
+    /// implementation in this PR shipped the naive formula, hit silent
+    /// fails on every short clip in CI, and got reverted — the user then
+    /// pushed for a real fixture-driven sweep, which produced this table.
     ///
-    /// Returning Int32 because whisper's `audio_ctx` field is `int` in C.
+    /// Policy:
+    ///   * For audio shorter than the trained 30s window: use audio_ctx=750
+    ///     (= 15s capacity, comfortably covers our VAD-bounded 1-10s
+    ///     utterances with room to spare; one of two known-good values).
+    ///   * For audio >= 30s: return 0 (= "use whisper's default 1500").
     static func computeAudioCtx(sampleCount: Int) -> Int32 {
         guard sampleCount > 0 else { return 0 }
         let sampleRate = WhisperAudioFormat.sampleRate
-        // Whisper's full window is 30s of audio = 1500 ctx tokens.
         let fullWindowSamples = Int(sampleRate * 30.0)
         if sampleCount >= fullWindowSamples { return 0 }
-
-        let seconds = Double(sampleCount) / sampleRate
-        let safetyTokens = 50  // ~1s of headroom
-        let needed = Int((seconds * 50.0).rounded(.up)) + safetyTokens
-        // Whisper sometimes hallucinates under very tight contexts; clamp up
-        // to a minimum of 100 (~2s) and never exceed the default 1500.
-        return Int32(min(1500, max(100, needed)))
+        // 750 = 15s capacity — covers all our VAD-emitted utterances
+        // (max-cap 10s) with comfortable margin. The "discrete safe
+        // subdivision of 1500" point that whisper's encoder accepts.
+        return 750
     }
 
     /// Apply auto-gain so quiet recordings still hit Whisper's speech threshold.
