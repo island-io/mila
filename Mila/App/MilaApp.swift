@@ -670,6 +670,11 @@ struct MilaApp: App {
         let diarSettings = diarizationSettings
         let langSettings = languageSettings
         let sessionRef = session
+        // `actions` captured weakly so the .idle handler can read
+        // its `isFinalizingRecording` flag to decide whether the
+        // drain belongs here (sleep/lock/quit path) or to
+        // `stopRecording` (Stop-button path).
+        let actionsRef: QuickActionsController? = actions
 
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
@@ -804,37 +809,50 @@ struct MilaApp: App {
                 feedTask = nil
                 aiEnabledCancellable?.cancel()
                 aiEnabledCancellable = nil
-                // Force one last whisper pass on whatever's in the
-                // buffer so the tail of the meeting (up to ~chunkSeconds
-                // since the previous tick) makes it into the live pane
-                // and the saved Live AI snapshot. The tick task's
-                // sleep loop would otherwise let this audio sit
-                // un-transcribed.
-                await transcriber.transcribeNow()
-                // Same idea for the LLM: if new segments just landed
-                // and Live AI is on, push one final feed so the
-                // recording's stored summary/items reflect the tail.
-                if aiSettings.enabled && llmSettingsRef.isConfigured {
-                    let text = transcriber.formattedTranscript
-                    if !text.isEmpty {
-                        aiSession.feed(transcript: text)
+                // Coordination with QuickActionsController.stopRecording:
+                // when the user hits the Stop button, stopRecording
+                // sets `isFinalizingRecording = true` and runs an
+                // inline drain (transcribeNow + LLM feed +
+                // diarizer.awaitPending + applySpeakerLabels) so it
+                // can snapshot final state, write the saved
+                // Recording, and only THEN tear down the live
+                // pipelines. If we ran the drain here too, the two
+                // paths would race — `transcriber.stop()` could fire
+                // before stopRecording reads `liveTranscriber?.
+                // segments`, wiping the snapshot to empty.
+                //
+                // So: when stopRecording owns the lifecycle, this
+                // handler does only session-level cleanup (clear
+                // onLiveSamples). When stopRecording is NOT the
+                // trigger — sleep / lock-screen / app-quit /
+                // cancelAll — we run the full drain here so the
+                // tail doesn't get lost.
+                let stopRecordingOwnsFinalize = actionsRef?.isFinalizingRecording == true
+                if !stopRecordingOwnsFinalize {
+                    // Force one last whisper pass on whatever's in
+                    // the buffer so the tail of the meeting (up to
+                    // ~chunkSeconds since the previous tick) makes
+                    // it into the live pane and the saved Live AI
+                    // snapshot.
+                    await transcriber.transcribeNow()
+                    // Same idea for the LLM: if new segments just
+                    // landed and Live AI is on, push one final feed.
+                    if aiSettings.enabled && llmSettingsRef.isConfigured {
+                        let text = transcriber.formattedTranscript
+                        if !text.isEmpty {
+                            aiSession.feed(transcript: text)
+                        }
                     }
+                    _ = transcriber.stop()
+                    // Drain the diarizer's chained background work
+                    // BEFORE killing the daemon. The daemon stays
+                    // alive until every queued embed has landed; if
+                    // we stop()'d first, pending continuations would
+                    // resume with `error: "stopped"` and the final
+                    // utterance would lose its speaker label.
+                    await diarizer.awaitPending()
+                    diarizer.stop()
                 }
-                _ = transcriber.stop()
-                // Drain the diarizer's chained background work BEFORE
-                // killing the daemon. `stopRecording` also awaits this,
-                // but it runs concurrently on the @MainActor — if the
-                // `.idle` handler reaches `diarizer.stop()` first, the
-                // daemon process is terminated and the in-flight
-                // continuation in `pending` resumes with
-                // `error: "stopped"`, so `process(...)` skips
-                // appending the final utterance's interval and the
-                // final speaker label is permanently lost. Awaiting
-                // the queue here means the daemon stays alive until
-                // every queued embed has landed; stopRecording's
-                // duplicate `awaitPending` is then a no-op.
-                await diarizer.awaitPending()
-                diarizer.stop()
                 // Note: don't cancel aiSession here — QuickActionsController
                 // still needs to read .summary and .actionItems out of
                 // it when assembling the saved Recording. The next

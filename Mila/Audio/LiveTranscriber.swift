@@ -236,19 +236,36 @@ final class LiveTranscriber: ObservableObject {
     /// utterances chain on top of the previous task so whisper runs
     /// strictly serially (the engine actor enforces this anyway, but
     /// the chain also keeps the publish order stable).
+    ///
+    /// `epoch` is captured RIGHT HERE at schedule time — i.e. at the
+    /// moment the VAD emitted the utterance, while we still know the
+    /// audio belongs to the current recording. If we waited until
+    /// `transcribeUtterance` actually started running (potentially
+    /// after a fresh recording incremented the epoch), we'd compare
+    /// the stale audio against the new recording's epoch and the
+    /// guard would falsely pass.
     private func scheduleUtteranceTranscribe(samples: [Float], startSec: Double) {
+        let scheduledEpoch = epoch
         let prev = lastUtteranceTask
         lastUtteranceTask = Task { @MainActor [weak self] in
             await prev?.value
-            await self?.transcribeUtterance(samples: samples, startSec: startSec)
+            await self?.transcribeUtterance(samples: samples,
+                                            startSec: startSec,
+                                            scheduledEpoch: scheduledEpoch)
         }
     }
 
-    private func transcribeUtterance(samples: [Float], startSec: Double) async {
-        // Capture the epoch at entry. If `start()` runs between now and
-        // when whisper returns, this transcribe is for the PREVIOUS
-        // recording and its segments must NOT land in the current one.
-        let myEpoch = epoch
+    private func transcribeUtterance(samples: [Float], startSec: Double, scheduledEpoch: Int) async {
+        // Stale-result drop, applied BEFORE the diarizer feed so we
+        // don't pollute the new recording's speaker intervals with
+        // embeddings derived from the previous recording's audio. The
+        // old placement of this guard (after whisper returned) only
+        // protected the segment append; the diarizer's queue still
+        // got fed for stale audio, leaking speakers across recordings.
+        guard scheduledEpoch == epoch else {
+            liveLog.log("LiveTranscriber utterance dropped at entry — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
+            return
+        }
         isTranscribing = true
         defer { isTranscribing = false }
         // Hand the same utterance to the speaker diarizer in parallel
@@ -275,14 +292,16 @@ final class LiveTranscriber: ObservableObject {
         let startedAt = Date()
         let whisperSegs = await transcription.transcribeOnceSegments(samples: padded, language: language)
         let elapsed = Date().timeIntervalSince(startedAt)
-        liveLog.log("LiveTranscriber utterance: samples=\(samples.count) padded=\(padded.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) startSec=\(startSec, privacy: .public) epoch=\(myEpoch, privacy: .public) currentEpoch=\(self.epoch, privacy: .public)")
+        liveLog.log("LiveTranscriber utterance: samples=\(samples.count) padded=\(padded.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) startSec=\(startSec, privacy: .public) epoch=\(scheduledEpoch, privacy: .public) currentEpoch=\(self.epoch, privacy: .public)")
         guard !whisperSegs.isEmpty else { return }
 
-        // Stale-result drop. If `start()` ran while whisper was busy,
-        // the user moved to a new recording — appending this segment
-        // would show the previous conversation inside the fresh one.
-        guard self.epoch == myEpoch else {
-            liveLog.log("LiveTranscriber utterance dropped — epoch changed (was \(myEpoch, privacy: .public) now \(self.epoch, privacy: .public))")
+        // Second epoch check post-whisper: the entry check covered the
+        // diarizer feed, but the user could still have started a new
+        // recording between then and now (whisper takes seconds), in
+        // which case we must drop the segment to avoid bleeding the
+        // previous conversation into the fresh transcript.
+        guard scheduledEpoch == self.epoch else {
+            liveLog.log("LiveTranscriber utterance dropped post-whisper — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
             return
         }
 

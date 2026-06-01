@@ -104,6 +104,16 @@ final class QuickActionsController: ObservableObject {
     /// before the transcript is saved.
     var liveDiarizer: LiveSpeakerDiarizer?
 
+    /// True while `stopRecording` is running its inline drain and
+    /// finalize. `MilaApp.wireLiveAIPipeline`'s `.idle` state handler
+    /// reads this flag — when set, it skips the duplicate drain and
+    /// the transcriber/diarizer `stop()` cleanup (stopRecording owns
+    /// the lifecycle and will read final state + run cleanup itself).
+    /// When clear, the `.idle` handler runs its own drain — covers
+    /// the lock-screen / sleep / app-quit paths that don't reach
+    /// `stopRecording`.
+    @Published var isFinalizingRecording: Bool = false
+
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
     /// VAD path already produced segments), TranscriptionService's
@@ -364,61 +374,97 @@ final class QuickActionsController: ObservableObject {
             postRecording.present(recording)
         }
 
-        // ---- BACKGROUND DRAIN: finalize what was still in-flight,
-        // then update the Recording in the store so the sheet
-        // re-renders with final data.
-        let recordingID = recording.id
-        let outputURLLocal = outputURL
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.liveTranscriber?.transcribeNow()
-            await self.liveDiarizer?.awaitPending()
-            if let diar = self.liveDiarizer {
-                self.liveTranscriber?.applySpeakerLabels(diar.intervals)
-            }
-            await self.liveAISession?.awaitFinalTick()
-
-            // Snapshot final state.
-            let finalLiveSegments = self.liveTranscriber?.segments ?? []
-            let finalSummary = (self.liveAISession?.summary ?? "")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let finalItems = self.liveAISession?.actionItems ?? []
-            let useLiveTranscript = !finalLiveSegments.isEmpty && vadActive
-            let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
-                TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                                  text: ls.text, speaker: ls.speaker)
-            }
-            let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
-
-            // Update the stored Recording. The rename sheet's
-            // `liveRecording` binding picks the new data up the next
-            // time the store publishes.
-            guard var updated = self.store.recordings.first(where: { $0.id == recordingID }) else {
-                _ = outputURLLocal  // keep capture; nothing else to do
-                return
-            }
-            updated.segments = finalTranscriptSegments
-            updated.fullText = useLiveTranscript ? finalFullText : ""
-            updated.summary = finalSummary.isEmpty ? nil : finalSummary
-            updated.actionItems = finalItems.isEmpty ? nil : finalItems
-            updated.status = useLiveTranscript ? .completed : .pending
-            self.store.update(updated)
-
-            if useLiveTranscript {
-                // Mirror the enqueue path's post-success side effect:
-                // write `.srt` sidecar so video / subtitle workflows
-                // find it next to the WAV.
-                TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
-                // The enqueue path runs the summary trigger via
-                // TranscriptionService's onTranscriptionCompleted
-                // hook, but this branch bypassed enqueue. Fire it
-                // here — the summarizer's gate skips redundant work
-                // when a live summary already exists.
-                self.summarizer?.summarizeIfNeeded(updated)
-            } else {
-                self.transcription.enqueue(updated)
-            }
+        // ---- INLINE DRAIN: finalize what was still in-flight, then
+        // update the Recording in the store so the sheet re-renders
+        // with final data.
+        //
+        // The drain runs INLINE (not in a background Task) for two
+        // reasons:
+        //
+        //   1. Bugbot Finding #1: a background Task reads
+        //      `liveTranscriber`, `liveDiarizer`, `liveAISession` —
+        //      all singletons that get reset on the NEXT recording's
+        //      `start()`. If the user pressed Record before the
+        //      background Task finished, the Task would snapshot the
+        //      new recording's state and apply it to the OLD
+        //      recording's id.
+        //
+        //   2. Bugbot Finding #3: `wireLiveAIPipeline`'s `.idle`
+        //      handler also drains the same pipelines. Without
+        //      explicit coordination the two paths interleave —
+        //      `.idle` can call `transcriber.stop()` while we're
+        //      still reading state, wiping segments out from under
+        //      the snapshot.
+        //
+        // The sheet still appears immediately: `postRecording.present`
+        // above sets a `@Published` value, which SwiftUI schedules
+        // for the next runloop tick. That tick happens during the
+        // first `await` below (releasing the @MainActor), so the
+        // sheet renders within ~16ms even though we don't return
+        // from `stopRecording` for another few seconds.
+        //
+        // `isFinalizingRecording` tells the `.idle` handler to skip
+        // its own drain + cleanup — we own the lifecycle in this
+        // codepath.
+        isFinalizingRecording = true
+        defer { isFinalizingRecording = false }
+        await liveTranscriber?.transcribeNow()
+        await liveDiarizer?.awaitPending()
+        if let diar = liveDiarizer {
+            liveTranscriber?.applySpeakerLabels(diar.intervals)
         }
+        await liveAISession?.awaitFinalTick()
+
+        // Snapshot final state. Safe to read now because `.idle`
+        // handler is skipping its `transcriber.stop()` /
+        // `diarizer.stop()` while `isFinalizingRecording` is true.
+        let finalLiveSegments = liveTranscriber?.segments ?? []
+        let finalSummary = (liveAISession?.summary ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let finalItems = liveAISession?.actionItems ?? []
+        let useLiveTranscript = !finalLiveSegments.isEmpty && vadActive
+        let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
+            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
+                              text: ls.text, speaker: ls.speaker)
+        }
+        let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
+
+        guard var updated = store.recordings.first(where: { $0.id == recording.id }) else {
+            // Recording was removed from the store between `add` and
+            // here (e.g. user hit Cancel on the rename sheet). Nothing
+            // more to update, but we still need to clean up the live
+            // pipelines below before returning.
+            liveTranscriber?.stop()
+            liveDiarizer?.stop()
+            return
+        }
+        updated.segments = finalTranscriptSegments
+        updated.fullText = useLiveTranscript ? finalFullText : ""
+        updated.summary = finalSummary.isEmpty ? nil : finalSummary
+        updated.actionItems = finalItems.isEmpty ? nil : finalItems
+        updated.status = useLiveTranscript ? .completed : .pending
+        store.update(updated)
+
+        if useLiveTranscript {
+            // Mirror the enqueue path's post-success side effect:
+            // write `.srt` sidecar so video / subtitle workflows
+            // find it next to the WAV.
+            TranscriptExporter.writeSRT(for: updated, in: store.recordingsDirectory)
+            // The enqueue path runs the summary trigger via
+            // TranscriptionService's onTranscriptionCompleted hook,
+            // but this branch bypassed enqueue. Fire it here — the
+            // summarizer's gate skips redundant work when a live
+            // summary already exists.
+            summarizer?.summarizeIfNeeded(updated)
+        } else {
+            transcription.enqueue(updated)
+        }
+
+        // Cleanup: `.idle` handler skipped these because of the flag.
+        // Now that we've snapshotted everything we needed, it's safe
+        // to tear down the live pipelines.
+        liveTranscriber?.stop()
+        liveDiarizer?.stop()
     }
 
     // MARK: - Sleep interruption
