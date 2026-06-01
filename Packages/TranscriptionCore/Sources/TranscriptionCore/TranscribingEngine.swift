@@ -51,10 +51,28 @@ public protocol TranscribingEngine: Sendable {
     /// default implementation returns `.unavailable` so non-whisper engines
     /// (stubs in tests) opt out without boilerplate.
     var coreMLStatus: CoreMLStatus { get async }
+
+    /// Install a callback that fires on the start/end of each
+    /// `loadIfNeeded` that the engine considers "long-running" (i.e. the
+    /// first CoreML compile of a given mlmodelc on this device, which
+    /// pegs CPU for ~13s on M-series). The callback is invoked with
+    /// `true` immediately before the heavy work begins and `false` once
+    /// the load completes (or fails).
+    ///
+    /// The closure must be `@Sendable` because the engine may invoke it
+    /// from any actor. UI bridges should hop to `@MainActor` inside.
+    ///
+    /// Default implementation is a no-op so stub engines used in tests
+    /// don't need to implement it.
+    func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) async
 }
 
 extension TranscribingEngine {
     public var coreMLStatus: CoreMLStatus {
         get async { .unavailable }
+    }
+
+    public func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) async {
+        // no-op default
     }
 }
