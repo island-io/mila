@@ -308,6 +308,7 @@ struct MilaApp: App {
                 .environmentObject(liveAISession)
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
+                .task { prewarmDefaultModel() }
                 .task { await diarizationSettings.runHealthCheck() }
                 .task { await diarizationSettings.runStartupCheckDepsIfNeeded() }
                 .task { await diarizationSettings.startAutoBootstrapIfNeeded() }
@@ -897,6 +898,19 @@ struct MilaApp: App {
             print("MilaApp: re-enqueuing recovered recording \(recording.audioFileName)")
             transcription.enqueue(recording)
         }
+    }
+
+    /// Kick the engine's `loadIfNeeded` on the user's default model
+    /// once at launch. The first time whisper.cpp loads a model with
+    /// a sibling `-encoder.mlmodelc` on a given device, CoreML
+    /// compiles the mlmodelc for that hardware — ~13s peg on M-series
+    /// the very first time, then fully cached. Doing this at launch
+    /// (rather than on the user's first Record press) means the
+    /// preparation banner shows BEFORE the user reaches for the
+    /// button, and any too-eager Record press during the window finds
+    /// the model already loaded.
+    private func prewarmDefaultModel() {
+        transcription.prewarm(language: languageSettings.current.rawValue)
     }
 
     /// Pre-download the two default models on first launch:

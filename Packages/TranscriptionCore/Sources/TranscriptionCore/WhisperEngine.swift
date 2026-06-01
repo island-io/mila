@@ -76,10 +76,32 @@ public actor WhisperEngine {
     /// from whisper.cpp's own init log lines (see `parseCoreMLStatus`).
     public private(set) var coreMLStatus: CoreMLStatus = .unavailable
 
+    /// Optional callback fired around `loadIfNeeded` when the engine
+    /// expects the load to take a noticeable amount of time (i.e. when
+    /// a sibling `-encoder.mlmodelc` exists but has never been
+    /// CoreML-compiled on this device — see
+    /// `coreml.compiled.<modelName>` in UserDefaults). Called with
+    /// `true` immediately before the C init, and `false` after the
+    /// init returns. The second argument is an optional human-readable
+    /// status string the UI can surface (e.g. "Compiling Neural Engine
+    /// model…").
+    private var preparationObserver: (@Sendable (Bool, String?) -> Void)?
+
+    /// Threshold above which we consider a load to have been a "real"
+    /// CoreML compile and persist the `coreml.compiled.<modelName>`
+    /// flag so the next launch can skip the banner. Tuned to be well
+    /// above the warm-cache load time (<1s on M-series) and well below
+    /// the observed cold-compile time (~13s).
+    private static let coreMLCompileThresholdSeconds: TimeInterval = 2
+
     public init() {}
 
     deinit {
         if let ctx { whisper_free(ctx) }
+    }
+
+    public func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) {
+        self.preparationObserver = observer
     }
 
     public func loadIfNeeded(modelURL: URL, displayName: String) async throws {
@@ -100,11 +122,37 @@ public actor WhisperEngine {
         params.flash_attn = false
         #endif
 
+        // Heuristic for "this is the first CoreML compile" — emit a
+        // preparation notification iff a sibling `-encoder.mlmodelc`
+        // exists AND we haven't persisted a "compiled" marker for this
+        // model yet. The very first load on a fresh install takes
+        // ~13s while CoreML compiles the mlmodelc for the local
+        // hardware; subsequent loads are <1s (cached). Without this
+        // pre-flight check we'd either skip the banner on the slow
+        // case or show it on every launch.
+        let mlmodelcPath = modelURL.deletingPathExtension().path + "-encoder.mlmodelc"
+        let hasSiblingMLModel = FileManager.default.fileExists(atPath: mlmodelcPath)
+        let compiledKey = "coreml.compiled.\(modelURL.lastPathComponent)"
+        let alreadyCompiled = UserDefaults.standard.bool(forKey: compiledKey)
+        let expectCompile = hasSiblingMLModel && !alreadyCompiled
+        if expectCompile {
+            preparationObserver?(true, "Preparing Neural Engine (one-time setup)…")
+            whisperLog.notice("Expecting first-time CoreML compile for \(displayName, privacy: .public)")
+        }
+
+        let started = Date()
         WhisperLogCapture.shared.startCapture()
         let newCtxOptional = modelURL.path.withCString { cPath in
             whisper_init_from_file_with_params(cPath, params)
         }
         let captured = WhisperLogCapture.shared.stopCapture()
+        let elapsed = Date().timeIntervalSince(started)
+
+        // Always notify "done" if we previously notified "starting", so
+        // the UI never sticks in the preparing state on a failed load.
+        if expectCompile {
+            preparationObserver?(false, nil)
+        }
 
         guard let newCtx = newCtxOptional else {
             throw Error.modelLoadFailed(modelURL.path)
@@ -113,7 +161,18 @@ public actor WhisperEngine {
         self.loadedPath = modelURL.path
         self.modelName = displayName
         self.coreMLStatus = Self.parseCoreMLStatus(from: captured)
-        whisperLog.notice("Loaded \(displayName, privacy: .public) coreML=\(self.coreMLStatus.description, privacy: .public)")
+        whisperLog.notice("Loaded \(displayName, privacy: .public) coreML=\(self.coreMLStatus.description, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
+
+        // Persist the "compiled" marker after a successful load when
+        // CoreML actually engaged. The next launch will see the flag
+        // and skip the preparation banner because the mlmodelc cache
+        // is already populated for this device.
+        if case .loaded = self.coreMLStatus {
+            if elapsed > Self.coreMLCompileThresholdSeconds {
+                whisperLog.notice("CoreML compile detected for \(displayName, privacy: .public) (elapsed=\(elapsed, privacy: .public)s > \(Self.coreMLCompileThresholdSeconds, privacy: .public)s)")
+            }
+            UserDefaults.standard.set(true, forKey: compiledKey)
+        }
 
         #if canImport(Metal)
         // Force ggml-metal to finish its async resource-set init right now.

@@ -19,6 +19,19 @@ final class TranscriptionService: ObservableObject {
     @Published private(set) var progress: Double = 0
     @Published var lastError: String?
 
+    /// True while the underlying whisper engine is doing a "noticeable"
+    /// first-time load — currently means a sibling `-encoder.mlmodelc`
+    /// is being compiled by CoreML for this device (~13s on M-series
+    /// the very first time). The engine notifies us via a callback;
+    /// we bridge to `@MainActor` so SwiftUI views can gate the Record
+    /// button on this state. See `HomeView`'s preparation banner.
+    @Published private(set) var isPreparingModel: Bool = false
+
+    /// Human-readable status string the engine wants the UI to show
+    /// alongside the spinner ("Preparing Neural Engine…"). `nil` when
+    /// not preparing or when the engine didn't supply one.
+    @Published private(set) var preparationStatus: String?
+
     /// Audio shorter than this is treated as "no recording" — Whisper happily
     /// hallucinates confident transcripts from sub-100ms noise.
     static let minimumAudioDurationSeconds: Double = 0.3
@@ -68,6 +81,56 @@ final class TranscriptionService: ObservableObject {
         self.modelManager = modelManager
         self.diarizationSettings = diarizationSettings
         self.engine = engine
+        // Bridge the engine's preparation callback onto the main
+        // actor so SwiftUI subscribers see flips through `@Published`
+        // (which is itself MainActor-isolated). The closure is
+        // `@Sendable` because the engine actor invokes it from its
+        // own context.
+        let serviceRef = self
+        Task {
+            await engine.setPreparationObserver { [weak serviceRef] preparing, status in
+                Task { @MainActor in
+                    guard let serviceRef else { return }
+                    serviceRef.isPreparingModel = preparing
+                    serviceRef.preparationStatus = preparing ? status : nil
+                }
+            }
+        }
+    }
+
+    // MARK: - Prewarm
+
+    /// Pre-load the user's default model in a detached task. Called
+    /// once at app launch so the first-ever CoreML compile (~13s on
+    /// M-series) happens BEFORE the user taps Record. Without this,
+    /// pressing Record during the compile window produces a recording
+    /// that yields `segments=0` because the encoder isn't ready yet.
+    ///
+    /// Failures are silent — the actual transcription path will retry
+    /// `loadIfNeeded` and surface any real error there. Best-effort.
+    ///
+    /// `language` defaults to the user's persisted recording language;
+    /// callers pass in their `RecordingLanguageSettings.current` so we
+    /// pick the model the next recording is most likely to want.
+    func prewarm(language: String) {
+        guard let model = modelManager.model(for: language),
+              modelManager.isInstalled(model) else {
+            print("TranscriptionService.prewarm: skipping — no installed model for lang=\(language)")
+            return
+        }
+        let modelURL = modelManager.url(for: model)
+        let displayName = model.displayName
+        print("TranscriptionService.prewarm: kicking off load for \(displayName)")
+        Task.detached(priority: .userInitiated) { [engine] in
+            do {
+                try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
+                print("TranscriptionService.prewarm: completed for \(displayName)")
+            } catch {
+                // Silent — the real transcription call will retry and
+                // can surface any error through its own path.
+                print("TranscriptionService.prewarm: failed for \(displayName) (will retry on first use): \(error)")
+            }
+        }
     }
 
     // MARK: - Public API
