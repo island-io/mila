@@ -698,10 +698,21 @@ struct MilaApp: App {
             case .recording:
                 guard aiSettings.isLiveAIAvailable else {
                     // Hardware below the Live AI bar AND no override
-                    // override flipped. Recording still runs via
-                    // RecordingSession; QuickActionsController enqueues
-                    // a post-record transcribe on stop. We just skip
-                    // the live pipeline setup.
+                    // flipped. Recording still runs via RecordingSession;
+                    // QuickActionsController enqueues a post-record
+                    // transcribe on stop. We just skip the live
+                    // pipeline setup.
+                    //
+                    // BUT: clear the transcriber's `segments` /
+                    // `useVAD` first. Without this, a stale live
+                    // transcript from a previous recording (when the
+                    // user had the override toggle on) would still be
+                    // sitting in memory; `stopRecording` would
+                    // snapshot it onto the new recording and could
+                    // mark it `.completed` without ever running batch
+                    // transcription. Cursor flagged on 62e1c3b.
+                    _ = transcriber.stop()
+                    sessionRef.onLiveSamples = nil
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue

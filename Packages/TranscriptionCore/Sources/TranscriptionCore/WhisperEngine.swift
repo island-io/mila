@@ -106,7 +106,22 @@ public actor WhisperEngine {
 
     public func loadIfNeeded(modelURL: URL, displayName: String) async throws {
         _ = installLogCaptureOnce
-        if loadedPath == modelURL.path { return }
+        // Reload if path matches but we previously loaded WITHOUT
+        // CoreML and the sibling .mlmodelc has since appeared. The
+        // race window: app-launch prewarm fires `loadIfNeeded` before
+        // ModelManager finishes downloading the mlmodelc. Without this
+        // re-check, the first transcribe wins and whisper stays on
+        // Metal-only for the rest of the session even after the
+        // mlmodelc lands. Cursor flagged on 62e1c3b.
+        if loadedPath == modelURL.path {
+            let mlmodelcPath = modelURL.deletingPathExtension().path + "-encoder.mlmodelc"
+            let siblingNowExists = FileManager.default.fileExists(atPath: mlmodelcPath)
+            let alreadyOnCoreML = (self.coreMLStatus != .unavailable)
+            if !(siblingNowExists && !alreadyOnCoreML) {
+                return
+            }
+            whisperLog.notice("Reloading \(displayName, privacy: .public) — sibling .mlmodelc now available, was loaded without CoreML")
+        }
         if let ctx {
             whisper_free(ctx)
             self.ctx = nil
