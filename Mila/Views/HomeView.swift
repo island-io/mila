@@ -74,6 +74,7 @@ struct HomeView: View {
     private var heroAction: some View {
         HeroRecordButton(
             isRecording: isRecording,
+            isFinalizing: actions.isFinalizingRecording,
             languageFlag: languageSettings.current.flagEmoji,
             languageName: languageSettings.current.displayName,
             withSystemAudio: withSystemAudio,
@@ -82,6 +83,11 @@ struct HomeView: View {
             Task { await actions.toggleRecord(withSystemAudio: withSystemAudio) }
         }
         .frame(maxWidth: 460)
+        // Belt-and-suspenders with the controller-side guard: greying
+        // out the button gives the user immediate visual feedback that
+        // a tap during the drain won't do anything, instead of just
+        // silently swallowing it.
+        .disabled(actions.isFinalizingRecording)
     }
 
     /// Small toggle below the Record button. Default-on. Disabled while
@@ -149,6 +155,11 @@ struct HomeView: View {
 /// circle — once you're recording you want it loud and unmissable.
 private struct HeroRecordButton: View {
     let isRecording: Bool
+    /// True while `stopRecording`'s inline drain is running. The button
+    /// is `.disabled` in this state (set by the caller) but we also want
+    /// the visible title/caption to say "Finalizing…" so the user
+    /// understands why pressing it again doesn't do anything.
+    let isFinalizing: Bool
     let languageFlag: String
     let languageName: String
     let withSystemAudio: Bool
@@ -263,11 +274,15 @@ private struct HeroRecordButton: View {
     }
 
     private var titleText: String {
+        if isFinalizing { return "Finalizing…" }
         if isRecording { return "Recording…" }
         return liveAIEnabled ? "Transcribe and Summarize" : "Transcribe"
     }
 
     private var captionText: String {
+        if isFinalizing {
+            return "Saving transcript…"
+        }
         if isRecording {
             return "Tap to stop"
         }

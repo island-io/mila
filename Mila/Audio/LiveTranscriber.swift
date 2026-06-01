@@ -40,9 +40,19 @@ final class LiveTranscriber: ObservableObject {
     /// Accumulated, growing transcript. Drives the live transcript pane.
     @Published private(set) var fullText: String = ""
     /// Set true while a whisper call is in flight — drives the
-    /// "thinking" indicator in the UI.
+    /// "thinking" indicator in the UI. Backed by an internal counter
+    /// (`activeTranscribeCount`) so concurrent transcribes don't
+    /// trample each other: a stale call returning while a fresh one
+    /// is in flight no longer flips the indicator off prematurely.
     @Published private(set) var isTranscribing: Bool = false
     @Published private(set) var lastError: String?
+
+    /// Number of currently-running transcribe invocations. Always
+    /// mutated alongside `isTranscribing = (count > 0)` via
+    /// `beginTranscribe()` / `endTranscribe()` so the published
+    /// indicator reflects whether *any* transcribe is still in
+    /// flight, not just whichever one returned last.
+    private var activeTranscribeCount: Int = 0
 
     /// Authoritative per-utterance list with whisper's absolute
     /// recording-time start/end. The live view renders one line per
@@ -148,6 +158,34 @@ final class LiveTranscriber: ObservableObject {
         lastUtteranceTask?.cancel()
         lastUtteranceTask = nil
         return fullText
+    }
+
+    /// Bump the in-flight counter and publish `isTranscribing = true`.
+    /// Pair with `endTranscribe()` (typically via `defer`) so the count
+    /// stays balanced even on early returns. Reads as `true` whenever
+    /// at least one transcribe is running, which is what the UI's
+    /// "thinking" indicator actually wants.
+    ///
+    /// Exposed as `internal` (not `private`) so the unit tests can
+    /// drive overlapping-transcribe scenarios deterministically — the
+    /// natural in-flight overlap is hard to reproduce against the
+    /// stub engine because cancellation collapses the simulated
+    /// delay before the test can interleave a second call.
+    func beginTranscribe() {
+        activeTranscribeCount += 1
+        if !isTranscribing { isTranscribing = true }
+    }
+
+    /// Decrement the in-flight counter and publish
+    /// `isTranscribing = false` only when the count hits zero. Without
+    /// this, a stale transcribe finishing while a fresh one is still
+    /// running would flip the indicator off and the UI would falsely
+    /// show "idle" mid-recording.
+    func endTranscribe() {
+        activeTranscribeCount = max(0, activeTranscribeCount - 1)
+        if activeTranscribeCount == 0, isTranscribing {
+            isTranscribing = false
+        }
     }
 
     func ingest(_ samples: ArraySlice<Float>) {
@@ -266,8 +304,8 @@ final class LiveTranscriber: ObservableObject {
             liveLog.log("LiveTranscriber utterance dropped at entry — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
             return
         }
-        isTranscribing = true
-        defer { isTranscribing = false }
+        beginTranscribe()
+        defer { endTranscribe() }
         // Hand the same utterance to the speaker diarizer in parallel
         // with whisper. The diarizer maintains its own pool of speaker
         // centroids; the matching back to segments happens via
@@ -348,8 +386,8 @@ final class LiveTranscriber: ObservableObject {
             liveLog.log("LiveTranscriber.runOnce SKIP: buffer=\(total) < \(minSamples) samples")
             return
         }
-        isTranscribing = true
-        defer { isTranscribing = false }
+        beginTranscribe()
+        defer { endTranscribe() }
 
         let windowSamples = Int(windowSeconds * sampleRate)
         let windowStartIndex = max(0, total - windowSamples)

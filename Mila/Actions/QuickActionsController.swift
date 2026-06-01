@@ -1,10 +1,14 @@
 import Foundation
 import AppKit
 import Combine
+import OSLog
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 import AVFoundation
 import TranscriptionCore
+
+private let quickActionsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                     category: "QuickActionsController")
 
 /// Single entry point used by the Home tiles + sidebar buttons.
 /// Hides recording/transcription orchestration from the UI layer.
@@ -147,6 +151,21 @@ final class QuickActionsController: ObservableObject {
     /// held by the caller (HomeView's @AppStorage toggle) so we can
     /// stay stateless about it here.
     func toggleRecord(withSystemAudio: Bool) async {
+        // Block re-entry while `stopRecording`'s inline drain is in
+        // flight. The drain awaits whisper / diarizer / LLM finalize
+        // and each `await` releases the @MainActor — if the user taps
+        // Record during that window, the .recording branch of
+        // `wireLiveAIPipeline` would fire and wipe the live segments
+        // out from under the snapshot we're about to read, applying
+        // an empty transcript to the OLD recording's id.
+        //
+        // The Record button is also `.disabled(actions.isFinalizingRecording)`
+        // for visual feedback, but a keyboard shortcut or AppleScript
+        // can still drive this method directly — keep the guard.
+        if isFinalizingRecording {
+            quickActionsLog.log("toggleRecord ignored — finalize in progress")
+            return
+        }
         if case .recording = activeJob {
             await stopRecording()
         } else if case .recordingMic = activeJob {
