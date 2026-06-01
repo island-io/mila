@@ -107,12 +107,15 @@ jobs:
         # path broke the CoreML wiring even though the build still
         # links CoreML.framework.
         env:
-          # xcodebuild passes plain env vars through to the (non-UI)
-          # MilaTests process — same pattern as audio-loopback-e2e.yml's
-          # MILA_PIPELINE_E2E. No TEST_RUNNER_ prefix needed since these
-          # don't run via XCUITest.
-          MILA_COREML_E2E: "1"
-          MILA_COREML_MODEL: "/Users/runner/.cache/whisper-coreml-test/ggml-tiny.bin"
+          # xcodebuild strips the `TEST_RUNNER_` prefix and forwards the
+          # remainder into the test process's environment. This is the
+          # reliable propagation path for both XCUITest UI tests and
+          # plain unit tests — empirically, the un-prefixed pattern that
+          # some other workflows in this repo use does NOT propagate
+          # (the test was XCTSkip'd in the first run on this PR even
+          # though the step-level env was clearly set).
+          TEST_RUNNER_MILA_COREML_E2E: "1"
+          TEST_RUNNER_MILA_COREML_MODEL: "/Users/runner/.cache/whisper-coreml-test/ggml-tiny.bin"
         run: |
           set -o pipefail
           xcodebuild \
