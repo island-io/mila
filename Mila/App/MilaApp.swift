@@ -179,32 +179,6 @@ struct MilaApp: App {
             let path = String(arg.dropFirst("--ui-test-tiny-model-path=".count))
             mgr.setTestModelOverride(URL(fileURLWithPath: path))
         }
-        // UI-test override for the auto-drop silence window. Production
-        // uses 5 minutes; the silence-drop UI tests need ~10s so they
-        // can observe the drop within a CI budget. Plumbed onto `session`
-        // here (rather than parsed inside RecordingSession) so the field
-        // is set BEFORE any start() call. See
-        // `MilaUITests/RecordingSilenceUITests.swift`.
-        if let arg = CommandLine.arguments.first(where: {
-            $0.hasPrefix("--ui-test-silence-window-seconds=")
-        }) {
-            let raw = String(arg.dropFirst("--ui-test-silence-window-seconds=".count))
-            if let secs = TimeInterval(raw), secs > 0 {
-                session.silenceWindowSecondsOverride = secs
-                os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                    .log("silence-window override: \(secs, privacy: .public)s")
-            }
-        }
-        // UI-test inspection seam for the silence-drop tests: a file the
-        // session writes "active"/"dropped" into so the XCUITest process
-        // can poll for the auto-drop outcome (OSLog isn't observable
-        // from the test runner).
-        if let arg = CommandLine.arguments.first(where: {
-            $0.hasPrefix("--ui-test-silence-status-file=")
-        }) {
-            let path = String(arg.dropFirst("--ui-test-silence-status-file=".count))
-            session.silenceStatusFileURL = URL(fileURLWithPath: path)
-        }
         if CommandLine.arguments.contains("--ui-test-rtl-live-hebrew") {
             liveTrans.seedForTesting([
                 LiveSegment(id: UUID(), startSeconds: 0, endSeconds: 2,
@@ -318,7 +292,6 @@ struct MilaApp: App {
                 .task { startMeetingDetectionIfNeeded() }
                 .task { await wireLiveAIPipeline() }
                 .task { await injectFixtureWavIfRequested() }
-                .task { await startFakeMeetingIfRequested() }
                 .task { recordingSummarizer.backfillIfNeeded() }
                 .environmentObject(recordingSummarizer)
                 .environmentObject(meetingDetectionSettings)
@@ -474,40 +447,6 @@ struct MilaApp: App {
         os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
             .log("inject-fixture: pumping \(wavPath, privacy: .public) agc=\(agcEnabled ? "on" : "off", privacy: .public)")
         await Self.pumpFixtureWAV(path: wavPath, to: sessionRef, agcEnabled: agcEnabled)
-    }
-
-    /// UI-test seam for the silence-drop tests. When the launch arg
-    /// `--ui-test-fake-meeting=silent` or `=with-audio` is present,
-    /// kicks off a meeting recording without ScreenCaptureKit and
-    /// either feeds zero buffers (silent) or a synthetic tone
-    /// (with-audio). RecordingSession writes "active"/"dropped" to
-    /// the `--ui-test-silence-status-file=` path, which the test
-    /// polls. The launch-arg parse is the only "logic" here — the
-    /// silence-monitor behaviour lives in RecordingSession.
-    @MainActor
-    private func startFakeMeetingIfRequested() async {
-        guard let arg = CommandLine.arguments.first(where: {
-            $0.hasPrefix("--ui-test-fake-meeting=")
-        }) else { return }
-        let mode = String(arg.dropFirst("--ui-test-fake-meeting=".count))
-        let withSystemAudio: Bool
-        switch mode {
-        case "silent": withSystemAudio = false
-        case "with-audio": withSystemAudio = true
-        default:
-            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                .log("fake-meeting: unknown mode '\(mode, privacy: .public)' — expected 'silent' or 'with-audio'")
-            return
-        }
-        // Same race-avoidance as injectFixtureWavIfRequested — give
-        // the rest of the SwiftUI .task wiring a moment to mount.
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mila-fake-meeting-\(UUID().uuidString).wav")
-        await session.startFakeMeetingForTesting(outputURL: outputURL,
-                                                 withSystemAudio: withSystemAudio)
-        os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-            .log("fake-meeting: started mode=\(mode, privacy: .public)")
     }
 
     /// Read a 16kHz mono WAV from disk and feed it to

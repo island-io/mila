@@ -15,13 +15,6 @@ final class RecordingSession: ObservableObject {
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var micLevel: Float = 0
     @Published private(set) var systemLevel: Float = 0
-    /// `true` while the system-audio (ScreenCaptureKit) leg of a meeting
-    /// recording is feeding samples. Flips to `false` if the silence
-    /// monitor drops the leg after a quiet window. Stays `true` for
-    /// `.systemAudio` source recordings (no monitor) and is unused for
-    /// `.microphone`. UI tests observe this flag (indirectly via the
-    /// silence status file) to verify the auto-drop path fires.
-    @Published private(set) var systemAudioActive: Bool = false
 
     let mic = MicrophoneRecorder()
     let system = SystemAudioRecorder()
@@ -38,19 +31,6 @@ final class RecordingSession: ObservableObject {
     private var timerTask: Task<Void, Never>?
     private var micTask: Task<Void, Never>?
     private var systemTask: Task<Void, Never>?
-
-    /// Override for the silence-monitor window. `nil` keeps the default
-    /// (5 minutes). UI tests set this to 10 seconds via a launch arg so
-    /// the drop can be observed in test budget.
-    var silenceWindowSecondsOverride: TimeInterval?
-    private var silenceMonitor: AppAudioSilenceMonitor?
-
-    /// UI-test inspection seam. When set, the session writes "active"
-    /// to this file when the system-audio leg starts and "dropped"
-    /// when the silence monitor tears it down. UI tests poll the file
-    /// because OSLog isn't readable from XCUITest. nil in production.
-    var silenceStatusFileURL: URL?
-    private var fakeMeetingTonePumpTask: Task<Void, Never>?
 
     /// Latest sample buffers, used by the mixer to combine mic + system per chunk.
     private var pendingMic: [Float] = []
@@ -107,21 +87,11 @@ final class RecordingSession: ObservableObject {
 
         if source == .systemAudio || source == .meeting {
             try await system.start()
-            systemAudioActive = true
-            writeSilenceStatus("active")
             systemTask = Task { [weak self] in
                 guard let self else { return }
                 for await buf in self.system.audioStream {
                     await self.consumeSystem(buf)
                 }
-            }
-            // Only meetings get the silence monitor. A `.systemAudio`-only
-            // recording is the user explicitly choosing system audio, so
-            // dropping it would leave nothing recording at all — wrong
-            // behaviour. Meetings have the mic as a fallback, which is the
-            // whole reason the auto-drop is safe.
-            if source == .meeting {
-                installSilenceMonitor()
             }
         }
 
@@ -165,89 +135,9 @@ final class RecordingSession: ObservableObject {
         }
     }
 
-    /// UI-test seam: simulate a meeting recording without
-    /// AVAudioEngine or ScreenCaptureKit. Arms the silence monitor
-    /// against the configured `silenceWindowSecondsOverride` and, if
-    /// `withSystemAudio` is true, pumps a synthetic 0.05-amplitude
-    /// buffer at 20 Hz so the monitor observes "audio is real" before
-    /// its window expires. With `withSystemAudio = false` the monitor
-    /// sees zero buffers and fires the drop path.
-    ///
-    /// Combined with `silenceStatusFileURL`, the test process polls
-    /// the file to verify which branch was taken without needing
-    /// accessibility-tree hooks into RecordingSession's internals.
-    func startFakeMeetingForTesting(outputURL: URL, withSystemAudio: Bool) async {
-        guard state == .idle else { return }
-        self.source = .meeting
-        self.fileURL = outputURL
-        self.writesSinceStart = 0
-        // Skip AVAudioFile setup — this path doesn't write a WAV;
-        // the test only cares about the silence-monitor wiring.
-        startTime = Date()
-        systemAudioActive = true
-        writeSilenceStatus("active")
-        installSilenceMonitor()
-        if withSystemAudio {
-            // Pump a synthetic 0.05-amplitude buffer at 20Hz into the
-            // monitor only. Each buffer is 800 samples — well above the
-            // 0.001 RMS threshold so the monitor short-circuits on the
-            // very first ingest and the window will end with "audio
-            // present, keep capture". The format is hoisted out of the
-            // loop because `WhisperAudioFormat.pcmFloat32` constructs a
-            // new `AVAudioFormat` each access.
-            let format = WhisperAudioFormat.pcmFloat32
-            fakeMeetingTonePumpTask = Task { @MainActor [weak self] in
-                while !Task.isCancelled {
-                    guard let monitor = self?.silenceMonitor else { return }
-                    if let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 800) {
-                        buf.frameLength = 800
-                        if let ch = buf.floatChannelData?[0] {
-                            for i in 0..<800 { ch[i] = 0.05 }
-                        }
-                        monitor.ingest(buffer: buf)
-                    }
-                    try? await Task.sleep(nanoseconds: 50_000_000)
-                }
-            }
-        }
-        state = .recording
-        timerTask = Task { @MainActor [weak self] in
-            while let self, self.state == .recording {
-                if let start = self.startTime {
-                    self.elapsed = Date().timeIntervalSince(start)
-                }
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-        }
-    }
-
-    /// Build + arm a new silence monitor. Factored out so both the
-    /// production `start()` and the UI-test fake-meeting seam share
-    /// the same wiring (window resolution, drop callback,
-    /// status-file notification on `dropSystemAudioLeg`).
-    private func installSilenceMonitor() {
-        let window = silenceWindowSecondsOverride ?? AppAudioSilenceMonitor.defaultWindowSeconds
-        // The monitor's onDrop is invoked on the main actor (it fires
-        // out of `evaluate()` inside a `Task { @MainActor }` deadline),
-        // and `dropSystemAudioLeg` is itself `@MainActor` — so we just
-        // hop a Task to satisfy the sync-closure -> async-method
-        // boundary. `[weak self]` so a monitor that outlives the
-        // session (it shouldn't, but cancel() can race with dealloc)
-        // can't pin us.
-        let monitor = AppAudioSilenceMonitor(windowSeconds: window) { [weak self] in
-            Task { @MainActor in
-                await self?.dropSystemAudioLeg()
-            }
-        }
-        silenceMonitor = monitor
-        monitor.start()
-    }
-
     func stop() async -> URL? {
         guard state == .recording else { return fileURL }
         state = .stopping
-        silenceMonitor?.cancel(); silenceMonitor = nil
-        fakeMeetingTonePumpTask?.cancel(); fakeMeetingTonePumpTask = nil
         await mic.stop()
         await system.stop()
         micTask?.cancel(); micTask = nil
@@ -260,7 +150,6 @@ final class RecordingSession: ObservableObject {
         fileURL = nil
         startTime = nil
         elapsed = 0
-        systemAudioActive = false
         state = .idle
         return url
     }
@@ -271,8 +160,6 @@ final class RecordingSession: ObservableObject {
     /// pinned by a half-running session.
     func cancelAll() async {
         guard state != .idle else { return }
-        silenceMonitor?.cancel(); silenceMonitor = nil
-        fakeMeetingTonePumpTask?.cancel(); fakeMeetingTonePumpTask = nil
         await mic.stop()
         await system.stop()
         micTask?.cancel(); micTask = nil
@@ -284,7 +171,6 @@ final class RecordingSession: ObservableObject {
         elapsed = 0
         pendingMic.removeAll(keepingCapacity: false)
         pendingSystem.removeAll(keepingCapacity: false)
-        systemAudioActive = false
         state = .idle
     }
 
@@ -319,57 +205,12 @@ final class RecordingSession: ObservableObject {
     private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
         let samples = AudioConvert.samples(from: buffer)
         await MainActor.run { self.systemLevel = AudioMeter.level(from: buffer) }
-        // Feed the silence monitor before the mixer — the monitor only
-        // looks at raw RMS and short-circuits once it's seen audio, so
-        // the cost during a normal meeting is negligible.
-        silenceMonitor?.ingest(buffer: buffer)
         if source == .systemAudio {
             await write(samples)
         } else {
             pendingSystem.append(contentsOf: samples)
             await flushPending(force: false)
         }
-    }
-
-    /// Tear down the system-audio leg while the recording stays alive on
-    /// the microphone. Used by `AppAudioSilenceMonitor` when the opening
-    /// window passed without any audio above the threshold — the user
-    /// (almost certainly) picked the wrong app or started recording
-    /// before the meeting began, and the cleaner UX is to seamlessly
-    /// fall back to mic-only.
-    ///
-    /// Flips `source` to `.microphone` so subsequent mic samples are
-    /// written directly instead of accumulating in `pendingMic` waiting
-    /// for a matching `pendingSystem` chunk that will never arrive.
-    /// Any pending mic samples are flushed by `flushPending(force: true)`
-    /// — they're "leftover" from the mixer's pair-wait logic, not
-    /// stale, and dropping them would silently lose a couple of seconds
-    /// of the user's voice from the start of the recording.
-    func dropSystemAudioLeg() async {
-        guard state == .recording, source == .meeting else { return }
-        recLog.log("dropping system audio leg — silence window elapsed")
-        await system.stop()
-        systemTask?.cancel(); systemTask = nil
-        silenceMonitor?.cancel(); silenceMonitor = nil
-        fakeMeetingTonePumpTask?.cancel(); fakeMeetingTonePumpTask = nil
-        // Drain whatever mic samples were sitting paired with absent
-        // system samples. force=true also empties pendingSystem, which
-        // should be empty (since we got here) but the call is cheap and
-        // keeps things tidy.
-        await flushPending(force: true)
-        source = .microphone
-        systemAudioActive = false
-        systemLevel = 0
-        writeSilenceStatus("dropped")
-    }
-
-    /// Write the current system-audio leg status to the inspection
-    /// file, if one was configured. No-op in production. Errors are
-    /// swallowed — UI tests will time out and the failure message
-    /// will point to the missing/wrong file anyway.
-    private func writeSilenceStatus(_ value: String) {
-        guard let url = silenceStatusFileURL else { return }
-        try? value.data(using: .utf8)?.write(to: url, options: .atomic)
     }
 
     /// When recording mic+system, emit pairs of equal length, average them, and write.
