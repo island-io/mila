@@ -47,9 +47,17 @@ enum CLI {
         for fixture in fixtures {
             do {
                 let samples = try WAVReader.loadSamples(url: fixture.wavURL)
+                // Use the full-context path (audio_ctx = 0), matching how
+                // production batch transcription runs (TranscriptionService.process
+                // passes `audioCtx: 0`). Without this, `transcribe`'s default
+                // `audioCtx: nil` falls through to `computeAudioCtx` → 750 (the
+                // live-VAD speed truncation), which is NOT the path these batch
+                // fixtures are meant to validate and degrades harder clips
+                // (e.g. en_numbers_and_dates: WER 0.36 at 750 vs the threshold 0.3).
                 let segments = try await engine.transcribe(
                     samples: samples,
                     language: fixture.language,
+                    audioCtx: 0,
                     progress: nil,
                     isCancelled: nil
                 )

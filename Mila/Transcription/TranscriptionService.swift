@@ -260,6 +260,40 @@ final class TranscriptionService: ObservableObject {
         }
     }
 
+    /// Re-run the OFFLINE speaker diarizer on an already-transcribed
+    /// recording's WAV and return its segments with refreshed speaker
+    /// labels — WITHOUT re-running whisper. Used by the live/authoritative
+    /// stop path (meeting mode) to replace the online diarizer's
+    /// over-segmented labels with the offline pipeline's global clustering,
+    /// which produces far cleaner speaker counts.
+    ///
+    /// Returns nil (so the caller keeps the existing live speakers) when
+    /// diarization isn't configured, there are no segments, the offline pass
+    /// yields no turns, or it throws. The whole pass runs off-main inside
+    /// `SpeakerDiarizer.diarize`.
+    func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment]) async -> [TranscriptSegment]? {
+        guard diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
+        do {
+            let turns = try await SpeakerDiarizer.diarize(wavURL: wavURL,
+                                                          pythonPath: diarizationSettings.pythonPath)
+            guard !turns.isEmpty else { return nil }
+            var enriched = segments
+            for i in enriched.indices {
+                enriched[i].speaker = SpeakerDiarizer.assignSpeaker(
+                    segmentStart: enriched[i].start,
+                    segmentEnd: enriched[i].end,
+                    turns: turns)
+            }
+            let normalized = Self.normalizeSpeakerLabels(in: enriched)
+            let distinct = Set(normalized.compactMap(\.speaker)).count
+            serviceLog.log("rediarizeSegments: offline pass labeled \(normalized.count, privacy: .public) segments with \(distinct, privacy: .public) speakers (was \(Set(segments.compactMap(\.speaker)).count, privacy: .public) live)")
+            return normalized
+        } catch {
+            serviceLog.log("rediarizeSegments: failed (keeping live speakers): \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
     /// Free engine resources synchronously. Called from the AppDelegate at
     /// shutdown so the ggml-metal device tear-down happens before libc++
     /// global destructors run (which is what triggered SIGABRT on quit).

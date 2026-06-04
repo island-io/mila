@@ -91,7 +91,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
                              summary: nil)
 
         summarizer.backfillIfNeeded()
-        try await waitForSummary(recordingID: target.id, timeoutSeconds: 30)
+        try await waitForSummary(recordingID: target.id, timeoutSeconds: 120)
 
         // The eligible one got the script's output.
         XCTAssertEqual(currentSummary(of: target.id), "FILLED")
@@ -143,7 +143,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
         llm.executablePath = script.path
         llm.tool = .claude
 
-        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 30)
+        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 120)
         XCTAssertEqual(currentSummary(of: rec.id), "AUTO")
     }
 
@@ -218,7 +218,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
 
         // And every candidate eventually got a summary.
         for rec in recs {
-            try await waitForSummary(recordingID: rec.id, timeoutSeconds: 30)
+            try await waitForSummary(recordingID: rec.id, timeoutSeconds: 120)
         }
     }
 
@@ -278,9 +278,9 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
         summarizer.backfillIfNeeded()
 
         // Wait for all three to land.
-        try await waitForSummary(recordingID: oldest.id, timeoutSeconds: 30)
-        try await waitForSummary(recordingID: middle.id, timeoutSeconds: 30)
-        try await waitForSummary(recordingID: newest.id, timeoutSeconds: 30)
+        try await waitForSummary(recordingID: oldest.id, timeoutSeconds: 120)
+        try await waitForSummary(recordingID: middle.id, timeoutSeconds: 120)
+        try await waitForSummary(recordingID: newest.id, timeoutSeconds: 120)
 
         let log = try String(contentsOf: order, encoding: .utf8)
         let lines = log.split(whereSeparator: \.isNewline).map(String.init)

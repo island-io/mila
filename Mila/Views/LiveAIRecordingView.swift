@@ -446,25 +446,32 @@ private struct TranscriptLineView: View {
 
 private struct ThinkingIndicator: View {
     let isThinking: Bool
-    @State private var pulse = false
 
     var body: some View {
         HStack(spacing: 6) {
-            Circle()
-                .fill(isThinking ? Color.purple : Color.gray.opacity(0.5))
-                .frame(width: 8, height: 8)
-                .scaleEffect(pulse && isThinking ? 1.35 : 1.0)
-                .animation(
-                    isThinking
-                        ? .easeInOut(duration: 0.6).repeatForever(autoreverses: true)
-                        : .default,
-                    value: pulse
-                )
+            // Use AppKit's indeterminate spinner while thinking instead of a
+            // SwiftUI `.repeatForever` scaleEffect. The old pulse animation
+            // never stopped (a repeatForever keyed on a @State `pulse` keeps
+            // interpolating regardless of the current `isThinking`), which
+            // pinned the main thread: SwiftUI re-ran the animation + layout
+            // pipeline every frame, cascading into a full re-layout of the
+            // whole recording screen — including the transcript ScrollView —
+            // at ~60fps even at idle (confirmed via a process sample: a
+            // continuous AnimatableAttribute/NSHostingView.layout storm).
+            // NSProgressIndicator animates in its own layer and does NOT
+            // drive the SwiftUI view graph, so it spins for free.
+            if isThinking {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 8, height: 8)
+            } else {
+                Circle()
+                    .fill(Color.gray.opacity(0.5))
+                    .frame(width: 8, height: 8)
+            }
             Text(isThinking ? "Thinking…" : "Idle")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .onAppear { pulse = true }
-        .onChange(of: isThinking) { _, _ in pulse.toggle() }
     }
 }

@@ -43,10 +43,12 @@ final class TranscriptionServicePrewarmTests: XCTestCase {
         let initialCount = await stub.loadCallCount
         XCTAssertEqual(initialCount, 0)
         service.prewarm(language: "he")
-        // Polled wait: the prewarm task is detached, so we can't rely on
-        // a single yield. ~1s max wall time is generous for an in-process
-        // stub.
-        let deadline = Date().addingTimeInterval(1.0)
+        // Polled wait: the prewarm task is detached, so we can't rely on a
+        // single yield. The deadline is generous (15s) because the heavy CI
+        // `build-and-test` job can delay detached-Task scheduling well past
+        // 1s under load (that was the observed flake). The loop breaks the
+        // instant the call lands, so a longer ceiling costs nothing normally.
+        let deadline = Date().addingTimeInterval(15.0)
         var count = 0
         while Date() < deadline {
             count = await stub.loadCallCount
@@ -77,7 +79,7 @@ final class TranscriptionServicePrewarmTests: XCTestCase {
         // Poll until we observe the preparing=true state.
         var sawPreparing = false
         var observedStatus: String?
-        let preparingDeadline = Date().addingTimeInterval(1.0)
+        let preparingDeadline = Date().addingTimeInterval(15.0)
         while Date() < preparingDeadline {
             if service.isPreparingModel {
                 sawPreparing = true
@@ -91,7 +93,7 @@ final class TranscriptionServicePrewarmTests: XCTestCase {
                        "preparationStatus should mirror the engine-supplied caption")
 
         // Poll until we observe the load finishing.
-        let doneDeadline = Date().addingTimeInterval(2.0)
+        let doneDeadline = Date().addingTimeInterval(15.0)
         while Date() < doneDeadline {
             if !service.isPreparingModel { break }
             try? await Task.sleep(nanoseconds: 10_000_000)

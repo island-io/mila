@@ -758,11 +758,11 @@ struct MilaApp: App {
                 }
             case .stopping:
                 // Don't tear down yet — RecordingSession.stop() still
-                // flushes the mixer's pendingMic/pendingSystem tail
-                // during `.stopping`, calling write() one or two more
-                // times. We need `onLiveSamples` and the transcriber
-                // to remain live so the last chunk lands in the live
-                // pane and produces a final Live AI update. Cleanup
+                // flushes the buffered system-audio tail during
+                // `.stopping`, calling write() (and onLiveSamples) one or
+                // two more times. We need `onLiveSamples` and the
+                // transcriber to remain live so the last chunk lands in the
+                // live pane and produces a final Live AI update. Cleanup
                 // happens when state lands at `.idle`.
                 break
             case .idle:
@@ -970,6 +970,12 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// IOPMAssertion while recording, the user expects the recording to
     /// keep running when they walk away from the keyboard.
     ///
+    /// `SleepGuard` also holds a `PreventUserIdleDisplaySleep` assertion
+    /// while recording, which suppresses the idle screensaver/auto-lock.
+    /// So `com.apple.screenIsLocked` now only fires for the *deliberate*
+    /// locks above — the automatic "lock after X minutes" that used to
+    /// cut meeting captures short no longer reaches this observer.
+    ///
     /// We stop recording rather than discard it: the user's working
     /// assumption is "the conversation is over, I want the bit I captured
     /// saved + transcribed", not "throw it away". Dictation IS discarded
@@ -1161,6 +1167,10 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// the user had hit Stop. Active dictation is dropped (a synthesized
     /// ⌘V into a locked screen is at best useless, at worst leaks the
     /// transcript onto the lock-screen password field).
+    ///
+    /// This only runs for *deliberate* locks: while recording, `SleepGuard`
+    /// holds a display-sleep assertion that prevents the idle auto-lock from
+    /// firing, so reaching here means the user explicitly locked the screen.
     private func pauseForScreenLock(reason: String) async {
         guard let actions else { return }
         if actions.isRecording {

@@ -101,10 +101,15 @@ final class LiveSpeakerDiarizerPoolTests: XCTestCase {
             }
             return Set(ids).count
         }
-        XCTAssertEqual(runWithThreshold(0.55), 2,
+        let c55 = runWithThreshold(0.55)
+        let c85 = runWithThreshold(0.85)
+        XCTAssertEqual(c55, 2,
             "Default 0.55 should consolidate to 2 speakers on realistic variance")
-        XCTAssertGreaterThan(runWithThreshold(0.85), 5,
-            "Too-strict 0.85 should over-split (≥6 IDs) — confirms the sensitivity is real")
+        // With hysteresis, even a too-strict MATCH threshold no longer
+        // catastrophically over-splits — the create floor (max(0.40,t-0.15))
+        // catches intra-speaker variance. (Pre-hysteresis 0.85 produced ≥6.)
+        XCTAssertLessThanOrEqual(c85, 4,
+            "Hysteresis should keep a too-strict threshold from over-splitting")
     }
 
     func test_assign_dissimilar_embedding_creates_new_speaker() {
@@ -144,13 +149,52 @@ final class LiveSpeakerDiarizerPoolTests: XCTestCase {
         XCTAssertEqual(id, "SPEAKER_00")
     }
 
+    /// Hysteresis: it takes a clearly-dissimilar embedding to mint a new
+    /// speaker, NOT merely one below the (high) match threshold. The create
+    /// floor is `max(0.40, threshold - 0.15)`, so at threshold 0.99 the floor
+    /// is 0.84 — a 0.95-sim vector attaches instead of forking (this is the
+    /// fix for "every sentence a new speaker"), while a near-orthogonal
+    /// vector still forks.
+    func test_hysteresis_attaches_borderline_but_forks_dissimilar() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.99
+        _ = d.assign(embedding: [1, 0, 0, 0])
+        // sim ≈ 0.95: below the 0.99 match bar but above the 0.84 create
+        // floor → attach, don't fork.
+        let attached = d.assign(embedding: [0.95, 0.3, 0, 0])
+        XCTAssertEqual(attached, "SPEAKER_00",
+            "Borderline-high similarity must attach via hysteresis, not mint a new speaker")
+        // sim ≈ 0.0: below the create floor → genuinely new speaker.
+        let forked = d.assign(embedding: [0, 1, 0, 0])
+        XCTAssertEqual(forked, "SPEAKER_01",
+            "A clearly-dissimilar embedding must still create a new speaker")
+    }
+
+    /// Regression for the user-reported "almost every sentence is a different
+    /// speaker" on a single-narrator source: real wespeaker cosine sim for
+    /// the SAME voice on short VAD chunks dips into 0.45–0.55, just under the
+    /// 0.55 match threshold. Pre-hysteresis each such dip forked a new
+    /// SPEAKER_NN. The create floor (0.40) must keep them on one speaker.
+    func test_borderline_same_speaker_dips_do_not_fork() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.55
+        let first = d.assign(embedding: [1, 0, 0, 0])
+        // sim ≈ 0.53 to [1,0,0,0]: cos = 0.85/sqrt(0.85²+0.53²) ≈ 0.849…
+        // Use a vector whose cosine lands in the [0.40, 0.55) borderline band.
+        // [0.5, 0.85, 0, 0] → cos ≈ 0.507 — under match (0.55), over floor (0.40).
+        let dip = d.assign(embedding: [0.5, 0.85, 0, 0])
+        XCTAssertEqual(first, "SPEAKER_00")
+        XCTAssertEqual(dip, "SPEAKER_00",
+            "A same-speaker similarity dip into the [0.40,0.55) band must attach, not fork")
+    }
+
     func test_higher_threshold_makes_pool_more_conservative() {
         let d = LiveSpeakerDiarizer()
         d.similarityThreshold = 0.99
         _ = d.assign(embedding: [1, 0, 0, 0])
-        // A close-but-not-identical vector is rejected at threshold 0.99
-        // and registers a new speaker, where it would have merged at 0.7.
-        let id = d.assign(embedding: [0.95, 0.3, 0, 0])
+        // Below the 0.84 create floor (sim ≈ 0.30) → new speaker even though
+        // a lower match threshold would have merged it.
+        let id = d.assign(embedding: [0.3, 0.95, 0, 0])
         XCTAssertEqual(id, "SPEAKER_01")
     }
 }

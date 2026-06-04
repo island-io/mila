@@ -1,8 +1,19 @@
 import Foundation
 import whisper
+#if canImport(os)
 import os.log
-
 private let whisperLog = Logger(subsystem: "io.island.mila.TranscriptionCore", category: "whisper")
+#endif
+
+/// Cross-platform `notice`-level log. `os.log` is Apple-only, but this package
+/// also builds under `swift test` on Linux (the WER/WAV utilities), where
+/// WhisperEngine must still compile — there this is a no-op. Wrapping the whole
+/// message in `.public` is fine: these lines carry model names + timings, no PII.
+@inline(__always) private func whisperNotice(_ message: String) {
+#if canImport(os)
+    whisperLog.notice("\(message, privacy: .public)")
+#endif
+}
 
 /// whisper.cpp's `whisper_log_set` is a process-global single-slot
 /// callback, so capture lives at file scope rather than per-actor. Lines
@@ -120,7 +131,7 @@ public actor WhisperEngine {
             if !(siblingNowExists && !alreadyOnCoreML) {
                 return
             }
-            whisperLog.notice("Reloading \(displayName, privacy: .public) — sibling .mlmodelc now available, was loaded without CoreML")
+            whisperNotice("Reloading \(displayName) — sibling .mlmodelc now available, was loaded without CoreML")
         }
         if let ctx {
             whisper_free(ctx)
@@ -161,7 +172,7 @@ public actor WhisperEngine {
         let hasSiblingMLModel = FileManager.default.fileExists(atPath: mlmodelcPath)
         if hasSiblingMLModel {
             preparationObserver?(true, "Preparing Neural Engine…")
-            whisperLog.notice("CoreML load starting for \(displayName, privacy: .public) (sibling .mlmodelc found)")
+            whisperNotice("CoreML load starting for \(displayName) (sibling .mlmodelc found)")
         }
 
         let started = Date()
@@ -185,10 +196,10 @@ public actor WhisperEngine {
         self.loadedPath = modelURL.path
         self.modelName = displayName
         self.coreMLStatus = Self.parseCoreMLStatus(from: captured)
-        whisperLog.notice("Loaded \(displayName, privacy: .public) coreML=\(self.coreMLStatus.description, privacy: .public) elapsed=\(elapsed, privacy: .public)s")
+        whisperNotice("Loaded \(displayName) coreML=\(self.coreMLStatus.description) elapsed=\(elapsed)s")
 
         if case .loaded = self.coreMLStatus, elapsed > Self.coreMLCompileThresholdSeconds {
-            whisperLog.notice("CoreML cold compile detected for \(displayName, privacy: .public) (elapsed=\(elapsed, privacy: .public)s > \(Self.coreMLCompileThresholdSeconds, privacy: .public)s)")
+            whisperNotice("CoreML cold compile detected for \(displayName) (elapsed=\(elapsed)s > \(Self.coreMLCompileThresholdSeconds)s)")
         }
 
         #if canImport(Metal)

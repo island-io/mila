@@ -179,6 +179,18 @@ final class QuickActionsController: ObservableObject {
     }
 
     private func startRecording(withSystemAudio: Bool) async {
+        // Controller-side counterpart to HomeView's
+        // `.disabled(... transcription.isPreparingModel)`. The button
+        // greys out during the first-time Neural Engine compile, but
+        // keyboard shortcuts / menu commands / AppleScript drive this
+        // method directly and would otherwise start a recording the
+        // encoder can't yet transcribe — the user would speak for a
+        // minute and get `segments=0` while the model finishes compiling.
+        // Mirror the `isFinalizingRecording` guard in `toggleRecord`.
+        guard !transcription.isPreparingModel else {
+            quickActionsLog.log("startRecording ignored — model still preparing (Neural Engine compile)")
+            return
+        }
         // Pre-flight the mic auth check — if denied we want to point the
         // user at System Settings (like we do for screen recording),
         // not surface a vague "operation couldn't be completed" error
@@ -265,6 +277,12 @@ final class QuickActionsController: ObservableObject {
 
     func startAppRecording(app: SCRunningApplication?, includeMic: Bool) async {
         isAppPickerShown = false
+        // Same Neural-Engine-preparing guard as `startRecording` — the
+        // app-audio entry point isn't behind the gated Home button.
+        guard !transcription.isPreparingModel else {
+            quickActionsLog.log("startAppRecording ignored — model still preparing (Neural Engine compile)")
+            return
+        }
         // When the user opted into capturing their mic alongside system
         // audio, pre-flight the mic auth check too — otherwise the same
         // vague-error-after-rename trap as Voice Memo.
@@ -481,14 +499,20 @@ final class QuickActionsController: ObservableObject {
         // `enabled` made VAD-with-LiveAI-off recordings unnecessarily
         // re-batch-transcribed.
         let vadActive = (liveAISettings?.useVAD == true)
-        // Meeting mode: live whisper only sees the mic (see
-        // RecordingSession.consumeMic comment for why). The saved WAV
-        // still contains the mic+system mix, so the live transcript
-        // is INCOMPLETE — remote/system-side speech would never make
-        // it into the saved transcript if we treated mic-only as
-        // final. Force batch transcription in meeting mode.
-        // Cursor (PRRT_kwDOSY2m-s6GOIjm) caught this.
-        let isMeetingMode = (source == .meeting)
+        // Meeting mode now feeds the mic+system MIX to the live
+        // transcriber (RecordingSession.consumeMic clocks off the mic and
+        // mixes in buffered system audio), so the live transcript is
+        // COMPLETE — app-/system-side speech is in it, not just the mic.
+        // That means meeting recordings can be authoritative on the same
+        // terms as any other source and no longer need a forced batch
+        // re-transcribe of the WAV (which was also re-summarizing on top of
+        // the live AI summary). The remaining gate is `vadActive` below:
+        // chunk mode still needs the batch pass for speaker labels.
+        //
+        // Earlier this forced batch transcription for `.meeting` because the
+        // live feed was mic-only and the saved transcript would otherwise
+        // drop system-side speech (Cursor PRRT_kwDOSY2m-s6GOIjm). The live
+        // feed now carries the full mix, so that no longer applies.
         // Two questions, two gates:
         //
         //   1. `hasLiveSegments`: do we have something to SHOW the user
@@ -508,7 +532,7 @@ final class QuickActionsController: ObservableObject {
         // `vadActive` here is whatever was passed in by the caller —
         // typically `liveAISettings.useVAD && liveAISettings.enabled`.
         let hasLiveSegments = !finalLiveSegments.isEmpty
-        let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive && !isMeetingMode
+        let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive
         let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
             TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
                               text: ls.text, speaker: ls.speaker)
@@ -536,10 +560,22 @@ final class QuickActionsController: ObservableObject {
         store.update(updated)
 
         if liveTranscriptIsAuthoritative {
-            // VAD path: live segments already have speakers from the
-            // diarizer pipeline; no batch run needed. Write the SRT
-            // sidecar + trigger the summarizer ourselves (the enqueue
-            // path normally runs both via its onTranscriptionCompleted
+            // VAD path: keep the live transcript TEXT (no re-transcription),
+            // but the ONLINE diarizer over-segments speakers — it labels
+            // each utterance as it streams in and can never revise, so early
+            // borderline embeddings spawn extra SPEAKER_NN that never merge.
+            // Re-run the OFFLINE diarizer on the finished WAV (global
+            // clustering → far cleaner speaker counts) and swap in its
+            // labels. Skips gracefully — keeping the live speakers — if
+            // diarization isn't configured or the pass fails.
+            if let rediarized = await transcription.rediarizeSegments(
+                wavURL: store.audioURL(for: updated),
+                segments: updated.segments) {
+                updated.segments = rediarized
+                store.update(updated)
+            }
+            // Write the SRT sidecar + trigger the summarizer ourselves (the
+            // enqueue path normally runs both via its onTranscriptionCompleted
             // hook).
             TranscriptExporter.writeSRT(for: updated, in: store.recordingsDirectory)
             summarizer?.summarizeIfNeeded(updated)

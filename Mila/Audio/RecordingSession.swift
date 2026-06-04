@@ -32,9 +32,20 @@ final class RecordingSession: ObservableObject {
     private var micTask: Task<Void, Never>?
     private var systemTask: Task<Void, Never>?
 
-    /// Latest sample buffers, used by the mixer to combine mic + system per chunk.
-    private var pendingMic: [Float] = []
+    /// Jitter buffer for system audio in meeting mode. The mic is the
+    /// master clock (it delivers continuously at 16kHz); each mic chunk in
+    /// `consumeMic` pulls an equal span of system audio out of here and
+    /// mixes the two. ScreenCaptureKit only delivers system buffers while
+    /// sound is actually playing, so this drains to empty during quiet
+    /// stretches — the mix just falls back to mic-only for that span, which
+    /// is why the live feed never starves the way the old mic/system
+    /// pairing did.
     private var pendingSystem: [Float] = []
+    /// Cap on the system jitter buffer (~30s @ 16kHz). Generous so normal SCK
+    /// bursts / clock skew just *delay* app audio (the mic clock catches back
+    /// up) instead of losing it; only a genuinely stuck mic clock reaches the
+    /// cap, and `consumeSystem` logs when it trims so the loss isn't silent.
+    private let maxPendingSystem = Int(WhisperAudioFormat.sampleRate) * 30
     private let writeQueue = DispatchQueue(label: "io.island.mila.recording-write")
 
     /// Fired with each post-mix sample chunk so the live transcriber
@@ -144,7 +155,7 @@ final class RecordingSession: ObservableObject {
         systemTask?.cancel(); systemTask = nil
         timerTask?.cancel(); timerTask = nil
 
-        await flushPending(force: true)
+        await flushPendingSystemTail()
         let url = fileURL
         audioFile = nil
         fileURL = nil
@@ -169,7 +180,6 @@ final class RecordingSession: ObservableObject {
         fileURL = nil
         startTime = nil
         elapsed = 0
-        pendingMic.removeAll(keepingCapacity: false)
         pendingSystem.removeAll(keepingCapacity: false)
         state = .idle
     }
@@ -179,64 +189,89 @@ final class RecordingSession: ObservableObject {
     private func consumeMic(_ buffer: AVAudioPCMBuffer) async {
         let samples = AudioConvert.samples(from: buffer)
         await MainActor.run { self.micLevel = AudioMeter.level(from: buffer) }
-        // Live-transcription feed is driven by the mic in ALL modes that
-        // include a mic (`.microphone` and `.meeting`). In meeting mode
-        // the file still mixes mic+system when paired, but the live
-        // feed must NOT wait on the pair — observed bug (1 Jun 2026):
-        // when the system-audio leg is silent (e.g. user is the only
-        // speaker), `flushPending` keeps `min(pendingMic, pendingSystem)
-        // == 0` so `write()` is never called and onLiveSamples never
-        // fires. Pressing Stop then flushes ~60s of buffered mic as one
-        // giant write, and the live pane shows nothing during the
-        // recording. Tradeoff: in meeting mode, live transcription only
-        // covers the mic side — the saved WAV still has the mix and
-        // gets a full post-recording transcription pass.
-        if let onLive = onLiveSamples {
-            onLive(samples[0..<samples.count])
-        }
         if source == .microphone {
+            // Mic-only: the live feed and the saved file are both just the
+            // mic, so drive the live transcriber here and write directly.
+            if let onLive = onLiveSamples { onLive(samples[0..<samples.count]) }
             await write(samples)
-        } else {
-            pendingMic.append(contentsOf: samples)
-            await flushPending(force: false)
+            return
         }
+        // Meeting mode: the mic is the master clock. Each mic chunk pulls an
+        // equal span of system audio out of `pendingSystem` (silence where
+        // the app wasn't playing) and mixes the two, then drives BOTH the
+        // saved file and the live transcriber with the result. Driving the
+        // mix off the mic's steady 16kHz cadence — rather than the old
+        // min(pendingMic, pendingSystem) pairing — means the live feed can't
+        // starve when the system leg goes quiet, and the app-audio side now
+        // reaches the live pane instead of only the on-disk WAV.
+        let mixed = mixWithBufferedSystem(mic: samples)
+        if let onLive = onLiveSamples { onLive(mixed[0..<mixed.count]) }
+        await write(mixed)
     }
 
     private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
         let samples = AudioConvert.samples(from: buffer)
         await MainActor.run { self.systemLevel = AudioMeter.level(from: buffer) }
         if source == .systemAudio {
+            // No mic to clock against — system audio IS the recording.
+            // write() drives the live feed for `.systemAudio`.
             await write(samples)
-        } else {
-            pendingSystem.append(contentsOf: samples)
-            await flushPending(force: false)
+            return
+        }
+        // Meeting mode: park the system audio for the mic clock to consume
+        // in `consumeMic`. Bound the backlog so a stalled mic clock can't grow
+        // it without limit. The cap is generous (~30s), so an SCK burst at
+        // session start or slow clock skew just delays app audio until the mic
+        // clock catches up — it isn't dropped. Trimming only happens if the
+        // mic clock is genuinely stuck, and we log it so it's not silent.
+        pendingSystem.append(contentsOf: samples)
+        if pendingSystem.count > maxPendingSystem {
+            let dropped = pendingSystem.count - maxPendingSystem
+            pendingSystem.removeFirst(dropped)
+            recLog.error("system jitter buffer overflow — dropped \(dropped, privacy: .public) samples (mic clock stalled?)")
         }
     }
 
-    /// When recording mic+system, emit pairs of equal length, average them, and write.
-    private func flushPending(force: Bool) async {
-        let count = min(pendingMic.count, pendingSystem.count)
-        guard count > 0 else {
-            if force {
-                let leftover: [Float]
-                if pendingMic.count > pendingSystem.count {
-                    leftover = pendingMic
-                    pendingMic.removeAll()
-                } else {
-                    leftover = pendingSystem
-                    pendingSystem.removeAll()
-                }
-                if !leftover.isEmpty { await write(leftover) }
+    /// Mix one mic chunk with the head of the buffered system audio and
+    /// consume the system samples used. Where both legs overlap they're
+    /// averaged (×0.5, so a simultaneously-loud mic + app can't clip); where
+    /// no system audio is buffered the mic is kept at FULL scale (never
+    /// halved). Drives both the saved WAV and the live transcriber with the
+    /// same result.
+    private func mixWithBufferedSystem(mic: [Float]) -> [Float] {
+        let n = mic.count
+        let take = min(n, pendingSystem.count)
+        var mixed = [Float](repeating: 0, count: n)
+        for i in 0..<n {
+            if i < take {
+                // Both legs present → average so a simultaneous loud mic + app
+                // can't clip past ±1.0.
+                mixed[i] = (mic[i] + pendingSystem[i]) * 0.5
+            } else {
+                // No app audio buffered for this span → keep the mic at FULL
+                // scale. Averaging here would silently halve the user's own
+                // voice whenever the app is quiet, making a meeting capture
+                // quieter than a plain voice memo of the same mic input.
+                mixed[i] = mic[i]
             }
-            return
         }
-        var mixed = [Float](repeating: 0, count: count)
-        for i in 0..<count {
-            mixed[i] = (pendingMic[i] + pendingSystem[i]) * 0.5
-        }
-        pendingMic.removeFirst(count)
-        pendingSystem.removeFirst(count)
-        await write(mixed)
+        if take > 0 { pendingSystem.removeFirst(take) }
+        return mixed
+    }
+
+    /// Flush any system audio still buffered when the mic clock stops
+    /// (meeting mode only — `.microphone` / `.systemAudio` write inline, so
+    /// `pendingSystem` is empty for them). The mic is already torn down by
+    /// the time `stop()` calls this, so the trailing span is system-only and
+    /// goes out at full scale (the same way mic-only spans are written full
+    /// scale in `mixWithBufferedSystem`), so the last bit of app audio isn't
+    /// lost.
+    private func flushPendingSystemTail() async {
+        guard !pendingSystem.isEmpty else { return }
+        let tail = pendingSystem
+        pendingSystem.removeAll(keepingCapacity: false)
+        if let onLive = onLiveSamples { onLive(tail[0..<tail.count]) }
+        await write(tail)
     }
 
     private var writesSinceStart: Int = 0
@@ -262,13 +297,11 @@ final class RecordingSession: ObservableObject {
         } catch {
             print("Audio file write error: \(error)")
         }
-        // Note: onLiveSamples is NOT fired here. Live-transcription feed
-        // is driven by `consumeMic` / `consumeSystem` directly so the
-        // pair-wait for file mixing in meeting mode can't starve the
-        // live pane. See `consumeMic` for the meeting-mode rationale.
+        // Live-transcription feed: `.microphone` and `.meeting` fire
+        // `onLiveSamples` from `consumeMic` (the latter with the mic+system
+        // mix, so app audio reaches the live pane). `.systemAudio` has no
+        // mic clock, so it drives the live feed from here instead.
         if source == .systemAudio, let onLive = onLiveSamples {
-            // For systemAudio-only recordings (no mic) we need this
-            // path to drive the live feed since `consumeMic` doesn't run.
             onLive(samples[0..<samples.count])
         }
     }

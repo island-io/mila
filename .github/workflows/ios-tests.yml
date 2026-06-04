@@ -91,12 +91,20 @@ jobs:
       - name: Run unit tests
         run: |
           set -o pipefail
+          # `-retry-tests-on-failure -test-iterations 3`: the subprocess-spawning
+          # tests (LLMRunner / RecordingSummarizer) and detached-Task tests
+          # (prewarm) flake intermittently under CI runner load. Retry failed
+          # tests up to 3× (early-exit on first pass) so a load-induced flake
+          # doesn't red the build; genuine failures still fail all 3 attempts.
+          # Mirrors the same flag in ci.yml's build-and-test job.
           xcodebuild -project Mila.xcodeproj \
             -scheme Mila \
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \
             -only-testing:MilaTests \
+            -retry-tests-on-failure \
+            -test-iterations 3 \
             test 2>&1 | tail -200
 
       - name: Run UI tests

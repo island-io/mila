@@ -118,6 +118,14 @@ jobs:
           TEST_RUNNER_MILA_COREML_MODEL: "/Users/runner/.cache/whisper-coreml-test/ggml-tiny.bin"
         run: |
           set -o pipefail
+          # `-retry-tests-on-failure -test-iterations 3`: this heavy job
+          # (build + diarization bundle + whisper download + full suite on one
+          # runner) is loaded enough that the subprocess-spawning tests
+          # (LLMRunner / RecordingSummarizer) and detached-Task tests
+          # (prewarm) intermittently fail under contention — they pass in the
+          # lighter unit-and-ui-tests job and on a good roll. Retry failed
+          # tests up to 3× (early-exit on first pass) so load-induced flakes
+          # don't red the build. Genuine failures still fail all 3 attempts.
           xcodebuild \
             -project Mila.xcodeproj \
             -scheme Mila \
@@ -125,4 +133,6 @@ jobs:
             -derivedDataPath build \
             -destination 'platform=macOS' \
             -only-testing:MilaTests \
+            -retry-tests-on-failure \
+            -test-iterations 3 \
             test

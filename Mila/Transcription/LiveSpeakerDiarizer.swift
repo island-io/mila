@@ -222,16 +222,31 @@ final class LiveSpeakerDiarizer: ObservableObject {
             if let err = response.error { lastError = "Diar daemon: \(err)" }
             return
         }
-        let speakerID = assign(embedding: embedding)
+        let speakerID = assign(embedding: embedding, utteranceDuration: endSeconds - startSeconds)
         intervals.append((start: startSeconds, end: endSeconds, speaker: speakerID))
         diarLog.log("interval added: \(startSeconds, privacy: .public)..\(endSeconds, privacy: .public) → \(speakerID, privacy: .public) (poolSize=\(self.pool.count, privacy: .public) totalIntervals=\(self.intervals.count, privacy: .public))")
     }
 
-    /// Match a new embedding against the pool by cosine similarity. If no
-    /// existing centroid beats `similarityThreshold`, register a new
-    /// speaker. The matched centroid is updated as a running mean so the
-    /// representation tightens as we see more samples per speaker.
-    func assign(embedding: [Float]) -> String {
+    /// Match a new embedding against the pool by cosine similarity, using a
+    /// two-tier (hysteresis) policy to curb over-segmentation:
+    ///
+    ///   • `sim ≥ similarityThreshold` → confident match; fold the
+    ///     embedding into that speaker's centroid (running mean).
+    ///   • `createThreshold ≤ sim < similarityThreshold`, OR the utterance
+    ///     is too short to trust as a new voice → attach to the closest
+    ///     existing speaker WITHOUT updating its centroid (a marginal match
+    ///     shouldn't be allowed to drift the representation).
+    ///   • `sim < createThreshold` (or the pool is empty) → mint a new
+    ///     speaker.
+    ///
+    /// Why: wespeaker cosine sim for the SAME speaker on 1-5s VAD chunks
+    /// routinely dips to ~0.45-0.55, so a single hard threshold minted a
+    /// fresh `SPEAKER_NN` for a big fraction of one person's sentences
+    /// (observed: 7+ speakers for a single-narrator video). Requiring a
+    /// clearly-dissimilar embedding — or a long-enough utterance — before
+    /// creating a speaker keeps the live pool from exploding. The offline
+    /// pass at stop still does the authoritative global clustering.
+    func assign(embedding: [Float], utteranceDuration: Double = 2.0) -> String {
         var best: (idx: Int, sim: Double)?
         for (idx, profile) in pool.enumerated() {
             let sim = cosineSimilarity(embedding, profile.centroid)
@@ -241,9 +256,16 @@ final class LiveSpeakerDiarizer: ObservableObject {
         }
         let bestSim = best?.sim ?? -1.0
         let bestId = best.map { pool[$0.idx].id } ?? "(none)"
-        diarLog.log("assign: poolSize=\(self.pool.count, privacy: .public) bestMatch=\(bestId, privacy: .public) bestSim=\(bestSim, privacy: .public) threshold=\(self.similarityThreshold, privacy: .public)")
+        // Floor for minting a new speaker — kept a notch below the match
+        // threshold so borderline utterances attach rather than fork.
+        // Clamped so a low user-set threshold can't drive it negative.
+        let createThreshold = max(0.40, similarityThreshold - 0.15)
+        // Short chunks give noisy embeddings; don't let them mint a new
+        // speaker when we already have a pool to attach to.
+        let longEnoughForNewSpeaker = utteranceDuration >= 1.0
+        diarLog.log("assign: poolSize=\(self.pool.count, privacy: .public) bestMatch=\(bestId, privacy: .public) bestSim=\(bestSim, privacy: .public) threshold=\(self.similarityThreshold, privacy: .public) createThreshold=\(createThreshold, privacy: .public) dur=\(utteranceDuration, privacy: .public)")
         if let chosen = best, chosen.sim >= similarityThreshold {
-            // Update centroid as running mean.
+            // Confident match → fold into the centroid (running mean).
             let n = pool[chosen.idx].sampleCount
             var centroid = pool[chosen.idx].centroid
             for i in 0..<centroid.count {
@@ -251,6 +273,11 @@ final class LiveSpeakerDiarizer: ObservableObject {
             }
             pool[chosen.idx].centroid = centroid
             pool[chosen.idx].sampleCount = n + 1
+            return pool[chosen.idx].id
+        }
+        // Borderline, or too short to trust as a new voice → attach to the
+        // closest existing speaker (leave its centroid untouched).
+        if let chosen = best, chosen.sim >= createThreshold || !longEnoughForNewSpeaker {
             return pool[chosen.idx].id
         }
         let nextID = String(format: "SPEAKER_%02d", pool.count)

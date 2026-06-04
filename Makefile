@@ -1,4 +1,4 @@
-.PHONY: all bootstrap project open build test run clean models models-coreml-tiny help dmg release-build e2e package-test bundle-diarization
+.PHONY: all bootstrap project open build test run clean models models-coreml-tiny help dmg release-build e2e package-test bundle-diarization verify-ane
 
 XCODEPROJ := Mila.xcodeproj
 SCHEME := Mila
@@ -53,6 +53,12 @@ test: project
 
 run: build
 	open $(APP)
+
+# Local (self-hosted) check: verify an upgrade doesn't recompile the CoreML/ANE
+# encoder. Needs a real Neural Engine + an installed model + a GUI session, so
+# it is NOT runnable on GitHub-hosted CI. See scripts/verify-ane-cache.sh.
+verify-ane:
+	./scripts/verify-ane-cache.sh
 
 models:
 	@mkdir -p "$(HOME)/Library/Application Support/Mila/Models"

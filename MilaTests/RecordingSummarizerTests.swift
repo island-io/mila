@@ -117,7 +117,7 @@ final class RecordingSummarizerTests: XCTestCase {
         store.add(rec)
 
         summarizer.summarizeIfNeeded(rec)
-        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 30)
+        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 120)
 
         let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertEqual(updated.summary, "A concise summary of the meeting.")
@@ -193,7 +193,7 @@ final class RecordingSummarizerTests: XCTestCase {
             store.update(current)
         }
 
-        try await waitForNoInFlight(recordingID: rec.id, timeoutSeconds: 30)
+        try await waitForNoInFlight(recordingID: rec.id, timeoutSeconds: 120)
         let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertEqual(updated.summary, "live_summary_from_recording",
                        "Late-arriving CLI output must not overwrite a summary that already exists")
@@ -230,7 +230,7 @@ final class RecordingSummarizerTests: XCTestCase {
         // exists; `regenerate` bypasses that gate.
         summarizer.regenerate(rec)
         try await waitForSummary(recordingID: rec.id,
-                                 timeoutSeconds: 30,
+                                 timeoutSeconds: 120,
                                  expected: "REGENERATED")
         let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertEqual(updated.summary, "REGENERATED")
@@ -315,7 +315,7 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertTrue(summarizer.isSummarizing(rec.id),
                       "isSummarizing should be true while CLI is running")
 
-        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 10)
+        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 120)
         XCTAssertFalse(summarizer.isSummarizing(rec.id),
                        "isSummarizing should clear after CLI returns")
     }

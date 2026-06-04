@@ -51,7 +51,26 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - Run tests with `make test` or via Xcode.
 
 ## Release Process
-See `.cursor/rules/release.mdc` for the full release SOP. Key points:
-- Version is bumped only in `project.yml` (`MARKETING_VERSION` + `CURRENT_PROJECT_VERSION`)
-- Tags are `v`-prefixed: `v1.2.8`
-- DMG is ad-hoc signed; internal distribution only
+Releases are cut via the **`mila-sign-and-notarize` Jenkins job** on
+`jenkins.island.io` — **Island employees only**, and only reachable on the
+Island VPN (it is NOT reachable from outside the corp network, so it can't be
+triggered/inspected from a plain dev environment). The job builds a Release
+`Mila.app`, re-signs it with the Island **Developer ID Application** identity,
+notarizes via Apple `notarytool`, staples, and archives `Mila-<version>.dmg`.
+Trigger it manually from the Jenkins UI with params: `gitRef` (branch/tag/SHA,
+default `main`), `skipNotarize` (sign-only for fast iteration), and
+`sharedLibraryRef`. Pipeline + script live in `jenkins/sign-and-notarize.Jenkinsfile`
+and `scripts/sign-and-notarize.sh`. See `.cursor/rules/release.mdc` for the SOP.
+
+Key points:
+- Version is bumped only in `project.yml` (`MARKETING_VERSION` + `CURRENT_PROJECT_VERSION`).
+- Tags are `v`-prefixed: `v1.2.8`.
+- The old GitHub Actions release workflow (`release.yml`) was **removed** —
+  release/build-for-release no longer lives in `.github/workflows` (CI/e2e
+  workflows stay). Do not re-add a GitHub release workflow.
+- The Jenkins job notarizes + archives the DMG but does **not yet** upload to
+  the `island-whisper-updates` S3 bucket or update the Sparkle appcast — so
+  Sparkle auto-updates are not published by it. Enabling that needs the
+  `mac-builder` IAM principal granted S3 write on `island-whisper-updates` in
+  the infrastructure repo's `environments/prod/zero-abstraction/iam/policies/jenkins-worker-policy.json`
+  (mirroring infra PR #7888, which granted read on `island-browser-releases`).

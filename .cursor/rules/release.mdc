@@ -47,45 +47,54 @@ Before tagging:
 
 ## Cutting the release
 
-Two paths — pick the one that matches the situation.
+Releases run through the **`mila-sign-and-notarize` Jenkins job** on
+`jenkins.island.io` (Island employees only; **requires the Island VPN** — it
+cannot be reached or triggered from outside the corp network). The old
+tag-driven GitHub Actions `release.yml` has been removed.
 
-**Common first step:** If the release includes work from a feature branch /
-PR, merge it to `main` first (`gh pr merge --squash` or merge via GitHub),
-then `git pull origin main` locally before tagging. The version bump should
-already be in the merged commits; if not, bump it now in `project.yml`.
-
-### A. Tag-driven (preferred for routine releases)
+**Common first step:** merge the release work to `main` first
+(`gh pr merge --squash` or via GitHub), with the version bump
+(`MARKETING_VERSION` + `CURRENT_PROJECT_VERSION` in `project.yml`) already in
+the merged commits. Tag the release commit so the artifact is traceable:
 
 ```bash
-# Version is bumped only in project.yml (Info.plist inherits via build settings).
-git add project.yml
-git commit -m "Release v<NEW_VERSION>"
-git push origin main
-
+git pull origin main
 git tag v<NEW_VERSION>
 git push origin v<NEW_VERSION>
 ```
 
-The `release.yml` workflow then builds, packages, and uploads the DMG
-automatically. Watch it via `gh run watch`.
+### Run the Jenkins job
 
-### B. Manual local build (when CI is unavailable)
+From the Jenkins UI (or the Jenkins MCP, only when on the Island VPN), trigger
+`mila-sign-and-notarize` with:
+
+- `gitRef` — the tag/branch/SHA to build (e.g. `v<NEW_VERSION>` or `main`)
+- `skipNotarize` — `false` for a real release (`true` only for fast sign-only iteration)
+- `sharedLibraryRef` — usually leave default
+
+The job builds Release `Mila.app`, signs with the Island Developer ID
+identity + hardened runtime, notarizes via `notarytool --wait`, staples, and
+archives `Mila-<version>.dmg` as a build artifact.
+
+> **Sparkle auto-update note:** as of now the job does NOT upload the DMG/ZIP
+> or update the appcast on the `island-whisper-updates` S3 bucket — so an
+> auto-update is not published. Distribution is the archived artifact only.
+> Wiring S3 upload into the job requires granting the `mac-builder` IAM
+> principal S3 write on `island-whisper-updates` in the infrastructure repo
+> (`environments/prod/zero-abstraction/iam/policies/jenkins-worker-policy.json`,
+> mirroring infra PR #7888), then adding a publish step (reuse
+> `scripts/update-appcast.py` + the Sparkle EdDSA signing the old `release.yml`
+> did).
+
+### Fallback: manual local build (no notarization)
 
 ```bash
-# 1. Bump version files (same as above).
 make clean
-make dmg                       # produces Mila-<version>.dmg
-
-# 2. Tag and push:
-git tag v<NEW_VERSION>
-git push origin v<NEW_VERSION>
-
-# 3. Create the release and attach the DMG.
-gh release create v<NEW_VERSION> \
-    "Mila-<NEW_VERSION>.dmg" \
-    --title "Mila <NEW_VERSION>" \
-    --generate-notes
+make dmg                       # produces an ad-hoc-signed Mila-<version>.dmg
 ```
+
+Ad-hoc DMGs trip Gatekeeper (right-click → Open). Use only when Jenkins is
+unavailable and notarization isn't required.
 
 ## DMG details
 
