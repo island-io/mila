@@ -377,6 +377,16 @@ final class QuickActionsController: ObservableObject {
             }
         }()
 
+        // A mic-only recording that captured zero frames produces an empty
+        // WAV → empty transcript → silent ".failed". Tell the user why
+        // (the recording itself is still saved, so the rename sheet appears
+        // as usual — this just explains the empty result). Meeting captures
+        // can still succeed on the system-audio leg, so don't warn there.
+        if source == .microphone, session.lastMicFrameCount == 0 {
+            transcription.lastError = "Microphone captured no audio. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
+            quickActionsLog.error("mic-only recording captured 0 frames — surfaced audio-input guidance to the user")
+        }
+
         // ---- IMMEDIATE: build a tentative Recording from whatever
         // live state is available RIGHT NOW (no awaits), add it to
         // the store, and present the rename sheet. Previously we

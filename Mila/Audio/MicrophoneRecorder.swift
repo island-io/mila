@@ -1,10 +1,26 @@
 import Foundation
 import AVFoundation
 import Combine
+import os
+
+private let micLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MicrophoneRecorder")
 
 enum MicrophoneError: Error, Equatable {
     case noInputDevice
     case bringUpTimedOut
+}
+
+/// Per-session capture counters. The audio tap (a realtime thread) is the
+/// only writer; the main actor reads a snapshot after `stop()`. Held behind
+/// an `OSAllocatedUnfairLock` so the per-buffer update never hops actors.
+/// Surfaced in the diagnostic log so a "0-second failed recording" can be
+/// told apart from "device delivered no buffers" vs "every buffer failed
+/// format conversion" — the three look identical on disk (an empty WAV) but
+/// have completely different fixes.
+struct MicFrameStats: Sendable {
+    var buffers = 0
+    var frames = 0
+    var conversionFailures = 0
 }
 
 /// Pulls samples from the user's preferred input device using `AVAudioEngine`.
@@ -34,6 +50,16 @@ final class MicrophoneRecorder: ObservableObject {
     private(set) var audioStream: AsyncStream<AVAudioPCMBuffer>
     private var audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
     private var engine: AVAudioEngine?
+
+    /// Capture counters for the current/most-recent session, rebuilt on every
+    /// `start()`. Left intact across `stop()` so the orchestrator can read
+    /// `capturedFrameCount` after teardown.
+    private var stats: OSAllocatedUnfairLock<MicFrameStats>?
+
+    /// Whisper-format frames the tap has yielded to consumers this session.
+    /// 0 after a recording means the mic produced nothing — a dead/muted
+    /// device, the wrong input selected, or a failing format conversion.
+    var capturedFrameCount: Int { stats?.withLock { $0.frames } ?? 0 }
 
     /// How long we'll wait for the AVAudioEngine bring-up before giving up
     /// and throwing `MicrophoneError.bringUpTimedOut`. CoreAudio can stall
@@ -115,21 +141,28 @@ final class MicrophoneRecorder: ObservableObject {
         let agc = AdaptiveGainController(enabled: agcEnabled)
         self.gain = agc
 
+        let sessionStats = OSAllocatedUnfairLock(initialState: MicFrameStats())
+        self.stats = sessionStats
+
         let result = try await Self.withTimeout(seconds: bringUpTimeout) {
             try await Self.realBringUp(continuation: continuationForTap,
                                        onLevel: onLevel,
-                                       gain: agc)
+                                       gain: agc,
+                                       stats: sessionStats)
         }
         self.engine = result.engine
         isRunning = true
-        print(String(format: "Mic: started (%.0fHz, %d ch, agc=%@)",
-                     result.format.sampleRate,
-                     Int(result.format.channelCount),
-                     agcEnabled ? "on" : "off"))
+        micLog.log("mic started: \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch agc=\(agcEnabled ? "on" : "off", privacy: .public)")
     }
 
     func stop() async {
         guard isRunning else { return }
+        if let s = stats?.withLock({ $0 }) {
+            micLog.log("mic stopping: buffers=\(s.buffers, privacy: .public) frames=\(s.frames, privacy: .public) conversionFailures=\(s.conversionFailures, privacy: .public)")
+            if s.frames == 0 {
+                micLog.error("microphone delivered NO audio this session (buffers=\(s.buffers, privacy: .public), conversionFailures=\(s.conversionFailures, privacy: .public)) — the recording will be empty")
+            }
+        }
         let toTeardown = engine
         engine = nil
         gain = nil
@@ -165,7 +198,8 @@ final class MicrophoneRecorder: ObservableObject {
     private static func realBringUp(
         continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
         onLevel: @escaping @Sendable (Float) -> Void,
-        gain: AdaptiveGainController
+        gain: AdaptiveGainController,
+        stats: OSAllocatedUnfairLock<MicFrameStats>
     ) async throws -> EngineBox {
         // Read the user's pinned input UID off the main actor — UserDefaults
         // is thread-safe and Settings writes via a @MainActor object, so the
@@ -177,13 +211,17 @@ final class MicrophoneRecorder: ObservableObject {
             if let device = AudioDeviceManager.preferredInputDevice(preferredUID: preferredUID) {
                 do {
                     try AudioDeviceManager.setInputDevice(device, on: engine)
-                    print("Mic: using \(device.name) [\(device.manufacturer)]")
+                    micLog.log("input device: \(device.name, privacy: .public) [\(device.manufacturer, privacy: .public)] uid=\(device.uid, privacy: .public)")
                 } catch {
-                    print("Mic: could not switch to \(device.name): \(error)")
+                    micLog.error("could not switch to \(device.name, privacy: .public): \(error.localizedDescription, privacy: .public) — falling back to AVAudioEngine default input")
                 }
+            } else {
+                micLog.log("input device: AVAudioEngine default (no connected device matched the preferred UID)")
             }
             let nativeFormat = input.inputFormat(forBus: 0)
+            micLog.log("native input format: \(nativeFormat.sampleRate, privacy: .public)Hz \(nativeFormat.channelCount, privacy: .public)ch")
             guard nativeFormat.sampleRate > 0 else {
+                micLog.error("input format reports sampleRate=0 — no usable input device; throwing noInputDevice")
                 throw MicrophoneError.noInputDevice
             }
             input.installTap(onBus: 0,
@@ -210,13 +248,31 @@ final class MicrophoneRecorder: ObservableObject {
                     if let channel = toMutate.floatChannelData?[0] {
                         gain.process(channel, count: Int(toMutate.frameLength))
                     }
+                    let yielded = Int(toMutate.frameLength)
+                    let isFirst = stats.withLock { s -> Bool in
+                        s.buffers += 1
+                        s.frames += yielded
+                        return s.buffers == 1
+                    }
+                    if isFirst {
+                        micLog.log("first mic buffer delivered (\(yielded, privacy: .public) frames) — capture is live")
+                    }
                     continuation.yield(toMutate)
                 } catch {
-                    print("Mic conversion error: \(error)")
+                    // Don't log every dropped buffer (could be thousands) —
+                    // log the first, and `stop()` reports the running total.
+                    let failures = stats.withLock { s -> Int in
+                        s.conversionFailures += 1
+                        return s.conversionFailures
+                    }
+                    if failures == 1 {
+                        micLog.error("mic buffer conversion failed (dropping frames): \(error.localizedDescription, privacy: .public)")
+                    }
                 }
             }
             engine.prepare()
             try engine.start()
+            micLog.log("AVAudioEngine started; tap installed, awaiting buffers")
             return EngineBox(engine: engine, format: nativeFormat)
         }.value
     }

@@ -20,6 +20,11 @@ final class RecordingSession: ObservableObject {
     let system = SystemAudioRecorder()
 
     private(set) var source: RecordingSource = .microphone
+    /// Mic frames captured by the most recent recording, snapshotted at
+    /// `stop()` before the engine is torn down. 0 for a mic/meeting recording
+    /// means the microphone produced nothing — read by the caller to surface
+    /// an actionable message instead of a silent "failed" recording.
+    private(set) var lastMicFrameCount: Int = 0
     /// Path of the WAV currently being written. `nil` while idle. The live
     /// streaming consumers (LiveSpeakerDiarizer) read partial frames out of
     /// this file while we're still appending to it — safe because
@@ -149,6 +154,10 @@ final class RecordingSession: ObservableObject {
     func stop() async -> URL? {
         guard state == .recording else { return fileURL }
         state = .stopping
+        // Snapshot the mic frame count BEFORE teardown so the caller can tell
+        // a genuinely-empty mic session apart from a normal one.
+        let micFrames = mic.capturedFrameCount
+        lastMicFrameCount = micFrames
         await mic.stop()
         await system.stop()
         micTask?.cancel(); micTask = nil
@@ -156,6 +165,10 @@ final class RecordingSession: ObservableObject {
         timerTask?.cancel(); timerTask = nil
 
         await flushPendingSystemTail()
+        recLog.log("stop: source=\(self.source.rawValue, privacy: .public) micFrames=\(micFrames, privacy: .public) writes=\(self.writesSinceStart, privacy: .public)")
+        if (source == .microphone || source == .meeting) && micFrames == 0 {
+            recLog.error("recording stopped with 0 microphone frames (source=\(self.source.rawValue, privacy: .public)) — dead/muted input device, wrong input selected, or failed format conversion")
+        }
         let url = fileURL
         audioFile = nil
         fileURL = nil
@@ -295,7 +308,7 @@ final class RecordingSession: ObservableObject {
         do {
             try file.write(from: buffer)
         } catch {
-            print("Audio file write error: \(error)")
+            recLog.error("audio file write error: \(error.localizedDescription, privacy: .public)")
         }
         // Live-transcription feed: `.microphone` and `.meeting` fire
         // `onLiveSamples` from `consumeMic` (the latter with the mic+system

@@ -94,50 +94,73 @@ struct RenameRecordingSheet: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            header
+        VStack(alignment: .leading, spacing: 0) {
+            // Fixed top: identity + status. Never scrolls, so the title field
+            // and "transcribing…" status are always visible.
+            VStack(alignment: .leading, spacing: 16) {
+                header
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Name").font(.callout.weight(.semibold))
-                HStack {
-                    TextField("Recording title", text: $title)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { save() }
-                    if llm.isConfigured && llm.nameGenerationEnabled {
-                        Button {
-                            startFetchName(auto: false)
-                        } label: {
-                            if isFetchingName {
-                                ProgressView().controlSize(.small)
-                            } else {
-                                Label("Suggest", systemImage: "sparkles")
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Name").font(.callout.weight(.semibold))
+                    HStack {
+                        TextField("Recording title", text: $title)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { save() }
+                        if llm.isConfigured && llm.nameGenerationEnabled {
+                            Button {
+                                startFetchName(auto: false)
+                            } label: {
+                                if isFetchingName {
+                                    ProgressView().controlSize(.small)
+                                } else {
+                                    Label("Suggest", systemImage: "sparkles")
+                                }
                             }
+                            .disabled(isFetchingName || !transcriptReady)
+                            .help(transcriptReady
+                                  ? "Ask \(llm.tool.displayName) for a title"
+                                  : "Available once the transcript is ready")
                         }
-                        .disabled(isFetchingName || !transcriptReady)
-                        .help(transcriptReady
-                              ? "Ask \(llm.tool.displayName) for a title"
-                              : "Available once the transcript is ready")
                     }
                 }
+
+                transcriptionStatus
+            }
+            .padding(20)
+
+            // Scrollable middle: the AI summary + action items + LLM prompt
+            // can be arbitrarily long. Cap the height and scroll inside it so
+            // a long summary can never push the footer buttons off-screen —
+            // that was the "can't reach Save/Discard" bug. Mirrors the
+            // ScrollView+maxHeight pattern already used in RecordingDetailView.
+            if hasAIOverview || llm.isConfigured || llmError != nil {
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if hasAIOverview {
+                            aiOverviewSection
+                        }
+                        if llm.isConfigured {
+                            llmPromptDisclosure
+                        }
+                        if let llmError {
+                            Text(llmError)
+                                .font(.callout)
+                                .foregroundStyle(.red)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 16)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 260)
             }
 
-            transcriptionStatus
+            Divider()
 
-            if hasAIOverview {
-                aiOverviewSection
-            }
-
-            if llm.isConfigured {
-                llmPromptDisclosure
-            }
-
-            if let llmError {
-                Text(llmError)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
+            // Fixed footer: Save/Discard are pinned here, always reachable
+            // regardless of summary length.
             HStack {
                 // Destructive opt-out: throws the recording away entirely
                 // (and any in-flight LLM call + active whisper
@@ -168,8 +191,8 @@ struct RenameRecordingSheet: View {
                         .buttonStyle(.borderedProminent)
                 }
             }
+            .padding(20)
         }
-        .padding(20)
         .frame(width: 480)
         // ESC = save and close. Without this, ESC has no binding and the
         // sheet stays modal until the user clicks. We deliberately do NOT
