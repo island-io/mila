@@ -1,17 +1,15 @@
 name: Live AI E2E
 
-# Hits the real Anthropic API to verify Mila's Live AI loop end-to-end:
-#  - session continuity (--session-id then --resume style)
-#  - items emerge + persist across ticks with stable ids
-#  - summary refreshes
-#  - no duplicate items after speaker restates them
+# Offline, deterministic check of Mila's Live AI loop — NO API key, no network,
+# no model. Verifies the CALL CONTRACT the app must honour:
+#  - session continuity (open once with --session-id, then --resume each tick)
+#  - a transcript delta is shipped every tick
+#  - the JSON envelope parses and items/summary are tracked across ticks
+#    without dropping state
 #
-# Lives on Ubuntu because the LLM logic is pure Python — no whisper /
-# Mila app code is exercised here. The Mac-side build + UI tests stay
-# in the regular CI workflow.
-#
-# Required repo secret: ANTHROPIC_API_KEY (sk-ant-...)
-# Cost per run: a few cents on Haiku (~12 short Claude calls).
+# Pure Python, runs on Ubuntu (free on public repos). The real-LLM semantic
+# run is available on demand via `scripts/llm-live-ai-e2e.py --backend cli`
+# (local OAuth) or `--backend api` (needs ANTHROPIC_API_KEY) — not in default CI.
 
 on:
   push:
@@ -31,95 +29,54 @@ on:
       - '.github/workflows/llm-live-ai-e2e.yml'
   workflow_dispatch:
     inputs:
-      fixture:
-        description: "Path to a transcript fixture under scripts/fixtures/"
-        required: false
-        default: "scripts/fixtures/3min-meeting-en.txt"
       minutes:
         description: "Total simulated meeting length in minutes"
         required: false
         default: "3"
 
 jobs:
-  # Guard job determines whether the secret is configured. Its output
-  # is consumed by every other job's `if:` — `secrets.X` references in
-  # job-level `if:` conditions are not allowed by GitHub Actions
-  # (workflow_dispatch fails YAML parsing with "Unrecognized
-  # named-value: 'secrets'"), so we hop through this output instead.
-  guard:
-    name: Secret guard
-    runs-on: ubuntu-latest
-    outputs:
-      has_key: ${{ steps.check.outputs.has_key }}
-    steps:
-      - id: check
-        env:
-          KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: |
-          if [ -z "$KEY" ]; then
-            echo "::warning::ANTHROPIC_API_KEY is not configured for this repo. The Live AI E2E + UI vision jobs were skipped."
-            echo "::warning::To enable: gh secret set ANTHROPIC_API_KEY -R \$GITHUB_REPOSITORY"
-            echo "has_key=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "ANTHROPIC_API_KEY is configured — E2E + vision jobs will run."
-            echo "has_key=true" >> "$GITHUB_OUTPUT"
-          fi
-
   live-ai-en:
-    name: English meeting
+    name: English meeting (mock)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: guard
-    if: needs.guard.outputs.has_key == 'true'
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: pip install --upgrade anthropic
-      - name: Run E2E (English, 3 min)
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Run E2E (English, mock backend — no key)
         run: |
           python scripts/llm-live-ai-e2e.py \
-            --backend api \
+            --backend mock \
             --fixture scripts/fixtures/3min-meeting-en.txt \
             --minutes ${{ github.event.inputs.minutes || '3' }}
 
   live-ai-he:
-    name: Hebrew meeting
+    name: Hebrew meeting (mock)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: guard
-    if: needs.guard.outputs.has_key == 'true'
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Install dependencies
-        run: pip install --upgrade anthropic
-      - name: Run E2E (Hebrew, 3 min)
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - name: Run E2E (Hebrew, mock backend — no key)
         run: |
           python scripts/llm-live-ai-e2e.py \
-            --backend api \
+            --backend mock \
             --fixture scripts/fixtures/3min-meeting-he.txt \
             --minutes ${{ github.event.inputs.minutes || '3' }}
 
-  # macOS job: build Mila, run the existing XCTest UI tests (which
-  # write screenshots to /tmp/mila-ui-screenshots/), then feed those
-  # screenshots to Claude vision for a structural check. This catches
-  # the kind of layout regressions that frame-coordinate asserts miss
-  # (sidebar list scrolled out, detail pane collapsed, etc.).
-  ui-vision:
-    name: UI tests + vision check
+  # Builds Mila and runs the layout UI tests (DetailLayoutUITests) — those are
+  # deterministic frame-coordinate assertions that run ALWAYS, free, no key.
+  # The final Claude-vision step is the one piece that genuinely needs a model
+  # (a layout *judge*, which can't be mocked into a meaningful assertion): it
+  # runs as a bonus when ANTHROPIC_API_KEY is present and skips otherwise, so
+  # the job never depends on a key.
+  ui-layout:
+    name: UI layout tests (+ optional vision)
     runs-on: macos-26
     timeout-minutes: 30
-    needs: guard
-    if: needs.guard.outputs.has_key == 'true'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -168,5 +125,9 @@ jobs:
       - name: Visual regression check via Claude vision
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python scripts/llm-verify-screenshots.py
-
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::warning::ANTHROPIC_API_KEY not set — skipping the vision check."
+            exit 0
+          fi
+          python scripts/llm-verify-screenshots.py

@@ -10,14 +10,14 @@ name: Audio Loopback E2E
 #      fast, English-trained). Verifies rendering + a11y path. Hebrew
 #      transcription quality is covered by the unit test instead.
 #
-# Cadence: workflow_dispatch only. Cold path is slow (~4 GB of models
-# + Claude CLI install); warm cache run is ~3-5 min per matrix language.
+# Cadence: workflow_dispatch only. Cold path is slow (~4 GB of models);
+# warm cache run is ~3-5 min per matrix language.
 
 on:
   workflow_dispatch:
     inputs:
       include_llm_summary:
-        description: "Install Claude CLI + assert LLM summary too (needs ANTHROPIC_API_KEY secret)"
+        description: "Exercise the LLM naming/summary path via a mock CLI stub (no API key)"
         type: boolean
         default: true
 
@@ -84,18 +84,16 @@ jobs:
           echo "=== Tiny ==="
           ls -la "$HOME/.cache/whisper-models" || true
 
-      - name: Install Claude CLI (when LLM E2E requested)
+      - name: Set up mock LLM CLI (when LLM path requested)
         id: claude-cli
         if: ${{ github.event.inputs.include_llm_summary == 'true' || github.event.inputs.include_llm_summary == null }}
         run: |
-          curl -fsSL https://claude.ai/install.sh | bash || true
-          for p in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
-            if [ -x "$p" ]; then
-              echo "claude_path=$p" >> "$GITHUB_OUTPUT"
-              "$p" --version || true
-              break
-            fi
-          done
+          # No real CLI install, no API key: Mila shells out to a committed
+          # stub that prints a canned title. The unit suite
+          # (RecordingSummarizerTests) asserts the exact call shape; here we
+          # just exercise the app→CLI seam end-to-end without a model.
+          chmod +x scripts/fake-llm-cli.sh
+          echo "claude_path=$GITHUB_WORKSPACE/scripts/fake-llm-cli.sh" >> "$GITHUB_OUTPUT"
 
       - name: Generate Xcode project
         run: make project
@@ -157,8 +155,8 @@ jobs:
           TEST_RUNNER_MILA_FIXTURE_WAV_PATH: /tmp/mila-fixture-en.wav
           TEST_RUNNER_MILA_FIXTURE_WAV_QUIET_PATH: /tmp/mila-fixture-en-quiet.wav
           TEST_RUNNER_MILA_TINY_MODEL_PATH: /Users/runner/.cache/whisper-models/ggml-tiny.bin
+          # Mock LLM CLI stub (no API key) — see "Set up mock LLM CLI" above.
           TEST_RUNNER_MILA_CLAUDE_PATH: ${{ steps.claude-cli.outputs.claude_path }}
-          TEST_RUNNER_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           xcodebuild test \
             -project Mila.xcodeproj \

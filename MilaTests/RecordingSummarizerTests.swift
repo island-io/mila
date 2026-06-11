@@ -126,6 +126,65 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(onDisk, "A concise summary of the meeting.")
     }
 
+    /// The core "right call" assertion: when a transcript is ready, the
+    /// summarizer must invoke the configured CLI ONCE, in claude's one-shot
+    /// `-p` shape, with the transcript embedded in the prompt via
+    /// `LLMRunner.composedPrompt`. A capturing stub records the exact argv so
+    /// we assert the wire call the app makes — no real model, no API key.
+    /// This is what replaced the old real-Anthropic e2e: instead of asking a
+    /// live model and judging its answer, we verify Mila issues the correct
+    /// invocation off the back of a transcription.
+    func test_summarize_invokes_cli_with_transcript_in_one_shot_prompt() async throws {
+        let capture = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-llm-capture-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: capture) }
+
+        // Stub `claude`: record every argv entry (NUL-separated, so prompts
+        // containing newlines round-trip intact) to the capture file, then
+        // emit a canned summary so the summarizer has output to store. The
+        // capture path is baked into the script body rather than passed via
+        // env, so we don't depend on ProcessInfo.environment snapshotting.
+        let script = makeScript("""
+            #!/bin/sh
+            printf '%s\\0' "$@" > '\(capture.path)'
+            printf 'A concise summary of the meeting.'
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        llm.tool = .claude
+        llm.executablePath = script.path
+        liveAI.model = ""   // keep argv minimal: no --model passthrough
+
+        let transcript = "we discussed the roadmap and agreed to ship next week"
+        let audioURL = store.freshAudioURL(suggestedName: "Call")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Call",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: transcript
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        try await waitForSummary(recordingID: rec.id, timeoutSeconds: 120)
+
+        // The CLI ran and its output was stored — proves the call completed.
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "A concise summary of the meeting.")
+
+        // Assert the SHAPE of the call the app made.
+        let data = try XCTUnwrap(try? Data(contentsOf: capture),
+                                 "stub CLI was never invoked — no capture file written")
+        let args = data.split(separator: 0).map { String(decoding: $0, as: UTF8.self) }
+        XCTAssertTrue(args.contains("-p"),
+                      "claude must be invoked in one-shot `-p` mode; got argv=\(args)")
+        let prompt = try XCTUnwrap(args.first { $0.contains(transcript) },
+                                   "the transcript must be embedded in the prompt; argv=\(args)")
+        XCTAssertTrue(prompt.contains("Transcript:"),
+                      "prompt should use LLMRunner.composedPrompt's labelled format")
+    }
+
     /// Empty CLI output must NOT clobber a (currently nil) summary — we
     /// don't want a wedged CLI to mask the recording as "summarized".
     func test_summarize_drops_empty_output() async throws {
