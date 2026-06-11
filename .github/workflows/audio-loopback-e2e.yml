@@ -1,0 +1,206 @@
+name: Audio Loopback E2E
+
+# Two-track E2E that exercises the full live-recording pipeline:
+#   1. PIPELINE: unit-level test (MilaTests/LiveTranscriberPipelineE2ETests)
+#      drives a real LiveTranscriber + real WhisperEngine with the full
+#      production models (turbo / ivrit-large) for BOTH languages. No UI,
+#      no XCUITest a11y — direct API assertion of `transcriber.segments`.
+#   2. UI: AudioLoopbackUITests drives the actual SwiftUI view via the
+#      WAV-injection seam — English-only with ggml-tiny.bin (small,
+#      fast, English-trained). Verifies rendering + a11y path. Hebrew
+#      transcription quality is covered by the unit test instead.
+#
+# Cadence: workflow_dispatch only. Cold path is slow (~4 GB of models
+# + Claude CLI install); warm cache run is ~3-5 min per matrix language.
+
+on:
+  workflow_dispatch:
+    inputs:
+      include_llm_summary:
+        description: "Install Claude CLI + assert LLM summary too (needs ANTHROPIC_API_KEY secret)"
+        type: boolean
+        default: true
+
+jobs:
+  e2e:
+    name: Live pipeline E2E
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Pre-grant microphone TCC (defensive)
+        run: |
+          TCC_DB="$HOME/Library/Application Support/com.apple.TCC/TCC.db"
+          for client in \
+              "io.island.whisper.IslandWhisper" \
+              "io.island.whisper.IslandWhisperUITests.xctrunner"; do
+            sqlite3 "$TCC_DB" \
+              "INSERT OR REPLACE INTO access (service, client, client_type, auth_value, auth_reason, auth_version, indirect_object_identifier, flags, last_modified) VALUES ('kTCCServiceMicrophone', '$client', 0, 2, 4, 1, 'UNUSED', 0, strftime('%s','now'));" \
+              || echo "::warning::TCC pre-grant for $client failed"
+          done
+
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: Mila/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
+      - name: Cache whisper models (full + tiny)
+        id: whisper-models-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Application Support/Mila/Models
+            ~/.cache/whisper-models
+          key: whisper-models-v2-${{ runner.os }}
+
+      - name: Download full whisper models (cold path only)
+        if: steps.whisper-models-cache.outputs.cache-hit != 'true'
+        run: make models
+
+      - name: Download ggml-tiny.bin (cold path only)
+        if: steps.whisper-models-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$HOME/.cache/whisper-models"
+          curl -L --fail --progress-bar \
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin" \
+            -o "$HOME/.cache/whisper-models/ggml-tiny.bin"
+
+      - name: Verify models on disk
+        run: |
+          echo "=== Full models ==="
+          ls -la "$HOME/Library/Application Support/Mila/Models" || true
+          echo "=== Tiny ==="
+          ls -la "$HOME/.cache/whisper-models" || true
+
+      - name: Install Claude CLI (when LLM E2E requested)
+        id: claude-cli
+        if: ${{ github.event.inputs.include_llm_summary == 'true' || github.event.inputs.include_llm_summary == null }}
+        run: |
+          curl -fsSL https://claude.ai/install.sh | bash || true
+          for p in "$HOME/.local/bin/claude" "/opt/homebrew/bin/claude" "/usr/local/bin/claude"; do
+            if [ -x "$p" ]; then
+              echo "claude_path=$p" >> "$GITHUB_OUTPUT"
+              "$p" --version || true
+              break
+            fi
+          done
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Generate audio fixtures (en + he)
+        run: |
+          ./scripts/generate-audio-fixture.sh /tmp/mila-fixture-en.wav en
+          ./scripts/generate-audio-fixture.sh /tmp/mila-fixture-he.wav he
+
+      - name: Generate quiet English fixture (-26 dBFS for AGC E2E)
+        run: |
+          # Attenuate the loud English fixture by ~26 dB so the captured
+          # signal lands at ~-26 dBFS peak — matches the real-world bug
+          # where a user's mic captured speech far below the live VAD's
+          # RMS cutoff (0.012). With AGC ON the live transcript still
+          # populates; with AGC OFF the same signal stays below the cut
+          # and the live pane stays empty.
+          #
+          # Done in Python (stdlib `wave`) because macos-26 runners ship
+          # neither `ffmpeg` nor `sox`, and we'd rather not add a brew
+          # install to the cold-path budget. Scaling 16-bit PCM samples
+          # by 0.05 gives ~20*log10(0.05) ≈ -26 dB attenuation —
+          # equivalent to `sox gain -26` for our purposes here. The
+          # script also emits the measured peak/RMS for sanity.
+          python3 scripts/attenuate-wav.py \
+            /tmp/mila-fixture-en.wav \
+            /tmp/mila-fixture-en-quiet.wav \
+            0.05
+          echo "=== Quiet fixture ==="
+          ls -la /tmp/mila-fixture-en-quiet.wav
+
+      - name: Mark log capture start
+        run: |
+          date -u +"%Y-%m-%d %H:%M:%S" > /tmp/mila-log-start.txt
+
+      - name: Run pipeline E2E unit tests (en + he, full models)
+        env:
+          # Unit tests run inside the MilaTests target; xcodebuild passes
+          # plain env vars to the test process (no TEST_RUNNER_ prefix
+          # needed for non-UI tests).
+          MILA_PIPELINE_E2E: "1"
+          MILA_FIXTURE_WAV_EN: /tmp/mila-fixture-en.wav
+          MILA_FIXTURE_WAV_HE: /tmp/mila-fixture-he.wav
+        run: |
+          xcodebuild test \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -destination 'platform=macOS' \
+            -only-testing:MilaTests/LiveTranscriberPipelineE2ETests \
+            -derivedDataPath build-pipeline \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath build-pipeline/pipeline.xcresult
+
+      - name: Run UI E2E (English, ggml-tiny.bin)
+        env:
+          # XCUITest needs the TEST_RUNNER_ prefix to propagate env vars
+          # through xcodebuild to the test runner process.
+          TEST_RUNNER_MILA_FIXTURE_E2E: "1"
+          TEST_RUNNER_MILA_FIXTURE_WAV_PATH: /tmp/mila-fixture-en.wav
+          TEST_RUNNER_MILA_FIXTURE_WAV_QUIET_PATH: /tmp/mila-fixture-en-quiet.wav
+          TEST_RUNNER_MILA_TINY_MODEL_PATH: /Users/runner/.cache/whisper-models/ggml-tiny.bin
+          TEST_RUNNER_MILA_CLAUDE_PATH: ${{ steps.claude-cli.outputs.claude_path }}
+          TEST_RUNNER_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          xcodebuild test \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -destination 'platform=macOS' \
+            -only-testing:MilaUITests/AudioLoopbackUITests/test_english_two_minute_recording_progresses \
+            -only-testing:MilaUITests/AudioLoopbackUITests/test_english_low_volume_recovered_by_agc \
+            -derivedDataPath build-ui \
+            CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath build-ui/ui.xcresult
+
+      - name: Capture os_log (pipeline + UI)
+        if: always()
+        run: |
+          set +e
+          mkdir -p logs
+          if [ -f /tmp/mila-log-start.txt ]; then
+            START="$(cat /tmp/mila-log-start.txt)"
+            /usr/bin/log show \
+              --start "$START" \
+              --style compact \
+              --predicate 'subsystem == "io.island.whisper.IslandWhisper" OR subsystem == "io.island.mila.Mila"' \
+              > logs/vad-transcriber.log 2>&1
+          fi
+          echo "## Pipeline + UI activity" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          grep -E "VAD emit|LiveTranscriber utterance|transcribeOnceSegments|interval added|inject-fixture|PipelineE2E|FixtureE2E" \
+            logs/vad-transcriber.log 2>/dev/null \
+            | head -80 \
+            >> "$GITHUB_STEP_SUMMARY" || echo "(nothing captured)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results
+          path: |
+            build-pipeline/pipeline.xcresult
+            build-ui/ui.xcresult
+            logs
+            /tmp/mila-fixture-en.wav
+            /tmp/mila-fixture-en-quiet.wav
+            /tmp/mila-fixture-he.wav
+          if-no-files-found: warn

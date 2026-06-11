@@ -1,0 +1,197 @@
+name: Mila
+options:
+  bundleIdPrefix: io.island.whisper
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  developmentLanguage: en
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ENABLE_HARDENED_RUNTIME: YES
+    SWIFT_STRICT_CONCURRENCY: minimal
+    GENERATE_INFOPLIST_FILE: NO
+    PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
+    MARKETING_VERSION: "1.8.5"
+    # 1.7.0 ships eight features in one batch:
+    #   * Adaptive mic gain control (AGC): boosts low-volume input to
+    #     a -26 dBFS target with smooth attack/release + soft clip.
+    #     Live transcript stays useful even when system mic input is
+    #     low. Toggle in Settings → Audio Input.
+    #   * Summary backfill + regenerate: completed recordings missing
+    #     a summary get one filled on launch + when LLM CLI is
+    #     enabled. Right-click → Regenerate summary in the detail
+    #     view + rename sheet.
+    #   * Post-record popup: always appears with summary + action
+    #     items. Send-to-Claude carries transcript + summary.
+    #   * Save summary to disk: `.summary.txt` sidecar next to the
+    #     transcript. LLM summary generated for every recording when
+    #     the CLI is configured, not just Live AI mode.
+    #   * Copyable summary: right-click → Copy in the detail view +
+    #     rename sheet.
+    #   * Configurable recordings directory: Settings → Storage with
+    #     a folder picker (security-scoped bookmark) and "Reset to
+    #     default" action.
+    #   * App-record silence auto-drop: system-audio leg drops after
+    #     a silent window (5 min prod, 10s in UI tests).
+    #   * MacBook Air hardware gate: skips the live AI pipeline on
+    #     Air-class chips (whisper + pyannote together can't keep up
+    #     real-time), recording + post-record transcribe still runs.
+    # 1.6.4 ships live speaker labels + instant save:
+    #   * Wired the LiveSpeakerDiarizer feed — pyannote daemon was
+    #     spawning but no one was calling diarizer.process; speaker
+    #     labels never appeared in the live pane.
+    #   * Fixed the daemon's embedder call — pyannote 3.x's
+    #     `pipeline._embedding` takes a torch.Tensor directly, not a
+    #     `{"waveform":, "sample_rate":}` dict, so every embed call
+    #     was crashing silently with 'dict has no attribute to'.
+    #   * applySpeakerLabels matches segments to intervals by max
+    #     overlap; runs on every recording (not LLM-gated) and stays
+    #     under 50ms even at 2-min scale.
+    #   * Live pane renders `SPEAKER_00:` prefix inline as labels
+    #     arrive.
+    #   * When VAD ran successfully, post-record skips re-transcribe
+    #     + re-diarize entirely — rename sheet pops up with the
+    #     transcript already populated. Drains diarizer + reapplies
+    #     labels at stop time so the final utterance gets its
+    #     speaker label before saving (4 race fixes from Bugbot
+    #     review). Still writes the .srt sidecar.
+    CURRENT_PROJECT_VERSION: "42"
+
+packages:
+  TranscriptionCore:
+    path: Packages/TranscriptionCore
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
+    
+targets:
+  Mila:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Mila
+        excludes:
+          - "Resources/Info.plist"
+          - "Resources/Mila.entitlements"
+          - "Resources/DiarizationModels"
+          - "Resources/PythonRuntime"
+      - path: Mila/Resources/DiarizationModels
+        type: folder
+        buildPhase: resources
+      # PythonRuntime is produced by `make bundle-diarization`. Treated as
+      # a folder reference (not a recursive source scan) so XcodeGen copies
+      # the entire directory tree into Contents/Resources/PythonRuntime/.
+      # The directory is .gitignored; CI is expected to fetch/build it
+      # before invoking xcodebuild. If it's missing, the build proceeds
+      # without bundled diarization — SpeakerDiarizer.resolvePython falls
+      # back to the user-configured python automatically.
+      - path: Mila/Resources/PythonRuntime
+        type: folder
+        buildPhase: resources
+        optional: true
+    resources:
+      - path: Mila/Assets.xcassets
+    info:
+      path: Mila/Resources/Info.plist
+      properties:
+        CFBundleName: Mila
+        CFBundleDisplayName: Mila
+        # Inherit from settings.MARKETING_VERSION / CURRENT_PROJECT_VERSION above
+        # so a release bump only has to change those two fields. Hardcoding here
+        # caused v1.2.4 to ship with build 6 instead of 7 — Sparkle's appcast
+        # advertised 7 (correct), but the bundle's CFBundleVersion stayed at
+        # the stale literal until the next release picked up the inheritance.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: "14.0"
+        LSApplicationCategoryType: public.app-category.productivity
+        NSHumanReadableCopyright: "Written by Uri Harduf from Island"
+        NSMicrophoneUsageDescription: "Mila needs microphone access to record audio for transcription and dictation."
+        NSScreenCaptureUsageDescription: "Mila needs screen recording permission to capture audio from apps like Zoom."
+        NSAppleEventsUsageDescription: "Mila uses AppleEvents to paste dictated text into the active app."
+        NSSpeechRecognitionUsageDescription: "Mila transcribes locally on your Mac; no audio is sent to the cloud."
+        NSPrincipalClass: NSApplication
+        LSUIElement: false
+        # Custom UTI used by the in-app drag-and-drop payload that moves a
+        # recording from a list row onto a sidebar folder. Declaring it as
+        # an *exported* type is what lets SwiftUI's .dropDestination match
+        # the payload — without this entry, `UTType(exportedAs: …)` in code
+        # registers nothing at runtime and drops silently no-op (the folder
+        # never highlights as a drop target).
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: io.island.whisper.recording
+            UTTypeDescription: Mila Recording
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification: {}
+        # Sparkle auto-update feed. The appcast is a static file published to
+        # GitHub Pages; release binaries are attached to GitHub Releases. Forks
+        # that want their own update channel should point this at their own
+        # appcast and sign releases with their own EdDSA key (see SUPublicEDKey).
+        SUFeedURL: https://island-open-source.github.io/mila/appcast.xml
+        SUPublicEDKey: iF35blPidKUXIaLr59fJgGGdXtI8AgVNxOx5w+eTieY=
+        SUEnableAutomaticChecks: true
+        SUScheduledCheckInterval: 86400
+    entitlements:
+      path: Mila/Resources/Mila.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.device.audio-input: true
+        com.apple.security.device.microphone: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.network.client: true
+        com.apple.security.cs.allow-jit: true
+        com.apple.security.cs.disable-library-validation: true
+    dependencies:
+      - package: TranscriptionCore
+        product: TranscriptionCore
+      - package: Sparkle
+        product: Sparkle
+    settings:
+      base:
+        OTHER_LDFLAGS: "$(inherited) -framework Accelerate -framework Metal -framework MetalKit"
+
+  MilaTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: MilaTests
+    dependencies:
+      - target: Mila
+      - package: TranscriptionCore
+        product: TranscriptionCore
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Mila.app/Contents/MacOS/Mila"
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperTests
+
+  MilaUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: MilaUITests
+    dependencies:
+      - target: Mila
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisperUITests
+        TEST_TARGET_NAME: Mila
+        # Match the host app's ad-hoc signing so the runner app and the
+        # injected xctest bundle have the same (empty) Team ID — otherwise
+        # macOS rejects the dlopen at test-time with "different Team IDs".
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        ENABLE_HARDENED_RUNTIME: NO
