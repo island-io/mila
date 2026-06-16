@@ -538,18 +538,27 @@ final class AudioLoopbackUITests: XCTestCase {
 
         // LLM summary check — soft unless --ui-test-llm-claude was
         // passed (i.e. the workflow installed a CLI + key).
-        let summary = app.staticTexts.matching(identifier: "liveAI.summary").firstMatch
+        //
+        // Match with `.descendants(matching: .any)`, NOT `.staticTexts`: the
+        // `liveAI.summary` node is an `.accessibilityElement(children:
+        // .combine)` over a VStack, which surfaces as a container element
+        // (Group/Other) rather than a StaticText, so a `.staticTexts` query
+        // wouldn't find it. And read `label` OR `value` — the combined text
+        // lands in `.value` on macOS (same as the history rows above).
+        let summary = app.descendants(matching: .any)
+            .matching(identifier: "liveAI.summary").firstMatch
         if let claudePath = ProcessInfo.processInfo.environment["MILA_CLAUDE_PATH"],
            !claudePath.isEmpty {
             XCTAssertTrue(summary.waitForExistence(timeout: 30),
                           "[\(language)] liveAI.summary element never rendered despite CLI configured")
-            let body = summary.label
+            let body = (summary.label + " " + ((summary.value as? String) ?? ""))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             print("FixtureE2E[\(language)]: summary len=\(body.count) body=\(body.prefix(200))")
             XCTAssertFalse(body.isEmpty,
                            "[\(language)] LLM summary is empty after 2 min — session didn't run or returned nothing")
         } else {
             if summary.exists {
-                print("FixtureE2E[\(language)]: summary len=\(summary.label.count) (no CLI configured — informational only)")
+                print("FixtureE2E[\(language)]: summary present (no CLI configured — informational only)")
             }
         }
     }
