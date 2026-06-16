@@ -108,13 +108,26 @@ final class QuickActionsController: ObservableObject {
     /// before the transcript is saved.
     var liveDiarizer: LiveSpeakerDiarizer?
 
-    /// True while `stopRecording` is running its inline drain and
-    /// finalize. `MilaApp.wireLiveAIPipeline`'s `.idle` state handler
-    /// reads this flag — when set, it skips the duplicate drain and
-    /// the transcriber/diarizer `stop()` cleanup (stopRecording owns
-    /// the lifecycle and will read final state + run cleanup itself).
-    /// When clear, the `.idle` handler runs its own drain — covers
-    /// the lock-screen / sleep / app-quit paths that don't reach
+    /// True only while `stopRecording` is running its inline LIVE-PIPELINE
+    /// drain — the short, bounded window where it flushes the transcriber
+    /// tail, drains the diarizer queue, runs the final Live AI tick,
+    /// snapshots the live state onto the saved Recording, and tears down
+    /// the live singletons. The record button is disabled (and shows
+    /// "Finalizing…") for exactly this window.
+    ///
+    /// It is NOT held across the heavy post-snapshot tail (offline
+    /// re-diarize / summarize / transcode / batch enqueue) — that runs in
+    /// a detached `finalizeTasks` entry so the record button frees up the
+    /// moment the live pipeline is safely drained. The user can start a
+    /// new recording while the prior one finishes finalizing in the
+    /// background.
+    ///
+    /// `MilaApp.wireLiveAIPipeline`'s `.idle` state handler reads this
+    /// flag — when set, it skips the duplicate drain and the
+    /// transcriber/diarizer `stop()` cleanup (stopRecording owns the
+    /// lifecycle and will read final state + run cleanup itself). When
+    /// clear, the `.idle` handler runs its own drain — covers the
+    /// lock-screen / sleep / app-quit paths that don't reach
     /// `stopRecording`.
     @Published var isFinalizingRecording: Bool = false
 
@@ -134,6 +147,19 @@ final class QuickActionsController: ObservableObject {
     /// Active silence-watch task — cancelled when the recording stops so
     /// we never fire the warning for a recording that's already over.
     private var silenceWatchTask: Task<Void, Never>?
+
+    /// Background finalize tasks, keyed by the recording id they're
+    /// finalizing. After `stopRecording` drains the live pipeline and
+    /// frees the record button, the HEAVY tail of finalization — the
+    /// offline re-diarize subprocess, the summarizer LLM call, the m4a
+    /// transcode (or, for chunk/empty recordings, the batch
+    /// transcription enqueue) — runs here so a new recording can start
+    /// immediately. None of this tail touches the live singletons
+    /// (`liveTranscriber` / `liveDiarizer` / `liveAISession`); it only
+    /// reads the on-disk WAV + writes back to the store by id, so it's
+    /// safe to overlap a fresh live recording. Mirrors
+    /// `RecordingSummarizer`'s id-keyed background-task ownership model.
+    private var finalizeTasks: [UUID: Task<Void, Never>] = [:]
 
     /// Returns true — and sets a user-facing `lastError` — when starting
     /// a new recording would exceed the configured storage cap. Called at
@@ -398,8 +424,13 @@ final class QuickActionsController: ObservableObject {
         // session.stop()` left a window where `.idle` could call
         // `transcriber.stop()` mid-flight, wiping `liveTranscriber.
         // segments` before this function's inline drain reads them.
+        // NOTE: `isFinalizingRecording` is deliberately NOT cleared by a
+        // blanket `defer` here. It must stay `true` only for the bounded
+        // live-pipeline drain below, and be cleared the instant that drain
+        // + live-singleton teardown completes — so the record button frees
+        // up before the heavy offline tail (re-diarize / summarize /
+        // transcode) runs. Each early-return path clears it explicitly.
         isFinalizingRecording = true
-        defer { isFinalizingRecording = false }
         guard let outputURL = await session.stop() else {
             // Failed stop: still tear down the live pipelines since
             // wireLiveAIPipeline's `.idle` handler skipped its
@@ -408,6 +439,7 @@ final class QuickActionsController: ObservableObject {
             // recording. Cursor (PRRT_kwDOSY2m-s6GOIj-) flagged it.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            isFinalizingRecording = false
             activeJob = .none
             return
         }
@@ -498,20 +530,24 @@ final class QuickActionsController: ObservableObject {
             postRecording.present(recording)
         }
 
-        // ---- INLINE DRAIN: finalize what was still in-flight, then
-        // update the Recording in the store so the sheet re-renders
-        // with final data.
+        // ---- INLINE LIVE-PIPELINE DRAIN: finalize whatever was still
+        // in-flight in the live singletons, then update the Recording in
+        // the store so the sheet re-renders with final data.
         //
-        // The drain runs INLINE (not in a background Task) for two
-        // reasons:
+        // This drain — and ONLY this drain — runs INLINE (not in a
+        // background Task), and `isFinalizingRecording` stays `true` for
+        // exactly this window. Everything here reads or mutates the live
+        // singletons (`liveTranscriber` / `liveDiarizer` / `liveAISession`),
+        // which must NOT be touched by a background task, for two reasons:
         //
-        //   1. Bugbot Finding #1: a background Task reads
-        //      `liveTranscriber`, `liveDiarizer`, `liveAISession` —
-        //      all singletons that get reset on the NEXT recording's
-        //      `start()`. If the user pressed Record before the
-        //      background Task finished, the Task would snapshot the
-        //      new recording's state and apply it to the OLD
-        //      recording's id.
+        //   1. Bugbot Finding #1: those singletons get reset on the NEXT
+        //      recording's `start()` (epoch bump, `aiSession.start()`,
+        //      `diarizer.reset()`). A background task reading them after a
+        //      new recording started would snapshot the NEW recording's
+        //      state and apply it to the OLD recording's id. The
+        //      `isFinalizingRecording` re-entry guard in `toggleRecord` /
+        //      `startRecording` is what holds a new recording off until
+        //      this drain + the live-singleton teardown below complete.
         //
         //   2. Bugbot Finding #3: `wireLiveAIPipeline`'s `.idle`
         //      handler also drains the same pipelines. Without
@@ -519,6 +555,12 @@ final class QuickActionsController: ObservableObject {
         //      `.idle` can call `transcriber.stop()` while we're
         //      still reading state, wiping segments out from under
         //      the snapshot.
+        //
+        // The HEAVY tail that follows the snapshot (offline re-diarize /
+        // summarize / transcode / batch enqueue) touches none of those
+        // singletons, so it's split off into a background `finalizeTasks`
+        // entry (`finalizeTail`) and the record button frees up before it
+        // runs — letting the user start a new recording immediately.
         //
         // The sheet still appears immediately: `postRecording.present`
         // above sets a `@Published` value, which SwiftUI schedules
@@ -614,6 +656,7 @@ final class QuickActionsController: ObservableObject {
             // pipelines below before returning.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            isFinalizingRecording = false
             return
         }
         updated.segments = finalTranscriptSegments
@@ -627,45 +670,106 @@ final class QuickActionsController: ObservableObject {
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         store.update(updated)
 
-        if liveTranscriptIsAuthoritative {
-            // VAD path: keep the live transcript TEXT (no re-transcription),
-            // but the ONLINE diarizer over-segments speakers — it labels
-            // each utterance as it streams in and can never revise, so early
-            // borderline embeddings spawn extra SPEAKER_NN that never merge.
-            // Re-run the OFFLINE diarizer on the finished WAV (global
-            // clustering → far cleaner speaker counts) and swap in its
-            // labels. Skips gracefully — keeping the live speakers — if
-            // diarization isn't configured or the pass fails.
-            if let rediarized = await transcription.rediarizeSegments(
-                wavURL: store.audioURL(for: updated),
-                segments: updated.segments) {
-                updated.segments = rediarized
-                store.update(updated)
-            }
-            // Write the SRT sidecar + trigger the summarizer ourselves (the
-            // enqueue path normally runs both via its onTranscriptionCompleted
-            // hook).
-            TranscriptExporter.writeSRT(for: updated, in: store.recordingsDirectory)
-            summarizer?.summarizeIfNeeded(updated)
-            // Shrink storage: the live transcript is authoritative and the
-            // rediarize above is done reading the WAV, so transcode it to
-            // m4a in the background. (The batch path does this via its own
-            // completion hook in TranscriptionService.)
-            let compressID = updated.id
-            Task { await store.compressRecordingAudio(id: compressID) }
-        } else {
-            // Chunk mode or no live segments: enqueue for batch
-            // transcription. For chunk mode the batch pass overwrites
-            // segments + fullText with diarized output; for the
-            // empty-segments case it's the first transcription pass.
-            transcription.enqueue(updated)
-        }
-
-        // Cleanup: `.idle` handler skipped these because of the flag.
-        // Now that we've snapshotted everything we needed, it's safe
-        // to tear down the live pipelines.
+        // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
+        //
+        // Everything above read or mutated the live singletons
+        // (`liveTranscriber` / `liveDiarizer` / `liveAISession`). We've now
+        // snapshotted their final state onto `updated` and written it to
+        // the store, so it's safe to tear them down — and once they're
+        // torn down, a NEW recording can grab them via `start()`.
+        //
+        // Cleanup: `.idle` handler skipped these because the flag was set.
         liveTranscriber?.stop()
         liveDiarizer?.stop()
+        // Free the record button NOW. The heavy tail below (offline
+        // re-diarize subprocess / summarizer LLM call / m4a transcode, or
+        // the batch-transcription enqueue) touches only the on-disk WAV,
+        // the store, and the already-serialized background services — never
+        // the live singletons — so it's safe to run it concurrently with a
+        // fresh live recording. Clearing the flag here is what lets the
+        // user hit Record again immediately instead of waiting on that tail.
+        isFinalizingRecording = false
+
+        finalizeTail(for: updated, liveTranscriptIsAuthoritative: liveTranscriptIsAuthoritative)
+    }
+
+    /// The HEAVY, live-singleton-free tail of finalization, run as a
+    /// detached, id-keyed background task so the record button (freed in
+    /// `stopRecording` once the live pipeline is drained) stays usable
+    /// while the prior recording finishes processing.
+    ///
+    /// Safe to overlap a fresh live recording because it reads only the
+    /// on-disk WAV and writes back to the store by recording id — it does
+    /// NOT touch `liveTranscriber` / `liveDiarizer` / `liveAISession`,
+    /// which the new recording owns. Whisper contention is a non-issue:
+    /// the engine actor in `TranscriptionService` serializes every call
+    /// (live + batch) internally, and the offline diarizer / summarizer
+    /// run as their own subprocesses.
+    ///
+    /// `internal` (not `private`) so tests can drive the tail directly —
+    /// the live-pipeline drain that precedes it in `stopRecording` needs a
+    /// real audio session that CI can't spin up, but the tail itself is
+    /// pure store + service work and is the part this PR decoupled.
+    func finalizeTail(for recording: Recording, liveTranscriptIsAuthoritative: Bool) {
+        let id = recording.id
+        // Replace (and cancel) any previous tail for the same id —
+        // defensive; ids are unique per recording so this shouldn't
+        // collide in practice.
+        finalizeTasks[id]?.cancel()
+        finalizeTasks[id] = Task { @MainActor [weak self] in
+            defer { self?.finalizeTasks[id] = nil }
+            guard let self else { return }
+            var updated = recording
+            if liveTranscriptIsAuthoritative {
+                // VAD path: keep the live transcript TEXT (no re-transcription),
+                // but the ONLINE diarizer over-segments speakers — it labels
+                // each utterance as it streams in and can never revise, so early
+                // borderline embeddings spawn extra SPEAKER_NN that never merge.
+                // Re-run the OFFLINE diarizer on the finished WAV (global
+                // clustering → far cleaner speaker counts) and swap in its
+                // labels. Skips gracefully — keeping the live speakers — if
+                // diarization isn't configured or the pass fails.
+                //
+                // Re-fetch before writing: the user may have renamed the
+                // recording (rename sheet) while this tail was running, so
+                // we update only the segments rather than clobbering the row.
+                if let rediarized = await self.transcription.rediarizeSegments(
+                    wavURL: self.store.audioURL(for: updated),
+                    segments: updated.segments) {
+                    updated.segments = rediarized
+                    if var current = self.store.recordings.first(where: { $0.id == id }) {
+                        current.segments = rediarized
+                        self.store.update(current)
+                        updated = current
+                    }
+                }
+                // Write the SRT sidecar + trigger the summarizer ourselves (the
+                // enqueue path normally runs both via its onTranscriptionCompleted
+                // hook).
+                TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
+                self.summarizer?.summarizeIfNeeded(updated)
+                // Shrink storage: the live transcript is authoritative and the
+                // rediarize above is done reading the WAV, so transcode it to
+                // m4a in the background. (The batch path does this via its own
+                // completion hook in TranscriptionService.)
+                await self.store.compressRecordingAudio(id: id)
+            } else {
+                // Chunk mode or no live segments: enqueue for batch
+                // transcription. For chunk mode the batch pass overwrites
+                // segments + fullText with diarized output; for the
+                // empty-segments case it's the first transcription pass.
+                self.transcription.enqueue(updated)
+            }
+        }
+    }
+
+    /// Await every in-flight background finalize tail. Test seam so a test
+    /// can drive `finalizeTail` and then deterministically assert on the
+    /// resulting store / queue state.
+    func awaitFinalizeTails() async {
+        for task in finalizeTasks.values {
+            await task.value
+        }
     }
 
     // MARK: - Sleep interruption

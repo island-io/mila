@@ -241,6 +241,60 @@ final class QuickActionsControllerTests: XCTestCase {
         controller.isFinalizingRecording = false
     }
 
+    /// REGRESSION (user report: "couldn't start a new recording until the
+    /// previous one finished processing; the Record button said
+    /// 'Finalizing'").
+    ///
+    /// `finalizeTail` is the live-singleton-FREE heavy tail that
+    /// `stopRecording` now spins off into a background, id-keyed task AFTER
+    /// it drains the live pipeline and clears `isFinalizingRecording`. For
+    /// the non-authoritative (chunk / empty-segments) path it must enqueue
+    /// the recording for batch transcription on the already-serialized
+    /// background service — never holding the record button. This pins that
+    /// the tail completes the recording in the background without ever
+    /// touching the finalize flag.
+    func test_finalize_tail_enqueues_batch_transcription_in_background() async throws {
+        // The batch worker resolves audio via `store.audioURL(for:)`, which
+        // lives under the store's recordings directory — write the WAV there
+        // (not the bare temp root) so the tail can actually load it.
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.recordingsDirectory.appendingPathComponent("finalize-tail.wav")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.6)
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 0.6, text: "finalized in background")
+        ])
+
+        // A freshly-stopped recording that produced no authoritative live
+        // segments (chunk mode / empty): status .pending, awaiting batch.
+        let recording = Recording(
+            title: "tail-recording",
+            duration: 0.6,
+            source: .microphone,
+            audioFileName: url.lastPathComponent,
+            status: .pending,
+            language: languageSettings.current.rawValue
+        )
+        store.add(recording)
+
+        // The button must already be free by the time the tail runs —
+        // stopRecording clears the flag before calling finalizeTail.
+        controller.isFinalizingRecording = false
+        controller.finalizeTail(for: recording, liveTranscriptIsAuthoritative: false)
+
+        // The tail enqueues onto the background service; draining it
+        // produces the completed transcript without the finalize flag ever
+        // latching.
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.fullText, "finalized in background")
+        XCTAssertFalse(controller.isFinalizingRecording,
+                       "the heavy finalize tail must run with the record button free")
+    }
+
     func test_user_bug_repro_second_recording_after_first_started_transcribing() async throws {
         let first = tempRoot.appendingPathComponent("recording-A.wav")
         let second = tempRoot.appendingPathComponent("recording-B.wav")
