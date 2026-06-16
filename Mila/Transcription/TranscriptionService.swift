@@ -16,6 +16,15 @@ private let serviceLog = Logger(subsystem: "io.island.whisper.IslandWhisper", ca
 final class TranscriptionService: ObservableObject {
     @Published private(set) var activeRecordingID: UUID?
     @Published private(set) var pendingIDs: [UUID] = []
+
+    /// Set to a recording's id while the OFFLINE speaker re-diarize pass is
+    /// running for it (`rediarizeSegments`). This is NOT transcription —
+    /// the transcript text is already final by this point; the pyannote
+    /// subprocess is only re-clustering speaker labels. The UI uses this to
+    /// show an accurate "Identifying speakers…" status instead of falsely
+    /// implying the transcript is still being produced. `nil` when no
+    /// re-diarize is in flight.
+    @Published private(set) var diarizingRecordingID: UUID?
     @Published private(set) var progress: Double = 0
     @Published var lastError: String?
 
@@ -271,8 +280,15 @@ final class TranscriptionService: ObservableObject {
     /// diarization isn't configured, there are no segments, the offline pass
     /// yields no turns, or it throws. The whole pass runs off-main inside
     /// `SpeakerDiarizer.diarize`.
-    func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment]) async -> [TranscriptSegment]? {
+    ///
+    /// Pass `recordingID` so the UI can show an accurate "Identifying
+    /// speakers…" status (via `diarizingRecordingID`) for exactly the
+    /// recording being re-diarized — the transcript text is already final
+    /// here, so calling this "Transcribing" would mislead.
+    func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment], recordingID: UUID? = nil) async -> [TranscriptSegment]? {
         guard diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
+        diarizingRecordingID = recordingID
+        defer { diarizingRecordingID = nil }
         do {
             let turns = try await SpeakerDiarizer.diarize(wavURL: wavURL,
                                                           pythonPath: diarizationSettings.pythonPath)

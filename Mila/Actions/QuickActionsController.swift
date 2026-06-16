@@ -27,6 +27,23 @@ final class QuickActionsController: ObservableObject {
         case importingFile(URL)
     }
 
+    /// Upper bound on the number of distinct speakers the LIVE diarizer
+    /// found below which we skip the offline re-diarize pass entirely.
+    ///
+    /// The offline re-diarize (`TranscriptionService.rediarizeSegments`)
+    /// only exists to fix the online diarizer's tendency to OVER-segment —
+    /// it labels each utterance as it streams in and can never revise, so a
+    /// single narrator can end up split across 7 `SPEAKER_NN`. Global
+    /// clustering on the finished WAV collapses those back down.
+    ///
+    /// But over-segmentation only matters when MANY speakers were minted.
+    /// For a short conversation the live pass already pinned at ≤3 distinct
+    /// speakers, the labels are almost certainly correct, so re-running the
+    /// heavy pyannote subprocess is wasted work and delay — "when you're
+    /// done, you're just done." We re-diarize only when the live count
+    /// exceeds this threshold. See `shouldRediarize(liveSpeakerCount:)`.
+    static let maxLiveSpeakersToSkipRediarize = 3
+
     @Published private(set) var activeJob: ActiveJob = .none
     @Published private(set) var availableApps: [SCRunningApplication] = []
     @Published var isAppPickerShown = false
@@ -737,6 +754,20 @@ final class QuickActionsController: ObservableObject {
         finalizeTail(for: updated, liveTranscriptIsAuthoritative: liveTranscriptIsAuthoritative)
     }
 
+    /// Whether the offline re-diarize pass is worth running given how many
+    /// distinct speakers the LIVE diarizer already found. Re-diarization
+    /// only corrects OVER-segmentation, which only happens when many
+    /// speakers were minted; at or below `maxLiveSpeakersToSkipRediarize`
+    /// the live labels are almost certainly already right, so we skip the
+    /// heavy pyannote subprocess. `liveSpeakerCount == 0` (no labels at
+    /// all) also skips — there's nothing for the offline pass to clean up.
+    ///
+    /// Pure + `static` so the gate is unit-testable without a real
+    /// diarization subprocess (which CI can't spin up).
+    static func shouldRediarize(liveSpeakerCount: Int) -> Bool {
+        liveSpeakerCount > maxLiveSpeakersToSkipRediarize
+    }
+
     /// The HEAVY, live-singleton-free tail of finalization, run as a
     /// detached, id-keyed background task so the record button (freed in
     /// `stopRecording` once the live pipeline is drained) stays usable
@@ -774,17 +805,28 @@ final class QuickActionsController: ObservableObject {
                 // labels. Skips gracefully — keeping the live speakers — if
                 // diarization isn't configured or the pass fails.
                 //
-                // Re-fetch before writing: the user may have renamed the
-                // recording (rename sheet) while this tail was running, so
-                // we update only the segments rather than clobbering the row.
-                if let rediarized = await self.transcription.rediarizeSegments(
-                    wavURL: self.store.audioURL(for: updated),
-                    segments: updated.segments) {
-                    updated.segments = rediarized
-                    if var current = self.store.recordings.first(where: { $0.id == id }) {
-                        current.segments = rediarized
-                        self.store.update(current)
-                        updated = current
+                // Only re-diarize when the live pass minted MORE than
+                // `maxLiveSpeakersToSkipRediarize` distinct speakers —
+                // that's the over-segmentation the offline pass fixes. A
+                // short conversation the live diarizer already pinned at
+                // ≤3 speakers is almost certainly correct, so we finalize
+                // with the live labels as-is and skip the heavy pyannote
+                // subprocess (saves seconds of post-record delay).
+                let liveSpeakerCount = Set(updated.segments.compactMap(\.speaker)).count
+                if Self.shouldRediarize(liveSpeakerCount: liveSpeakerCount) {
+                    // Re-fetch before writing: the user may have renamed the
+                    // recording (rename sheet) while this tail was running, so
+                    // we update only the segments rather than clobbering the row.
+                    if let rediarized = await self.transcription.rediarizeSegments(
+                        wavURL: self.store.audioURL(for: updated),
+                        segments: updated.segments,
+                        recordingID: id) {
+                        updated.segments = rediarized
+                        if var current = self.store.recordings.first(where: { $0.id == id }) {
+                            current.segments = rediarized
+                            self.store.update(current)
+                            updated = current
+                        }
                     }
                 }
                 // Write the SRT sidecar + trigger the summarizer ourselves (the

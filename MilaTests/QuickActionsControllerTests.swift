@@ -295,6 +295,29 @@ final class QuickActionsControllerTests: XCTestCase {
                        "the heavy finalize tail must run with the record button free")
     }
 
+    // MARK: - Re-diarize gate (skip when the live pass found few speakers)
+
+    /// The offline re-diarize only fixes the online diarizer's
+    /// over-segmentation, which only happens when MANY speakers were
+    /// minted. At or below the threshold the live labels are kept as-is
+    /// (no heavy pyannote subprocess). `0` (no labels) also skips.
+    func test_shouldRediarize_skips_at_or_below_threshold() {
+        XCTAssertEqual(QuickActionsController.maxLiveSpeakersToSkipRediarize, 3)
+        XCTAssertFalse(QuickActionsController.shouldRediarize(liveSpeakerCount: 0),
+                       "No live speaker labels at all — nothing to clean up, skip")
+        XCTAssertFalse(QuickActionsController.shouldRediarize(liveSpeakerCount: 1))
+        XCTAssertFalse(QuickActionsController.shouldRediarize(liveSpeakerCount: 2))
+        XCTAssertFalse(QuickActionsController.shouldRediarize(liveSpeakerCount: 3),
+                       "Exactly at the threshold must still skip")
+    }
+
+    /// Above the threshold the live pass over-segmented (e.g. one narrator
+    /// split into 7 speakers) — re-diarize to re-cluster globally.
+    func test_shouldRediarize_runs_above_threshold() {
+        XCTAssertTrue(QuickActionsController.shouldRediarize(liveSpeakerCount: 4))
+        XCTAssertTrue(QuickActionsController.shouldRediarize(liveSpeakerCount: 7))
+    }
+
     func test_user_bug_repro_second_recording_after_first_started_transcribing() async throws {
         let first = tempRoot.appendingPathComponent("recording-A.wav")
         let second = tempRoot.appendingPathComponent("recording-B.wav")

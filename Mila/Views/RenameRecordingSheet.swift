@@ -77,13 +77,19 @@ struct RenameRecordingSheet: View {
             || summarizer.isSummarizing(liveRecording.id)
     }
 
-    /// "Transcribing…", "Done", "Failed", "Waiting in queue" — drives the
-    /// progress indicator inside the sheet.
+    /// "Transcribing…", "Identifying speakers…", "Done", "Failed",
+    /// "Waiting in queue" — drives the progress indicator inside the sheet.
     private var transcriptionLabel: String {
         let live = liveRecording
         if transcription.activeRecordingID == live.id {
             let pct = Int(transcription.progress * 100)
             return "Transcribing… \(pct)%"
+        }
+        // The offline re-diarize pass: the transcript text is already final
+        // (status is .completed), so "Transcribing" would be wrong — the
+        // pyannote subprocess is only re-clustering speaker labels.
+        if transcription.diarizingRecordingID == live.id {
+            return "Identifying speakers…"
         }
         switch live.status {
         case .pending:   return "Waiting to transcribe…"
@@ -384,13 +390,20 @@ struct RenameRecordingSheet: View {
 
     @ViewBuilder
     private var statusIcon: some View {
-        switch liveRecording.status {
-        case .completed:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-        case .failed:
-            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-        default:
+        // While the offline re-diarize is in flight the transcript is done
+        // but speaker labels aren't — show a spinner, not the green check,
+        // to match the "Identifying speakers…" label.
+        if transcription.diarizingRecordingID == liveRecording.id {
             ProgressView().controlSize(.small)
+        } else {
+            switch liveRecording.status {
+            case .completed:
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            default:
+                ProgressView().controlSize(.small)
+            }
         }
     }
 
