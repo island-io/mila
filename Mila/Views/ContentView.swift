@@ -335,6 +335,23 @@ private struct ModelDownloadBanner: View {
     }
 }
 
+/// Builds a toolbar `Menu` label as a single padded `Text`.
+///
+/// macOS 26 sizes a toolbar menu pill to its label's `Text` glyph run and
+/// ignores `.padding` / spacer views; it also locks the disclosure chevron to
+/// the pill's right edge (so figure spaces after the label only ever push the
+/// chevron, never pad to its right). To get *symmetric* horizontal breathing
+/// room, the call site hides the system indicator (`.menuIndicator(.hidden)`)
+/// and we draw our own `chevron.down` here, padding both outer edges with
+/// figure spaces (U+2007 — non-breaking, fixed width).
+private func paddedToolbarMenuLabel(_ inner: Text) -> Text {
+    let pad = Text("\u{2007}\u{2007}").font(.system(size: 15))
+    let gap = Text("\u{2007}").font(.system(size: 15))
+    let chevron = Text(Image(systemName: "chevron.down"))
+        .font(.system(size: 10, weight: .semibold))
+    return pad + inner + gap + chevron + pad
+}
+
 /// Compact toolbar dropdown that pins the input device used for the next
 /// recording / dictation. Mirrors the Settings → Audio "Input source"
 /// picker but lives next to the language picker so the user can swap to
@@ -365,18 +382,17 @@ private struct InputDevicePickerToolbarItem: View {
             Divider()
             Button("Refresh device list") { refresh() }
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "mic")
-                    .font(.system(size: 14, weight: .medium))
-                Text(displayName)
+            // Single Text label (mic symbol + device name + our own chevron),
+            // figure-space padded on both edges — see `paddedToolbarMenuLabel`
+            // for why .padding / the system chevron don't work on macOS 26.
+            paddedToolbarMenuLabel(
+                Text("\(Image(systemName: "mic"))\u{2007}\(displayName)")
                     .font(.callout.weight(.medium))
-                    .lineLimit(1)
-            }
-            // Breathing room so the icon/label aren't flush against the
-            // borderless menu's rounded capsule edges.
-            .padding(.horizontal, 8)
+            )
+            .lineLimit(1)
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .help("Microphone used for new recordings and dictation")
         .onAppear(perform: refresh)
     }
@@ -428,18 +444,15 @@ private struct LanguagePickerToolbarItem: View {
             .pickerStyle(.inline)
             .labelsHidden()
         } label: {
-            HStack(spacing: 6) {
-                Text(languageSettings.current.flagEmoji)
-                    .font(.system(size: 16))
-                Text(languageSettings.current.displayName)
-                    .font(.callout.weight(.medium))
-            }
-            // Breathing room so the flag/label aren't flush against the
-            // borderless menu's rounded capsule edges (matches the input
-            // device picker next to it).
-            .padding(.horizontal, 8)
+            // Flag only — the language name is intentionally omitted (the flag
+            // is enough). Figure-space padded with our own chevron so the flag
+            // gets symmetric breathing room; see `paddedToolbarMenuLabel`.
+            paddedToolbarMenuLabel(
+                Text(languageSettings.current.flagEmoji).font(.system(size: 15))
+            )
         }
         .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
         .help("Language used for new voice memos and app-audio recordings")
     }
 }
