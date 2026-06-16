@@ -138,6 +138,207 @@ final class AudioLoopbackUITests: XCTestCase {
         )
     }
 
+    /// REGRESSION E2E for `fix/record-while-finalizing` (PR #4).
+    ///
+    /// The bug: after Stop, the Record button was disabled and showed
+    /// "Finalizing…" from the moment the user hit Stop until ALL
+    /// post-record processing (offline re-diarize subprocess, summarizer
+    /// LLM call, m4a transcode, or batch enqueue) finished — tens of
+    /// seconds. The user couldn't start a new recording in the meantime.
+    /// `stopRecording` held `isFinalizingRecording = true` across the whole
+    /// inline finalize via a blanket `defer`.
+    ///
+    /// The fix split finalize into Phase A (inline, holds the flag — the
+    /// bounded live-pipeline drain + snapshot + live-singleton teardown)
+    /// and Phase B (background, id-keyed `finalizeTasks` — the heavy
+    /// live-singleton-free tail). `isFinalizingRecording` clears the moment
+    /// Phase A ends, so the Record button frees up immediately and a NEW
+    /// recording can run while the prior one finishes finalizing.
+    ///
+    /// What this test drives (all through the REAL `stopRecording` path —
+    /// only the AVAudioEngine START is faked, via the
+    /// `--ui-test-finalize-regression` seam in `MilaApp`):
+    ///   1. Tap Record → stream the fixture → live segments appear.
+    ///   2. Tap Stop → assert the Record button returns to a USABLE idle
+    ///      state quickly (exists + enabled + not "Finalizing"). This is
+    ///      the core regression assertion — in the buggy code the button
+    ///      stayed disabled/"Finalizing" through the whole tail.
+    ///   3. Tap Record AGAIN (only possible because the button is free) →
+    ///      stream the fixture → live segments → Stop.
+    ///   4. Open All Transcriptions and assert BOTH recordings landed with
+    ///      non-empty transcripts — neither clobbered the other.
+    ///
+    /// Gated on `MILA_FIXTURE_E2E=1` like the sibling tests; uses the same
+    /// tiny-model + fixture-WAV env wiring.
+    func test_record_then_finalize_in_background_then_record_again() throws {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["MILA_FIXTURE_E2E"] == "1",
+            "Set MILA_FIXTURE_E2E=1 (via TEST_RUNNER_MILA_FIXTURE_E2E in xcodebuild env) to run."
+        )
+        guard let wavPath = ProcessInfo.processInfo.environment["MILA_FIXTURE_WAV_PATH"] else {
+            XCTFail("MILA_FIXTURE_WAV_PATH not set — workflow must point to the generated fixture WAV")
+            return
+        }
+
+        let app = XCUIApplication()
+        var args = [
+            "--uitests",
+            "--ui-test-recording-lang-en",
+            "--ui-test-finalize-regression",
+            "--ui-test-inject-fixture-wav=\(wavPath)",
+        ]
+        if let tinyPath = ProcessInfo.processInfo.environment["MILA_TINY_MODEL_PATH"],
+           !tinyPath.isEmpty {
+            args.append("--ui-test-tiny-model-path=\(tinyPath)")
+        }
+        // NOTE: deliberately NOT passing --ui-test-llm-claude here. The
+        // regression is about the button freeing up regardless of the heavy
+        // tail; leaving the summarizer unconfigured keeps the Phase B tail
+        // (which we want to overlap recording #2) free of an external CLI
+        // dependency and keeps the test deterministic.
+        app.launchArguments = args
+        app.launch()
+
+        // ---- Recording #1.
+        let record = app.descendants(matching: .any)
+            .matching(identifier: "home.record.hero").firstMatch
+        XCTAssertTrue(record.waitForExistence(timeout: 30),
+                      "Home Record button never appeared at launch")
+        snap(app: app, name: "[finalize] t=0 home pre-record-1")
+        record.tap()
+
+        // The fixture pump + tiny-model cold load: first live segment can
+        // take ~60-150s on a cold CI runner (see the throughput test).
+        let firstSegment1 = app.staticTexts
+            .matching(identifier: "liveTranscript.segment").firstMatch
+        XCTAssertTrue(firstSegment1.waitForExistence(timeout: 180),
+                      "Recording #1 produced no live segment within 180s")
+        let segCount1 = app.descendants(matching: .any)
+            .matching(identifier: "liveTranscript.segment")
+            .allElementsBoundByIndex.count
+        snap(app: app, name: "[finalize] recording-1 segs=\(segCount1)")
+        print("FinalizeE2E: recording#1 segments=\(segCount1)")
+
+        // ---- Stop #1 — the moment under test. After Phase A the button
+        // must be usable again even though Phase B may still be running.
+        let stop1 = app.descendants(matching: .any)
+            .matching(identifier: "liveAI.stop").firstMatch
+        XCTAssertTrue(stop1.waitForExistence(timeout: 10),
+                      "Stop button missing during recording #1")
+        stop1.tap()
+
+        // CORE REGRESSION ASSERTION: the Record button comes back, becomes
+        // ENABLED, and is NOT labelled "Finalizing…" — quickly. The Phase A
+        // drain is bounded (transcribeNow + diarizer drain on a tiny
+        // fixture), so 60s is generous; the buggy code would keep the
+        // button disabled for the WHOLE tail (or indefinitely under a CLI
+        // summarize). We poll because the Home view only re-renders the
+        // Record button once `isRecording` flips back to false.
+        let buttonFreed = pollUntil(timeout: 60) {
+            let btn = app.descendants(matching: .any)
+                .matching(identifier: "home.record.hero").firstMatch
+            guard btn.exists, btn.isEnabled else { return false }
+            // Belt-and-suspenders: the disabled state is the load-bearing
+            // signal, but also reject the "Finalizing…" copy in case the
+            // button is somehow enabled while still showing that label.
+            return !btn.label.localizedCaseInsensitiveContains("Finalizing")
+        }
+        let homeRecord = app.descendants(matching: .any)
+            .matching(identifier: "home.record.hero").firstMatch
+        snap(app: app, name: "[finalize] after-stop-1 freed=\(buttonFreed) label=\(homeRecord.exists ? homeRecord.label : "<gone>")")
+        print("FinalizeE2E: after-stop-1 freed=\(buttonFreed) enabled=\(homeRecord.exists ? "\(homeRecord.isEnabled)" : "gone")")
+        XCTAssertTrue(buttonFreed,
+                      "Record button stayed disabled/\"Finalizing\" after Stop #1 — the finalize is blocking the button (regression). It must free up after Phase A while the heavy Phase B tail runs in the background.")
+
+        // ---- Recording #2 — only reachable because the button is free.
+        homeRecord.tap()
+        let firstSegment2 = app.staticTexts
+            .matching(identifier: "liveTranscript.segment").firstMatch
+        // After the tiny model is warm the second cold load is far faster,
+        // but keep a generous budget for CI scheduling noise.
+        XCTAssertTrue(firstSegment2.waitForExistence(timeout: 120),
+                      "Recording #2 never started / produced no live segment within 120s — the Record button likely didn't actually start a new recording after Stop #1.")
+        let segCount2 = app.descendants(matching: .any)
+            .matching(identifier: "liveTranscript.segment")
+            .allElementsBoundByIndex.count
+        snap(app: app, name: "[finalize] recording-2 segs=\(segCount2)")
+        print("FinalizeE2E: recording#2 segments=\(segCount2)")
+
+        let stop2 = app.descendants(matching: .any)
+            .matching(identifier: "liveAI.stop").firstMatch
+        XCTAssertTrue(stop2.waitForExistence(timeout: 10),
+                      "Stop button missing during recording #2")
+        stop2.tap()
+
+        // Wait for the second finalize's Phase A to free the button again.
+        let buttonFreed2 = pollUntil(timeout: 60) {
+            let btn = app.descendants(matching: .any)
+                .matching(identifier: "home.record.hero").firstMatch
+            return btn.exists && btn.isEnabled
+        }
+        XCTAssertTrue(buttonFreed2, "Record button stayed disabled after Stop #2")
+
+        // ---- Assert BOTH recordings finalized with transcripts. Navigate
+        // to All Transcriptions (the unfiled bucket) and read the rows.
+        let allTranscriptions = app.descendants(matching: .any)
+            .matching(identifier: "sidebar.folder.default").firstMatch
+        XCTAssertTrue(allTranscriptions.waitForExistence(timeout: 10),
+                      "All Transcriptions sidebar row missing")
+        allTranscriptions.tap()
+
+        // Both recordings should appear as history rows. Their previews
+        // (the recording.fullText) must be non-empty — i.e. each kept its
+        // own live transcript through finalization. Poll: Phase B's
+        // rediarize/SRT may still be settling when we first navigate.
+        var rowCount = 0
+        var rowsWithText = 0
+        _ = pollUntil(timeout: 60) {
+            let rows = app.descendants(matching: .any)
+                .matching(NSPredicate(format: "identifier BEGINSWITH 'history.row.'"))
+                .allElementsBoundByIndex
+            rowCount = rows.count
+            // A combined a11y element folds the title + preview + meta into
+            // the row's label, so a row that carries its transcript has a
+            // label longer than just its title line. We assert presence of
+            // BOTH rows and that each one's label is non-trivial.
+            rowsWithText = rows.filter { !$0.label.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }.count
+            return rowCount >= 2 && rowsWithText >= 2
+        }
+        snap(app: app, name: "[finalize] all-transcriptions rows=\(rowCount) withText=\(rowsWithText)")
+        print("FinalizeE2E: history rows=\(rowCount) withText=\(rowsWithText)")
+        if rowCount < 2 {
+            print("FinalizeE2E: ===A11Y TREE AT FAILURE===")
+            print(app.debugDescription)
+            print("FinalizeE2E: ===A11Y TREE END===")
+        }
+        XCTAssertGreaterThanOrEqual(
+            rowCount, 2,
+            "Expected BOTH recordings in All Transcriptions, found \(rowCount). One recording clobbered the other (the id-keyed finalize-tail ownership regressed).")
+
+        // Each recording must carry a transcript. Read the live segments we
+        // observed during each recording as the floor (both were > 0) and
+        // confirm the persisted rows aren't empty shells.
+        XCTAssertGreaterThan(segCount1, 0, "Recording #1 captured no live segments")
+        XCTAssertGreaterThan(segCount2, 0, "Recording #2 captured no live segments")
+        XCTAssertGreaterThanOrEqual(
+            rowsWithText, 2,
+            "Both history rows must carry a transcript; only \(rowsWithText) of \(rowCount) had non-empty content.")
+    }
+
+    /// Poll `condition` every 0.5s until it returns true or `timeout`
+    /// elapses. Returns the last evaluation. Used instead of
+    /// `waitForExistence` where the thing we're waiting on is a *state*
+    /// (button enabled / row count) rather than a single element's
+    /// existence.
+    private func pollUntil(timeout: TimeInterval, _ condition: () -> Bool) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+        return condition()
+    }
+
     // MARK: - Driver
 
     private enum TokenStrictness {

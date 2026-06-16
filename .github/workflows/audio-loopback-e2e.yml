@@ -164,6 +164,7 @@ jobs:
             -destination 'platform=macOS' \
             -only-testing:MilaUITests/AudioLoopbackUITests/test_english_two_minute_recording_progresses \
             -only-testing:MilaUITests/AudioLoopbackUITests/test_english_low_volume_recovered_by_agc \
+            -only-testing:MilaUITests/AudioLoopbackUITests/test_record_then_finalize_in_background_then_record_again \
             -derivedDataPath build-ui \
             CODE_SIGNING_ALLOWED=NO \
             -resultBundlePath build-ui/ui.xcresult

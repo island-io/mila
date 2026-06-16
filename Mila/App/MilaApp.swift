@@ -295,6 +295,7 @@ struct MilaApp: App {
                 .task { startMeetingDetectionIfNeeded() }
                 .task { await wireLiveAIPipeline() }
                 .task { await injectFixtureWavIfRequested() }
+                .task { await runFinalizeRegressionIfRequested() }
                 .task { recordingSummarizer.backfillIfNeeded() }
                 .environmentObject(recordingSummarizer)
                 .environmentObject(meetingDetectionSettings)
@@ -423,6 +424,12 @@ struct MilaApp: App {
     /// signal to verify AGC is what's bridging the gap.
     @MainActor
     private func injectFixtureWavIfRequested() async {
+        // The finalize-regression seam reuses `--ui-test-inject-fixture-wav=`
+        // but drives its own start/pump/stop cycle through
+        // `QuickActionsController`; if both ran they'd both flip
+        // `session.state` and fight over the fake recording. Defer entirely
+        // to `runFinalizeRegressionIfRequested` when that flag is present.
+        guard !CommandLine.arguments.contains("--ui-test-finalize-regression") else { return }
         guard let arg = CommandLine.arguments.first(where: {
             $0.hasPrefix("--ui-test-inject-fixture-wav=")
         }) else { return }
@@ -450,6 +457,118 @@ struct MilaApp: App {
         os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
             .log("inject-fixture: pumping \(wavPath, privacy: .public) agc=\(agcEnabled ? "on" : "off", privacy: .public)")
         await Self.pumpFixtureWAV(path: wavPath, to: sessionRef, agcEnabled: agcEnabled)
+    }
+
+    /// CI E2E seam for the "record while the previous recording finalizes"
+    /// regression (PR `fix/record-while-finalizing`). Distinct from
+    /// `injectFixtureWavIfRequested` — that one pumps a single recording
+    /// forever for the throughput/AGC tests; this one is TEST-DRIVEN: the UI
+    /// test taps the real Record button to start / stop each recording, and
+    /// this seam supplies the audio so a recording produces real live
+    /// segments without a mic. It lets the UI test assert that:
+    ///
+    ///   1. Stop #1 frees the Record button quickly (Phase A is bounded and
+    ///      `isFinalizingRecording` clears the moment the live pipeline is
+    ///      drained — it is NOT held across the heavy Phase B tail). In the
+    ///      buggy pre-PR code the flag was held by a blanket `defer` across
+    ///      the whole finalize, so a second Start was blocked until the tail
+    ///      finished.
+    ///   2. Recording #2 can start and finalize while #1's heavy tail
+    ///      (rediarize / SRT / summarize / transcode, or batch enqueue) is
+    ///      still settling in the background, and BOTH recordings end up in
+    ///      the store with their live transcripts intact (neither clobbers
+    ///      the other — the id-keyed `finalizeTasks` ownership model).
+    ///
+    /// Triggered by `--ui-test-finalize-regression`. The button tap is
+    /// routed to `QuickActionsController.startFakeRecordingForTesting`
+    /// (which skips AVAudioEngine) by the `toggleRecord` interception. This
+    /// task just watches `session.$state`: each time a recording starts it
+    /// kicks a ONE-SHOT finite fixture pump so the live transcriber produces
+    /// real segments. (The post-record rename sheet is suppressed under the
+    /// same flag in `PostRecordingCoordinator.present`, so Home and the
+    /// Record button stay reachable for the next tap without any dismiss
+    /// dance here.)
+    ///
+    /// Reuses the same `--ui-test-inject-fixture-wav=` /
+    /// `--ui-test-tiny-model-path=` launch args as the throughput test so
+    /// the workflow wiring is shared.
+    @MainActor
+    private func runFinalizeRegressionIfRequested() async {
+        guard CommandLine.arguments.contains("--ui-test-finalize-regression") else { return }
+        guard let arg = CommandLine.arguments.first(where: {
+            $0.hasPrefix("--ui-test-inject-fixture-wav=")
+        }) else { return }
+        let wavPath = String(arg.dropFirst("--ui-test-inject-fixture-wav=".count))
+        guard FileManager.default.fileExists(atPath: wavPath) else {
+            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                .log("finalize-regression: WAV missing at \(wavPath, privacy: .public)")
+            return
+        }
+        let sessionRef = session
+        var pumpTask: Task<Void, Never>?
+        // Watch for the test tapping Record (→ .recording) and Stop
+        // (→ .stopping → .idle). On each fresh .recording, pump the fixture
+        // once so the live transcriber produces real segments.
+        for await state in sessionRef.$state.values {
+            switch state {
+            case .recording:
+                guard pumpTask == nil else { break }
+                os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                    .log("finalize-regression: .recording — arming one-shot fixture pump")
+                pumpTask = Task { @MainActor in
+                    // Wait for wireLiveAIPipeline to install onLiveSamples
+                    // on the .recording transition before pumping (≤ ~3s).
+                    for _ in 0..<60 {
+                        if sessionRef.onLiveSamples != nil { break }
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                    await Self.pumpFixtureWAVOnce(path: wavPath, to: sessionRef, agcEnabled: true)
+                }
+            case .stopping:
+                break
+            case .idle:
+                pumpTask?.cancel()
+                pumpTask = nil
+            }
+        }
+    }
+
+    /// Like `pumpFixtureWAV` but pumps the fixture exactly ONCE and returns
+    /// (no infinite loop). Used by the finalize-regression seam, which needs
+    /// each recording to have a finite tail it can stop on. The fixture is
+    /// only ~5-10s so a recording's worth of segments lands quickly even on
+    /// CI's slow first whisper cold-load.
+    private static func pumpFixtureWAVOnce(path: String,
+                                           to session: RecordingSession,
+                                           agcEnabled: Bool) async {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let (samples, sampleRate) = Self.decodeWAV(data: data) else {
+            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                .log("finalize-regression: failed to decode WAV at \(path, privacy: .public)")
+            return
+        }
+        let agc = AdaptiveGainController(sampleRate: sampleRate, enabled: agcEnabled)
+        let chunkSamples = Int(sampleRate * 0.02)  // 20ms
+        let startedAt = Date()
+        var pumped = 0
+        var offset = 0
+        while offset < samples.count {
+            if Task.isCancelled { return }
+            let end = min(offset + chunkSamples, samples.count)
+            var chunk = Array(samples[offset..<end])
+            if agcEnabled {
+                chunk = agc.process(chunk)
+            }
+            session.onLiveSamples?(ArraySlice(chunk))
+            offset = end
+            pumped += chunk.count
+            let elapsedTarget = Double(pumped) / sampleRate
+            let elapsedReal = Date().timeIntervalSince(startedAt)
+            if elapsedTarget > elapsedReal {
+                let napNs = UInt64((elapsedTarget - elapsedReal) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: napNs)
+            }
+        }
     }
 
     /// Read a 16kHz mono WAV from disk and feed it to

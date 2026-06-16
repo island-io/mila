@@ -38,6 +38,13 @@ final class PostRecordingCoordinator: ObservableObject {
     /// dropped (we don't queue — concurrent voice memos are rare and a
     /// stack of sheets is worse UX than just naming the first one).
     func present(_ recording: Recording) {
+        // UI-TEST: the record-while-finalizing E2E drives two back-to-back
+        // recordings through the real `stopRecording`; a modal rename sheet
+        // after each Stop would sit over Home and block the next Record tap
+        // / the button-state query. Suppress it under the regression flag —
+        // the recording is still added to the store (the assertion target),
+        // it just isn't surfaced for renaming. No effect on any real launch.
+        if CommandLine.arguments.contains("--ui-test-finalize-regression") { return }
         guard pending == nil else { return }
         pending = recording
     }

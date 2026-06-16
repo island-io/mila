@@ -251,11 +251,55 @@ final class QuickActionsController: ObservableObject {
             quickActionsLog.log("toggleRecord ignored — both Microphone and App audio are off")
             return
         }
+        // UI-TEST routing: when the finalize-regression E2E is driving the
+        // app, the Record button tap must NOT spin up AVAudioEngine (no mic
+        // on CI). Route to the fake-start seam instead; MilaApp's
+        // `runFinalizeRegressionIfRequested` observes the resulting
+        // `.recording` state transition and pumps the fixture WAV. Every
+        // other code path (the real Stop above, the whole `stopRecording`
+        // Phase A/Phase B split under test) is unchanged — only the START
+        // is faked, exactly the part CI can't do for real.
+        if CommandLine.arguments.contains("--ui-test-finalize-regression") {
+            let url = store.freshAudioURL(suggestedName: "Recording")
+            await startFakeRecordingForTesting(outputURL: url)
+            return
+        }
         if microphone {
             await startRecording(withSystemAudio: appAudio)
         } else {
             await startAppRecording(app: nil, includeMic: false)
         }
+    }
+
+    /// UI-TEST SEAM. Starts a recording without AVAudioEngine / the mic
+    /// permission gate, so the audio-loopback E2E can drive the REAL
+    /// `stopRecording` (Phase A / Phase B split) without a physical mic.
+    /// Mirrors `startRecording(withSystemAudio:)`'s post-start bookkeeping
+    /// — it sets `activeJob` (so `isRecording` is true and `stopRecording`
+    /// builds the right title) and flips `RecordingSession.state` to
+    /// `.recording` via `startFakeForTesting`, which is what
+    /// `wireLiveAIPipeline` observes to wire up the live transcriber /
+    /// diarizer / LLM session. The caller is responsible for pumping
+    /// fixture samples into `session.onLiveSamples` and then calling
+    /// `stopRecording()`.
+    ///
+    /// `withSystemAudio: false` so the saved recording's source is
+    /// `.microphone` — the simplest path through `stopRecording`'s title /
+    /// source switch and the post-stop empty-mic warning (which is a
+    /// `lastError` toast, not a blocking modal, so it doesn't interfere).
+    ///
+    /// Guarded behind the re-entry flag like the production start paths so
+    /// a second start during the prior recording's bounded Phase A drain is
+    /// a no-op (the whole point of the regression: Phase A is short, so by
+    /// the time the test issues recording #2 the flag is already clear).
+    func startFakeRecordingForTesting(outputURL: URL) async {
+        if isFinalizingRecording {
+            quickActionsLog.log("startFakeRecordingForTesting ignored — finalize in progress")
+            return
+        }
+        guard activeJob == .none else { return }
+        await session.startFakeForTesting(outputURL: outputURL)
+        activeJob = .recording(withSystemAudio: false)
     }
 
     private func startRecording(withSystemAudio: Bool) async {

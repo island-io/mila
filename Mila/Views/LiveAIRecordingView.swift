@@ -67,6 +67,10 @@ struct LiveAIRecordingView: View {
             }
             .buttonStyle(.plain)
             .keyboardShortcut(.return, modifiers: .command)
+            // Stable handle for the audio-loopback E2E to drive Stop (the
+            // record-while-finalizing regression test taps this, then polls
+            // the Home Record button to confirm it isn't stuck "Finalizing").
+            .accessibilityIdentifier("liveAI.stop")
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(aiActive ? "Recording — Live AI" : "Recording")

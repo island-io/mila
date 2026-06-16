@@ -25,6 +25,12 @@ final class RecordingSession: ObservableObject {
     /// means the microphone produced nothing — read by the caller to surface
     /// an actionable message instead of a silent "failed" recording.
     private(set) var lastMicFrameCount: Int = 0
+    /// True only for a UI-test session started via `startFakeForTesting`.
+    /// Read by `stop()` so it doesn't snapshot a 0 mic-frame count (the fake
+    /// session never starts the real mic) — otherwise `stopRecording` would
+    /// trip its empty-mic `lastError` alert and pop a blocking modal over
+    /// the UI test.
+    private var isFakeForTesting = false
     /// Path of the WAV currently being written. `nil` while idle. The live
     /// streaming consumers (LiveSpeakerDiarizer) read partial frames out of
     /// this file while we're still appending to it — safe because
@@ -76,6 +82,7 @@ final class RecordingSession: ObservableObject {
         self.source = source
         self.fileURL = outputURL
         self.writesSinceStart = 0
+        self.isFakeForTesting = false
 
         let format = WhisperAudioFormat.pcmFloat32
         let settings: [String: Any] = [
@@ -137,6 +144,7 @@ final class RecordingSession: ObservableObject {
         self.source = .microphone
         self.fileURL = outputURL
         self.writesSinceStart = 0
+        self.isFakeForTesting = true
         // Skip AVAudioFile setup — the test injects samples directly
         // into onLiveSamples; nothing should be writing to disk.
         startTime = Date()
@@ -155,8 +163,10 @@ final class RecordingSession: ObservableObject {
         guard state == .recording else { return fileURL }
         state = .stopping
         // Snapshot the mic frame count BEFORE teardown so the caller can tell
-        // a genuinely-empty mic session apart from a normal one.
-        let micFrames = mic.capturedFrameCount
+        // a genuinely-empty mic session apart from a normal one. A fake
+        // UI-test session never started the real mic, so report a non-zero
+        // sentinel to keep `stopRecording` from tripping its empty-mic alert.
+        let micFrames = isFakeForTesting ? 1 : mic.capturedFrameCount
         lastMicFrameCount = micFrames
         await mic.stop()
         await system.stop()
@@ -174,6 +184,7 @@ final class RecordingSession: ObservableObject {
         fileURL = nil
         startTime = nil
         elapsed = 0
+        isFakeForTesting = false
         state = .idle
         return url
     }
@@ -193,6 +204,7 @@ final class RecordingSession: ObservableObject {
         fileURL = nil
         startTime = nil
         elapsed = 0
+        isFakeForTesting = false
         pendingSystem.removeAll(keepingCapacity: false)
         state = .idle
     }
