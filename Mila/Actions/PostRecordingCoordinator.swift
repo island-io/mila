@@ -1,5 +1,9 @@
 import Foundation
 import Combine
+import OSLog
+
+private let postRecordingLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                      category: "PostRecordingCoordinator")
 
 /// Owns the "Name this recording" sheet lifecycle. The sheet pops the moment
 /// a recording is added (i.e. recording stopped) — NOT when transcription
@@ -26,6 +30,27 @@ final class PostRecordingCoordinator: ObservableObject {
     /// torn down, and so the in-flight handle survives the SwiftUI redraws
     /// that would otherwise re-create local `@State`.
     private var llmTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Background "Send to <LLM>" work, keyed per-recording. Owned here —
+    /// on the app-lifetime coordinator — rather than spawned as a bare
+    /// anonymous `Task.detached` from the sheet, so the call survives the
+    /// sheet being dismissed (the whole point of "fire and walk away") and
+    /// so `cancelAndDiscard` can cancel it before deleting the recording.
+    ///
+    /// Separate from `llmTasks` (the foreground / auto Suggest path) so a
+    /// manual Suggest and a background Send for the same recording don't
+    /// clobber each other's handle. Mirrors `RecordingSummarizer.inFlight`:
+    /// id-keyed, self-clearing on completion, re-send for the same id
+    /// cancels + replaces the prior one.
+    private var sendTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// How long the background send will wait for an as-yet-unfinished
+    /// transcript before giving up. "Send to Claude" can now be pressed
+    /// before transcription finishes (fire and walk away), so when the
+    /// caller hands us an empty transcript we poll the store until the
+    /// recording lands in a terminal state. Generous bound: a long file
+    /// can still be transcribing minutes after the user walks away.
+    var transcriptWaitTimeout: TimeInterval = 600
 
     init(store: RecordingStore, transcription: TranscriptionService) {
         self.store = store
@@ -72,13 +97,134 @@ final class PostRecordingCoordinator: ObservableObject {
         llmTasks[recordingID] = nil
     }
 
+    // MARK: - Background "Send to <LLM>"
+
+    /// True while a background send is in flight for `recordingID`. Lets
+    /// the rename sheet (or any caller) reflect "still sending" state.
+    func isSending(_ recordingID: UUID) -> Bool {
+        sendTasks[recordingID] != nil
+    }
+
+    /// Fire the configured LLM action against `recordingID` in the
+    /// background and report the result through the activity banner.
+    ///
+    /// This is the shared implementation behind the rename sheet's
+    /// "Send to <LLM>" button and the right-click "Send to <LLM>…"
+    /// sheet. Both snapshot their prompt / transcript / summary and
+    /// dismiss BEFORE calling this, so the call genuinely runs in the
+    /// background — the user can close the sheet and walk away.
+    ///
+    /// `transcript` is whatever the caller had at click time. When the
+    /// user fires before transcription finishes it'll be empty; in that
+    /// case we wait for the recording to reach a terminal state and pull
+    /// the finished transcript out of the store ourselves, rather than
+    /// blocking the UI behind a disabled button. (The sheet used to gate
+    /// the button on `transcriptReady` for exactly this reason — now the
+    /// readiness wait lives here so "Send" is always pressable.)
+    ///
+    /// Idempotent per id: a second send for the same recording cancels and
+    /// replaces the first (no use case for two competing CLI calls writing
+    /// the same banner). The task clears its own handle on completion.
+    func sendToLLM(recordingID: UUID,
+                   tool: LLMTool,
+                   prompt: String,
+                   transcript: String,
+                   summary: String,
+                   executableOverride: String?) {
+        guard tool != .none else { return }
+        let toolName = tool.displayName
+
+        // Cancel + replace any prior send for this recording.
+        sendTasks[recordingID]?.cancel()
+
+        postStatus("Sending to \(toolName)…")
+
+        let timeout = transcriptWaitTimeout
+        let task = Task { @MainActor [weak self] in
+            defer {
+                if let self { self.sendTasks[recordingID] = nil }
+            }
+            guard let self else { return }
+            // Resolve the transcript: use the click-time snapshot if it
+            // already has text, otherwise wait for transcription to finish.
+            let resolved: String
+            if transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                guard let waited = await self.awaitTranscript(for: recordingID,
+                                                              timeout: timeout) else {
+                    if Task.isCancelled { return }
+                    self.postStatus("\(toolName): no transcript to send.", isError: true)
+                    return
+                }
+                resolved = waited
+            } else {
+                resolved = transcript
+            }
+            if Task.isCancelled { return }
+            do {
+                let output = try await LLMRunner.run(
+                    tool: tool,
+                    prompt: prompt,
+                    transcript: resolved,
+                    summary: summary,
+                    executablePathOverride: executableOverride,
+                    timeout: LLMRunner.defaultTimeout
+                )
+                let preview = output
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .prefix(80)
+                self.postStatus("\(toolName): \(preview)")
+                postRecordingLog.log("send succeeded \(recordingID.uuidString.prefix(8), privacy: .public) -> \(output.count, privacy: .public) chars")
+            } catch LLMRunnerError.cancelled {
+                // User discarded the recording (or fired a replacement
+                // send) — no banner, the cancellation was deliberate.
+            } catch {
+                if Task.isCancelled { return }
+                self.postStatus("\(toolName) failed: \(error.localizedDescription)",
+                                isError: true)
+                postRecordingLog.error("send failed \(recordingID.uuidString.prefix(8), privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        sendTasks[recordingID] = task
+    }
+
+    /// Poll the store until `recordingID` has a non-empty transcript and
+    /// has left the in-progress states (`.pending` / `.running`), then
+    /// return the speaker-aware plain text. Returns nil if the recording
+    /// disappears, ends up with no text, or the wait times out / is
+    /// cancelled. The wait is cheap (a short sleep between checks) and
+    /// honours task cancellation so `cancelAndDiscard` unblocks it
+    /// immediately.
+    private func awaitTranscript(for recordingID: UUID,
+                                 timeout: TimeInterval) async -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if Task.isCancelled { return nil }
+            guard let rec = store.recordings.first(where: { $0.id == recordingID }) else {
+                return nil  // discarded out from under us
+            }
+            if rec.status != .pending && rec.status != .running {
+                let text = TranscriptFormatter.plainText(segments: rec.segments,
+                                                         fallback: rec.fullText)
+                return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    ? nil
+                    : text
+            }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return nil
+    }
+
     /// The Cancel button in the rename sheet: throw away EVERYTHING related
     /// to this recording. The user's mental model is "I changed my mind" —
     /// transcription that's still running keeps burning CPU on a result they
     /// won't see, and the foreground/background LLM call keeps running
     /// against the user's CLI auth quota. So:
-    ///  1. cancel any in-flight LLM task (terminating the underlying CLI
-    ///     process via LLMRunner's task-cancellation handler)
+    ///  1. cancel any in-flight LLM task — both the foreground Suggest
+    ///     task AND the background Send task — terminating the underlying
+    ///     CLI process via LLMRunner's task-cancellation handler. (Without
+    ///     cancelling the Send task, Discard could delete the recording out
+    ///     from under an in-flight send, leaving a CLI call chewing on a
+    ///     transcript whose recording no longer exists.)
     ///  2. trip the transcription service's abort flag so whisper.cpp
     ///     unwinds within ~100ms instead of finishing
     ///  3. permanently delete the recording + its audio file
@@ -86,6 +232,9 @@ final class PostRecordingCoordinator: ObservableObject {
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
         if let task = llmTasks.removeValue(forKey: recording.id) {
+            task.cancel()
+        }
+        if let task = sendTasks.removeValue(forKey: recording.id) {
             task.cancel()
         }
         transcription.cancel(recordingID: recording.id)

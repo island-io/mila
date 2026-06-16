@@ -178,13 +178,17 @@ struct RenameRecordingSheet: View {
                 Spacer()
                 if llm.isConfigured && llm.postActionEnabled {
                     Button("Save") { save() }
+                    // Always enabled — pressing this saves, dismisses, and
+                    // runs the action in the BACKGROUND, exactly like Save.
+                    // It used to be `.disabled(!transcriptReady)`, which
+                    // forced the user to wait for transcription with the
+                    // sheet open before they could "fire and walk away".
+                    // The coordinator now waits for the transcript itself
+                    // when fired early, so the button never needs to gate.
                     Button("Send to \(llm.tool.displayName)") { saveAndSend() }
                         .keyboardShortcut(.defaultAction)
                         .buttonStyle(.borderedProminent)
-                        .disabled(!transcriptReady)
-                        .help(transcriptReady
-                              ? "Save the title and run your action in the background"
-                              : "Available once the transcript is ready")
+                        .help("Save the title and run your action in the background")
                 } else {
                     Button("Save") { save() }
                         .keyboardShortcut(.defaultAction)
@@ -398,8 +402,16 @@ struct RenameRecordingSheet: View {
     /// background. We never block the UI on the LLM here — that's the whole
     /// point of "Send": the user expects to get on with their day, and the
     /// activity banner reports success / failure when the CLI returns.
+    ///
+    /// The actual send is owned by `PostRecordingCoordinator` (an
+    /// app-lifetime object) rather than a bare `Task.detached` here, so
+    /// the call survives the sheet being torn down and `cancelAndDiscard`
+    /// can cancel it. We snapshot the prompt/transcript/summary first
+    /// (they're tied to this `liveRecording`) and hand them off; the
+    /// transcript snapshot may be empty if the user pressed Send before
+    /// transcription finished — the coordinator waits for it in that case.
     private func saveAndSend() {
-        let toolName = llm.tool.displayName
+        let recordingID = liveRecording.id
         let prompt = llm.postActionPrompt
         let transcriptSnapshot = transcript
         // Summary travels alongside the transcript so the LLM sees the
@@ -411,31 +423,12 @@ struct RenameRecordingSheet: View {
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let tool = llm.tool
         coordinator.dismiss(savingTitle: title)
-        coordinator.postStatus("Sending to \(toolName)…")
-        Task.detached(priority: .utility) {
-            do {
-                let output = try await LLMRunner.run(
-                    tool: tool,
-                    prompt: prompt,
-                    transcript: transcriptSnapshot,
-                    summary: summarySnapshot,
-                    executablePathOverride: executableOverride,
-                    timeout: LLMRunner.defaultTimeout
-                )
-                let preview = output
-                    .replacingOccurrences(of: "\n", with: " ")
-                    .prefix(80)
-                await MainActor.run {
-                    coordinator.postStatus("\(toolName): \(preview)")
-                }
-                print("LLMRunner: \(toolName) succeeded -> \(output.count) chars")
-            } catch {
-                await MainActor.run {
-                    coordinator.postStatus("\(toolName) failed: \(error.localizedDescription)",
-                                           isError: true)
-                }
-            }
-        }
+        coordinator.sendToLLM(recordingID: recordingID,
+                              tool: tool,
+                              prompt: prompt,
+                              transcript: transcriptSnapshot,
+                              summary: summarySnapshot,
+                              executableOverride: executableOverride)
     }
 
     private func fetchNameFromLLM(auto: Bool = false) async {

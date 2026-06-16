@@ -105,7 +105,7 @@ struct SendToLLMSheet: View {
     }
 
     private func send() {
-        let toolName = llm.tool.displayName
+        let recordingID = liveRecording.id
         let promptSnapshot = prompt
         let transcriptSnapshot = transcript
         // Include any Live-AI summary so the LLM sees the gist before the
@@ -117,29 +117,16 @@ struct SendToLLMSheet: View {
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let tool = llm.tool
         dismiss()
-        postRecording.postStatus("Sending to \(toolName)…")
-        Task.detached(priority: .utility) {
-            do {
-                let output = try await LLMRunner.run(
-                    tool: tool,
-                    prompt: promptSnapshot,
-                    transcript: transcriptSnapshot,
-                    summary: summarySnapshot,
-                    executablePathOverride: executableOverride,
-                    timeout: LLMRunner.defaultTimeout
-                )
-                let preview = output
-                    .replacingOccurrences(of: "\n", with: " ")
-                    .prefix(80)
-                await MainActor.run {
-                    postRecording.postStatus("\(toolName): \(preview)")
-                }
-            } catch {
-                await MainActor.run {
-                    postRecording.postStatus("\(toolName) failed: \(error.localizedDescription)",
-                                             isError: true)
-                }
-            }
-        }
+        // Hand off to the app-lifetime coordinator so the call is owned +
+        // cancellable rather than spawned as a fire-and-forget detached
+        // Task. The Send button here is already gated on a non-empty
+        // transcript, so the snapshot is populated and the coordinator
+        // runs it immediately (no transcript wait).
+        postRecording.sendToLLM(recordingID: recordingID,
+                                tool: tool,
+                                prompt: promptSnapshot,
+                                transcript: transcriptSnapshot,
+                                summary: summarySnapshot,
+                                executableOverride: executableOverride)
     }
 }
