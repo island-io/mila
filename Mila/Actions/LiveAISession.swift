@@ -35,6 +35,61 @@ final class LiveAISession: ObservableObject {
     private var coalesced: Bool = false
     private var latestTranscript: String = ""
 
+    // MARK: - Min-interval throttle
+
+    /// When the most recent tick *started* (nil before the first tick).
+    /// The throttle is measured from the start, not the end, so a long
+    /// call that already outlasted the interval adds no extra delay.
+    private var lastKickStartedAt: Date?
+    /// A throttled tick that's sleeping out the remaining interval. At
+    /// most one exists at a time; cancelled on stop / finalize.
+    private var pendingKickTask: Task<Void, Never>?
+    /// Set while `awaitFinalTick()` is draining at stop time — makes
+    /// every scheduled kick fire immediately (no floor) so the saved
+    /// summary covers right up to stop.
+    private var isFinalizing: Bool = false
+
+    /// Clock seam — overridable in tests to drive the throttle on a
+    /// simulated timeline. Production reads the wall clock.
+    var nowProvider: () -> Date = { Date() }
+
+    /// The actual subprocess call, factored out so tests can substitute a
+    /// stub that records invocations without spawning a real CLI.
+    /// Production runs the `claude` / `cursor-agent` binary via
+    /// `LLMRunner.run`.
+    struct LLMCall {
+        let tool: LLMTool
+        let prompt: String
+        let transcript: String
+        let executablePathOverride: String?
+        let model: String
+        let session: LLMSession
+        let timeout: TimeInterval
+    }
+    var performCall: (LLMCall) async throws -> String = { call in
+        try await LLMRunner.run(
+            tool: call.tool,
+            prompt: call.prompt,
+            transcript: call.transcript,
+            executablePathOverride: call.executablePathOverride,
+            model: call.model,
+            session: call.session,
+            timeout: call.timeout
+        )
+    }
+
+    /// Pure throttle core: how long to wait before the next tick may
+    /// *start*, given the previous tick's start time and the configured
+    /// minimum spacing. `0` means "start now". Exposed `static` so it can
+    /// be unit-tested exhaustively without any timing or subprocess.
+    static func kickDelay(now: Date,
+                          lastKickStartedAt: Date?,
+                          minInterval: TimeInterval) -> TimeInterval {
+        guard minInterval > 0, let last = lastKickStartedAt else { return 0 }
+        let elapsed = now.timeIntervalSince(last)
+        return elapsed >= minInterval ? 0 : (minInterval - elapsed)
+    }
+
     /// Per-recording session id for stateful Claude conversations. The
     /// first call uses `--session-id <uuid>` to CREATE the conversation
     /// and subsequent calls use `--resume <uuid>` to continue it (the
@@ -96,12 +151,27 @@ final class LiveAISession: ObservableObject {
     /// QuickActionsController at stop time to avoid the race where
     /// the saved Recording was assembled with stale Live AI output.
     func awaitFinalTick() async {
-        // Drain coalesced ticks too — the `.idle` teardown path fires
-        // one last `feed()`, which might land while a tick is in
-        // flight and queue a follow-up. The tick task itself sets
-        // `inFlight = nil` in its tail before potentially calling
-        // `kick()` again (which assigns a NEW Task), so looping
-        // until `inFlight` is nil drains everything.
+        // Stop time: flush now, don't honour the min-interval floor.
+        // `isFinalizing` makes every scheduleKick() in this window fire
+        // immediately (delay 0), including the coalesced re-kick the
+        // completion handler queues.
+        isFinalizing = true
+        defer { isFinalizing = false }
+        // Drop any throttled tick that's sleeping out the interval — we
+        // flush its (now stale) intent immediately below instead.
+        pendingKickTask?.cancel()
+        pendingKickTask = nil
+        // If nothing is running, fire the latest transcript right away.
+        // In session mode an already-sent transcript yields an empty
+        // delta and kick() returns without launching, so this is a
+        // no-op when there's nothing new.
+        if inFlight == nil {
+            scheduleKick(immediate: true)
+        }
+        // Drain the in-flight tick and any coalesced follow-up. The tick
+        // task sets `inFlight = nil` in its tail before potentially
+        // scheduling another (immediate, since isFinalizing) kick, so
+        // looping until `inFlight` is nil drains everything.
         while let handle = inFlight {
             _ = await handle.value
         }
@@ -116,6 +186,10 @@ final class LiveAISession: ObservableObject {
         coalesced = false
         latestTranscript = ""
         isThinking = false
+        pendingKickTask?.cancel()
+        pendingKickTask = nil
+        lastKickStartedAt = nil
+        isFinalizing = false
         // Wipe the per-session stable sandbox dir LLMRunner created so
         // /tmp doesn't accumulate one folder per recording. The child
         // claude subprocess receives SIGTERM via the cancelled Task,
@@ -134,16 +208,49 @@ final class LiveAISession: ObservableObject {
         lastTranscriptSent = ""
     }
 
-    /// Feed the latest full transcript. Triggers a tick if one isn't
-    /// already in flight; otherwise marks the session to fire one more
-    /// pass when the current call returns.
-    func feed(transcript: String) {
+    /// Feed the latest full transcript. Routes through the min-interval
+    /// throttle: a tick starts now only if no call is in flight AND at
+    /// least `llmMinIntervalSeconds` has passed since the last one
+    /// started; otherwise it's deferred or coalesced. Pass
+    /// `immediate: true` to bypass the floor (stop-time flush, or a
+    /// user-initiated toggle-on that wants instant feedback).
+    func feed(transcript: String, immediate: Bool = false) {
         latestTranscript = transcript
-        if inFlight == nil {
+        scheduleKick(immediate: immediate)
+    }
+
+    /// The single funnel all feed paths go through, so the throttle is
+    /// applied uniformly. Decides: start now, defer until the interval
+    /// elapses, or fold into the running call.
+    private func scheduleKick(immediate: Bool = false) {
+        guard llmSettings.isConfigured, !latestTranscript.isEmpty else { return }
+        // A call is already running — record that fresh transcript
+        // arrived; the completion handler re-evaluates and fires one
+        // more pass with the latest snapshot.
+        guard inFlight == nil else { coalesced = true; return }
+        let delay = (immediate || isFinalizing)
+            ? 0
+            : Self.kickDelay(now: nowProvider(),
+                             lastKickStartedAt: lastKickStartedAt,
+                             minInterval: liveAISettings.llmMinIntervalSeconds)
+        if delay <= 0 {
+            pendingKickTask?.cancel()
+            pendingKickTask = nil
             kick()
-        } else {
-            coalesced = true
+        } else if pendingKickTask == nil {
+            // Sleep out the remaining interval, then re-evaluate: the
+            // interval will have elapsed so it kicks — unless a call
+            // started meanwhile, in which case scheduleKick() coalesces.
+            // `latestTranscript` is read at fire time, so it picks up any
+            // segments that land while waiting.
+            pendingKickTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                guard let self, !Task.isCancelled else { return }
+                self.pendingKickTask = nil
+                self.scheduleKick()
+            }
         }
+        // else: a deferred kick is already waiting — leave it in place.
     }
 
     private func kick() {
@@ -236,8 +343,15 @@ TRANSCRIPT SO FAR:
             llmSession = .none
         }
         isThinking = true
+        // Stamp the throttle clock at the moment a tick commits to
+        // running (after all the early-return guards above), so a
+        // skipped/empty-delta kick doesn't reset the min-interval window.
+        lastKickStartedAt = nowProvider()
         let kickStart = Date()
         let kickTag = "tick-\(Int(kickStart.timeIntervalSinceReferenceDate * 1000) % 100_000)"
+        // Capture the (possibly stubbed) call closure so the detached
+        // task doesn't need `self` just to reach it.
+        let perform = performCall
         // Identify this tick by the session UUID it was launched for.
         // If `cancel()` or a fresh `start()` runs while the LLM call
         // is still in flight (session UUID gets cleared / replaced),
@@ -249,7 +363,7 @@ TRANSCRIPT SO FAR:
         inFlight = Task { @MainActor [weak self] in
             let llmStart = Date()
             do {
-                let raw = try await LLMRunner.run(
+                let raw = try await perform(LLMCall(
                     tool: tool,
                     prompt: prompt,
                     transcript: augmentedTranscript,
@@ -257,7 +371,7 @@ TRANSCRIPT SO FAR:
                     model: model,
                     session: llmSession,
                     timeout: timeout
-                )
+                ))
                 let elapsed = Date().timeIntervalSince(llmStart)
                 let parsed = Self.parseEnvelope(from: raw)
                 print(String(format: "LiveAI[%@]: response in %.1fs → %d items, summary=%dch", kickTag, elapsed, parsed.items.count, parsed.summary.count))
@@ -306,7 +420,10 @@ TRANSCRIPT SO FAR:
             // pass with the latest snapshot.
             if let self, self.coalesced {
                 self.coalesced = false
-                self.kick()
+                // Route through the throttle: honours the min-interval
+                // floor during normal operation, fires immediately while
+                // finalizing.
+                self.scheduleKick()
             }
         }
     }

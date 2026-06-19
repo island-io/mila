@@ -648,7 +648,9 @@ final class QuickActionsController: ObservableObject {
            let transcriber = liveTranscriber {
             let text = transcriber.formattedTranscript
             if !text.isEmpty {
-                liveAISession?.feed(transcript: text)
+                // Stop-time flush — bypass the min-interval floor so the
+                // final tick covers up to stop (awaitFinalTick drains it).
+                liveAISession?.feed(transcript: text, immediate: true)
             }
         }
         await liveAISession?.awaitFinalTick()

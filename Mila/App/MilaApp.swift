@@ -855,7 +855,9 @@ struct MilaApp: App {
                     .sink { [weak transcriber, weak aiSession] _ in
                         guard llmSettingsRef.isConfigured else { return }
                         if let text = transcriber?.formattedTranscript, !text.isEmpty {
-                            aiSession?.feed(transcript: text)
+                            // User just flipped Live AI on — bypass the
+                            // min-interval floor for instant feedback.
+                            aiSession?.feed(transcript: text, immediate: true)
                         }
                     }
 
@@ -934,7 +936,9 @@ struct MilaApp: App {
                     if aiSettings.enabled && llmSettingsRef.isConfigured {
                         let text = transcriber.formattedTranscript
                         if !text.isEmpty {
-                            aiSession.feed(transcript: text)
+                            // Final teardown flush — bypass the floor so
+                            // the saved snapshot covers up to stop.
+                            aiSession.feed(transcript: text, immediate: true)
                         }
                     }
                     _ = transcriber.stop()
