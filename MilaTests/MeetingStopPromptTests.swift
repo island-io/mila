@@ -75,6 +75,44 @@ final class MeetingStopPromptTests: XCTestCase {
         )
     }
 
+    // MARK: - Auto-dismiss when recording ends elsewhere
+
+    /// The bug this fixes: the stop prompt is up (≤10s countdown) and the
+    /// user stops recording through ANOTHER path (Record button, hotkey,
+    /// system sleep). The prompt must tear down rather than leave a dead
+    /// "Stop recording" button.
+    func test_stop_prompt_dismisses_when_recording_ends() {
+        XCTAssertTrue(
+            MeetingPromptCoordinator.shouldDismissStopPrompt(
+                stopPromptShowing: true,
+                isRecording: false
+            ),
+            "A showing stop prompt must auto-dismiss once recording is no longer active"
+        )
+    }
+
+    func test_stop_prompt_stays_while_recording_continues() {
+        XCTAssertFalse(
+            MeetingPromptCoordinator.shouldDismissStopPrompt(
+                stopPromptShowing: true,
+                isRecording: true
+            ),
+            "While recording is still active the stop prompt's button is live — keep it up"
+        )
+    }
+
+    /// The start prompt (and the no-prompt case) never set `stopPromptShowing`,
+    /// so recording-state changes must not dismiss anything through this path.
+    func test_no_dismiss_when_stop_prompt_not_showing() {
+        XCTAssertFalse(
+            MeetingPromptCoordinator.shouldDismissStopPrompt(
+                stopPromptShowing: false,
+                isRecording: false
+            ),
+            "With no stop prompt up (start prompt or nothing), recording-end must not dismiss"
+        )
+    }
+
     // MARK: - Detector transition (debounce)
 
     /// A single inactive poll must NOT fire `meetingEnded` — that's the

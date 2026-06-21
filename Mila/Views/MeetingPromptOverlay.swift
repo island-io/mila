@@ -24,7 +24,14 @@ final class MeetingPromptCoordinator: ObservableObject {
     private let actions: QuickActionsController
     private var startCancellable: AnyCancellable?
     private var endCancellable: AnyCancellable?
+    private var recordingStateCancellable: AnyCancellable?
     private var window: NSPanel?
+    /// True only while the currently-presented panel is the *stop* prompt.
+    /// Used to auto-dismiss that prompt if recording ends through any other
+    /// path (Record button, hotkey, sleep) during its countdown — a dead
+    /// "Stop recording" button is worse than no prompt. The start prompt is
+    /// untouched by this.
+    private var stopPromptShowing = false
 
     init(detector: MeetingDetector,
          settings: MeetingDetectionSettings,
@@ -59,6 +66,18 @@ final class MeetingPromptCoordinator: ObservableObject {
         return true
     }
 
+    /// Pure decision for whether a *showing* stop prompt should now
+    /// auto-dismiss. The stop prompt only makes sense while a recording is
+    /// live — its sole action is "stop recording." If recording ends through
+    /// any other path during the prompt's countdown (Record button, hotkey,
+    /// system sleep, etc.), the button becomes a dead no-op, so we tear the
+    /// prompt down. Only applies to the stop prompt; the start prompt is left
+    /// alone. Extracted so it's unit-testable without a real Zoom / panel.
+    static func shouldDismissStopPrompt(stopPromptShowing: Bool,
+                                        isRecording: Bool) -> Bool {
+        stopPromptShowing && !isRecording
+    }
+
     func start() {
         startCancellable = detector.meetingStarted
             .receive(on: DispatchQueue.main)
@@ -70,6 +89,15 @@ final class MeetingPromptCoordinator: ObservableObject {
             .sink { [weak self] app in
                 self?.handleMeetingEnd(app: app)
             }
+        // Auto-dismiss a showing stop prompt the moment recording leaves the
+        // active state through any path — `activeJob` is what backs
+        // `isRecording`, so observing it covers the Record button, hotkeys,
+        // and system-sleep stops alike.
+        recordingStateCancellable = actions.$activeJob
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.dismissStopPromptIfRecordingEnded()
+            }
         if settings.enabled {
             detector.start()
         }
@@ -80,6 +108,8 @@ final class MeetingPromptCoordinator: ObservableObject {
         startCancellable = nil
         endCancellable?.cancel()
         endCancellable = nil
+        recordingStateCancellable?.cancel()
+        recordingStateCancellable = nil
         detector.stop()
         hidePanel()
     }
@@ -129,6 +159,17 @@ final class MeetingPromptCoordinator: ObservableObject {
         ) else { return }
 
         showStopPanel(for: app)
+    }
+
+    /// Fires on every `actions.activeJob` change. If the stop prompt is up
+    /// and recording is no longer active, dismiss it — the "Stop recording"
+    /// button would otherwise be a dead no-op (recording already ended).
+    private func dismissStopPromptIfRecordingEnded() {
+        guard Self.shouldDismissStopPrompt(
+            stopPromptShowing: stopPromptShowing,
+            isRecording: actions.isRecording
+        ) else { return }
+        hidePanel()
     }
 
     private func showStartPanel(for app: MeetingDetector.App) {
@@ -184,6 +225,7 @@ final class MeetingPromptCoordinator: ObservableObject {
                 self?.hidePanel()
             }
         )
+        stopPromptShowing = true
         presentPanel(hosting: view)
     }
 
@@ -214,6 +256,7 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
 
     private func hidePanel() {
+        stopPromptShowing = false
         guard let panel = window else { return }
         self.window = nil
         NSAnimationContext.runAnimationGroup({ ctx in
