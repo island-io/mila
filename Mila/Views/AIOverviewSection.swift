@@ -62,9 +62,7 @@ struct AIOverviewSection: View {
             VStack(alignment: .leading, spacing: 12) {
                 let summaryText = summary ?? ""
                 if !summaryText.isEmpty || isSummarizing {
-                    summaryView(summaryText,
-                                alignment: alignmentValue,
-                                multiline: multilineAlignment)
+                    summaryView(summaryText)
                 }
                 if !items.isEmpty {
                     actionItemsView()
@@ -74,10 +72,8 @@ struct AIOverviewSection: View {
         }
     }
 
-    private func summaryView(_ text: String,
-                             alignment: Alignment,
-                             multiline: TextAlignment) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func summaryView(_ text: String) -> some View {
+        VStack(alignment: sectionIsRTL ? .trailing : .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Label("Summary", systemImage: "sparkles")
                     .font(.callout.weight(.semibold))
@@ -119,11 +115,18 @@ struct AIOverviewSection: View {
             // and — when the caller wired it — a "Regenerate summary"
             // entry that re-runs the LLM against the current transcript.
             if !text.isEmpty {
-                Text(text)
+                // Render with structure: a single run-on paragraph (the
+                // live rolling summary) becomes one bullet per sentence so
+                // it reads as a few lines like the live pane; an already
+                // multi-line markdown block is kept as-is. Inline markdown
+                // (**bold** etc.) renders. `.leading` + layoutDirection
+                // keeps Hebrew right-aligned with bullets on the right.
+                Text(Self.summaryAttributed(text))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: alignment)
-                    .multilineTextAlignment(multiline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(.leading)
+                    .environment(\.layoutDirection, sectionIsRTL ? .rightToLeft : .leftToRight)
                     .textSelection(.enabled)
                     .contextMenu {
                         Button("Copy summary") {
@@ -146,8 +149,8 @@ struct AIOverviewSection: View {
                     .font(.callout)
                     .italic()
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: alignment)
-                    .multilineTextAlignment(multiline)
+                    .frame(maxWidth: .infinity, alignment: sectionIsRTL ? .trailing : .leading)
+                    .multilineTextAlignment(sectionIsRTL ? .trailing : .leading)
             }
         }
     }
@@ -204,6 +207,33 @@ struct AIOverviewSection: View {
     /// All action items as a bulleted plain-text block, for one-click copy.
     fileprivate static func actionItemsText(_ items: [ActionItem]) -> String {
         items.map { "• \($0.text)" }.joined(separator: "\n")
+    }
+
+    /// Turn a stored summary into a few readable lines. The LLM emits
+    /// either a short run-on paragraph (the live rolling summary) or a
+    /// multi-line markdown block (the one-shot summarizer). A paragraph
+    /// with no line breaks is split into one bullet per sentence so it
+    /// reads as a few lines — matching the live recording pane — while a
+    /// block that already has line structure is kept as-is. Inline
+    /// markdown (`**bold**` etc.) is rendered; `\n` and literal "- " are
+    /// preserved.
+    static func summaryAttributed(_ raw: String) -> AttributedString {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body: String
+        if trimmed.contains("\n") {
+            body = trimmed
+        } else {
+            let sentences = trimmed
+                .split(whereSeparator: { ".!?".contains($0) })
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+            body = sentences.count > 1
+                ? sentences.map { "•\u{00A0}\($0)" }.joined(separator: "\n")
+                : trimmed
+        }
+        let opts = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return (try? AttributedString(markdown: body, options: opts)) ?? AttributedString(body)
     }
 
     fileprivate static func copyToPasteboard(_ text: String) {
