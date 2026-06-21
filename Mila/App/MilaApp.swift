@@ -124,6 +124,14 @@ final class UpdaterViewModel: NSObject, ObservableObject,
         let version = item.displayVersionString
         let notes = item.itemDescription
         Task { @MainActor in
+            // A user-initiated "Check for Updates…" (menu command, or
+            // "Update Now" from the popup) is owned end-to-end by Sparkle's
+            // STANDARD driver — it puts up its own "update available" window.
+            // If we ALSO recorded the custom popup here, BOTH would appear.
+            // Bail in that case so exactly one UI shows. The silent scheduled
+            // background poll leaves this flag false, so the custom popup
+            // still owns that path.
+            guard !self.userInitiatedCheckInFlight else { return }
             guard self.gate.shouldShow(availableVersion: version) else { return }
             self.availableUpdate = WhatsNewUpdate(
                 displayVersion: version,
@@ -138,27 +146,42 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     /// scheduled-update UI itself.
     nonisolated var supportsGentleScheduledUpdateReminders: Bool { true }
 
-    /// Return `false` for a SCHEDULED (background-poll) discovery so we can
-    /// present `WhatsNewPopup` instead of Sparkle's stock window. Return
-    /// `true` for a user-initiated check (menu command / "Update Now") so the
-    /// standard install dialog runs as usual.
+    /// Return `false` for a SCHEDULED (background-poll) discovery so the
+    /// delegate (our custom `WhatsNewPopup`) owns presentation instead of
+    /// Sparkle's stock window.
+    ///
+    /// This method is NOT called for user-initiated checks — per
+    /// `SPUStandardUserDriverDelegate.h`, "the standard user driver always
+    /// handles those." So we must NOT branch on `immediateFocus`: it merely
+    /// reflects whether the app was launched recently / the system is idle
+    /// (a common path), NOT whether the check was user-initiated. Branching
+    /// on it was why Sparkle's stock window ALSO popped on the launch poll.
+    ///
+    /// We only return `false` when the gate says we'd actually show a popup
+    /// for this version. If the gate would suppress the popup (e.g. the user
+    /// already dismissed this version), let Sparkle's standard UI handle it so
+    /// a scheduled discovery never ends up with no UI at all.
     nonisolated func standardUserDriverShouldHandleShowingScheduledUpdate(
         _ update: SUAppcastItem,
         andInImmediateFocus immediateFocus: Bool
     ) -> Bool {
-        // `immediateFocus` is true when the check was user-initiated /
-        // foreground — defer to Sparkle's standard UI in that case.
-        if immediateFocus { return true }
-        return MainActor.assumeIsolated { self.userInitiatedCheckInFlight }
+        let version = update.displayVersionString
+        return MainActor.assumeIsolated {
+            !self.gate.shouldShow(availableVersion: version)
+        }
     }
 
-    /// Sparkle is about to show (or hand off) an update. Reset the
-    /// user-initiated flag once a check resolves so the NEXT scheduled poll is
-    /// treated as scheduled again.
-    nonisolated func standardUserDriverWillHandleShowingUpdate(
-        _ handleShowingUpdate: Bool,
-        forUpdate update: SUAppcastItem,
-        state: SPUUserUpdateState
+    /// Called when an update CHECK CYCLE finishes — update scheduled, no
+    /// update found, dismissed/skipped, or aborted (per `SPUUpdaterDelegate.h`).
+    /// Reset the user-initiated flag here so the NEXT scheduled poll is treated
+    /// as scheduled again. We use this terminal callback rather than
+    /// `standardUserDriverWillHandleShowingUpdate` (which fires BEFORE the
+    /// update window appears and not at all for "no update found", which would
+    /// leave the flag stuck `true` after a user check that finds nothing).
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
     ) {
         Task { @MainActor in
             self.userInitiatedCheckInFlight = false

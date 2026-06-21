@@ -117,13 +117,33 @@ struct WhatsNewUpdate: Equatable, Identifiable {
     static func plainText(from html: String) -> String {
         var text = ""
         var insideTag = false
-        for ch in html {
+        var i = html.startIndex
+        while i < html.endIndex {
+            let ch = html[i]
             switch ch {
-            case "<": insideTag = true
-            case ">": insideTag = false
+            case "<":
+                // Only enter tag-stripping mode for a PLAUSIBLE tag-open: there
+                // must be a later '>' to close it. An unmatched '<' (e.g. CDATA
+                // prose like "latency < 50ms") is literal text — without this
+                // guard the old code silently dropped everything after such a
+                // '<'. Real tags (`<li>`, `<br>`, …) always have a closing '>',
+                // so they're stripped exactly as before.
+                if html[html.index(after: i)...].contains(">") {
+                    insideTag = true
+                } else {
+                    text.append(ch)
+                }
+            case ">":
+                if insideTag {
+                    insideTag = false
+                } else {
+                    // A stray '>' with no open tag is literal text.
+                    text.append(ch)
+                }
             default:
                 if !insideTag { text.append(ch) }
             }
+            i = html.index(after: i)
         }
         let entities: [(String, String)] = [
             ("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),

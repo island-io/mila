@@ -68,6 +68,29 @@ final class WhatsNewUpdateTests: XCTestCase {
         XCTAssertTrue(update.fullNotes.isEmpty)
     }
 
+    // MARK: - plainText tag-stripping edge cases
+
+    /// Regression for the parser dropping everything after a literal '<' with
+    /// no following '>' (e.g. release-note prose "latency < 50ms"). The old
+    /// loop entered tag-stripping mode on any '<' and never re-emitted, so the
+    /// tail was silently discarded.
+    func test_plainTextPreservesUnmatchedLessThan() {
+        XCTAssertEqual(WhatsNewUpdate.plainText(from: "latency < 50ms now"),
+                       "latency < 50ms now")
+    }
+
+    func test_plainTextPreservesStandaloneComparisonInList() {
+        let notes = "<ul><li>Reduced latency to a < b ms</li></ul>"
+        let update = WhatsNewUpdate(displayVersion: "1.9.0", releaseNotesHTML: notes)
+        XCTAssertEqual(update.highlights, ["Reduced latency to a < b ms"])
+    }
+
+    /// Real HTML tags must still be stripped after the fix.
+    func test_plainTextStillStripsRealTags() {
+        XCTAssertEqual(WhatsNewUpdate.plainText(from: "Fixed <b>crash</b><br>and more"),
+                       "Fixed crashand more")
+    }
+
     // MARK: - Show / last-seen gate
 
     private func freshDefaults(_ name: String = #function) -> UserDefaults {
