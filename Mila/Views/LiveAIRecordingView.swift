@@ -10,7 +10,12 @@ import OSLog
 /// vs. transcript volumes can drag the divider to fit their preference.
 struct LiveAIRecordingView: View {
     @EnvironmentObject private var actions: QuickActionsController
-    @EnvironmentObject private var session: RecordingSession
+    // NOTE: `session` is deliberately NOT observed here. RecordingSession
+    // is a fat ObservableObject that also @Publishes micLevel/systemLevel
+    // at ~50 Hz; holding it here re-evaluated this whole body (including
+    // the growing transcript ForEach) on every mic-level tick. The
+    // elapsed clock now lives in the `RecordingElapsedLabel` leaf so only
+    // that tiny Text re-renders at audio cadence — not the transcript.
     @EnvironmentObject private var transcriber: LiveTranscriber
     @EnvironmentObject private var diarizer: LiveSpeakerDiarizer
     @EnvironmentObject private var aiSession: LiveAISession
@@ -75,9 +80,7 @@ struct LiveAIRecordingView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(aiActive ? "Recording — Live AI" : "Recording")
                     .font(.callout.weight(.semibold))
-                Text(elapsedString)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                RecordingElapsedLabel()
             }
 
             Spacer()
@@ -97,18 +100,6 @@ struct LiveAIRecordingView: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
         .background(.regularMaterial)
-    }
-
-    private var elapsedString: String {
-        // Read directly from session — its `@Published var elapsed`
-        // ticks every 200 ms. Reading via actions.elapsed (a computed
-        // pass-through) didn't subscribe to session's publisher, so
-        // the body only re-rendered when something else in `actions`
-        // changed (typically not until a 5 s LLM tick or a mic-level
-        // bump), making the timer look like it was updating every
-        // few seconds.
-        let t = Int(session.elapsed.rounded())
-        return String(format: "%02d:%02d", t / 60, t % 60)
     }
 
     // MARK: - Action items pane
@@ -272,7 +263,11 @@ struct LiveAIRecordingView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
+                    // LazyVStack (not VStack): a plain VStack lays out
+                    // every segment on each invalidation, so per-tick cost
+                    // grew ~linearly with recording length. Lazy keeps it
+                    // O(visible) — flat regardless of transcript size.
+                    LazyVStack(alignment: .leading, spacing: 6) {
                         let _ = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LiveAIRecordingView")
                             .log("render segments.count=\(transcriber.segments.count, privacy: .public)")
                         if transcriber.segments.isEmpty {
@@ -406,6 +401,23 @@ private struct ActionItemRow: View {
     private func formatTimestamp(_ s: Double) -> String {
         let total = Int(s.rounded())
         return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+}
+
+/// Leaf that owns the only dependency on `RecordingSession`, so the
+/// session's high-frequency @Published updates (elapsed at 5 Hz,
+/// micLevel/systemLevel at ~50 Hz) re-render ONLY this small Text rather
+/// than the whole `LiveAIRecordingView` body (which holds the growing
+/// transcript). The mm:ss display rounds to whole seconds, so the extra
+/// audio-cadence updates here are cheap and invisible.
+private struct RecordingElapsedLabel: View {
+    @EnvironmentObject private var session: RecordingSession
+
+    var body: some View {
+        let t = Int(session.elapsed.rounded())
+        Text(String(format: "%02d:%02d", t / 60, t % 60))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
     }
 }
 
