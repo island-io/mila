@@ -10,7 +10,12 @@ import OSLog
 /// vs. transcript volumes can drag the divider to fit their preference.
 struct LiveAIRecordingView: View {
     @EnvironmentObject private var actions: QuickActionsController
-    @EnvironmentObject private var session: RecordingSession
+    // NOTE: `session` is deliberately NOT observed here. RecordingSession
+    // is a fat ObservableObject that also @Publishes micLevel/systemLevel
+    // at ~50 Hz; holding it here re-evaluated this whole body (including
+    // the growing transcript ForEach) on every mic-level tick. The
+    // elapsed clock now lives in the `RecordingElapsedLabel` leaf so only
+    // that tiny Text re-renders at audio cadence — not the transcript.
     @EnvironmentObject private var transcriber: LiveTranscriber
     @EnvironmentObject private var diarizer: LiveSpeakerDiarizer
     @EnvironmentObject private var aiSession: LiveAISession
@@ -46,6 +51,27 @@ struct LiveAIRecordingView: View {
     private var isRTL: Bool { language == "he" }
     private var aiActive: Bool { liveAISettings.enabled && llmSettings.isConfigured }
 
+    /// RTL for the AI pane (summary + action items). The AI output is its
+    /// own language setting; for `.auto` we detect from the actual emitted
+    /// text — summary + ALL item texts combined — so a short individual
+    /// item with an embedded English name ("…ל-Cursor") doesn't mis-detect
+    /// while its neighbours are clearly Hebrew. One verdict for the whole
+    /// pane keeps every row aligned the same way. Drives EXPLICIT
+    /// `.trailing` alignment (never `\.layoutDirection`) — see the live
+    /// transcript pane: flipping layoutDirection mis-measured inside the
+    /// split view / open sidebar and shoved Hebrew to the left.
+    private var aiOutputIsRTL: Bool {
+        switch liveAISettings.outputLanguage {
+        case .hebrew: return true
+        case .english: return false
+        case .auto:
+            if language == "he" { return true }
+            let combined = aiSession.summary + " "
+                + aiSession.actionItems.map(\.text).joined(separator: " ")
+            return combined.isPredominantlyHebrew
+        }
+    }
+
     // MARK: - Header
 
     private var header: some View {
@@ -75,9 +101,7 @@ struct LiveAIRecordingView: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(aiActive ? "Recording — Live AI" : "Recording")
                     .font(.callout.weight(.semibold))
-                Text(elapsedString)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                RecordingElapsedLabel()
             }
 
             Spacer()
@@ -97,18 +121,6 @@ struct LiveAIRecordingView: View {
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
         .background(.regularMaterial)
-    }
-
-    private var elapsedString: String {
-        // Read directly from session — its `@Published var elapsed`
-        // ticks every 200 ms. Reading via actions.elapsed (a computed
-        // pass-through) didn't subscribe to session's publisher, so
-        // the body only re-rendered when something else in `actions`
-        // changed (typically not until a 5 s LLM tick or a mic-level
-        // bump), making the timer look like it was updating every
-        // few seconds.
-        let t = Int(session.elapsed.rounded())
-        return String(format: "%02d:%02d", t / 60, t % 60)
     }
 
     // MARK: - Action items pane
@@ -144,15 +156,17 @@ struct LiveAIRecordingView: View {
             if aiSession.summary.isEmpty && aiSession.actionItems.isEmpty {
                 emptyState
             } else {
+                let rtl = aiOutputIsRTL
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 18) {
+                    VStack(alignment: rtl ? .trailing : .leading, spacing: 18) {
                         if !aiSession.summary.isEmpty {
-                            summarySection
+                            summarySection(isRTL: rtl)
                         }
                         if !aiSession.actionItems.isEmpty {
-                            actionItemsSection
+                            actionItemsSection(isRTL: rtl)
                         }
                     }
+                    .frame(maxWidth: .infinity, alignment: rtl ? .trailing : .leading)
                     .padding(.horizontal, 18)
                     .padding(.bottom, 18)
                 }
@@ -167,39 +181,49 @@ struct LiveAIRecordingView: View {
     /// — that's the "summary as bullet points" look the user asked
     /// for, without forcing a prompt change that would risk
     /// breaking JSON parsing.
-    private var summarySection: some View {
+    private func summarySection(isRTL: Bool) -> some View {
         let bullets = Self.bulletsFromSummary(aiSession.summary)
-        let isRTL = aiSession.summary.isPredominantlyHebrew || language == "he"
-        return VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 4) {
-                Image(systemName: "text.alignleft").foregroundStyle(.tint)
-                Text("Summary").font(.callout.weight(.semibold))
-            }
-            VStack(alignment: .leading, spacing: 4) {
+        return VStack(alignment: isRTL ? .trailing : .leading, spacing: 6) {
+            sectionHeader(icon: "text.alignleft", title: "Summary", isRTL: isRTL)
+            VStack(alignment: isRTL ? .trailing : .leading, spacing: 4) {
                 ForEach(bullets, id: \.self) { line in
-                    BulletLine(text: line)
+                    BulletLine(text: line, isRTL: isRTL)
                 }
             }
-            .environment(\.layoutDirection, isRTL ? .rightToLeft : .leftToRight)
             // Aggregate accessibility node — the UI test reads this
             // single element's label to verify LLM summary populated.
             .accessibilityElement(children: .combine)
             .accessibilityIdentifier("liveAI.summary")
         }
+        .frame(maxWidth: .infinity, alignment: isRTL ? .trailing : .leading)
     }
 
-    private var actionItemsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 4) {
-                Image(systemName: "checklist").foregroundStyle(.tint)
-                Text("Action items").font(.callout.weight(.semibold))
-            }
-            VStack(alignment: .leading, spacing: 4) {
+    private func actionItemsSection(isRTL: Bool) -> some View {
+        VStack(alignment: isRTL ? .trailing : .leading, spacing: 6) {
+            sectionHeader(icon: "checklist", title: "Action items", isRTL: isRTL)
+            VStack(alignment: isRTL ? .trailing : .leading, spacing: 4) {
                 ForEach(aiSession.actionItems) { item in
-                    ActionItemRow(item: item, language: language)
+                    ActionItemRow(item: item, language: language, isRTL: isRTL)
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: isRTL ? .trailing : .leading)
+    }
+
+    /// Section header (icon + label). For RTL the icon sits on the right
+    /// of the label and the whole header pins to the trailing edge, so it
+    /// reads with the Hebrew content below it.
+    private func sectionHeader(icon: String, title: String, isRTL: Bool) -> some View {
+        HStack(spacing: 4) {
+            if isRTL {
+                Text(title).font(.callout.weight(.semibold))
+                Image(systemName: icon).foregroundStyle(.tint)
+            } else {
+                Image(systemName: icon).foregroundStyle(.tint)
+                Text(title).font(.callout.weight(.semibold))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: isRTL ? .trailing : .leading)
     }
 
     /// Split a rolling summary paragraph into one bullet per sentence.
@@ -272,7 +296,11 @@ struct LiveAIRecordingView: View {
 
             ScrollViewReader { proxy in
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
+                    // LazyVStack (not VStack): a plain VStack lays out
+                    // every segment on each invalidation, so per-tick cost
+                    // grew ~linearly with recording length. Lazy keeps it
+                    // O(visible) — flat regardless of transcript size.
+                    LazyVStack(alignment: .leading, spacing: 6) {
                         let _ = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LiveAIRecordingView")
                             .log("render segments.count=\(transcriber.segments.count, privacy: .public)")
                         if transcriber.segments.isEmpty {
@@ -326,77 +354,77 @@ struct LiveAIRecordingView: View {
 /// right-to-left with the bullet on the right.
 private struct BulletLine: View {
     let text: String
-
-    private var isRTL: Bool { text.isPredominantlyHebrew }
+    /// Decided by the AI pane (one verdict for all rows), not per-line —
+    /// drives EXPLICIT alignment rather than `\.layoutDirection`, which
+    /// mis-measured inside the split view and shoved Hebrew left.
+    var isRTL: Bool = false
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("•")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.secondary)
-            Text(text)
-                .font(.callout)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .multilineTextAlignment(.leading)
+        let bullet = Text("•")
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.secondary)
+        let label = Text(text)
+            .font(.callout)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: isRTL ? .trailing : .leading)
+            .multilineTextAlignment(isRTL ? .trailing : .leading)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if isRTL { label; bullet } else { bullet; label }
         }
-        .environment(\.layoutDirection, isRTL ? .rightToLeft : .leftToRight)
     }
 }
 
 private struct ActionItemRow: View {
     let item: ActionItem
     let language: String
-
-    /// Per-row RTL detection so a Hebrew action item flips alignment
-    /// even on a recording whose language dropdown was left on
-    /// English.
-    private var isRTL: Bool {
-        if language == "he" { return true }
-        return item.text.isPredominantlyHebrew
-    }
+    /// Decided once by the AI pane for all items (so they align
+    /// consistently), driving EXPLICIT `.trailing` alignment. We do NOT
+    /// flip `\.layoutDirection` — that mis-measured inside the split view
+    /// / open sidebar and shoved Hebrew action items to the left, which
+    /// is the bug this replaces.
+    var isRTL: Bool = false
 
     var body: some View {
-        // IMPORTANT: when `\.layoutDirection` is `.rightToLeft`, the
-        // semantic alignments .leading / .trailing already MIRROR —
-        // `.leading` becomes the right edge, `.trailing` becomes the
-        // left. Using `.trailing` while ALSO setting the env value
-        // double-flipped and put Hebrew text on the LEFT. The fix is
-        // to use `.leading` everywhere and let layoutDirection do the
-        // mirroring exactly once.
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("•")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(item.text)
-                    .font(.callout)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .multilineTextAlignment(.leading)
-                if hasMetadata {
-                    HStack(spacing: 8) {
-                        if let speaker = item.speaker {
-                            Text(speaker.friendlySpeakerLabel(language: language))
-                                .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
-                        }
-                        if item.timestampSeconds > 0 {
-                            Text(formatTimestamp(item.timestampSeconds))
-                                .font(.caption2.monospacedDigit())
-                                .foregroundStyle(.secondary)
-                        }
-                        if item.source == .voiceCommand {
-                            Text("(voice command)")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
-                    }
-                }
+        let align: Alignment = isRTL ? .trailing : .leading
+        let textAlign: TextAlignment = isRTL ? .trailing : .leading
+        let bullet = Text("•")
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.secondary)
+        let content = VStack(alignment: isRTL ? .trailing : .leading, spacing: 4) {
+            Text(item.text)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: align)
+                .multilineTextAlignment(textAlign)
+            if hasMetadata {
+                metadataRow
+                    .frame(maxWidth: .infinity, alignment: align)
             }
         }
-        .environment(\.layoutDirection, isRTL ? .rightToLeft : .leftToRight)
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            if isRTL { content; bullet } else { bullet; content }
+        }
         .padding(.vertical, 2)
+    }
+
+    @ViewBuilder private var metadataRow: some View {
+        HStack(spacing: 8) {
+            if let speaker = item.speaker {
+                Text(speaker.friendlySpeakerLabel(language: language))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            if item.timestampSeconds > 0 {
+                Text(formatTimestamp(item.timestampSeconds))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            if item.source == .voiceCommand {
+                Text("(voice command)")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+        }
     }
 
     private var hasMetadata: Bool {
@@ -406,6 +434,23 @@ private struct ActionItemRow: View {
     private func formatTimestamp(_ s: Double) -> String {
         let total = Int(s.rounded())
         return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+}
+
+/// Leaf that owns the only dependency on `RecordingSession`, so the
+/// session's high-frequency @Published updates (elapsed at 5 Hz,
+/// micLevel/systemLevel at ~50 Hz) re-render ONLY this small Text rather
+/// than the whole `LiveAIRecordingView` body (which holds the growing
+/// transcript). The mm:ss display rounds to whole seconds, so the extra
+/// audio-cadence updates here are cheap and invisible.
+private struct RecordingElapsedLabel: View {
+    @EnvironmentObject private var session: RecordingSession
+
+    var body: some View {
+        let t = Int(session.elapsed.rounded())
+        Text(String(format: "%02d:%02d", t / 60, t % 60))
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
     }
 }
 

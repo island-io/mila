@@ -8,8 +8,12 @@ import Combine
 ///
 /// Two cost dials live here so power users can shave dollars without
 /// touching code: which model the CLI is asked to use (default = the
-/// cheapest current Claude / Cursor model), and how often we tick the
-/// LLM (default = every 5 s).
+/// cheapest current Claude / Cursor model), and the minimum spacing
+/// between LLM calls (`llmMinIntervalSeconds`, default 20 s). The LLM
+/// feed itself is event-driven — it fires whenever new transcript
+/// lands — so without a floor it can spawn a `claude` subprocess every
+/// few seconds in VAD mode. The interval caps that to at most one call
+/// per N seconds.
 @MainActor
 final class LiveAISettings: ObservableObject {
     @Published var enabled: Bool {
@@ -34,6 +38,19 @@ final class LiveAISettings: ObservableObject {
     /// cadence; lowering it costs more LLM calls (and more whisper CPU).
     @Published var chunkSeconds: Double {
         didSet { defaults.set(chunkSeconds, forKey: Keys.chunkSeconds) }
+    }
+
+    /// Minimum spacing, in seconds, between Live AI LLM calls. The feed
+    /// loop wakes on every new transcript segment (every few seconds in
+    /// VAD mode), and each call spawns a fresh `claude` / `cursor-agent`
+    /// subprocess — so back-to-back ticks pegged CPU on long recordings.
+    /// This is a floor measured from the START of the previous call: at
+    /// most one call begins per `llmMinIntervalSeconds`. The final
+    /// stop-time flush bypasses it so the saved summary always covers up
+    /// to stop. 0 disables the floor (legacy "fire as fast as segments
+    /// arrive" behaviour).
+    @Published var llmMinIntervalSeconds: Double {
+        didSet { defaults.set(llmMinIntervalSeconds, forKey: Keys.llmMinInterval) }
     }
 
     /// When true, the live transcriber routes audio through a VAD
@@ -185,6 +202,11 @@ final class LiveAISettings: ObservableObject {
         // window per tick, non-overlapping, clean boundaries.
         let raw = defaults.double(forKey: Keys.chunkSeconds)
         self.chunkSeconds = raw >= 25.0 ? raw : 30.0
+        // Default 20s. `double(forKey:)` returns 0 for an unset key, and
+        // 0 is also the legitimate "disable the floor" value — so use a
+        // sentinel via object(forKey:) to tell "never set" (→ 20) apart
+        // from "user explicitly chose 0".
+        self.llmMinIntervalSeconds = (defaults.object(forKey: Keys.llmMinInterval) as? Double) ?? 20.0
         // Default ON: users who never touched the toggle get the
         // cleaner-boundary VAD path. Explicit false is preserved.
         self.useVAD = defaults.object(forKey: Keys.useVAD) as? Bool ?? true
@@ -276,6 +298,7 @@ the content.
         static let enabled = "liveAI.enabled"
         static let model = "liveAI.model"
         static let chunkSeconds = "liveAI.chunkSeconds"
+        static let llmMinInterval = "liveAI.llmMinIntervalSeconds"
         static let useVAD = "liveAI.useVAD"
         static let backgroundMode = "liveAI.backgroundMode"
         static let forceLowEnd = "liveAI.forceOnLowEndHardware"

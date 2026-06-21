@@ -62,23 +62,18 @@ struct AIOverviewSection: View {
             VStack(alignment: .leading, spacing: 12) {
                 let summaryText = summary ?? ""
                 if !summaryText.isEmpty || isSummarizing {
-                    summaryView(summaryText,
-                                alignment: alignmentValue,
-                                multiline: multilineAlignment)
+                    summaryView(summaryText)
                 }
                 if !items.isEmpty {
-                    actionItemsView(alignment: alignmentValue,
-                                    multiline: multilineAlignment)
+                    actionItemsView()
                 }
             }
             .frame(maxWidth: .infinity, alignment: alignmentValue)
         }
     }
 
-    private func summaryView(_ text: String,
-                             alignment: Alignment,
-                             multiline: TextAlignment) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+    private func summaryView(_ text: String) -> some View {
+        VStack(alignment: sectionIsRTL ? .trailing : .leading, spacing: 4) {
             HStack(spacing: 6) {
                 Label("Summary", systemImage: "sparkles")
                     .font(.callout.weight(.semibold))
@@ -120,11 +115,18 @@ struct AIOverviewSection: View {
             // and — when the caller wired it — a "Regenerate summary"
             // entry that re-runs the LLM against the current transcript.
             if !text.isEmpty {
-                Text(text)
+                // Render with structure: a single run-on paragraph (the
+                // live rolling summary) becomes one bullet per sentence so
+                // it reads as a few lines like the live pane; an already
+                // multi-line markdown block is kept as-is. Inline markdown
+                // (**bold** etc.) renders. `.leading` + layoutDirection
+                // keeps Hebrew right-aligned with bullets on the right.
+                Text(Self.summaryAttributed(text))
                     .font(.callout)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: alignment)
-                    .multilineTextAlignment(multiline)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(.leading)
+                    .environment(\.layoutDirection, sectionIsRTL ? .rightToLeft : .leftToRight)
                     .textSelection(.enabled)
                     .contextMenu {
                         Button("Copy summary") {
@@ -147,14 +149,13 @@ struct AIOverviewSection: View {
                     .font(.callout)
                     .italic()
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: alignment)
-                    .multilineTextAlignment(multiline)
+                    .frame(maxWidth: .infinity, alignment: sectionIsRTL ? .trailing : .leading)
+                    .multilineTextAlignment(sectionIsRTL ? .trailing : .leading)
             }
         }
     }
 
-    private func actionItemsView(alignment: Alignment,
-                                 multiline: TextAlignment) -> some View {
+    private func actionItemsView() -> some View {
         // One combined bullet line per item, joined into a SINGLE Text so
         // the whole list is drag-selectable / copyable at once (the old
         // per-item Text views couldn't be selected together). Non-breaking
@@ -181,15 +182,18 @@ struct AIOverviewSection: View {
                     .accessibilityIdentifier("detail.actionItems.copy")
                 }
             }
-            // Single selectable block. Drive the block's layout direction
-            // from the section's RTL decision so the bullets land on the
-            // correct (right) side for Hebrew — the per-item HStack used to
-            // put the "•" on the left even in RTL.
+            // Single selectable block. `\.layoutDirection` drives the base
+            // direction so the bullets land on the correct (right) side for
+            // Hebrew. With layoutDirection set, the alignment MUST be
+            // `.leading` (which mirrors to the right under RTL) — using
+            // `.trailing` here too double-flipped and pushed Hebrew action
+            // items to the LEFT, which was the bug. Let layoutDirection do
+            // the mirroring exactly once.
             Text(combined)
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: alignment)
-                .multilineTextAlignment(multiline)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .multilineTextAlignment(.leading)
                 .textSelection(.enabled)
                 .environment(\.layoutDirection, sectionIsRTL ? .rightToLeft : .leftToRight)
                 .contextMenu {
@@ -203,6 +207,39 @@ struct AIOverviewSection: View {
     /// All action items as a bulleted plain-text block, for one-click copy.
     fileprivate static func actionItemsText(_ items: [ActionItem]) -> String {
         items.map { "• \($0.text)" }.joined(separator: "\n")
+    }
+
+    /// Turn a stored summary into a few readable lines. The LLM emits
+    /// either a short run-on paragraph (the live rolling summary) or a
+    /// multi-line markdown block (the one-shot summarizer). A paragraph
+    /// with no line breaks is split into one bullet per sentence so it
+    /// reads as a few lines — matching the live recording pane — while a
+    /// block that already has line structure is kept as-is. Inline
+    /// markdown (`**bold**` etc.) is rendered; `\n` and literal "- " are
+    /// preserved.
+    static func summaryAttributed(_ raw: String) -> AttributedString {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let body: String
+        if trimmed.contains("\n") {
+            body = trimmed
+        } else {
+            // Proper sentence segmentation via Foundation's tokenizer.
+            // A naive split on bare ".!?" mangled "3.30 p.m.", "v2.0",
+            // "acme.com", "https://…" into garbled mid-token bullets;
+            // `.bySentences` keeps those intact.
+            var sentences: [String] = []
+            trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex,
+                                        options: [.bySentences, .localized]) { sub, _, _, _ in
+                let s = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !s.isEmpty { sentences.append(s) }
+            }
+            body = sentences.count > 1
+                ? sentences.map { "•\u{00A0}\($0)" }.joined(separator: "\n")
+                : trimmed
+        }
+        let opts = AttributedString.MarkdownParsingOptions(
+            interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        return (try? AttributedString(markdown: body, options: opts)) ?? AttributedString(body)
     }
 
     fileprivate static func copyToPasteboard(_ text: String) {

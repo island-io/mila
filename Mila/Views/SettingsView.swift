@@ -1088,6 +1088,21 @@ private struct LiveAISettingsTab: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack {
+                        Text("AI update interval").font(.callout.weight(.semibold))
+                        Spacer()
+                        Text("\(Int(settings.llmMinIntervalSeconds))s")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $settings.llmMinIntervalSeconds, in: 5...60, step: 5)
+                    Text("Minimum time between AI summary updates. The transcript is sent to the LLM at most once per interval, so longer values use less CPU and fewer API calls on long recordings. 20s is the default; the final update when you stop always runs regardless.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
                         Text("Speaker similarity threshold").font(.callout.weight(.semibold))
                         Spacer()
                         Text(String(format: "%.2f", settings.speakerSimilarityThreshold))

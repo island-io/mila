@@ -86,17 +86,34 @@ struct MilaApp: App {
             store.relocateRecordings(to: custom)
         }
         let mgr = ModelManager(modelsDirectory: store.modelsDirectory)
-        // Diarization is on by default for fresh installs so the bundled
-        // Python runtime auto-downloads its torch wheels on first launch
-        // and speaker labels work without the user opening Settings. Users
-        // who previously toggled the setting either way have an explicit
-        // value persisted, which shadows this default. Passed as a ctor
-        // argument rather than registered on `UserDefaults.standard` because
-        // the unit-test process loads MilaApp as TEST_HOST — a global
+        // Diarization is OFF by default. The live diarizer runs a
+        // continuous pyannote (torch) subprocess that embeds every
+        // utterance during recording — a heavy, separate-process CPU draw
+        // that competes with the app and was a major contributor to the
+        // "high CPU on long recordings" reports. Speaker labels are worth
+        // it for some users, so it stays one toggle away in Settings ▸
+        // Diarization (enabling it triggers the one-time torch download);
+        // we just don't pay that cost for everyone by default. Users who
+        // previously toggled it either way have an explicit value
+        // persisted, which shadows this default. Passed as a ctor argument
+        // rather than registered on `UserDefaults.standard` because the
+        // unit-test process loads MilaApp as TEST_HOST — a global
         // registration would leak into tests and fire DiarizationSettings'
-        // launch-time checkDeps subprocess, starving the cooperative thread
-        // pool that timing-sensitive tests depend on.
-        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: true)
+        // launch-time checkDeps subprocess, starving the cooperative
+        // thread pool that timing-sensitive tests depend on.
+        //
+        // One-time force-off migration: flipping the default only helps
+        // users with no persisted value. To stop the pyannote subprocess
+        // CPU draw for EVERYONE on upgrade — including those who had
+        // explicitly enabled it — turn it off exactly once, guarded by a
+        // versioned flag. Anyone who re-enables it in Settings afterward
+        // keeps their choice (the flag stops the migration re-running).
+        let diarForceOffKey = "diarization.forcedOffMigration.v1"
+        if UserDefaults.standard.object(forKey: diarForceOffKey) == nil {
+            UserDefaults.standard.set(false, forKey: "diarization.enabled")
+            UserDefaults.standard.set(true, forKey: diarForceOffKey)
+        }
+        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false)
         let svc = TranscriptionService(store: store, modelManager: mgr, diarizationSettings: diarSettings)
         let session = RecordingSession()
         let langSettings = RecordingLanguageSettings()
@@ -855,7 +872,9 @@ struct MilaApp: App {
                     .sink { [weak transcriber, weak aiSession] _ in
                         guard llmSettingsRef.isConfigured else { return }
                         if let text = transcriber?.formattedTranscript, !text.isEmpty {
-                            aiSession?.feed(transcript: text)
+                            // User just flipped Live AI on — bypass the
+                            // min-interval floor for instant feedback.
+                            aiSession?.feed(transcript: text, immediate: true)
                         }
                     }
 
@@ -934,7 +953,9 @@ struct MilaApp: App {
                     if aiSettings.enabled && llmSettingsRef.isConfigured {
                         let text = transcriber.formattedTranscript
                         if !text.isEmpty {
-                            aiSession.feed(transcript: text)
+                            // Final teardown flush — bypass the floor so
+                            // the saved snapshot covers up to stop.
+                            aiSession.feed(transcript: text, immediate: true)
                         }
                     }
                     _ = transcriber.stop()
