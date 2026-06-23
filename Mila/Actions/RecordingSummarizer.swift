@@ -57,13 +57,9 @@ final class RecordingSummarizer: ObservableObject {
     /// gets an automatic backfill sweep the moment the toggle flips.
     private var cancellables: Set<AnyCancellable> = []
 
-    /// Timeout for the one-shot summary call. Comfortably larger than
-    /// the live-session per-tick budget because cold-starting `claude`
-    /// can take 30–60s on the first invocation after a sleep / fresh
-    /// boot. Foreground UI isn't blocked — the recording is already
-    /// saved with `.completed` status before we get here — so the
-    /// generous bound is fine.
-    var timeoutSeconds: TimeInterval = 300
+    /// Timeout for the one-shot summary call. Reads from `LLMSettings.cliTimeout`
+    /// so it follows the user's preference set in Settings → LLM.
+    var timeoutSeconds: TimeInterval { llmSettings.cliTimeout }
 
     init(store: RecordingStore,
          llmSettings: LLMSettings,

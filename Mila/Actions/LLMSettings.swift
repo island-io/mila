@@ -136,6 +136,17 @@ final class LLMSettings: ObservableObject {
         didSet { defaults.set(postActionPrompt, forKey: Keys.actionPrompt) }
     }
 
+    /// Maximum wall-clock seconds Mila allows a post-recording LLM call to
+    /// run before killing the subprocess. Applies to title generation, the
+    /// auto-summary, and the Send-action button. Live AI's per-tick timeouts
+    /// are tuned separately and are not affected by this setting.
+    @Published var cliTimeout: TimeInterval {
+        didSet {
+            guard cliTimeout != oldValue else { return }
+            defaults.set(cliTimeout, forKey: Keys.cliTimeout)
+        }
+    }
+
     /// Master switch for the AUTOMATIC post-recording summary
     /// (`RecordingSummarizer`). When off, no summary is generated when a
     /// recording finishes, on launch backfill, or on re-transcription —
@@ -169,6 +180,7 @@ final class LLMSettings: ObservableObject {
         // have never seen this key, silently disabling summaries for
         // everyone on upgrade. Treat "key absent" as true.
         self.summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
+        self.cliTimeout = (defaults.object(forKey: Keys.cliTimeout) as? Double) ?? 300
     }
 
     /// Default name prompt is deliberately *tool-free*. The previous default
@@ -202,5 +214,6 @@ final class LLMSettings: ObservableObject {
         static let actionEnabled = "llm.action.enabled"
         static let actionPrompt = "llm.action.prompt"
         static let summaryEnabled = "llm.summary.enabled"
+        static let cliTimeout = "llm.cli.timeout"
     }
 }
