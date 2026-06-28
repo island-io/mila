@@ -327,7 +327,7 @@ private struct RecordingSubRow: View {
         .contentShape(Rectangle())
         .tag(SidebarSelection.recording(recording.id))
         .draggable(RecordingDragPayload(id: recording.id))
-        .accessibilityIdentifier("sidebar.recording.\(recording.title)")
+        .accessibilityIdentifier("sidebar.recording.\(recording.id.uuidString)")
     }
 }
 
