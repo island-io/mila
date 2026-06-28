@@ -1,0 +1,121 @@
+name: E2E Remote Transcription
+
+# End-to-end test of the remote transcription backend: spawns a local
+# OpenAI-compatible mock server and drives the real `RemoteWhisperEngine`
+# client against it over HTTP. Path-gated so it only runs when the remote
+# backend (or this workflow) changes — not on every push.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Mila/Transcription/RemoteWhisperEngine.swift'
+      - 'Mila/Models/RemoteTranscriptionSettings.swift'
+      - 'Mila/Transcription/TranscriptionService.swift'
+      - 'MilaTests/RemoteTranscriptionE2ETests.swift'
+      - 'MilaTests/RemoteTranscriptionTests.swift'
+      - 'scripts/mock-openai-transcription-server.py'
+      - '.github/workflows/e2e-remote-transcription.yml'
+  pull_request:
+    paths:
+      - 'Mila/Transcription/RemoteWhisperEngine.swift'
+      - 'Mila/Models/RemoteTranscriptionSettings.swift'
+      - 'Mila/Transcription/TranscriptionService.swift'
+      - 'MilaTests/RemoteTranscriptionE2ETests.swift'
+      - 'MilaTests/RemoteTranscriptionTests.swift'
+      - 'scripts/mock-openai-transcription-server.py'
+      - '.github/workflows/e2e-remote-transcription.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  remote-transcription-e2e:
+    runs-on: macos-26
+    timeout-minutes: 30
+    env:
+      MOCK_PORT: "8123"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          python3 --version
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      # The .xcodeproj references Mila/Resources/PythonRuntime, so the bundle
+      # must exist before project generation / build. Same cache key as ci.yml
+      # so a single entry services both workflows.
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@v4
+        with:
+          path: Mila/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Clear SwiftPM caches
+        run: |
+          rm -rf ~/Library/Caches/org.swift.swiftpm
+          rm -rf ~/Library/org.swift.swiftpm
+          rm -rf ~/Library/Developer/Xcode/DerivedData/SourcePackages
+
+      - name: Resolve Swift Package dependencies
+        run: |
+          xcodebuild \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -destination 'platform=macOS' \
+            -resolvePackageDependencies
+
+      - name: Start mock OpenAI transcription server
+        run: |
+          python3 scripts/mock-openai-transcription-server.py --port "$MOCK_PORT" \
+            > mock-server.log 2>&1 &
+          echo $! > mock-server.pid
+          # Wait for the server to accept connections before pointing the
+          # client at it (up to ~15s).
+          for i in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:${MOCK_PORT}/v1/models" >/dev/null 2>&1; then
+              echo "mock server is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "::error::mock server did not come up"; cat mock-server.log; exit 1
+
+      - name: Run remote-transcription E2E test
+        # xcodebuild forwards env vars into the test process after stripping
+        # the TEST_RUNNER_ prefix (see ci.yml for why the bare form doesn't
+        # propagate reliably).
+        env:
+          TEST_RUNNER_MILA_REMOTE_TEST_ENDPOINT: "http://127.0.0.1:8123/v1"
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            -only-testing:MilaTests/RemoteTranscriptionE2ETests \
+            test
+
+      - name: Stop mock server
+        if: always()
+        run: |
+          if [ -f mock-server.pid ]; then kill "$(cat mock-server.pid)" 2>/dev/null || true; fi
+          echo "--- mock server log ---"; cat mock-server.log 2>/dev/null || true
