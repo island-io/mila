@@ -218,7 +218,13 @@ final class LLMSettings: ObservableObject {
     /// Run the configured prompt against the sample transcript and stash the
     /// full result (command + streams + exit code) for the UI to render.
     func runTest() async {
+        // A fast double-tap can enqueue two `Task { await runTest() }` calls
+        // before the button re-renders disabled — bail on the second so we
+        // don't spawn duplicate subprocesses or let a late finisher overwrite
+        // a newer result.
+        guard !isTesting else { return }
         isTesting = true
+        lastTestResult = nil
         defer { isTesting = false }
         let result = await LLMRunner.diagnose(
             tool: tool,

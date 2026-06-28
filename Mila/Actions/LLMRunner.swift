@@ -233,33 +233,40 @@ enum LLMRunner {
         let args = tool.arguments(prompt: fullPrompt, model: model) + extraArgs
         let command = ([executable.path] + args).map(shellQuote).joined(separator: " ")
         let start = Date()
+        // Bridge Task cancellation to the child process, same as `run` — if
+        // the test is cancelled (Settings closed, a newer run started), SIGTERM
+        // the CLI instead of leaving it alive until the timeout.
         let handle = ProcessHandle()
-        return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let elapsed: () -> TimeInterval = { Date().timeIntervalSince(start) }
-                do {
-                    let outcome = try executeProcess(executable: executable,
-                                                     arguments: args,
-                                                     timeout: timeout,
-                                                     handle: handle,
-                                                     sandboxKey: nil)
-                    continuation.resume(returning: LLMTestResult(
-                        command: command,
-                        succeeded: !outcome.timedOut && outcome.exitCode == 0,
-                        exitCode: outcome.exitCode,
-                        stdout: outcome.stdout,
-                        stderr: outcome.stderr,
-                        durationSeconds: elapsed(),
-                        timedOut: outcome.timedOut))
-                } catch {
-                    // Only `launchFailed` reaches here now.
-                    let msg = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
-                    continuation.resume(returning: LLMTestResult(
-                        command: command,
-                        durationSeconds: elapsed(),
-                        setupError: msg))
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let elapsed: () -> TimeInterval = { Date().timeIntervalSince(start) }
+                    do {
+                        let outcome = try executeProcess(executable: executable,
+                                                         arguments: args,
+                                                         timeout: timeout,
+                                                         handle: handle,
+                                                         sandboxKey: nil)
+                        continuation.resume(returning: LLMTestResult(
+                            command: command,
+                            succeeded: !outcome.timedOut && outcome.exitCode == 0,
+                            exitCode: outcome.exitCode,
+                            stdout: outcome.stdout,
+                            stderr: outcome.stderr,
+                            durationSeconds: elapsed(),
+                            timedOut: outcome.timedOut))
+                    } catch {
+                        // Only `launchFailed` reaches here now.
+                        let msg = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+                        continuation.resume(returning: LLMTestResult(
+                            command: command,
+                            durationSeconds: elapsed(),
+                            setupError: msg))
+                    }
                 }
             }
+        } onCancel: {
+            handle.terminate()
         }
     }
 
@@ -434,11 +441,18 @@ enum LLMRunner {
         let deadline = DispatchTime.now() + .seconds(Int(timeout.rounded(.up)))
         let timedOut = runningGroup.wait(timeout: deadline) == .timedOut
         if timedOut {
+            // SIGTERM first; if the CLI ignores it, hard-kill after a short
+            // grace period so we don't read half-drained pipes or remove the
+            // sandbox out from under a still-running child.
             process.terminate()
-            _ = group.wait(timeout: .now() + 1)
-        } else {
-            group.wait()
+            if runningGroup.wait(timeout: .now() + 1) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                runningGroup.wait()
+            }
         }
+        // Drain the pipe readers once the process is known to be gone (either it
+        // exited on its own or we killed it above).
+        group.wait()
 
         let stdout = String(data: outData, encoding: .utf8) ?? ""
         let stderr = String(data: errData, encoding: .utf8) ?? ""
