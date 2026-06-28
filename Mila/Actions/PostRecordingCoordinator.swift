@@ -138,6 +138,7 @@ final class PostRecordingCoordinator: ObservableObject {
                    transcript: String,
                    summary: String,
                    executableOverride: String?,
+                   extraArgs: [String] = [],
                    cliTimeout: TimeInterval = LLMRunner.defaultTimeout) {
         guard tool != .none else { return }
         let toolName = tool.displayName
@@ -175,6 +176,7 @@ final class PostRecordingCoordinator: ObservableObject {
                     transcript: resolved,
                     summary: summary,
                     executablePathOverride: executableOverride,
+                    extraArgs: extraArgs,
                     timeout: cliTimeout
                 )
                 let preview = output

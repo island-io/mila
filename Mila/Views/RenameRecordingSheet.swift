@@ -442,6 +442,7 @@ struct RenameRecordingSheet: View {
                               transcript: transcriptSnapshot,
                               summary: summarySnapshot,
                               executableOverride: executableOverride,
+                              extraArgs: llm.extraArgsTokens,
                               cliTimeout: llm.cliTimeout)
     }
 
@@ -456,6 +457,7 @@ struct RenameRecordingSheet: View {
                 prompt: llm.namePrompt,
                 transcript: transcript,
                 executablePathOverride: llm.executablePath.isEmpty ? nil : llm.executablePath,
+                extraArgs: llm.extraArgsTokens,
                 timeout: llm.cliTimeout
             )
             let cleaned = suggestion
