@@ -422,7 +422,10 @@ final class TranscriptionService: ObservableObject {
             }
             await remoteEngine.configure(config)
             localModel = nil
-            modelDisplayName = remoteSettings.modelLabel
+            // Label from the captured config, not remoteSettings — a Settings
+            // edit mid-run must not change what's persisted to this
+            // recording's modelName.
+            modelDisplayName = "Remote · \(config.model)"
         } else {
             guard let model = modelManager.model(for: recording.language) else {
                 lastError = "No model selected."

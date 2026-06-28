@@ -89,7 +89,9 @@ final class RemoteTranscriptionE2ETests: XCTestCase {
     func test_testConnection_reachesModelsEndpoint() async {
         let suite = UserDefaults(suiteName: "RemoteTranscriptionE2ETests.conn")!
         suite.removePersistentDomain(forName: "RemoteTranscriptionE2ETests.conn")
-        let settings = RemoteTranscriptionSettings(defaults: suite)
+        let settings = RemoteTranscriptionSettings(
+            defaults: suite,
+            apiKeyKeychainKey: "RemoteTranscriptionE2ETests.conn.apiKey")
         settings.backend = .remote
         settings.endpoint = endpoint.absoluteString
         settings.apiKey = "test-key-123"

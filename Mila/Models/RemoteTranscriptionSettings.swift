@@ -82,7 +82,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
     @Published var apiKey: String {
         didSet {
             guard apiKey != oldValue else { return }
-            KeychainHelper.save(key: Keys.apiKey, value: apiKey)
+            KeychainHelper.save(key: apiKeyKeychainKey, value: apiKey)
             testStatus = .idle
         }
     }
@@ -94,15 +94,22 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     private let defaults: UserDefaults
     private let urlSession: URLSession
+    /// Keychain item the API token is stored under. Injectable so tests /
+    /// previews / alternate instances don't read or clobber the real app's
+    /// `remote.apiKey` item (mirrors how `defaults` is injected).
+    private let apiKeyKeychainKey: String
 
-    init(defaults: UserDefaults = .standard, urlSession: URLSession = .shared) {
+    init(defaults: UserDefaults = .standard,
+         urlSession: URLSession = .shared,
+         apiKeyKeychainKey: String = Keys.apiKey) {
         self.defaults = defaults
         self.urlSession = urlSession
+        self.apiKeyKeychainKey = apiKeyKeychainKey
         self.backend = TranscriptionBackend(rawValue: defaults.string(forKey: Keys.backend) ?? "")
             ?? .local
         self.endpoint = defaults.string(forKey: Keys.endpoint) ?? Self.defaultEndpoint
         self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
-        self.apiKey = KeychainHelper.load(key: Keys.apiKey) ?? ""
+        self.apiKey = KeychainHelper.load(key: apiKeyKeychainKey) ?? ""
     }
 
     /// True when the user has chosen the remote backend (regardless of whether
@@ -175,6 +182,11 @@ final class RemoteTranscriptionSettings: ObservableObject {
         }
         do {
             let (_, response) = try await urlSession.data(for: request)
+            // Drop the result if the user edited the endpoint/key while the
+            // request was in flight — `didSet` already reset status to .idle,
+            // and a stale result for the previous values would be misleading.
+            guard endpointURL == url,
+                  apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
             guard let http = response as? HTTPURLResponse else {
                 testStatus = .failed("No HTTP response.")
                 return
@@ -191,6 +203,8 @@ final class RemoteTranscriptionSettings: ObservableObject {
                 testStatus = .failed("Server returned HTTP \(http.statusCode).")
             }
         } catch {
+            guard endpointURL == url,
+                  apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
             testStatus = .failed(error.localizedDescription)
         }
     }

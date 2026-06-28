@@ -8,7 +8,10 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
     private func makeSettings(_ label: String = #function) -> RemoteTranscriptionSettings {
         let suite = UserDefaults(suiteName: "RemoteTranscriptionSettingsTests.\(label)")!
         suite.removePersistentDomain(forName: "RemoteTranscriptionSettingsTests.\(label)")
-        return RemoteTranscriptionSettings(defaults: suite)
+        // Isolated Keychain item so these tests never read/clobber the real
+        // app's `remote.apiKey`.
+        return RemoteTranscriptionSettings(defaults: suite,
+                                           apiKeyKeychainKey: "RemoteTranscriptionSettingsTests.\(label).apiKey")
     }
 
     func test_defaults_areLocalAndOpenAI() {

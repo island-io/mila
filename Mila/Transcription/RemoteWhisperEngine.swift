@@ -109,7 +109,9 @@ actor RemoteWhisperEngine: TranscribingEngine {
                                       model: config.model,
                                       language: language)
 
-        remoteLog.log("transcribe: POST \(request.url?.absoluteString ?? "?", privacy: .public) model=\(config.model, privacy: .public) lang=\(language, privacy: .public) bytes=\(body.count, privacy: .public)")
+        // Endpoint kept .private — a user-configured URL can carry private
+        // hostnames or credentials/query tokens we must not leak to the log.
+        remoteLog.log("transcribe: POST \(request.url?.absoluteString ?? "?", privacy: .private) model=\(config.model, privacy: .public) lang=\(language, privacy: .public) bytes=\(body.count, privacy: .public)")
 
         // The protocol's `isCancelled` is a polled flag (the batch Cancel
         // button), not Swift task cancellation. Bridge it: run the upload in a
