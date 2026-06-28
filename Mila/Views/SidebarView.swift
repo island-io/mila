@@ -41,6 +41,12 @@ struct SidebarView: View {
     @State private var renameTarget: String?
     @State private var renameDraft = ""
 
+    /// Whether the "All Transcriptions" section is expanded to show its
+    /// recordings inline. Persisted so the user's choice survives app
+    /// launches (issue #28).
+    @AppStorage("sidebar.allTranscriptions.expanded")
+    private var allTranscriptionsExpanded = false
+
     var body: some View {
         List(selection: $selection) {
             Section {
@@ -57,13 +63,27 @@ struct SidebarView: View {
                 // recordings (folder == nil). Lives under "Folders" but is
                 // labeled descriptively so first-time users know that's
                 // where their transcripts show up.
-                folderRow(label: "All Transcriptions",
-                          systemImage: "tray.full",
-                          selection: .defaultFolder,
-                          identifier: "sidebar.folder.default") { payload in
+                //
+                // It doubles as a collapsible section (issue #28): the
+                // disclosure triangle expands an inline list of the
+                // recordings so the user can jump straight to one without
+                // first landing on the all-recordings page. Tapping the
+                // row body still navigates to that page (tag ==
+                // .defaultFolder); only the triangle toggles expansion.
+                let unfiled = store.unfiledRecordings()
+                AllTranscriptionsRow(
+                    expanded: $allTranscriptionsExpanded,
+                    hasRecordings: !unfiled.isEmpty
+                ) { payload in
                     if let id = payload?.id,
                        let rec = store.recordings.first(where: { $0.id == id }) {
                         store.assign(rec, toFolder: nil)
+                    }
+                }
+
+                if allTranscriptionsExpanded {
+                    ForEach(unfiled) { rec in
+                        RecordingSubRow(recording: rec)
                     }
                 }
 
@@ -225,6 +245,89 @@ private struct FolderRow: View {
                 ? Color.accentColor.opacity(0.18)
                 : Color.clear
         )
+    }
+}
+
+/// Header row for the collapsible "All Transcriptions" section (issue #28).
+///
+/// Mirrors `FolderRow` (selectable + drop destination for unfiling a dragged
+/// recording) but prefixes a disclosure triangle that toggles the inline
+/// recording list independently of selection. The triangle is a `.plain`
+/// Button so clicking it flips `expanded` without also selecting the row;
+/// clicking anywhere else on the row falls through to List selection and
+/// navigates to `.defaultFolder`, exactly as the old plain row did.
+private struct AllTranscriptionsRow: View {
+    @Binding var expanded: Bool
+    /// When there are no unfiled recordings the triangle is hidden (but its
+    /// space is kept) so the label stays aligned with the sibling folders.
+    let hasRecordings: Bool
+    let onDrop: (RecordingDragPayload?) -> Void
+
+    @State private var isTargeted = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .frame(width: 12, height: 12)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasRecordings)
+            .opacity(hasRecordings ? 1 : 0)
+            .help(expanded ? "Hide recordings" : "Show recordings")
+            .accessibilityIdentifier("sidebar.folder.default.disclosure")
+
+            Label("All Transcriptions", systemImage: "tray.full")
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .dropDestination(for: RecordingDragPayload.self) { items, _ in
+            guard let first = items.first else { return false }
+            onDrop(first)
+            return true
+        } isTargeted: { isTargeted = $0 }
+        .tag(SidebarSelection.defaultFolder)
+        .accessibilityIdentifier("sidebar.folder.default")
+        .listRowBackground(
+            isTargeted
+                ? Color.accentColor.opacity(0.18)
+                : Color.clear
+        )
+    }
+}
+
+/// Inline sub-row shown under an expanded "All Transcriptions" (issue #28):
+/// the recording title as primary text with a smaller, gray timestamp
+/// beneath it. Tagged `.recording(id)` so List selection drives navigation
+/// straight to the transcript page, and `.draggable` so it can still be
+/// filed into a folder by dragging — same payload the history rows use.
+private struct RecordingSubRow: View {
+    let recording: Recording
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(recording.title)
+                .font(.callout)
+                .lineLimit(1)
+            Text(recording.createdAt,
+                 format: .dateTime.month().day().hour().minute())
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        // Indent so the sub-rows read as children of the section header
+        // rather than peers of the folder rows.
+        .padding(.leading, 18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .tag(SidebarSelection.recording(recording.id))
+        .draggable(RecordingDragPayload(id: recording.id))
+        .accessibilityIdentifier("sidebar.recording.\(recording.title)")
     }
 }
 
