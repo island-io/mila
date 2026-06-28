@@ -60,13 +60,45 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(config?.model, RemoteTranscriptionSettings.defaultModel)
     }
 
-    func test_editingEndpointResetsTestStatus() {
-        let settings = makeSettings()
+    func test_editingEndpointResetsTestStatus() async {
+        // Stub the network so testConnection() actually seeds a non-idle
+        // status (.ok), then assert that editing the endpoint resets it —
+        // exercising the real reset path rather than a no-op from .idle.
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubOKURLProtocol.self]
+        let session = URLSession(configuration: config)
+        let suite = UserDefaults(suiteName: "RemoteTranscriptionSettingsTests.reset")!
+        suite.removePersistentDomain(forName: "RemoteTranscriptionSettingsTests.reset")
+        let settings = RemoteTranscriptionSettings(
+            defaults: suite,
+            urlSession: session,
+            apiKeyKeychainKey: "RemoteTranscriptionSettingsTests.reset.apiKey")
+        settings.backend = .remote
         settings.endpoint = "https://example.com/v1"
-        // testStatus starts .idle; just assert mutation path doesn't crash and
-        // stays idle without a network call.
-        XCTAssertEqual(settings.testStatus, .idle)
+
+        await settings.testConnection()
+        guard case .ok = settings.testStatus else {
+            return XCTFail("Expected testConnection to seed .ok, got \(settings.testStatus)")
+        }
+
+        settings.endpoint = "https://example.com/v2"
+        XCTAssertEqual(settings.testStatus, .idle, "Editing the endpoint must reset the status")
     }
+}
+
+/// Returns 200 for any request — lets `testConnection()` reach `.ok` without a
+/// real server.
+private final class StubOKURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                       httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data("{}".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
 
 final class RemoteWhisperEngineParsingTests: XCTestCase {

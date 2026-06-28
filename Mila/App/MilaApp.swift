@@ -1264,6 +1264,8 @@ struct MilaApp: App {
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
     private func prewarmDefaultModel() {
+        // No local weights to warm when the remote backend is selected.
+        guard !remoteTranscriptionSettings.isActive else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
     }
 
@@ -1274,6 +1276,11 @@ struct MilaApp: App {
     /// same `URLSession` so they don't actually saturate the network, and
     /// the in-app banner shows whichever is currently selected.
     private func ensureDefaultModelsInstalled() {
+        // Skip the multi-GB local model downloads + CoreML prep entirely for
+        // users who've opted into the remote backend — they don't need any
+        // local weights. (The Models tab still offers manual downloads, and
+        // switching back to local re-triggers this on next launch.)
+        guard !remoteTranscriptionSettings.isActive else { return }
         modelManager.setSelected(WhisperModel.ivritLarge)
         for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {
             if !modelManager.isInstalled(model) && modelManager.downloads[model.name] == nil {
