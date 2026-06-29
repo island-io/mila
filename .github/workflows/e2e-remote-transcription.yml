@@ -8,23 +8,7 @@ name: E2E Remote Transcription
 on:
   push:
     branches: [main]
-    paths:
-      - 'Mila/Transcription/RemoteWhisperEngine.swift'
-      - 'Mila/Models/RemoteTranscriptionSettings.swift'
-      - 'Mila/Transcription/TranscriptionService.swift'
-      - 'MilaTests/RemoteTranscriptionE2ETests.swift'
-      - 'MilaTests/RemoteTranscriptionTests.swift'
-      - 'scripts/mock-openai-transcription-server.py'
-      - '.github/workflows/e2e-remote-transcription.yml'
   pull_request:
-    paths:
-      - 'Mila/Transcription/RemoteWhisperEngine.swift'
-      - 'Mila/Models/RemoteTranscriptionSettings.swift'
-      - 'Mila/Transcription/TranscriptionService.swift'
-      - 'MilaTests/RemoteTranscriptionE2ETests.swift'
-      - 'MilaTests/RemoteTranscriptionTests.swift'
-      - 'scripts/mock-openai-transcription-server.py'
-      - '.github/workflows/e2e-remote-transcription.yml'
 
 permissions:
   contents: read
@@ -42,18 +26,34 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'Mila/Transcription/RemoteWhisperEngine.swift'
+              - 'Mila/Models/RemoteTranscriptionSettings.swift'
+              - 'Mila/Transcription/TranscriptionService.swift'
+              - 'MilaTests/RemoteTranscriptionE2ETests.swift'
+              - 'MilaTests/RemoteTranscriptionTests.swift'
+              - 'scripts/mock-openai-transcription-server.py'
+              - '.github/workflows/e2e-remote-transcription.yml'
+
       - name: Show toolchain
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           xcodebuild -version
           python3 --version
 
       - name: Install xcodegen
+        if: steps.changes.outputs.relevant == 'true'
         run: brew install xcodegen
 
       # The .xcodeproj references Mila/Resources/PythonRuntime, so the bundle
       # must exist before project generation / build. Same cache key as ci.yml
       # so a single entry services both workflows.
       - name: Cache diarization bundle
+        if: steps.changes.outputs.relevant == 'true'
         id: diar-bundle-cache
         uses: actions/cache@v4
         with:
@@ -61,19 +61,22 @@ jobs:
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
 
       - name: Build diarization bundle (cold path only)
-        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        if: steps.changes.outputs.relevant == 'true' && (steps.diar-bundle-cache.outputs.cache-hit != 'true')
         run: make bundle-diarization
 
       - name: Generate Xcode project
+        if: steps.changes.outputs.relevant == 'true'
         run: make project
 
       - name: Clear SwiftPM caches
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           rm -rf ~/Library/Caches/org.swift.swiftpm
           rm -rf ~/Library/org.swift.swiftpm
           rm -rf ~/Library/Developer/Xcode/DerivedData/SourcePackages
 
       - name: Resolve Swift Package dependencies
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           xcodebuild \
             -project Mila.xcodeproj \
@@ -82,6 +85,7 @@ jobs:
             -resolvePackageDependencies
 
       - name: Start mock OpenAI transcription server
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           python3 scripts/mock-openai-transcription-server.py --port "$MOCK_PORT" \
             > mock-server.log 2>&1 &
@@ -101,6 +105,7 @@ jobs:
         # xcodebuild forwards env vars into the test process after stripping
         # the TEST_RUNNER_ prefix (see ci.yml for why the bare form doesn't
         # propagate reliably).
+        if: steps.changes.outputs.relevant == 'true'
         env:
           TEST_RUNNER_MILA_REMOTE_TEST_ENDPOINT: "http://127.0.0.1:8123/v1"
         run: |
@@ -115,7 +120,7 @@ jobs:
             test
 
       - name: Stop mock server
-        if: always()
+        if: steps.changes.outputs.relevant == 'true' && (always())
         run: |
           if [ -f mock-server.pid ]; then kill "$(cat mock-server.pid)" 2>/dev/null || true; fi
           echo "--- mock server log ---"; cat mock-server.log 2>/dev/null || true

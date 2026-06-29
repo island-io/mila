@@ -3,19 +3,7 @@ name: App Tests
 on:
   push:
     branches: [main]
-    paths:
-      - 'Mila/**'
-      - 'MilaTests/**'
-      - 'MilaUITests/**'
-      - 'project.yml'
-      - '.github/workflows/ios-tests.yml'
   pull_request:
-    paths:
-      - 'Mila/**'
-      - 'MilaTests/**'
-      - 'MilaUITests/**'
-      - 'project.yml'
-      - '.github/workflows/ios-tests.yml'
 
 jobs:
   unit-and-ui-tests:

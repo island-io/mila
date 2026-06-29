@@ -95,10 +95,19 @@ jobs:
             build | xcpretty || true
 
       - name: Run unit tests
-        # Scope to MilaTests only. UI tests can't reliably foreground on
-        # hosted runners (see ios-tests.yml for the full explanation);
-        # gating CI on them would mean a permanently red status, which
-        # is worse than no UI-test signal at all.
+        # Scope to ONLY WhisperEngineCoreMLTests — the CoreML/ANE E2E test
+        # that this job uniquely sets up the CoreML model + env for. The
+        # rest of MilaTests is covered by the unit-and-ui-tests job; running
+        # the full suite here too redundantly re-ran subprocess-spawning
+        # tests on this overloaded runner (build + diarization bundle +
+        # whisper download all on one host), which caused contention flakes.
+        # In unit-and-ui-tests WhisperEngineCoreMLTests auto-skips because
+        # MILA_COREML_E2E isn't set there, so coverage doesn't overlap.
+        #
+        # UI tests can't reliably foreground on hosted runners (see
+        # ios-tests.yml for the full explanation); gating CI on them would
+        # mean a permanently red status, which is worse than no UI-test
+        # signal at all.
         #
         # MILA_COREML_E2E + MILA_COREML_MODEL unblock
         # `WhisperEngineCoreMLTests`, which verifies that whisper.cpp's
@@ -141,7 +150,7 @@ jobs:
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \
-            -only-testing:MilaTests \
+            -only-testing:MilaTests/WhisperEngineCoreMLTests \
             -retry-tests-on-failure \
             -test-iterations 3 \
             -test-timeouts-enabled YES \
