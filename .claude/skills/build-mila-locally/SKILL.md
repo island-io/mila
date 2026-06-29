@@ -28,15 +28,18 @@ All build commands run from the repo root (`~/ClonedProjects/mila`).
 ## CRITICAL: `make dmg` needs an explicit VERSION
 
 `make dmg` **fails on a clean checkout** with:
-```
+
+```text
 /bin/sh: MARKETING_VERSION: command not found
 ./scripts/make-dmg.sh: ... usage: make-dmg.sh APP_PATH DMG_PATH VERSION
 ```
-**Why:** `Info.plist` stores the literal `$(MARKETING_VERSION)` (resolved only at Xcode build time). The Makefile's version fallback reads `Info.plist` with `PlistBuddy`, gets the literal string back, and the shell tries to *execute* `MARKETING_VERSION`. The build itself SUCCEEDS — only DMG packaging breaks.
 
-**Fix:** pass the real version (it lives in `project.yml`) explicitly:
+**Why:** the Makefile's `VERSION` fallback reads `CFBundleShortVersionString` from `Info.plist`, but that key stores the literal `$(MARKETING_VERSION)` (Xcode resolves it only at build time). Make passes that literal into the recipe, the shell tries to *command-substitute* `$(MARKETING_VERSION)` — hence the `MARKETING_VERSION: command not found` line — and `VERSION` collapses to an empty string. `scripts/make-dmg.sh` then aborts on its empty-`VERSION` guard (`${3:?usage…}`). The release build itself SUCCEEDS — only DMG packaging breaks.
+
+**Fix:** the canonical version lives in `project.yml` (`MARKETING_VERSION`). Pass it explicitly:
+
 ```bash
-VERSION=$(grep -E 'MARKETING_VERSION:' project.yml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+VERSION=$(awk -F'"' '/^[[:space:]]*MARKETING_VERSION:/{print $2; exit}' project.yml)
 make dmg VERSION="$VERSION"
 ```
 

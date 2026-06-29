@@ -13,7 +13,7 @@ Mila's bundle identifier is **`io.island.whisper.IslandWhisper`** (Island.io ori
 
 ## The Iron Rules
 
-1. **Back up recordings BEFORE deleting anything.** Copy `Recordings/` + `recordings.json` to a safe location outside Application Support (e.g. `~/Desktop/Mila-Recordings-Backup-<date>`). Verify file counts match before proceeding.
+1. **Back up recordings BEFORE deleting anything.** Copy `Recordings/` + `recordings.json` + `folders.json` to a safe location outside Application Support (e.g. `~/Desktop/Mila-Recordings-Backup-<date>`). Verify file counts match before proceeding.
 2. **Use `trash`, never `rm`.** Every removal must be reversible.
 3. **Keep-by-default items are NOT deleted unless the user says so.** You MUST ASK the user about each one (see below). Default = keep. This includes the **settings/preferences plist** — never wipe the user's configuration as part of a routine uninstall; preserving it means a reinstall comes back with the same model, language, and settings.
 4. **Never touch the source repo** at `~/ClonedProjects/mila` — only its `build/` output is an app artifact.
@@ -24,6 +24,7 @@ Mila's bundle identifier is **`io.island.whisper.IslandWhisper`** (Island.io ori
 |---|---|---|
 | `~/Library/Application Support/Mila/Recordings/` | **User data — irreplaceable** | **Always keep + back up** |
 | `~/Library/Application Support/Mila/recordings.json` | **User data — the index** | **Always keep + back up** |
+| `~/Library/Application Support/Mila/folders.json` | **User data — folder organization** | **Always keep + back up** |
 | `~/Library/Application Support/Mila/Models/` (~6.8 GB) | Regenerable (whisper weights, re-downloaded) | **Keep — ASK before deleting** |
 | `~/Library/Application Support/Mila/torch-site-packages/` (~444 MB) | Regenerable (Python runtime, re-installed) | **Keep — ASK before deleting** |
 | App bundle in `/Applications/Mila.app` | App | Remove |
@@ -58,8 +59,10 @@ SRC="$HOME/Library/Application Support/Mila"
 DST="$HOME/Desktop/Mila-Recordings-Backup-$(date +%Y-%m-%d)"
 mkdir -p "$DST"
 cp -Rp "$SRC/Recordings" "$DST/" && cp -p "$SRC/recordings.json" "$DST/"
+cp -p "$SRC/folders.json" "$DST/" 2>/dev/null || true   # folder map — may not exist yet (optional)
 # verify counts match before continuing:
 echo "src=$(find "$SRC/Recordings" -type f | wc -l)  bak=$(find "$DST/Recordings" -type f | wc -l)"
+ls "$DST/recordings.json" "$DST/folders.json" 2>/dev/null   # confirm index + folder map backed up
 
 # 2. Quit the app if running
 pgrep -f "Mila.app/Contents/MacOS" && osascript -e 'quit app "Mila"' || true
@@ -127,7 +130,7 @@ ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
 
 - **Deleting the whole `~/Library/Application Support/Mila` folder.** It contains the irreplaceable `Recordings/` + `recordings.json`. Never blanket-delete it.
 - **Searching only for "Mila".** The prefs/caches are under `io.island.whisper.IslandWhisper`. Search the bundle id too.
-- **Forgetting `recordings.json`.** Backing up `Recordings/` without the index leaves a reinstall with an empty library.
+- **Forgetting `recordings.json` / `folders.json`.** Backing up `Recordings/` without the index leaves a reinstall with an empty library; dropping `folders.json` loses the user's folder organization.
 - **Using `rm`.** Always `trash` so the user can recover.
 - **Deleting `Models/`/`torch-site-packages/` without asking.** These are keep-by-default; deleting them forces multi-GB re-downloads on reinstall.
 - **Wiping the preferences plist on a routine uninstall.** That destroys the user's settings (model, language, diarization, LLM config). Keep it unless the user explicitly wants a full reset — and if they do, clear `cfprefsd` too or it gets rewritten.
