@@ -21,7 +21,7 @@ All build commands run from the repo root (wherever your checkout lives).
 | Release build | `make release-build` | `build-release/Build/Products/Release/Mila.app` |
 | Self-signed DMG | `make dmg VERSION=<x.y.z>` | `Mila-<x.y.z>.dmg` (ad-hoc signed) |
 | Run tests | `make test` | XCTest run |
-| Clean | `make clean` | removes `.xcodeproj`, `build`, `build-release`, `*.dmg` |
+| Clean | `make clean` | removes `Mila.xcodeproj`, `build`, `build-release`, `*.dmg` |
 
 `make` targets chain: `dmg → release-build → project → bootstrap`, so a single command regenerates the project and builds.
 

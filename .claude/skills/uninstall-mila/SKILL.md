@@ -16,7 +16,7 @@ Mila's bundle identifier is **`io.island.whisper.IslandWhisper`** (Island.io ori
 1. **Back up recordings BEFORE deleting anything.** Copy `Recordings/` + `recordings.json` + `folders.json` to a safe location outside Application Support (e.g. `~/Desktop/Mila-Recordings-Backup-<date>`). Verify file counts match before proceeding.
 2. **Use `trash`, never `rm`.** Every removal must be reversible.
 3. **Keep-by-default items are NOT deleted unless the user says so.** You MUST ASK the user about each one (see below). Default = keep. This includes the **settings/preferences plist** — never wipe the user's configuration as part of a routine uninstall; preserving it means a reinstall comes back with the same model, language, and settings.
-4. **Never touch the source repo** at `~/ClonedProjects/mila` — only its `build/` output is an app artifact.
+4. **Never touch the source repo** (your `mila` checkout, wherever it lives) — only its `build/` output is an app artifact.
 
 ## What is what (map before you touch)
 
@@ -74,7 +74,8 @@ pgrep -f "Mila.app/Contents/MacOS" && osascript -e 'quit app "Mila"' || true
 
 # 3. Remove app bundles + build artifacts (to Trash)
 trash /Applications/Mila.app 2>/dev/null || true
-trash "$HOME/ClonedProjects/mila/build" 2>/dev/null || true       # only the build/ output, NOT the repo
+REPO="$HOME/ClonedProjects/mila"          # ← set to your checkout location
+trash "$REPO/build" 2>/dev/null || true   # only the build/ output, NOT the repo itself
 for d in "$HOME/Library/Developer/Xcode/DerivedData/"Mila-*; do [ -d "$d" ] && trash "$d"; done
 
 # 4. Remove system footprint (bundle id, NOT "Mila").
@@ -125,7 +126,7 @@ killall Dock
 
 ```bash
 mdfind -name "Mila.app" 2>/dev/null | grep -v "/.Trash/" || echo "(no app outside Trash)"
-ls -d ~/Library/{Preferences/io.island.whisper.IslandWhisper.plist,Caches/io.island.whisper.IslandWhisper} 2>/dev/null || echo "(footprint gone)"
+ls -d ~/Library/{Preferences/io.island.whisper.IslandWhisper.plist,Caches/io.island.whisper.IslandWhisper,HTTPStorages/io.island.whisper.IslandWhisper,WebKit/io.island.whisper.IslandWhisper} 2>/dev/null || echo "(footprint gone)"
 defaults read com.apple.dock persistent-apps 2>/dev/null | grep -i mila || echo "(no Mila in Dock)"
 # user data intact:
 ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
@@ -139,4 +140,4 @@ ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
 - **Using `rm`.** Always `trash` so the user can recover.
 - **Deleting `Models/`/`torch-site-packages/` without asking.** These are keep-by-default; deleting them forces multi-GB re-downloads on reinstall.
 - **Wiping the preferences plist on a routine uninstall.** That destroys the user's settings (model, language, diarization, LLM config). Keep it unless the user explicitly wants a full reset — and if they do, clear `cfprefsd` too or it gets rewritten.
-- **Trashing the source repo.** Only `build/` inside `~/ClonedProjects/mila` is an artifact; the rest is source.
+- **Trashing the source repo.** Only `build/` inside your `mila` checkout is an artifact; the rest is source.
