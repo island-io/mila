@@ -39,11 +39,21 @@ final class UtteranceDetectorFixtureTests: XCTestCase {
             proc.standardOutput = pipe
             proc.standardError = pipe
             try proc.run()
+            // Drain stdout+stderr concurrently BEFORE waitUntilExit. The
+            // generator runs `say` per speaker + `afconvert` + a numpy/scipy
+            // mixing pass, which can emit well over the ~64KB pipe buffer.
+            // Reading only AFTER waitUntilExit (the previous code) deadlocks:
+            // the child blocks on write() once the buffer fills while the
+            // parent blocks on exit — the exact hang documented in
+            // .claude/rules/python-subprocess.md. On a contended CI runner
+            // this stalled the whole unit-and-ui-tests job to its 30-min
+            // timeout. Read to EOF on a detached task, then join after exit.
+            let readTask = Task.detached { pipe.fileHandleForReading.readDataToEndOfFile() }
             proc.waitUntilExit()
+            let outData = await readTask.value
             guard proc.terminationStatus == 0,
                   FileManager.default.fileExists(atPath: fixturePath) else {
-                let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
-                                 encoding: .utf8) ?? ""
+                let out = String(data: outData, encoding: .utf8) ?? ""
                 throw XCTSkip("Fixture generation failed: \(out)")
             }
         }
