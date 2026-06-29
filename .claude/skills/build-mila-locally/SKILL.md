@@ -40,6 +40,7 @@ All build commands run from the repo root (wherever your checkout lives).
 
 ```bash
 VERSION=$(awk -F'"' '/^[[:space:]]*MARKETING_VERSION:/{print $2; exit}' project.yml)
+[ -n "$VERSION" ] || { echo "MARKETING_VERSION not found in project.yml" >&2; exit 1; }
 make dmg VERSION="$VERSION"
 ```
 

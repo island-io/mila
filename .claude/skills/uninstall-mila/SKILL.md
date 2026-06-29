@@ -74,8 +74,13 @@ pgrep -f "Mila.app/Contents/MacOS" && osascript -e 'quit app "Mila"' || true
 
 # 3. Remove app bundles + build artifacts (to Trash)
 trash /Applications/Mila.app 2>/dev/null || true
-REPO="$HOME/ClonedProjects/mila"          # ← set to your checkout location
-trash "$REPO/build" 2>/dev/null || true   # only the build/ output, NOT the repo itself
+# Build artifacts — only relevant if Mila was built from source. Point REPO at
+# your checkout (or `export MILA_REPO=...`); the project.yml check guards against
+# trashing an unrelated build/ tree if REPO is wrong.
+REPO="${MILA_REPO:-$HOME/ClonedProjects/mila}"
+if [ -f "$REPO/project.yml" ]; then
+  trash "$REPO/build" 2>/dev/null || true   # only the build/ output, NOT the repo itself
+fi
 for d in "$HOME/Library/Developer/Xcode/DerivedData/"Mila-*; do [ -d "$d" ] && trash "$d"; done
 
 # 4. Remove system footprint (bundle id, NOT "Mila").
