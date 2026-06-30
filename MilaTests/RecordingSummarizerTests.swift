@@ -164,14 +164,18 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
         liveAI.model = ""   // keep argv minimal: no --model passthrough
 
-        // Capture the argv the app would have launched. The stub builds it
-        // from the same (tool, prompt, model) the production runner uses, so
-        // the assertion still proves the composed one-shot `-p` shape.
+        // Capture the argv the app would have launched. The production
+        // runner (`LLMRunner.run`) composes the user prompt + transcript via
+        // `composedPrompt` BEFORE handing the blob to `LLMTool.arguments`, so
+        // the stub does the same here — that's what embeds the transcript and
+        // the "Transcript:" label into the `-p` argument. Reconstructing the
+        // argv this way proves the one-shot `-p` shape without a subprocess.
         var capturedArgs: [String] = []
         var callCount = 0
-        useStubRunner { tool, prompt, _, _, model, extraArgs, _ in
+        useStubRunner { tool, prompt, transcript, _, model, extraArgs, _ in
             callCount += 1
-            capturedArgs = tool.arguments(prompt: prompt, model: model) + extraArgs
+            let composed = LLMRunner.composedPrompt(prompt, transcript: transcript)
+            capturedArgs = tool.arguments(prompt: composed, model: model) + extraArgs
             return "A concise summary of the meeting."
         }
 
