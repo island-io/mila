@@ -41,6 +41,18 @@ struct VoiceMemosLibrary {
         recordingsDirectory.appendingPathComponent("CloudRecordings.db")
     }
 
+    /// `databaseURL.path` / `recordingsDirectory.path` with the home directory
+    /// shortened to `~`. The absolute form embeds the macOS account name, so
+    /// these are the variants safe to log at `.public` — they keep full
+    /// diagnostic value (which path Mila probed) without leaking a user
+    /// identifier into the unified log. See issue #45.
+    var databaseDisplayPath: String {
+        (databaseURL.path as NSString).abbreviatingWithTildeInPath
+    }
+    var recordingsDirectoryDisplayPath: String {
+        (recordingsDirectory.path as NSString).abbreviatingWithTildeInPath
+    }
+
     /// Why the Voice Memos library can — or can't — be read right now.
     ///
     /// A bare `fileExists` check can't tell "the user has no synced library"
