@@ -289,6 +289,11 @@ final class TranscriptionService: ObservableObject {
             return
         }
         await remoteSettings.testConnection()
+        // Drop a superseded/cancelled probe: the caller cancels this task when
+        // the recording stops or a newer recording starts, so a late, out-of-
+        // order failure can't overwrite UI state for a recording the user has
+        // already moved past.
+        if Task.isCancelled { return }
         if case .failed(let message) = remoteSettings.testStatus {
             lastError = "Remote transcription server check failed: \(message) Your audio is still being recorded — fix the endpoint or API key in Settings → Models, then re-transcribe."
         }

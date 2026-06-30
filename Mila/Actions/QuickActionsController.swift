@@ -165,6 +165,14 @@ final class QuickActionsController: ObservableObject {
     /// we never fire the warning for a recording that's already over.
     private var silenceWatchTask: Task<Void, Never>?
 
+    /// Active record-start remote-backend probe (see `startRecording`).
+    /// Single-owner: superseded when a new recording starts and cancelled
+    /// when one stops, so an older probe — whose `GET /models` is still in
+    /// flight against the same unchanged config (which `testConnection()`
+    /// can't detect as stale) — can't land an out-of-order failure into
+    /// `lastError`/`testStatus` after the user already moved on.
+    private var remoteProbeTask: Task<Void, Never>?
+
     /// Background finalize tasks, keyed by the recording id they're
     /// finalizing. After `stopRecording` drains the live pipeline and
     /// frees the record button, the HEAVY tail of finalization — the
@@ -373,7 +381,12 @@ final class QuickActionsController: ObservableObject {
             // recorded a whole meeting before learning it failed). Non-blocking
             // — recording already started and audio is being saved; this just
             // races an error banner to the user. No-op for the local backend.
-            Task { [transcription] in await transcription.probeRemoteBackendIfActive() }
+            // Single-owner: cancel any prior probe so its (possibly stale)
+            // result can't overwrite UI state for this newer recording.
+            remoteProbeTask?.cancel()
+            remoteProbeTask = Task { [transcription] in
+                await transcription.probeRemoteBackendIfActive()
+            }
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             screenRecordingPermissionMissing = true
         } catch {
@@ -493,6 +506,10 @@ final class QuickActionsController: ObservableObject {
         // user already stopped (especially common for sub-10s recordings).
         silenceWatchTask?.cancel()
         silenceWatchTask = nil
+        // Cancel any in-flight record-start remote probe for the same reason:
+        // its failure result must not land after the recording is over.
+        remoteProbeTask?.cancel()
+        remoteProbeTask = nil
         // Release the sleep assertion as soon as the engine is shutting
         // down — keeping it past `stop()` would block idle sleep while
         // the user is just looking at the rename sheet.
