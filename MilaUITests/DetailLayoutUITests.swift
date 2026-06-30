@@ -91,38 +91,49 @@ final class DetailLayoutUITests: XCTestCase {
         let app = launchApp()
         attachScreenshot(app, name: "01-home-on-launch")
 
-        // Navigate: All Transcriptions → seeded recording.
+        // Navigate to the seeded recording. The app is launched with
+        // `--ui-test-seed-recording`, which now ALSO pins the
+        // "All Transcriptions" section EXPANDED (see MilaApp.init) — so the
+        // seeded recording's inline sidebar row is deterministically present
+        // on launch, no folder click required.
+        //
+        // Previously the test clicked the folder row and then raced two
+        // possible outcomes (folder *selected* → `history.row.*` in the detail
+        // pane, vs folder *expanded* → inline `sidebar.recording.*`). That
+        // select-vs-expand split was non-deterministic on the macOS-26 runner
+        // and flaked the test (PR #40 tried to accept either, but the disclosure
+        // state itself leaked across runs via @AppStorage, so even the
+        // "expanded" branch wasn't guaranteed). Forcing the expanded state at
+        // launch removes the ambiguity at the source.
         let folder = app.descendants(matching: .any)
             .matching(identifier: "sidebar.folder.default").firstMatch
         XCTAssertTrue(folder.waitForExistence(timeout: 5),
                       "All Transcriptions sidebar row not found")
-        folder.click()
         attachScreenshot(app, name: "02-all-transcriptions-list")
 
-        // The seeded recording is reachable two ways, and which one
-        // appears is non-deterministic on the macOS-26 CI runner:
-        //   * folder *selected*  → HistoryListView in the detail pane,
-        //     row id `history.row.Seed Recording`
-        //   * folder *expanded*  → inline child in the sidebar,
-        //     row id `sidebar.recording.Seed Recording`
-        // A single click on the folder row lands on one or the other
-        // (List selection vs. disclosure toggle). Both tags drive
-        // navigation to the same RecordingDetailView, so accept whichever
-        // surfaces rather than assuming the history-list path (the latter
-        // assumption flaked this test on CI — see PR #40).
-        let recordingIDs = ["history.row.Seed Recording",
-                            "sidebar.recording.Seed Recording"]
+        // The inline recording row is the deterministic target. We still also
+        // accept the history-list row id as a fallback (e.g. if a future change
+        // alters the default expansion), and explicitly expand the disclosure if
+        // for any reason the inline row hasn't surfaced yet.
+        let recordingIDs = ["sidebar.recording.Seed Recording",
+                            "history.row.Seed Recording"]
         var row = firstExisting(in: app, identifiers: recordingIDs, timeout: 8)
         if row == nil {
-            // The click neither selected nor expanded the folder — force
-            // the disclosure open and look for the inline child row.
-            let disclosure = app.descendants(matching: .any)
-                .matching(identifier: "sidebar.folder.default.disclosure").firstMatch
-            if disclosure.exists { disclosure.click() }
+            // Inline row not present — expand the disclosure and retry. Guard on
+            // the inline row NOT already existing so we never toggle a section
+            // that's already open back closed.
+            let inline = app.descendants(matching: .any)
+                .matching(identifier: "sidebar.recording.Seed Recording").firstMatch
+            if !inline.exists {
+                let disclosure = app.descendants(matching: .any)
+                    .matching(identifier: "sidebar.folder.default.disclosure").firstMatch
+                if disclosure.exists { disclosure.click() }
+            }
             row = firstExisting(in: app, identifiers: recordingIDs, timeout: 5)
         }
         let recordingRow = try XCTUnwrap(
-            row, "Seeded recording not reachable via the history list or the sidebar")
+            row, "Seeded recording not reachable via the sidebar or the history list")
+        XCTAssertTrue(recordingRow.waitForExistence(timeout: 5))
         recordingRow.click()
 
         // Detail-view title label should exist (the row click landed on
