@@ -14,19 +14,7 @@ name: Live AI E2E
 on:
   push:
     branches: [main]
-    paths:
-      - 'scripts/llm-live-ai-e2e.py'
-      - 'scripts/fixtures/**'
-      - 'Mila/Models/LiveAISettings.swift'
-      - 'Mila/Actions/LiveAISession.swift'
-      - '.github/workflows/llm-live-ai-e2e.yml'
   pull_request:
-    paths:
-      - 'scripts/llm-live-ai-e2e.py'
-      - 'scripts/fixtures/**'
-      - 'Mila/Models/LiveAISettings.swift'
-      - 'Mila/Actions/LiveAISession.swift'
-      - '.github/workflows/llm-live-ai-e2e.yml'
   workflow_dispatch:
     inputs:
       minutes:
@@ -41,10 +29,22 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'scripts/llm-live-ai-e2e.py'
+              - 'scripts/fixtures/**'
+              - 'Mila/Models/LiveAISettings.swift'
+              - 'Mila/Actions/LiveAISession.swift'
+              - '.github/workflows/llm-live-ai-e2e.yml'
       - uses: actions/setup-python@v5
+        if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
       - name: Run E2E (English, mock backend — no key)
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           python scripts/llm-live-ai-e2e.py \
             --backend mock \
@@ -57,10 +57,22 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'scripts/llm-live-ai-e2e.py'
+              - 'scripts/fixtures/**'
+              - 'Mila/Models/LiveAISettings.swift'
+              - 'Mila/Actions/LiveAISession.swift'
+              - '.github/workflows/llm-live-ai-e2e.yml'
       - uses: actions/setup-python@v5
+        if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
       - name: Run E2E (Hebrew, mock backend — no key)
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           python scripts/llm-live-ai-e2e.py \
             --backend mock \
@@ -81,24 +93,40 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'scripts/llm-live-ai-e2e.py'
+              - 'scripts/llm-verify-screenshots.py'
+              - 'scripts/fixtures/**'
+              - 'Mila/Models/LiveAISettings.swift'
+              - 'Mila/Actions/LiveAISession.swift'
+              - 'MilaUITests/DetailLayoutUITests.swift'
+              - '.github/workflows/llm-live-ai-e2e.yml'
       - name: Install xcodegen
+        if: steps.changes.outputs.relevant == 'true'
         run: brew install xcodegen
       # The .xcodeproj references Mila/Resources/PythonRuntime as a
       # bundled resource — the link step fails without it. Same cache
       # key as ios-tests.yml so cold builds across the two workflows
       # restore from a single entry.
       - name: Cache diarization bundle
+        if: steps.changes.outputs.relevant == 'true'
         id: diar-bundle-cache
         uses: actions/cache@v4
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
       - name: Build diarization bundle (cold path only)
-        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        if: steps.changes.outputs.relevant == 'true' && (steps.diar-bundle-cache.outputs.cache-hit != 'true')
         run: make bundle-diarization
       - name: Generate Xcode project
+        if: steps.changes.outputs.relevant == 'true'
         run: make project
       - name: Run UI tests (writes screenshots to /tmp/mila-ui-screenshots/)
+        if: steps.changes.outputs.relevant == 'true'
         env:
           MILA_UI_SCREENSHOTS_DIR: /tmp/mila-ui-screenshots
         run: |
@@ -113,16 +141,19 @@ jobs:
             -derivedDataPath build-uitests \
             CODE_SIGNING_ALLOWED=NO || (echo "UI tests failed — vision check skipped" && exit 1)
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: steps.changes.outputs.relevant == 'true' && (always())
         with:
           name: ui-screenshots
           path: /tmp/mila-ui-screenshots/
           if-no-files-found: warn
       - uses: actions/setup-python@v5
+        if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
       - run: pip install --upgrade anthropic
+        if: steps.changes.outputs.relevant == 'true'
       - name: Visual regression check via Claude vision
+        if: steps.changes.outputs.relevant == 'true'
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |

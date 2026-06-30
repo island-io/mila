@@ -3,17 +3,7 @@ name: E2E Diarization
 on:
   push:
     branches: [main]
-    paths:
-      - 'Mila/Transcription/SpeakerDiarizer.swift'
-      - 'Mila/Resources/DiarizationModels/**'
-      - 'scripts/diarize-e2e.py'
-      - '.github/workflows/e2e-diarization.yml'
   pull_request:
-    paths:
-      - 'Mila/Transcription/SpeakerDiarizer.swift'
-      - 'Mila/Resources/DiarizationModels/**'
-      - 'scripts/diarize-e2e.py'
-      - '.github/workflows/e2e-diarization.yml'
 
 # The bulk of CI time on a cold cache is the torch wheel download (~150 MB)
 # and pyannote.audio + numpy/scipy/etc (~50 MB more). Cache the entire venv
@@ -33,7 +23,18 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'Mila/Transcription/SpeakerDiarizer.swift'
+              - 'Mila/Resources/DiarizationModels/**'
+              - 'scripts/diarize-e2e.py'
+              - '.github/workflows/e2e-diarization.yml'
+
       - name: Cache pyannote venv
+        if: steps.changes.outputs.relevant == 'true'
         id: venv-cache
         uses: actions/cache@v4
         with:
@@ -41,7 +42,7 @@ jobs:
           key: diar-venv-${{ runner.os }}-py3.11-${{ env.VENV_VERSION }}
 
       - name: Set up Python venv (cold path only)
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.changes.outputs.relevant == 'true' && (steps.venv-cache.outputs.cache-hit != 'true')
         run: |
           /usr/bin/python3 -m venv ~/diar-venv
           ~/diar-venv/bin/pip install --upgrade pip
@@ -54,6 +55,7 @@ jobs:
             'huggingface_hub<1.0'
 
       - name: Diarize fixture
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           ~/diar-venv/bin/python scripts/diarize-e2e.py \
             Mila/Resources/DiarizationModels \

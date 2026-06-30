@@ -3,17 +3,7 @@ name: E2E Transcription
 on:
   push:
     branches: [main]
-    paths:
-      - 'Packages/TranscriptionCore/**'
-      - 'Mila/Transcription/**'
-      - '.github/workflows/e2e-transcription.yml'
-      - '.github/whisper-cpp-pin.txt'
   pull_request:
-    paths:
-      - 'Packages/TranscriptionCore/**'
-      - 'Mila/Transcription/**'
-      - '.github/workflows/e2e-transcription.yml'
-      - '.github/whisper-cpp-pin.txt'
 
 env:
   LIBRARY_PATH: /usr/local/lib
@@ -31,7 +21,18 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: dorny/paths-filter@v3
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'Packages/TranscriptionCore/**'
+              - 'Mila/Transcription/**'
+              - '.github/workflows/e2e-transcription.yml'
+              - '.github/whisper-cpp-pin.txt'
+
       - name: Verify whisper.cpp submodule hash
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           EXPECTED=$(cat .github/whisper-cpp-pin.txt | tr -d '[:space:]')
           ACTUAL=$(git submodule status Packages/TranscriptionCore/vendor/whisper.cpp | awk '{print $1}' | tr -d '+')
@@ -43,11 +44,13 @@ jobs:
           echo "whisper.cpp submodule at expected commit $EXPECTED"
 
       - name: Install system dependencies
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential
 
       - name: Cache whisper.cpp build
+        if: steps.changes.outputs.relevant == 'true'
         uses: actions/cache@v4
         id: whisper-build-cache
         with:
@@ -61,7 +64,7 @@ jobs:
           key: whisper-build-${{ hashFiles('.github/whisper-cpp-pin.txt') }}
 
       - name: Build and install whisper.cpp
-        if: steps.whisper-build-cache.outputs.cache-hit != 'true'
+        if: steps.changes.outputs.relevant == 'true' && (steps.whisper-build-cache.outputs.cache-hit != 'true')
         working-directory: Packages/TranscriptionCore/vendor/whisper.cpp
         run: |
           cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
@@ -69,20 +72,24 @@ jobs:
           sudo cmake --install build
 
       - name: Update linker cache
+        if: steps.changes.outputs.relevant == 'true'
         run: sudo ldconfig
 
       - name: Install Swift
+        if: steps.changes.outputs.relevant == 'true'
         uses: swift-actions/setup-swift@v2
         with:
           swift-version: '5.10'
 
       - name: Cache whisper model
+        if: steps.changes.outputs.relevant == 'true'
         uses: actions/cache@v4
         with:
           path: ~/.cache/whisper-models
           key: whisper-model-ggml-tiny-v1
 
       - name: Download ggml-tiny model
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           mkdir -p ~/.cache/whisper-models
           if [ ! -f ~/.cache/whisper-models/ggml-tiny.bin ]; then
@@ -92,14 +99,17 @@ jobs:
           fi
 
       - name: Run package unit tests
+        if: steps.changes.outputs.relevant == 'true'
         working-directory: Packages/TranscriptionCore
         run: swift test
 
       - name: Build whisper-e2e
+        if: steps.changes.outputs.relevant == 'true'
         working-directory: Packages/TranscriptionCore
         run: swift build --product whisper-e2e -c release
 
       - name: Run E2E transcription tests
+        if: steps.changes.outputs.relevant == 'true'
         working-directory: Packages/TranscriptionCore
         run: |
           swift run -c release whisper-e2e \
