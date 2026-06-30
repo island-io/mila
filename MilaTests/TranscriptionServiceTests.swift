@@ -24,7 +24,15 @@ final class TranscriptionServiceTests: XCTestCase {
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
-        service = TranscriptionService(store: store, modelManager: manager, diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.diarization")!), engine: stub)
+        // Inject an isolated, local-backend RemoteTranscriptionSettings so the
+        // service can't read `.standard` and route to a real remote endpoint
+        // (which would bypass the stub). See TestSupport.isolatedRemoteSettings.
+        service = TranscriptionService(
+            store: store,
+            modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.diarization")!),
+            remoteSettings: TestSupport.isolatedRemoteSettings(label: "TranscriptionServiceTests"),
+            engine: stub)
     }
 
     override func tearDown() async throws {
