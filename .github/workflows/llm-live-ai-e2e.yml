@@ -99,9 +99,11 @@ jobs:
           filters: |
             relevant:
               - 'scripts/llm-live-ai-e2e.py'
+              - 'scripts/llm-verify-screenshots.py'
               - 'scripts/fixtures/**'
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
+              - 'MilaUITests/DetailLayoutUITests.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
       - name: Install xcodegen
         if: steps.changes.outputs.relevant == 'true'
