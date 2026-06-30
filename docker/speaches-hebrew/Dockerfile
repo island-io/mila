@@ -44,13 +44,14 @@ RUN python -c "from huggingface_hub import snapshot_download; \
 # Server config (speaches reads these env vars; see src/speaches/config.py).
 #   - PRELOAD_MODELS: a JSON list. Load the model into memory at startup so the
 #     very first transcription request doesn't pay the load cost (CI health-gates
-#     on it). The default below matches the default MODEL_ID; if you override
-#     MODEL_ID with a different repo, also pass that repo here.
+#     on it). DERIVED from MODEL_ID (expanded at build time) so a custom
+#     `--build-arg MODEL_ID=...` build preloads the model it actually baked into
+#     the HF cache above — never a stale hard-coded repo.
 #   - WHISPER__INFERENCE_DEVICE/COMPUTE_TYPE: CPU int8 — the GitHub runner has no
 #     GPU, and int8 keeps the turbo model's latency tolerable.
 #   - ENABLE_UI=false: no gradio UI; this is an API-only server.
 #   - ALLOW_ORIGINS=["*"]: the E2E client reaches it through a tunnel hostname.
-ENV PRELOAD_MODELS=["ivrit-ai/whisper-large-v3-turbo-ct2"] \
+ENV PRELOAD_MODELS=["${MODEL_ID}"] \
     WHISPER__INFERENCE_DEVICE=cpu \
     WHISPER__COMPUTE_TYPE=int8 \
     ENABLE_UI=false \

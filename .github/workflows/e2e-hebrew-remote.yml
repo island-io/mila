@@ -15,6 +15,16 @@ name: E2E Hebrew Remote Transcription
 # workflow artifact the client polls for. The server job stays alive serving
 # until the client signals "done" (another artifact), then tears down.
 #
+# WHY BUILD THE IMAGE IN-JOB (not pull `:latest` from GHCR)
+# ---------------------------------------------------------
+# The server job builds the speaches image from `docker/speaches-hebrew/` in the
+# checkout, so a PR that edits the Dockerfile (or the model) is tested against
+# the code UNDER REVIEW — not the last image published from `main`. The
+# `build-speaches-image.yml` workflow only pushes on `main`/dispatch, so a
+# `:latest` pull would silently test stale bytes on PRs (and fork PRs can't pull
+# a private package at all). Building shares the same `type=gha` layer cache as
+# the publish workflow, so the model bake is paid once and reused.
+#
 # This is heavier and inherently more network-dependent than the default
 # `e2e-remote-transcription` mock-server E2E. It is path-gated and also
 # manually dispatchable so it doesn't run on every push.
@@ -34,13 +44,15 @@ on:
     paths:
       - 'Mila/Transcription/RemoteWhisperEngine.swift'
       - 'Mila/Models/RemoteTranscriptionSettings.swift'
+      # Keep in sync with the `push` filter: the shared transcription service
+      # routes the remote path, so PRs touching it must run this E2E too.
+      - 'Mila/Transcription/TranscriptionService.swift'
       - 'MilaTests/RemoteTranscriptionE2ETests.swift'
       - 'docker/speaches-hebrew/**'
       - '.github/workflows/e2e-hebrew-remote.yml'
 
 permissions:
   contents: read
-  packages: read     # pull the speaches image from GHCR
   actions: read       # poll run artifacts via the REST API (handoff channel)
 
 concurrency:
@@ -48,41 +60,41 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_BASENAME: mila-speaches-hebrew
   TUNNEL_ARTIFACT: hebrew-tunnel-url
   DONE_ARTIFACT: hebrew-client-done
   HEBREW_MODEL: ivrit-ai/whisper-large-v3-turbo-ct2
 
 jobs:
   # ----------------------------------------------------------------------------
-  # SERVER: Linux. Runs the speaches container, opens a cloudflared quick tunnel,
-  # publishes the tunnel URL as an artifact, then stays alive serving until the
-  # client uploads the "done" artifact (or a hard timeout).
+  # SERVER: Linux. Builds the speaches image from the checkout, runs the
+  # container, opens a cloudflared quick tunnel, publishes the tunnel URL as an
+  # artifact, then stays alive serving until the client uploads the "done"
+  # artifact (or a hard timeout).
   # ----------------------------------------------------------------------------
   speaches-server:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Lowercase image ref
-        id: img
-        run: |
-          owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
-          echo "ref=${{ env.REGISTRY }}/${owner}/${{ env.IMAGE_BASENAME }}:latest" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
+      # Build the PR's own image (linux/amd64 == this runner) and load it into
+      # the local docker daemon. `cache-from: type=gha` reuses the layers the
+      # publish workflow baked, so the ~1.6 GB model download isn't repeated.
+      - name: Build speaches image (from the checkout under review)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          context: docker/speaches-hebrew
+          platforms: linux/amd64
+          load: true
+          tags: mila-speaches-hebrew:e2e
+          cache-from: type=gha
 
       - name: Start speaches container
         run: |
-          docker run -d --name speaches -p 8000:8000 \
-            "${{ steps.img.outputs.ref }}"
+          docker run -d --name speaches -p 8000:8000 mila-speaches-hebrew:e2e
           echo "Waiting for speaches /health (model preload can take a few minutes)..."
           for i in $(seq 1 60); do
             if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
@@ -118,19 +130,25 @@ jobs:
             echo "::error::tunnel URL never appeared"; cat tunnel.log; exit 1
           fi
           echo "Tunnel URL: $URL"
-          # Verify the tunnel actually proxies to speaches before handing it off.
+          # Verify the tunnel actually proxies to speaches before handing it
+          # off. Fail fast if it never comes up — handing a dead URL to the
+          # client just produces a confusing downstream test failure.
+          tunnel_ok=""
           for i in $(seq 1 30); do
             if curl -fsS "$URL/health" >/dev/null 2>&1; then
-              echo "tunnel reaches speaches /health"; break
+              echo "tunnel reaches speaches /health"; tunnel_ok=1; break
             fi
             sleep 2
           done
+          if [ -z "$tunnel_ok" ]; then
+            echo "::error::tunnel never proxied to speaches /health"; cat tunnel.log; exit 1
+          fi
           # The remote endpoint Mila expects is the OpenAI-style /v1 base.
           printf '%s/v1' "$URL" > endpoint.txt
           echo "endpoint=$(cat endpoint.txt)" >> "$GITHUB_OUTPUT"
 
       - name: Publish tunnel URL for the client job
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.TUNNEL_ARTIFACT }}
           path: endpoint.txt
@@ -142,12 +160,15 @@ jobs:
       - name: Serve until client done
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          DONE_ARTIFACT: ${{ env.DONE_ARTIFACT }}
         run: |
           echo "Serving; waiting for client 'done' signal (max ~30 min)..."
           for i in $(seq 1 180); do
             count=$(gh api \
-              "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-              --jq "[.artifacts[] | select(.name == \"${{ env.DONE_ARTIFACT }}\")] | length" \
+              "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+              --jq "[.artifacts[] | select(.name == \"${DONE_ARTIFACT}\")] | length" \
               2>/dev/null || echo 0)
             if [ "$count" != "0" ] && [ -n "$count" ]; then
               echo "client signalled done"; exit 0
@@ -177,14 +198,14 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install xcodegen
         run: brew install xcodegen
 
       - name: Cache diarization bundle
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -229,13 +250,16 @@ jobs:
         id: endpoint
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TUNNEL_ARTIFACT: ${{ env.TUNNEL_ARTIFACT }}
         run: |
-          echo "Polling for the '${{ env.TUNNEL_ARTIFACT }}' artifact..."
+          echo "Polling for the '${TUNNEL_ARTIFACT}' artifact..."
           ART_ID=""
           for i in $(seq 1 120); do   # up to ~20 min (server may bake/preload)
             ART_ID=$(gh api \
-              "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-              --jq "[.artifacts[] | select(.name == \"${{ env.TUNNEL_ARTIFACT }}\")][0].id" \
+              "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+              --jq "[.artifacts[] | select(.name == \"${TUNNEL_ARTIFACT}\")][0].id" \
               2>/dev/null || true)
             if [ -n "$ART_ID" ] && [ "$ART_ID" != "null" ]; then break; fi
             sleep 10
@@ -243,18 +267,24 @@ jobs:
           if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
             echo "::error::tunnel URL artifact never appeared"; exit 1
           fi
-          gh api "repos/${{ github.repository }}/actions/artifacts/${ART_ID}/zip" > art.zip
+          gh api "repos/${REPO}/actions/artifacts/${ART_ID}/zip" > art.zip
           unzip -o art.zip -d art >/dev/null
           ENDPOINT=$(cat art/endpoint.txt)
           echo "Endpoint: $ENDPOINT"
-          # Health-gate the tunnel from the client side before testing.
+          # Health-gate the tunnel from the client side before testing. Fail
+          # fast if it never answers — better a clear "tunnel dead" error here
+          # than a misleading transcription failure in the test step.
+          base="${ENDPOINT%/v1}"
+          tunnel_ok=""
           for i in $(seq 1 30); do
-            base="${ENDPOINT%/v1}"
             if curl -fsS "${base}/health" >/dev/null 2>&1; then
-              echo "tunnel healthy from client"; break
+              echo "tunnel healthy from client"; tunnel_ok=1; break
             fi
             sleep 5
           done
+          if [ -z "$tunnel_ok" ]; then
+            echo "::error::tunnel endpoint never healthy from client: ${ENDPOINT}"; exit 1
+          fi
           echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
 
       - name: Run Hebrew remote E2E test
@@ -284,7 +314,7 @@ jobs:
 
       - name: Upload done marker
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ env.DONE_ARTIFACT }}
           path: done/done.txt
