@@ -28,26 +28,6 @@ final class DetailLayoutUITests: XCTestCase {
         return app
     }
 
-    /// Poll for the first of `identifiers` to exist, returning it (or nil
-    /// on timeout). Unlike chaining `waitForExistence` per element, this
-    /// races several candidates at once — used where the same target is
-    /// reachable under more than one accessibility id depending on a
-    /// non-deterministic UI state on the CI runner.
-    private func firstExisting(in app: XCUIApplication,
-                               identifiers: [String],
-                               timeout: TimeInterval) -> XCUIElement? {
-        let deadline = Date().addingTimeInterval(timeout)
-        repeat {
-            for id in identifiers {
-                let el = app.descendants(matching: .any)
-                    .matching(identifier: id).firstMatch
-                if el.exists { return el }
-            }
-            usleep(200_000)  // 0.2s between polls
-        } while Date() < deadline
-        return nil
-    }
-
     /// Attach a PNG screenshot to the test result so CI artifacts
     /// include a visual record AND write a copy to
     /// `$MILA_UI_SCREENSHOTS_DIR` (or `/tmp/mila-ui-screenshots/` by
@@ -111,29 +91,17 @@ final class DetailLayoutUITests: XCTestCase {
                       "All Transcriptions sidebar row not found")
         attachScreenshot(app, name: "02-all-transcriptions-list")
 
-        // The inline recording row is the deterministic target. We still also
-        // accept the history-list row id as a fallback (e.g. if a future change
-        // alters the default expansion), and explicitly expand the disclosure if
-        // for any reason the inline row hasn't surfaced yet.
-        let recordingIDs = ["sidebar.recording.Seed Recording",
-                            "history.row.Seed Recording"]
-        var row = firstExisting(in: app, identifiers: recordingIDs, timeout: 8)
-        if row == nil {
-            // Inline row not present — expand the disclosure and retry. Guard on
-            // the inline row NOT already existing so we never toggle a section
-            // that's already open back closed.
-            let inline = app.descendants(matching: .any)
-                .matching(identifier: "sidebar.recording.Seed Recording").firstMatch
-            if !inline.exists {
-                let disclosure = app.descendants(matching: .any)
-                    .matching(identifier: "sidebar.folder.default.disclosure").firstMatch
-                if disclosure.exists { disclosure.click() }
-            }
-            row = firstExisting(in: app, identifiers: recordingIDs, timeout: 5)
-        }
-        let recordingRow = try XCTUnwrap(
-            row, "Seeded recording not reachable via the sidebar or the history list")
-        XCTAssertTrue(recordingRow.waitForExistence(timeout: 5))
+        // `MilaApp.init()` pins `sidebar.allTranscriptions.expanded = true` under
+        // `--ui-test-seed-recording`, so the seeded recording's inline row is
+        // deterministically present on launch. Target it directly: no
+        // `history.row` fallback and no expand-and-retry — that masking would let
+        // this test pass even if the launch-state contract regressed, defeating
+        // the exact flake this PR locks down.
+        let recordingRow = app.descendants(matching: .any)
+            .matching(identifier: "sidebar.recording.Seed Recording").firstMatch
+        XCTAssertTrue(
+            recordingRow.waitForExistence(timeout: 8),
+            "Seeded recording's inline sidebar row (sidebar.recording.Seed Recording) was not present on launch — the --ui-test-seed-recording expanded-disclosure contract in MilaApp.init() may have regressed")
         recordingRow.click()
 
         // Detail-view title label should exist (the row click landed on

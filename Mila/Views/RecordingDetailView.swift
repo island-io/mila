@@ -137,14 +137,12 @@ struct RecordingDetailView: View {
         return HStack(spacing: 10) {
             Menu {
                 Button {
-                    // Enqueue the CURRENT store record (its audioFileName may
-                    // have been compressed to .m4a since this view captured
-                    // `recording`).
-                    if let current = store.recordings.first(where: { $0.id == recording.id }) {
-                        transcription.enqueue(current)
-                    } else {
-                        transcription.enqueue(recording)
-                    }
+                    // Route through the live-store chokepoint (same as the
+                    // language-switch action) so status + audioFileName handling
+                    // stays consistent and we never enqueue a stale snapshot
+                    // whose `.wav` a since-run compression already deleted.
+                    guard let prepared = store.prepareForRetranscription(id: recording.id) else { return }
+                    transcription.enqueue(prepared)
                 } label: {
                     Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
                           systemImage: "arrow.clockwise")

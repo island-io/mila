@@ -463,6 +463,21 @@ final class TranscriptionService: ObservableObject {
             return
         }
 
+        // Re-fetch from the store BEFORE resolving backend/model/audio so every
+        // downstream choice uses the same live recording snapshot. The enqueued
+        // `recording` can be stale: a re-transcribe-in-other-language switches
+        // the store's `language` (via `prepareForRetranscription`) after the
+        // snapshot was captured, and the previous pass's compression may have
+        // renamed the audio. Picking the model from the stale `recording.language`
+        // while transcribing with `working.language` (below) could load/persist
+        // the wrong model for the language actually transcribed.
+        // (The recording may also have been edited or soft-deleted in the gap.)
+        var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+        if working.isTrashed {
+            print("Transcribe skipped: \(working.title) was deleted before processing")
+            return
+        }
+
         // Resolve the backend up front. Remote skips the local-model gate
         // entirely (a remote-only user may never have downloaded a `.bin`);
         // local keeps the existing "is the model installed yet?" guards.
@@ -482,7 +497,7 @@ final class TranscriptionService: ObservableObject {
             // recording's modelName.
             modelDisplayName = "Remote · \(config.model)"
         } else {
-            guard let model = modelManager.model(for: recording.language) else {
+            guard let model = modelManager.model(for: working.language) else {
                 lastError = "No model selected."
                 markFailed(recording)
                 return
@@ -497,15 +512,6 @@ final class TranscriptionService: ObservableObject {
             modelDisplayName = model.displayName
         }
         let activeEngine: any TranscribingEngine = useRemote ? remoteEngine : engine
-
-        // Re-fetch from the store so we work against the latest persisted version.
-        // (The recording may have been edited or even soft-deleted between
-        //  enqueue() and now.)
-        var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
-        if working.isTrashed {
-            print("Transcribe skipped: \(working.title) was deleted before processing")
-            return
-        }
 
         // Snapshot pre-run summary state so the completion hook can tell
         // the summarizer "this was a re-transcription, force-regenerate."
