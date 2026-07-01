@@ -33,6 +33,7 @@ Mila's bundle identifier is **`io.island.whisper.IslandWhisper`** (Island.io ori
 | `~/Library/Caches/io.island.whisper.IslandWhisper` | Cache (no user settings) | Remove |
 | `~/Library/HTTPStorages/io.island.whisper.IslandWhisper` | HTTP cache | Remove |
 | `~/Library/WebKit/io.island.whisper.IslandWhisper` | WebKit data | Remove |
+| TCC privacy grants (Screen & System Audio Recording, Microphone, Speech Recognition, Automation/AppleEvents) | System privacy DB (`tccutil`) | Remove (reset) |
 | Dock tile pointing at any `Mila.app` | Dock entry | Remove |
 
 `recordings.json` is the index that ties the audio/transcript files together — it MUST be kept alongside `Recordings/`, or a reinstalled Mila shows an empty library.
@@ -97,6 +98,22 @@ done
 # NOTE: also reset cfprefsd's in-memory cache if you DID delete the plist, or it
 # may be rewritten on next launch: `defaults delete $BID` + `killall cfprefsd`.
 
+# 4b. Remove macOS privacy (TCC) grants. These are NOT files — they live in the
+#     system TCC databases, so a file-based uninstall leaves them behind as orphan
+#     entries. This is a STANDARD step (not user data): resetting just makes a
+#     future reinstall re-prompt, exactly like a fresh install.
+#     `tccutil reset` talks to the TCC daemon and works WITHOUT sudo, even for the
+#     system-level ScreenCapture service. Verified: exits 0, "Successfully reset".
+#
+#     One command clears every grant Mila accumulated (Microphone, ScreenCapture,
+#     SpeechRecognition, AppleEvents, Calendar, folder access, ...):
+tccutil reset All "$BID"
+#
+#     If you want to reset ONLY the "Screen & System Audio Recording" permission
+#     (Sequoia's new name for Screen Recording; TCC service is still ScreenCapture)
+#     and leave the rest, use the per-service form instead:
+# tccutil reset ScreenCapture "$BID"
+
 # 5. (ONLY IF USER EXPLICITLY OPTED IN) reclaim regenerable data
 # trash "$SRC/Models" "$SRC/torch-site-packages"
 
@@ -138,6 +155,13 @@ ls -d ~/Library/{Caches/io.island.whisper.IslandWhisper,HTTPStorages/io.island.w
 # Preferences plist: present on a routine uninstall (kept), absent only after a full reset.
 ls -d ~/Library/Preferences/io.island.whisper.IslandWhisper.plist 2>/dev/null && echo "(prefs kept — routine)" || echo "(prefs removed — full reset)"
 defaults read com.apple.dock persistent-apps 2>/dev/null | grep -i mila || echo "(no Mila in Dock)"
+# TCC privacy grants gone: the user DB is readable only if this terminal has Full
+# Disk Access; ScreenCapture lives in the SIP-protected system DB (needs sudo).
+# The authoritative signal is tccutil's own "Successfully reset" output above.
+# Best-effort check of the user DB (Microphone/SpeechRecognition/AppleEvents):
+sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+  "SELECT service,auth_value FROM access WHERE client='io.island.whisper.IslandWhisper';" \
+  2>/dev/null || echo "(user TCC.db not readable — no FDA; rely on tccutil output)"
 # user data intact:
 ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
 ```
@@ -151,3 +175,5 @@ ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
 - **Deleting `Models/`/`torch-site-packages/` without asking.** These are keep-by-default; deleting them forces multi-GB re-downloads on reinstall.
 - **Wiping the preferences plist on a routine uninstall.** That destroys the user's settings (model, language, diarization, LLM config). Keep it unless the user explicitly wants a full reset — and if they do, clear `cfprefsd` too or it gets rewritten.
 - **Trashing the source repo.** Only `build/` inside your `mila` checkout is an artifact; the rest is source.
+- **Leaving TCC privacy grants behind.** A file-based uninstall does NOT clear the "Screen & System Audio Recording", Microphone, etc. grants — they live in the system TCC databases, not in files, and linger as orphan entries. Run `tccutil reset All io.island.whisper.IslandWhisper` (no sudo needed) as a standard step.
+- **Trying to `sqlite3`-edit the system TCC.db directly.** It's SIP-protected and needs Full Disk Access even to read. Use `tccutil reset`, which goes through the TCC daemon and works without sudo.
