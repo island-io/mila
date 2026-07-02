@@ -456,17 +456,28 @@ enum LLMRunner {
                 runningGroup.wait()
             }
         }
-        // Drain the pipe readers once the process is known to be gone (either
-        // it exited on its own or we killed it above). BOUNDED: the write
-        // ends normally close the instant the child dies and the readers hit
-        // EOF immediately — but a grandchild that inherited the pipes and
-        // survived the kill (an MCP server or node helper the CLI spawned)
-        // holds them open indefinitely, and an unbounded wait here hung this
-        // method (and the awaiting continuation, and the caller's in-flight
-        // slot) forever. After the grace we return whatever was captured;
-        // the leaked reader threads exit when the pipes finally close.
-        if group.wait(timeout: .now() + 3) == .timedOut {
-            print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
+        // Drain the pipe readers once the process is known to be gone.
+        if timedOut || handle.wasTerminated {
+            // Killed path: BOUNDED. A grandchild that inherited the pipes
+            // and survived the kill (an MCP server or node helper the CLI
+            // spawned) holds them open indefinitely, and an unbounded wait
+            // here hung this method (and the awaiting continuation, and
+            // the caller's in-flight slot) forever. The output is being
+            // discarded anyway (the caller sees .timedOut / .cancelled),
+            // so after the grace we move on; the leaked reader threads
+            // exit when the pipes finally close.
+            if group.wait(timeout: .now() + 3) == .timedOut {
+                print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
+            }
+        } else {
+            // Normal exit: UNBOUNDED, deliberately. The child closed its
+            // write ends when it died, so the readers hit EOF as soon as
+            // they get CPU — but on a loaded macos-26 CI VM "as soon as"
+            // can be 10s+ of dispatch latency, and a fixed grace here
+            // truncated perfectly good output mid-stream (caught by
+            // LLMRunnerTests.test_runner_spawns_child_in_isolated_temp_directory
+            // going flaky on CI).
+            group.wait()
         }
 
         let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
