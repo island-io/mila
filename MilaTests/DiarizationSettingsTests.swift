@@ -80,6 +80,44 @@ final class DiarizationSettingsTests: XCTestCase {
                        "isConfigured must remain false until torch is installed, even after the init refresh.")
     }
 
+    // MARK: - Regression: enabling mid-session restores persisted verification
+
+    /// Regression: launching with diarization OFF but a persisted verified
+    /// setup, then flipping the toggle ON, showed "Setup needed" for a fully
+    /// verified setup. The `isEnabled` didSet deliberately skips `checkDeps()`
+    /// when `diarization.verified` is persisted — but nothing restored
+    /// `verificationStatus` either (`restoreVerifiedState()` only ran in
+    /// init, and only when the app launched already-enabled). `status` stayed
+    /// at "Setup needed" (and on the legacy no-bundled-runtime flow, where
+    /// `isConfigured` returns `status.isGood`, the whole feature stayed
+    /// gated) until the user manually re-verified.
+    func test_enabling_mid_session_restores_persisted_verified_state() throws {
+        // A real file on disk so `pythonFound` is deterministic.
+        let pythonStub = tempRoot.appendingPathComponent("python3")
+        try Data().write(to: pythonStub)
+
+        defaults.set(false, forKey: "diarization.enabled")
+        defaults.set(true, forKey: "diarization.verified")
+        defaults.set(pythonStub.path, forKey: "diarization.pythonPath")
+        defaults.set(pythonStub.path, forKey: "diarization.verifiedPythonPath")
+
+        // Inject a bootstrap that's already "ready" (fake bundled python +
+        // installed torch) so the didSet's fire-and-forget
+        // `bootstrapIfNeeded()` early-returns instead of downloading wheels
+        // from the network inside a unit test.
+        let bootstrap = DiarizationBootstrap(bundledPython: try makeFakeBundledPython().path,
+                                             sitePackages: try makeFakeTorchSitePackages())
+        let settings = DiarizationSettings(defaults: defaults, bootstrap: bootstrap)
+        XCTAssertEqual(settings.status, .disabled, "Sanity: launched disabled")
+
+        settings.isEnabled = true
+
+        XCTAssertEqual(settings.status, .verified,
+                       "Persisted verification must be restored when the user re-enables mid-session — not report 'Setup needed'")
+        XCTAssertTrue(settings.status.isGood,
+                      "status.isGood is what isConfigured returns on the legacy (no-bundled-runtime) flow — the restored verification must open that gate")
+    }
+
     // MARK: - Fixtures
 
     private func makeFakeBundledPython() throws -> URL {

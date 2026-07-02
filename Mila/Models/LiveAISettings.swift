@@ -213,10 +213,12 @@ final class LiveAISettings: ObservableObject {
         self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
         // Migrate pre-1.6.1 persisted values (default was 5s, range 3-20s).
         // 5s windows cut words mid-utterance and made the trailing-window
-        // merge stitch together inconsistent segments. 30s = one full
-        // window per tick, non-overlapping, clean boundaries.
+        // merge stitch together inconsistent segments. Only values below
+        // the current slider minimum (15s) are treated as stale — 15 and
+        // 20 are legal choices on today's 15-60s slider and must survive
+        // a relaunch, so they can't be used as a migration marker.
         let raw = defaults.double(forKey: Keys.chunkSeconds)
-        self.chunkSeconds = raw >= 25.0 ? raw : 30.0
+        self.chunkSeconds = raw >= 15.0 ? raw : 30.0
         // Default 20s. `double(forKey:)` returns 0 for an unset key, and
         // 0 is also the legitimate "disable the floor" value — so use a
         // sentinel via object(forKey:) to tell "never set" (→ 20) apart
@@ -233,11 +235,23 @@ final class LiveAISettings: ObservableObject {
         self.backgroundMode = defaults.bool(forKey: Keys.backgroundMode)
         self.forceLiveAIOnLowEndHardware = defaults.bool(forKey: Keys.forceLowEnd)
         let sim = defaults.double(forKey: Keys.simThreshold)
-        // Migrate the old 0.75 default — too strict for wespeaker on
-        // 1-5s VAD utterances; same-speaker cosine sim at that length
-        // sits in 0.5-0.7, so 0.75 split every utterance into a new
-        // SPEAKER_NN. Treat values >= 0.7 as "old default, migrate".
-        self.speakerSimilarityThreshold = (sim > 0 && sim < 0.7) ? sim : 0.55
+        if defaults.bool(forKey: Keys.simThresholdMigrated) {
+            self.speakerSimilarityThreshold = sim > 0 ? sim : 0.55
+        } else {
+            // One-shot migration of the old 0.75 default — too strict for
+            // wespeaker on 1-5s VAD utterances; same-speaker cosine sim at
+            // that length sits in 0.5-0.7, so 0.75 split every utterance
+            // into a new SPEAKER_NN. Treat values >= 0.7 as "old default,
+            // migrate" — but only ONCE: the Settings slider legitimately
+            // offers up to 0.95, so re-running this on every launch would
+            // silently discard a user's chosen threshold. The flag (plus
+            // writing the migrated value back) makes later >= 0.7 values
+            // stick.
+            let migrated = (sim > 0 && sim < 0.7) ? sim : 0.55
+            self.speakerSimilarityThreshold = migrated
+            defaults.set(migrated, forKey: Keys.simThreshold)
+            defaults.set(true, forKey: Keys.simThresholdMigrated)
+        }
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
         let langRaw = defaults.string(forKey: Keys.outputLanguage) ?? OutputLanguage.auto.rawValue
         self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto
@@ -324,6 +338,7 @@ the content.
         static let backgroundMode = "liveAI.backgroundMode"
         static let forceLowEnd = "liveAI.forceOnLowEndHardware"
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
+        static let simThresholdMigrated = "liveAI.speakerSimilarityThreshold.migrated"
         static let prompt = "liveAI.prompt"
         static let outputLanguage = "liveAI.outputLanguage"
         static let summaryPrompt = "liveAI.summaryPrompt"

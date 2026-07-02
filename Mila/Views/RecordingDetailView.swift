@@ -238,6 +238,27 @@ struct RecordingDetailView: View {
         return modelManager.selectedModel()?.displayName ?? ""
     }
 
+    /// What the transcript area shows while a recording has no segments.
+    /// `nil` means no placeholder — the active-transcription progress view
+    /// owns that state.
+    enum EmptyTranscriptPlaceholder: Equatable {
+        /// Queued behind the active transcription — the Transcribe menu is
+        /// disabled (see `busy` in `actionButtons`), so pointing the user
+        /// at it would be a dead end.
+        case waitingInQueue
+        /// Idle: invite the user to start a transcription themselves.
+        case clickTranscribe
+    }
+
+    /// Decision for the empty-segments placeholder, split out as a pure
+    /// function so RecordingDetailPlaceholderTests can pin the queued
+    /// case without building the view.
+    static func emptyTranscriptPlaceholder(isActive: Bool,
+                                           isQueued: Bool) -> EmptyTranscriptPlaceholder? {
+        if isActive { return nil }
+        return isQueued ? .waitingInQueue : .clickTranscribe
+    }
+
     @ViewBuilder
     private var transcriptArea: some View {
         if transcription.activeRecordingID == recording.id {
@@ -261,11 +282,23 @@ struct RecordingDetailView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if recording.segments.isEmpty {
-            ContentUnavailableView(
-                "No transcript yet",
-                systemImage: "text.alignleft",
-                description: Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to start.")
+            let placeholder = Self.emptyTranscriptPlaceholder(
+                isActive: transcription.activeRecordingID == recording.id,
+                isQueued: transcription.pendingIDs.contains(recording.id)
             )
+            if placeholder == .waitingInQueue {
+                ContentUnavailableView {
+                    Label("Waiting in queue", systemImage: "clock")
+                } description: {
+                    Text("Transcription will start when the recording ahead of it finishes.")
+                }
+            } else {
+                ContentUnavailableView(
+                    "No transcript yet",
+                    systemImage: "text.alignleft",
+                    description: Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to start.")
+                )
+            }
         } else {
             VStack(spacing: 0) {
                 // Transcript-area copy button, on the right just below the
@@ -430,6 +463,14 @@ private struct PlayPauseButton: View {
             if player.timeControlStatus == .playing {
                 player.pause()
             } else {
+                // AVPlayer parks at end-of-item when playback finishes and
+                // a bare play() there is a no-op — the button looked dead
+                // after a memo played to the end until the user dragged the
+                // slider back. Rewind first in that case.
+                if let item = player.currentItem, item.duration.isNumeric,
+                   item.duration.seconds - player.currentTime().seconds <= 0.1 {
+                    player.seek(to: .zero)
+                }
                 player.play()
             }
         } label: {

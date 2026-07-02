@@ -124,11 +124,13 @@ final class RecordingStore: ObservableObject {
         self.modelsDirectory = rootDirectory.appendingPathComponent("Models", isDirectory: true)
         self.storeURL = rootDirectory.appendingPathComponent("recordings.json")
         self.foldersURL = rootDirectory.appendingPathComponent("folders.json")
+        self.tombstonesURL = rootDirectory.appendingPathComponent("voicememo-tombstones.json")
 
         try? fileManager.createDirectory(at: defaultRecs, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         load()
         loadFolders()
+        loadTombstones()
     }
 
     /// Switch the recordings directory to `newDirectory`. Clears the
@@ -443,6 +445,15 @@ final class RecordingStore: ObservableObject {
         try? fileManager.removeItem(at: transcriptURL(for: recording))
         try? fileManager.removeItem(at: summaryURL(for: recording))
         try? fileManager.removeItem(at: subtitleURL(for: recording))
+        // Tombstone a deleted Voice-Memos import so the next sync doesn't
+        // resurrect it: the importer's dedup is keyed on the LIVE store, and
+        // the source memo still exists in the Voice Memos folder — deleting
+        // an imported memo silently never stuck before this. (Escape hatch:
+        // a manual File → Open import carries no memo ID and still works.)
+        if let memoID = recording.voiceMemoUniqueID {
+            voiceMemoTombstones.insert(memoID)
+            persistTombstones()
+        }
         persist()
     }
 
@@ -646,6 +657,33 @@ final class RecordingStore: ObservableObject {
             try data.write(to: storeURL, options: .atomic)
         } catch {
             print("RecordingStore persist error: \(error)")
+        }
+    }
+
+    // MARK: - Voice-memo tombstones
+
+    /// Voice-memo unique IDs the user permanently deleted from Mila. The
+    /// importer skips these on every sync — without the tombstone, a
+    /// deleted import re-imported (and re-transcribed) on the next FSEvents
+    /// fire or rescan, because the dedup set is built from the live store
+    /// and the source memo still exists in the Voice Memos folder.
+    /// Persisted at the original root (app state, not user content — it
+    /// deliberately does NOT travel with a relocated recordings folder).
+    private(set) var voiceMemoTombstones: Set<String> = []
+    private let tombstonesURL: URL
+
+    private func loadTombstones() {
+        guard let data = try? Data(contentsOf: tombstonesURL),
+              let ids = try? JSONDecoder().decode(Set<String>.self, from: data) else { return }
+        voiceMemoTombstones = ids
+    }
+
+    private func persistTombstones() {
+        do {
+            let data = try JSONEncoder().encode(voiceMemoTombstones)
+            try data.write(to: tombstonesURL, options: .atomic)
+        } catch {
+            print("RecordingStore tombstones persist error: \(error)")
         }
     }
 

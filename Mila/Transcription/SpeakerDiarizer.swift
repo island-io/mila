@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 struct SpeakerTurn: Codable {
     let start: Double
@@ -44,51 +45,74 @@ enum SpeakerDiarizer {
         }
     }
 
-    private struct PythonResult {
+    struct PythonResult {
         let stdout: Data
         let stderr: Data
         let exitCode: Int32
     }
 
-    private static func runPython(
+    /// Internal (not private) so tests can exercise the cancellation path
+    /// directly with a stub executable.
+    static func runPython(
         path: String,
         arguments: [String],
         environment: [String: String]? = nil
     ) async throws -> PythonResult {
-        try await Task.detached(priority: .userInitiated) {
-            guard FileManager.default.fileExists(atPath: path) else {
-                throw Error.pythonNotFound(path)
-            }
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw Error.pythonNotFound(path)
+        }
 
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: path)
-            process.arguments = arguments
-            var env = ProcessInfo.processInfo.environment
-            if let extra = environment { env.merge(extra) { _, new in new } }
-            process.environment = env
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = arguments
+        var env = ProcessInfo.processInfo.environment
+        if let extra = environment { env.merge(extra) { _, new in new } }
+        process.environment = env
 
-            let stdout = Pipe()
-            let stderr = Pipe()
-            process.standardOutput = stdout
-            process.standardError = stderr
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
 
-            try process.run()
+        // Task cancellation must reach the subprocess. Without this, a
+        // cancelled transcription (user hits Cancel / app shutdown) had no
+        // way to stop a running pyannote pass: `waitUntilExit()` blocked
+        // until the full diarization finished — minutes of CPU on a
+        // recording that may already be deleted, with the serial
+        // transcription queue stalled behind it the whole time.
+        let cancelled = OSAllocatedUnfairLock(initialState: false)
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                if cancelled.withLock({ $0 }) { throw CancellationError() }
+                try process.run()
+                // Close the narrow window where onCancel ran between the
+                // check above and `run()` — its terminate() hit a not-yet-
+                // launched process and was a no-op.
+                if cancelled.withLock({ $0 }) { process.terminate() }
 
-            // Drain both pipes in detached tasks to avoid deadlock.
-            // macOS pipe buffers are ~64 KB — if the subprocess
-            // fills stderr before we read it, it blocks on write()
-            // while we block on waitUntilExit().
-            let stdoutRead = Task.detached { stdout.fileHandleForReading.readDataToEndOfFile() }
-            let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
+                // Drain both pipes in detached tasks to avoid deadlock.
+                // macOS pipe buffers are ~64 KB — if the subprocess
+                // fills stderr before we read it, it blocks on write()
+                // while we block on waitUntilExit().
+                let stdoutRead = Task.detached { stdout.fileHandleForReading.readDataToEndOfFile() }
+                let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
 
-            process.waitUntilExit()
+                process.waitUntilExit()
 
-            return PythonResult(
-                stdout: await stdoutRead.value,
-                stderr: await stderrRead.value,
-                exitCode: process.terminationStatus
-            )
-        }.value
+                let result = PythonResult(
+                    stdout: await stdoutRead.value,
+                    stderr: await stderrRead.value,
+                    exitCode: process.terminationStatus
+                )
+                // A SIGTERM'd run must surface as cancellation, not as a
+                // "diarization failed (exit 15)" error banner.
+                if cancelled.withLock({ $0 }) { throw CancellationError() }
+                return result
+            }.value
+        } onCancel: {
+            cancelled.withLock { $0 = true }
+            if process.isRunning { process.terminate() }
+        }
     }
 
     // MARK: - Public API

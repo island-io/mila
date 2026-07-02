@@ -1118,8 +1118,14 @@ struct MilaApp: App {
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.
+                // The session token (claimed synchronously HERE) lets a
+                // stop() that lands before/while the detached body runs
+                // supersede it — otherwise a fast start→stop recording
+                // booted the ~1 GB daemon after the recording ended and
+                // left it idling.
+                let diarSession = diarizer.beginSession()
                 Task.detached(priority: .userInitiated) { [diarizer, diarSettings] in
-                    await diarizer.start(diarization: diarSettings)
+                    await diarizer.start(diarization: diarSettings, session: diarSession)
                 }
                 // Watch for off→on transitions on the Live AI toggle.
                 // The feed loop only kicks when new segments land, so

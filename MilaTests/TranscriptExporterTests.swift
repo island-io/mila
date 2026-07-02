@@ -55,6 +55,23 @@ final class TranscriptExporterTests: XCTestCase {
         XCTAssertFalse(body.contains("00:00:01.500"))
     }
 
+    /// Regression: timestamps within 0.5ms below a minute boundary used to
+    /// emit an invalid `:60` seconds field — hours/minutes were truncated
+    /// from the raw double while the seconds field was rounded by printf,
+    /// so 59.9996 printed as "00:00:60,000" instead of "00:01:00,000".
+    /// Local whisper sits on a 10ms grid, but the remote path passes
+    /// through the server's full-precision floats.
+    func test_srt_time_rounds_up_across_minute_boundary() {
+        let rec = makeRecording(segments: [
+            .init(start: 59.9996, end: 3599.9996, text: "Boundary")
+        ])
+        let body = TranscriptExporter.srtBody(for: rec)
+        XCTAssertTrue(body.contains("00:01:00,000 --> 01:00:00,000"),
+                      "Rounding must carry into minutes/hours; got: \(body)")
+        XCTAssertFalse(body.contains(":60,"),
+                       "An SRT seconds field can never be 60: \(body)")
+    }
+
     func test_srt_body_prefixes_speaker_labels_when_present() {
         var seg1 = TranscriptSegment(start: 0, end: 1, text: "Hello")
         seg1.speaker = "SPEAKER_00"

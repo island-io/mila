@@ -37,11 +37,27 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     @Published var selectedApp: SCRunningApplication?
     @Published private(set) var level: Float = 0
 
+    /// Set when SCK kills the stream from its own side mid-capture (TCC
+    /// revocation, display disconnect). Cleared on the next successful
+    /// `start()`. Lets callers tell "meeting silently lost its app-audio
+    /// leg" apart from a normal stop.
+    @Published private(set) var lastStreamError: String?
+
     let audioStream: AsyncStream<AVAudioPCMBuffer>
     private let audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
 
     private var stream: SCStream?
     private let audioOutput = AudioStreamOutput()
+
+    /// Serial delivery queue for the audio sample callbacks. `.global()`
+    /// is a CONCURRENT queue: two SCK callbacks can run in parallel, and
+    /// the per-buffer Task hop the old code used added a second unordered
+    /// step — under CPU load, consecutive ~10-20ms chunks could land in
+    /// `audioStream` out of capture order (audible garbling in the saved
+    /// mix). A private serial queue plus a direct yield (below) preserves
+    /// capture order end-to-end.
+    private let sampleQueue = DispatchQueue(label: "io.island.mila.system-audio-samples",
+                                            qos: .userInitiated)
 
     override init() {
         var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation!
@@ -49,6 +65,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         self.audioContinuation = continuation
         super.init()
         self.audioOutput.parent = self
+        self.audioOutput.continuation = continuation
     }
 
     func refreshShareableContent() async {
@@ -133,27 +150,34 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(audioOutput,
                                    type: .audio,
-                                   sampleHandlerQueue: .global(qos: .userInitiated))
+                                   sampleHandlerQueue: sampleQueue)
         try stream.addStreamOutput(audioOutput,
                                    type: .screen,
                                    sampleHandlerQueue: .global(qos: .utility))
         try await stream.startCapture()
         self.stream = stream
         self.isRunning = true
+        self.lastStreamError = nil
     }
 
     func stop() async {
-        guard isRunning, let stream else { return }
+        // Deliberately NOT gated on `isRunning`: when SCK killed the stream
+        // itself (`didStopWithError` flips isRunning to false), the old
+        // `guard isRunning` made this a no-op and the dead SCStream stayed
+        // retained for the app's lifetime.
+        guard let stream else {
+            isRunning = false
+            level = 0
+            return
+        }
         do { try await stream.stopCapture() } catch { print("stopCapture: \(error)") }
         self.stream = nil
         self.isRunning = false
         self.level = 0
     }
 
-    fileprivate func handle(buffer: AVAudioPCMBuffer) {
-        let level = AudioMeter.level(from: buffer)
-        Task { @MainActor in self.level = level }
-        audioContinuation.yield(buffer)
+    fileprivate func publishLevel(_ level: Float) {
+        self.level = level
     }
 
     deinit {
@@ -163,16 +187,38 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 
 extension SystemAudioRecorder: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("SCStream stopped with error: \(error)")
+        let message = error.localizedDescription
+        print("SCStream stopped with error: \(message)")
         Task { @MainActor in
+            // SCK killed the stream from its side (TCC revocation, display
+            // config change, ...). Release the dead stream and record the
+            // failure — before this, `stream` stayed set (leaked) and the
+            // meeting recording silently degraded to mic-only with no
+            // signal anywhere.
+            self.stream = nil
             self.isRunning = false
             self.level = 0
+            self.lastStreamError = message
         }
     }
 }
 
 private final class AudioStreamOutput: NSObject, SCStreamOutput {
     weak var parent: SystemAudioRecorder?
+
+    /// Handed over once at recorder init. Yielding directly here — on the
+    /// recorder's serial sample-handler queue — keeps buffers in capture
+    /// order end-to-end (`AsyncStream.Continuation.yield` is thread-safe);
+    /// only the cosmetic level meter hops to the main actor. The old
+    /// per-buffer `Task { @MainActor … yield }` hop gave every chunk its
+    /// own unordered task, so delivery order wasn't guaranteed.
+    var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+
+    /// Session-scoped stateful converter (resampling keeps filter history
+    /// across buffers — see StreamingWhisperConverter). Built lazily from
+    /// the first buffer's format and rebuilt if SCK ever changes it; only
+    /// touched on the serial sample-handler queue.
+    private var converter: StreamingWhisperConverter?
 
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -181,9 +227,15 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
               CMSampleBufferIsValid(sampleBuffer),
               let buffer = sampleBuffer.toPCMBuffer() else { return }
         do {
-            let converted = try AudioConvert.toWhisperFormat(buffer)
+            if converter == nil || converter?.inputFormat != buffer.format {
+                converter = StreamingWhisperConverter(inputFormat: buffer.format)
+            }
+            let converted = try converter?.convert(buffer)
+                ?? AudioConvert.toWhisperFormat(buffer)
+            continuation?.yield(converted)
+            let level = AudioMeter.level(from: converted)
             Task { @MainActor [weak parent] in
-                parent?.handle(buffer: converted)
+                parent?.publishLevel(level)
             }
         } catch {
             print("System audio convert: \(error)")

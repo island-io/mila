@@ -98,6 +98,80 @@ enum AudioConvert {
     }
 }
 
+/// Stateful streaming variant of `AudioConvert.toWhisperFormat` for capture
+/// sessions.
+///
+/// Sample-rate conversion is stateful: the resampler carries filter history
+/// across buffers. `toWhisperFormat` builds a fresh `AVAudioConverter` per
+/// call and flushes it with `.endOfStream` — correct for one-shot
+/// (whole-file) conversion, wrong for a live tap: restarting the filter at
+/// every ~85ms tap buffer zero-pads its history and independently rounds
+/// the fractional frame ratio (48k→16k = 1365⅓ frames per 4096), leaving a
+/// small waveform discontinuity at every buffer boundary of every recording
+/// made from a non-16kHz device. One instance per capture session keeps the
+/// filter warm across buffers; the only cost is that the last few samples of
+/// filter latency are never flushed at stream end (a sub-millisecond tail,
+/// vs. an artifact every 85ms).
+///
+/// NOT thread-safe: feed it from a single serial context (the AVAudioEngine
+/// tap or the SCK sample-handler queue).
+final class StreamingWhisperConverter {
+    /// nil when the input is already whisper-shaped (pass-through).
+    private let converter: AVAudioConverter?
+    let inputFormat: AVAudioFormat
+
+    /// Fails only if `AVAudioConverter` can't be built for `inputFormat`.
+    init?(inputFormat: AVAudioFormat) {
+        self.inputFormat = inputFormat
+        let target = WhisperAudioFormat.pcmFloat32
+        if inputFormat.sampleRate == target.sampleRate &&
+            inputFormat.channelCount == target.channelCount &&
+            inputFormat.commonFormat == .pcmFormatFloat32 {
+            self.converter = nil
+        } else if let converter = AVAudioConverter(from: inputFormat, to: target) {
+            self.converter = converter
+        } else {
+            return nil
+        }
+    }
+
+    /// Convert one buffer, retaining resampler state for the next call.
+    /// Pass-through inputs return the SAME buffer instance — callers that
+    /// mutate the result in place must copy first (same contract as
+    /// `toWhisperFormat`).
+    func convert(_ buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
+        guard let converter else { return buffer }
+        let target = WhisperAudioFormat.pcmFloat32
+        let ratio = target.sampleRate / inputFormat.sampleRate
+        let outputCapacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio + 1024)
+        guard let output = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: outputCapacity) else {
+            throw NSError(domain: "AudioConvert", code: 2)
+        }
+
+        var error: NSError?
+        var fed = false
+        let status = converter.convert(to: output, error: &error) { _, statusPointer in
+            if fed {
+                // `.noDataNow`, NOT `.endOfStream`: the filter history must
+                // stay alive for the next buffer — flushing here is exactly
+                // the per-chunk restart this class exists to avoid.
+                statusPointer.pointee = .noDataNow
+                return nil
+            }
+            statusPointer.pointee = .haveData
+            fed = true
+            return buffer
+        }
+
+        if let error { throw error }
+        if status == .error {
+            throw NSError(domain: "AudioConvert", code: 3,
+                          userInfo: [NSLocalizedDescriptionKey: "Converter returned error."])
+        }
+        return output
+    }
+}
+
 /// Computes a 0...1 RMS level from an audio buffer for VU meters.
 enum AudioMeter {
     static func level(from buffer: AVAudioPCMBuffer) -> Float {

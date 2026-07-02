@@ -110,6 +110,14 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         let boundary = "MilaBoundary-\(UUID().uuidString)"
         var request = URLRequest(url: config.endpoint.appendingPathComponent("audio/transcriptions"))
         request.httpMethod = "POST"
+        // The session's 120s request timeout is an INACTIVITY timer, and an
+        // OpenAI-compatible server sends zero bytes while it transcribes —
+        // after the upload finishes, a long recording routinely stays silent
+        // well past 120s of server-side processing, which failed the whole
+        // transcription with "The request timed out". Override per-request so
+        // only the 1-hour resource timeout bounds the wait; the short idle
+        // timeout still applies to everything else on this session.
+        request.timeoutInterval = 60 * 60
         request.setValue("multipart/form-data; boundary=\(boundary)",
                          forHTTPHeaderField: "Content-Type")
         if !config.apiKey.isEmpty {

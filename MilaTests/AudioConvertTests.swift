@@ -92,6 +92,52 @@ final class AudioConvertTests: XCTestCase {
         XCTAssertTrue(samples.isEmpty)
     }
 
+    // MARK: - StreamingWhisperConverter
+
+    /// Regression: sample-rate conversion is stateful. The old pattern —
+    /// a fresh `AVAudioConverter` per tap buffer (`toWhisperFormat` in a
+    /// loop) — restarts the resampler filter at every chunk edge, which
+    /// dips the output toward zero at each boundary (~every 85ms of every
+    /// recording from a 48kHz mic). A DC (constant 1.0) input makes those
+    /// dips easy to detect: through the session-scoped streaming converter
+    /// the settled output must stay flat across all chunk boundaries.
+    func test_streaming_converter_keeps_resampler_state_across_buffers() throws {
+        let inputFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                        sampleRate: 48_000,
+                                        channels: 1,
+                                        interleaved: false)!
+        let converter = try XCTUnwrap(StreamingWhisperConverter(inputFormat: inputFormat))
+
+        var output: [Float] = []
+        for _ in 0..<8 {
+            let chunk = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: 4096)!
+            chunk.frameLength = 4096
+            if let ptr = chunk.floatChannelData?[0] {
+                for i in 0..<4096 { ptr[i] = 1.0 }
+            }
+            let converted = try converter.convert(chunk)
+            output.append(contentsOf: AudioConvert.samples(from: converted))
+        }
+
+        // 8 × 4096 @ 48k → ~10.9k frames @ 16k (minus a little converter
+        // latency). Skip the legitimate initial filter ramp, then require
+        // the DC level to hold across every boundary.
+        XCTAssertGreaterThan(output.count, 8_000, "converter should emit most frames")
+        let settled = output.dropFirst(400)
+        let minValue = settled.min() ?? 0
+        XCTAssertGreaterThan(minValue, 0.95,
+                             "DC input must stay flat across buffer boundaries — a dip means the resampler state was reset mid-stream (min=\(minValue))")
+    }
+
+    func test_streaming_converter_passes_through_whisper_shaped_buffers() throws {
+        let converter = try XCTUnwrap(
+            StreamingWhisperConverter(inputFormat: WhisperAudioFormat.pcmFloat32))
+        let buffer = makeBuffer(format: WhisperAudioFormat.pcmFloat32, sineHz: 440, frames: 1600)
+        let converted = try converter.convert(buffer)
+        XCTAssertTrue(converted === buffer,
+                      "Pass-through must return the same instance (documented contract — callers copy before mutating)")
+    }
+
     // MARK: - Helpers
 
     private func makeBuffer(format: AVAudioFormat,

@@ -70,11 +70,36 @@ final class LiveSpeakerDiarizer: ObservableObject {
         let error: String?
     }
 
+    /// Monotonic counter pairing each recording's daemon start with the
+    /// stop() that follows it. The record-start path deliberately detaches
+    /// `start()` (pyannote cold-init must not block the state observer),
+    /// which used to leave a race: a fast start→stop recording could run
+    /// `stop()` (no-op, nothing launched yet) BEFORE the detached start
+    /// body executed — the ~1 GB torch daemon then booted *after* the
+    /// recording ended and idled until some future recording's stop.
+    /// Claiming a session synchronously at record-start and closing it in
+    /// stop() lets the late-running start body detect it was superseded.
+    private var session = 0
+
+    /// Claim a session token synchronously BEFORE detaching the async
+    /// `start(diarization:session:)` call.
+    func beginSession() -> Int {
+        session += 1
+        return session
+    }
+
     /// Boot the Python daemon. No-op if a daemon is already running, or
     /// if diarization is disabled / not configured. Throws nothing — any
     /// failure becomes a `lastError` so callers don't have to wrap try/
     /// catch around every recording start.
-    func start(diarization: DiarizationSettings) async {
+    ///
+    /// `session` (from `beginSession()`) ties this start to one recording;
+    /// pass nil only where start/stop can't race (tests).
+    func start(diarization: DiarizationSettings, session: Int? = nil) async {
+        if let session, session != self.session {
+            diarLog.log("start skipped — recording already stopped before the detached start ran")
+            return
+        }
         guard process == nil else {
             diarLog.log("start skipped — daemon already running")
             return
@@ -131,6 +156,13 @@ final class LiveSpeakerDiarizer: ObservableObject {
         // daemon emits `{"ready":true}` on stdout once the pipeline and
         // embedding inference are loaded.
         let ready = await waitForReady(timeoutSeconds: 30)
+        if let session, session != self.session {
+            // stop() ran while we waited for the handshake — it already
+            // terminated the daemon and reset the state; don't resurrect
+            // any of it for a recording that's over.
+            diarLog.log("start superseded during ready-wait — leaving stopped state alone")
+            return
+        }
         isReady = ready
         diarLog.log("daemon ready=\(ready, privacy: .public)")
         if !ready {
@@ -140,6 +172,9 @@ final class LiveSpeakerDiarizer: ObservableObject {
 
     /// Shut down the daemon. Idempotent. Called when a recording stops.
     func stop() {
+        // Close the current session so a start() that was detached for this
+        // recording but hasn't run (or is still in its ready-wait) aborts.
+        session += 1
         if let stdin = stdinPipe {
             let cmd = #"{"cmd":"shutdown"}\#n"#
             try? stdin.fileHandleForWriting.write(contentsOf: Data(cmd.utf8))
@@ -148,6 +183,11 @@ final class LiveSpeakerDiarizer: ObservableObject {
         process?.terminate()
         process = nil
         stdinPipe = nil
+        // Detach the readability handler BEFORE dropping the handle: bytes
+        // still buffered in the dying daemon's stdout pipe would otherwise
+        // keep arriving through the old handler and get matched against the
+        // NEXT daemon's `pending` queue.
+        stdoutHandle?.readabilityHandler = nil
         stdoutHandle = nil
         stderrHandle = nil
         stdoutBuffer.removeAll()
@@ -312,6 +352,13 @@ final class LiveSpeakerDiarizer: ObservableObject {
             // The stdout reader fills `stdoutBuffer` and dispatches lines
             // to pending continuations. If isReady is set elsewhere, exit.
             if isReady { return true }
+            // Daemon died before the handshake (missing dep, bad models
+            // path) or stop() ran mid-wait: bail now instead of spinning
+            // the full 30s. Whatever error line the daemon printed on its
+            // way down was captured into `lastError` by handleLine /
+            // failPending, so start()'s `lastError ??` fallback preserves
+            // the real diagnosis over the generic "did not become ready".
+            guard let process, process.isRunning else { return false }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
         return isReady
@@ -353,7 +400,18 @@ final class LiveSpeakerDiarizer: ObservableObject {
             isReady = true
             return
         }
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty else {
+            // Pre-ready line with no waiter. The daemon reports startup
+            // failures as an {"error": ...} line right before exiting —
+            // dropping it here left only the generic "did not become
+            // ready" after a full timeout spin. Keep the real diagnosis.
+            if let resp = try? JSONDecoder().decode(EmbedResponse.self, from: data),
+               let error = resp.error {
+                lastError = error
+                diarLog.log("daemon pre-ready error: \(error, privacy: .public)")
+            }
+            return
+        }
         let cont = pending.removeFirst()
         if let resp = try? JSONDecoder().decode(EmbedResponse.self, from: data) {
             cont.resume(returning: resp)
@@ -368,6 +426,9 @@ final class LiveSpeakerDiarizer: ObservableObject {
         }
         pending.removeAll()
         isReady = false
+        // Keep an earlier, more specific report (e.g. the daemon's own
+        // {"error": ...} startup line) over this generic one.
+        lastError = lastError ?? error
     }
 
     private func startStderrReader() {

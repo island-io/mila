@@ -180,6 +180,11 @@ private struct HistoryRow: View {
     @State private var promptForNewFolder = false
     @State private var newFolderDraft = ""
     @State private var showingSendSheet = false
+    /// Confirmation gate before "Delete Permanently" actually removes the
+    /// files — unlike soft-delete there's no Trash to restore from, and
+    /// accidental loss of recordings was the #1 user complaint (same
+    /// rationale as the rename sheet's Discard confirm).
+    @State private var confirmingPermanentDelete = false
 
     var body: some View {
         let isSelected: Bool = {
@@ -275,6 +280,19 @@ private struct HistoryRow: View {
         .sheet(isPresented: $showingSendSheet) {
             SendToLLMSheet(recording: recording)
         }
+        .confirmationDialog("Delete “\(recording.title)” permanently?",
+                            isPresented: $confirmingPermanentDelete,
+                            titleVisibility: .visible) {
+            Button("Delete Permanently", role: .destructive) {
+                store.permanentlyDelete(recording)
+                if case .recording(let id) = selection, id == recording.id {
+                    selection = .home
+                }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("The audio file and any transcript will be permanently deleted. This can't be undone.")
+        }
     }
 
     @ViewBuilder
@@ -283,10 +301,7 @@ private struct HistoryRow: View {
             Button("Restore") { store.restore(recording) }
             Divider()
             Button("Delete Permanently", role: .destructive) {
-                store.permanentlyDelete(recording)
-                if case .recording(let id) = selection, id == recording.id {
-                    selection = .home
-                }
+                confirmingPermanentDelete = true
             }
         } else {
             Button("Rename…") {
@@ -429,7 +444,13 @@ struct RenameSheet: View {
             Text("Rename Recording").font(.title3.weight(.semibold))
             TextField("Title", text: $draft)
                 .textFieldStyle(.roundedBorder)
-                .onSubmit { onConfirm(draft) }
+                // Return must behave like the Save button below — without
+                // the guard it committed a blank title the disabled button
+                // was there to prevent.
+                .onSubmit {
+                    guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    onConfirm(draft)
+                }
                 .accessibilityIdentifier("rename.title.field")
             HStack {
                 Spacer()

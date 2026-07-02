@@ -40,6 +40,39 @@ final class RecordingStoreTests: XCTestCase {
         XCTAssertTrue(third.recordings.isEmpty)
     }
 
+    /// Regression: deleting an imported Voice Memo never stuck — the
+    /// importer dedups against the live store, and the source memo still
+    /// exists in the Voice Memos folder, so the next sync re-imported (and
+    /// re-transcribed) it. Permanent deletion must leave a persistent
+    /// tombstone the importer's dedup set includes.
+    func test_permanently_deleting_voice_memo_import_leaves_persistent_tombstone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Imported memo",
+                            source: .microphone,
+                            audioFileName: "memo.wav",
+                            voiceMemoUniqueID: "memo-unique-123")
+        store.add(rec)
+        XCTAssertTrue(store.voiceMemoTombstones.isEmpty)
+
+        store.permanentlyDelete(rec)
+        XCTAssertTrue(store.voiceMemoTombstones.contains("memo-unique-123"),
+                      "Deleting a voice-memo import must tombstone its unique ID")
+
+        // Survives a relaunch (the importer syncs on every launch).
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertTrue(reloaded.voiceMemoTombstones.contains("memo-unique-123"),
+                      "Tombstones must persist across store instances")
+    }
+
+    func test_permanently_deleting_non_import_leaves_no_tombstone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Mic recording", source: .microphone,
+                            audioFileName: "plain.wav")
+        store.add(rec)
+        store.permanentlyDelete(rec)
+        XCTAssertTrue(store.voiceMemoTombstones.isEmpty)
+    }
+
     func test_soft_delete_moves_to_recently_deleted_and_restore_returns_it() {
         let store = RecordingStore(rootDirectory: tempRoot)
         let rec = Recording(title: "X", source: .microphone, audioFileName: "x.wav")

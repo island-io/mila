@@ -219,9 +219,26 @@ private struct HotkeysSettingsTab: View {
                 ForEach(HotkeyAction.allCases) { action in
                     HotkeyRow(action: action,
                               isRecording: recordingAction == action,
-                              onStartRecording: { recordingAction = action },
+                              // Live-registration warning: register() can fail
+                              // (another app owns the combo globally) and the
+                              // binding then LOOKS active while doing nothing.
+                              // Suppressed mid-capture — suspendAll() has
+                              // deliberately parked everything then.
+                              showsInactiveWarning: recordingAction == nil
+                                  && !HotkeyManager.shared.isRegistered(action),
+                              onStartRecording: {
+                                  recordingAction = action
+                                  // Park our own registrations so the pressed
+                                  // combo reaches the capture field's keyDown —
+                                  // Carbon otherwise consumes a currently-bound
+                                  // combo and STARTS DICTATION mid-capture.
+                                  HotkeyManager.shared.suspendAll()
+                              },
                               onCaptured: { applyCapture($0, for: action) },
-                              onCancel: { recordingAction = nil },
+                              onCancel: {
+                                  recordingAction = nil
+                                  HotkeyManager.shared.resumeAll()
+                              },
                               onReset: { resetToDefault(action) })
                 }
             }
@@ -235,10 +252,19 @@ private struct HotkeysSettingsTab: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .onDisappear {
+            // Window closed mid-capture: don't leave the app's hotkeys
+            // parked forever.
+            if recordingAction != nil {
+                recordingAction = nil
+                HotkeyManager.shared.resumeAll()
+            }
+        }
     }
 
     private func applyCapture(_ binding: HotkeyBinding, for action: HotkeyAction) {
         recordingAction = nil
+        HotkeyManager.shared.resumeAll()
 
         // Reject empty / modifier-only combos: Carbon will accept them but
         // Apple shortcut conventions require at least one of ⌘ ⌃ ⌥.
@@ -258,6 +284,24 @@ private struct HotkeysSettingsTab: View {
             }
         }
 
+        // Re-capturing the combo the action already has: nothing to do
+        // (and the registrability probe below would false-positive against
+        // our own live registration).
+        guard binding != hotkeys.binding(for: action) else {
+            lastError = nil
+            return
+        }
+
+        // Validate registrability BEFORE persisting. The old flow persisted
+        // first and dropped the registration failure on the floor: Settings
+        // showed the new combo as active while no hotkey was registered at
+        // all (the previous combo had already been unregistered) — dictation
+        // went silently dead until a reset.
+        guard HotkeyManager.shared.canRegister(binding) else {
+            lastError = "\(binding.displayName) is already taken by another app or macOS — choose a different combo."
+            return
+        }
+
         lastError = nil
         hotkeys.setBinding(binding, for: action)
     }
@@ -273,6 +317,7 @@ private struct HotkeyRow: View {
 
     let action: HotkeyAction
     let isRecording: Bool
+    let showsInactiveWarning: Bool
     let onStartRecording: () -> Void
     let onCaptured: (HotkeyBinding) -> Void
     let onCancel: () -> Void
@@ -283,6 +328,13 @@ private struct HotkeyRow: View {
             Text(action.displayLabel)
                 .font(.body)
                 .frame(width: 160, alignment: .leading)
+
+            if showsInactiveWarning {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .help("This combo couldn't be registered — another app or macOS owns it globally. Pick a different one or hit Reset.")
+                    .accessibilityIdentifier("hotkeys.\(action.rawValue).inactive")
+            }
 
             Spacer()
 
@@ -449,6 +501,24 @@ private struct ModelsSettingsTab: View {
                     ModelRow(model: model)
                 }
             }
+
+            // Failed downloads used to only leave an os_log line — the
+            // progress bar vanished with zero explanation of whether the
+            // model installed or why it didn't.
+            if let error = manager.lastDownloadError {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text(error)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                    Button("Dismiss") { manager.lastDownloadError = nil }
+                        .buttonStyle(.borderless)
+                }
+                .accessibilityIdentifier("models.download.error")
+            }
         }
     }
 }
@@ -561,6 +631,12 @@ private struct ModelRow: View {
     @EnvironmentObject private var manager: ModelManager
     let model: WhisperModel
 
+    /// Confirmation gate before deleting an installed model — these are
+    /// multi-GB downloads, so an accidental click shouldn't cost the user
+    /// a re-download.
+    @State private var confirmingDelete = false
+    @State private var deleteError: String?
+
     var body: some View {
         let progress = manager.downloads[model.name]
         let installed = manager.isInstalled(model)
@@ -583,7 +659,7 @@ private struct ModelRow: View {
                     .foregroundStyle(.green)
                     .labelStyle(.iconOnly)
                 Button("Delete", role: .destructive) {
-                    try? manager.delete(model)
+                    confirmingDelete = true
                 }
                 .buttonStyle(.borderless)
             } else {
@@ -593,6 +669,29 @@ private struct ModelRow: View {
         }
         .padding(8)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .confirmationDialog("Delete \(model.displayName)?",
+                            isPresented: $confirmingDelete,
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                do {
+                    try manager.delete(model)
+                } catch {
+                    deleteError = error.localizedDescription
+                }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Using this model again will require re-downloading it (\(byteCountString(model.sizeBytes))).")
+        }
+        .alert(
+            "Couldn't delete model",
+            isPresented: Binding(
+                get: { deleteError != nil },
+                set: { if !$0 { deleteError = nil } }
+            ),
+            actions: { Button("OK") { deleteError = nil } },
+            message: { Text(deleteError ?? "") }
+        )
     }
 
     private func byteCountString(_ bytes: Int64) -> String {

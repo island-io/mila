@@ -144,7 +144,17 @@ final class MicrophoneRecorder: ObservableObject {
         let sessionStats = OSAllocatedUnfairLock(initialState: MicFrameStats())
         self.stats = sessionStats
 
-        let result = try await Self.withTimeout(seconds: bringUpTimeout) {
+        let result = try await Self.withTimeout(
+            seconds: bringUpTimeout,
+            onAbandoned: { box in
+                // The bring-up finished after the timeout already threw.
+                // Nobody owns this engine — tear it down (off-main, same as
+                // stop()'s detached teardown) or the mic stays hot forever.
+                micLog.error("mic bring-up completed after the timeout had thrown — tearing down the abandoned engine")
+                box.engine.inputNode.removeTap(onBus: 0)
+                box.engine.stop()
+            }
+        ) {
             try await Self.realBringUp(continuation: continuationForTap,
                                        onLevel: onLevel,
                                        gain: agc,
@@ -224,12 +234,20 @@ final class MicrophoneRecorder: ObservableObject {
                 micLog.error("input format reports sampleRate=0 — no usable input device; throwing noInputDevice")
                 throw MicrophoneError.noInputDevice
             }
+            // One converter for the whole session: resampling is stateful,
+            // and a fresh converter per tap buffer put a small discontinuity
+            // at every ~85ms boundary (see StreamingWhisperConverter). Tap
+            // callbacks for one engine are serial, so no locking needed.
+            // Fallback to the per-buffer path only if the converter can't
+            // be built for this format (effectively never).
+            let sessionConverter = StreamingWhisperConverter(inputFormat: nativeFormat)
             input.installTap(onBus: 0,
                              bufferSize: 4096,
                              format: nativeFormat) { buffer, _ in
                 onLevel(AudioMeter.level(from: buffer))
                 do {
-                    let converted = try AudioConvert.toWhisperFormat(buffer)
+                    let converted = try sessionConverter?.convert(buffer)
+                        ?? AudioConvert.toWhisperFormat(buffer)
                     // Apply adaptive digital gain in-place on the whisper-
                     // format buffer so the WAV writer AND the live VAD/
                     // whisper feed both see the same boosted signal —
@@ -298,25 +316,52 @@ final class MicrophoneRecorder: ObservableObject {
     }
 
     /// Race `operation` against a sleep; whichever completes first wins.
-    /// On timeout the in-flight operation is cancelled at the Swift-task
-    /// level — note this does NOT actually unblock an underlying CoreAudio
-    /// `dispatch_sync` if that's what's stalling. The detached worker
-    /// thread may keep waiting (and the engine may never come up) until
-    /// CoreAudio finally returns. The crucial thing is that the *main
-    /// actor* is never blocked, so the UI / hotkeys stay responsive.
+    ///
+    /// Implemented as a first-wins continuation race rather than a
+    /// `withThrowingTaskGroup` race on purpose: a task group cannot return
+    /// until ALL of its children finish, and the real bring-up child awaits
+    /// a detached task's `.value` — an await that is NOT cancellation-
+    /// responsive. With the group version, a wedged CoreAudio call kept
+    /// `start()` suspended long past the deadline (the timeout error
+    /// couldn't propagate out of the group), so the "throw after 5s, caller
+    /// beeps, user retries" behavior never actually happened on the real
+    /// path — or never happened at all if CoreAudio stayed stuck.
+    ///
+    /// On timeout the loser is *abandoned*, not cancelled: nothing can
+    /// unblock a stalled CoreAudio `dispatch_sync`, so the detached worker
+    /// keeps waiting. If it eventually succeeds after we already threw,
+    /// `onAbandoned` is called with the result so the caller can tear down
+    /// the now-ownerless resource (otherwise the engine would keep the mic
+    /// hot forever). The main actor is never blocked either way.
     private static func withTimeout<T: Sendable>(
         seconds: TimeInterval,
+        onAbandoned: @escaping @Sendable (T) -> Void = { _ in },
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
-        try await withThrowingTaskGroup(of: T.self) { group in
-            group.addTask { try await operation() }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                throw MicrophoneError.bringUpTimedOut
+        let claimed = OSAllocatedUnfairLock(initialState: false)
+        return try await withCheckedThrowingContinuation { cont in
+            // Returns true when this call won the race and resumed `cont`.
+            let finish: @Sendable (Result<T, Error>) -> Bool = { result in
+                let isFirst = claimed.withLock { done -> Bool in
+                    if done { return false }
+                    done = true
+                    return true
+                }
+                if isFirst { cont.resume(with: result) }
+                return isFirst
             }
-            let result = try await group.next()!
-            group.cancelAll()
-            return result
+            Task.detached(priority: .userInitiated) {
+                do {
+                    let value = try await operation()
+                    if !finish(.success(value)) { onAbandoned(value) }
+                } catch {
+                    _ = finish(.failure(error))
+                }
+            }
+            Task.detached {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                _ = finish(.failure(MicrophoneError.bringUpTimedOut))
+            }
         }
     }
 }

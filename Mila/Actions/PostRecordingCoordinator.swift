@@ -248,7 +248,12 @@ final class PostRecordingCoordinator: ObservableObject {
         let timeout = transcriptWaitTimeout
         let task = Task { @MainActor [weak self] in
             defer {
-                if let self { self.sendTasks[recordingID] = nil }
+                // Only relinquish the slot if we finished on our own. If we
+                // were cancelled, a replacement send (or `cancelAndDiscard`)
+                // took over the slot — clearing it here would orphan the
+                // replacement's handle (isSending would go false mid-flight
+                // and a later cancel couldn't reach it).
+                if let self, !Task.isCancelled { self.sendTasks[recordingID] = nil }
             }
             guard let self else { return }
             // Resolve the transcript: use the click-time snapshot if it

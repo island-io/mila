@@ -130,6 +130,17 @@ final class VoiceMemosImporter: ObservableObject {
 
     private func sync() async {
         guard settings.isEnabled, settings.hasSelection else { return }
+        // Re-check on entry: `requestSync`'s guard runs when the request is
+        // made, but `isSyncing` only flips once this Task actually starts.
+        // Two requests landing in the same main-actor drain (e.g. "Rescan
+        // now" + an FSEvents hop) both saw false and spawned overlapping
+        // syncs — each snapshots `alreadyImported` before the other's
+        // `store.add` lands, so the same memo imported (and transcribed)
+        // twice.
+        guard !isSyncing else {
+            pendingResync = true
+            return
+        }
         isSyncing = true
         lastError = nil
         defer {
@@ -160,7 +171,12 @@ final class VoiceMemosImporter: ObservableObject {
             return
         }
 
+        // Live imports + tombstones of imports the user permanently
+        // deleted — without the tombstones, deleting an imported memo in
+        // Mila didn't stick (the source memo still exists in the Voice
+        // Memos folder and re-imported on the next sync).
         let alreadyImported = Set(store.recordings.compactMap { $0.voiceMemoUniqueID })
+            .union(store.voiceMemoTombstones)
         let fm = FileManager.default
 
         var imported = 0

@@ -83,39 +83,61 @@ final class RecordingSession: ObservableObject {
         self.fileURL = outputURL
         self.writesSinceStart = 0
         self.isFakeForTesting = false
+        // Never inherit a stale system-audio tail from the previous
+        // recording: a `consumeSystem` call that was already dequeued when
+        // the last stop() ran its flush can append to `pendingSystem`
+        // after the flush, and stop() doesn't clear the buffer.
+        pendingSystem.removeAll(keepingCapacity: false)
 
-        let format = WhisperAudioFormat.pcmFloat32
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatLinearPCM,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: format.channelCount,
-            AVLinearPCMBitDepthKey: 32,
-            AVLinearPCMIsFloatKey: true,
-            AVLinearPCMIsBigEndianKey: false,
-            AVLinearPCMIsNonInterleaved: false
-        ]
-        self.audioFile = try AVAudioFile(forWriting: outputURL, settings: settings,
-                                         commonFormat: .pcmFormatFloat32, interleaved: false)
+        do {
+            let format = WhisperAudioFormat.pcmFloat32
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: format.sampleRate,
+                AVNumberOfChannelsKey: format.channelCount,
+                AVLinearPCMBitDepthKey: 32,
+                AVLinearPCMIsFloatKey: true,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false
+            ]
+            self.audioFile = try AVAudioFile(forWriting: outputURL, settings: settings,
+                                             commonFormat: .pcmFormatFloat32, interleaved: false)
 
-        if source == .microphone || source == .meeting {
-            _ = await mic.requestAccess()
-            try await mic.start()
-            micTask = Task { [weak self] in
-                guard let self else { return }
-                for await buf in self.mic.audioStream {
-                    await self.consumeMic(buf)
+            if source == .microphone || source == .meeting {
+                _ = await mic.requestAccess()
+                try await mic.start()
+                micTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await buf in self.mic.audioStream {
+                        await self.consumeMic(buf)
+                    }
                 }
             }
-        }
 
-        if source == .systemAudio || source == .meeting {
-            try await system.start()
-            systemTask = Task { [weak self] in
-                guard let self else { return }
-                for await buf in self.system.audioStream {
-                    await self.consumeSystem(buf)
+            if source == .systemAudio || source == .meeting {
+                try await system.start()
+                systemTask = Task { [weak self] in
+                    guard let self else { return }
+                    for await buf in self.system.audioStream {
+                        await self.consumeSystem(buf)
+                    }
                 }
             }
+        } catch {
+            // A partial bring-up must not leak. Without this teardown, a
+            // meeting-mode start whose system leg throws (typically Screen
+            // Recording permission denied) left the mic engine hot and the
+            // WAV file open, appending mic audio indefinitely — and since
+            // `state` is still .idle, `cancelAll()` refused to clean it up.
+            recLog.error("start(\(source.rawValue, privacy: .public)) failed mid-bring-up — tearing down partial session: \(error.localizedDescription, privacy: .public)")
+            micTask?.cancel(); micTask = nil
+            systemTask?.cancel(); systemTask = nil
+            await mic.stop()
+            await system.stop()
+            audioFile = nil
+            fileURL = nil
+            pendingSystem.removeAll(keepingCapacity: false)
+            throw error
         }
 
         startTime = Date()

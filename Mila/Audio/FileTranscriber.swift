@@ -71,12 +71,19 @@ enum FileTranscriber {
                 throw NSError(domain: "FileTranscriber", code: 1)
             }
 
+            // One converter for the whole file: resampling is stateful, and
+            // a fresh converter per 32k-frame chunk left a discontinuity at
+            // every chunk edge of the re-encoded WAV (see
+            // StreamingWhisperConverter).
+            let converter = StreamingWhisperConverter(inputFormat: inFile.processingFormat)
+
             var totalFramesIn: AVAudioFramePosition = 0
             while inFile.framePosition < inFile.length {
                 let toRead = min(chunk, AVAudioFrameCount(inFile.length - inFile.framePosition))
                 inputBuffer.frameLength = toRead
                 try inFile.read(into: inputBuffer, frameCount: toRead)
-                let converted = try AudioConvert.toWhisperFormat(inputBuffer)
+                let converted = try converter?.convert(inputBuffer)
+                    ?? AudioConvert.toWhisperFormat(inputBuffer)
                 try outFile.write(from: converted)
                 totalFramesIn += AVAudioFramePosition(toRead)
             }

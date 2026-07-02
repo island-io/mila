@@ -40,6 +40,10 @@ struct SidebarView: View {
     @State private var newFolderName = ""
     @State private var renameTarget: String?
     @State private var renameDraft = ""
+    /// Inline error shown in the rename sheet when `store.renameFolder`
+    /// rejects the new name (collision). Kept here so the sheet can stay
+    /// open instead of silently no-op'ing and closing.
+    @State private var renameError: String?
 
     /// Whether the "All Transcriptions" section is expanded to show its
     /// recordings inline. Persisted so the user's choice survives app
@@ -100,6 +104,7 @@ struct SidebarView: View {
                     .contextMenu {
                         Button("Rename Folder…") {
                             renameDraft = name
+                            renameError = nil
                             renameTarget = name
                         }
                         Button("Delete Folder", role: .destructive) {
@@ -168,11 +173,17 @@ struct SidebarView: View {
                 title: "Rename Folder",
                 confirmLabel: "Rename",
                 name: $renameDraft,
+                errorText: $renameError,
                 onConfirm: {
-                    if let renamed = store.renameFolder(target.name, to: renameDraft) {
-                        if case .folder(let sel) = selection, sel == target.name {
-                            selection = .folder(renamed)
-                        }
+                    // nil = rejected (name collides with an existing
+                    // folder). Keep the sheet open with an inline error
+                    // instead of silently closing as if it worked.
+                    guard let renamed = store.renameFolder(target.name, to: renameDraft) else {
+                        renameError = "A folder with that name already exists."
+                        return
+                    }
+                    if case .folder(let sel) = selection, sel == target.name {
+                        selection = .folder(renamed)
                     }
                     renameTarget = nil
                 },
@@ -339,16 +350,50 @@ struct FolderNameSheet: View {
     let title: String
     let confirmLabel: String
     @Binding var name: String
+    /// Inline validation message (e.g. a rename collision). Owned by the
+    /// presenting view — its confirm handler sets it and keeps the sheet
+    /// open; the sheet clears it as soon as the user edits the name.
+    /// Defaults to a constant nil so the create-folder call sites (which
+    /// have no failure mode to surface) don't have to thread state through.
+    @Binding var errorText: String?
     let onConfirm: () -> Void
     let onCancel: () -> Void
+
+    init(title: String,
+         confirmLabel: String,
+         name: Binding<String>,
+         errorText: Binding<String?> = .constant(nil),
+         onConfirm: @escaping () -> Void,
+         onCancel: @escaping () -> Void) {
+        self.title = title
+        self.confirmLabel = confirmLabel
+        self._name = name
+        self._errorText = errorText
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.title3.weight(.semibold))
             TextField("Folder name", text: $name)
                 .textFieldStyle(.roundedBorder)
-                .onSubmit { onConfirm() }
+                // Return must behave like the confirm button below — without
+                // the guard it fired onConfirm on a blank name the disabled
+                // button was there to prevent.
+                .onSubmit {
+                    guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    onConfirm()
+                }
+                .onChange(of: name) { _, _ in errorText = nil }
                 .accessibilityIdentifier("folder.name.field")
+            if let errorText {
+                Text(errorText)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("folder.name.error")
+            }
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)

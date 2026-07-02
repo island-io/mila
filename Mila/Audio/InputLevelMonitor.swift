@@ -29,7 +29,21 @@ final class InputLevelMonitor: ObservableObject {
 
     private var engine: AVAudioEngine?
 
+    /// Bumped by every `start()` and `stop()`. The off-main bring-up can
+    /// take seconds on a wireless mic, and `engine`/`isRunning` are only
+    /// assigned AFTER it completes — so a `stop()` (view closed) or a
+    /// second `start()` (device changed) landing inside that window used
+    /// to be lost: the late-completing engine was adopted anyway and ran
+    /// forever, holding the mic open with no view left to stop it. Each
+    /// bring-up records the generation it started under and abandons its
+    /// engine if anything bumped it since.
+    private var generation = 0
+
     func start() async {
+        // Supersede any in-flight bring-up first: if two starts race, the
+        // later one wins and the earlier tears its engine down on arrival.
+        generation += 1
+        let myGeneration = generation
         guard !isRunning, engine == nil else { return }
         let preferredUID = self.preferredUID
         let onLevel: @Sendable (Float) -> Void = { [weak self] lvl in
@@ -56,7 +70,14 @@ final class InputLevelMonitor: ObservableObject {
             }
         }.value
         guard let built else {
-            self.level = 0
+            if generation == myGeneration { self.level = 0 }
+            return
+        }
+        guard generation == myGeneration, engine == nil else {
+            // A stop() or newer start() took over while we were coming up
+            // — nobody owns this engine, so tear it down instead of
+            // adopting it.
+            await Self.teardown(built)
             return
         }
         self.engine = built
@@ -64,14 +85,19 @@ final class InputLevelMonitor: ObservableObject {
     }
 
     func stop() async {
+        generation += 1
         let toTeardown = engine
         engine = nil
         isRunning = false
         level = 0
         guard let toTeardown else { return }
+        await Self.teardown(toTeardown)
+    }
+
+    private static func teardown(_ engine: AVAudioEngine) async {
         await Task.detached(priority: .utility) {
-            toTeardown.inputNode.removeTap(onBus: 0)
-            toTeardown.stop()
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
         }.value
     }
 

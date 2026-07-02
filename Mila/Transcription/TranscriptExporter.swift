@@ -54,9 +54,18 @@ enum TranscriptExporter {
     }
 
     private static func formatSRTTime(_ seconds: Double) -> String {
-        let h = Int(seconds) / 3600
-        let m = (Int(seconds) % 3600) / 60
-        let s = seconds.truncatingRemainder(dividingBy: 60)
-        return String(format: "%02d:%02d:%06.3f", h, m, s).replacingOccurrences(of: ".", with: ",")
+        // Round to whole milliseconds FIRST, then decompose. The previous
+        // version truncated hours/minutes from the raw double but let
+        // `%06.3f` round the seconds field, so inputs within 0.5ms below a
+        // minute boundary printed an invalid :60 seconds field (59.9996 →
+        // "00:00:60,000" instead of "00:01:00,000"). Local whisper sits on
+        // a 10ms grid, but the remote path passes through the server's
+        // full-precision floats.
+        let totalMillis = Int((seconds * 1000).rounded())
+        let h = totalMillis / 3_600_000
+        let m = (totalMillis % 3_600_000) / 60_000
+        let s = (totalMillis % 60_000) / 1_000
+        let ms = totalMillis % 1_000
+        return String(format: "%02d:%02d:%02d,%03d", h, m, s, ms)
     }
 }

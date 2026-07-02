@@ -28,7 +28,18 @@ public enum WERCalculator {
     }
 
     private static func tokenize(_ text: String) -> [String] {
-        let stripped = text.unicodeScalars.filter { char in
+        // Fold typographic apostrophes to ASCII before the punctuation
+        // strip. The filter below exempts only U+0027, so "don’t" (smart
+        // quote U+2019, what most editors auto-insert) tokenized to "dont"
+        // while "don't" stayed "don't" — every contraction counted as a
+        // substitution when reference and hypothesis disagreed on the
+        // apostrophe form. Same for Hebrew geresh (U+05F3, ג׳ון) and the
+        // modifier-letter apostrophe (U+02BC).
+        let folded = text
+            .replacingOccurrences(of: "\u{2019}", with: "'")
+            .replacingOccurrences(of: "\u{05F3}", with: "'")
+            .replacingOccurrences(of: "\u{02BC}", with: "'")
+        let stripped = folded.unicodeScalars.filter { char in
             !CharacterSet.punctuationCharacters.contains(char) || CharacterSet(charactersIn: "'").contains(char)
         }
         return String(stripped)

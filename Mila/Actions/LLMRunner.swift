@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Errors surfaced from the CLI invocation. The Settings UI / rename sheet
 /// renders `errorDescription` directly so users can self-diagnose path /
@@ -417,18 +418,23 @@ enum LLMRunner {
 
         // Read stdout/stderr eagerly on background queues so a chatty CLI
         // can't deadlock by filling the OS pipe buffer while we waitUntilExit.
-        var outData = Data()
-        var errData = Data()
+        // Chunked reads into lock-guarded boxes (not one readDataToEndOfFile
+        // into a captured var) so the bounded drain below can snapshot what
+        // arrived so far without racing a still-blocked reader.
+        let outBox = OSAllocatedUnfairLock(initialState: Data())
+        let errBox = OSAllocatedUnfairLock(initialState: Data())
         let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        group.enter()
-        DispatchQueue.global().async {
-            errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
+        for (pipe, box) in [(stdoutPipe, outBox), (stderrPipe, errBox)] {
+            group.enter()
+            DispatchQueue.global().async {
+                let handle = pipe.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData   // blocks until data or EOF
+                    if chunk.isEmpty { break }
+                    box.withLock { $0.append(chunk) }
+                }
+                group.leave()
+            }
         }
 
         // Bounded wait — kill the process if it's still running at deadline.
@@ -450,12 +456,21 @@ enum LLMRunner {
                 runningGroup.wait()
             }
         }
-        // Drain the pipe readers once the process is known to be gone (either it
-        // exited on its own or we killed it above).
-        group.wait()
+        // Drain the pipe readers once the process is known to be gone (either
+        // it exited on its own or we killed it above). BOUNDED: the write
+        // ends normally close the instant the child dies and the readers hit
+        // EOF immediately — but a grandchild that inherited the pipes and
+        // survived the kill (an MCP server or node helper the CLI spawned)
+        // holds them open indefinitely, and an unbounded wait here hung this
+        // method (and the awaiting continuation, and the caller's in-flight
+        // slot) forever. After the grace we return whatever was captured;
+        // the leaked reader threads exit when the pipes finally close.
+        if group.wait(timeout: .now() + 3) == .timedOut {
+            print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
+        }
 
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
+        let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
+        let stderr = String(data: errBox.withLock { $0 }, encoding: .utf8) ?? ""
 
         return ProcessOutcome(stdout: stdout,
                               stderr: stderr,

@@ -229,14 +229,31 @@ struct LiveAIRecordingView: View {
     /// Split a rolling summary paragraph into one bullet per sentence.
     /// Falls back to the whole string as a single bullet when no
     /// sentence boundary is found — better than showing nothing.
+    ///
+    /// Uses Foundation's `.bySentences` tokenizer (same as
+    /// `AIOverviewSection.summaryAttributed`, so the live pane and the
+    /// detail pane split the same summary identically). The previous
+    /// naive split on every '.', '!', '?' character turned "Budget is
+    /// 3.5 million." into two bullets — and, despite its comment, never
+    /// actually included the Hebrew full stop in the separator set.
     static func bulletsFromSummary(_ s: String) -> [String] {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        // Split on '. ', '! ', '? ' and the Hebrew full stop "׃ " plus
-        // line breaks. Filter empties.
-        let parts = trimmed
-            .split(whereSeparator: { ".!?\n".contains($0) })
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        let sourceLines: [String]
+        if trimmed.contains("\n") {
+            // Already has line structure (often the LLM's own bullets).
+            sourceLines = trimmed.components(separatedBy: "\n")
+        } else {
+            var sentences: [String] = []
+            trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex,
+                                        options: [.bySentences, .localized]) { sub, _, _, _ in
+                let sentence = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sentence.isEmpty { sentences.append(sentence) }
+            }
+            sourceLines = sentences
+        }
+        let parts = sourceLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         return parts.isEmpty ? [trimmed] : parts
     }

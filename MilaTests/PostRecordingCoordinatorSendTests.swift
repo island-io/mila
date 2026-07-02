@@ -116,6 +116,54 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
                        "Replaced send must not surface its output")
     }
 
+    /// Regression: when a send is cancelled-and-replaced, the REPLACED
+    /// task's self-cleanup must not wipe the REPLACEMENT's handle. Before
+    /// the fix, the first task's unconditional `defer { sendTasks[id] = nil }`
+    /// ran when it unwound with `.cancelled` — `isSending` went false while
+    /// the replacement CLI was still running, and `cancelAndDiscard` could
+    /// no longer reach it (the CLI kept running against a recording that
+    /// was being permanently deleted).
+    func test_replaced_send_does_not_orphan_replacement_handle() async throws {
+        let first = makeScript("""
+            #!/bin/sh
+            sleep 5
+            printf 'FIRST'
+            """)
+        let second = makeScript("""
+            #!/bin/sh
+            sleep 20
+            printf 'SECOND'
+            """)
+        defer {
+            try? FileManager.default.removeItem(at: first)
+            try? FileManager.default.removeItem(at: second)
+        }
+
+        let rec = addCompletedRecording(text: "transcript")
+        coordinator.present(rec)
+
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
+                              transcript: "transcript", summary: "",
+                              executableOverride: first.path)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        // Replace: cancels the first task (its CLI gets SIGTERM'd and it
+        // unwinds through its defer while the second is still running).
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
+                              transcript: "transcript", summary: "",
+                              executableOverride: second.path)
+        // Give the replaced task ample time to unwind and run its cleanup.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        XCTAssertTrue(coordinator.isSending(rec.id),
+                      "The replacement send is still in flight — the replaced task's cleanup must not have cleared its handle")
+
+        // And the handle still works: discard reaches the replacement.
+        coordinator.cancelAndDiscard()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(coordinator.isSending(rec.id),
+                       "cancelAndDiscard must be able to cancel the replacement send")
+    }
+
     // MARK: - Discard cancels an in-flight send
 
     /// Discarding the recording (cancelAndDiscard) must cancel a pending

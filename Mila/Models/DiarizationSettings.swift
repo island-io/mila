@@ -9,6 +9,16 @@ final class DiarizationSettings: ObservableObject {
             if isEnabled && pythonFound && lastVerifyResult == nil && !isVerified {
                 Task { await checkDeps() }
             }
+            // Enabling with a previously-persisted verification: restore it.
+            // `restoreVerifiedState()` otherwise only runs in init (and only
+            // when the app launched with diarization already on), so flipping
+            // the toggle on mid-session skipped `checkDeps` above (isVerified
+            // is true) but left `verificationStatus` at .disabled — `status`
+            // showed "Setup needed" and `isConfigured` stayed false for a
+            // fully verified setup until a manual re-verify.
+            if isEnabled && isVerified {
+                restoreVerifiedState()
+            }
             if isEnabled, hasBundledRuntime {
                 Task { await bootstrap.bootstrapIfNeeded() }
             }

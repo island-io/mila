@@ -19,7 +19,6 @@ struct HomeView: View {
     @EnvironmentObject private var transcription: TranscriptionService
 
     @Binding var selection: SidebarSelection?
-    let search: String
 
     /// User's preference for capturing the system's audio mix. Defaults
     /// to ON because the main use case is meeting / content

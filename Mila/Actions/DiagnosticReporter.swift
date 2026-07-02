@@ -189,8 +189,13 @@ enum DiagnosticReporter {
     private static func writeSettings(at dir: URL) throws {
         // Whitelist of UserDefaults key prefixes we know are Mila-owned.
         // Avoids leaking unrelated app or system defaults into the zip.
+        // "recording." covers `recording.language` — the key the language
+        // picker actually persists (RecordingLanguageSettings). The old
+        // entry here was "recordingLanguage", which matches no real key,
+        // so the one setting most language-related support reports need
+        // was silently missing from settings.json.
         let prefixes = ["diarization.", "audio.", "llm.", "hotkeys.",
-                        "home.", "rename.", "recordingLanguage", "selectedModelName"]
+                        "home.", "rename.", "recording.", "selectedModelName"]
         let defaults = UserDefaults.standard.dictionaryRepresentation()
         var scoped: [String: Any] = [:]
         for (key, value) in defaults {

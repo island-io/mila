@@ -286,7 +286,11 @@ final class DiarizationBootstrap: ObservableObject {
             ]
             let stderr = Pipe()
             process.standardError = stderr
-            process.standardOutput = Pipe()
+            // Discard stdout via the null device — an assigned-but-never-read
+            // Pipe() is NOT a sink: it's a ~64 KB buffer, and pip's progress
+            // output can fill it, blocking pip on write() while we block in
+            // waitUntilExit() (the PR #15 deadlock class).
+            process.standardOutput = FileHandle.nullDevice
             try process.run()
             let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
             process.waitUntilExit()
@@ -319,7 +323,9 @@ final class DiarizationBootstrap: ObservableObject {
             ] + wheelPaths
             let stderr = Pipe()
             process.standardError = stderr
-            process.standardOutput = Pipe()  // discard
+            // Null device, not Pipe(): an unread Pipe deadlocks past ~64 KB
+            // of pip stdout (see runPipInstallSpec).
+            process.standardOutput = FileHandle.nullDevice
             try process.run()
             let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
             process.waitUntilExit()
@@ -359,8 +365,12 @@ final class DiarizationBootstrap: ObservableObject {
                 find \(pathList) \\( -name '*.so' -o -name '*.dylib' \\) -print0 \
                   | xargs -0 -n1 codesign -f -s - --timestamp=none
                 """]
-            process.standardError = Pipe()
-            process.standardOutput = Pipe()
+            // Null device, not Pipe(): nobody reads these, and codesign's
+            // per-dylib "replacing existing signature" chatter over hundreds
+            // of files can overflow an unread pipe's ~64 KB buffer — child
+            // blocks on write(), we block in waitUntilExit(), deadlock.
+            process.standardError = FileHandle.nullDevice
+            process.standardOutput = FileHandle.nullDevice
             try process.run()
             process.waitUntilExit()
             // Non-fatal: ad-hoc signing failures don't block functionality on
