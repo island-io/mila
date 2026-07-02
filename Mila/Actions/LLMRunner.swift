@@ -478,14 +478,24 @@ enum LLMRunner {
                 print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
             }
         } else {
-            // Normal exit: UNBOUNDED, deliberately. The child closed its
-            // write ends when it died, so the readers hit EOF as soon as
-            // they get CPU — but on a loaded macos-26 CI VM "as soon as"
-            // can be 10s+ of dispatch latency, and a fixed grace here
-            // truncated perfectly good output mid-stream (caught by
-            // LLMRunnerTests.test_runner_spawns_child_in_isolated_temp_directory
-            // going flaky on CI).
-            group.wait()
+            // Normal exit: bounded too, but with a GENEROUS grace. Two
+            // opposing constraints meet here:
+            //  * The child closed its write ends when it died, so the
+            //    readers hit EOF as soon as they get CPU — on a loaded
+            //    macos-26 CI VM that can be 10s+ of dispatch latency, and
+            //    a tight 3s bound truncated perfectly good output
+            //    mid-stream (test_runner_spawns_child_in_isolated_temp_
+            //    directory went flaky on CI).
+            //  * EOF is not GUARANTEED even after exit 0 — a helper the
+            //    CLI spawned (MCP server, node daemon) can inherit the
+            //    pipes and keep them open indefinitely; an unbounded wait
+            //    hung the caller forever.
+            // 30s clears any realistic dispatch latency while still
+            // returning the (fully buffered by then) output if a
+            // pipe-holding helper never lets EOF arrive.
+            if group.wait(timeout: .now() + 30) == .timedOut {
+                print("LLMRunner: pipe drain timed out after normal exit — a helper process is still holding stdout/stderr; returning buffered output")
+            }
         }
 
         let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
