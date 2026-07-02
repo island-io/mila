@@ -104,6 +104,10 @@ final class LiveSpeakerDiarizer: ObservableObject {
             diarLog.log("start skipped — daemon already running")
             return
         }
+        // Fresh launch: don't let a previous daemon's failure report leak
+        // into this session's diagnostics (failPending deliberately keeps
+        // the FIRST error it sees, so a stale one would win).
+        lastError = nil
         guard diarization.isConfigured else {
             lastError = "Diarization is not configured"
             diarLog.log("NOT starting — isConfigured=false (isEnabled=\(diarization.isEnabled, privacy: .public) hasBundledRuntime=\(diarization.hasBundledRuntime, privacy: .public) bootstrap.isReady=\(diarization.bootstrap.isReady, privacy: .public))")
@@ -374,13 +378,21 @@ final class LiveSpeakerDiarizer: ObservableObject {
             if data.isEmpty {
                 // EOF — daemon exited.
                 Task { @MainActor [weak self] in
-                    self?.failPending(error: "daemon exited")
+                    // Identity gate: a task enqueued just before stop()
+                    // detached this handler can land AFTER a new daemon
+                    // is up — it must not fail the NEW daemon's pending
+                    // queue.
+                    guard let self, self.stdoutHandle === fh else { return }
+                    self.failPending(error: "daemon exited")
                 }
                 fh.readabilityHandler = nil
                 return
             }
             Task { @MainActor [weak self] in
-                self?.consumeStdout(data)
+                // Same identity gate: stale bytes from a dying daemon must
+                // not be matched against the next daemon's pending queue.
+                guard let self, self.stdoutHandle === fh else { return }
+                self.consumeStdout(data)
             }
         }
     }

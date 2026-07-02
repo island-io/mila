@@ -99,13 +99,21 @@ enum SpeakerDiarizer {
 
                 process.waitUntilExit()
 
+                // A SIGTERM'd run surfaces as cancellation, not as a
+                // "diarization failed (exit 15)" error banner. Checked
+                // BEFORE awaiting the drains: the output is discarded
+                // anyway, and `readDataToEndOfFile` only returns at EOF —
+                // which any pipe-inheriting straggler of the killed python
+                // could postpone indefinitely. The abandoned readers exit
+                // on their own when the pipes finally close.
+                if cancelled.withLock({ $0 }) { throw CancellationError() }
+
                 let result = PythonResult(
                     stdout: await stdoutRead.value,
                     stderr: await stderrRead.value,
                     exitCode: process.terminationStatus
                 )
-                // A SIGTERM'd run must surface as cancellation, not as a
-                // "diarization failed (exit 15)" error banner.
+                // Cancellation that landed while draining still wins.
                 if cancelled.withLock({ $0 }) { throw CancellationError() }
                 return result
             }.value

@@ -154,6 +154,12 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         try stream.addStreamOutput(audioOutput,
                                    type: .screen,
                                    sampleHandlerQueue: .global(qos: .utility))
+        // `audioOutput` outlives capture sessions — drop the previous
+        // session's resampler state (filter history must not smear the
+        // last recording's tail into this one's first buffers). On the
+        // sample queue, since that's the only context that touches it;
+        // it's idle until startCapture below.
+        sampleQueue.sync { audioOutput.resetConverter() }
         try await stream.startCapture()
         self.stream = stream
         self.isRunning = true
@@ -190,6 +196,10 @@ extension SystemAudioRecorder: SCStreamDelegate {
         let message = error.localizedDescription
         print("SCStream stopped with error: \(message)")
         Task { @MainActor in
+            // Only act for the CURRENTLY active stream — a stale callback
+            // from a previous session's stream arriving after a restart
+            // must not clear the new stream or surface an old error.
+            guard self.stream === stream else { return }
             // SCK killed the stream from its side (TCC revocation, display
             // config change, ...). Release the dead stream and record the
             // failure — before this, `stream` stayed set (leaked) and the
@@ -219,6 +229,11 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
     /// the first buffer's format and rebuilt if SCK ever changes it; only
     /// touched on the serial sample-handler queue.
     private var converter: StreamingWhisperConverter?
+
+    /// Called (on the sample queue) at the start of each capture session.
+    func resetConverter() {
+        converter = nil
+    }
 
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,

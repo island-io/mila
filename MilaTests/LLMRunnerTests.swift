@@ -216,12 +216,24 @@ final class LLMRunnerTests: XCTestCase {
     /// stdout and outlives its killed parent. `run` must still return
     /// `.timedOut` promptly instead of waiting out the grandchild.
     func test_timeout_returns_even_when_grandchild_holds_pipes_open() async {
+        // The grandchild's PID is parked in a file so the test can reap it
+        // on exit — otherwise every run leaves a stray `sleep 60` behind.
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-grandchild-\(UUID().uuidString).pid")
         let script = makeScript("""
             #!/bin/sh
             sleep 60 &
+            echo $! > "\(pidFile.path)"
             sleep 60
             """)
-        defer { try? FileManager.default.removeItem(at: script) }
+        defer {
+            if let pidText = try? String(contentsOf: pidFile, encoding: .utf8),
+               let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                kill(pid, SIGKILL)
+            }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
 
         let started = Date()
         do {

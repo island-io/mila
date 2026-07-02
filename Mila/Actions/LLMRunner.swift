@@ -453,7 +453,15 @@ enum LLMRunner {
             process.terminate()
             if runningGroup.wait(timeout: .now() + 1) == .timedOut {
                 kill(process.processIdentifier, SIGKILL)
-                runningGroup.wait()
+                // BOUNDED: `waitUntilExit` has been observed never returning
+                // even after a SIGKILL (macOS 26, sampled live — likely a
+                // reaping race inside NSTask). The child is dead-or-dying
+                // either way, and this is the timedOut path so its exit
+                // status is already being discarded — don't hang the caller
+                // (and its awaiting continuation) on the obituary.
+                if runningGroup.wait(timeout: .now() + 5) == .timedOut {
+                    print("LLMRunner: waitUntilExit didn't return after SIGKILL — abandoning the wait")
+                }
             }
         }
         // Drain the pipe readers once the process is known to be gone.
@@ -593,11 +601,20 @@ enum LLMRunner {
 final class ProcessHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
-    private(set) var wasTerminated = false
+    private var _wasTerminated = false
+
+    /// Lock-protected read: `terminate()` sets the flag from whatever
+    /// thread cancellation lands on while `executeProcess` reads it from
+    /// its own context — an unlocked read is a data race (and could steer
+    /// the drain-path choice wrong).
+    var wasTerminated: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _wasTerminated
+    }
 
     func attach(_ p: Process) {
         lock.lock(); defer { lock.unlock() }
-        if wasTerminated {
+        if _wasTerminated {
             // Cancel beat us to attach — the Task was already cancelled
             // before the Process even started. Reach out and SIGTERM right
             // now so the child doesn't even get a head start.
@@ -609,7 +626,7 @@ final class ProcessHandle: @unchecked Sendable {
 
     func terminate() {
         lock.lock(); defer { lock.unlock() }
-        wasTerminated = true
+        _wasTerminated = true
         process?.terminate()
     }
 }

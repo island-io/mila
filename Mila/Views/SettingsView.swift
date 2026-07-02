@@ -504,20 +504,24 @@ private struct ModelsSettingsTab: View {
 
             // Failed downloads used to only leave an os_log line — the
             // progress bar vanished with zero explanation of whether the
-            // model installed or why it didn't.
-            if let error = manager.lastDownloadError {
-                HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text(error)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer()
-                    Button("Dismiss") { manager.lastDownloadError = nil }
-                        .buttonStyle(.borderless)
+            // model installed or why it didn't. One row per failed model:
+            // the defaults auto-download concurrently on first launch, so
+            // two reports can be live at once.
+            ForEach(manager.lastDownloadErrors.keys.sorted(), id: \.self) { name in
+                if let error = manager.lastDownloadErrors[name] {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                        Text(error)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
+                        Button("Dismiss") { manager.lastDownloadErrors[name] = nil }
+                            .buttonStyle(.borderless)
+                    }
+                    .accessibilityIdentifier("models.download.error.\(name)")
                 }
-                .accessibilityIdentifier("models.download.error")
             }
         }
     }

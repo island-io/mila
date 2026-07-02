@@ -40,14 +40,20 @@ final class InputLevelMonitor: ObservableObject {
     private var generation = 0
 
     func start() async {
-        // Supersede any in-flight bring-up first: if two starts race, the
-        // later one wins and the earlier tears its engine down on arrival.
+        guard !isRunning, engine == nil else { return }
+        // Supersede any in-flight bring-up: if two starts race, the later
+        // one wins and the earlier tears its engine down on arrival.
         generation += 1
         let myGeneration = generation
-        guard !isRunning, engine == nil else { return }
         let preferredUID = self.preferredUID
         let onLevel: @Sendable (Float) -> Void = { [weak self] lvl in
-            Task { @MainActor in self?.level = lvl }
+            Task { @MainActor [weak self] in
+                // Generation gate: a superseded engine keeps tapping until
+                // its teardown lands — its queued updates must not repaint
+                // the meter after stop() zeroed it.
+                guard let self, self.generation == myGeneration else { return }
+                self.level = lvl
+            }
         }
         let built: AVAudioEngine? = await Task.detached(priority: .utility) {
             let engine = AVAudioEngine()

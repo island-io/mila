@@ -62,8 +62,8 @@ final class DictationPasteboardTests: XCTestCase {
         DictationController.restorePasteboard(pasteboard, from: snapshot)
 
         let strings = (pasteboard.pasteboardItems ?? []).compactMap { $0.string(forType: .string) }
-        XCTAssertEqual(strings.sorted(), ["first", "second"],
-                       "Every pasteboard item must be restored, not just the first")
+        XCTAssertEqual(strings, ["first", "second"],
+                       "Every pasteboard item must be restored, in order, not just the first")
     }
 
     func test_empty_pasteboard_snapshot_is_empty() {

@@ -88,12 +88,15 @@ final class ModelManager: NSObject, ObservableObject {
     @Published private(set) var downloads: [String: Double] = [:]
     @Published var selectedModelName: String
 
-    /// Human-readable description of the most recent failed model download,
-    /// or nil. Every failure path of a multi-GB fetch used to end in a log
-    /// line only — the progress row just vanished and the user had no idea
-    /// whether the model installed or why it didn't. Cleared when a new
-    /// download for the same model starts (and dismissible from the UI).
-    @Published var lastDownloadError: String?
+    /// Human-readable descriptions of failed model downloads, keyed by
+    /// `WhisperModel.name`. Every failure path of a multi-GB fetch used to
+    /// end in a log line only — the progress row just vanished and the user
+    /// had no idea whether the model installed or why it didn't. Keyed per
+    /// model (not one flat slot) because the two default models auto-download
+    /// concurrently on first launch: starting B must not wipe A's report.
+    /// A new attempt for a model clears only that model's entry; also
+    /// dismissible from the UI.
+    @Published var lastDownloadErrors: [String: String] = [:]
 
     private let modelsDirectory: URL
     private lazy var session: URLSession = {
@@ -201,8 +204,9 @@ final class ModelManager: NSObject, ObservableObject {
     func download(_ model: WhisperModel) {
         guard downloads[model.name] == nil else { return }
         guard !didShutDownSession else { return }
-        // A fresh attempt supersedes the previous failure report.
-        lastDownloadError = nil
+        // A fresh attempt supersedes the previous failure report for THIS
+        // model only — a concurrent sibling download's error must survive.
+        lastDownloadErrors[model.name] = nil
         downloads[model.name] = 0
         let task = session.downloadTask(with: model.url)
         observers[task.taskIdentifier] = model
@@ -342,7 +346,7 @@ extension ModelManager: URLSessionDownloadDelegate {
             }
             if let moveErr {
                 modelLogger.error("Download \(model.name, privacy: .public): failed to capture URLSession temp file: \(moveErr.localizedDescription, privacy: .public)")
-                self.lastDownloadError = "\(model.displayName): download failed (\(moveErr.localizedDescription))"
+                self.lastDownloadErrors[model.name] = "\(model.displayName): download failed (\(moveErr.localizedDescription))"
                 return
             }
             // A 404/403 from HuggingFace delivers an HTML error page that
@@ -352,7 +356,7 @@ extension ModelManager: URLSessionDownloadDelegate {
                !(200..<300).contains(http.statusCode) {
                 try? FileManager.default.removeItem(at: tempCopy)
                 modelLogger.error("Download \(model.name, privacy: .public): server returned HTTP \(http.statusCode, privacy: .public)")
-                self.lastDownloadError = "\(model.displayName): server returned HTTP \(http.statusCode)"
+                self.lastDownloadErrors[model.name] = "\(model.displayName): server returned HTTP \(http.statusCode)"
                 return
             }
             // Hash off the main actor — for the 3 GB ivritLarge model this is
@@ -367,7 +371,7 @@ extension ModelManager: URLSessionDownloadDelegate {
             } catch {
                 try? FileManager.default.removeItem(at: tempCopy)
                 modelLogger.error("Download \(model.name, privacy: .public): integrity check failed: \(error.localizedDescription, privacy: .public)")
-                self.lastDownloadError = "\(model.displayName): downloaded file failed its integrity check — try again"
+                self.lastDownloadErrors[model.name] = "\(model.displayName): downloaded file failed its integrity check — try again"
                 return
             }
             let dest = self.url(for: model)
@@ -377,7 +381,7 @@ extension ModelManager: URLSessionDownloadDelegate {
                 modelLogger.notice("Download \(model.name, privacy: .public): installed at \(dest.path, privacy: .public)")
             } catch {
                 modelLogger.error("Download \(model.name, privacy: .public): final move failed: \(error.localizedDescription, privacy: .public)")
-                self.lastDownloadError = "\(model.displayName): could not install (\(error.localizedDescription))"
+                self.lastDownloadErrors[model.name] = "\(model.displayName): could not install (\(error.localizedDescription))"
             }
             self.refreshInstalled()
         }
@@ -392,7 +396,7 @@ extension ModelManager: URLSessionDownloadDelegate {
             if let model = self.observers.removeValue(forKey: id) {
                 self.downloads.removeValue(forKey: model.name)
                 modelLogger.error("Download \(model.name, privacy: .public): network/task failure: \(error.localizedDescription, privacy: .public)")
-                self.lastDownloadError = "\(model.displayName): download failed (\(error.localizedDescription))"
+                self.lastDownloadErrors[model.name] = "\(model.displayName): download failed (\(error.localizedDescription))"
             } else if let model = self.coreMLObservers.removeValue(forKey: id) {
                 self.coreMLDownloads.removeValue(forKey: model.name)
                 modelLogger.error("CoreML download \(model.name, privacy: .public): network/task failure: \(error.localizedDescription, privacy: .public)")
