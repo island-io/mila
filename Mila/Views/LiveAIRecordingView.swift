@@ -497,7 +497,7 @@ private struct TranscriptLineView: View {
             if let sp = segment.speaker {
                 Text(sp.friendlySpeakerLabel(language: language))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(useSpeakerColor ? sp.speakerColor : .tint)
+                    .foregroundStyle(useSpeakerColor ? sp.speakerColor : Color.accentColor)
                     .frame(minWidth: 96, alignment: .leading)
             } else {
                 Color.clear.frame(width: 96, height: 1)

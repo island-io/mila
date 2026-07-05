@@ -580,7 +580,7 @@ private struct SegmentRow: View {
             if showSpeaker, let raw = segment.speaker, !raw.isEmpty {
                 Text(raw.friendlySpeakerLabel(language: language) + ":")
                     .font(.body.weight(.semibold))
-                    .foregroundStyle(useSpeakerColor ? raw.speakerColor : .tint)
+                    .foregroundStyle(useSpeakerColor ? raw.speakerColor : Color.accentColor)
                     .fixedSize(horizontal: true, vertical: false)
             }
             Text(segment.text)

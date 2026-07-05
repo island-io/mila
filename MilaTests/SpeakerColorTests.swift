@@ -18,15 +18,11 @@ final class SpeakerColorTests: XCTestCase {
     func test_color_wraps_around_the_palette_beyond_its_size() {
         // Whatever the palette size N is, speaker N should reuse speaker 0's
         // color rather than crash or silently default to one color.
-        var index = 0
-        var color = "SPEAKER_00".speakerColor
-        while true {
-            index += 1
-            let next = "SPEAKER_\(String(format: "%02d", index))".speakerColor
-            if next == color { break }
-            color = next
-            XCTAssertLessThan(index, 64, "Palette should wrap well before 64 distinct speakers.")
+        let first = "SPEAKER_00".speakerColor
+        let wrapped = (1..<64).contains { index in
+            "SPEAKER_\(String(format: "%02d", index))".speakerColor == first
         }
+        XCTAssertTrue(wrapped, "Palette should wrap back to speaker 0's color well before 64 distinct speakers.")
     }
 
     func test_non_standard_speaker_ids_still_resolve_to_a_stable_color() {
