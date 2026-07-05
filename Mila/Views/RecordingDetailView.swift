@@ -329,10 +329,15 @@ struct RecordingDetailView: View {
                         // "Speaker A" so the user gets feedback that the
                         // detection ran (vs. silently failing to detect).
                         let hasSpeakers = recording.segments.contains { $0.speaker != nil }
+                        // Only color speaker labels once there's more than
+                        // one distinct speaker to tell apart — a single-
+                        // speaker recording keeps the plain tint color.
+                        let hasMultipleSpeakers = Set(recording.segments.compactMap(\.speaker)).count > 1
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,
                                        showSpeaker: hasSpeakers,
+                                       useSpeakerColor: hasMultipleSpeakers,
                                        language: recording.language,
                                        onTap: { seek(to: seg.start) })
                         }
@@ -555,6 +560,10 @@ private struct SegmentRow: View {
     let segment: TranscriptSegment
     let isActive: Bool
     let showSpeaker: Bool
+    /// Whether to color the speaker label per-speaker rather than the
+    /// default tint — set by the caller once it's seen more than one
+    /// distinct speaker across the recording.
+    let useSpeakerColor: Bool
     /// Recording's language so we can render the raw `SPEAKER_00`
     /// label from pyannote as `Speaker A` / `דובר א׳` in the user's
     /// language — matching the labels the live view + post-recording
@@ -571,7 +580,7 @@ private struct SegmentRow: View {
             if showSpeaker, let raw = segment.speaker, !raw.isEmpty {
                 Text(raw.friendlySpeakerLabel(language: language) + ":")
                     .font(.body.weight(.semibold))
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(useSpeakerColor ? raw.speakerColor : .tint)
                     .fixedSize(horizontal: true, vertical: false)
             }
             Text(segment.text)

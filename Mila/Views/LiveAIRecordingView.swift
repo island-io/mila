@@ -327,8 +327,13 @@ struct LiveAIRecordingView: View {
                                 .frame(maxWidth: .infinity, alignment: textAlignment)
                                 .accessibilityIdentifier("liveTranscript.listening")
                         } else {
+                            // Only color speaker labels once there's more
+                            // than one distinct speaker to tell apart — a
+                            // single-speaker recording keeps the plain
+                            // tint color.
+                            let hasMultipleSpeakers = Set(transcriber.segments.compactMap(\.speaker)).count > 1
                             ForEach(transcriber.segments) { seg in
-                                TranscriptLineView(segment: seg, language: language)
+                                TranscriptLineView(segment: seg, language: language, useSpeakerColor: hasMultipleSpeakers)
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                 // Identifier is applied to the inner Text
                                 // inside TranscriptLineView (where SwiftUI
@@ -474,6 +479,10 @@ private struct RecordingElapsedLabel: View {
 private struct TranscriptLineView: View {
     let segment: LiveSegment
     let language: String
+    /// Whether to color the speaker label per-speaker rather than the
+    /// default tint — set by the caller once it's seen more than one
+    /// distinct speaker across the live transcript.
+    var useSpeakerColor: Bool = false
 
     var body: some View {
         // We rely on the PARENT pane's layoutDirection. That mirrors the
@@ -488,7 +497,7 @@ private struct TranscriptLineView: View {
             if let sp = segment.speaker {
                 Text(sp.friendlySpeakerLabel(language: language))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tint)
+                    .foregroundStyle(useSpeakerColor ? sp.speakerColor : .tint)
                     .frame(minWidth: 96, alignment: .leading)
             } else {
                 Color.clear.frame(width: 96, height: 1)
