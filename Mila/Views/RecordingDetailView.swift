@@ -332,7 +332,7 @@ struct RecordingDetailView: View {
                         // Only color speaker labels once there's more than
                         // one distinct speaker to tell apart — a single-
                         // speaker recording keeps the plain tint color.
-                        let hasMultipleSpeakers = Set(recording.segments.compactMap(\.speaker)).count > 1
+                        let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,

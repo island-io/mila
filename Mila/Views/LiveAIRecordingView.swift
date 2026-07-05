@@ -331,7 +331,7 @@ struct LiveAIRecordingView: View {
                             // than one distinct speaker to tell apart — a
                             // single-speaker recording keeps the plain
                             // tint color.
-                            let hasMultipleSpeakers = Set(transcriber.segments.compactMap(\.speaker)).count > 1
+                            let hasMultipleSpeakers = transcriber.segments.hasMultipleSpeakers
                             ForEach(transcriber.segments) { seg in
                                 TranscriptLineView(segment: seg, language: language, useSpeakerColor: hasMultipleSpeakers)
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
