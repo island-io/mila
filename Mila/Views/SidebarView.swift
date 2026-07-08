@@ -87,7 +87,7 @@ struct SidebarView: View {
 
                 if allTranscriptionsExpanded {
                     ForEach(unfiled) { rec in
-                        RecordingSubRow(recording: rec)
+                        RecordingSubRow(recording: rec, selection: $selection)
                     }
                 }
 
@@ -318,8 +318,14 @@ private struct AllTranscriptionsRow: View {
 /// beneath it. Tagged `.recording(id)` so List selection drives navigation
 /// straight to the transcript page, and `.draggable` so it can still be
 /// filed into a folder by dragging — same payload the history rows use.
+///
+/// Carries the same per-recording `.recordingContextMenu` as the
+/// All Transcripts list so right-click works here too (issue #62): the menu
+/// needs the shared `selection` binding to navigate away if the currently
+/// open recording is deleted from the row.
 private struct RecordingSubRow: View {
     let recording: Recording
+    @Binding var selection: SidebarSelection?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 1) {
@@ -338,6 +344,7 @@ private struct RecordingSubRow: View {
         .contentShape(Rectangle())
         .tag(SidebarSelection.recording(recording.id))
         .draggable(RecordingDragPayload(id: recording.id))
+        .recordingContextMenu(recording: recording, selection: $selection)
         .accessibilityIdentifier("sidebar.recording.\(recording.title)")
     }
 }
