@@ -489,6 +489,34 @@ final class TranscriptionServiceTests: XCTestCase {
                           "User-cancelled recordings must not surface as engine failures")
     }
 
+    /// The Queue's "Stop" button flow: abort the active run via the service AND
+    /// flip the store status (the service leaves it alone). The recording must
+    /// end in a terminal state so it drops out of the Queue instead of showing
+    /// "Transcribing" forever, but the audio + row must survive for a later
+    /// re-transcribe.
+    func test_stop_from_queue_leaves_recording_terminal_and_kept() async throws {
+        let target = try TestRecordingFixture.make(in: store, title: "Stop me")
+        await stub.setDefaultDelay(0.4)
+
+        service.enqueue(target.recording)
+        let deadline = Date().addingTimeInterval(2)
+        while service.activeRecordingID != target.recording.id && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(service.activeRecordingID, target.recording.id)
+
+        // Mirror QueueRow.cancel(): trip the abort flag + mark it cancelled.
+        service.cancel(recordingID: target.recording.id)
+        store.cancelTranscription(target.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == target.recording.id })
+        XCTAssertEqual(stored.status, .failed,
+                       "A stopped recording must leave the running/pending Queue state")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.audioURL.path),
+                      "Stop keeps the audio so the user can re-transcribe")
+    }
+
     // MARK: - Re-transcribe with the other language
 
     /// Drives the right-click "Re-transcribe in [other language]" path: the

@@ -421,6 +421,28 @@ final class RecordingStore: ObservableObject {
         }
     }
 
+    /// Mark a queued/in-progress recording as no longer transcribing after the
+    /// user cancelled it from the Queue. We land it in `.failed` — the existing
+    /// terminal state — rather than adding a dedicated `.cancelled` case: the
+    /// Queue only keeps `.pending`/`.running` rows, so a cancelled item drops
+    /// out of the Queue either way, and every status-rendering site (list rows,
+    /// detail view) already handles `.failed`. The recording + its audio stay on
+    /// disk so the user can still re-transcribe it later; use
+    /// `permanentlyDelete` when they want it gone.
+    ///
+    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
+    /// engine's abort flag so the in-flight whisper pass unwinds. That path
+    /// deliberately leaves the store status alone (the discard coordinator owns
+    /// the delete), so a Queue-level cancel must flip the status itself —
+    /// otherwise a `.running` item would sit in the Queue forever. No-op if the
+    /// recording is already in a terminal state.
+    func cancelTranscription(_ recording: Recording) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
+        recordings[idx].status = .failed
+        persist()
+    }
+
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
     func softDelete(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }

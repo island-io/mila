@@ -406,6 +406,68 @@ final class RecordingStoreTests: XCTestCase {
                        "Whitespace-only summary must be treated as empty")
     }
 
+    // MARK: - Cancelling a queued/running transcription
+
+    /// Stopping a `.running` recording from the Queue must move it to a
+    /// terminal state (`.failed`) so it drops out of the Queue instead of
+    /// sitting there forever showing "Transcribing".
+    func test_cancel_transcription_marks_running_recording_failed() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "In progress", source: .microphone, audioFileName: "r.wav")
+        rec.status = .running
+        store.add(rec)
+
+        store.cancelTranscription(rec)
+
+        let stored = store.recordings.first { $0.id == rec.id }
+        XCTAssertEqual(stored?.status, .failed)
+    }
+
+    /// Same for a `.pending` item still waiting its turn.
+    func test_cancel_transcription_marks_pending_recording_failed() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Waiting", source: .microphone,
+                            audioFileName: "p.wav", status: .pending)
+        store.add(rec)
+
+        store.cancelTranscription(rec)
+
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.status, .failed)
+    }
+
+    /// Cancelling an already-completed recording is a no-op — we must not
+    /// clobber a finished transcript's status back to `.failed` if the row is
+    /// stale (e.g. the run finished between the user clicking Stop and the
+    /// mutation landing).
+    func test_cancel_transcription_is_noop_for_completed_recording() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Done", source: .microphone,
+                            audioFileName: "d.wav", status: .completed,
+                            fullText: "hello")
+        store.add(rec)
+
+        store.cancelTranscription(rec)
+
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.status, .completed)
+    }
+
+    /// Removing from the Queue reuses `permanentlyDelete`, so both the metadata
+    /// and the on-disk audio go away.
+    func test_permanently_delete_removes_queued_recording_and_audio() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let audioURL = store.freshAudioURL(suggestedName: "Queued")
+        try Data(repeating: 0, count: 1024).write(to: audioURL)
+        let rec = Recording(title: "Queued", source: .microphone,
+                            audioFileName: audioURL.lastPathComponent, status: .running)
+        store.add(rec)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+
+        store.permanentlyDelete(rec)
+
+        XCTAssertNil(store.recordings.first { $0.id == rec.id })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
+    }
+
     func test_load_seeds_folders_from_recordings_when_folders_file_missing() throws {
         // Simulates a recordings.json that already references a folder name
         // (e.g. after restoring from backup, or hand-editing the JSON).

@@ -548,7 +548,7 @@ private struct QueueView: View {
                 } else {
                     VStack(spacing: 8) {
                         ForEach(Array(queue.enumerated()), id: \.element.id) { index, rec in
-                            QueueRow(recording: rec, position: index)
+                            QueueRow(recording: rec, position: index, selection: $selection)
                                 .contentShape(Rectangle())
                                 .onTapGesture { selection = .recording(rec.id) }
                         }
@@ -566,7 +566,14 @@ private struct QueueRow: View {
     let recording: Recording
     /// 0 = currently transcribing, 1+ = number of jobs ahead in the queue
     let position: Int
+    @Binding var selection: SidebarSelection?
+    @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
+
+    /// Gate before "Remove" wipes the audio + any transcript — there's no
+    /// Trash to restore from (same rationale as the context menu's permanent
+    /// delete), so a stray click can't silently discard a recording.
+    @State private var confirmingRemove = false
 
     private var isActive: Bool {
         transcription.activeRecordingID == recording.id
@@ -606,10 +613,61 @@ private struct QueueRow: View {
                     }
                 }
             }
+
+            // Stop (cancel the run/queue slot, keep the recording) + Remove
+            // (cancel and delete it outright). Both trip the engine abort flag
+            // first so a `.running` item stops burning CPU immediately.
+            Button {
+                cancel()
+            } label: {
+                Image(systemName: "stop.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Stop transcribing — keeps the recording so you can re-transcribe later")
+            .accessibilityIdentifier("queue.row.stop.\(recording.title)")
+
+            Button(role: .destructive) {
+                confirmingRemove = true
+            } label: {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .help("Remove from queue and delete the recording")
+            .accessibilityIdentifier("queue.row.remove.\(recording.title)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .confirmationDialog("Remove “\(recording.title)” from the queue?",
+                            isPresented: $confirmingRemove,
+                            titleVisibility: .visible) {
+            Button("Remove", role: .destructive) { remove() }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Transcription stops and the audio file is permanently deleted. This can't be undone.")
+        }
+    }
+
+    /// Stop the transcription but keep the recording. Trip the engine abort
+    /// flag (unwinds `whisper_full` in ~100ms / drops it from the pending
+    /// queue) AND flip the store status out of `.pending`/`.running` — the
+    /// service's cancel path intentionally leaves the status alone, so without
+    /// this the row would stay stuck in the Queue.
+    private func cancel() {
+        transcription.cancel(recordingID: recording.id)
+        store.cancelTranscription(recording)
+    }
+
+    /// Stop AND delete: abort the run, then remove the recording and its audio
+    /// + sidecars via the same `permanentlyDelete` the context menu uses. Move
+    /// the selection home if this row was selected so we don't leave a dangling
+    /// detail pane.
+    private func remove() {
+        transcription.cancel(recordingID: recording.id)
+        store.permanentlyDelete(recording)
+        if case .recording(let id) = selection, id == recording.id {
+            selection = .home
+        }
     }
 
     private var statusLabel: String {
