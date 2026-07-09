@@ -624,7 +624,7 @@ private struct QueueRow: View {
             }
             .buttonStyle(.borderless)
             .help("Stop transcribing — keeps the recording so you can re-transcribe later")
-            .accessibilityIdentifier("queue.row.stop.\(recording.title)")
+            .accessibilityIdentifier("queue.row.stop.\(recording.id)")
 
             Button(role: .destructive) {
                 confirmingRemove = true
@@ -633,7 +633,7 @@ private struct QueueRow: View {
             }
             .buttonStyle(.borderless)
             .help("Remove from queue and delete the recording")
-            .accessibilityIdentifier("queue.row.remove.\(recording.title)")
+            .accessibilityIdentifier("queue.row.remove.\(recording.id)")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 12)
