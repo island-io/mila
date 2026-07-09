@@ -1246,17 +1246,41 @@ struct MilaApp: App {
         }
     }
 
+    /// Recovery decision for one recording left over from a previous
+    /// session, factored out of `enqueueRecoveredRecordings` so the launch
+    /// sweep is unit-testable without the App/SwiftUI lifecycle.
+    enum RecoveryAction: Equatable {
+        case reenqueue    // hand back to the transcription worker
+        case markFailed   // audio is gone — stop the row from retrying
+        case leaveAlone   // terminal / already settled
+    }
+
+    /// `.running` (died mid-transcription) and `.pending` (queued but never
+    /// started) are both mid-flight leftovers the fresh worker won't resume
+    /// on its own: re-enqueue when the `.wav` survives, else `.failed`.
+    /// `.completed` / `.failed` are terminal and left untouched.
+    static func recoveryAction(status: TranscriptionStatus, wavExists: Bool) -> RecoveryAction {
+        switch status {
+        case .running, .pending:
+            return wavExists ? .reenqueue : .markFailed
+        case .completed, .failed:
+            return .leaveAlone
+        }
+    }
+
     /// Crash-recovery sweep + stale-status cleanup. Two things happen
     /// here at launch:
-    ///   1. Any recording left in `.running` from a previous session
-    ///      (the app died while whisper was mid-transcription OR while
-    ///      the stop-time live-drain in `QuickActionsController` was
-    ///      still in flight) is reset to `.pending` and re-enqueued for
-    ///      transcription — provided its `.wav` is still on disk.
-    ///      Without re-enqueue, the row would sit in `.running` forever
-    ///      (the worker never publishes it on the new process) and the
-    ///      Queue view's "still-pending fallback" keeps showing it.
-    ///      If the WAV is gone we fall back to `.failed` so the row
+    ///   1. Any recording left mid-flight from a previous session is
+    ///      re-enqueued — both `.running` (the app died while whisper was
+    ///      mid-transcription OR the stop-time live-drain in
+    ///      `QuickActionsController` was still in flight) and `.pending`
+    ///      (queued but never started before the app quit). The worker on
+    ///      this fresh process boots with an empty queue and won't touch
+    ///      either unless we hand it back, so a `.pending` row would
+    ///      otherwise sit in the Queue forever showing "Queued" and a
+    ///      `.running` row would never advance. `.running` is first reset to
+    ///      `.pending`; both are re-enqueued provided the `.wav` is still on
+    ///      disk. If the WAV is gone we fall back to `.failed` so the row
     ///      doesn't loop forever trying to read a missing file.
     ///   2. Orphan .wav files re-attached by RecordingStore as
     ///      `.pending` are enqueued for transcription so the user
@@ -1267,26 +1291,36 @@ struct MilaApp: App {
     /// `.failed` in the list so empty orphans don't nag the user at
     /// launch.
     private func enqueueRecoveredRecordings() {
-        // 1. Reset stale .running recordings. The current process
-        //    hasn't started its worker loop yet — anything still
-        //    flagged .running must be a leftover.
+        // 1. Resurrect stale mid-flight recordings. The current process
+        //    hasn't started its worker loop yet, so anything still flagged
+        //    `.running` (died mid-transcription) or `.pending` (queued but
+        //    never started) is a leftover the new worker won't resume on its
+        //    own. `enqueue` is idempotent, so a row also re-attached as a
+        //    recovered orphan in step 2 is still enqueued at most once.
         let fm = FileManager.default
-        for recording in store.recordings where recording.status == .running {
+        for recording in store.recordings
+        where recording.status == .running || recording.status == .pending {
             let wavURL = store.audioURL(for: recording)
             var fixed = recording
-            if fm.fileExists(atPath: wavURL.path) {
-                // Stop-time drain or batch worker died mid-transcription;
-                // the audio is still on disk, so re-queue for a fresh
-                // batch run instead of stranding the row at `.failed`
-                // (which has no recovery path the user can self-serve).
-                fixed.status = .pending
-                store.update(fixed)
-                print("MilaApp: re-enqueuing stale .running recording \(recording.audioFileName)")
+            switch Self.recoveryAction(status: recording.status,
+                                       wavExists: fm.fileExists(atPath: wavURL.path)) {
+            case .reenqueue:
+                // Audio still on disk: re-queue for a fresh batch run rather
+                // than stranding the row at `.failed` (no self-serve recovery
+                // path). `.running` is reset to `.pending`; an already
+                // `.pending` row is re-enqueued as-is.
+                if fixed.status != .pending {
+                    fixed.status = .pending
+                    store.update(fixed)
+                }
+                print("MilaApp: re-enqueuing stale \(recording.status.rawValue) recording \(recording.audioFileName)")
                 transcription.enqueue(fixed)
-            } else {
+            case .markFailed:
                 fixed.status = .failed
                 store.update(fixed)
-                print("MilaApp: reset stale .running recording \(recording.audioFileName) to .failed (WAV missing)")
+                print("MilaApp: reset stale \(recording.status.rawValue) recording \(recording.audioFileName) to .failed (WAV missing)")
+            case .leaveAlone:
+                break  // unreachable given the `where` filter above
             }
         }
 
