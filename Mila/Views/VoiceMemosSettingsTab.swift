@@ -79,8 +79,10 @@ struct VoiceMemosSettingsTab: View {
             Image(systemName: "lock.shield")
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Mila can't read your Voice Memos library. macOS needs you to grant "
-                     + "Mila Full Disk Access, then reopen this tab.")
+                Text("Mila can't read your Voice Memos library. Open Full Disk Access below "
+                     + "and enable Mila. If Mila already appears enabled there, toggle it off "
+                     + "and back on — updating Mila can invalidate the grant — then quit and "
+                     + "reopen Mila.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
