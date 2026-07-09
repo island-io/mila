@@ -147,10 +147,12 @@ final class VoiceMemosLibraryTests: XCTestCase {
         XCTAssertEqual(rec1.duration, 12.0, accuracy: 0.001)
         XCTAssertEqual(rec1.date, Date(timeIntervalSinceReferenceDate: 700000000.0))
         XCTAssertEqual(rec1.fileURL, tempRoot.appendingPathComponent("file1.m4a"))
-        XCTAssertFalse(rec1.isUnsupportedFormat)
         XCTAssertFalse(rec1.isComposition)
 
-        XCTAssertTrue(try XCTUnwrap(byID["rec-6"]).isUnsupportedFormat)  // .qta
-        XCTAssertTrue(try XCTUnwrap(byID["rec-7"]).isComposition)        // .composition
+        // `.qta` (the modern QuickTime-container Voice Memo) is a flat audio
+        // file the import path decodes normally — it must NOT be treated as a
+        // `.composition` bundle and skipped.
+        XCTAssertFalse(try XCTUnwrap(byID["rec-6"]).isComposition)  // .qta imports normally
+        XCTAssertTrue(try XCTUnwrap(byID["rec-7"]).isComposition)   // .composition
     }
 }

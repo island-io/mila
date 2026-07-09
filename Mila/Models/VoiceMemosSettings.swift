@@ -16,7 +16,15 @@ final class VoiceMemosSettings: ObservableObject {
     /// Master switch. Off by default: Voice Memos sync reads another app's
     /// data and kicks off bulk transcription, so it's strictly opt-in.
     @Published var isEnabled: Bool {
-        didSet { defaults.set(isEnabled, forKey: Keys.enabled) }
+        didSet {
+            defaults.set(isEnabled, forKey: Keys.enabled)
+            // Turning sync on starts the cutoff at today so a large existing
+            // library doesn't backfill years of memos into the queue. The user
+            // moves the date earlier in Settings to pull older recordings in.
+            if isEnabled, oldValue == false {
+                startDate = Calendar.current.startOfDay(for: Date())
+            }
+        }
     }
 
     /// `ZUUID`s of the Voice Memos folders the user chose to watch.
@@ -31,12 +39,22 @@ final class VoiceMemosSettings: ObservableObject {
         didSet { defaults.set(includeUnfiled, forKey: Keys.includeUnfiled) }
     }
 
+    /// Only import memos recorded on or after this date. Older memos are
+    /// skipped so enabling sync on a large existing library doesn't flood the
+    /// queue with years of backfill. Defaults to the start of today (set when
+    /// sync is turned on); the always-visible picker in Settings lets the user
+    /// move it earlier to backfill retroactively. Persisted as a plist `Date`.
+    @Published var startDate: Date {
+        didSet { defaults.set(startDate, forKey: Keys.startDate) }
+    }
+
     private let defaults: UserDefaults
 
     private enum Keys {
         static let enabled = "voiceMemos.enabled"
         static let folderUUIDs = "voiceMemos.folderUUIDs"
         static let includeUnfiled = "voiceMemos.includeUnfiled"
+        static let startDate = "voiceMemos.startDate"
     }
 
     /// Skip accidental sub-`minDurationSeconds` taps during bulk import. Voice
@@ -50,6 +68,16 @@ final class VoiceMemosSettings: ObservableObject {
         let stored = defaults.stringArray(forKey: Keys.folderUUIDs) ?? []
         self.selectedFolderUUIDs = Set(stored)
         self.includeUnfiled = defaults.bool(forKey: Keys.includeUnfiled)
+        if let stored = defaults.object(forKey: Keys.startDate) as? Date {
+            self.startDate = stored
+        } else {
+            // Pin to the start of today on first run so the value doesn't
+            // drift forward each launch — an unpinned "today" default would
+            // keep moving the cutoff and silently hold back yesterday's memos.
+            let today = Calendar.current.startOfDay(for: Date())
+            self.startDate = today
+            defaults.set(today, forKey: Keys.startDate)
+        }
     }
 
     /// True when the user has actually picked something to watch — gates the

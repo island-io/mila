@@ -12,8 +12,10 @@ import OSLog
 ///  - **Dedup:** every imported recording carries its `ZUNIQUEID` in
 ///    `Recording.voiceMemoUniqueID`; a rescan skips anything already present,
 ///    so restarts / repeated FSEvents bursts never re-import a memo.
-///  - **Filtering:** short pocket recordings, `.qta` (unsupported format) and
-///    `.composition` (multi-take) bundles are skipped, with counts surfaced.
+///  - **Filtering:** short pocket recordings, memos before the start-date
+///    cutoff, and `.composition` (multi-take) bundles are skipped, with counts
+///    surfaced. Modern `.qta` (QuickTime-container) memos import normally —
+///    `AVAudioFile`/`reencode` decodes their standard audio track.
 ///
 /// Imports reuse `FileTranscriber.importFile`, which re-encodes into the
 /// library and enqueues exactly like a drag-and-drop import — no new
@@ -28,12 +30,30 @@ final class VoiceMemosImporter: ObservableObject {
 
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "VoiceMemos")
 
+    /// Per-run tally the Settings status line reads to explain what the last
+    /// sync did — especially *why* it imported less than the folder count
+    /// (before the start-date cutoff, not downloaded yet, failed to decode…).
+    struct SyncSummary: Equatable {
+        var imported = 0
+        var failedImport = 0        // attempted but errored (couldn't decode/re-encode)
+        var skippedOlder = 0        // recorded before the start-date cutoff
+        var skippedShort = 0        // sub-minDurationSeconds pocket taps
+        var skippedComposition = 0  // multi-take .composition bundles
+        var skippedMissing = 0      // not downloaded from iCloud yet
+
+        var totalHeldBack: Int {
+            failedImport + skippedOlder + skippedShort + skippedComposition + skippedMissing
+        }
+    }
+
     /// Last successful sync timestamp, for the Settings status line.
     @Published private(set) var lastSyncDate: Date?
     /// Recordings enqueued by the most recent sync.
     @Published private(set) var lastImportedCount = 0
     /// Cumulative recordings imported this session.
     @Published private(set) var totalImported = 0
+    /// Breakdown of the most recent sync run (imported + why others skipped).
+    @Published private(set) var lastSummary = SyncSummary()
     @Published private(set) var isSyncing = false
     @Published private(set) var lastError: String?
 
@@ -157,6 +177,7 @@ final class VoiceMemosImporter: ObservableObject {
 
         let folderUUIDs = settings.selectedFolderUUIDs
         let includeUnfiled = settings.includeUnfiled
+        let startDate = settings.startDate
 
         // Read the (private, WAL-mode) DB off the main actor.
         let lib = library
@@ -179,17 +200,18 @@ final class VoiceMemosImporter: ObservableObject {
             .union(store.voiceMemoTombstones)
         let fm = FileManager.default
 
-        var imported = 0
-        var skippedShort = 0, skippedFormat = 0, skippedComposition = 0, skippedMissing = 0
+        var summary = SyncSummary()
 
         for memo in memos where !alreadyImported.contains(memo.uniqueID) {
-            if memo.isComposition { skippedComposition += 1; continue }
-            if memo.isUnsupportedFormat { skippedFormat += 1; continue }
-            if memo.duration < VoiceMemosSettings.minDurationSeconds { skippedShort += 1; continue }
+            // Start-date cutoff first, so the "before cutoff" count reflects
+            // everything the user's date choice held back.
+            if memo.date < startDate { summary.skippedOlder += 1; continue }
+            if memo.isComposition { summary.skippedComposition += 1; continue }
+            if memo.duration < VoiceMemosSettings.minDurationSeconds { summary.skippedShort += 1; continue }
             guard fm.fileExists(atPath: memo.fileURL.path) else {
                 // Not downloaded from iCloud yet (or evicted); a later
                 // FSEvents fire will catch it once it lands.
-                skippedMissing += 1
+                summary.skippedMissing += 1
                 continue
             }
 
@@ -204,15 +226,17 @@ final class VoiceMemosImporter: ObservableObject {
                     voiceMemoUniqueID: memo.uniqueID
                 )
                 transcription.enqueue(recording)
-                imported += 1
+                summary.imported += 1
             } catch {
+                summary.failedImport += 1
                 log.error("VoiceMemos import failed for \(memo.fileURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
             }
         }
 
-        lastImportedCount = imported
-        totalImported += imported
+        lastImportedCount = summary.imported
+        totalImported += summary.imported
+        lastSummary = summary
         lastSyncDate = Date()
-        log.log("VoiceMemos sync: imported \(imported), skipped short=\(skippedShort) format=\(skippedFormat) composition=\(skippedComposition) missing=\(skippedMissing)")
+        log.log("VoiceMemos sync: imported \(summary.imported), failed=\(summary.failedImport) older=\(summary.skippedOlder) short=\(summary.skippedShort) composition=\(summary.skippedComposition) missing=\(summary.skippedMissing)")
     }
 }

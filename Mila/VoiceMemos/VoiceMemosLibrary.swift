@@ -132,13 +132,6 @@ struct VoiceMemosLibrary {
         var isComposition: Bool {
             fileURL.pathExtension.lowercased() == "composition"
         }
-
-        /// `.qta` is the newer (2025+) Voice Memos container that whisper /
-        /// AVAudioFile can't open directly — flagged so the importer can
-        /// skip it until a conversion step exists.
-        var isUnsupportedFormat: Bool {
-            fileURL.pathExtension.lowercased() == "qta"
-        }
     }
 
     enum LibraryError: LocalizedError, Equatable {

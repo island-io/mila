@@ -95,7 +95,7 @@ enum FileTranscriber {
     static let allowedExtensions: [String] = [
         "wav", "aif", "aiff", "caf",
         "m4a", "mp3", "aac",
-        "mp4", "mov", "m4v", "mkv",
+        "mp4", "mov", "m4v", "mkv", "qta",
         "webm", "ogg", "flac"
     ]
 }

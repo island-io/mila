@@ -30,6 +30,7 @@ struct VoiceMemosSettingsTab: View {
             case .available:
                 if settings.isEnabled {
                     folderPicker
+                    startDatePicker
                     statusFooter
                 }
             case .databaseMissing:
@@ -155,23 +156,73 @@ struct VoiceMemosSettingsTab: View {
         }
     }
 
+    /// Retroactive start-date cutoff. Always visible; defaults to today when
+    /// sync is turned on (see `VoiceMemosSettings`) so enabling on a large
+    /// library doesn't backfill years of memos. The user moves the date
+    /// earlier to pull in older recordings.
+    private var startDatePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Text("Transcribe memos recorded after")
+                DatePicker(
+                    "Start date",
+                    selection: $settings.startDate,
+                    in: ...Date(),
+                    displayedComponents: .date
+                )
+                .datePickerStyle(.field)
+                .labelsHidden()
+                .fixedSize()
+            }
+            Text("Memos recorded before this date aren't imported. Move it earlier to backfill older recordings.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var statusFooter: some View {
-        HStack(spacing: 6) {
-            if importer.isSyncing {
-                ProgressView().controlSize(.small)
-                Text("Syncing…").foregroundStyle(.secondary)
-            } else if let error = importer.lastError {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
-                Text(error).foregroundStyle(.secondary)
-            } else if let date = importer.lastSyncDate {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                Text("Last synced \(date.formatted(date: .abbreviated, time: .shortened)) — "
-                     + "\(importer.totalImported) imported this session")
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                if importer.isSyncing {
+                    ProgressView().controlSize(.small)
+                    Text("Syncing…").foregroundStyle(.secondary)
+                } else if let error = importer.lastError {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text(error).foregroundStyle(.secondary)
+                } else if let date = importer.lastSyncDate {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                    Text("Last synced \(date.formatted(date: .abbreviated, time: .shortened)) — "
+                         + "\(importer.totalImported) imported this session")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            // Explain why the last scan imported less than the folder count —
+            // otherwise "0 imported" with memos present looks broken (before
+            // the start-date cutoff, not downloaded yet, failed to decode…).
+            if !importer.isSyncing, importer.lastError == nil, let detail = lastScanDetail {
+                Text(detail)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 20)
             }
         }
         .font(.caption)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// One-line "why were some skipped" summary of the most recent scan, or
+    /// nil when nothing was skipped.
+    private var lastScanDetail: String? {
+        let s = importer.lastSummary
+        var parts: [String] = []
+        if s.failedImport > 0 { parts.append("\(s.failedImport) failed to import") }
+        if s.skippedOlder > 0 { parts.append("\(s.skippedOlder) before start date") }
+        if s.skippedMissing > 0 { parts.append("\(s.skippedMissing) not downloaded from iCloud yet") }
+        if s.skippedShort > 0 { parts.append("\(s.skippedShort) too short") }
+        if s.skippedComposition > 0 { parts.append("\(s.skippedComposition) multi-take") }
+        guard !parts.isEmpty else { return nil }
+        return "Last scan held back " + parts.joined(separator: ", ") + "."
     }
 
     private func binding(for folder: VoiceMemosLibrary.Folder) -> Binding<Bool> {
