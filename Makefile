@@ -8,7 +8,8 @@ APP := $(DERIVED)/Build/Products/Debug/Mila.app
 RELEASE_APP := $(RELEASE_DERIVED)/Build/Products/Release/Mila.app
 VERSION ?= $(shell /usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" Mila/Resources/Info.plist 2>/dev/null || echo "0.0.0")
 DMG := Mila-$(VERSION).dmg
-DEVELOPER_DIR ?= /Applications/Xcode.app/Contents/Developer
+XCODE_DEVELOPER_DIR := /Applications/Xcode.app/Contents/Developer
+DEVELOPER_DIR ?= $(shell if [ -d "$(XCODE_DEVELOPER_DIR)" ]; then echo "$(XCODE_DEVELOPER_DIR)"; else xcode-select -p 2>/dev/null; fi)
 export DEVELOPER_DIR
 
 all: project
@@ -24,7 +25,7 @@ help:
 	@echo "  run           - Build and launch the app"
 	@echo "  models        - Pre-download both ggml models into ~/Library/Application Support/Mila/Models"
 	@echo "  models-coreml-tiny - Download ggml-tiny + sibling -encoder.mlmodelc into ~/.cache/whisper-coreml-test/ (for CI ANE verification test)"
-	@echo "  dmg           - Build a release DMG ($(DMG)) suitable for upload"
+	@echo "  dmg           - Build a release DMG (VERSION=<x.y.z>) suitable for upload"
 	@echo "  e2e           - Run E2E transcription tests (requires ggml-tiny.bin)"
 	@echo "  package-test  - Run TranscriptionCore package unit tests"
 	@echo "  bundle-diarization - Produce the bundled Python + pyannote.audio runtime under Mila/Resources/PythonRuntime/"
@@ -35,6 +36,12 @@ bootstrap:
 		echo "Installing xcodegen via Homebrew..."; \
 		brew install xcodegen; \
 	}
+
+check-xcode:
+	@if [ "$(DEVELOPER_DIR)" = "/Library/Developer/CommandLineTools" ] || [ -z "$(DEVELOPER_DIR)" ] || [ ! -d "$(DEVELOPER_DIR)" ]; then \
+		echo "Full Xcode is required. Install Xcode, then run sudo xcode-select -s $(XCODE_DEVELOPER_DIR)" >&2; \
+		exit 1; \
+	fi
 
 project: bootstrap
 	@# PythonRuntime is a .gitignored folder reference (see project.yml). It is
@@ -48,13 +55,13 @@ project: bootstrap
 open: project
 	open $(XCODEPROJ)
 
-build: project
+build: project check-xcode
 	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Debug -derivedDataPath $(DERIVED) -destination 'platform=macOS' build
 
-release-build: project
+release-build: project check-xcode
 	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Release -derivedDataPath $(RELEASE_DERIVED) -destination 'platform=macOS' build
 
-test: project
+test: project check-xcode
 	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Debug -derivedDataPath $(DERIVED) -destination 'platform=macOS' test
 
 run: build
