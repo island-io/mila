@@ -111,6 +111,41 @@ final class TranscriptExporterTests: XCTestCase {
         XCTAssertTrue(written.contains("Line two"))
     }
 
+    // MARK: - Raw-segments variant (mid-recording export, issue #65)
+
+    func test_srt_body_for_raw_segments_matches_recording_variant() {
+        let segments: [TranscriptSegment] = [
+            .init(start: 0.0, end: 1.2, text: "Hello", speaker: "SPEAKER_00"),
+            .init(start: 1.2, end: 2.4, text: " "),       // blank — must be skipped
+            .init(start: 2.4, end: 3.6, text: "World")
+        ]
+        let body = TranscriptExporter.srtBody(for: segments)
+        // The recording-based variant delegates here — both must agree.
+        XCTAssertEqual(body, TranscriptExporter.srtBody(for: makeRecording(segments: segments)))
+        XCTAssertTrue(body.contains("1\n00:00:00,000 --> 00:00:01,200\nSPEAKER_00: Hello"))
+        XCTAssertTrue(body.contains("2\n00:00:02,400 --> 00:00:03,600\nWorld"))
+    }
+
+    func test_writeSRT_raw_segments_writes_file_to_explicit_destination() throws {
+        let segments: [TranscriptSegment] = [
+            .init(start: 0.0, end: 1.0, text: "Live line one"),
+            .init(start: 1.0, end: 2.0, text: "Live line two")
+        ]
+        let dest = tempRoot.appendingPathComponent("live.srt")
+        try TranscriptExporter.writeSRT(segments: segments, to: dest)
+
+        let written = try String(contentsOf: dest, encoding: .utf8)
+        XCTAssertTrue(written.contains("Live line one"))
+        XCTAssertTrue(written.contains("Live line two"))
+    }
+
+    func test_writeSRT_raw_segments_throws_when_empty() {
+        let url = tempRoot.appendingPathComponent("empty-live.srt")
+        XCTAssertThrowsError(try TranscriptExporter.writeSRT(segments: [], to: url))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                       "No file should be created when there's nothing to write")
+    }
+
     func test_sidecar_writeSRT_removes_stale_file_for_empty_segments() throws {
         // Mimic the "re-transcription came back empty" path: there's an old
         // sidecar from a prior successful run, the new run produced no

@@ -1,5 +1,7 @@
 import SwiftUI
+import AppKit
 import OSLog
+import TranscriptionCore
 
 /// Replaces the Home view while a recording is active AND Live AI mode is
 /// configured + enabled. Two stacked panes (top: action items, bottom:
@@ -306,6 +308,21 @@ struct LiveAIRecordingView: View {
                 if transcriber.isTranscribing {
                     ProgressView().controlSize(.small)
                 }
+                // Mid-recording SRT export (issue #65): save whatever the
+                // live transcript has accumulated so far, without stopping
+                // the recording. The finished recording still gets its
+                // authoritative .srt sidecar on Stop as before.
+                Button {
+                    exportLiveSRT()
+                } label: {
+                    Label("Export SRT…", systemImage: "square.and.arrow.up")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(transcriber.segments.isEmpty ? Color.secondary : Color.accentColor)
+                .disabled(transcriber.segments.isEmpty)
+                .help("Save the transcript so far as an .srt subtitles file — recording keeps going.")
+                .accessibilityIdentifier("liveAI.exportSRT")
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)
@@ -369,6 +386,35 @@ struct LiveAIRecordingView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.primary.opacity(0.02))
+    }
+
+    /// Save the accumulated live transcript as an SRT to a user-chosen
+    /// location — mid-recording, without stopping (issue #65). The
+    /// segment list is snapshotted BEFORE the modal save panel runs, so
+    /// the exported file reflects the transcript as of the button press
+    /// even though the live loop keeps appending while the panel is up.
+    /// Mirrors `RecordingContextMenu.exportSRT` (NSSavePanel + NSAlert on
+    /// failure); the suggested filename matches the date-stamped default
+    /// title a stopped recording would get.
+    private func exportLiveSRT() {
+        let snapshot = transcriber.segments.map { ls in
+            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
+                              text: ls.text, speaker: ls.speaker)
+        }
+        guard !snapshot.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Subtitles"
+        panel.allowedContentTypes = [.init(filenameExtension: "srt") ?? .data]
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        panel.nameFieldStringValue = "Recording · \(f.string(from: Date())).srt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TranscriptExporter.writeSRT(segments: snapshot, to: url)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
     }
 }
 

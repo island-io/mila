@@ -1,4 +1,5 @@
 import Foundation
+import TranscriptionCore
 
 enum TranscriptExporter {
 
@@ -27,7 +28,15 @@ enum TranscriptExporter {
     /// history context menu so users can drop subtitles next to a source
     /// video file. Throws so the caller can surface failures via NSAlert.
     static func writeSRT(for recording: Recording, to url: URL) throws {
-        let body = srtBody(for: recording)
+        try writeSRT(segments: recording.segments, to: url)
+    }
+
+    /// Raw-segments variant: write an SRT for a segment list that isn't
+    /// (yet) attached to a saved `Recording`. Used by the mid-recording
+    /// "Export SRT…" button in the live transcript pane, which snapshots
+    /// `LiveTranscriber.segments` while the recording is still running.
+    static func writeSRT(segments: [TranscriptSegment], to url: URL) throws {
+        let body = srtBody(for: segments)
         guard !body.isEmpty else {
             throw NSError(domain: "TranscriptExporter", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "No transcript segments to export."])
@@ -38,7 +47,13 @@ enum TranscriptExporter {
     /// Format the SRT content for `recording`. Returns empty string when
     /// there's nothing to write (no segments, or every segment is blank).
     static func srtBody(for recording: Recording) -> String {
-        let segments = recording.segments
+        srtBody(for: recording.segments)
+    }
+
+    /// Format SRT content for a raw segment list. Returns empty string
+    /// when there's nothing to write (no segments, or every segment is
+    /// blank).
+    static func srtBody(for segments: [TranscriptSegment]) -> String {
         guard !segments.isEmpty else { return "" }
 
         var entries: [String] = []
