@@ -1298,6 +1298,12 @@ struct MilaApp: App {
         //    own. `enqueue` is idempotent, so a row also re-attached as a
         //    recovered orphan in step 2 is still enqueued at most once.
         let fm = FileManager.default
+        // Collect the status changes and re-enqueues, then persist once at the
+        // end. `store.update(_:)` rewrites the whole recordings file per call,
+        // so a large synced library (dozens of stale `.pending` rows) would
+        // otherwise fire a burst of synchronous full-file writes on launch.
+        var statusChanged: [Recording] = []
+        var toEnqueue: [Recording] = []
         for recording in store.recordings
         where recording.status == .running || recording.status == .pending {
             let wavURL = store.audioURL(for: recording)
@@ -1311,18 +1317,20 @@ struct MilaApp: App {
                 // `.pending` row is re-enqueued as-is.
                 if fixed.status != .pending {
                     fixed.status = .pending
-                    store.update(fixed)
+                    statusChanged.append(fixed)
                 }
                 print("MilaApp: re-enqueuing stale \(recording.status.rawValue) recording \(recording.audioFileName)")
-                transcription.enqueue(fixed)
+                toEnqueue.append(fixed)
             case .markFailed:
                 fixed.status = .failed
-                store.update(fixed)
+                statusChanged.append(fixed)
                 print("MilaApp: reset stale \(recording.status.rawValue) recording \(recording.audioFileName) to .failed (WAV missing)")
             case .leaveAlone:
                 break  // unreachable given the `where` filter above
             }
         }
+        store.updateAll(statusChanged)          // single persist for the whole sweep
+        toEnqueue.forEach(transcription.enqueue)
 
         // 2. Auto-enqueue recovered orphans.
         let ids = store.consumePendingRecoveryIDs()

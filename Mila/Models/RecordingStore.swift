@@ -322,6 +322,23 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
+    /// Replace several stored records in one pass with a SINGLE persist, vs.
+    /// `update(_:)`'s one full-file rewrite per call. Used by the launch
+    /// crash-recovery sweep, which can flip many stale rows at once (a large
+    /// synced library can leave dozens of `.pending` rows). This is a
+    /// status/metadata bulk update — transcript/summary sidecars are left
+    /// as-is (recovery doesn't change their content). Unknown ids are skipped;
+    /// persists only if something actually changed.
+    func updateAll(_ updated: [Recording]) {
+        var touched = false
+        for recording in updated {
+            guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { continue }
+            recordings[idx] = recording
+            touched = true
+        }
+        if touched { persist() }
+    }
+
     /// Flip a recording into `.pending` (optionally switching its transcription
     /// `language`) and return the CURRENT store record, ready to hand to
     /// `TranscriptionService.enqueue`.
