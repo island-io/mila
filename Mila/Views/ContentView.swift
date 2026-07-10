@@ -506,8 +506,16 @@ private struct QueueView: View {
     private var queue: [Recording] {
         var seen = Set<UUID>()
         var ordered: [Recording] = []
+        // Only surface the engine's active recording while it's still in a
+        // queue state. When the user hits Stop, `cancelTranscription` flips the
+        // store status to `.failed` immediately, but the engine's
+        // `activeRecordingID` only clears ~100ms later once `whisper_full`
+        // unwinds. Without this status guard the cancelled row lingers as
+        // "Transcribing" in that window, so Stop looks unresponsive and the
+        // user clicks it repeatedly.
         if let activeID = transcription.activeRecordingID,
-           let active = store.recordings.first(where: { $0.id == activeID }) {
+           let active = store.recordings.first(where: { $0.id == activeID }),
+           active.status == .running || active.status == .pending {
             ordered.append(active)
             seen.insert(activeID)
         }
