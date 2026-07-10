@@ -78,7 +78,11 @@ final class DictationOverlayWindow {
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.backgroundColor = .clear
         panel.isOpaque = false
-        panel.hasShadow = true
+        // No window shadow: the pill fills only a small part of this
+        // transparent 320×64 panel, so AppKit's window shadow floats around
+        // the panel silhouette as a detached black rounded border rather than
+        // hugging the pill. The pill draws its own SwiftUI `.shadow` instead.
+        panel.hasShadow = false
         panel.isMovable = false
         panel.ignoresMouseEvents = true
         panel.contentView = NSHostingView(
