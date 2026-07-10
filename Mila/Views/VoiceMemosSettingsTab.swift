@@ -96,6 +96,15 @@ struct VoiceMemosSettingsTab: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 Button("Grant Access…") { grantAccess() }
+                // A failed grant leaves availability at `.accessDenied`, so this
+                // card (not `folderPicker`) stays on screen — surface the error
+                // here or the user gets no feedback.
+                if let loadError {
+                    Text(loadError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .padding(12)
