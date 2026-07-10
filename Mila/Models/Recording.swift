@@ -81,6 +81,25 @@ struct Recording: Identifiable, Codable, Hashable {
     /// non-Voice-Memo recording.
     var voiceMemoUniqueID: String?
 
+    /// The Voice Memos folder this memo was imported from, keyed by the
+    /// stable `ZFOLDER.ZUUID`, or `Recording.voiceMemoUnfiledFolderID` for
+    /// the unfiled bucket. Set only on `source == .voiceMemo` imports. Lets
+    /// "un-selecting a folder removes its recordings" (issue #57) find every
+    /// recording that came from a given folder without guessing.
+    ///
+    /// nil means "origin not recorded" — either a non-Voice-Memo recording or
+    /// a memo imported before this field existed. Legacy nil is deliberately
+    /// treated as unknown and never swept up by the un-select cleanup, so an
+    /// upgrade can't mass-delete a user's older imports.
+    var voiceMemoFolderUUID: String?
+
+    /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
+    /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
+    /// "imported from Unfiled" distinguishable from a legacy import whose
+    /// origin was never recorded (nil) — the former is cleaned up when the
+    /// user turns Unfiled off, the latter is left alone.
+    static let voiceMemoUnfiledFolderID = "__voicememos.unfiled__"
+
     init(id: UUID = UUID(),
          title: String,
          createdAt: Date = Date(),
@@ -97,7 +116,8 @@ struct Recording: Identifiable, Codable, Hashable {
          appName: String? = nil,
          summary: String? = nil,
          actionItems: [ActionItem]? = nil,
-         voiceMemoUniqueID: String? = nil) {
+         voiceMemoUniqueID: String? = nil,
+         voiceMemoFolderUUID: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -115,6 +135,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.summary = summary
         self.actionItems = actionItems
         self.voiceMemoUniqueID = voiceMemoUniqueID
+        self.voiceMemoFolderUUID = voiceMemoFolderUUID
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -149,7 +170,7 @@ struct Recording: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, voiceMemoUniqueID
+             summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -173,6 +194,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
         self.actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
+        self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -196,6 +218,7 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(summary, forKey: .summary)
         try c.encodeIfPresent(actionItems, forKey: .actionItems)
         try c.encodeIfPresent(voiceMemoUniqueID, forKey: .voiceMemoUniqueID)
+        try c.encodeIfPresent(voiceMemoFolderUUID, forKey: .voiceMemoFolderUUID)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

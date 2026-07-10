@@ -524,6 +524,41 @@ final class RecordingStore: ObservableObject {
         recordings.filter { !$0.isTrashed && $0.folder == folderName }
     }
 
+    /// Live (non-trashed) Voice-Memo imports that originated from the Voice
+    /// Memos folder `folderID` (a `ZFOLDER.ZUUID`, or
+    /// `Recording.voiceMemoUnfiledFolderID` for the unfiled bucket). Only
+    /// `.voiceMemo` recordings with a matching recorded origin are returned —
+    /// legacy imports (nil origin) and the user's own recordings are excluded,
+    /// so the un-select cleanup can never sweep up something it didn't import.
+    func voiceMemoRecordings(fromFolderID folderID: String) -> [Recording] {
+        recordings.filter {
+            !$0.isTrashed
+                && $0.source == .voiceMemo
+                && $0.voiceMemoFolderUUID == folderID
+        }
+    }
+
+    /// Un-select cleanup (issue #57): move every live Voice-Memo import that
+    /// came from `folderID` to Recently Deleted. Soft-delete (not permanent)
+    /// so the user can restore them, and — crucially — so no tombstone is
+    /// written: the recordings stay in the store, so re-selecting the folder
+    /// won't re-import duplicates, and the source memos remain untouched in
+    /// Voice Memos. Returns the number moved to the trash.
+    @discardableResult
+    func softDeleteVoiceMemos(fromFolderID folderID: String) -> Int {
+        let now = Date()
+        var count = 0
+        for idx in recordings.indices where
+            !recordings[idx].isTrashed
+            && recordings[idx].source == .voiceMemo
+            && recordings[idx].voiceMemoFolderUUID == folderID {
+            recordings[idx].deletedAt = now
+            count += 1
+        }
+        if count > 0 { persist() }
+        return count
+    }
+
     /// Non-trashed recordings that haven't been filed anywhere yet. These
     /// surface in the sidebar's "Default" view. Replaces the old
     /// Transcriptions/Meetings/Dictations category split — we now have one

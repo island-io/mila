@@ -14,7 +14,9 @@ enum FileTranscriber {
                            source: RecordingSource = .systemAudio,
                            title titleOverride: String? = nil,
                            createdAt: Date? = nil,
-                           voiceMemoUniqueID: String? = nil) async throws -> Recording {
+                           voiceMemoUniqueID: String? = nil,
+                           voiceMemoFolderUUID: String? = nil,
+                           folder: String? = nil) async throws -> Recording {
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
 
@@ -30,6 +32,13 @@ enum FileTranscriber {
 
         let duration = try await reencode(source: sourceURL, destination: destURL)
 
+        // Ensure the destination folder exists in the sidebar list before the
+        // recording references it — `createFolder` is idempotent, so a shared
+        // folder like "Voice Memos" is only created once. Without this the
+        // folder wouldn't appear in the sidebar until the next launch (it's
+        // otherwise only seeded from persisted recordings at load).
+        if let folder { store.createFolder(folder) }
+
         let recording = Recording(
             title: title,
             createdAt: createdAt ?? Date(),
@@ -37,7 +46,9 @@ enum FileTranscriber {
             source: source,
             audioFileName: destURL.lastPathComponent,
             language: language.rawValue,
-            voiceMemoUniqueID: voiceMemoUniqueID
+            folder: folder,
+            voiceMemoUniqueID: voiceMemoUniqueID,
+            voiceMemoFolderUUID: voiceMemoFolderUUID
         )
         store.add(recording)
         return recording

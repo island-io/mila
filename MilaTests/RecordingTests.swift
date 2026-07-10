@@ -146,4 +146,41 @@ final class RecordingTests: XCTestCase {
         XCTAssertEqual(formatDuration(3_600), "1:00:00")
         XCTAssertEqual(formatDuration(3_661), "1:01:01")
     }
+
+    /// The Voice-Memo source-folder field (issue #57) round-trips, and a legacy
+    /// record without the key decodes to nil rather than throwing — so an
+    /// upgrade never crashes on existing imports, and legacy-nil origins are
+    /// left out of the un-select cleanup.
+    func test_voiceMemoFolderUUID_round_trips_and_legacy_decodes_nil() throws {
+        let original = Recording(
+            title: "Imported memo",
+            source: .voiceMemo,
+            audioFileName: "memo.wav",
+            voiceMemoUniqueID: "unique-1",
+            voiceMemoFolderUUID: "FOLDER-42"
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Recording.self, from: try encoder.encode(original))
+        XCTAssertEqual(decoded.voiceMemoFolderUUID, "FOLDER-42")
+
+        let legacy = """
+        {
+          "id": "11111111-2222-3333-4444-555555555555",
+          "title": "Legacy import",
+          "createdAt": "2025-01-01T00:00:00Z",
+          "duration": 1.0,
+          "source": "voiceMemo",
+          "audioFileName": "Legacy.wav",
+          "status": "completed",
+          "language": "en",
+          "segments": [],
+          "voiceMemoUniqueID": "unique-legacy"
+        }
+        """.data(using: .utf8)!
+        let decodedLegacy = try decoder.decode(Recording.self, from: legacy)
+        XCTAssertNil(decodedLegacy.voiceMemoFolderUUID)
+    }
 }

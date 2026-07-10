@@ -37,6 +37,12 @@ final class VoiceMemosImporter: ObservableObject {
 
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "VoiceMemos")
 
+    /// Mila folder that synced Voice Memos are filed into so they're grouped
+    /// together in the sidebar instead of mixed into All Transcripts
+    /// (issue #57, part 4). One shared folder — simple and predictable; the
+    /// per-source origin is tracked separately on `Recording.voiceMemoFolderUUID`.
+    static let syncedFolderName = "Voice Memos"
+
     /// Per-run tally the Settings status line reads to explain what the last
     /// sync did — especially *why* it imported less than the folder count
     /// (before the start-date cutoff, not downloaded yet, failed to decode…).
@@ -51,6 +57,43 @@ final class VoiceMemosImporter: ObservableObject {
         var totalHeldBack: Int {
             failedImport + skippedOlder + skippedShort + skippedComposition + skippedMissing
         }
+    }
+
+    /// Pure classification of a scan: which not-yet-imported memos are eligible
+    /// to import, plus the tally of why the rest were held back. Split out of
+    /// `sync()` so the "is there real work?" decision — the one that gates the
+    /// visible "Syncing…" state — is testable without a database or filesystem,
+    /// and so an idle rescan that imports nothing never flips the UI (issue #57,
+    /// the "Last synced" flicker).
+    struct ImportPlan: Equatable {
+        var toImport: [VoiceMemosLibrary.Memo] = []
+        var summary = SyncSummary()
+
+        /// True only when the scan will actually import something — the sole
+        /// case that should surface a "Syncing…" spinner to the user.
+        var hasVisibleWork: Bool { !toImport.isEmpty }
+    }
+
+    /// Decide what a scan would do, given the memos read from the library and
+    /// the dedup/cutoff inputs. Pure (no I/O beyond the injected `fileExists`
+    /// probe) so it's unit-testable. Mirrors the eligibility order the old
+    /// inline loop used: start-date cutoff first (so its count reflects the
+    /// user's date choice), then composition, then too-short, then not-yet-
+    /// downloaded.
+    static func plan(memos: [VoiceMemosLibrary.Memo],
+                     alreadyImported: Set<String>,
+                     startDate: Date,
+                     minDuration: Double,
+                     fileExists: (URL) -> Bool) -> ImportPlan {
+        var plan = ImportPlan()
+        for memo in memos where !alreadyImported.contains(memo.uniqueID) {
+            if memo.date < startDate { plan.summary.skippedOlder += 1; continue }
+            if memo.isComposition { plan.summary.skippedComposition += 1; continue }
+            if memo.duration < minDuration { plan.summary.skippedShort += 1; continue }
+            guard fileExists(memo.fileURL) else { plan.summary.skippedMissing += 1; continue }
+            plan.toImport.append(memo)
+        }
+        return plan
     }
 
     /// Last successful sync timestamp, for the Settings status line.
@@ -69,6 +112,12 @@ final class VoiceMemosImporter: ObservableObject {
     private var started = false
     /// Coalesces FSEvents bursts and overlapping triggers into one run.
     private var pendingResync = false
+    /// A scan is running. Distinct from the *published* `isSyncing`, which now
+    /// only reflects user-visible import work (issue #57): a scan that imports
+    /// nothing runs with `scanInFlight == true` but never flips `isSyncing`, so
+    /// the status line stays steady. This is the flag the coalescing guard
+    /// keys on so two scans never overlap.
+    private var scanInFlight = false
 
     init(store: RecordingStore,
          transcription: TranscriptionService,
@@ -146,7 +195,11 @@ final class VoiceMemosImporter: ObservableObject {
 
     /// Run a sync, coalescing requests so two never overlap.
     private func requestSync() {
-        guard !isSyncing else {
+        // Guard on `scanInFlight` (set synchronously at the top of `sync()`),
+        // NOT the published `isSyncing` — the latter now only tracks visible
+        // import work, so an idle scan leaves it false and two requests would
+        // otherwise both spawn overlapping syncs.
+        guard !scanInFlight else {
             pendingResync = true
             return
         }
@@ -156,24 +209,23 @@ final class VoiceMemosImporter: ObservableObject {
     private func sync() async {
         guard settings.isEnabled, settings.hasSelection else { return }
         // Re-check on entry: `requestSync`'s guard runs when the request is
-        // made, but `isSyncing` only flips once this Task actually starts.
-        // Two requests landing in the same main-actor drain (e.g. "Rescan
-        // now" + an FSEvents hop) both saw false and spawned overlapping
-        // syncs — each snapshots `alreadyImported` before the other's
-        // `store.add` lands, so the same memo imported (and transcribed)
-        // twice.
-        guard !isSyncing else {
+        // made, but the flag only flips once this Task actually starts. Two
+        // requests landing in the same main-actor drain (e.g. "Rescan now" +
+        // an FSEvents hop) both saw false and spawned overlapping syncs — each
+        // snapshots `alreadyImported` before the other's `store.add` lands, so
+        // the same memo imported (and transcribed) twice. `scanInFlight` is set
+        // synchronously below before the first `await`, closing that window.
+        guard !scanInFlight else {
             pendingResync = true
             return
         }
-        isSyncing = true
-        lastError = nil
+        scanInFlight = true
         defer {
-            isSyncing = false
+            scanInFlight = false
             // A folder change / FSEvents burst that arrived mid-sync set
-            // `pendingResync`; kick the next pass now that `isSyncing` is
-            // clear (doing this before clearing it would just re-set the flag
-            // and the second pass would never run).
+            // `pendingResync`; kick the next pass now that the flag is clear
+            // (doing this before clearing it would just re-set the flag and
+            // the second pass would never run).
             if pendingResync {
                 pendingResync = false
                 requestSync()
@@ -192,7 +244,7 @@ final class VoiceMemosImporter: ObservableObject {
                 try lib.recordings(folderUUIDs: folderUUIDs, includeUnfiled: includeUnfiled)
             }.value
         } catch {
-            lastError = error.localizedDescription
+            setError(error.localizedDescription)
             log.error("VoiceMemos sync failed reading DB: \(error.localizedDescription, privacy: .public)")
             return
         }
@@ -204,22 +256,29 @@ final class VoiceMemosImporter: ObservableObject {
         let alreadyImported = Set(store.recordings.compactMap { $0.voiceMemoUniqueID })
             .union(store.voiceMemoTombstones)
         let fm = FileManager.default
+        let plan = Self.plan(memos: memos,
+                             alreadyImported: alreadyImported,
+                             startDate: startDate,
+                             minDuration: VoiceMemosSettings.minDurationSeconds,
+                             fileExists: { fm.fileExists(atPath: $0.path) })
 
-        var summary = SyncSummary()
+        // Nothing to import: publish the (stable) summary WITHOUT ever flipping
+        // `isSyncing`. This is the fix for the "Last synced" flicker (issue
+        // #57) — the FSEvents watcher fires ~once/second as voicememod touches
+        // the WAL, and every one of those idle rescans used to flash the
+        // spinner and re-stamp the timestamp. `publishOutcome` also skips any
+        // no-op writes, so an idle rescan leaves the status line untouched.
+        guard plan.hasVisibleWork else {
+            publishOutcome(summary: plan.summary, imported: 0)
+            return
+        }
 
-        for memo in memos where !alreadyImported.contains(memo.uniqueID) {
-            // Start-date cutoff first, so the "before cutoff" count reflects
-            // everything the user's date choice held back.
-            if memo.date < startDate { summary.skippedOlder += 1; continue }
-            if memo.isComposition { summary.skippedComposition += 1; continue }
-            if memo.duration < VoiceMemosSettings.minDurationSeconds { summary.skippedShort += 1; continue }
-            guard fm.fileExists(atPath: memo.fileURL.path) else {
-                // Not downloaded from iCloud yet (or evicted); a later
-                // FSEvents fire will catch it once it lands.
-                summary.skippedMissing += 1
-                continue
-            }
+        // Real work — surface the spinner only for the actual import loop.
+        isSyncing = true
+        defer { isSyncing = false }
 
+        var summary = plan.summary
+        for memo in plan.toImport {
             do {
                 let recording = try await FileTranscriber.importFile(
                     at: memo.fileURL,
@@ -228,7 +287,13 @@ final class VoiceMemosImporter: ObservableObject {
                     source: .voiceMemo,
                     title: memo.title,
                     createdAt: memo.date,
-                    voiceMemoUniqueID: memo.uniqueID
+                    voiceMemoUniqueID: memo.uniqueID,
+                    // Record the origin folder so "un-select removes its
+                    // recordings" (issue #57) can find them later. Unfiled
+                    // memos carry the sentinel so they stay distinct from a
+                    // legacy import whose origin was never stored.
+                    voiceMemoFolderUUID: memo.folderUUID ?? Recording.voiceMemoUnfiledFolderID,
+                    folder: Self.syncedFolderName
                 )
                 transcription.enqueue(recording)
                 summary.imported += 1
@@ -238,10 +303,33 @@ final class VoiceMemosImporter: ObservableObject {
             }
         }
 
-        lastImportedCount = summary.imported
-        totalImported += summary.imported
-        lastSummary = summary
-        lastSyncDate = Date()
+        publishOutcome(summary: summary, imported: summary.imported)
         log.log("VoiceMemos sync: imported \(summary.imported), failed=\(summary.failedImport) older=\(summary.skippedOlder) short=\(summary.skippedShort) composition=\(summary.skippedComposition) missing=\(summary.skippedMissing)")
+    }
+
+    /// Publish a scan's results, mutating only the `@Published` state that
+    /// actually changed. An idle rescan that imports nothing and finds the same
+    /// held-back set as last time leaves every published property untouched, so
+    /// the status line doesn't re-render — the crux of the anti-flicker fix
+    /// (issue #57). Clearing a stale error only happens on a successful scan.
+    private func publishOutcome(summary: SyncSummary, imported: Int) {
+        if lastError != nil { lastError = nil }
+        if imported > 0 {
+            lastImportedCount = imported
+            totalImported += imported
+        }
+        if summary != lastSummary { lastSummary = summary }
+        // Bump the timestamp on real imports, and once on the first successful
+        // scan so the user still gets an initial "Last synced …". Idle rescans
+        // leave it alone, so it reads as a steady last-activity time rather
+        // than a once-a-second churn.
+        if imported > 0 || lastSyncDate == nil { lastSyncDate = Date() }
+    }
+
+    /// Set `lastError` only when it changes, so a failure that recurs on every
+    /// idle rescan (e.g. a transient DB read error) doesn't re-render the
+    /// status line each time.
+    private func setError(_ message: String?) {
+        if lastError != message { lastError = message }
     }
 }

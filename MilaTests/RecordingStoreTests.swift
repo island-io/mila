@@ -483,4 +483,74 @@ final class RecordingStoreTests: XCTestCase {
         let reloaded = RecordingStore(rootDirectory: tempRoot)
         XCTAssertEqual(reloaded.folders, ["Imported"])
     }
+
+    // MARK: - Voice Memos un-select cleanup (issue #57, part 1)
+
+    /// Build a Voice-Memo import stub with a recorded source folder.
+    private func voiceMemoImport(_ id: String,
+                                 fromFolderID folderID: String?) -> Recording {
+        Recording(title: "Memo \(id)",
+                  source: .voiceMemo,
+                  audioFileName: "\(id).wav",
+                  voiceMemoUniqueID: "unique-\(id)",
+                  voiceMemoFolderUUID: folderID)
+    }
+
+    func test_voiceMemoRecordings_fromFolderID_selectsOnlyMatchingOrigin() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("b", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("c", fromFolderID: "FOLDER-2"))
+        store.add(voiceMemoImport("d", fromFolderID: Recording.voiceMemoUnfiledFolderID))
+        // Legacy import (origin never recorded) + a plain mic recording must
+        // never be selected.
+        store.add(voiceMemoImport("legacy", fromFolderID: nil))
+        store.add(Recording(title: "Mic", source: .microphone, audioFileName: "mic.wav"))
+
+        XCTAssertEqual(Set(store.voiceMemoRecordings(fromFolderID: "FOLDER-1").map(\.voiceMemoUniqueID)),
+                       ["unique-a", "unique-b"])
+        XCTAssertEqual(store.voiceMemoRecordings(fromFolderID: "FOLDER-2").map(\.voiceMemoUniqueID),
+                       ["unique-c"])
+        XCTAssertEqual(store.voiceMemoRecordings(fromFolderID: Recording.voiceMemoUnfiledFolderID).map(\.voiceMemoUniqueID),
+                       ["unique-d"])
+    }
+
+    func test_softDeleteVoiceMemos_movesMatchingToTrash_leavesOthers() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("b", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("c", fromFolderID: "FOLDER-2"))
+        store.add(voiceMemoImport("legacy", fromFolderID: nil))
+
+        let removed = store.softDeleteVoiceMemos(fromFolderID: "FOLDER-1")
+        XCTAssertEqual(removed, 2)
+
+        // The two FOLDER-1 imports are trashed but still present (restorable).
+        let trashedIDs = Set(store.recordings.filter { $0.isTrashed }.map(\.voiceMemoUniqueID))
+        XCTAssertEqual(trashedIDs, ["unique-a", "unique-b"])
+        // FOLDER-2 and the legacy nil-origin import are untouched.
+        XCTAssertEqual(Set(store.recordings.filter { !$0.isTrashed }.map(\.voiceMemoUniqueID)),
+                       ["unique-c", "unique-legacy"])
+    }
+
+    /// Soft-delete (not permanent) so no tombstone is written — the recordings
+    /// stay in the store, so re-selecting the folder can't create duplicates,
+    /// and the source memos in Voice Memos are never touched.
+    func test_softDeleteVoiceMemos_doesNotTombstone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+
+        store.softDeleteVoiceMemos(fromFolderID: "FOLDER-1")
+        XCTAssertTrue(store.voiceMemoTombstones.isEmpty,
+                      "Un-select cleanup must not tombstone — it's a recoverable soft-delete")
+        XCTAssertEqual(store.recordings.count, 1, "The recording stays in the store")
+        XCTAssertTrue(store.recordings.first?.isTrashed ?? false)
+    }
+
+    func test_softDeleteVoiceMemos_noMatches_returnsZero() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+        XCTAssertEqual(store.softDeleteVoiceMemos(fromFolderID: "FOLDER-UNKNOWN"), 0)
+        XCTAssertFalse(store.recordings.first?.isTrashed ?? true)
+    }
 }

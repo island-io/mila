@@ -8,11 +8,40 @@ import AppKit
 struct VoiceMemosSettingsTab: View {
     @EnvironmentObject private var settings: VoiceMemosSettings
     @EnvironmentObject private var importer: VoiceMemosImporter
+    @EnvironmentObject private var store: RecordingStore
 
     @State private var folders: [VoiceMemosLibrary.Folder] = []
     @State private var unfiledCount = 0
     @State private var loadError: String?
     @State private var isLoading = false
+
+    /// Folder ids (a `ZFOLDER.ZUUID`, or `unfiledPreviewID` for the unfiled
+    /// bucket) the user expanded to preview contents (issue #57, part 2).
+    @State private var expandedFolderIDs: Set<String> = []
+    /// Cached preview memos per folder id — the first `previewLimit` titles,
+    /// loaded lazily on expand so the user can review a folder WITHOUT syncing.
+    @State private var previews: [String: [VoiceMemosLibrary.Memo]] = [:]
+    /// Folder ids with a preview load in flight (drives the row's spinner).
+    @State private var loadingPreviews: Set<String> = []
+    /// Set when de-selecting a folder that still has imported recordings, to
+    /// drive the "remove its recordings?" confirmation (issue #57, part 1).
+    @State private var pendingCleanup: PendingCleanup?
+
+    /// Stable key for the unfiled bucket in the preview/expansion dictionaries
+    /// (it has no real folder UUID). Reuses the same sentinel the importer
+    /// stamps onto unfiled imports so the two never disagree.
+    private var unfiledPreviewID: String { Recording.voiceMemoUnfiledFolderID }
+
+    /// Cap on how many memo titles a preview loads/shows — enough to review a
+    /// folder without reading/rendering thousands of rows.
+    private let previewLimit = 50
+
+    private struct PendingCleanup: Identifiable {
+        let folderID: String
+        let name: String
+        let count: Int
+        var id: String { folderID }
+    }
 
     /// Reader over the folder the user granted (falling back to the standard
     /// location, which is what a legacy Full-Disk-Access user already sees).
@@ -51,6 +80,24 @@ struct VoiceMemosSettingsTab: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .task(id: "\(settings.isEnabled)-\(settings.grantedFolderURL?.path ?? "")") {
             if settings.isEnabled { await loadFolders() }
+        }
+        .confirmationDialog(
+            "Remove imported recordings?",
+            isPresented: Binding(
+                get: { pendingCleanup != nil },
+                set: { if !$0 { pendingCleanup = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: pendingCleanup
+        ) { cleanup in
+            Button("Move \(cleanup.count) to Recently Deleted", role: .destructive) {
+                store.softDeleteVoiceMemos(fromFolderID: cleanup.folderID)
+                pendingCleanup = nil
+            }
+            Button("Keep Recordings", role: .cancel) { pendingCleanup = nil }
+        } message: { cleanup in
+            Text("Move the \(cleanup.count) recording\(cleanup.count == 1 ? "" : "s") imported from “\(cleanup.name)” to Recently Deleted? "
+                 + "You can restore them there, and re-syncing this folder later won't create duplicates.")
         }
     }
 
@@ -153,13 +200,17 @@ struct VoiceMemosSettingsTab: View {
             }
 
             List {
-                Toggle(isOn: $settings.includeUnfiled) {
-                    folderRow(name: "Unfiled", count: unfiledCount, systemImage: "tray")
-                }
+                folderGroup(id: unfiledPreviewID,
+                            name: "Unfiled",
+                            count: unfiledCount,
+                            systemImage: "tray",
+                            isUnfiled: true)
                 ForEach(folders) { folder in
-                    Toggle(isOn: binding(for: folder)) {
-                        folderRow(name: folder.name, count: folder.count, systemImage: "folder")
-                    }
+                    folderGroup(id: folder.uuid,
+                                name: folder.name,
+                                count: folder.count,
+                                systemImage: "folder",
+                                isUnfiled: false)
                 }
             }
             .frame(height: 220)
@@ -171,9 +222,87 @@ struct VoiceMemosSettingsTab: View {
             }
 
             if !settings.hasSelection {
-                Text("Choose at least one folder to start syncing.")
+                Text("Choose at least one folder to start syncing. Tap the arrow to preview a folder's recordings before turning it on.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// One folder in the picker: a selection toggle with a leading disclosure
+    /// arrow that expands an inline, non-importing preview of the folder's
+    /// recordings (issue #57, part 2).
+    @ViewBuilder
+    private func folderGroup(id: String,
+                             name: String,
+                             count: Int,
+                             systemImage: String,
+                             isUnfiled: Bool) -> some View {
+        HStack(spacing: 6) {
+            Button {
+                toggleExpand(id: id, isUnfiled: isUnfiled)
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(expandedFolderIDs.contains(id) ? 90 : 0))
+                    .frame(width: 12, height: 12)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            // An empty folder has nothing to preview; keep the space so the
+            // toggles stay aligned.
+            .disabled(count == 0)
+            .opacity(count == 0 ? 0 : 1)
+            .help(expandedFolderIDs.contains(id) ? "Hide recordings" : "Preview recordings")
+
+            Toggle(isOn: selectionBinding(folderID: id, isUnfiled: isUnfiled, displayName: name)) {
+                folderRow(name: name, count: count, systemImage: systemImage)
+            }
+        }
+
+        if expandedFolderIDs.contains(id) {
+            previewRows(for: id, total: count)
+        }
+    }
+
+    /// Inline preview rows shown under an expanded folder — a loading spinner,
+    /// an empty note, or the memo titles + a "…and N more" overflow line.
+    @ViewBuilder
+    private func previewRows(for id: String, total: Int) -> some View {
+        if loadingPreviews.contains(id) {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Loading…").font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.leading, 26)
+        } else if let memos = previews[id] {
+            if memos.isEmpty {
+                Text("No recordings in this folder.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 26)
+            } else {
+                ForEach(memos) { memo in
+                    HStack {
+                        Text(memo.title)
+                            .font(.caption)
+                            .lineLimit(1)
+                        Spacer()
+                        Text(memo.date, format: .dateTime.month().day().year())
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 26)
+                }
+                if total > memos.count {
+                    Text("…and \(total - memos.count) more")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 26)
+                }
             }
         }
     }
@@ -187,6 +316,41 @@ struct VoiceMemosSettingsTab: View {
             Text("\(count)")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+        }
+    }
+
+    /// Toggle a folder's inline preview, lazily loading its memo titles the
+    /// first time it's expanded.
+    private func toggleExpand(id: String, isUnfiled: Bool) {
+        if expandedFolderIDs.contains(id) {
+            expandedFolderIDs.remove(id)
+        } else {
+            expandedFolderIDs.insert(id)
+            loadPreview(id: id, isUnfiled: isUnfiled)
+        }
+    }
+
+    /// Read a folder's memo titles off the main actor and cache them. Reuses
+    /// the read-only library reader — no import, no queueing.
+    private func loadPreview(id: String, isUnfiled: Bool) {
+        guard previews[id] == nil, !loadingPreviews.contains(id) else { return }
+        loadingPreviews.insert(id)
+        let lib = library
+        let limit = previewLimit
+        Task {
+            let loaded: [VoiceMemosLibrary.Memo]
+            do {
+                loaded = try await Task.detached(priority: .userInitiated) {
+                    let memos = try lib.recordings(
+                        folderUUIDs: isUnfiled ? [] : [id],
+                        includeUnfiled: isUnfiled)
+                    return Array(memos.sorted { $0.date > $1.date }.prefix(limit))
+                }.value
+            } catch {
+                loaded = []
+            }
+            previews[id] = loaded
+            loadingPreviews.remove(id)
         }
     }
 
@@ -259,16 +423,46 @@ struct VoiceMemosSettingsTab: View {
         return "Last scan held back " + parts.joined(separator: ", ") + "."
     }
 
-    private func binding(for folder: VoiceMemosLibrary.Folder) -> Binding<Bool> {
+    /// Selection toggle for a folder (or the unfiled bucket). Turning it OFF
+    /// stops future imports immediately, then — if that folder already
+    /// imported recordings — arms the cleanup confirmation so de-selecting can
+    /// actually reverse the sync (issue #57, part 1).
+    private func selectionBinding(folderID: String,
+                                  isUnfiled: Bool,
+                                  displayName: String) -> Binding<Bool> {
         Binding(
-            get: { settings.selectedFolderUUIDs.contains(folder.uuid) },
-            set: { settings.setFolder(folder.uuid, selected: $0) }
+            get: {
+                isUnfiled ? settings.includeUnfiled : settings.selectedFolderUUIDs.contains(folderID)
+            },
+            set: { newValue in
+                if newValue {
+                    if isUnfiled { settings.includeUnfiled = true }
+                    else { settings.setFolder(folderID, selected: true) }
+                    return
+                }
+                // De-selecting: stop future imports right away.
+                if isUnfiled { settings.includeUnfiled = false }
+                else { settings.setFolder(folderID, selected: false) }
+                // Then offer to remove what this folder already imported. The
+                // cleanup keys on the recorded origin (a real ZUUID, or the
+                // unfiled sentinel), independent of this display name.
+                let cleanupID = isUnfiled ? Recording.voiceMemoUnfiledFolderID : folderID
+                let matches = store.voiceMemoRecordings(fromFolderID: cleanupID).count
+                if matches > 0 {
+                    pendingCleanup = PendingCleanup(folderID: cleanupID,
+                                                    name: displayName,
+                                                    count: matches)
+                }
+            }
         )
     }
 
     private func loadFolders() async {
         isLoading = true
         loadError = nil
+        // Drop cached previews so a rescan reflects the current library; keep
+        // the user's expansion choices and re-load previews for what's open.
+        previews.removeAll()
         defer { isLoading = false }
         let lib = library
         do {
@@ -277,6 +471,9 @@ struct VoiceMemosSettingsTab: View {
             }.value
             folders = loaded.folders
             unfiledCount = loaded.unfiled
+            for id in expandedFolderIDs {
+                loadPreview(id: id, isUnfiled: id == unfiledPreviewID)
+            }
         } catch {
             // Drop stale data so a failed refresh can't leave the user
             // interacting with folder choices that no longer reflect the DB.
