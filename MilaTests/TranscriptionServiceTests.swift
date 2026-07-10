@@ -505,16 +505,18 @@ final class TranscriptionServiceTests: XCTestCase {
         }
         XCTAssertEqual(service.activeRecordingID, target.recording.id)
 
-        // Mirror QueueRow.cancel(): trip the abort flag + mark it cancelled.
+        // Mirror QueueRow.cancel(): trip the abort flag + stop (move to trash).
         service.cancel(recordingID: target.recording.id)
-        store.cancelTranscription(target.recording)
+        store.stopTranscription(target.recording)
         await service.waitForIdle()
 
         let stored = try XCTUnwrap(store.recordings.first { $0.id == target.recording.id })
         XCTAssertEqual(stored.status, .failed,
                        "A stopped recording must leave the running/pending Queue state")
+        XCTAssertTrue(stored.isTrashed,
+                      "Stop moves the recording to Recently Deleted so it leaves the list")
         XCTAssertTrue(FileManager.default.fileExists(atPath: target.audioURL.path),
-                      "Stop keeps the audio so the user can re-transcribe")
+                      "Stop keeps the audio (in the trash) so the user can restore / re-transcribe")
     }
 
     // MARK: - Re-transcribe with the other language

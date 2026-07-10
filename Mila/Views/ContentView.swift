@@ -507,14 +507,15 @@ private struct QueueView: View {
         var seen = Set<UUID>()
         var ordered: [Recording] = []
         // Only surface the engine's active recording while it's still in a
-        // queue state. When the user hits Stop, `cancelTranscription` flips the
-        // store status to `.failed` immediately, but the engine's
-        // `activeRecordingID` only clears ~100ms later once `whisper_full`
-        // unwinds. Without this status guard the cancelled row lingers as
-        // "Transcribing" in that window, so Stop looks unresponsive and the
-        // user clicks it repeatedly.
+        // queue state and not trashed. When the user hits Stop,
+        // `stopTranscription` flips the store status to `.failed` and moves it
+        // to Recently Deleted immediately, but the engine's `activeRecordingID`
+        // only clears ~100ms later once `whisper_full` unwinds. Without this
+        // guard the cancelled row lingers as "Transcribing" in that window, so
+        // Stop looks unresponsive and the user clicks it repeatedly.
         if let activeID = transcription.activeRecordingID,
            let active = store.recordings.first(where: { $0.id == activeID }),
+           !active.isTrashed,
            active.status == .running || active.status == .pending {
             ordered.append(active)
             seen.insert(activeID)
@@ -622,16 +623,16 @@ private struct QueueRow: View {
                 }
             }
 
-            // Stop (cancel the run/queue slot, keep the recording) + Remove
-            // (cancel and delete it outright). Both trip the engine abort flag
-            // first so a `.running` item stops burning CPU immediately.
+            // Stop (cancel + move to Recently Deleted) + Remove (cancel +
+            // permanently delete). Both trip the engine abort flag first so a
+            // `.running` item stops burning CPU immediately.
             Button {
                 cancel()
             } label: {
                 Image(systemName: "stop.circle")
             }
             .buttonStyle(.borderless)
-            .help("Stop transcribing — keeps the recording so you can re-transcribe later")
+            .help("Stop transcribing and move to Recently Deleted (restorable)")
             .accessibilityIdentifier("queue.row.stop.\(recording.id)")
 
             Button(role: .destructive) {
@@ -656,14 +657,15 @@ private struct QueueRow: View {
         }
     }
 
-    /// Stop the transcription but keep the recording. Trip the engine abort
-    /// flag (unwinds `whisper_full` in ~100ms / drops it from the pending
-    /// queue) AND flip the store status out of `.pending`/`.running` — the
-    /// service's cancel path intentionally leaves the status alone, so without
-    /// this the row would stay stuck in the Queue.
+    /// Stop the transcription and move the recording to Recently Deleted so it
+    /// leaves the list instead of lingering as a "Failed" row. Trip the engine
+    /// abort flag (unwinds `whisper_full` in ~100ms / drops it from the pending
+    /// queue), then `stopTranscription` flips the status terminal and soft-
+    /// deletes it — the audio survives in the trash, restorable if this was a
+    /// misclick (or a re-transcription of an already-completed recording).
     private func cancel() {
         transcription.cancel(recordingID: recording.id)
-        store.cancelTranscription(recording)
+        store.stopTranscription(recording)
     }
 
     /// Stop AND delete: abort the run, then remove the recording and its audio

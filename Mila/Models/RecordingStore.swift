@@ -453,10 +453,22 @@ final class RecordingStore: ObservableObject {
     /// the delete), so a Queue-level cancel must flip the status itself —
     /// otherwise a `.running` item would sit in the Queue forever. No-op if the
     /// recording is already in a terminal state.
-    func cancelTranscription(_ recording: Recording) {
+    /// Stop a queued/active transcription from the Queue and move the
+    /// recording to "Recently Deleted" rather than leaving a `.failed` row
+    /// cluttering the list. The status also flips to a terminal `.failed` so
+    /// the launch crash-recovery sweep and the Queue don't resurrect it. The
+    /// audio stays on disk (recoverable via Restore), so this is safe for mic
+    /// recordings and re-transcriptions of already-completed recordings — the
+    /// user gets their content back from the trash if they hit Stop by
+    /// mistake. No-op if the recording is already terminal (guards a stale
+    /// click racing a just-finished run). Paired with
+    /// `TranscriptionService.cancel(recordingID:)`, which trips the engine's
+    /// abort flag so the in-flight whisper pass unwinds.
+    func stopTranscription(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
         recordings[idx].status = .failed
+        recordings[idx].deletedAt = Date()
         persist()
     }
 

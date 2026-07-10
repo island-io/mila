@@ -406,49 +406,54 @@ final class RecordingStoreTests: XCTestCase {
                        "Whitespace-only summary must be treated as empty")
     }
 
-    // MARK: - Cancelling a queued/running transcription
+    // MARK: - Stopping a queued/running transcription
 
-    /// Stopping a `.running` recording from the Queue must move it to a
-    /// terminal state (`.failed`) so it drops out of the Queue instead of
-    /// sitting there forever showing "Transcribing".
-    func test_cancel_transcription_marks_running_recording_failed() {
+    /// Stopping a `.running` recording from the Queue moves it to Recently
+    /// Deleted (soft-delete) and marks it terminal, so it drops out of the
+    /// Queue and the main list instead of lingering as a "Failed" row — while
+    /// the audio stays recoverable via Restore.
+    func test_stop_transcription_trashes_running_recording() {
         let store = RecordingStore(rootDirectory: tempRoot)
         var rec = Recording(title: "In progress", source: .microphone, audioFileName: "r.wav")
         rec.status = .running
         store.add(rec)
 
-        store.cancelTranscription(rec)
+        store.stopTranscription(rec)
 
         let stored = store.recordings.first { $0.id == rec.id }
         XCTAssertEqual(stored?.status, .failed)
+        XCTAssertTrue(stored?.isTrashed == true, "Stopped recording should move to Recently Deleted")
     }
 
     /// Same for a `.pending` item still waiting its turn.
-    func test_cancel_transcription_marks_pending_recording_failed() {
+    func test_stop_transcription_trashes_pending_recording() {
         let store = RecordingStore(rootDirectory: tempRoot)
         let rec = Recording(title: "Waiting", source: .microphone,
                             audioFileName: "p.wav", status: .pending)
         store.add(rec)
 
-        store.cancelTranscription(rec)
+        store.stopTranscription(rec)
 
-        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.status, .failed)
+        let stored = store.recordings.first { $0.id == rec.id }
+        XCTAssertEqual(stored?.status, .failed)
+        XCTAssertTrue(stored?.isTrashed == true)
     }
 
-    /// Cancelling an already-completed recording is a no-op — we must not
-    /// clobber a finished transcript's status back to `.failed` if the row is
-    /// stale (e.g. the run finished between the user clicking Stop and the
-    /// mutation landing).
-    func test_cancel_transcription_is_noop_for_completed_recording() {
+    /// Stopping an already-completed recording is a no-op — we must not trash a
+    /// finished recording or clobber its status if the row is stale (e.g. the
+    /// run finished between the user clicking Stop and the mutation landing).
+    func test_stop_transcription_is_noop_for_completed_recording() {
         let store = RecordingStore(rootDirectory: tempRoot)
         let rec = Recording(title: "Done", source: .microphone,
                             audioFileName: "d.wav", status: .completed,
                             fullText: "hello")
         store.add(rec)
 
-        store.cancelTranscription(rec)
+        store.stopTranscription(rec)
 
-        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.status, .completed)
+        let stored = store.recordings.first { $0.id == rec.id }
+        XCTAssertEqual(stored?.status, .completed)
+        XCTAssertFalse(stored?.isTrashed == true, "A completed recording must not be trashed by a stale Stop")
     }
 
     /// Removing from the Queue reuses `permanentlyDelete`, so both the metadata
