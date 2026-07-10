@@ -34,9 +34,15 @@ import Combine
 final class RecordingStorageSettings: ObservableObject {
     static let bookmarkKey = "storage.recordingsDirectoryBookmark"
     static let limitBytesKey = "storage.limitBytes"
+    static let minDurationKey = "recordings.minDuration"
     /// 5 GiB — generous for compressed (m4a) recordings (~20–30 MB/hour),
     /// so this is roughly 150+ hours before the cap bites.
     static let defaultLimitBytes: Int64 = 5 * 1024 * 1024 * 1024
+    /// Auto-drop threshold (seconds). Recordings that finish transcription
+    /// with no text AND shorter than this are discarded as accidental
+    /// captures (hotkey misfires, silence). `0` disables the gate — keep
+    /// everything. See issue #61 / `shouldAutoDrop`.
+    static let defaultMinDuration: Double = 5.0
 
     /// Hard cap on the recordings library size. New recordings are
     /// blocked once usage reaches this; existing/in-progress recordings
@@ -53,6 +59,40 @@ final class RecordingStorageSettings: ObservableObject {
     var limitGigabytes: Double {
         get { Double(limitBytes) / 1_073_741_824.0 }
         set { limitBytes = max(1, Int64((newValue * 1_073_741_824.0).rounded())) }
+    }
+
+    /// Minimum-duration gate for auto-dropping accidental captures (issue
+    /// #61). A recording that finishes transcription with an empty transcript
+    /// AND a duration below this many seconds is a hotkey misfire / silence
+    /// clip — Mila discards it so it never spams the list. `0` disables the
+    /// gate (keep everything). Persisted so the choice sticks across launches.
+    @Published var minDuration: Double {
+        didSet {
+            // Clamp defensively (the Settings stepper is already bounded);
+            // the reassignment re-enters didSet and persists the clamped value.
+            if minDuration < 0 { minDuration = 0; return }
+            guard minDuration != oldValue else { return }
+            defaults.set(minDuration, forKey: Self.minDurationKey)
+        }
+    }
+
+    /// Auto-drop gate for accidental short recordings (issue #61). Returns
+    /// true when a just-finished recording should be dropped: it is BOTH
+    /// shorter than `threshold` AND its transcript is empty/whitespace-only.
+    ///
+    /// A `threshold` of 0 disables the gate entirely (keep everything). A
+    /// short clip that DID produce text is kept ("short but has content"),
+    /// as is any clip at or over the threshold — length alone never drops a
+    /// recording that captured real speech.
+    static func shouldAutoDrop(duration: Double, transcript: String, threshold: Double) -> Bool {
+        guard threshold > 0, duration < threshold else { return false }
+        return transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Convenience over the static gate using the user's persisted
+    /// `minDuration` threshold.
+    func shouldAutoDrop(duration: Double, transcript: String) -> Bool {
+        Self.shouldAutoDrop(duration: duration, transcript: transcript, threshold: minDuration)
     }
 
     /// The currently-active user-selected recordings directory, or nil when
@@ -81,6 +121,11 @@ final class RecordingStorageSettings: ObservableObject {
             self.limitBytes = Int64(stored)
         } else {
             self.limitBytes = Self.defaultLimitBytes
+        }
+        if let stored = defaults.object(forKey: Self.minDurationKey) as? Double {
+            self.minDuration = max(0, stored)
+        } else {
+            self.minDuration = Self.defaultMinDuration
         }
         resolveAndStartAccessing()
     }

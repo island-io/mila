@@ -297,6 +297,110 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(stored.fullText, "")
     }
 
+    // MARK: - Auto-drop short + empty recordings (issue #61)
+
+    /// Wire the real gate onto the service so these tests exercise the exact
+    /// production path (`RecordingStorageSettings.shouldAutoDrop` +
+    /// `TranscriptionService.process`), not a test-only shortcut.
+    private func enableAutoDrop(threshold: Double = 5) {
+        service.shouldAutoDropShortEmpty = { duration, transcript in
+            RecordingStorageSettings.shouldAutoDrop(
+                duration: duration, transcript: transcript, threshold: threshold)
+        }
+    }
+
+    func test_short_empty_recording_is_auto_dropped_after_transcription() async throws {
+        enableAutoDrop()
+        // Audible + long enough to reach whisper (passes the silence guard),
+        // but the engine returns no segments → empty transcript, under 5s.
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Hotkey misfire",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        XCTAssertNil(store.recordings.first { $0.id == fixture.recording.id },
+                     "A short recording with an empty transcript must be dropped from the store")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.audioURL.path),
+                       "The dropped recording's audio file must be removed (no orphan)")
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 1, "Drop happens AFTER transcription resolves")
+    }
+
+    func test_short_but_transcribed_recording_is_kept() async throws {
+        // The explicit edge case from the issue: short, but it produced text.
+        enableAutoDrop()
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Short but real",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "quick note to self")
+        ])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.fullText, "quick note to self")
+    }
+
+    func test_short_empty_recording_is_kept_when_gate_disabled() async throws {
+        // Threshold 0 disables the gate: the short+empty clip stays as .failed
+        // (the pre-#61 behaviour), it is NOT dropped.
+        enableAutoDrop(threshold: 0)
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Kept because gate off",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    func test_short_empty_recording_is_kept_when_no_hook_wired() async throws {
+        // Default: no gate wired at all (every existing caller/test). Behaviour
+        // is unchanged — the short+empty recording lands .failed and stays.
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "No hook",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    /// The silence guard rejects the clip before whisper runs; the auto-drop
+    /// gate must still remove it (short + empty), so accidental sub-0.3s /
+    /// silent captures never even reach the list.
+    func test_silence_rejected_recording_is_auto_dropped_when_short() async throws {
+        enableAutoDrop()
+        let url = store.freshAudioURL(suggestedName: "Silent misfire")
+        try TestSupport.writeSineWav(at: url, durationSeconds: 0.06, amplitude: 0.0001)
+        let recording = Recording(title: "Silent misfire",
+                                  duration: 0.06,
+                                  source: .microphone,
+                                  audioFileName: url.lastPathComponent,
+                                  language: "he")
+        store.add(recording)
+
+        service.enqueue(recording)
+        await service.waitForIdle()
+
+        XCTAssertNil(store.recordings.first { $0.id == recording.id },
+                     "A silence-rejected short clip must be auto-dropped")
+        let calls = await stub.transcribeCalls
+        XCTAssertTrue(calls.isEmpty, "Silence guard still short-circuits before whisper")
+    }
+
     // MARK: - User-reported "every empty recording shows the same transcript"
 
     /// REGRESSION: When the second/third Voice Memo captures almost no audio

@@ -79,6 +79,70 @@ final class RecordingStorageSettingsTests: XCTestCase {
                      "Stale bookmarks pointing at deleted folders must surface as nil so the store falls back to default")
     }
 
+    // MARK: - Auto-drop gate (issue #61)
+
+    func test_minDuration_defaults_to_five_seconds() {
+        let settings = RecordingStorageSettings(defaults: defaults)
+        XCTAssertEqual(settings.minDuration, 5.0)
+    }
+
+    func test_minDuration_persists_across_instances() {
+        let first = RecordingStorageSettings(defaults: defaults)
+        first.minDuration = 8
+        let second = RecordingStorageSettings(defaults: defaults)
+        XCTAssertEqual(second.minDuration, 8)
+    }
+
+    func test_minDuration_clamps_negative_to_zero() {
+        let settings = RecordingStorageSettings(defaults: defaults)
+        settings.minDuration = -3
+        XCTAssertEqual(settings.minDuration, 0)
+    }
+
+    func test_gate_drops_short_and_empty() {
+        // The core case: a sub-threshold clip with no transcript is dropped.
+        XCTAssertTrue(RecordingStorageSettings.shouldAutoDrop(
+            duration: 2, transcript: "", threshold: 5))
+    }
+
+    func test_gate_treats_whitespace_only_transcript_as_empty() {
+        XCTAssertTrue(RecordingStorageSettings.shouldAutoDrop(
+            duration: 2, transcript: "   \n\t ", threshold: 5))
+    }
+
+    func test_gate_keeps_short_but_non_empty() {
+        // "Short but has content" — the explicit edge case from the issue. A
+        // brief clip that DID capture speech must never be dropped.
+        XCTAssertFalse(RecordingStorageSettings.shouldAutoDrop(
+            duration: 2, transcript: "hi there", threshold: 5))
+    }
+
+    func test_gate_keeps_long_recordings() {
+        // At/over the threshold is kept regardless of transcript (a long
+        // silent recording is a deliberate capture, not list spam).
+        XCTAssertFalse(RecordingStorageSettings.shouldAutoDrop(
+            duration: 30, transcript: "", threshold: 5))
+        XCTAssertFalse(RecordingStorageSettings.shouldAutoDrop(
+            duration: 5, transcript: "", threshold: 5),
+            "Exactly at the threshold is kept (strict less-than)")
+    }
+
+    func test_gate_disabled_at_threshold_zero_keeps_everything() {
+        XCTAssertFalse(RecordingStorageSettings.shouldAutoDrop(
+            duration: 0.1, transcript: "", threshold: 0),
+            "Threshold 0 disables the gate — even a 0.1s empty clip is kept")
+    }
+
+    func test_gate_instance_method_uses_persisted_threshold() {
+        let settings = RecordingStorageSettings(defaults: defaults)
+        settings.minDuration = 3
+        XCTAssertTrue(settings.shouldAutoDrop(duration: 1, transcript: ""))
+        XCTAssertFalse(settings.shouldAutoDrop(duration: 4, transcript: ""))
+        settings.minDuration = 0
+        XCTAssertFalse(settings.shouldAutoDrop(duration: 1, transcript: ""),
+                       "minDuration 0 must keep everything")
+    }
+
     // MARK: - RecordingStore.relocateRecordings
 
     func test_store_relocate_routes_new_recordings_to_new_directory() throws {

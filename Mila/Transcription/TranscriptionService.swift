@@ -85,6 +85,17 @@ final class TranscriptionService: ObservableObject {
     /// exists). For first-time transcription it's `false`.
     var onTranscriptionCompleted: ((Recording, _ wasRetranscription: Bool) -> Void)?
 
+    /// Auto-drop gate for accidental short+empty captures (issue #61). Wired
+    /// by `MilaApp` to the user's `recordings.minDuration` threshold. Given a
+    /// just-finished recording's duration + transcript, returns `true` when
+    /// the clip should be dropped — i.e. it's BOTH shorter than the threshold
+    /// AND has no transcript (a hotkey misfire / silence). Short clips that
+    /// DID produce text, and anything at/over the threshold, return `false`
+    /// (kept). `nil` — the default, used by every test that doesn't opt in —
+    /// means "never drop", so transcription behaviour is unchanged unless the
+    /// app explicitly wires the gate.
+    var shouldAutoDropShortEmpty: ((_ duration: Double, _ transcript: String) -> Bool)?
+
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
 
@@ -591,6 +602,11 @@ final class TranscriptionService: ObservableObject {
                 working.status = .failed
                 working.fullText = ""
                 working.segments = []
+                // Auto-drop accidental short+empty captures (issue #61) before
+                // we persist the .failed row: a sub-threshold clip with no
+                // transcribable audio is pure list spam. A long-but-silent clip
+                // is over the threshold, so the gate keeps it as .failed.
+                if autoDropIfShortAndEmpty(working, transcript: "") { return }
                 store.update(working)
                 return
             }
@@ -693,6 +709,13 @@ final class TranscriptionService: ObservableObject {
                 working.duration = lastEnd
             }
             working.status = text.isEmpty ? .failed : .completed
+            // Auto-drop accidental short+empty captures (issue #61): a clip
+            // that came back with NO transcript AND is under the user's
+            // minimum-duration threshold is a hotkey misfire / silence — drop
+            // it instead of leaving a .failed row cluttering the list. The gate
+            // keeps any clip that produced text (even a short one) and anything
+            // at/over the threshold, so this only ever removes worthless rows.
+            if autoDropIfShortAndEmpty(working, transcript: text) { return }
             store.update(working)
 
             if working.status == .completed {
@@ -753,6 +776,21 @@ final class TranscriptionService: ObservableObject {
             working.status = .failed
             store.update(working)
         }
+    }
+
+    /// Permanently delete `recording` when the auto-drop gate flags it as an
+    /// accidental short+empty capture (issue #61). Returns `true` if it
+    /// dropped it (the caller should then early-return without persisting a
+    /// `.failed`/`.completed` row). We hard-delete rather than soft-delete:
+    /// these clips have no transcript and no audio worth keeping, so routing
+    /// them through Recently Deleted would just leave orphaned audio on disk
+    /// for the grace period. No-op when the gate isn't wired (tests) or the
+    /// recording has real content / is long enough to keep.
+    private func autoDropIfShortAndEmpty(_ recording: Recording, transcript: String) -> Bool {
+        guard shouldAutoDropShortEmpty?(recording.duration, transcript) == true else { return false }
+        print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(recording.duration)s + empty transcript (issue #61)")
+        store.permanentlyDelete(recording)
+        return true
     }
 }
 

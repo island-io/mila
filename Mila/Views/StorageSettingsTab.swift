@@ -34,6 +34,7 @@ struct StorageSettingsTab: View {
             header
             currentLocationCard
             storageLimitCard
+            autoDropCard
             if storage.lastResolutionWasStale {
                 staleBookmarkNotice
             }
@@ -150,6 +151,41 @@ struct StorageSettingsTab: View {
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Auto-drop threshold: a stepper for the minimum-duration gate that
+    /// discards accidental short + empty captures (hotkey misfires, silence)
+    /// right after transcription. 0 disables it (keep everything). See
+    /// issue #61 / `RecordingStorageSettings.minDuration`.
+    private var autoDropCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Image(systemName: "scissors")
+                    .foregroundStyle(.tint)
+                Text("Discard accidental recordings")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+            }
+            Stepper(value: Binding(get: { storage.minDuration },
+                                   set: { storage.minDuration = $0 }),
+                    in: 0...60, step: 1) {
+                Text(autoDropSummary)
+                    .font(.callout)
+            }
+            .accessibilityIdentifier("storage.minDuration.stepper")
+            Text("When a recording finishes with no transcript and is shorter than this, Mila deletes it automatically — those are almost always hotkey misfires or silence. Short recordings that did capture speech are always kept. Set to 0 seconds to keep everything.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var autoDropSummary: String {
+        let s = Int(storage.minDuration.rounded())
+        if s == 0 { return "Keep all recordings (auto-discard off)" }
+        return "Discard empty recordings under \(s) second\(s == 1 ? "" : "s")"
     }
 
     private var reclaimSummary: String {
