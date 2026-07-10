@@ -14,7 +14,12 @@ struct VoiceMemosSettingsTab: View {
     @State private var loadError: String?
     @State private var isLoading = false
 
-    private let library = VoiceMemosLibrary()
+    /// Reader over the folder the user granted (falling back to the standard
+    /// location, which is what a legacy Full-Disk-Access user already sees).
+    private var library: VoiceMemosLibrary {
+        VoiceMemosLibrary(recordingsDirectory: settings.grantedFolderURL
+                          ?? VoiceMemosLibrary.defaultRecordingsDirectory)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -26,22 +31,25 @@ struct VoiceMemosSettingsTab: View {
             Toggle("Sync recordings from iPhone Voice Memos", isOn: $settings.isEnabled)
                 .toggleStyle(.switch)
 
-            switch library.availability {
-            case .available:
-                if settings.isEnabled {
+            if settings.isEnabled {
+                switch library.availability {
+                case .available:
                     folderPicker
                     startDatePicker
                     statusFooter
+                case .databaseMissing:
+                    // We can read the folder (grant or legacy FDA in place)
+                    // but there's no library there — iCloud sync off, or the
+                    // user granted the wrong folder.
+                    unavailableNotice
+                case .accessDenied:
+                    grantAccessNotice
                 }
-            case .databaseMissing:
-                unavailableNotice
-            case .accessDenied:
-                accessDeniedNotice
             }
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .task(id: settings.isEnabled) {
+        .task(id: "\(settings.isEnabled)-\(settings.grantedFolderURL?.path ?? "")") {
             if settings.isEnabled { await loadFolders() }
         }
     }
@@ -72,30 +80,45 @@ struct VoiceMemosSettingsTab: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
     }
 
-    /// Shown when the Voice Memos DB exists but macOS blocked access. Mila is
-    /// not sandboxed, so reading the Voice Memos group container needs Full
-    /// Disk Access — point the user straight at the right pane (issue #45).
-    private var accessDeniedNotice: some View {
+    /// Shown until Mila holds a scoped grant to the Voice Memos folder. Mila
+    /// is not sandboxed, so reading another app's group container needs the
+    /// user's consent — but a one-folder grant is all it takes, no Full Disk
+    /// Access. The panel is pre-pointed at the folder so the user just
+    /// confirms rather than navigating hidden `~/Library`.
+    private var grantAccessNotice: some View {
         HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "lock.shield")
+            Image(systemName: "folder.badge.questionmark")
                 .foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 8) {
-                Text("Mila can't read your Voice Memos library. Open Full Disk Access below "
-                     + "and enable Mila. If Mila already appears enabled there, toggle it off "
-                     + "and back on — updating Mila can invalidate the grant — then quit and "
-                     + "reopen Mila.")
+                Text("Mila needs your permission to read the Voice Memos folder. Click below "
+                     + "and confirm — Mila gets access to just that one folder, not your whole disk.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
-                Button("Open Full Disk Access Settings…") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
+                Button("Grant Access…") { grantAccess() }
             }
         }
         .padding(12)
         .background(RoundedRectangle(cornerRadius: 8).fill(Color.orange.opacity(0.08)))
+    }
+
+    /// Run the folder-grant open panel, pre-pointed at the standard Voice
+    /// Memos location, and persist the resulting security-scoped bookmark.
+    private func grantAccess() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = VoiceMemosSettings.suggestedFolder
+        panel.message = "Grant Mila access to your iPhone Voice Memos recordings folder."
+        panel.prompt = "Grant Access"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        if settings.grantFolder(url) {
+            Task { await loadFolders() }
+            importer.rescan()
+        } else {
+            loadError = "Couldn't save access to that folder. Please try again."
+        }
     }
 
     private var folderPicker: some View {

@@ -48,6 +48,19 @@ final class VoiceMemosSettings: ObservableObject {
         didSet { defaults.set(startDate, forKey: Keys.startDate) }
     }
 
+    /// The Voice Memos Recordings folder the user granted Mila access to,
+    /// resolved from a persisted security-scoped bookmark. `nil` until the
+    /// user grants it (or if the grant was lost). Reading another app's
+    /// group container needs an explicit grant; this scoped, single-folder
+    /// grant replaces the old Full Disk Access requirement. Mirrors the
+    /// bookmark pattern in `RecordingStorageSettings`.
+    @Published private(set) var grantedFolderURL: URL?
+
+    /// The URL we currently hold `startAccessingSecurityScopedResource` on,
+    /// paired with a `stop` before re-resolving. Unsandboxed builds don't
+    /// strictly need this, but it's the correct pattern (and sandbox-ready).
+    private var accessingURL: URL?
+
     private let defaults: UserDefaults
 
     private enum Keys {
@@ -55,7 +68,13 @@ final class VoiceMemosSettings: ObservableObject {
         static let folderUUIDs = "voiceMemos.folderUUIDs"
         static let includeUnfiled = "voiceMemos.includeUnfiled"
         static let startDate = "voiceMemos.startDate"
+        static let folderBookmark = "voiceMemos.folderBookmark"
     }
+
+    /// The standard on-disk location of the synced Voice Memos library —
+    /// what the "Grant Access" open panel points at so the user only has to
+    /// confirm, not navigate into hidden `~/Library`.
+    static var suggestedFolder: URL { VoiceMemosLibrary.defaultRecordingsDirectory }
 
     /// Skip accidental sub-`minDurationSeconds` taps during bulk import. Voice
     /// Memos libraries are full of 1–2s pocket recordings; transcribing them
@@ -77,6 +96,76 @@ final class VoiceMemosSettings: ObservableObject {
             let today = Calendar.current.startOfDay(for: Date())
             self.startDate = today
             defaults.set(today, forKey: Keys.startDate)
+        }
+        resolveFolderAccess()
+    }
+
+    // MARK: - Scoped folder access (replaces Full Disk Access)
+
+    /// True once Mila holds a working grant to the Voice Memos folder.
+    var hasFolderAccess: Bool { grantedFolderURL != nil }
+
+    /// Resolve the persisted bookmark and start accessing it. Idempotent —
+    /// safe to call again after `grantFolder`. Mirrors
+    /// `RecordingStorageSettings.resolveAndStartAccessing`.
+    func resolveFolderAccess() {
+        if let url = accessingURL {
+            url.stopAccessingSecurityScopedResource()
+            accessingURL = nil
+        }
+        grantedFolderURL = nil
+
+        guard let data = defaults.data(forKey: Keys.folderBookmark) else { return }
+        var isStale = false
+        let resolved: URL
+        do {
+            resolved = try URL(resolvingBookmarkData: data,
+                               options: [.withSecurityScope],
+                               relativeTo: nil,
+                               bookmarkDataIsStale: &isStale)
+        } catch {
+            // Unreadable blob — drop it so we don't fail on every launch.
+            print("VoiceMemosSettings: failed to resolve folder bookmark: \(error)")
+            defaults.removeObject(forKey: Keys.folderBookmark)
+            return
+        }
+        if isStale {
+            if let refreshed = try? resolved.bookmarkData(options: [.withSecurityScope],
+                                                          includingResourceValuesForKeys: nil,
+                                                          relativeTo: nil) {
+                defaults.set(refreshed, forKey: Keys.folderBookmark)
+            } else {
+                defaults.removeObject(forKey: Keys.folderBookmark)
+                return
+            }
+        }
+        let started = resolved.startAccessingSecurityScopedResource()
+        var isDir: ObjCBool = false
+        let exists = FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDir)
+        if !exists || !isDir.boolValue {
+            if started { resolved.stopAccessingSecurityScopedResource() }
+            defaults.removeObject(forKey: Keys.folderBookmark)
+            return
+        }
+        accessingURL = resolved
+        grantedFolderURL = resolved
+    }
+
+    /// Persist a freshly-picked folder (from the "Grant Access" open panel)
+    /// as a security-scoped bookmark and start accessing it. Returns true on
+    /// success. Mirrors `RecordingStorageSettings.setDirectory`.
+    @discardableResult
+    func grantFolder(_ url: URL) -> Bool {
+        do {
+            let data = try url.bookmarkData(options: [.withSecurityScope],
+                                            includingResourceValuesForKeys: nil,
+                                            relativeTo: nil)
+            defaults.set(data, forKey: Keys.folderBookmark)
+            resolveFolderAccess()
+            return grantedFolderURL != nil
+        } catch {
+            print("VoiceMemosSettings: failed to mint folder bookmark for \(url.path): \(error)")
+            return false
         }
     }
 

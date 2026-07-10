@@ -26,7 +26,14 @@ final class VoiceMemosImporter: ObservableObject {
     private let transcription: TranscriptionService
     private let settings: VoiceMemosSettings
     private let languageSettings: RecordingLanguageSettings
-    private let library: VoiceMemosLibrary
+
+    /// Reader over the folder the user granted access to (falling back to the
+    /// standard location, which is what a Full-Disk-Access user already sees).
+    /// Rebuilt each access so it always reflects the current grant.
+    private var library: VoiceMemosLibrary {
+        VoiceMemosLibrary(recordingsDirectory: settings.grantedFolderURL
+                          ?? VoiceMemosLibrary.defaultRecordingsDirectory)
+    }
 
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "VoiceMemos")
 
@@ -66,13 +73,11 @@ final class VoiceMemosImporter: ObservableObject {
     init(store: RecordingStore,
          transcription: TranscriptionService,
          settings: VoiceMemosSettings,
-         languageSettings: RecordingLanguageSettings,
-         library: VoiceMemosLibrary = VoiceMemosLibrary()) {
+         languageSettings: RecordingLanguageSettings) {
         self.store = store
         self.transcription = transcription
         self.settings = settings
         self.languageSettings = languageSettings
-        self.library = library
     }
 
     /// Wire up settings observation + the watcher, and run an initial sync.
@@ -105,9 +110,9 @@ final class VoiceMemosImporter: ObservableObject {
             return
         }
         // Sync is on and folders are chosen, but the library may still be
-        // unreadable. Log *why* rather than silently bailing — a TCC / Full
-        // Disk Access denial is the one failure that otherwise leaves no
-        // trace in the logs at all (issue #45).
+        // unreadable. Log *why* rather than silently bailing — a TCC denial
+        // is the one failure that otherwise leaves no trace in the logs at
+        // all (issue #45).
         switch library.availability {
         case .available:
             break
@@ -116,7 +121,7 @@ final class VoiceMemosImporter: ObservableObject {
             stop()
             return
         case .accessDenied(let reason):
-            log.error("VoiceMemos sync is enabled but macOS denied access to \(self.library.databaseDisplayPath, privacy: .public) (\(reason, privacy: .public)). Grant Mila Full Disk Access in System Settings → Privacy & Security → Full Disk Access.")
+            log.error("VoiceMemos sync is enabled but macOS denied access to \(self.library.databaseDisplayPath, privacy: .public) (\(reason, privacy: .public)). Grant access to the Voice Memos folder from Settings → Voice Memos.")
             lastError = VoiceMemosLibrary.LibraryError.accessDenied(reason).localizedDescription
             stop()
             return

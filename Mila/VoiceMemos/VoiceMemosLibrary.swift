@@ -145,10 +145,8 @@ struct VoiceMemosLibrary {
             case .databaseMissing:
                 return "No Voice Memos library was found on this Mac."
             case .accessDenied:
-                return "Mila can't read your Voice Memos library. Grant Mila Full Disk Access in "
-                    + "System Settings → Privacy & Security → Full Disk Access. If Mila already "
-                    + "appears enabled there, toggle it off and back on (updating Mila can "
-                    + "invalidate the grant), then quit and reopen Mila."
+                return "Mila can't read your Voice Memos library. Open Settings → Voice Memos "
+                    + "and click Grant Access to give Mila permission to that folder."
             case .openFailed(let msg):
                 return "Could not open the Voice Memos database: \(msg)"
             case .schemaUnsupported:
