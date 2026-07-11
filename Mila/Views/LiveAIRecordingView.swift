@@ -393,6 +393,10 @@ struct LiveAIRecordingView: View {
                 .buttonStyle(.borderless)
                 .disabled(transcriber.segments.isEmpty)
                 .help("Copy transcript")
+                // Icon-only button: `help` is the hover tooltip and the
+                // identifier is test-only — VoiceOver needs its own
+                // user-facing name.
+                .accessibilityLabel("Copy transcript")
                 .accessibilityIdentifier("liveTranscript.copy")
                 // Mid-recording SRT export (issue #65): save whatever the
                 // live transcript has accumulated so far, without stopping
