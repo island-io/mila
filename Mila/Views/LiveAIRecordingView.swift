@@ -379,6 +379,21 @@ struct LiveAIRecordingView: View {
                 if transcriber.isTranscribing {
                     ProgressView().controlSize(.small)
                 }
+                // Mid-recording clipboard copy: same format as the
+                // detail view's transcript copy (speaker-prefixed turns
+                // once live diarization has labelled anyone) so the two
+                // read as one feature.
+                Button {
+                    let text = transcriber.clipboardText
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(text, forType: .string)
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                }
+                .buttonStyle(.borderless)
+                .disabled(transcriber.segments.isEmpty)
+                .help("Copy transcript")
+                .accessibilityIdentifier("liveTranscript.copy")
                 // Mid-recording SRT export (issue #65): save whatever the
                 // live transcript has accumulated so far, without stopping
                 // the recording. The finished recording still gets its
@@ -517,10 +532,7 @@ struct LiveAIRecordingView: View {
     /// failure); the suggested filename matches the date-stamped default
     /// title a stopped recording would get.
     private func exportLiveSRT() {
-        let snapshot = transcriber.segments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
+        let snapshot = transcriber.transcriptSegments
         guard !snapshot.isEmpty else { return }
         let panel = NSSavePanel()
         panel.title = "Export Subtitles"

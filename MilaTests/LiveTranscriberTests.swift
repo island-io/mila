@@ -61,6 +61,31 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// Mid-recording copy button: `clipboardText` must match the detail
+    /// view's copy format — the plain fullText join while nobody is
+    /// labelled, speaker-prefixed turns once live diarization kicks in.
+    func test_clipboardText_matches_detail_copy_format() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "hello"),
+            TranscriptSegment(start: 2, end: 3, text: "hi there")
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+
+        // No speakers yet -> plain joined text, no prefixes.
+        XCTAssertEqual(transcriber.clipboardText, "hello hi there")
+
+        transcriber.applySpeakerLabels([
+            (start: 0, end: 1, speaker: "SPEAKER_00"),
+            (start: 2, end: 3, speaker: "SPEAKER_01")
+        ])
+        XCTAssertEqual(transcriber.clipboardText,
+                       "SPEAKER_00: hello\nSPEAKER_01: hi there")
+        _ = transcriber.stop()
+    }
+
     func test_successive_ticks_dedup_overlap_by_time() async {
         // Two ticks. Each whisper call sees the window starting at the
         // same absolute time (0s in this test because the buffer is
