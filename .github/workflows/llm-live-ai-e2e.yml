@@ -28,8 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         id: changes
         with:
           filters: |
@@ -39,7 +39,7 @@ jobs:
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
@@ -56,8 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         id: changes
         with:
           filters: |
@@ -67,7 +67,7 @@ jobs:
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
@@ -90,10 +90,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
         id: changes
         with:
           filters: |
@@ -115,7 +115,7 @@ jobs:
       - name: Cache diarization bundle
         if: steps.changes.outputs.relevant == 'true'
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -140,13 +140,13 @@ jobs:
             -only-testing:MilaUITests/DetailLayoutUITests \
             -derivedDataPath build-uitests \
             CODE_SIGNING_ALLOWED=NO || (echo "UI tests failed — vision check skipped" && exit 1)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: steps.changes.outputs.relevant == 'true' && (always())
         with:
           name: ui-screenshots
           path: /tmp/mila-ui-screenshots/
           if-no-files-found: warn
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"

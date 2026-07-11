@@ -27,7 +27,7 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
           submodules: recursive
 
@@ -47,7 +47,7 @@ jobs:
 
       - name: Cache diarization bundle
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -58,7 +58,7 @@ jobs:
 
       - name: Cache whisper models (full + tiny)
         id: whisper-models-cache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/Library/Application Support/Mila/Models
@@ -191,7 +191,7 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: e2e-results
