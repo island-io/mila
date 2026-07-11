@@ -420,6 +420,28 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(stored.status, .failed)
     }
 
+    /// A manual re-transcribe of an EXISTING recording that comes back empty
+    /// must not be auto-dropped — the recording already had content, and
+    /// deleting it would destroy the user's data. Only first-time captures are
+    /// eligible for auto-drop (issue #61 review).
+    func test_short_empty_retranscribe_of_existing_recording_is_kept() async throws {
+        enableAutoDrop()
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Existing note",
+                                                    durationSeconds: 1.0)
+        var rec = fixture.recording
+        rec.status = .completed
+        rec.fullText = "the note I already transcribed"
+        store.update(rec)                 // now it has prior content
+        await stub.setDefaultCanned([])   // the retry produces nothing
+
+        service.enqueue(rec)
+        await service.waitForIdle()
+
+        XCTAssertNotNil(store.recordings.first { $0.id == rec.id },
+                        "Re-transcribing an existing recording to an empty result must not delete it")
+    }
+
     /// The silence guard rejects the clip before whisper runs; the auto-drop
     /// gate must still remove it (short + empty), so accidental sub-0.3s /
     /// silent captures never even reach the list.

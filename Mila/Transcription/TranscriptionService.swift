@@ -484,6 +484,13 @@ final class TranscriptionService: ObservableObject {
         // the wrong model for the language actually transcribed.
         // (The recording may also have been edited or soft-deleted in the gap.)
         var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+        // Whether this is the recording's FIRST transcription. A manual
+        // re-transcribe keeps the prior transcript on the row, so a non-empty
+        // `fullText` here means "already has content" — we must NOT auto-drop
+        // such a recording if the retry comes back empty (that would delete an
+        // existing recording + its audio). Captured before `fullText` is
+        // overwritten below. See issue #61 review.
+        let isFirstTranscription = working.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if working.isTrashed {
             print("Transcribe skipped: \(working.title) was deleted before processing")
             return
@@ -606,7 +613,7 @@ final class TranscriptionService: ObservableObject {
                 // we persist the .failed row: a sub-threshold clip with no
                 // transcribable audio is pure list spam. A long-but-silent clip
                 // is over the threshold, so the gate keeps it as .failed.
-                if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: "") { return }
+                if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: "", isFirstTranscription: isFirstTranscription) { return }
                 store.update(working)
                 return
             }
@@ -715,7 +722,7 @@ final class TranscriptionService: ObservableObject {
             // it instead of leaving a .failed row cluttering the list. The gate
             // keeps any clip that produced text (even a short one) and anything
             // at/over the threshold, so this only ever removes worthless rows.
-            if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: text) { return }
+            if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: text, isFirstTranscription: isFirstTranscription) { return }
             store.update(working)
 
             if working.status == .completed {
@@ -786,7 +793,11 @@ final class TranscriptionService: ObservableObject {
     /// them through Recently Deleted would just leave orphaned audio on disk
     /// for the grace period. No-op when the gate isn't wired (tests) or the
     /// recording has real content / is long enough to keep.
-    private func autoDropIfShortAndEmpty(_ recording: Recording, duration: Double, transcript: String) -> Bool {
+    private func autoDropIfShortAndEmpty(_ recording: Recording, duration: Double, transcript: String, isFirstTranscription: Bool) -> Bool {
+        // Only auto-drop a recording's FIRST transcription. A manual
+        // re-transcribe of an existing recording that comes back empty must
+        // NOT be deleted — that would destroy content the user already had.
+        guard isFirstTranscription else { return false }
         // Only auto-drop accidental *local mic captures* (mic recordings +
         // dictation hotkey misfires — both `.microphone`). Never Voice Memos,
         // imported files (`.systemAudio`), or meeting captures: those aren't
