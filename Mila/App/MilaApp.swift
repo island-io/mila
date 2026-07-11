@@ -1339,7 +1339,12 @@ struct MilaApp: App {
             }
         }
         store.updateAll(statusChanged)          // single persist for the whole sweep
-        toEnqueue.forEach { transcription.enqueue($0) }
+        // Recovered rows are re-runs of transcriptions that were already
+        // in flight before the app quit — never a fresh capture. Mark them
+        // as re-transcriptions so the issue-#61 auto-drop gate can't delete
+        // one (e.g. a mid-retranscribe of an empty-transcript recording that
+        // crashed) just because the recovered rerun comes back short + empty.
+        toEnqueue.forEach { transcription.enqueue($0, isRetranscription: true) }
 
         // 2. Auto-enqueue recovered orphans.
         let ids = store.consumePendingRecoveryIDs()
