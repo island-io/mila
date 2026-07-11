@@ -142,7 +142,7 @@ struct RecordingDetailView: View {
                     // stays consistent and we never enqueue a stale snapshot
                     // whose `.wav` a since-run compression already deleted.
                     guard let prepared = store.prepareForRetranscription(id: recording.id) else { return }
-                    transcription.enqueue(prepared)
+                    transcription.enqueue(prepared, isRetranscription: true)
                 } label: {
                     Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
                           systemImage: "arrow.clockwise")
@@ -208,7 +208,7 @@ struct RecordingDetailView: View {
         guard let prepared = store.prepareForRetranscription(id: recording.id,
                                                              language: language.rawValue)
         else { return }
-        transcription.enqueue(prepared)
+        transcription.enqueue(prepared, isRetranscription: true)
     }
 
 

@@ -208,12 +208,22 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Public API
 
+    /// IDs enqueued as a manual re-transcribe. Consumed by `process` to make
+    /// the issue-#61 auto-drop gate an *explicit* first-transcription check
+    /// rather than one inferred from an empty transcript — a recording that
+    /// previously failed empty also has empty `fullText`, so inference alone
+    /// could hard-delete it (plus its audio) on a deliberate retry.
+    private var retranscriptionIDs: Set<UUID> = []
+
     /// Enqueue a recording for transcription. Returns immediately.
     /// Calls don't overlap — the queue drains FIFO on a single background task.
     /// Idempotent: re-enqueuing the active or already-queued recording is a no-op.
-    func enqueue(_ recording: Recording) {
+    /// `isRetranscription` marks a deliberate re-run of an existing recording so
+    /// the auto-drop gate never discards it (see `retranscriptionIDs`).
+    func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
         if activeRecordingID == recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
+        if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
         publishPending()
         startWorkerIfNeeded()
@@ -484,13 +494,17 @@ final class TranscriptionService: ObservableObject {
         // the wrong model for the language actually transcribed.
         // (The recording may also have been edited or soft-deleted in the gap.)
         var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
-        // Whether this is the recording's FIRST transcription. A manual
-        // re-transcribe keeps the prior transcript on the row, so a non-empty
-        // `fullText` here means "already has content" — we must NOT auto-drop
-        // such a recording if the retry comes back empty (that would delete an
-        // existing recording + its audio). Captured before `fullText` is
-        // overwritten below. See issue #61 review.
-        let isFirstTranscription = working.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Whether this is the recording's FIRST transcription — the only case
+        // the issue-#61 auto-drop gate may discard a recording. A manual
+        // re-transcribe must NEVER be dropped even if it comes back empty
+        // (that would delete an existing recording + its audio). Use the
+        // explicit `enqueue(isRetranscription:)` flag (consumed here), AND
+        // require an empty prior `fullText`, so neither a UI retry of a
+        // previously-failed-empty recording nor a recovered re-run is dropped.
+        // Captured before `fullText` is overwritten below. See issue #61 review.
+        let wasRetranscribeEnqueue = retranscriptionIDs.remove(recording.id) != nil
+        let isFirstTranscription = !wasRetranscribeEnqueue
+            && working.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if working.isTrashed {
             print("Transcribe skipped: \(working.title) was deleted before processing")
             return

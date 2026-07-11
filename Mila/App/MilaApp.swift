@@ -1339,7 +1339,7 @@ struct MilaApp: App {
             }
         }
         store.updateAll(statusChanged)          // single persist for the whole sweep
-        toEnqueue.forEach(transcription.enqueue)
+        toEnqueue.forEach { transcription.enqueue($0) }
 
         // 2. Auto-enqueue recovered orphans.
         let ids = store.consumePendingRecoveryIDs()

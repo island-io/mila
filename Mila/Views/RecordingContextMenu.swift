@@ -135,7 +135,7 @@ private struct RecordingContextMenu: ViewModifier {
                 guard !isBusy,
                       let prepared = store.prepareForRetranscription(id: recording.id)
                 else { return }
-                transcription.enqueue(prepared)
+                transcription.enqueue(prepared, isRetranscription: true)
             }
             .disabled(isBusy)
             Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
@@ -183,7 +183,7 @@ private struct RecordingContextMenu: ViewModifier {
         guard let prepared = store.prepareForRetranscription(id: recording.id,
                                                              language: language.rawValue)
         else { return }
-        transcription.enqueue(prepared)
+        transcription.enqueue(prepared, isRetranscription: true)
     }
 
     /// Save the recording's SRT to a user-chosen location. NSSavePanel lets
