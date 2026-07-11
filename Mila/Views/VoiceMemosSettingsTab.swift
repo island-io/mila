@@ -346,7 +346,11 @@ struct VoiceMemosSettingsTab: View {
     /// Read a folder's memo titles off the main actor and cache them. Reuses
     /// the read-only library reader — no import, no queueing.
     private func loadPreview(id: String, isUnfiled: Bool) {
-        guard previews[id] == nil, !loadingPreviews.contains(id) else { return }
+        // Don't start a preview while a folder refresh is in flight — it would
+        // capture the refresh's generation and cache a snapshot the refresh's
+        // own end-of-load pass would then suppress. `loadFolders` re-loads
+        // previews for expanded folders once the refresh finishes.
+        guard !isLoading, previews[id] == nil, !loadingPreviews.contains(id) else { return }
         loadingPreviews.insert(id)
         previewErrors.remove(id)
         let lib = library
@@ -492,16 +496,21 @@ struct VoiceMemosSettingsTab: View {
         previews.removeAll()
         loadingPreviews.removeAll()
         previewErrors.removeAll()
-        defer { if gen == loadGeneration { isLoading = false } }
         let lib = library
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
                 (folders: try lib.folders(), unfiled: try lib.unfiledCount())
             }.value
-            // A newer load started while this one was in flight — drop stale results.
+            // A newer load started while this one was in flight — drop stale
+            // results and let that newer load own `isLoading`.
             guard gen == loadGeneration else { return }
             folders = loaded.folders
             unfiledCount = loaded.unfiled
+            // Clear `isLoading` BEFORE kicking off preview loads: `loadPreview`
+            // refuses to start while a refresh is in flight (so a user expand
+            // mid-refresh can't cache a snapshot the refresh would then suppress),
+            // and this end-of-refresh pass is what loads previews for open folders.
+            isLoading = false
             for id in expandedFolderIDs {
                 loadPreview(id: id, isUnfiled: id == unfiledPreviewID)
             }
@@ -512,6 +521,7 @@ struct VoiceMemosSettingsTab: View {
             folders = []
             unfiledCount = 0
             loadError = error.localizedDescription
+            isLoading = false
         }
     }
 }
