@@ -23,6 +23,14 @@ struct VoiceMemosSettingsTab: View {
     @State private var previews: [String: [VoiceMemosLibrary.Memo]] = [:]
     /// Folder ids with a preview load in flight (drives the row's spinner).
     @State private var loadingPreviews: Set<String> = []
+    /// Folder ids whose last preview load FAILED. Tracked separately from
+    /// `previews` so a read error isn't cached as an empty folder (which would
+    /// suppress retries and show a false "No recordings"); re-expanding retries.
+    @State private var previewErrors: Set<String> = []
+    /// Bumped on every `loadFolders` (rescan / settings change). Async folder
+    /// and preview loads capture the current value and drop their results if a
+    /// newer load has started since, so a stale `Task` can't clobber fresh state.
+    @State private var loadGeneration = 0
     /// Set when de-selecting a folder that still has imported recordings, to
     /// drive the "remove its recordings?" confirmation (issue #57, part 1).
     @State private var pendingCleanup: PendingCleanup?
@@ -277,6 +285,11 @@ struct VoiceMemosSettingsTab: View {
                 Text("Loading…").font(.caption).foregroundStyle(.secondary)
             }
             .padding(.leading, 26)
+        } else if previewErrors.contains(id) {
+            Text("Couldn't load recordings — collapse and expand to retry.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.leading, 26)
         } else if let memos = previews[id] {
             if memos.isEmpty {
                 Text("No recordings in this folder.")
@@ -335,10 +348,12 @@ struct VoiceMemosSettingsTab: View {
     private func loadPreview(id: String, isUnfiled: Bool) {
         guard previews[id] == nil, !loadingPreviews.contains(id) else { return }
         loadingPreviews.insert(id)
+        previewErrors.remove(id)
         let lib = library
         let limit = previewLimit
+        let gen = loadGeneration
         Task {
-            let loaded: [VoiceMemosLibrary.Memo]
+            let loaded: [VoiceMemosLibrary.Memo]?
             do {
                 loaded = try await Task.detached(priority: .userInitiated) {
                     let memos = try lib.recordings(
@@ -347,10 +362,18 @@ struct VoiceMemosSettingsTab: View {
                     return Array(memos.sorted { $0.date > $1.date }.prefix(limit))
                 }.value
             } catch {
-                loaded = []
+                loaded = nil
             }
-            previews[id] = loaded
+            // Drop stale results: a rescan/settings change started a newer load.
+            guard gen == loadGeneration else { return }
             loadingPreviews.remove(id)
+            if let loaded {
+                previews[id] = loaded
+            } else {
+                // Don't cache the failure as an empty folder — flag it so the
+                // row shows a retryable error instead of a false "No recordings".
+                previewErrors.insert(id)
+            }
         }
     }
 
@@ -458,23 +481,32 @@ struct VoiceMemosSettingsTab: View {
     }
 
     private func loadFolders() async {
+        loadGeneration &+= 1
+        let gen = loadGeneration
         isLoading = true
         loadError = nil
         // Drop cached previews so a rescan reflects the current library; keep
         // the user's expansion choices and re-load previews for what's open.
+        // Also clear in-flight/error preview state so a rescan can re-load a
+        // folder that was previously loading or had failed.
         previews.removeAll()
-        defer { isLoading = false }
+        loadingPreviews.removeAll()
+        previewErrors.removeAll()
+        defer { if gen == loadGeneration { isLoading = false } }
         let lib = library
         do {
             let loaded = try await Task.detached(priority: .userInitiated) {
                 (folders: try lib.folders(), unfiled: try lib.unfiledCount())
             }.value
+            // A newer load started while this one was in flight — drop stale results.
+            guard gen == loadGeneration else { return }
             folders = loaded.folders
             unfiledCount = loaded.unfiled
             for id in expandedFolderIDs {
                 loadPreview(id: id, isUnfiled: id == unfiledPreviewID)
             }
         } catch {
+            guard gen == loadGeneration else { return }
             // Drop stale data so a failed refresh can't leave the user
             // interacting with folder choices that no longer reflect the DB.
             folders = []
