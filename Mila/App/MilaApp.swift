@@ -35,6 +35,10 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     private(set) var controller: SPUStandardUpdaterController!
     @Published var canCheckForUpdates = false
 
+    /// UserDefaults key for the "Enable beta version" opt-in. Read live by
+    /// `allowedChannels(for:)` and written by the toggle in Settings → Updates.
+    static let betaChannelDefaultsKey = "updates.betaChannel"
+
     /// The update we want the custom popup to show. Non-nil iff a scheduled
     /// poll found a newer version we haven't already shown the user.
     /// `ContentView` binds a `.sheet(item:)` to this.
@@ -116,6 +120,16 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     }
 
     // MARK: - SPUUpdaterDelegate
+
+    /// Which appcast channels this app is willing to update to. Sparkle always
+    /// includes the default (stable) channel; returning `["beta"]` additionally
+    /// opts the user into items tagged `<sparkle:channel>beta</sparkle:channel>`.
+    /// So stable users never see beta releases, while users who enable the beta
+    /// toggle get betas AND stable. Read live from defaults so flipping the
+    /// toggle takes effect on the next check — no relaunch needed.
+    nonisolated func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+        UserDefaults.standard.bool(forKey: Self.betaChannelDefaultsKey) ? ["beta"] : []
+    }
 
     /// Sparkle found a newer valid version. Capture its release notes for the
     /// custom popup. This fires for both scheduled and user-initiated checks;

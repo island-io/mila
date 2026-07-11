@@ -3,7 +3,7 @@ import AppKit
 import Carbon.HIToolbox
 
 enum SettingsTab: Int, Hashable {
-    case hotkeys, audio, models, llm, speakers, meetings, liveAI, voiceMemos, storage
+    case hotkeys, audio, models, llm, speakers, meetings, liveAI, voiceMemos, storage, updates
 }
 
 @Observable
@@ -45,6 +45,9 @@ struct SettingsView: View {
             StorageSettingsTab()
                 .tabItem { Label("Storage", systemImage: "externaldrive") }
                 .tag(SettingsTab.storage)
+            UpdatesSettingsTab()
+                .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
+                .tag(SettingsTab.updates)
         }
         .frame(width: 560, height: 560)
         .padding(20)
@@ -54,6 +57,55 @@ struct SettingsView: View {
                 SettingsNavigation.shared.pendingTab = nil
             }
         }
+    }
+}
+
+// MARK: - Updates
+
+/// Settings → Updates. Shows the current version and the opt-in beta channel.
+/// The toggle writes `UpdaterViewModel.betaChannelDefaultsKey`, which the
+/// Sparkle updater delegate (`allowedChannels(for:)`) reads to decide whether
+/// to offer `<sparkle:channel>beta</sparkle:channel>` appcast items.
+private struct UpdatesSettingsTab: View {
+    @AppStorage(UpdaterViewModel.betaChannelDefaultsKey) private var betaChannel = false
+
+    private var versionString: String {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "\(v) (\(b))"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Updates")
+                .font(.title3.weight(.semibold))
+            Text("Mila checks for updates automatically and installs them with your approval. You're on version \(versionString).")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
+            Toggle(isOn: $betaChannel) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Enable beta version of Mila")
+                    Text("Receive pre-release builds with the newest features before they ship to everyone. Betas can be less stable. Turn this off to stay on stable releases — you'll move back to stable the next time a stable version ships.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            .accessibilityIdentifier("updates.beta.toggle")
+
+            Text("After enabling, choose “Check for Updates…” from the Mila menu to fetch the latest beta right away.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
