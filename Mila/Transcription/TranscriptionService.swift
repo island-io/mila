@@ -606,7 +606,7 @@ final class TranscriptionService: ObservableObject {
                 // we persist the .failed row: a sub-threshold clip with no
                 // transcribable audio is pure list spam. A long-but-silent clip
                 // is over the threshold, so the gate keeps it as .failed.
-                if autoDropIfShortAndEmpty(working, transcript: "") { return }
+                if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: "") { return }
                 store.update(working)
                 return
             }
@@ -715,7 +715,7 @@ final class TranscriptionService: ObservableObject {
             // it instead of leaving a .failed row cluttering the list. The gate
             // keeps any clip that produced text (even a short one) and anything
             // at/over the threshold, so this only ever removes worthless rows.
-            if autoDropIfShortAndEmpty(working, transcript: text) { return }
+            if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: text) { return }
             store.update(working)
 
             if working.status == .completed {
@@ -786,9 +786,18 @@ final class TranscriptionService: ObservableObject {
     /// them through Recently Deleted would just leave orphaned audio on disk
     /// for the grace period. No-op when the gate isn't wired (tests) or the
     /// recording has real content / is long enough to keep.
-    private func autoDropIfShortAndEmpty(_ recording: Recording, transcript: String) -> Bool {
-        guard shouldAutoDropShortEmpty?(recording.duration, transcript) == true else { return false }
-        print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(recording.duration)s + empty transcript (issue #61)")
+    private func autoDropIfShortAndEmpty(_ recording: Recording, duration: Double, transcript: String) -> Bool {
+        // Only auto-drop accidental *local mic captures* (mic recordings +
+        // dictation hotkey misfires — both `.microphone`). Never Voice Memos,
+        // imported files (`.systemAudio`), or meeting captures: those aren't
+        // accidental and/or their source audio wasn't captured in Mila, so
+        // permanently deleting them would be data loss (issue #61 review).
+        guard recording.source == .microphone else { return false }
+        // Use the freshly-decoded audio duration, NOT `recording.duration`,
+        // which can be stale (crash-recovered rows are seeded with 0) and
+        // would let a long-but-silent clip slip under the threshold.
+        guard shouldAutoDropShortEmpty?(duration, transcript) == true else { return false }
+        print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(duration)s + empty transcript (issue #61)")
         store.permanentlyDelete(recording)
         return true
     }

@@ -378,6 +378,48 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(stored.status, .failed)
     }
 
+    /// The gate targets accidental *local mic* captures only. A short, empty
+    /// Voice Memos import must NOT be permanently deleted — it has its own
+    /// handling, and deleting it would tombstone the source memo (issue #61
+    /// review: scope the gate away from imports).
+    func test_voice_memo_short_empty_is_not_auto_dropped() async throws {
+        enableAutoDrop()
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Imported memo",
+                                                    durationSeconds: 1.0,
+                                                    source: .voiceMemo)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id },
+                                   "A Voice Memo import must not be auto-dropped by the mic-capture gate")
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    /// Regression: the gate must use the DECODED audio duration, not
+    /// `recording.duration`, which crash-recovered rows seed with a stale `0`.
+    /// A long-but-empty clip whose stored duration is `0` must stay `.failed`,
+    /// not be deleted as if it were short (issue #61 review).
+    func test_long_empty_recording_is_kept_despite_stale_zero_duration() async throws {
+        enableAutoDrop()
+        let audioURL = store.freshAudioURL(suggestedName: "Long silent")
+        try TestSupport.writeSineWav(at: audioURL, durationSeconds: 6.0)  // > 5s threshold
+        let rec = Recording(title: "Long silent", duration: 0,  // stale — real audio is 6s
+                            source: .microphone, audioFileName: audioURL.lastPathComponent,
+                            language: "he")
+        store.add(rec)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(rec)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == rec.id },
+                                   "A 6s clip must not be dropped just because recording.duration was a stale 0")
+        XCTAssertEqual(stored.status, .failed)
+    }
+
     /// The silence guard rejects the clip before whisper runs; the auto-drop
     /// gate must still remove it (short + empty), so accidental sub-0.3s /
     /// silent captures never even reach the list.
