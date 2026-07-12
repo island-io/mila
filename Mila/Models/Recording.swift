@@ -60,8 +60,8 @@ struct Recording: Identifiable, Codable, Hashable {
     /// User-assigned folder. nil = unfiled. Flat namespace (no nesting).
     var folder: String?
     /// The captured app's name when the recording came from an app-audio
-    /// (or meeting) capture — used to surface a Zoom-specific badge for
-    /// Zoom recordings without re-deriving from the title. nil for
+    /// (or meeting) capture — used to surface an app-specific badge (Zoom,
+    /// Microsoft Teams, …) without re-deriving from the title. nil for
     /// microphone-only or system-wide system-audio captures.
     var appName: String?
 
@@ -236,15 +236,19 @@ struct Recording: Identifiable, Codable, Hashable {
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 
-    /// True when the captured app appears to be Zoom (zoom.us / Zoom).
-    /// Used by list rows to surface a Zoom-specific badge. Falls back to a
-    /// title-substring check so app-audio recordings imported before we
-    /// started persisting `appName` still get the badge.
-    var isZoomRecording: Bool {
-        if let name = appName?.lowercased(), name.contains("zoom") {
-            return true
+    /// The known meeting app this recording appears to have come from, if
+    /// any. Checks `appName` first (set when the recording was started via
+    /// the manual "App Audio" picker), falling back to a `title`-substring
+    /// check so recordings captured before `appName` existed still match.
+    /// Used by list rows to surface an app-specific badge (e.g. Zoom-blue,
+    /// Teams-purple) instead of the generic source icon.
+    var detectedMeetingApp: MeetingApp? {
+        MeetingApp.allCases.first { app in
+            if let name = appName?.lowercased(), name.contains(app.info.matchSubstring) {
+                return true
+            }
+            return title.lowercased().contains(app.info.matchSubstring)
         }
-        return title.lowercased().contains("zoom")
     }
 }
 

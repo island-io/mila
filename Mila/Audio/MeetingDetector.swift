@@ -47,15 +47,21 @@ final class MeetingDetector: ObservableObject {
         let meetingTitleHints: [String]
     }
 
-    /// Supported meeting apps. Zoom is the only one implemented now;
-    /// adding Google Meet / Teams later is an entry here (they'd use the
-    /// same mic-capture signal, keyed on their own bundle IDs).
+    /// Supported meeting apps. Adding a new app (e.g. Google Meet) is just
+    /// another entry here — they'd use the same mic-capture signal, keyed
+    /// on their own bundle IDs.
     static let supportedApps: [App] = [
         App(
             bundleID: "us.zoom.xos",
             displayName: "Zoom",
             captureBundlePrefixes: ["us.zoom"],
             meetingTitleHints: ["zoom meeting"]
+        ),
+        App(
+            bundleID: "com.microsoft.teams2",
+            displayName: "Microsoft Teams",
+            captureBundlePrefixes: ["com.microsoft.teams2"],
+            meetingTitleHints: ["microsoft teams"]
         )
     ]
 

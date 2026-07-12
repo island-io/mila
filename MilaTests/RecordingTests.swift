@@ -117,29 +117,47 @@ final class RecordingTests: XCTestCase {
         }
     }
 
-    func test_is_zoom_recording_detects_app_name() {
+    func test_detected_meeting_app_detects_zoom_by_app_name() {
         let zoomByApp = Recording(
             title: "Standup · Apr 1",
             source: .systemAudio,
             audioFileName: "x.wav",
             appName: "zoom.us"
         )
-        XCTAssertTrue(zoomByApp.isZoomRecording)
+        XCTAssertEqual(zoomByApp.detectedMeetingApp, .zoom)
 
         let zoomByTitle = Recording(
             title: "Zoom · Yesterday",
             source: .systemAudio,
             audioFileName: "x.wav"
         )
-        XCTAssertTrue(zoomByTitle.isZoomRecording,
-                      "Legacy recordings without appName should still match via title prefix")
+        XCTAssertEqual(zoomByTitle.detectedMeetingApp, .zoom,
+                      "Legacy recordings without appName should still match via title")
 
         let unrelated = Recording(
             title: "Voice Memo",
             source: .microphone,
             audioFileName: "x.wav"
         )
-        XCTAssertFalse(unrelated.isZoomRecording)
+        XCTAssertNil(unrelated.detectedMeetingApp)
+    }
+
+    func test_detected_meeting_app_detects_teams_by_app_name() {
+        let teamsByApp = Recording(
+            title: "Standup · Apr 1",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "Microsoft Teams"
+        )
+        XCTAssertEqual(teamsByApp.detectedMeetingApp, .teams)
+
+        let teamsByTitle = Recording(
+            title: "Teams · Yesterday",
+            source: .systemAudio,
+            audioFileName: "x.wav"
+        )
+        XCTAssertEqual(teamsByTitle.detectedMeetingApp, .teams,
+                      "Legacy recordings without appName should still match via title")
     }
 
     func test_appName_round_trips_through_codable() throws {
