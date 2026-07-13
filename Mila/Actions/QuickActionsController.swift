@@ -688,22 +688,18 @@ final class QuickActionsController: ObservableObject {
         if let diar = liveDiarizer {
             liveTranscriber?.applySpeakerLabels(diar.intervals)
         }
-        // Push one final feed with the post-drain transcript so the
-        // LLM tail covers up to stop. Mirrors `.idle` handler's
-        // behavior; we skip the .idle drain here so we have to do
-        // the feed ourselves. `awaitFinalTick` then drains both the
-        // tick this feed kicks off AND any in-flight tick.
-        if liveAISettings?.enabled == true,
-           llmSettings?.isConfigured == true,
-           let transcriber = liveTranscriber {
-            let text = transcriber.formattedTranscript
-            if !text.isEmpty {
-                // Stop-time flush — bypass the min-interval floor so the
-                // final tick covers up to stop (awaitFinalTick drains it).
-                liveAISession?.feed(transcript: text, immediate: true)
-            }
-        }
-        await liveAISession?.awaitFinalTick()
+        // The final Live-AI summary tick is deliberately NOT awaited here.
+        // It used to run inline (feed the post-drain transcript, then
+        // `awaitFinalTick()` the resulting `claude` call), which held the
+        // Record button on "Finalizing…" for the whole summary subprocess —
+        // several seconds on a real conversation — even though the transcript
+        // was already complete and on screen. We now snapshot whatever the
+        // rolling live summary / action items are RIGHT NOW (for instant
+        // display in the post-record sheet), free the button below the
+        // instant the transcript is saved, and let `finalizeTail` regenerate
+        // the summary from the full transcript in the background. The saved
+        // summary upgrades in place a few seconds later, queue-style.
+        // See island-io/mila#86.
 
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
@@ -881,11 +877,24 @@ final class QuickActionsController: ObservableObject {
                         }
                     }
                 }
-                // Write the SRT sidecar + trigger the summarizer ourselves (the
-                // enqueue path normally runs both via its onTranscriptionCompleted
-                // hook).
+                // Write the SRT sidecar, then produce the summary in the
+                // background — the record button is already free while this
+                // runs. `stopRecording` no longer awaits the final Live-AI
+                // summary tick inline (island-io/mila#86), so the rolling
+                // summary snapshotted onto the recording can be a
+                // throttle-interval stale (missing the tail of the
+                // conversation). For a Live-AI recording, regenerate from the
+                // FULL transcript here so the saved summary is complete — this
+                // faithfully replaces the removed inline tick, under the same
+                // enabled + configured conditions. `summarizeIfNeeded` covers
+                // the Live-AI-off case under the normal auto-summary gate.
                 TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
-                self.summarizer?.summarizeIfNeeded(updated)
+                if self.liveAISettings?.enabled == true,
+                   self.llmSettings?.isConfigured == true {
+                    self.summarizer?.regenerate(updated)
+                } else {
+                    self.summarizer?.summarizeIfNeeded(updated)
+                }
                 // Shrink storage: the live transcript is authoritative and the
                 // rediarize above is done reading the WAV, so transcode it to
                 // m4a in the background. (The batch path does this via its own

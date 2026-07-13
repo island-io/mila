@@ -296,6 +296,74 @@ final class QuickActionsControllerTests: XCTestCase {
                        "the heavy finalize tail must run with the record button free")
     }
 
+    /// island-io/mila#86: `stopRecording` no longer blocks the Record button
+    /// on the final Live-AI summary tick. Instead, for an authoritative
+    /// Live-AI recording, `finalizeTail` regenerates the summary from the FULL
+    /// transcript in the BACKGROUND — so a rolling summary that was a
+    /// throttle-interval stale at stop time (missing the tail of the
+    /// conversation) gets refreshed with the finalize flag already clear.
+    func test_finalize_tail_regenerates_live_ai_summary_in_background() async throws {
+        // Live AI on + claude configured, on isolated suites.
+        let llmSuite = "QuickActionsControllerTests.llm.regen"
+        let liveSuite = "QuickActionsControllerTests.live.regen"
+        UserDefaults().removePersistentDomain(forName: llmSuite)
+        UserDefaults().removePersistentDomain(forName: liveSuite)
+        let llm = LLMSettings(defaults: UserDefaults(suiteName: llmSuite)!)
+        llm.tool = .claude
+        let liveAI = LiveAISettings(defaults: UserDefaults(suiteName: liveSuite)!)
+        liveAI.enabled = true
+        liveAI.model = ""
+        defer {
+            UserDefaults().removePersistentDomain(forName: llmSuite)
+            UserDefaults().removePersistentDomain(forName: liveSuite)
+        }
+
+        // Stubbed summarizer standing in for the real full-transcript claude
+        // call — echoes the transcript so the assertion can prove the summary
+        // was regenerated from the WHOLE transcript, not the stale rolling one.
+        let summarizer = RecordingSummarizer(store: store,
+                                             llmSettings: llm,
+                                             liveAISettings: liveAI,
+                                             runLLM: { _, _, transcript, _, _, _, _ in
+            "COMPLETE: \(transcript)"
+        })
+        controller.llmSettings = llm
+        controller.liveAISettings = liveAI
+        controller.summarizer = summarizer
+
+        // A freshly-stopped Live-AI recording: authoritative live segments
+        // covering the whole conversation, but a STALE rolling summary.
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.recordingsDirectory.appendingPathComponent("regen.wav")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.6)
+        var recording = Recording(
+            title: "regen-recording",
+            duration: 0.6,
+            source: .microphone,
+            audioFileName: url.lastPathComponent,
+            status: .completed,
+            language: languageSettings.current.rawValue,
+            segments: [TranscriptSegment(start: 0, end: 0.6,
+                                         text: "the whole conversation including the tail")],
+            fullText: "the whole conversation including the tail"
+        )
+        recording.summary = "stale rolling summary"
+        store.add(recording)
+
+        // The button is already free by the time the tail runs.
+        controller.isFinalizingRecording = false
+        controller.finalizeTail(for: recording, liveTranscriptIsAuthoritative: true)
+        await controller.awaitFinalizeTails()
+        await summarizer.awaitInFlight(recording.id)
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(stored.summary, "COMPLETE: the whole conversation including the tail",
+                       "finalizeTail must regenerate the Live-AI summary from the full transcript in the background")
+        XCTAssertFalse(controller.isFinalizingRecording,
+                       "summary regeneration must run with the record button free")
+    }
+
     // MARK: - Re-diarize gate (skip when the live pass found few speakers)
 
     /// The offline re-diarize only fixes the online diarizer's
