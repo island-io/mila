@@ -444,8 +444,24 @@ enum SpeakerDiarizer {
                 result["code"] = "missing_pyannote"
                 result["error"] = f"pyannote.audio not installed: {e}"
         except Exception as e:
-            result["code"] = "unknown"
-            result["error"] = f"{type(e).__name__}: {e}"
+            msg = f"{type(e).__name__}: {e}"
+            # dlopen refusing to map torch's dylibs is macOS library
+            # validation (hardened runtime), not a broken install: the
+            # interpreter is missing the disable-library-validation
+            # entitlement, so the ad-hoc-signed torch dylibs are rejected
+            # with "different Team IDs" / "code signature ... not valid".
+            # Promote it to a stable code so the Swift side does NOT take
+            # the wipe-and-reinstall path — a reinstall produces the same
+            # ad-hoc signatures and the same refusal.
+            if isinstance(e, OSError) and (
+                "different Team IDs" in msg
+                or "code signature" in msg
+                or "not valid for use in process" in msg
+            ):
+                result["code"] = "codesign_blocked"
+            else:
+                result["code"] = "unknown"
+            result["error"] = msg
 
         json.dump(result, sys.stdout)
         """

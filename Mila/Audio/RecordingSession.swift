@@ -57,6 +57,11 @@ final class RecordingSession: ObservableObject {
     /// up) instead of losing it; only a genuinely stuck mic clock reaches the
     /// cap, and `consumeSystem` logs when it trims so the loss isn't silent.
     private let maxPendingSystem = Int(WhisperAudioFormat.sampleRate) * 30
+    /// Count of overflow flushes this recording — used to throttle the
+    /// overflow log line (a stall arrives as thousands of ~320-sample SCK
+    /// buffers; logging each one buried a diagnostic bundle in ~3k
+    /// identical lines).
+    private var overflowFlushesSinceStart = 0
     private let writeQueue = DispatchQueue(label: "io.island.mila.recording-write")
 
     /// Fired with each post-mix sample chunk so the live transcriber
@@ -82,6 +87,7 @@ final class RecordingSession: ObservableObject {
         self.source = source
         self.fileURL = outputURL
         self.writesSinceStart = 0
+        self.overflowFlushesSinceStart = 0
         self.isFakeForTesting = false
         // Never inherit a stale system-audio tail from the previous
         // recording: a `consumeSystem` call that was already dequeued when
@@ -269,13 +275,29 @@ final class RecordingSession: ObservableObject {
         // in `consumeMic`. Bound the backlog so a stalled mic clock can't grow
         // it without limit. The cap is generous (~30s), so an SCK burst at
         // session start or slow clock skew just delays app audio until the mic
-        // clock catches up — it isn't dropped. Trimming only happens if the
-        // mic clock is genuinely stuck, and we log it so it's not silent.
+        // clock catches up — it isn't dropped.
         pendingSystem.append(contentsOf: samples)
         if pendingSystem.count > maxPendingSystem {
-            let dropped = pendingSystem.count - maxPendingSystem
-            pendingSystem.removeFirst(dropped)
-            recLog.error("system jitter buffer overflow — dropped \(dropped, privacy: .public) samples (mic clock stalled?)")
+            // Hitting the cap means the mic clock has stalled outright
+            // (display sleep/wake, input device yanked) while
+            // ScreenCaptureKit kept delivering. The old behavior discarded
+            // the oldest span, which cost a real user ~58 seconds of the
+            // other side of a meeting after a display wake (2,883
+            // consecutive 320-sample drops in one diagnostic bundle). The
+            // mic isn't producing anything during a stall, so nothing is
+            // being written — flush the overflow straight to the WAV and
+            // the live feed instead (system-only, full scale, exactly what
+            // `flushPendingSystemTail` does at stop). When the mic clock
+            // resumes, mixing continues from the ≤30s still buffered.
+            let overflowCount = pendingSystem.count - maxPendingSystem
+            let overflow = Array(pendingSystem.prefix(overflowCount))
+            pendingSystem.removeFirst(overflowCount)
+            overflowFlushesSinceStart += 1
+            if overflowFlushesSinceStart == 1 || overflowFlushesSinceStart % 100 == 0 {
+                recLog.error("system jitter buffer overflow #\(self.overflowFlushesSinceStart, privacy: .public) — mic clock stalled; flushing \(overflow.count, privacy: .public) samples to the WAV instead of dropping")
+            }
+            if let onLive = onLiveSamples { onLive(overflow[0..<overflow.count]) }
+            await write(overflow)
         }
     }
 

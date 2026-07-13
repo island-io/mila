@@ -335,8 +335,14 @@ struct LiveAIRecordingView: View {
                     // grew ~linearly with recording length. Lazy keeps it
                     // O(visible) — flat regardless of transcript size.
                     LazyVStack(alignment: .leading, spacing: 6) {
+                        // .debug, not .log: this fires on every SwiftUI
+                        // body invalidation (hundreds per segment), and at
+                        // default persistence it accounted for ~79% of a
+                        // real user's diagnostic bundle. Debug entries
+                        // stream to Console when attached but aren't
+                        // persisted into log collect / diagnostics.
                         let _ = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LiveAIRecordingView")
-                            .log("render segments.count=\(transcriber.segments.count, privacy: .public)")
+                            .debug("render segments.count=\(transcriber.segments.count, privacy: .public)")
                         if transcriber.segments.isEmpty {
                             Text("Listening…")
                                 .font(.callout)

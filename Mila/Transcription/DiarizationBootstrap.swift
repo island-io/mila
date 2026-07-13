@@ -179,8 +179,35 @@ final class DiarizationBootstrap: ObservableObject {
     }
 
     /// Kick off the bootstrap. Idempotent — if torch is already installed,
-    /// returns without doing anything.
+    /// returns without doing anything. Concurrent callers coalesce onto a
+    /// single in-flight run: on launch this can be entered twice at once
+    /// (MilaApp's `.task` via `startAutoBootstrapIfNeeded`, and the health
+    /// check's self-heal via `nuclearRepair`), and without the guard the two
+    /// runs interleaved — duplicate wheel downloads, two pip installs racing
+    /// into the same --target dir, and `reinstall()`'s directory wipe
+    /// landing mid-install, leaving the stage stuck in `downloadingTorch`.
     func bootstrapIfNeeded() async {
+        if let running = inFlightBootstrap {
+            await running.value
+            return
+        }
+        // Clear the slot INSIDE the task, as its last statement — that runs
+        // strictly before any awaiter of `task.value` resumes, so a caller
+        // that queued behind this run (e.g. `reinstall()`) sees nil and can
+        // start a fresh run instead of short-circuiting on a completed task.
+        let task = Task {
+            await self.performBootstrap()
+            self.inFlightBootstrap = nil
+        }
+        inFlightBootstrap = task
+        await task.value
+    }
+
+    /// The in-flight bootstrap, when one is running. `@MainActor` on the
+    /// class makes the check-then-set in `bootstrapIfNeeded` race-free.
+    private var inFlightBootstrap: Task<Void, Never>?
+
+    private func performBootstrap() async {
         refreshReadyState()
         if isReady { return }
 
@@ -233,6 +260,11 @@ final class DiarizationBootstrap: ObservableObject {
     /// Resets the user-writable site-packages and re-runs bootstrap. For
     /// the manual "Reinstall" button in Settings.
     func reinstall() async {
+        // Let any in-flight bootstrap finish before wiping the directory.
+        // Deleting site-packages out from under a running `pip install
+        // --target` leaves a half-written tree whose torch/torchaudio
+        // `__init__.py` presence check can then mis-report as installed.
+        if let running = inFlightBootstrap { await running.value }
         try? fileManager.removeItem(at: sitePackagesURL)
         isReady = false
         stage = .notStarted

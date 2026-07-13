@@ -220,6 +220,14 @@ final class DiarizationSettings: ObservableObject {
     @Published private(set) var healthCheckResult: SpeakerDiarizer.HealthCheckResult?
     @Published private(set) var isHealthChecking = false
 
+    /// Seam for tests. Production always points at the static
+    /// `SpeakerDiarizer.healthCheck`; `DiarizationSettingsTests` swaps in a
+    /// stub so the self-heal decision table (which codes trigger a repair,
+    /// which must surface untouched) can be exercised without spawning a
+    /// python subprocess or touching the network.
+    var healthCheckRunner: (String) async throws -> SpeakerDiarizer.HealthCheckResult
+        = SpeakerDiarizer.healthCheck
+
     var status: SetupStatus {
         guard isEnabled else { return .disabled }
         guard pythonFound else { return .pythonNotFound }
@@ -348,6 +356,22 @@ final class DiarizationSettings: ObservableObject {
                     }
                     isInstalling = false
                     lastCode = result.code
+                case "codesign_blocked":
+                    // macOS library validation refused to map the torch
+                    // dylibs into the interpreter ("different Team IDs").
+                    // That's a signing/entitlement problem on the python
+                    // binary, not a broken install: `nuclearRepair` would
+                    // wipe the site-packages, re-download the ~62 MB
+                    // wheels, ad-hoc re-sign them — and hit the exact same
+                    // refusal. On a machine in this state, taking the
+                    // repair path here meant a destructive re-download on
+                    // EVERY launch with diarization still dead at the end
+                    // of it (observed live in a user diagnostic: bootstrap
+                    // pinned at downloadingTorch while the health check
+                    // kept reporting the dlopen error). Surface it so
+                    // Settings can show an actionable message instead.
+                    healthCheckResult = result
+                    return
                 default:
                     // Non-recoverable error code (e.g. "unknown" — common
                     // when pyannote internally swallows a ModuleNotFoundError
@@ -454,7 +478,7 @@ final class DiarizationSettings: ObservableObject {
 
     private func runHealthCheckOnce() async -> SpeakerDiarizer.HealthCheckResult {
         do {
-            return try await SpeakerDiarizer.healthCheck(pythonPath: pythonPath)
+            return try await healthCheckRunner(pythonPath)
         } catch {
             return SpeakerDiarizer.HealthCheckResult(
                 ok: false, error: error.localizedDescription

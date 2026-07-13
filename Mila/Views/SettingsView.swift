@@ -1278,7 +1278,15 @@ private struct DiarizationSettingsTabContent: View {
     private var healthLabel: String {
         if diarization.isHealthChecking { return "Checking…" }
         guard let result = diarization.healthCheckResult else { return "Not checked yet" }
-        return result.ok ? "Speaker detection is working" : "Speaker detection unavailable"
+        if result.ok { return "Speaker detection is working" }
+        // Library validation refused torch's dylibs — reinstalling the
+        // Python packages can't fix that (the health check deliberately
+        // skips auto-repair for this code); the app binary itself needs
+        // its release entitlements. Point the user at the actual fix.
+        if result.code == "codesign_blocked" {
+            return "Speaker detection blocked by macOS code signing — reinstall Mila from the official download"
+        }
+        return "Speaker detection unavailable"
     }
 }
 
