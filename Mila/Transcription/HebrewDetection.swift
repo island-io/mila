@@ -27,4 +27,23 @@ extension String {
         }
         return hebrew > latin
     }
+
+    /// Cyrillic character count (Unicode scalars U+0400..U+04FF) must constitute
+    /// at least 30% of the total letter characters (Cyrillic + Latin) in the text.
+    var isPredominantlyCyrillic: Bool {
+        var cyrillic = 0
+        var latin = 0
+        for scalar in self.unicodeScalars {
+            let value = scalar.value
+            if value >= 0x0400 && value <= 0x04FF {
+                cyrillic += 1
+            } else if (value >= 0x0041 && value <= 0x005A)
+                   || (value >= 0x0061 && value <= 0x007A) {
+                latin += 1
+            }
+        }
+        let total = cyrillic + latin
+        guard total > 0 else { return false }
+        return Double(cyrillic) / Double(total) >= 0.3
+    }
 }

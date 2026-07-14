@@ -18,9 +18,9 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         try await super.tearDown()
     }
 
-    func test_fresh_install_defaults_to_hebrew() {
+    func test_fresh_install_defaults_to_english() {
         let settings = RecordingLanguageSettings(defaults: defaults)
-        XCTAssertEqual(settings.current, .hebrew)
+        XCTAssertEqual(settings.current, .english)
     }
 
     func test_assignment_persists_across_instances() {

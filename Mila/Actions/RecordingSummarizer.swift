@@ -319,11 +319,19 @@ final class RecordingSummarizer: ObservableObject {
         let promptLanguageName: String = {
             switch liveAISettings.outputLanguage {
             case .auto:
-                return recording.fullText.isPredominantlyHebrew ? "Hebrew" : "English"
+                if recording.language == "ru" || recording.fullText.isPredominantlyCyrillic {
+                    return "Russian"
+                } else if recording.fullText.isPredominantlyHebrew {
+                    return "Hebrew"
+                } else {
+                    return "English"
+                }
             case .english:
                 return "English"
             case .hebrew:
                 return "Hebrew"
+            case .russian:
+                return "Russian"
             }
         }()
         let prompt = liveAISettings.summaryPrompt

@@ -66,6 +66,7 @@ struct LiveAIRecordingView: View {
         switch liveAISettings.outputLanguage {
         case .hebrew: return true
         case .english: return false
+        case .russian: return false
         case .auto:
             if language == "he" { return true }
             let combined = aiSession.summary + " "

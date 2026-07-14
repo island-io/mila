@@ -297,11 +297,19 @@ final class LiveAISession: ObservableObject {
         let promptLanguageName: String = {
             switch liveAISettings.outputLanguage {
             case .auto:
-                return snapshot.isPredominantlyHebrew ? "Hebrew" : "English"
+                if snapshot.isPredominantlyCyrillic {
+                    return "Russian"
+                } else if snapshot.isPredominantlyHebrew {
+                    return "Hebrew"
+                } else {
+                    return "English"
+                }
             case .english:
                 return "English"
             case .hebrew:
                 return "Hebrew"
+            case .russian:
+                return "Russian"
             }
         }()
         let prompt = liveAISettings.prompt

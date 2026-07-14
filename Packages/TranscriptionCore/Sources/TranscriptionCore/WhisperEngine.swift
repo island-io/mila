@@ -350,7 +350,8 @@ public actor WhisperEngine {
             let t1 = Double(whisper_full_get_segment_t1(ctx, Int32(i))) / 100.0
             let cText = whisper_full_get_segment_text(ctx, Int32(i))
             let text = cText.flatMap { String(cString: $0) } ?? ""
-            segments.append(TranscriptSegment(start: t0, end: t1, text: text))
+            let cleanedText = Self.cleanWhisperText(text)
+            segments.append(TranscriptSegment(start: t0, end: t1, text: cleanedText))
         }
         return segments
     }
@@ -526,6 +527,30 @@ public actor WhisperEngine {
         var out = samples
         for i in 0..<out.count { out[i] = max(-1, min(1, out[i] * gain)) }
         return out
+    }
+
+    /// Clean Whisper hallucinations like subtitle credits.
+    public static func cleanWhisperText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = trimmed.lowercased()
+        
+        // Remove trailing punctuation like dots/commas for check
+        let cleanedForCheck = lowercased.trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.whitespacesAndNewlines))
+        
+        let patterns = [
+            "dimatorzok",
+            "субтитры создавал",
+            "субтитры создали",
+            "subtitles by"
+        ]
+        
+        for pattern in patterns {
+            if cleanedForCheck == pattern || cleanedForCheck.contains(pattern) {
+                return ""
+            }
+        }
+        
+        return text
     }
 }
 

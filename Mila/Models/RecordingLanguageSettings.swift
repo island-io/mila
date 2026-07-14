@@ -10,6 +10,7 @@ import Combine
 enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
     case hebrew = "he"
     case english = "en"
+    case russian = "ru"
     /// Let whisper detect the language of each utterance instead of forcing
     /// one. Whisper's `detect_language` runs per `whisper_full` call, and the
     /// live path transcribes one VAD-bounded utterance per call — so this
@@ -26,6 +27,7 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .hebrew:  return "Hebrew"
         case .english: return "English"
+        case .russian: return "Russian"
         case .auto:    return "Auto-detect"
         }
     }
@@ -37,6 +39,7 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .hebrew:  return "🇮🇱"
         case .english: return "🇬🇧"
+        case .russian: return "🇷🇺"
         case .auto:    return "🌐"
         }
     }
@@ -49,6 +52,7 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .hebrew:  return .english
         case .english: return .hebrew
+        case .russian: return .english
         case .auto:    return .hebrew
         }
     }
@@ -62,6 +66,7 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
         if normalized == "auto" { return .auto }
         if normalized == "iw" || normalized.hasPrefix("he") { return .hebrew }
         if normalized.hasPrefix("en") { return .english }
+        if normalized.hasPrefix("ru") { return .russian }
         return .hebrew
     }
 }
@@ -85,7 +90,7 @@ final class RecordingLanguageSettings: ObservableObject {
            let stored = RecordingLanguage(rawValue: raw) {
             self.current = stored
         } else {
-            self.current = .hebrew
+            self.current = .english
         }
     }
 }

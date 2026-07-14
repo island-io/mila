@@ -147,11 +147,15 @@ struct RecordingDetailView: View {
                     Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
                           systemImage: "arrow.clockwise")
                 }
-                Button {
-                    retranscribe(in: currentLang.other)
-                } label: {
-                    Label("\(currentLang.other.flagEmoji) \(currentLang.other.displayName)",
-                          systemImage: "arrow.triangle.2.circlepath")
+                ForEach(RecordingLanguage.allCases) { lang in
+                    if lang != currentLang {
+                        Button {
+                            retranscribe(in: lang)
+                        } label: {
+                            Label("\(lang.flagEmoji) \(lang.displayName)",
+                                  systemImage: "arrow.triangle.2.circlepath")
+                        }
+                    }
                 }
             } label: {
                 Image(systemName: "text.badge.checkmark")
@@ -359,9 +363,15 @@ struct RecordingDetailView: View {
                                  ? .rightToLeft : .leftToRight)
                 }
                 .contextMenu {
-                    let other = RecordingLanguage.fromCode(recording.language).other
-                    Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
-                        retranscribe(in: other)
+                    let currentLang = RecordingLanguage.fromCode(recording.language)
+                    Menu("Re-transcribe in") {
+                        ForEach(RecordingLanguage.allCases) { lang in
+                            if lang != currentLang {
+                                Button("\(lang.flagEmoji) \(lang.displayName)") {
+                                    retranscribe(in: lang)
+                                }
+                            }
+                        }
                     }
                     Button("Copy transcript") { copyTranscript() }
                         .disabled(recording.fullText.isEmpty)
