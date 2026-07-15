@@ -351,7 +351,9 @@ public actor WhisperEngine {
             let cText = whisper_full_get_segment_text(ctx, Int32(i))
             let text = cText.flatMap { String(cString: $0) } ?? ""
             let cleanedText = Self.cleanWhisperText(text)
-            segments.append(TranscriptSegment(start: t0, end: t1, text: cleanedText))
+            if !cleanedText.isEmpty {
+                segments.append(TranscriptSegment(start: t0, end: t1, text: cleanedText))
+            }
         }
         return segments
     }
@@ -536,8 +538,8 @@ public actor WhisperEngine {
     /// one. The credit is always trailing — a name or "Amara.org" follows the
     /// phrase — so we cut from the first credit fragment to the end of the
     /// segment and keep any real speech that preceded it. When the whole
-    /// segment was a credit, the remainder has no letters and we return "",
-    /// which the caller drops via its `isEmpty` guard.
+    /// segment was a credit, the remainder has no letters or digits and we
+    /// return "", which the caller drops via its `isEmpty` guard.
     ///
     /// Matching is a case-insensitive substring search rather than an exact
     /// equality check: whisper credits come with trailing names, casing
@@ -564,10 +566,10 @@ public actor WhisperEngine {
         }
         
         let trimmedKept = keptText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasLetters = trimmedKept.unicodeScalars.contains { scalar in
-            CharacterSet.letters.contains(scalar)
+        let hasAlphanumerics = trimmedKept.unicodeScalars.contains { scalar in
+            CharacterSet.alphanumerics.contains(scalar)
         }
-        guard hasLetters else { return "" }
+        guard hasAlphanumerics else { return "" }
         
         let leadingWhitespace = text.prefix(while: { $0.isWhitespace })
         return leadingWhitespace + trimmedKept
