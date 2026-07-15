@@ -626,7 +626,20 @@ final class OpenAIProviderTests: XCTestCase {
 /// `release()` if one was staged — so the "cancel wins over a late response"
 /// assertion is expressible).
 final class RecordingTransport: OpenAITransport, @unchecked Sendable {
-    private(set) var requests: [URLRequest] = []
+    // `requests` and `hang` are touched from the `send` task and, for `hang`,
+    // from the cancellation handler / `release()` — which run on different
+    // contexts. The lock serializes all of those accesses so the
+    // `@unchecked Sendable` conformance is honest and a cancellation race can
+    // neither miss the wakeup nor double-resume the `CheckedContinuation`
+    // (a double resume is a fatal error). `cannedResponse`/`cannedError`/
+    // `hangUntilCancelled` are set before the `send` task starts and only read
+    // inside it, so they need no guard.
+    private let lock = NSLock()
+    private var _requests: [URLRequest] = []
+    var requests: [URLRequest] {
+        lock.lock(); defer { lock.unlock() }
+        return _requests
+    }
     var cannedResponse: (HTTPURLResponse, Data)?
     var cannedError: Error?
     var hangUntilCancelled = false
@@ -641,18 +654,27 @@ final class RecordingTransport: OpenAITransport, @unchecked Sendable {
     deinit {}
 
     func send(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
-        requests.append(request)
+        lock.lock()
+        _requests.append(request)
+        lock.unlock()
         if let cannedError { throw cannedError }
         if hangUntilCancelled {
             let cancelled: Bool = await withTaskCancellationHandler {
                 await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-                    if Task.isCancelled { cont.resume(); return }
+                    self.lock.lock()
+                    if Task.isCancelled {
+                        self.lock.unlock()
+                        cont.resume(); return
+                    }
                     self.hang = cont
+                    self.lock.unlock()
                 }
                 return Task.isCancelled
             } onCancel: {
-                self.hang?.resume()
-                self.hang = nil
+                // Route through `release()` so there's a single resume path;
+                // the lock + nil-after-extract makes a double resume impossible
+                // even if cancellation and a manual `release()` both fire.
+                self.release()
             }
             if cancelled || Task.isCancelled { throw URLError(.cancelled) }
             // Resumed by `release()` with a staged response.
@@ -663,10 +685,16 @@ final class RecordingTransport: OpenAITransport, @unchecked Sendable {
         return cannedResponse
     }
 
-    /// Release a hanging `send` (for the "late response" assertion).
+    /// Release a hanging `send` (for the "late response" assertion). Extracts
+    /// the continuation under the lock and resumes *after* unlocking, so a
+    /// concurrent cancellation (or a second `release()`) finds `hang == nil`
+    /// and no-ops instead of double-resuming.
     func release() {
-        hang?.resume()
+        lock.lock()
+        let cont = hang
         hang = nil
+        lock.unlock()
+        cont?.resume()
     }
 }
 
