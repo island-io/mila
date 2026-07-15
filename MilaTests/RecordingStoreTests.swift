@@ -1,4 +1,5 @@
 import XCTest
+import MilaKit
 @testable import Mila
 
 @MainActor
@@ -596,5 +597,30 @@ final class RecordingStoreTests: XCTestCase {
         store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
         XCTAssertEqual(store.softDeleteVoiceMemos(fromFolderID: "FOLDER-UNKNOWN"), 0)
         XCTAssertFalse(store.recordings.first?.isTrashed ?? true)
+    }
+
+    // MARK: - Store-location pointer (mila-mcp discovery contract)
+
+    func test_init_writes_store_location_pointer_at_root() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let pointer = try XCTUnwrap(StoreLocationPointer.read(from: tempRoot))
+        XCTAssertEqual(pointer.recordingsDirectory, store.recordingsDirectory.path)
+        XCTAssertEqual(pointer.storeFile, store.storeURL.path)
+    }
+
+    func test_relocate_updates_pointer_and_reset_restores_it() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let custom = tempRoot.appendingPathComponent("Elsewhere", isDirectory: true)
+
+        store.relocateRecordings(to: custom)
+        var pointer = try XCTUnwrap(StoreLocationPointer.read(from: tempRoot))
+        XCTAssertEqual(pointer.recordingsDirectory, custom.path)
+        XCTAssertEqual(pointer.storeFile,
+                       custom.appendingPathComponent("recordings.json").path)
+
+        store.relocateRecordings(to: nil)
+        pointer = try XCTUnwrap(StoreLocationPointer.read(from: tempRoot))
+        XCTAssertEqual(pointer.recordingsDirectory,
+                       store.defaultRecordingsDirectory.path)
     }
 }
