@@ -244,8 +244,9 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         if let segments = parsed.segments, !segments.isEmpty {
             let mapped = segments.compactMap { seg -> TranscriptSegment? in
                 let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else { return nil }
-                return TranscriptSegment(start: seg.start, end: seg.end, text: seg.text)
+                let cleaned = WhisperEngine.cleanWhisperText(text)
+                guard !cleaned.isEmpty else { return nil }
+                return TranscriptSegment(start: seg.start, end: seg.end, text: cleaned)
             }
             if !mapped.isEmpty { return mapped }
         }
@@ -255,7 +256,9 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         // spanning the whole clip.
         if let text = parsed.text?.trimmingCharacters(in: .whitespacesAndNewlines),
            !text.isEmpty {
-            return [TranscriptSegment(start: 0, end: parsed.duration ?? 0, text: text)]
+            let cleaned = WhisperEngine.cleanWhisperText(text)
+            guard !cleaned.isEmpty else { throw RemoteError.emptyResult }
+            return [TranscriptSegment(start: 0, end: parsed.duration ?? 0, text: cleaned)]
         }
 
         throw RemoteError.emptyResult

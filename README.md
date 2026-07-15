@@ -3,9 +3,9 @@
 A native macOS app that records, dictates, and transcribes locally on your Mac
 — no audio leaves the device. Hebrew transcription is powered by the
 [ivrit.ai `large-v3` finetune](https://huggingface.co/ivrit-ai/whisper-large-v3-ggml)
-of Whisper, English by
-[OpenAI's `large-v3-turbo`](https://huggingface.co/ggerganov/whisper.cpp), both
-running through `whisper.cpp` (GPU via Metal).
+of Whisper; English, Russian, and other languages by
+[OpenAI's `large-v3-turbo`](https://huggingface.co/ggerganov/whisper.cpp), a
+multilingual model — both running through `whisper.cpp` (GPU via Metal).
 
 ## Features
 
@@ -13,12 +13,14 @@ running through `whisper.cpp` (GPU via Metal).
 - **Record system audio** from a single app (Zoom, Google Meet in Chrome,
   Slack, etc.) via `ScreenCaptureKit` — no virtual audio device required.
 - **Record meetings** = mic + system audio mixed into one mono 16 kHz WAV file.
-- **Dictate in two languages** with separate global hotkeys:
+- **Dictate in three languages** with separate global hotkeys:
     - `⌘2` — English dictation (OpenAI `large-v3-turbo`)
     - `⌘3` — Hebrew dictation (ivrit.ai `large-v3`)
-  Both hotkeys are user-configurable in **Settings → Hotkeys**.
+    - `⌘4` — Russian dictation (OpenAI `large-v3-turbo`)
+  All hotkeys are user-configurable in **Settings → Hotkeys**.
 - **Transcribe on-device** with ivrit.ai `large-v3` (Hebrew) or OpenAI
-  `large-v3-turbo` (English / multilingual). Audio never leaves your Mac.
+  `large-v3-turbo` (English, Russian, and 90+ other languages). Audio never
+  leaves your Mac.
 - **Transcribe on a remote server** — point Mila at any OpenAI-compatible
   `/v1/audio/transcriptions` endpoint (OpenAI's hosted Whisper API, or a
   self-hosted server) via **Settings → Models → Backend**. Useful on
@@ -38,7 +40,8 @@ running through `whisper.cpp` (GPU via Metal).
 - **Transcription queue** — view queued, in-progress, and recently-deleted jobs;
   stop or remove any item from the queue at any time.
 - **SRT export** (including mid-recording), per-segment timestamps, click to seek,
-  copy/share transcript, RTL rendering for Hebrew.
+  copy/share transcript, RTL rendering for Hebrew (Russian and other Latin/Cyrillic
+  scripts render left-to-right).
 - **Auto-discard accidental clips** — very short recordings with no speech are
   dropped automatically (threshold configurable in **Settings → Storage**).
 - **Opt into pre-release builds** via **Settings → Updates**.
@@ -51,10 +54,13 @@ To **run** Mila:
 - **Apple Silicon (M-series) strongly recommended.** Transcription runs on the
   Metal GPU (`whisper.cpp`) and speaker diarization on MPS/CPU (pyannote). Intel
   Macs fall back to CPU and are much slower.
-- **Disk:** ~4.6 GB for the two default Whisper models, downloaded on first
-  launch (ivrit.ai `large-v3` ~3.0 GB + OpenAI `large-v3-turbo` ~1.6 GB). Add
-  ~1 GB more if you enable speaker diarization (bundled Python runtime plus a
-  torch download on first enable).
+- **Disk:** depends on your system language. On a **Hebrew-locale** Mac, ~4.6 GB
+  for both default Whisper models downloaded on first launch (ivrit.ai
+  `large-v3` ~3.0 GB + OpenAI `large-v3-turbo` ~1.6 GB). On any other locale,
+  only the OpenAI `large-v3-turbo` model (~1.6 GB) is downloaded — it is
+  multilingual and covers English, Russian, and 90+ other languages, so no extra
+  model is fetched for non-Hebrew users. Add ~1 GB more if you enable speaker
+  diarization (bundled Python runtime plus a torch download on first enable).
 - **Memory (approximate):** 16 GB unified memory recommended. 8 GB is workable
   for plain transcription but tight with diarization. Rough working set: Hebrew
   `large-v3` ~3.5–4 GB, English `large-v3-turbo` ~1.5–2 GB, speaker diarization
@@ -92,14 +98,19 @@ release. The checksum is pinned in `Packages/WhisperBinary/Package.swift`.
 
 ## Models
 
-On first launch the app downloads both default models in the background:
+On first launch the app downloads the default model(s) in the background. Which
+ones depends on your system locale:
 
-- `ivrit-ai/whisper-large-v3-ggml` — Hebrew (~3.0 GB). Empirically more
-  accurate on Hebrew speech than the smaller `large-v3-turbo` finetune,
-  which is why we ship the larger one despite the size and ~2× inference
-  cost.
-- `openai whisper-large-v3-turbo` (the `ggerganov/whisper.cpp` build) —
-  English / multilingual (~1.6 GB).
+- **Hebrew-locale Macs** get both:
+  - `ivrit-ai/whisper-large-v3-ggml` — Hebrew (~3.0 GB). Empirically more
+    accurate on Hebrew speech than the smaller `large-v3-turbo` finetune,
+    which is why we ship the larger one despite the size and ~2× inference
+    cost.
+  - `openai whisper-large-v3-turbo` (the `ggerganov/whisper.cpp` build) —
+    English / multilingual (~1.6 GB).
+- **All other locales** get just the OpenAI `large-v3-turbo` model (~1.6 GB).
+  It is multilingual — English, Russian, and 90+ other languages all run on this
+  single model — so no extra weights are downloaded for non-Hebrew users.
 
 You can monitor progress in the in-app banner or pre-download from the CLI:
 
@@ -136,6 +147,54 @@ points at it via the Remote backend, audio stays on infrastructure you control),
 see **[docs/self-hosted-server/](docs/self-hosted-server/)**. That folder
 contains Kubernetes manifests and a step-by-step guide, plus an
 `example.milaconfig` you can hand to teammates for one-click setup.
+
+## Languages
+
+Mila ships with first-class support for **English**, **Hebrew**, and
+**Russian**. Each language surfaces in three places:
+
+- The **recording-language picker** on the home Record button (and in Settings),
+  which tells whisper which language to expect — or **Auto-detect**, which lets
+  whisper detect per utterance and so handles code-switching within a recording.
+- A dedicated **global dictation hotkey** (`⌘2` / `⌘3` / `⌘4`).
+- The **Re-transcribe in…** menu on any recording, which re-runs the audio
+  through a different language model.
+
+### Which model each language uses
+
+- **Hebrew** → ivrit.ai `large-v3` finetune (~3.0 GB, more accurate on Hebrew).
+- **English, Russian, and every other language** → OpenAI `large-v3-turbo`
+  (~1.6 GB), the single multilingual model `whisper.cpp` ships with. Russian
+  does **not** add a separate model download.
+
+When AI output is set to **Auto**, the LLM is asked to write in the same
+language as the transcript: Hebrew script routes to Hebrew, Cyrillic to Russian,
+otherwise English — so a recording's summary/action-items match its language
+without you picking one.
+
+### Adding another language
+
+Because every non-Hebrew language rides on the same multilingual OpenAI model,
+adding a language is a UI/data-layer change, not a model download. To add, say,
+French:
+
+1. Add `case french = "fr"` to `RecordingLanguage`
+   (`Mila/Models/RecordingLanguageSettings.swift`) — give it a `displayName`,
+   `flagEmoji`, and a branch in `fromCode(_:)`.
+2. Add the matching `case french` to `LiveAISettings.OutputLanguage`
+   (`Mila/Models/LiveAISettings.swift`) with `promptName` / `displayName`.
+3. If you want a dedicated dictation hotkey, add a `.dictateFrench` case to
+   `HotkeyAction` (`Mila/Dictation/HotkeyManager.swift`) with a `languageCode`,
+   `carbonID`, and default binding, then surface it in the `MilaApp` Dictation
+   menu and `HomeView`'s hint bar.
+4. If the language reads right-to-left, add a branch to the
+   `aiOutputIsRTL` / layout-direction checks in `LiveAIRecordingView.swift` and
+   `RecordingDetailView.swift`; LTR languages (like Russian) need no layout
+   change.
+
+The enum cases are exhaustive, so the compiler flags every spot that needs a new
+branch. No new model weights are required as long as the language is among the
+90+ that OpenAI's multilingual `large-v3-turbo` already supports.
 
 ## Required permissions
 
@@ -220,6 +279,7 @@ distribution via the App Store you'd:
 
 Newest first. Dates are release dates.
 
+- **Unreleased** — Added Russian as a first-class language: a dedicated `⌘4` dictation hotkey, a Russian option in the recording-language picker, Auto AI-output routing for Cyrillic text, and a dynamic "Re-transcribe in…" menu listing every installed language. Non-Hebrew-locale Macs now default to the smaller multilingual OpenAI `large-v3-turbo` model (~1.6 GB) on first launch instead of auto-downloading the ~3 GB Hebrew model.
 - **1.9.0** (2026-07-22) — Remote transcription server support (OpenAI-compatible API), one-click `.milaconfig` setup files, iPhone Voice Memos sync, named speaker labels, opt-in beta updates, hallucination reduction via neural VAD, adaptive gain for quiet mics, auto-discard of empty clips, stop/remove queue items, no more stuck "Queued" items after relaunch, color-coded speakers, mid-recording SRT export, automatic summaries toggle with configurable timeout, record button no longer waits on the previous summary, collapsible "All Transcriptions" sidebar section, CodeQL security scanning added to CI, and a large sweep of reliability fixes across audio capture, diarization, and UI.
 - **1.8.5** (2026-06-09) — Independent mic / app-audio capture toggles, AAC (`.m4a`) recordings, and a configurable recording-storage cap.
 - **1.8.4** (2026-06-09) — Fixed speaker diarization silently breaking in notarized builds (the bundled Python couldn't load torch's dylibs).

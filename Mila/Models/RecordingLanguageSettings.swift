@@ -44,19 +44,6 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
         }
     }
 
-    /// The opposite-language pair, used by the right-click "Re-transcribe in
-    /// the other language" menu item on a recording. Auto-detected
-    /// recordings offer a re-transcribe forced to Hebrew (the dominant
-    /// language for our users) as the manual override.
-    var other: RecordingLanguage {
-        switch self {
-        case .hebrew:  return .english
-        case .english: return .hebrew
-        case .russian: return .english
-        case .auto:    return .hebrew
-        }
-    }
-
     /// Best-effort decode of an ISO-style language string (`"he"`, `"he-IL"`,
     /// `"iw"`, `"en"`, `"en-US"`, `"auto"`, …). Falls back to Hebrew for
     /// legacy recordings that pre-date the per-language UX (those were always

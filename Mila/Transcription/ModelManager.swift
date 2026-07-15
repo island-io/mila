@@ -111,7 +111,7 @@ final class ModelManager: NSObject, ObservableObject {
         self.modelsDirectory = modelsDirectory
         let lastUsed = UserDefaults.standard.string(forKey: "selectedModelName")
         let defaultModel: WhisperModel
-        if Locale.current.language.languageCode == "he" || Locale.current.languageCode == "he" {
+        if Locale.current.language.languageCode?.identifier == "he" {
             defaultModel = .ivritLarge
         } else {
             defaultModel = .openaiTurbo

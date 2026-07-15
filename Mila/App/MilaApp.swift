@@ -1445,7 +1445,7 @@ struct MilaApp: App {
         // local weights. (The Models tab still offers manual downloads, and
         // switching back to local re-triggers this on next launch.)
         guard !remoteTranscriptionSettings.isActive else { return }
-        let isHebrewSystem = Locale.current.language.languageCode == "he" || Locale.current.languageCode == "he"
+        let isHebrewSystem = Locale.current.language.languageCode?.identifier == "he"
         if UserDefaults.standard.string(forKey: "selectedModelName") == nil {
             modelManager.setSelected(isHebrewSystem ? WhisperModel.ivritLarge : WhisperModel.openaiTurbo)
         }

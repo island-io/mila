@@ -529,28 +529,48 @@ public actor WhisperEngine {
         return out
     }
 
-    /// Clean Whisper hallucinations like subtitle credits.
+    /// Strip Whisper subtitle-credit hallucinations ("Субтитры создавал
+    /// DimaTorzok", "Subtitles by Amara.org", "DimaTorzok", …).
+    ///
+    /// Whisper emits these as a bare segment or tagged onto the tail of a real
+    /// one. The credit is always trailing — a name or "Amara.org" follows the
+    /// phrase — so we cut from the first credit fragment to the end of the
+    /// segment and keep any real speech that preceded it. When the whole
+    /// segment was a credit, the remainder has no letters and we return "",
+    /// which the caller drops via its `isEmpty` guard.
+    ///
+    /// Matching is a case-insensitive substring search rather than an exact
+    /// equality check: whisper credits come with trailing names, casing
+    /// variants, and occasional leading punctuation, so an exact match
+    /// ("subtitles by" == "subtitles by amara") would let real hallucinations
+    /// through. The fragments are specific enough that false positives on
+    /// legitimate speech are negligible.
     public static func cleanWhisperText(_ text: String) -> String {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowercased = trimmed.lowercased()
-        
-        // Remove trailing punctuation like dots/commas for check
-        let cleanedForCheck = lowercased.trimmingCharacters(in: CharacterSet.punctuationCharacters.union(.whitespacesAndNewlines))
-        
-        let patterns = [
-            "dimatorzok",
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
+
+        let creditFragments = [
             "субтитры создавал",
             "субтитры создали",
-            "subtitles by"
+            "subtitles by",
+            "dimatorzok"
         ]
         
-        for pattern in patterns {
-            if cleanedForCheck == pattern || cleanedForCheck.contains(pattern) {
-                return ""
+        var keptText = text
+        for fragment in creditFragments {
+            if let range = text.range(of: fragment, options: .caseInsensitive) {
+                keptText = String(text[..<range.lowerBound])
+                break
             }
         }
         
-        return text
+        let trimmedKept = keptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasLetters = trimmedKept.unicodeScalars.contains { scalar in
+            CharacterSet.letters.contains(scalar)
+        }
+        guard hasLetters else { return "" }
+        
+        let leadingWhitespace = text.prefix(while: { $0.isWhitespace })
+        return leadingWhitespace + trimmedKept
     }
 }
 
