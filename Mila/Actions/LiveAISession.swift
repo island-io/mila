@@ -499,6 +499,14 @@ TRANSCRIPT SO FAR:
         // cross-recording bleed bug (the session wasn't freshly started); a
         // healthy recording always opens with `.new`.
         liveAILog.log("tick \(kickTag, privacy: .public): session=\(String(describing: llmSession), privacy: .public) established=\(self.sessionEstablished, privacy: .public)")
+        // Capture the OpenAI endpoint config up front (kick-time snapshot).
+        // The Task below captures `[weak self]`, so touching `self.llmSettings`
+        // inside it would either require `self?.` (and read mid-flight state) or
+        // — as the bare access did — implicitly strong-capture self, defeating
+        // the weak capture (a Swift 6 error). Snapshotting here mirrors the
+        // `perform`/`kickSessionID` captures above. (CodeRabbit #1.)
+        let openAIBaseURL = llmSettings.openAIBaseURL
+        let openAIAPIKey = llmSettings.openAIAPIKey
         inFlight = Task { @MainActor [weak self] in
             let llmStart = Date()
             do {
@@ -514,8 +522,8 @@ TRANSCRIPT SO FAR:
                     // local OpenAI Live AI ticks hit `/chat/completions` with
                     // JSON mode + a low temperature for envelope reliability.
                     // Remote endpoints never reach here (gated above).
-                    openAIBaseURL: (tool == .openaiCompatible) ? llmSettings.openAIBaseURL : nil,
-                    openAIAPIKey: (tool == .openaiCompatible) ? llmSettings.openAIAPIKey : nil,
+                    openAIBaseURL: (tool == .openaiCompatible) ? openAIBaseURL : nil,
+                    openAIAPIKey: (tool == .openaiCompatible) ? openAIAPIKey : nil,
                     jsonMode: tool == .openaiCompatible,
                     temperature: tool == .openaiCompatible ? 0.2 : nil
                 ))

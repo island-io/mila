@@ -42,19 +42,34 @@ final class LLMSettingsOpenAIReadinessTests: XCTestCase {
         XCTAssertFalse(s.isConfigured)
     }
 
-    /// AC-READY-04
-    func test_isConfigured_trueForOpenAI_whenBaseURLPresent() {
+    /// AC-READY-04 — a base URL alone is NOT enough; the OpenAI HTTP path
+    /// can't pick its own model, so a blank model name means any auto-title /
+    /// summary request is doomed. `isConfigured` must require both (CodeRabbit
+    /// #3 / `.claude/rules/feature-gates.md` — "enabled AND ready").
+    func test_isConfigured_falseForOpenAI_whenModelNameEmpty() {
         let s = makeSettings()
         s.tool = .openaiCompatible
         s.openAIBaseURL = "https://api.openai.com/v1"
+        s.openAIModelName = ""
+        XCTAssertFalse(s.isConfigured)
+    }
+
+    /// AC-READY-04 — base URL + model name together mark the tool ready.
+    func test_isConfigured_trueForOpenAI_whenBaseURLAndModelPresent() {
+        let s = makeSettings()
+        s.tool = .openaiCompatible
+        s.openAIBaseURL = "https://api.openai.com/v1"
+        s.openAIModelName = "gpt-4o-mini"
         XCTAssertTrue(s.isConfigured)
     }
 
-    /// AC-READY — a local/anonymous endpoint is configured without a key.
+    /// AC-READY — a local/anonymous endpoint is configured without a key, but
+    /// still needs a model name (the API key is the only optional field).
     func test_isConfigured_trueForOpenAI_evenWhenAPIKeyEmpty() {
         let s = makeSettings()
         s.tool = .openaiCompatible
         s.openAIBaseURL = "http://localhost:11434/v1"
+        s.openAIModelName = "llama3.2"
         s.openAIAPIKey = ""
         XCTAssertTrue(s.isConfigured)
     }
@@ -182,7 +197,13 @@ final class OpenAIResponseParserTests: XCTestCase {
 
     private func expectFailure(_ result: Result<String, Error>) -> Error {
         switch result {
-        case .success: return XCTFail("expected failure, got success") as! Error
+        case .success:
+            // `XCTFail` returns Void and doesn't halt execution; force-casting it
+            // to `Error` (the old `as! Error`) traps on regression. Record the
+            // failure, then hand back a sentinel so the caller's assertion can
+            // run instead of crashing the test host. (CodeRabbit #5.)
+            XCTFail("expected failure, got success")
+            return NSError(domain: "OpenAIResponseParserTests", code: 1, userInfo: nil)
         case .failure(let e): return e
         }
     }
@@ -274,7 +295,15 @@ final class OpenAIRequestBuilderTests: XCTestCase {
 
     private func bodyJSON(_ request: URLRequest) -> [String: Any] {
         let data = request.httpBody ?? Data()
-        return (try! JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
+        // `try!` would trap on a malformed body (and `XCTFail` doesn't halt
+        // execution, so a later `as!`/subscript could still crash). Decode
+        // softly and record the failure. (CodeRabbit #5.)
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let dict = object as? [String: Any] else {
+            XCTFail("request body is not a JSON object: \(String(data: data, encoding: .utf8) ?? "<binary>")")
+            return [:]
+        }
+        return dict
     }
 
     /// AC-REQ-01 — `<trimmed baseURL>/chat/completions`, trailing-slash tolerant.
@@ -603,6 +632,14 @@ final class RecordingTransport: OpenAITransport, @unchecked Sendable {
     var hangUntilCancelled = false
     private var hang: CheckedContinuation<Void, Never>?
 
+    // Explicit deinit to satisfy the `required_deinit` lint (CodeRabbit #6).
+    // Intentionally a no-op: `hang` is a `CheckedContinuation`, and resuming it
+    // here would crash if `release()`/cancellation already resumed it (a
+    // `CheckedContinuation` resumed twice is a fatal error). The suspended
+    // continuation is owned by the test Task that's cancelled during teardown,
+    // so it resolves with the test's lifetime — we don't resume from deinit.
+    deinit {}
+
     func send(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
         requests.append(request)
         if let cannedError { throw cannedError }
@@ -750,6 +787,31 @@ final class OpenAITransportTests: XCTestCase {
         }
         XCTAssertEqual(transport.requests.count, 1,
                        "the request was dispatched before cancellation aborted it")
+    }
+
+    /// AC-CANCEL — a cooperative `CancellationError` (e.g. a custom/test
+    /// transport that throws it, rather than `URLSession`'s `URLError(.cancelled)`)
+    /// must map to `LLMRunnerError.cancelled`, not `.launchFailed` (CodeRabbit #2).
+    func test_runOpenAICompatible_mapsCancellationError_toCancelled() async throws {
+        struct CancelTransport: OpenAITransport {
+            func send(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
+                throw CancellationError()
+            }
+        }
+        do {
+            _ = try await LLMRunner.run(tool: .openaiCompatible,
+                                        prompt: "p", transcript: "t",
+                                        executablePathOverride: nil, model: "m",
+                                        timeout: 30,
+                                        openAIBaseURL: "http://localhost:11434/v1",
+                                        openAIAPIKey: "k", jsonMode: false,
+                                        transport: CancelTransport())
+            XCTFail("expected LLMRunnerError.cancelled")
+        } catch LLMRunnerError.cancelled {
+            // pass
+        } catch {
+            XCTFail("expected .cancelled, got \(error)")
+        }
     }
 
     // AC-CANCEL-02 — cancel wins over a response that arrives just after.
@@ -1080,8 +1142,13 @@ final class OpenAILiveAISplitTests: XCTestCase {
         // Two ticks fired (one per feed).
         XCTAssertGreaterThanOrEqual(log.calls.count, 2)
         // Stateless: the second tick ships the FULL latest transcript, not a
-        // delta — so it must contain both segments.
-        let second = log.calls.last!
+        // delta — so it must contain both segments. Guard rather than `last!`
+        // — `XCTAssertGreaterThanOrEqual` doesn't halt execution, so a failed
+        // count assertion would otherwise trap on the force-unwrap. (CodeRabbit #5.)
+        guard let second = log.calls.last else {
+            XCTFail("expected at least one tick call, got \(log.calls.count)")
+            return
+        }
         XCTAssertTrue(second.transcript.contains("segment one"))
         XCTAssertTrue(second.transcript.contains("segment two"))
         // LLMSession is always `.none` on the OpenAI HTTP path.

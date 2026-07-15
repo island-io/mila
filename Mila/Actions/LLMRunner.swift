@@ -296,14 +296,24 @@ enum LLMRunner {
 
         do {
             let (http, data) = try await transport.send(request)
+            // A cooperative cancellation (Task.cancel, or a custom/test
+            // transport that throws CancellationError) would otherwise fall
+            // through to `.launchFailed`; surface it as a cancellation so the
+            // banner/auto-suggest callers drop it quietly. (CodeRabbit #2.)
+            try Task.checkCancellation()
             switch OpenAIClient.parse(data: data, response: http) {
             case .success(let content):
+                // Re-check after the (possibly slow) transport returned: a
+                // late response to a cancelled task shouldn't be delivered.
+                try Task.checkCancellation()
                 return content
             case .failure(let error):
                 throw error
             }
         } catch let error as OpenAIRequestError {
             throw error
+        } catch is CancellationError {
+            throw LLMRunnerError.cancelled
         } catch let urlError as URLError {
             switch urlError.code {
             case .cancelled:

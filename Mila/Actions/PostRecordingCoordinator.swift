@@ -33,8 +33,10 @@ final class PostRecordingCoordinator: ObservableObject {
     /// Injectable LLM-run seam so tests can assert what `PostRecordingCoordinator`
     /// sends to `LLMRunner` (e.g. that the OpenAI path threads `openAIModelName`
     /// — issue celarent7/mila#3) without spawning a CLI or hitting the network.
-    /// Mirrors `RecordingSummarizer.RunLLM`. Defaults to `LLMRunner.run`.
-    typealias RunLLM = (
+    /// Mirrors `RecordingSummarizer.RunLLM`, including its `@MainActor` isolation,
+    /// so test stubs that capture/mutate main-actor variables stay data-race-clean
+    /// under Swift 6 strict concurrency (CodeRabbit #7). Defaults to `LLMRunner.run`.
+    typealias RunLLM = @MainActor (
         _ tool: LLMTool,
         _ prompt: String,
         _ transcript: String,
@@ -298,6 +300,14 @@ final class PostRecordingCoordinator: ObservableObject {
         postStatus("Sending to \(toolName)…")
 
         let timeout = transcriptWaitTimeout
+        // Capture the OpenAI endpoint config at click time. The Task below may
+        // wait on `awaitTranscript` (potentially long) before reading endpoint
+        // values; reading `self.llm` inside it would pair a mid-flight Settings
+        // edit with the click-time `tool`/`prompt`. Snapshot up front instead —
+        // mirrors `armAutoSuggestTitle` (CodeRabbit #8, issue celarent7/mila#8).
+        let openAIBaseURL = llm.openAIBaseURL
+        let openAIAPIKey = llm.openAIAPIKey
+        let openAIModelName = llm.openAIModelName
         let task = Task { @MainActor [weak self] in
             defer {
                 // Only relinquish the slot if we finished on our own. If we
@@ -326,7 +336,8 @@ final class PostRecordingCoordinator: ObservableObject {
             do {
                 // OpenAI-compatible runs need the model name threaded (the
                 // HTTP path can't pick its own). Issue celarent7/mila#3.
-                let openAIModelName = self.llm.openAIModelName
+                // `openAIModelName`/`openAIBaseURL`/`openAIAPIKey` are the
+                // click-time captures from above (#8).
                 let openAIModel: String? = (tool == .openaiCompatible && !openAIModelName.isEmpty)
                     ? openAIModelName : nil
                 let output = try await runLLM(
@@ -338,8 +349,8 @@ final class PostRecordingCoordinator: ObservableObject {
                     openAIModel,
                     extraArgs,
                     cliTimeout,
-                    self.llm.openAIBaseURL,
-                    self.llm.openAIAPIKey,
+                    openAIBaseURL,
+                    openAIAPIKey,
                     false,
                     nil)
                 let preview = output

@@ -489,6 +489,7 @@ struct RenameRecordingSheet: View {
                 prompt: llm.namePrompt,
                 transcript: transcript,
                 executablePathOverride: llm.executablePath.isEmpty ? nil : llm.executablePath,
+                model: llm.openAIModelName,
                 extraArgs: llm.extraArgsTokens,
                 timeout: llm.cliTimeout,
                 openAIBaseURL: llm.openAIBaseURL,

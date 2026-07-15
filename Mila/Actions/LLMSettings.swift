@@ -316,14 +316,20 @@ final class LLMSettings: ObservableObject {
     }
 
     /// Convenience the UI uses to decide whether to surface the rename /
-    /// run-action buttons at all. "Enabled AND ready": the OpenAI tool needs a
-    /// non-blank base URL; the CLI tools are ready as soon as they're selected
-    /// (per `.claude/rules/feature-gates.md`).
+    /// run-action buttons at all. "Enabled AND ready" (per
+    /// `.claude/rules/feature-gates.md`): the OpenAI tool needs a non-blank
+    /// base URL AND a non-blank model name — without a model, auto-title/summary
+    /// would launch HTTP requests guaranteed to fail (issue celarent7/mila#3/#4,
+    /// CodeRabbit #3). The API key stays optional so local/anonymous endpoints
+    /// (e.g. Ollama at localhost) count as configured without one. The CLI tools
+    /// are ready as soon as they're selected.
     var isConfigured: Bool {
         switch tool {
         case .none:             return false
         case .openaiCompatible:
-            return !openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let url = openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+            let model = openAIModelName.trimmingCharacters(in: .whitespacesAndNewlines)
+            return !url.isEmpty && !model.isEmpty
         default:                return true
         }
     }
