@@ -103,6 +103,8 @@ settings:
 packages:
   TranscriptionCore:
     path: Packages/TranscriptionCore
+  MilaKit:
+    path: Packages/MilaKit
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
@@ -206,6 +208,8 @@ targets:
     dependencies:
       - package: TranscriptionCore
         product: TranscriptionCore
+      - package: MilaKit
+        product: MilaKit
       - package: Sparkle
         product: Sparkle
     settings:
@@ -222,6 +226,8 @@ targets:
       - target: Mila
       - package: TranscriptionCore
         product: TranscriptionCore
+      - package: MilaKit
+        product: MilaKit
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"

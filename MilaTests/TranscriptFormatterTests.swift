@@ -1,5 +1,6 @@
 import XCTest
 import TranscriptionCore
+import MilaKit
 @testable import Mila
 
 final class TranscriptFormatterTests: XCTestCase {

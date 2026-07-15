@@ -2,6 +2,7 @@ import Foundation
 import Combine
 import OSLog
 import TranscriptionCore
+import MilaKit
 
 private let liveLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LiveTranscriber")
 

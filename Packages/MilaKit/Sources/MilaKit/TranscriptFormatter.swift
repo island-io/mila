@@ -1,7 +1,16 @@
 import Foundation
-import TranscriptionCore
 
-enum TranscriptFormatter {
+/// Minimal shape TranscriptFormatter needs from a transcript segment.
+/// Both the app's `TranscriptSegment` (TranscriptionCore) and MilaKit's own
+/// stored/live segment types conform, so the formatter lives here without
+/// dragging the whisper.cpp-linked TranscriptionCore into the MCP helper.
+public protocol SpeakerTextSegment {
+    var text: String { get }
+    /// Raw diarizer ID (`SPEAKER_00`), nil when diarization didn't run.
+    var speaker: String? { get }
+}
+
+public enum TranscriptFormatter {
 
     /// Plain-text rendering of `segments` suitable for the clipboard or for
     /// piping into an LLM prompt. When any segment carries a speaker label
@@ -17,8 +26,9 @@ enum TranscriptFormatter {
     ///
     /// Matches the SRT exporter's prefix format so the clipboard text and
     /// the on-disk `.srt` use the same speaker labels.
-    static func plainText(segments: [TranscriptSegment], fallback: String,
-                          names: [String: String] = [:]) -> String {
+    public static func plainText<S: SpeakerTextSegment>(
+        segments: [S], fallback: String, names: [String: String] = [:]
+    ) -> String {
         guard segments.contains(where: { $0.speaker != nil }) else { return fallback }
 
         var lines: [String] = []

@@ -3,6 +3,7 @@ import AVKit
 import AppKit
 import TranscriptionCore
 import UniformTypeIdentifiers
+import MilaKit
 
 struct RecordingDetailView: View {
     let recording: Recording
