@@ -1227,6 +1227,7 @@ struct MilaApp: App {
                         // flipped off → ticks stop; the LLM session
                         // preserves whatever it has produced so far.
                         let aiActive = aiSettings.enabled && llmSettingsRef.isConfigured
+                            && !llmSettingsRef.liveAIDisabledByRemoteOpenAI
                         // Speaker labels are a transcription feature,
                         // not an LLM feature — apply them whenever the
                         // diarizer has produced intervals, regardless

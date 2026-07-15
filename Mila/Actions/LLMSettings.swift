@@ -1,6 +1,70 @@
 import Foundation
 import Combine
 
+/// A closed set of OpenAI-compatible `/v1/chat/completions` providers. Each
+/// ships a base URL and a default model name so the Settings UI can offer
+/// working one-click presets, with `.custom` for anything else that speaks
+/// the same protocol.
+///
+/// There is deliberately **no** single hardcoded model fallback: every
+/// non-custom preset carries its own `defaultModelName` (see AC-PRESET-06).
+/// The locale-aware default-model mechanism in `ModelManager` applies to
+/// Whisper *transcription* models only and is not reused here.
+enum OpenAIProvider: String, CaseIterable, Identifiable, Codable {
+    case ollamaLocal
+    case ollamaCloud
+    case openai
+    case openrouter
+    case groq
+    case deepseek
+    case custom
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .ollamaLocal:  return "Ollama (local)"
+        case .ollamaCloud:  return "Ollama Cloud"
+        case .openai:       return "OpenAI"
+        case .openrouter:   return "OpenRouter"
+        case .groq:         return "Groq"
+        case .deepseek:     return "DeepSeek"
+        case .custom:       return "Custom"
+        }
+    }
+
+    /// Base URL the client appends `chat/completions` to. Empty for `.custom`
+    /// (the user supplies it).
+    var baseURL: String {
+        switch self {
+        case .ollamaLocal:  return "http://localhost:11434/v1"
+        case .ollamaCloud:  return "https://ollama.com/v1"
+        case .openai:       return "https://api.openai.com/v1"
+        case .openrouter:   return "https://openrouter.ai/api/v1"
+        case .groq:         return "https://api.groq.com/openai/v1"
+        case .deepseek:     return "https://api.deepseek.com/v1"
+        case .custom:       return ""
+        }
+    }
+
+    /// Whether the endpoint expects a Bearer token. A local Ollama server has
+    /// no auth by default; every hosted provider does.
+    var requiresAPIKey: Bool { self != .ollamaLocal }
+
+    /// Per-preset default model name. Empty for `.custom` (user-supplied).
+    var defaultModelName: String {
+        switch self {
+        case .ollamaLocal:  return "llama3.1"
+        case .ollamaCloud:  return "llama3.1"
+        case .openai:       return "gpt-4o-mini"
+        case .openrouter:   return "openai/gpt-4o-mini"
+        case .groq:         return "llama-3.3-70b-versatile"
+        case .deepseek:     return "deepseek-chat"
+        case .custom:       return ""
+        }
+    }
+}
+
 /// Which local LLM CLI Mila will shell out to for naming
 /// recordings and running post-recording actions. We deliberately keep this
 /// to a closed set of two so the Settings UI can show working defaults +
@@ -10,23 +74,28 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     case none
     case claude
     case cursor
+    case openaiCompatible = "openai_compatible"
 
     var id: String { rawValue }
 
     var displayName: String {
         switch self {
-        case .none:   return "Off"
-        case .claude: return "Claude (claude CLI)"
-        case .cursor: return "Cursor (cursor-agent CLI)"
+        case .none:            return "Off"
+        case .claude:          return "Claude (claude CLI)"
+        case .cursor:          return "Cursor (cursor-agent CLI)"
+        case .openaiCompatible: return "OpenAI Compatible"
         }
     }
 
-    /// Default executable name (looked up via the user's `$PATH`).
+    /// Default executable name (looked up via the user's `$PATH`). Empty for
+    /// `.openaiCompatible` — the HTTP branch in `LLMRunner.run` returns before
+    /// `resolveExecutable` is ever reached for this case.
     var executableName: String {
         switch self {
-        case .none:   return ""
-        case .claude: return "claude"
-        case .cursor: return "cursor-agent"
+        case .none:            return ""
+        case .claude:          return "claude"
+        case .cursor:          return "cursor-agent"
+        case .openaiCompatible: return ""
         }
     }
 
@@ -62,7 +131,8 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         let trimmedModel = model?.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasModel = !(trimmedModel?.isEmpty ?? true)
         switch self {
-        case .none:   return []
+        case .none:            return []
+        case .openaiCompatible: return []   // HTTP path never spawns a process
         case .claude:
             var args: [String] = ["-p", prompt]
             if hasModel, let m = trimmedModel {
@@ -106,6 +176,10 @@ final class LLMSettings: ObservableObject {
         didSet {
             guard tool != oldValue else { return }
             defaults.set(tool.rawValue, forKey: Keys.tool)
+            // Defer the Keychain read until the user actually selects the
+            // OpenAI tool — local/CLI-only users never trigger the macOS
+            // Keychain prompt. Mirrors `RemoteTranscriptionSettings.backend`.
+            if tool == .openaiCompatible { loadOpenAIAPIKeyIfNeeded() }
         }
     }
 
@@ -177,9 +251,96 @@ final class LLMSettings: ObservableObject {
     /// `extraArgs` parsed into an argv array, ready to hand to `LLMRunner`.
     var extraArgsTokens: [String] { LLMRunner.tokenizeArguments(extraArgs) }
 
+    // MARK: - OpenAI-compatible endpoint
+
+    /// Which OpenAI-compatible provider the user picked (drives the preset
+    /// picker). Defaults to `.custom` so the base URL / model fields start
+    /// empty and the user chooses a provider to fill them.
+    @Published var openAIProvider: OpenAIProvider {
+        didSet {
+            guard openAIProvider != oldValue else { return }
+            defaults.set(openAIProvider.rawValue, forKey: Keys.openAIProvider)
+        }
+    }
+
+    @Published var openAIBaseURL: String {
+        didSet {
+            guard openAIBaseURL != oldValue else { return }
+            defaults.set(openAIBaseURL, forKey: Keys.openAIBaseURL)
+        }
+    }
+
+    @Published var openAIModelName: String {
+        didSet {
+            guard openAIModelName != oldValue else { return }
+            defaults.set(openAIModelName, forKey: Keys.openAIModelName)
+        }
+    }
+
+    /// Bearer token for the OpenAI-compatible endpoint. Stored in the
+    /// **Keychain**, never `UserDefaults` — mirrors `RemoteTranscriptionSettings`
+    /// verbatim: write-through on `didSet`, lazy restore via
+    /// `loadOpenAIAPIKeyIfNeeded`, and an `isAdoptingStoredAPIKey` guard so
+    /// adopting the stored value doesn't trigger a redundant Keychain write.
+    @Published var openAIAPIKey: String {
+        didSet {
+            guard openAIAPIKey != oldValue else { return }
+            guard !isAdoptingStoredAPIKey else { return }
+            KeychainHelper.save(key: apiKeyKeychainKey, value: openAIAPIKey)
+        }
+    }
+
+    /// Apply a provider preset: fills the base URL + model fields only when
+    /// they are empty or still carry the *previous* preset's default, so a
+    /// user's custom value survives a preset change. The provider itself is
+    /// always updated (and persisted via `openAIProvider.didSet`).
+    func applyPreset(_ newPreset: OpenAIProvider) {
+        let previous = openAIProvider
+        openAIProvider = newPreset
+        if openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || openAIBaseURL == previous.baseURL {
+            openAIBaseURL = newPreset.baseURL
+        }
+        if openAIModelName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || openAIModelName == previous.defaultModelName {
+            openAIModelName = newPreset.defaultModelName
+        }
+    }
+
     /// Convenience the UI uses to decide whether to surface the rename /
-    /// run-action buttons at all.
-    var isConfigured: Bool { tool != .none }
+    /// run-action buttons at all. "Enabled AND ready": the OpenAI tool needs a
+    /// non-blank base URL; the CLI tools are ready as soon as they're selected
+    /// (per `.claude/rules/feature-gates.md`).
+    var isConfigured: Bool {
+        switch tool {
+        case .none:             return false
+        case .openaiCompatible:
+            return !openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        default:                return true
+        }
+    }
+
+    /// True iff the OpenAI-compatible endpoint is the active tool. Drives the
+    /// Settings UI's CLI-vs-HTTP field swap (AC-UI-01/02): CLI-only fields
+    /// (executable path, extra args) render only when this is false.
+    var isOpenAICompatible: Bool { tool == .openaiCompatible }
+
+    /// Label for the timeout row. Drops the "CLI" qualifier for the OpenAI
+    /// path, where the timeout bounds an HTTP request, not a process
+    /// (AC-UI-04).
+    var timeoutLabel: String { isOpenAICompatible ? "Timeout" : "CLI timeout" }
+
+    /// True when Live AI must NOT run for this tool (Phase 9, Option C).
+    /// Remote OpenAI-compatible endpoints re-bill the full transcript every
+    /// stateless tick with no prompt-cache discount, so Live AI is gated to
+    /// *local* endpoints only (localhost / loopback / `.local`). Local ones
+    /// are free and run the existing stateless `kick()` branch. Reuses the
+    /// Phase 8 `OpenAILocality.isLocal` host helper (same one the privacy
+    /// disclaimer uses) rather than duplicating the classification.
+    var liveAIDisabledByRemoteOpenAI: Bool {
+        guard tool == .openaiCompatible else { return false }
+        return !OpenAILocality.isLocal(baseURL: openAIBaseURL)
+    }
 
     // MARK: - Test / diagnostics
     //
@@ -226,16 +387,26 @@ final class LLMSettings: ObservableObject {
         isTesting = true
         lastTestResult = nil
         defer { isTesting = false }
+        // Only the OpenAI path needs a model from settings (the CLIs pick their
+        // own); passing `openAIModelName` here lets the test panel exercise the
+        // exact endpoint+model the user configured without an executable path.
+        let model: String? = (tool == .openaiCompatible)
+            ? (openAIModelName.isEmpty ? nil : openAIModelName)
+            : nil
         let result = await LLMRunner.diagnose(
             tool: tool,
             prompt: testPrompt,
             transcript: testTranscript,
             extraArgs: extraArgsTokens,
             executablePathOverride: executablePath.isEmpty ? nil : executablePath,
+            model: model,
             // Use the same timeout real runs use so the test faithfully
             // reproduces production behaviour — including letting the user
             // confirm that raising the timeout fixes a slow agentic run.
-            timeout: cliTimeout)
+            timeout: cliTimeout,
+            openAIBaseURL: openAIBaseURL,
+            openAIAPIKey: openAIAPIKey,
+            jsonMode: false)
         lastTestResult = result
     }
 
@@ -253,9 +424,19 @@ final class LLMSettings: ObservableObject {
         """
 
     private let defaults: UserDefaults
+    /// Keychain item the OpenAI API key is stored under. Injectable so tests
+    /// never read/clobber the real app's item — mirrors
+    /// `RemoteTranscriptionSettings.apiKeyKeychainKey`. Net-new param with a
+    /// production-safe default (existing `MilaApp.init()` call site is
+    /// unchanged).
+    private let apiKeyKeychainKey: String
+    private var hasLoadedOpenAIAPIKey = false
+    private var isAdoptingStoredAPIKey = false
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard,
+         apiKeyKeychainKey: String = Keys.openAIAPIKey) {
         self.defaults = defaults
+        self.apiKeyKeychainKey = apiKeyKeychainKey
         let rawTool = defaults.string(forKey: Keys.tool) ?? LLMTool.none.rawValue
         self.tool = LLMTool(rawValue: rawTool) ?? .none
         self.executablePath = defaults.string(forKey: Keys.executablePath) ?? ""
@@ -269,6 +450,33 @@ final class LLMSettings: ObservableObject {
         self.summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
         self.cliTimeout = (defaults.object(forKey: Keys.cliTimeout) as? Double) ?? 300
         self.extraArgs = defaults.string(forKey: Keys.extraArgs) ?? ""
+
+        self.openAIProvider = OpenAIProvider(rawValue:
+            defaults.string(forKey: Keys.openAIProvider) ?? "") ?? .custom
+        self.openAIBaseURL = defaults.string(forKey: Keys.openAIBaseURL) ?? ""
+        self.openAIModelName = defaults.string(forKey: Keys.openAIModelName) ?? ""
+        // Start empty; defer the Keychain read until OpenAI is the active tool
+        // (here if it's the restored choice, otherwise lazily in `tool.didSet`).
+        self.openAIAPIKey = ""
+        if tool == .openaiCompatible { loadOpenAIAPIKeyIfNeeded() }
+    }
+
+    /// Lazily read the OpenAI API key from the Keychain the first time the
+    /// OpenAI tool becomes active. Idempotent (guarded by
+    /// `hasLoadedOpenAIAPIKey`) and non-destructive: an in-progress user edit
+    /// is kept rather than overwritten by the stored value.
+    private func loadOpenAIAPIKeyIfNeeded() {
+        guard !hasLoadedOpenAIAPIKey else { return }
+        hasLoadedOpenAIAPIKey = true
+        guard openAIAPIKey.isEmpty else { return }
+        guard let stored = KeychainHelper.load(key: apiKeyKeychainKey),
+              !stored.isEmpty else { return }
+        // Suppress the `apiKey.didSet` write-through for this one assignment
+        // so adopting the stored value doesn't re-save it (a redundant Keychain
+        // write that could itself prompt).
+        isAdoptingStoredAPIKey = true
+        openAIAPIKey = stored
+        isAdoptingStoredAPIKey = false
     }
 
     /// Default name prompt is deliberately *tool-free*. The previous default
@@ -304,5 +512,9 @@ final class LLMSettings: ObservableObject {
         static let summaryEnabled = "llm.summary.enabled"
         static let cliTimeout = "llm.cli.timeout"
         static let extraArgs = "llm.extraArgs"
+        static let openAIProvider = "llm.openai.provider"
+        static let openAIBaseURL = "llm.openai.baseURL"
+        static let openAIModelName = "llm.openai.modelName"
+        static let openAIAPIKey = "llm.openai.apiKey"   // Keychain item, not UserDefaults
     }
 }

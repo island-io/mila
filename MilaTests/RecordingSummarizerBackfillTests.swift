@@ -60,7 +60,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
     /// one go so a future regression that loosens any of them is caught.
     func test_backfill_only_targets_completed_non_trashed_missing_summary() async throws {
         llm.tool = .claude
-        useStubRunner { _, _, _, _, _, _, _ in "FILLED" }
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "FILLED" }
 
         // Eligible: completed, non-empty text, no summary, not trashed.
         let target = try addRecording(title: "Target",
@@ -108,7 +108,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
     func test_backfill_noops_when_llm_not_configured() async throws {
         llm.tool = .none
         var called = false
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             called = true
             return "NOPE"
         }
@@ -134,7 +134,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
     /// to relaunch the app or wait for a fresh recording to see summaries
     /// fill in.
     func test_backfill_runs_on_llm_config_flip() async throws {
-        useStubRunner { _, _, _, _, _, _, _ in "AUTO" }
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "AUTO" }
 
         // LLM starts unconfigured.
         XCTAssertEqual(llm.tool, .none)
@@ -163,7 +163,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
     /// observable.
     func test_backfill_throttles_to_max_concurrent() async throws {
         let probe = ConcurrencyProbe()
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             await probe.enterAndWait()
             return "DONE"
         }
@@ -209,7 +209,7 @@ final class RecordingSummarizerBackfillTests: XCTestCase {
     /// parallel calls "first started" is the wrong question.
     func test_backfill_processes_newest_first() async throws {
         var order: [String] = []
-        useStubRunner { _, prompt, transcript, _, _, _, _ in
+        useStubRunner { _, prompt, transcript, _, _, _, _, _, _, _, _ in
             // The transcript text is the only thing that varies between our
             // recordings — record which marker this call carried.
             let blob = prompt + transcript

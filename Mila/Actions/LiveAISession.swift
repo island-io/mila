@@ -68,6 +68,14 @@ final class LiveAISession: ObservableObject {
         let model: String
         let session: LLMSession
         let timeout: TimeInterval
+        // OpenAI-compatible endpoint config (Phase 6.0.2). Populated from
+        // `llmSettings` by `kick()` (Phase 9 wires Live AI's local/remote
+        // split); defaulted so existing call sites compile unchanged.
+        var openAIBaseURL: String? = nil
+        var openAIAPIKey: String? = nil
+        var jsonMode: Bool = false
+        var temperature: Double? = nil
+        var transport: OpenAITransport? = nil
     }
     var performCall: (LLMCall) async throws -> String = { call in
         try await LLMRunner.run(
@@ -77,7 +85,12 @@ final class LiveAISession: ObservableObject {
             executablePathOverride: call.executablePathOverride,
             model: call.model,
             session: call.session,
-            timeout: call.timeout
+            timeout: call.timeout,
+            openAIBaseURL: call.openAIBaseURL,
+            openAIAPIKey: call.openAIAPIKey,
+            jsonMode: call.jsonMode,
+            temperature: call.temperature,
+            transport: call.transport
         )
     }
 
@@ -282,6 +295,18 @@ final class LiveAISession: ObservableObject {
     /// elapses, or fold into the running call.
     private func scheduleKick(immediate: Bool = false) {
         guard llmSettings.isConfigured, !latestTranscript.isEmpty else { return }
+        // Phase 9 (Option C): a remote OpenAI-compatible endpoint must never
+        // run the Live AI loop (full-transcript re-bill each tick, no
+        // prompt-cache discount). Defense in depth alongside the `aiActive`
+        // gates in `LiveAIRecordingView` / `MilaApp` — drop any deferred tick
+        // too, so a pendingKickTask sleeping out the min-interval floor can't
+        // wake into a stray remote call.
+        guard !llmSettings.liveAIDisabledByRemoteOpenAI else {
+            pendingKickTask?.cancel()
+            pendingKickTask = nil
+            coalesced = false
+            return
+        }
         // Live AI toggled off mid-recording: don't fire, and drop any
         // deferred tick. The feed loop stops calling feed() on toggle-off,
         // but a pendingKickTask already sleeping out the min-interval floor
@@ -324,6 +349,7 @@ final class LiveAISession: ObservableObject {
 
     private func kick() {
         guard llmSettings.isConfigured else { return }
+        guard !llmSettings.liveAIDisabledByRemoteOpenAI else { return }
         guard !latestTranscript.isEmpty else { return }
         let snapshot = latestTranscript
         let tool = llmSettings.tool
@@ -380,7 +406,11 @@ final class LiveAISession: ObservableObject {
             liveAISettings.prompt
                 .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
             context: context)
-        let model = liveAISettings.model
+        // OpenAI-compatible ticks use the endpoint's model name from
+        // `LLMSettings.openAIModelName`; CLI ticks use Live AI's model override.
+        let model = (tool == .openaiCompatible)
+            ? llmSettings.openAIModelName
+            : liveAISettings.model
         let useSession = (sessionID != nil)
         // Cold-start the first tick gets a longer timeout (see
         // `firstCallTimeoutSeconds`). All subsequent ticks use the
@@ -479,7 +509,15 @@ TRANSCRIPT SO FAR:
                     executablePathOverride: exe,
                     model: model,
                     session: llmSession,
-                    timeout: timeout
+                    timeout: timeout,
+                    // Phase 9: thread the OpenAI-compatible endpoint config so
+                    // local OpenAI Live AI ticks hit `/chat/completions` with
+                    // JSON mode + a low temperature for envelope reliability.
+                    // Remote endpoints never reach here (gated above).
+                    openAIBaseURL: (tool == .openaiCompatible) ? llmSettings.openAIBaseURL : nil,
+                    openAIAPIKey: (tool == .openaiCompatible) ? llmSettings.openAIAPIKey : nil,
+                    jsonMode: tool == .openaiCompatible,
+                    temperature: tool == .openaiCompatible ? 0.2 : nil
                 ))
                 let elapsed = Date().timeIntervalSince(llmStart)
                 let parsed = Self.parseEnvelope(from: raw)

@@ -473,4 +473,80 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertFalse(result.lowercased().contains("could you paste"),
                        "cursor-agent never saw the transcript — runner regressed: \(result)")
     }
+
+    // MARK: - Phase 10 — CLI regression guard (OpenAI branch must not leak)
+
+    /// AC-REGRESS-01 — the early `.openaiCompatible` branch added in Phase 6
+    /// must NOT divert `.claude` (or any CLI tool) into the HTTP path, even
+    /// when the new OpenAI params are explicitly passed. We prove it by
+    /// handing `.claude` a non-nil `openAIBaseURL` + `jsonMode` + `temperature`
+    /// AND a `makeScript` stand-in: if the branch were mis-scoped (e.g.
+    /// `tool != .none`), the runner would hit the HTTP transport instead of
+    /// spawning the script, and the marker would never come back. Uses the
+    /// shell-script stand-in (m1) — not `/bin/cat`.
+    func test_run_claude_unchanged_resolvesExecutableAndSpawns() async throws {
+        let script = makeScript("""
+            #!/bin/sh
+            printf 'CLI-PATH-MARKER:%s' "${@: -1}"
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let out = try await LLMRunner.run(
+            tool: .claude,
+            prompt: "hello",
+            transcript: "world",
+            executablePathOverride: script.path,
+            timeout: 30,
+            openAIBaseURL: "http://localhost:11434/v1",
+            openAIAPIKey: "ignored-by-cli-path",
+            jsonMode: true,
+            temperature: 0.5
+        )
+        XCTAssertTrue(out.contains("CLI-PATH-MARKER:"),
+                      "claude was diverted away from the CLI spawn path: \(out)")
+        XCTAssertTrue(out.contains("hello"),
+                      "composed prompt didn't reach the CLI: \(out)")
+    }
+
+    /// AC-REGRESS-02 — the OpenAI branch must not leak into `.none` or
+    /// `.cursor`. `.none` still throws `toolDisabled` (not an OpenAI/HTTP
+    /// error) even with OpenAI params present; `.cursor` still spawns the CLI
+    /// stand-in and ignores the OpenAI params. The existing suite is the
+    /// guard; this test pins the "no leak" invariant explicitly.
+    func test_existingLLMRunnerTestsStillPass() async throws {
+        // .none: OpenAI params present, but tool-disabled wins — no HTTP
+        // attempt, no OpenAIRequestError, just .toolDisabled.
+        do {
+            _ = try await LLMRunner.run(tool: .none,
+                                        prompt: "x", transcript: "y",
+                                        executablePathOverride: nil,
+                                        openAIBaseURL: "http://localhost:11434/v1",
+                                        openAIAPIKey: "k",
+                                        jsonMode: true,
+                                        temperature: 0.5)
+            XCTFail("Expected toolDisabled for .none")
+        } catch let error as LLMRunnerError {
+            guard case .toolDisabled = error else {
+                XCTFail(".none leaked into a non-toolDisabled path: \(error)"); return
+            }
+        } catch {
+            XCTFail("Wrong error type for .none: \(error)")
+        }
+
+        // .cursor: still spawns the CLI stand-in, ignoring the OpenAI params.
+        let script = makeScript("""
+            #!/bin/sh
+            printf 'cursor-ran'
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let out = try await LLMRunner.run(tool: .cursor,
+                                          prompt: "x", transcript: "y",
+                                          executablePathOverride: script.path,
+                                          timeout: 30,
+                                          openAIBaseURL: "http://localhost:11434/v1",
+                                          openAIAPIKey: "k",
+                                          jsonMode: true,
+                                          temperature: 0.5)
+        XCTAssertEqual(out, "cursor-ran",
+                       "cursor was diverted away from the CLI spawn path: \(out)")
+    }
 }

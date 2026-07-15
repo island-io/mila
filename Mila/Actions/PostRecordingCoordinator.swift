@@ -110,6 +110,8 @@ final class PostRecordingCoordinator: ObservableObject {
         let prompt = llm.namePrompt
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let cliTimeout = llm.cliTimeout
+        let openAIBaseURL = llm.openAIBaseURL
+        let openAIAPIKey = llm.openAIAPIKey
         let waitTimeout = transcriptWaitTimeout
         autoSuggestingIDs.insert(id)
         let task = Task { @MainActor [weak self] in
@@ -133,7 +135,10 @@ final class PostRecordingCoordinator: ObservableObject {
                     prompt: prompt,
                     transcript: transcript,
                     executablePathOverride: executableOverride,
-                    timeout: cliTimeout
+                    timeout: cliTimeout,
+                    openAIBaseURL: openAIBaseURL,
+                    openAIAPIKey: openAIAPIKey,
+                    jsonMode: false
                 )
                 if Task.isCancelled { return }
                 let title = Self.cleanedTitle(from: suggestion)
@@ -279,7 +284,10 @@ final class PostRecordingCoordinator: ObservableObject {
                     summary: summary,
                     executablePathOverride: executableOverride,
                     extraArgs: extraArgs,
-                    timeout: cliTimeout
+                    timeout: cliTimeout,
+                    openAIBaseURL: self.llm.openAIBaseURL,
+                    openAIAPIKey: self.llm.openAIAPIKey,
+                    jsonMode: false
                 )
                 let preview = output
                     .replacingOccurrences(of: "\n", with: " ")

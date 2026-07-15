@@ -41,22 +41,38 @@ enum LLMRunnerError: LocalizedError {
 struct LLMTestResult: Equatable {
     /// The exact, shell-quoted command line that was launched (or would have
     /// been, if we got far enough to build it). Empty when no tool/executable
-    /// was resolved.
+    /// was resolved. For the OpenAI HTTP path this is `POST <url>`.
     var command: String = ""
-    /// True only when the CLI launched and exited 0.
+    /// True only when the CLI launched and exited 0, OR the HTTP endpoint
+    /// returned 2xx with parseable content.
     var succeeded: Bool = false
     /// Process exit code, or nil when the CLI never launched (setup error).
+    /// Always nil for the OpenAI HTTP path (there is no process).
     var exitCode: Int32? = nil
     var stdout: String = ""
     var stderr: String = ""
     var durationSeconds: TimeInterval = 0
     /// Set when something prevented the CLI from even running — no tool
-    /// selected, executable not on PATH, launch failure.
+    /// selected, executable not on PATH, launch failure — or when the OpenAI
+    /// transport couldn't reach the endpoint (network/timeout failure).
     var setupError: String? = nil
     var timedOut: Bool = false
+    // OpenAI HTTP diagnostics (Phase 7). Populated only by the
+    // `.openaiCompatible` diagnose branch; empty/nil for the CLI path.
+    /// The full request URL the POST was sent to.
+    var url: String = ""
+    /// HTTP status code of the response, or nil when the request never got a
+    /// response (transport failure). This — not `exitCode` — is the "did the
+    /// HTTP call actually run?" signal for the OpenAI path (AC-DIAG-04).
+    var httpStatus: Int? = nil
+    /// The JSON request body that was sent, for copy-paste / debugging.
+    var requestBody: String = ""
 
-    /// Whether anything actually ran. False for pure setup failures.
-    var didLaunch: Bool { exitCode != nil }
+    /// Whether anything actually ran. For the CLI path, "launched a process"
+    /// (`exitCode != nil`); for the OpenAI path, "got an HTTP response"
+    /// (`httpStatus != nil`). False for pure setup failures (no tool selected,
+    /// executable not found, transport couldn't connect).
+    var didLaunch: Bool { exitCode != nil || httpStatus != nil }
 }
 
 /// Spawns the configured `claude` or `cursor-agent` binary with the user's
@@ -134,8 +150,43 @@ enum LLMRunner {
                     model: String? = nil,
                     session: LLMSession = .none,
                     extraArgs: [String] = [],
-                    timeout: TimeInterval = LLMRunner.defaultTimeout) async throws -> String {
+                    timeout: TimeInterval = LLMRunner.defaultTimeout,
+                    // OpenAI-compatible endpoint config (Phase 6.0). Only
+                    // `transport` is caller-transparent — it defaults to a real
+                    // `URLSession` so CLI-only callers pass nothing and are
+                    // unchanged. `baseURL`/`apiKey`/`jsonMode` default to
+                    // nil/nil/false; callers that can land on
+                    // `.openaiCompatible` MUST thread them (see the plan's
+                    // 6.0.3 call-site audit). `model:` is reused for the
+                    // OpenAI model name (`LLMSettings.openAIModelName`).
+                    openAIBaseURL: String? = nil,
+                    openAIAPIKey: String? = nil,
+                    jsonMode: Bool = false,
+                    temperature: Double? = nil,
+                    transport: OpenAITransport? = nil) async throws -> String {
         guard tool != .none else { throw LLMRunnerError.toolDisabled }
+
+        // OpenAI-compatible HTTP path — handled before any CLI resolution, so
+        // `executablePathOverride` / `session` / `extraArgs` (CLI-only) are
+        // irrelevant here. Defense in depth: `run` has no `LLMSettings`, so it
+        // re-checks the base-URL readiness gate the Settings UI also enforces
+        // via `isConfigured` — a nil/empty base URL can't send anything.
+        if tool == .openaiCompatible {
+            guard let baseURL = openAIBaseURL,
+                  !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { throw LLMRunnerError.toolDisabled }
+            let t = transport ?? URLSessionTransport(URLSession.shared)
+            return try await runOpenAICompatible(prompt: prompt,
+                                                 transcript: transcript,
+                                                 summary: summary,
+                                                 model: model,
+                                                 timeout: timeout,
+                                                 baseURL: baseURL,
+                                                 apiKey: openAIAPIKey ?? "",
+                                                 jsonMode: jsonMode,
+                                                 temperature: temperature,
+                                                 transport: t)
+        }
 
         let executable = try resolveExecutable(tool: tool,
                                                override: executablePathOverride)
@@ -200,6 +251,69 @@ enum LLMRunner {
         }
     }
 
+    /// HTTP path for `tool == .openaiCompatible`: build the
+    /// `/chat/completions` request via the pure `OpenAIClient.makeRequest`,
+    /// send it through the injectable transport, then decode via the pure
+    /// `OpenAIClient.parse`. `timeout` is applied as the request's
+    /// `timeoutInterval` (and `URLSession.data` surfaces the expiry as
+    /// `URLError.timedOut`); Task cancellation surfaces as
+    /// `URLError.cancelled`. Both are mapped back onto `LLMRunnerError` so
+    /// callers see the same error vocabulary the CLI path produces.
+    ///
+    /// Error mapping:
+    ///  - `OpenAIRequestError` (from `parse`) → rethrown as-is (typed,
+    ///    `LocalizedError`, rendered by the Settings sheet / rename sheet).
+    ///  - `URLError.cancelled` → `.cancelled` (mirrors the CLI's
+    ///    `ProcessHandle`-driven cancellation).
+    ///  - `URLError.timedOut` → `.timedOut(seconds:)`, rounded *up* to match
+    ///    the CLI path's `Int(timeout.rounded(.up))` so AC-TIMEOUT-02's
+    ///    "matches the CLI format" holds.
+    ///  - any other transport failure → `.launchFailed` (the closest existing
+    ///    bucket for "couldn't reach the endpoint").
+    static func runOpenAICompatible(prompt: String,
+                                    transcript: String,
+                                    summary: String,
+                                    model: String?,
+                                    timeout: TimeInterval,
+                                    baseURL: String,
+                                    apiKey: String,
+                                    jsonMode: Bool,
+                                    temperature: Double?,
+                                    transport: OpenAITransport) async throws -> String {
+        var request = OpenAIClient.makeRequest(baseURL: baseURL,
+                                               model: model ?? "",
+                                               prompt: prompt,
+                                               transcript: transcript,
+                                               summary: summary,
+                                               apiKey: apiKey,
+                                               jsonMode: jsonMode,
+                                               temperature: temperature)
+        if timeout > 0 { request.timeoutInterval = timeout }
+
+        do {
+            let (http, data) = try await transport.send(request)
+            switch OpenAIClient.parse(data: data, response: http) {
+            case .success(let content):
+                return content
+            case .failure(let error):
+                throw error
+            }
+        } catch let error as OpenAIRequestError {
+            throw error
+        } catch let urlError as URLError {
+            switch urlError.code {
+            case .cancelled:
+                throw LLMRunnerError.cancelled
+            case .timedOut:
+                throw LLMRunnerError.timedOut(seconds: Int(timeout.rounded(.up)))
+            default:
+                throw LLMRunnerError.launchFailed(urlError)
+            }
+        } catch {
+            throw LLMRunnerError.launchFailed(error)
+        }
+    }
+
     /// Run the configured CLI like `run` does, but never throw — capture the
     /// exact command line, exit code, stdout, and stderr and hand them all
     /// back so the Settings → LLM test panel can show the user precisely what
@@ -219,9 +333,31 @@ enum LLMRunner {
                          extraArgs: [String] = [],
                          executablePathOverride: String?,
                          model: String? = nil,
-                         timeout: TimeInterval = 120) async -> LLMTestResult {
+                         timeout: TimeInterval = 120,
+                         // OpenAI-compatible config (Phase 6.0/7). Same four
+                         // defaulted params as `run`; only `transport` is
+                         // caller-transparent. `diagnose` is non-throwing, so
+                         // the base-URL guard and transport failures come back
+                         // as `setupError` rather than exceptions.
+                         openAIBaseURL: String? = nil,
+                         openAIAPIKey: String? = nil,
+                         jsonMode: Bool = false,
+                         transport: OpenAITransport? = nil) async -> LLMTestResult {
         guard tool != .none else {
             return LLMTestResult(setupError: LLMRunnerError.toolDisabled.errorDescription ?? "No LLM configured.")
+        }
+        // OpenAI HTTP path — handled before CLI resolution, so no
+        // `executablePath` is required (AC-DIAG-05).
+        if tool == .openaiCompatible {
+            return await diagnoseOpenAICompatible(prompt: prompt,
+                                                  transcript: transcript,
+                                                  summary: summary,
+                                                  model: model,
+                                                  timeout: timeout,
+                                                  baseURL: openAIBaseURL ?? "",
+                                                  apiKey: openAIAPIKey ?? "",
+                                                  jsonMode: jsonMode,
+                                                  transport: transport)
         }
         let executable: URL
         do {
@@ -268,6 +404,100 @@ enum LLMRunner {
             }
         } onCancel: {
             handle.terminate()
+        }
+    }
+
+    /// Non-throwing HTTP diagnostic for `tool == .openaiCompatible` — the
+    /// "test" path the Settings → LLM panel uses to explain an OpenAI endpoint
+    /// to the user. Mirrors `runOpenAICompatible`'s request building but,
+    /// because `diagnose` never throws, captures every outcome into the
+    /// `LLMTestResult` fields: `url`/`requestBody`/`httpStatus` for the request
+    /// + response, `succeeded` iff 2xx with parseable content, the response
+    /// body in `stdout`, a typed error message in `stderr` for 4xx/5xx, and
+    /// `setupError`/`timedOut` for transport failures (so the panel can tell
+    /// "couldn't reach the endpoint" from "endpoint returned an error").
+    static func diagnoseOpenAICompatible(prompt: String,
+                                         transcript: String,
+                                         summary: String,
+                                         model: String?,
+                                         timeout: TimeInterval,
+                                         baseURL: String,
+                                         apiKey: String,
+                                         jsonMode: Bool,
+                                         transport: OpenAITransport?) async -> LLMTestResult {
+        let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBase.isEmpty else {
+            return LLMTestResult(
+                setupError: LLMRunnerError.toolDisabled.errorDescription
+                    ?? "No OpenAI endpoint is configured in Settings → LLM.")
+        }
+        var request = OpenAIClient.makeRequest(baseURL: trimmedBase,
+                                               model: model ?? "",
+                                               prompt: prompt,
+                                               transcript: transcript,
+                                               summary: summary,
+                                               apiKey: apiKey,
+                                               jsonMode: jsonMode,
+                                               temperature: nil)
+        if timeout > 0 { request.timeoutInterval = timeout }
+        let url = request.url?.absoluteString ?? ""
+        let requestBody = String(data: request.httpBody ?? Data(), encoding: .utf8) ?? ""
+        let command = "POST \(url)"
+        let start = Date()
+        let t = transport ?? URLSessionTransport(URLSession.shared)
+
+        do {
+            let (http, data) = try await t.send(request)
+            let status = http.statusCode
+            let bodyString = String(data: data, encoding: .utf8) ?? ""
+            switch OpenAIClient.parse(data: data, response: http) {
+            case .success(let content):
+                return LLMTestResult(
+                    command: command,
+                    succeeded: true,
+                    stdout: content,
+                    durationSeconds: Date().timeIntervalSince(start),
+                    url: url,
+                    httpStatus: status,
+                    requestBody: requestBody)
+            case .failure(let error):
+                // 4xx/5xx: the endpoint ran (httpStatus set) but didn't
+                // succeed. Surface the readable typed message in stderr and
+                // the raw body in stdout so the user can self-diagnose.
+                return LLMTestResult(
+                    command: command,
+                    succeeded: false,
+                    stdout: bodyString,
+                    stderr: (error as? LocalizedError)?.errorDescription ?? "\(error)",
+                    durationSeconds: Date().timeIntervalSince(start),
+                    url: url,
+                    httpStatus: status,
+                    requestBody: requestBody)
+            }
+        } catch let urlError as URLError {
+            if urlError.code == .timedOut {
+                return LLMTestResult(
+                    command: command,
+                    durationSeconds: Date().timeIntervalSince(start),
+                    setupError: LLMRunnerError.timedOut(
+                        seconds: Int(timeout.rounded(.up))).errorDescription,
+                    timedOut: true,
+                    url: url,
+                    requestBody: requestBody)
+            }
+            return LLMTestResult(
+                command: command,
+                durationSeconds: Date().timeIntervalSince(start),
+                setupError: urlError.localizedDescription,
+                url: url,
+                requestBody: requestBody)
+        } catch {
+            return LLMTestResult(
+                command: command,
+                durationSeconds: Date().timeIntervalSince(start),
+                setupError: error.localizedDescription,
+                url: url,
+                requestBody: requestBody)
         }
     }
 

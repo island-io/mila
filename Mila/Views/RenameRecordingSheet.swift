@@ -490,7 +490,10 @@ struct RenameRecordingSheet: View {
                 transcript: transcript,
                 executablePathOverride: llm.executablePath.isEmpty ? nil : llm.executablePath,
                 extraArgs: llm.extraArgsTokens,
-                timeout: llm.cliTimeout
+                timeout: llm.cliTimeout,
+                openAIBaseURL: llm.openAIBaseURL,
+                openAIAPIKey: llm.openAIAPIKey,
+                jsonMode: false
             )
             let cleaned = PostRecordingCoordinator.cleanedTitle(from: suggestion)
             if cleaned.isEmpty {

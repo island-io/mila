@@ -324,7 +324,7 @@ final class QuickActionsControllerTests: XCTestCase {
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
                                              liveAISettings: liveAI,
-                                             runLLM: { _, _, transcript, _, _, _, _ in
+                                             runLLM: { _, _, transcript, _, _, _, _, _, _, _, _ in
             "COMPLETE: \(transcript)"
         })
         controller.llmSettings = llm
