@@ -11,7 +11,7 @@ import Foundation
 /// Decoding is deliberately lenient (`decodeIfPresent` + defaults) so an
 /// older helper never chokes on a newer app's additions.
 public struct StoredRecording: Codable, Identifiable {
-    public struct Segment: Codable, SpeakerTextSegment {
+    public struct Segment: Codable, Equatable, SpeakerTextSegment {
         public var start: Double
         public var end: Double
         public var text: String

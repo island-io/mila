@@ -124,6 +124,11 @@ final class QuickActionsController: ObservableObject {
     /// diarizer work so the final utterance's speaker label lands
     /// before the transcript is saved.
     var liveDiarizer: LiveSpeakerDiarizer?
+    /// Set after init by MilaApp. `stopRecording` closes the on-disk
+    /// live-transcript sidecar with the saved recording's id so external
+    /// pollers (mila-mcp) can hand off from the live feed to the stored
+    /// transcript.
+    var liveSidecarWriter: LiveTranscriptSidecarWriter?
 
     /// True only while `stopRecording` is running its inline LIVE-PIPELINE
     /// drain — the short, bounded window where it flushes the transcriber
@@ -558,6 +563,7 @@ final class QuickActionsController: ObservableObject {
             // over either way, so its notes must not carry into the next
             // recording.
             liveAISettings?.meetingContext = ""
+            liveSidecarWriter?.finish(recordingID: nil)
             isFinalizingRecording = false
             activeJob = .none
             return
@@ -637,6 +643,11 @@ final class QuickActionsController: ObservableObject {
             speakerNames: liveTranscriber?.speakerNames ?? [:]
         )
         store.add(recording)
+        // The recording is persisted — close the live sidecar with its id
+        // so an external poller's next get_live_transcript sees
+        // `completed` + the handoff id (the inline drain below keeps
+        // updating the STORED recording, which is what the handoff reads).
+        liveSidecarWriter?.finish(recordingID: recording.id)
         activeJob = .none
         if sleepReason != nil {
             sleepInterruption = SleepInterruption(

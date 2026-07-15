@@ -114,8 +114,11 @@ final class RecordingStore: ObservableObject {
     /// `relocateRecordings(to: nil)` can revert to the original
     /// default-path layout (json files sit alongside the `Recordings/`
     /// subdir, matching the historical shape that pre-v1.7 builds
-    /// shipped).
-    private let originalRootDirectory: URL
+    /// shipped). Exposed (read-only) so app-state siblings that must NOT
+    /// travel with a relocated recordings folder — the store-location
+    /// pointer, the live-transcript sidecar — anchor to the same root,
+    /// keeping test instances (temp roots) isolated automatically.
+    let originalRootDirectory: URL
 
     init(rootDirectory: URL) {
         self.originalRootDirectory = rootDirectory
