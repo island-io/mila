@@ -645,14 +645,6 @@ final class RecordingTransport: OpenAITransport, @unchecked Sendable {
     var hangUntilCancelled = false
     private var hang: CheckedContinuation<Void, Never>?
 
-    // Explicit deinit to satisfy the `required_deinit` lint (CodeRabbit #6).
-    // Intentionally a no-op: `hang` is a `CheckedContinuation`, and resuming it
-    // here would crash if `release()`/cancellation already resumed it (a
-    // `CheckedContinuation` resumed twice is a fatal error). The suspended
-    // continuation is owned by the test Task that's cancelled during teardown,
-    // so it resolves with the test's lifetime — we don't resume from deinit.
-    deinit {}
-
     func send(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
         lock.lock()
         _requests.append(request)
