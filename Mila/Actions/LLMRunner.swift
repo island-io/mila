@@ -280,7 +280,11 @@ enum LLMRunner {
                                     jsonMode: Bool,
                                     temperature: Double?,
                                     transport: OpenAITransport) async throws -> String {
-        var request = OpenAIClient.makeRequest(baseURL: baseURL,
+        // `makeRequest` throws `OpenAIRequestError.invalidEndpoint` for a
+        // malformed base URL (issue celarent7/mila#1). It's an
+        // `OpenAIRequestError`, so the typed-rethrow catch below surfaces it
+        // to the caller as a readable LocalizedError — not a crash.
+        var request = try OpenAIClient.makeRequest(baseURL: baseURL,
                                                model: model ?? "",
                                                prompt: prompt,
                                                transcript: transcript,
@@ -431,14 +435,26 @@ enum LLMRunner {
                 setupError: LLMRunnerError.toolDisabled.errorDescription
                     ?? "No OpenAI endpoint is configured in Settings → LLM.")
         }
-        var request = OpenAIClient.makeRequest(baseURL: trimmedBase,
-                                               model: model ?? "",
-                                               prompt: prompt,
-                                               transcript: transcript,
-                                               summary: summary,
-                                               apiKey: apiKey,
-                                               jsonMode: jsonMode,
-                                               temperature: nil)
+        // `makeRequest` throws `invalidEndpoint` for a malformed base URL
+        // (issue celarent7/mila#1). `diagnose` never throws, so surface it as
+        // a setup problem the test panel can render — not a crash.
+        var request: URLRequest
+        do {
+            request = try OpenAIClient.makeRequest(baseURL: trimmedBase,
+                                                   model: model ?? "",
+                                                   prompt: prompt,
+                                                   transcript: transcript,
+                                                   summary: summary,
+                                                   apiKey: apiKey,
+                                                   jsonMode: jsonMode,
+                                                   temperature: nil)
+        } catch let error as OpenAIRequestError {
+            return LLMTestResult(
+                setupError: error.errorDescription ?? "\(error)",
+                url: "\(trimmedBase)/chat/completions")
+        } catch {
+            return LLMTestResult(setupError: error.localizedDescription)
+        }
         if timeout > 0 { request.timeoutInterval = timeout }
         let url = request.url?.absoluteString ?? ""
         let requestBody = String(data: request.httpBody ?? Data(), encoding: .utf8) ?? ""

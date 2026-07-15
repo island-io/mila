@@ -322,7 +322,15 @@ final class RecordingSummarizer: ObservableObject {
         let executableOverride = llmSettings.executablePath.isEmpty
             ? nil
             : llmSettings.executablePath
-        let model = liveAISettings.model
+        // OpenAI-compatible runs use the endpoint's model name from
+        // `llmSettings.openAIModelName`; CLI runs use Live AI's model
+        // override. Mirrors `LiveAISession.kick`'s tool-conditional selection
+        // (issue celarent7/mila#4 — previously this always sent
+        // `liveAISettings.model`, e.g. "claude-sonnet-4-6", to the OpenAI
+        // endpoint, which 404'd on model-not-found).
+        let model = (tool == .openaiCompatible)
+            ? llmSettings.openAIModelName
+            : liveAISettings.model
         let extraArgs = llmSettings.extraArgsTokens
         let promptLanguageName: String = {
             switch liveAISettings.outputLanguage {

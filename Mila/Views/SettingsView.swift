@@ -848,8 +848,13 @@ private struct LLMSettingsTab: View {
                     }
                 }
                 .pickerStyle(.menu)
-                .onChange(of: settings.openAIProvider) { _, newPreset in
-                    settings.applyPreset(newPreset)
+                .onChange(of: settings.openAIProvider) { oldPreset, newPreset in
+                    // Pass the PREVIOUS provider explicitly: the Picker
+                    // binding has already set `openAIProvider` to
+                    // `newPreset` by the time `.onChange` fires, so
+                    // `applyPreset` cannot derive the old value itself
+                    // (issue celarent7/mila#2).
+                    settings.applyPreset(newPreset, previous: oldPreset)
                 }
             }
             .font(.callout)

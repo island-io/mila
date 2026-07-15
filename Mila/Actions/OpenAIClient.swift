@@ -10,6 +10,12 @@ enum OpenAIRequestError: LocalizedError, Equatable {
     case notFound(String)
     case server(status: Int, message: String)
     case emptyOutput
+    /// The configured base URL couldn't be turned into a valid request URL
+    /// (e.g. it contains a space or other character `URL(string:)` rejects).
+    /// Raised by `OpenAIClient.makeRequest` instead of force-unwrapping — a
+    /// malformed base URL is user input and must surface as a readable error,
+    /// not crash the app (issue celarent7/mila#1).
+    case invalidEndpoint(String)
 
     var errorDescription: String? {
         switch self {
@@ -21,6 +27,8 @@ enum OpenAIRequestError: LocalizedError, Equatable {
             return "Server returned HTTP \(status). \(m)"
         case .emptyOutput:
             return "The model returned no content."
+        case .invalidEndpoint(let baseURL):
+            return "“\(baseURL)” is not a valid endpoint URL. Check the Base URL in Settings → LLM (it must look like https://api.openai.com/v1)."
         }
     }
 }
@@ -140,6 +148,11 @@ enum OpenAIClient {
     /// with `chat/completions`; `Authorization` is set iff `apiKey` is
     /// non-empty; `response_format` is included iff `jsonMode`; `stream` is
     /// always `false`. `temperature` is included iff non-nil.
+    ///
+    /// Throws `OpenAIRequestError.invalidEndpoint` if the trimmed base URL
+    /// can't be parsed into a URL (e.g. it contains a space). `baseURL` is
+    /// free-text user input — the builder must not assume it's well-formed
+    /// (issue celarent7/mila#1).
     static func makeRequest(baseURL: String,
                             model: String,
                             prompt: String,
@@ -147,10 +160,12 @@ enum OpenAIClient {
                             summary: String,
                             apiKey: String,
                             jsonMode: Bool,
-                            temperature: Double?) -> URLRequest {
+                            temperature: Double?) throws -> URLRequest {
         let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let url = URL(string: "\(trimmedBase)/chat/completions")!
+        guard let url = URL(string: "\(trimmedBase)/chat/completions") else {
+            throw OpenAIRequestError.invalidEndpoint(trimmedBase)
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")

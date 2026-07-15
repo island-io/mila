@@ -294,8 +294,16 @@ final class LLMSettings: ObservableObject {
     /// they are empty or still carry the *previous* preset's default, so a
     /// user's custom value survives a preset change. The provider itself is
     /// always updated (and persisted via `openAIProvider.didSet`).
-    func applyPreset(_ newPreset: OpenAIProvider) {
-        let previous = openAIProvider
+    ///
+    /// `previous` MUST be the provider value *before* this change. In the
+    /// Settings UI the `Picker` binding updates `openAIProvider` to the new
+    /// preset **before** `.onChange` fires, so `openAIProvider` is already
+    /// the new value by the time this runs — re-reading it here would
+    /// compare against the *new* preset and never overwrite the field, so
+    /// switching OpenAI→Groq would leave the endpoint pointed at OpenAI.
+    /// The Picker's `.onChange(old, new)` passes the real previous value
+    /// explicitly (issue celarent7/mila#2).
+    func applyPreset(_ newPreset: OpenAIProvider, previous: OpenAIProvider) {
         openAIProvider = newPreset
         if openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             || openAIBaseURL == previous.baseURL {

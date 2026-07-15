@@ -278,8 +278,8 @@ final class OpenAIRequestBuilderTests: XCTestCase {
     }
 
     /// AC-REQ-01 — `<trimmed baseURL>/chat/completions`, trailing-slash tolerant.
-    func test_makeRequest_postURL_joinsBaseURLWithChatCompletions() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://api.openai.com/v1",
+    func test_makeRequest_postURL_joinsBaseURLWithChatCompletions() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://api.openai.com/v1",
                                          model: "gpt-4o-mini", prompt: "p",
                                          transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: false, temperature: nil)
@@ -288,8 +288,8 @@ final class OpenAIRequestBuilderTests: XCTestCase {
         XCTAssertEqual(r.httpMethod, "POST")
     }
 
-    func test_makeRequest_stripsTrailingSlashFromBaseURL() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://api.openai.com/v1/",
+    func test_makeRequest_stripsTrailingSlashFromBaseURL() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://api.openai.com/v1/",
                                          model: "m", prompt: "p", transcript: "t",
                                          summary: "", apiKey: "k", jsonMode: false, temperature: nil)
         XCTAssertEqual(r.url?.absoluteString,
@@ -297,31 +297,31 @@ final class OpenAIRequestBuilderTests: XCTestCase {
     }
 
     /// AC-REQ-02
-    func test_makeRequest_setsContentTypeJSON() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_setsContentTypeJSON() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: false, temperature: nil)
         XCTAssertEqual(r.value(forHTTPHeaderField: "Content-Type"), "application/json")
     }
 
     /// AC-REQ-03
-    func test_makeRequest_setsBearerAuthorization_whenKeyPresent() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_setsBearerAuthorization_whenKeyPresent() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "sk-abc", jsonMode: false, temperature: nil)
         XCTAssertEqual(r.value(forHTTPHeaderField: "Authorization"), "Bearer sk-abc")
     }
 
-    func test_makeRequest_omitsAuthorizationHeader_whenKeyEmpty() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_omitsAuthorizationHeader_whenKeyEmpty() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "", jsonMode: false, temperature: nil)
         XCTAssertNil(r.value(forHTTPHeaderField: "Authorization"))
     }
 
     /// AC-REQ-04 — a single `user` message holding the composed prompt.
-    func test_makeRequest_bodyMessages_singleUserMessageWithComposedPrompt() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_bodyMessages_singleUserMessageWithComposedPrompt() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "Summarize.", transcript: "hello world",
                                          summary: "gist", apiKey: "k", jsonMode: false, temperature: nil)
         let body = bodyJSON(r)
@@ -333,50 +333,101 @@ final class OpenAIRequestBuilderTests: XCTestCase {
     }
 
     /// AC-REQ-05 — model name is trimmed.
-    func test_makeRequest_bodyModel_equalsTrimmedModelName() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "  gpt-4o-mini  ",
+    func test_makeRequest_bodyModel_equalsTrimmedModelName() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "  gpt-4o-mini  ",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: false, temperature: nil)
         XCTAssertEqual(bodyJSON(r)["model"] as? String, "gpt-4o-mini")
     }
 
     /// AC-REQ-06 — response_format present iff jsonMode.
-    func test_makeRequest_includesResponseFormat_whenJSONModeRequested() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_includesResponseFormat_whenJSONModeRequested() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: true, temperature: nil)
         let rf = bodyJSON(r)["response_format"] as? [String: String]
         XCTAssertEqual(rf?["type"], "json_object")
     }
 
-    func test_makeRequest_omitsResponseFormat_whenJSONModeNotRequested() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_omitsResponseFormat_whenJSONModeNotRequested() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: false, temperature: nil)
         XCTAssertNil(bodyJSON(r)["response_format"])
     }
 
     /// AC-REQ-07 — non-streaming only.
-    func test_makeRequest_streamAlwaysFalse() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_streamAlwaysFalse() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: true, temperature: nil)
         XCTAssertEqual(bodyJSON(r)["stream"] as? Bool, false)
     }
 
     /// AC-REQ-09 — temperature included iff non-nil.
-    func test_makeRequest_includesTemperature_whenSet() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_includesTemperature_whenSet() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: false, temperature: 0.2)
         XCTAssertEqual(bodyJSON(r)["temperature"] as? Double, 0.2)
     }
 
-    func test_makeRequest_omitsTemperature_whenNil() {
-        let r = OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
+    func test_makeRequest_omitsTemperature_whenNil() throws {
+        let r = try OpenAIClient.makeRequest(baseURL: "https://x/v1", model: "m",
                                          prompt: "p", transcript: "t", summary: "",
                                          apiKey: "k", jsonMode: false, temperature: nil)
         XCTAssertNil(bodyJSON(r)["temperature"])
+    }
+
+    /// AC-REQ-11 (issue celarent7/mila#1) — a malformed base URL must surface
+    /// a typed `invalidEndpoint` error instead of crashing the app via a
+    /// force-unwrap. An internal space (not just leading/trailing) makes
+    /// `URL(string:)` return nil.
+    func test_makeRequest_throwsInvalidEndpoint_forMalformedBaseURL() {
+        XCTAssertThrowsError(try OpenAIClient.makeRequest(baseURL: "https://api.open ai.com/v1",
+                                                          model: "m", prompt: "p",
+                                                          transcript: "t", summary: "",
+                                                          apiKey: "k", jsonMode: false,
+                                                          temperature: nil)) { error in
+            XCTAssertEqual(error as? OpenAIRequestError, .invalidEndpoint("https://api.open ai.com/v1"))
+        }
+    }
+
+    /// AC-REQ-12 (issue celarent7/mila#1) — `runOpenAICompatible` must surface
+    /// the typed `invalidEndpoint` error (readable in the rename / Send sheet)
+    /// rather than crashing, when the base URL is malformed.
+    func test_runOpenAICompatible_throwsInvalidEndpoint_forMalformedBaseURL() async throws {
+        struct AlwaysReach: OpenAITransport {
+            func send(_ request: URLRequest) async throws -> (HTTPURLResponse, Data) {
+                throw URLError(.badServerResponse)
+            }
+        }
+        do {
+            _ = try await LLMRunner.runOpenAICompatible(
+                prompt: "p", transcript: "t", summary: "", model: "m",
+                timeout: 30, baseURL: "https://api.open ai.com/v1",
+                apiKey: "k", jsonMode: false, temperature: nil,
+                transport: AlwaysReach())
+            XCTFail("Expected invalidEndpoint for a malformed base URL")
+        } catch let error as OpenAIRequestError {
+            XCTAssertEqual(error, .invalidEndpoint("https://api.open ai.com/v1"))
+        } catch {
+            XCTFail("Expected OpenAIRequestError.invalidEndpoint, got \(error)")
+        }
+    }
+
+    /// AC-REQ-13 (issue celarent7/mila#1) — `diagnoseOpenAICompatible` is
+    /// non-throwing, so a malformed base URL must land in `setupError` (and
+    /// NOT set `didLaunch`), not crash.
+    func test_diagnoseOpenAICompatible_reportsInvalidEndpoint_asSetupError() async {
+        let result = await LLMRunner.diagnoseOpenAICompatible(
+            prompt: "p", transcript: "t", summary: "", model: "m",
+            timeout: 30, baseURL: "https://api.open ai.com/v1",
+            apiKey: "k", jsonMode: false, transport: nil)
+        XCTAssertFalse(result.didLaunch, "An invalid endpoint must not count as a launch")
+        XCTAssertNotNil(result.setupError)
+        XCTAssertTrue(result.setupError?.contains("not a valid endpoint URL") ?? false,
+                      "setupError should name the invalid endpoint: \(result.setupError ?? "")")
     }
 
     /// AC-REQ-10 — the HTTP tool contributes no argv; the runner's HTTP branch
@@ -453,7 +504,8 @@ final class OpenAIProviderTests: XCTestCase {
     /// AC-PRESET-04 — picking a preset fills empty base URL + model fields.
     func test_selectingPreset_fillsBaseURLAndModel_whenFieldsEmpty() {
         let s = makeSettings()
-        s.applyPreset(.openai)
+        // First selection: provider starts at the `.custom` default.
+        s.applyPreset(.openai, previous: .custom)
         XCTAssertEqual(s.openAIBaseURL, OpenAIProvider.openai.baseURL)
         XCTAssertEqual(s.openAIModelName, OpenAIProvider.openai.defaultModelName)
         XCTAssertEqual(s.openAIProvider, .openai)
@@ -464,7 +516,7 @@ final class OpenAIProviderTests: XCTestCase {
         let s = makeSettings()
         s.openAIBaseURL = "https://my-hosted.example/v1"
         s.openAIModelName = "my-model"
-        s.applyPreset(.groq)
+        s.applyPreset(.groq, previous: .custom)
         XCTAssertEqual(s.openAIBaseURL, "https://my-hosted.example/v1",
                        "A custom base URL must not be overwritten by a preset")
         XCTAssertEqual(s.openAIModelName, "my-model",
@@ -476,11 +528,37 @@ final class OpenAIProviderTests: XCTestCase {
     /// default values but not a user edit.
     func test_selectingPreset_overwritesPreviousPresetDefault() {
         let s = makeSettings()
-        s.applyPreset(.openai)            // fills openai defaults
+        s.applyPreset(.openai, previous: .custom)   // fills openai defaults
         XCTAssertEqual(s.openAIBaseURL, OpenAIProvider.openai.baseURL)
-        s.applyPreset(.groq)              // openai defaults → groq defaults
+        s.applyPreset(.groq, previous: .openai)     // openai defaults → groq defaults
         XCTAssertEqual(s.openAIBaseURL, OpenAIProvider.groq.baseURL)
         XCTAssertEqual(s.openAIModelName, OpenAIProvider.groq.defaultModelName)
+    }
+
+    /// AC-PRESET-06 (issue celarent7/mila#2) — switching presets via the
+    /// Settings `Picker` must actually update the base URL + model. The
+    /// `Picker` binding sets `openAIProvider` to the new value *before*
+    /// `.onChange` fires, so this test reproduces that exact order (set the
+    /// provider to the new preset first, then call `applyPreset(new,
+    /// previous: old)`). With the old `let previous = openAIProvider` read,
+    /// `previous` would be `.groq` (already updated) and the fields would
+    /// NOT change — the endpoint would stay pointed at OpenAI.
+    func test_selectingPreset_viaBindingOrder_updatesBaseURLAndModel() {
+        let s = makeSettings()
+        // Start on OpenAI, fields holding openai defaults (as a real first
+        // pick would leave them).
+        s.openAIProvider = .openai
+        s.openAIBaseURL = OpenAIProvider.openai.baseURL
+        s.openAIModelName = OpenAIProvider.openai.defaultModelName
+        // Picker binding updates openAIProvider FIRST ...
+        s.openAIProvider = .groq
+        // ... then .onChange fires with old=.openai, new=.groq.
+        s.applyPreset(.groq, previous: .openai)
+        XCTAssertEqual(s.openAIProvider, .groq)
+        XCTAssertEqual(s.openAIBaseURL, OpenAIProvider.groq.baseURL,
+                       "Switching OpenAI→Groq must update the base URL")
+        XCTAssertEqual(s.openAIModelName, OpenAIProvider.groq.defaultModelName,
+                       "Switching OpenAI→Groq must update the model name")
     }
 
     /// AC-PRESET-05 — OpenAI fields survive a settings re-creation (same defaults).

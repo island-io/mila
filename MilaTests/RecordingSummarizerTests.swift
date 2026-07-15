@@ -471,6 +471,41 @@ final class RecordingSummarizerTests: XCTestCase {
                        "isSummarizing should clear after CLI returns")
     }
 
+    // MARK: - OpenAI-compatible model threading (issue celarent7/mila#4)
+
+    /// The OpenAI-compatible summarizer must send `openAIModelName` (the
+    /// user's configured endpoint model), NOT `liveAISettings.model` (a Live
+    /// AI CLI override such as "claude-sonnet-4-6"). The latter 404's at the
+    /// endpoint as model-not-found. Mirrors `LiveAISession.kick`'s
+    /// tool-conditional selection.
+    func test_summarize_threadsOpenAIModelName_forOpenAICompatible() async throws {
+        llm.tool = .openaiCompatible
+        llm.openAIBaseURL = "https://api.openai.com/v1"
+        llm.openAIModelName = "gpt-4o-mini"
+        // Live AI's model is intentionally a *different* name — if the
+        // summarizer used it (the bug), the stub would record it here.
+        liveAI.model = "claude-sonnet-4-6"
+
+        var capturedModel: String? = ""
+        useStubRunner { _, _, _, _, model, _, _, _, _, _, _ in
+            capturedModel = model
+            return "A concise summary."
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Meeting")
+        try Data("not-audio".utf8).write(to: audioURL)
+        let rec = Recording(title: "Meeting", source: .microphone,
+                            audioFileName: audioURL.lastPathComponent,
+                            fullText: "we discussed the roadmap")
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(capturedModel, "gpt-4o-mini",
+                       "The OpenAI summary path must send openAIModelName, not the Live AI model")
+    }
+
     // MARK: - Helpers
 
     /// Rebuild `summarizer` with a deterministic `runLLM` stub so the
