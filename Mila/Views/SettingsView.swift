@@ -809,7 +809,7 @@ private struct LLMSettingsTab: View {
                     .textFieldStyle(.roundedBorder)
             }
             .font(.callout)
-            Text("Leave blank to look up the binary on $PATH. Set this if `claude` / `cursor-agent` lives somewhere a GUI app won't see by default (e.g. ~/.local/bin, an asdf shim).")
+            Text("Leave blank to look up the binary on $PATH. Set this if `claude` / `cursor-agent` / `gemini` lives somewhere a GUI app won't see by default (e.g. ~/.local/bin, an asdf shim).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
