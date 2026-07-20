@@ -20,6 +20,13 @@ struct RenameRecordingSheet: View {
     /// Mila folder the recording should be filed under (nil = unfiled).
     /// Seeded from the recording and applied on Save via `store.assign`.
     @State private var selectedFolder: String?
+    /// Mirrors `userEditedTitle` for the folder: while false, the picker
+    /// tracks the stored recording's folder (so a folder chosen on the
+    /// recording screen shows up here even when SwiftUI reuses this sheet's
+    /// `@State` across presentations and the init seed goes stale). Once the
+    /// user picks a folder in this sheet we stop mirroring so their choice
+    /// isn't clobbered.
+    @State private var userEditedFolder = false
     @State private var showingNewFolderField = false
     @State private var newFolderName = ""
     @State private var isFetchingName = false
@@ -230,6 +237,14 @@ struct RenameRecordingSheet: View {
         // back over the stored suggestion.
         .onAppear {
             if !userEditedTitle { title = liveRecording.title }
+            if !userEditedFolder { selectedFolder = liveRecording.folder }
+        }
+        // Keep the folder in sync with the stored recording until the user
+        // picks one here — mirrors the title mirroring above. This is what
+        // carries a folder chosen on the recording screen into the sheet even
+        // if the init-seeded `@State` was stale.
+        .onChange(of: liveRecording.folder) { _, newFolder in
+            if !userEditedFolder { selectedFolder = newFolder }
         }
         // Mirror a background auto-suggestion into the field as it lands —
         // but only until the user expresses their own preference. The
@@ -367,13 +382,13 @@ struct RenameRecordingSheet: View {
             HStack(spacing: 8) {
                 Menu {
                     Button(selectedFolder == nil ? "✓ None" : "None") {
-                        selectedFolder = nil
+                        chooseFolder(nil)
                     }
                     if !store.folders.isEmpty {
                         Divider()
                         ForEach(store.folders, id: \.self) { folder in
                             Button(selectedFolder == folder ? "✓ \(folder)" : folder) {
-                                selectedFolder = folder
+                                chooseFolder(folder)
                             }
                         }
                     }
@@ -407,8 +422,15 @@ struct RenameRecordingSheet: View {
     private func commitNewFolder() {
         let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        selectedFolder = name
+        chooseFolder(name)
         showingNewFolderField = false
+    }
+
+    /// Record an explicit in-sheet folder choice and stop mirroring the
+    /// stored recording's folder so the user's pick is never clobbered.
+    private func chooseFolder(_ folder: String?) {
+        selectedFolder = folder
+        userEditedFolder = true
     }
 
     private var header: some View {
