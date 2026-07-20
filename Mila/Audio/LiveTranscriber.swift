@@ -112,6 +112,13 @@ final class LiveTranscriber: ObservableObject {
     /// amount so `windowAbsoluteStart` in `runOnce` keeps producing
     /// correct absolute timestamps for the segment merge.
     private var samplesDropped: Int = 0
+    /// Absolute time ranges of segments the user deleted from the live
+    /// pane. Incoming whisper output overlapping any of these is dropped so
+    /// a just-deleted line can't reappear on a later tick — the fixed-window
+    /// path re-transcribes a rolling buffer and would otherwise re-emit the
+    /// deleted content. The VAD path emits each utterance once, so this is
+    /// mostly a safety net there. Cleared on `start()`.
+    private var deletedRanges: [(start: Double, end: Double)] = []
     private var inFlight: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
     private var language: String = "he"
@@ -140,6 +147,7 @@ final class LiveTranscriber: ObservableObject {
         self.language = language
         self.buffer.removeAll(keepingCapacity: true)
         self.samplesDropped = 0
+        self.deletedRanges = []
         self.fullText = ""
         self.segments = []
         self.speakerNames = [:]
@@ -211,6 +219,45 @@ final class LiveTranscriber: ObservableObject {
         } else {
             buffer.append(contentsOf: samples)
         }
+    }
+
+    /// Called when the recording is paused. In VAD mode, close the current
+    /// utterance at the pause point — otherwise resume would append post-pause
+    /// audio onto the same utterance, gluing the two sides of the gap into a
+    /// single segment with a bogus duration. Uses `flushForPause()` (not
+    /// `flush()`) so the detector's recording clock is preserved: post-resume
+    /// utterances keep their absolute timestamps instead of restarting at 0.
+    /// The fixed-window path keeps a plain rolling buffer with no in-flight
+    /// utterance to close, so this is a no-op there (paused audio simply
+    /// never arrives via `ingest`).
+    func pauseBoundary() {
+        detector?.flushForPause()
+    }
+
+    /// Delete a line from the live transcript. Records the segment's time
+    /// range so a later whisper tick (fixed-window mode re-transcribes a
+    /// rolling buffer) can't re-emit it, removes it from `segments`, and
+    /// recomputes `fullText`. Because `segments` is `@Published`, the app's
+    /// feed loop picks the change up automatically (MCP sidecar + LLM
+    /// re-feed), and the Stop-time snapshot excludes the deleted line.
+    func removeSegment(id: UUID) {
+        guard let idx = segments.firstIndex(where: { $0.id == id }) else { return }
+        let seg = segments[idx]
+        deletedRanges.append((start: seg.startSeconds, end: seg.endSeconds))
+        segments.remove(at: idx)
+        fullText = segments.map(\.text).joined(separator: " ")
+        liveLog.log("LiveTranscriber.removeSegment start=\(seg.startSeconds, privacy: .public) end=\(seg.endSeconds, privacy: .public) remaining=\(self.segments.count, privacy: .public)")
+    }
+
+    /// Whether an incoming segment's absolute time range overlaps a range
+    /// the user deleted. Any positive overlap counts — the intent of a
+    /// delete is "drop what was said in that span," so re-emitted content
+    /// there should stay gone.
+    private func isSuppressed(start: Double, end: Double) -> Bool {
+        for r in deletedRanges where start < r.end && end > r.start {
+            return true
+        }
+        return false
     }
 
     func transcribeNow() async {
@@ -415,10 +462,14 @@ final class LiveTranscriber: ObservableObject {
             let text = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
             guard s.start < originalDuration else { continue }
+            let absStart = startSec + s.start
+            let absEnd = startSec + s.end
+            // Skip anything the user deleted from this time span.
+            guard !isSuppressed(start: absStart, end: absEnd) else { continue }
             segments.append(LiveSegment(
                 id: UUID(),
-                startSeconds: startSec + s.start,
-                endSeconds: startSec + s.end,
+                startSeconds: absStart,
+                endSeconds: absEnd,
                 text: text,
                 speaker: nil,
                 stable: true
@@ -473,10 +524,14 @@ final class LiveTranscriber: ObservableObject {
         let absoluteSegs: [LiveSegment] = whisperSegs.compactMap { s in
             let text = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { return nil }
+            let absStart = windowAbsoluteStart + s.start
+            let absEnd = windowAbsoluteStart + s.end
+            // Don't resurrect a line the user deleted from this span.
+            guard !isSuppressed(start: absStart, end: absEnd) else { return nil }
             return LiveSegment(
                 id: UUID(),
-                startSeconds: windowAbsoluteStart + s.start,
-                endSeconds: windowAbsoluteStart + s.end,
+                startSeconds: absStart,
+                endSeconds: absEnd,
                 text: text,
                 speaker: nil,
                 stable: true

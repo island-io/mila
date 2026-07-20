@@ -100,6 +100,8 @@ struct LiveAIRecordingView: View {
             // the Home Record button to confirm it isn't stuck "Finalizing").
             .accessibilityIdentifier("liveAI.stop")
 
+            RecordingPauseButton()
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(aiActive ? "Recording — Live AI" : "Recording")
                     .font(.callout.weight(.semibold))
@@ -379,6 +381,9 @@ struct LiveAIRecordingView: View {
                                                        } else {
                                                            transcriber.speakerNames.removeValue(forKey: raw)
                                                        }
+                                                   },
+                                                   onDelete: { id in
+                                                       transcriber.removeSegment(id: id)
                                                    })
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                 // Identifier is applied to the inner Text
@@ -546,9 +551,55 @@ private struct RecordingElapsedLabel: View {
 
     var body: some View {
         let t = Int(session.elapsed.rounded())
-        Text(String(format: "%02d:%02d", t / 60, t % 60))
+        let clock = String(format: "%02d:%02d", t / 60, t % 60)
+        // Show "Paused" alongside the (frozen) clock so the user gets clear
+        // feedback that capture is suspended. This leaf already observes the
+        // session, so folding the paused state in here keeps the larger
+        // view body from re-rendering.
+        Text(session.state == .paused ? "Paused · \(clock)" : clock)
             .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
+            .foregroundStyle(session.state == .paused ? .orange : .secondary)
+    }
+}
+
+/// Pause / Resume control for the active recording. Isolated as a leaf that
+/// observes `RecordingSession` so its paused-state flip doesn't re-render
+/// larger views (which the session's high-frequency level updates would
+/// otherwise churn). Pausing drops all audio until resume, so nothing said
+/// during the pause is recorded. Used by the Live AI header, Home, and the
+/// floating recording chip.
+struct RecordingPauseButton: View {
+    @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var session: RecordingSession
+    /// Icon-only rendering for the compact floating chip; labeled pill
+    /// everywhere else.
+    var compact: Bool = false
+
+    var body: some View {
+        let paused = session.state == .paused
+        Button {
+            actions.togglePause()
+        } label: {
+            if compact {
+                Image(systemName: paused ? "play.fill" : "pause.fill")
+                    .foregroundStyle(paused ? Color.accentColor : .primary)
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: paused ? "play.fill" : "pause.fill")
+                    Text(paused ? "Resume" : "Pause")
+                        .font(.callout.weight(.semibold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.primary.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(actions.isFinalizingRecording)
+        .help(paused ? "Resume recording" : "Pause recording (audio during the pause isn't recorded)")
+        .accessibilityLabel(paused ? "Resume recording" : "Pause recording")
+        .accessibilityIdentifier(paused ? "recording.resume" : "recording.pause")
     }
 }
 
@@ -564,6 +615,11 @@ private struct TranscriptLineView: View {
     /// Persists a rename picked from the label's popover mid-recording:
     /// (raw speaker ID, chosen name or nil-to-reset).
     var onAssignName: (String, String?) -> Void = { _, _ in }
+    /// Deletes this line from the live transcript. Wired to
+    /// `LiveTranscriber.removeSegment(id:)`.
+    var onDelete: (UUID) -> Void = { _ in }
+
+    @State private var hovering = false
 
     var body: some View {
         // We rely on the PARENT pane's layoutDirection. That mirrors the
@@ -600,8 +656,41 @@ private struct TranscriptLineView: View {
                 // outer wrapper-level identifier was a no-op (SwiftUI
                 // didn't materialize an a11y node there).
                 .accessibilityIdentifier("liveTranscript.segment")
+            // Hover-revealed delete button. Kept out of the layout-direction
+            // flip (its own LTR) so the trash icon sits on the trailing edge
+            // regardless of the line's script. Always present but near-
+            // invisible until hover so rows don't jump when the button
+            // appears.
+            deleteButton
+                .opacity(hovering ? 1 : 0)
+                .environment(\.layoutDirection, .leftToRight)
         }
         .environment(\.layoutDirection, lineRTL ? .rightToLeft : .leftToRight)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        // Right-click / control-click also offers delete, for when the
+        // hover button is easy to miss.
+        .contextMenu {
+            Button(role: .destructive) {
+                onDelete(segment.id)
+            } label: {
+                Label("Delete line", systemImage: "trash")
+            }
+        }
+    }
+
+    private var deleteButton: some View {
+        Button {
+            onDelete(segment.id)
+        } label: {
+            Image(systemName: "trash")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help("Delete this line from the transcript")
+        .accessibilityLabel("Delete line")
+        .accessibilityIdentifier("liveTranscript.deleteLine")
     }
 }
 
