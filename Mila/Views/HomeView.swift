@@ -53,8 +53,7 @@ struct HomeView: View {
                         .controlSize(.large)
                 }
                 sourceToggles
-                meetingNameField
-                folderPicker
+                recordingDestination
                 dictationHint
             }
             .padding(.horizontal, 24)
@@ -165,6 +164,17 @@ struct HomeView: View {
         .toggleStyle(.switch)
         .controlSize(.small)
         .disabled(isRecording)
+        .frame(maxWidth: 280, alignment: .leading)
+    }
+
+    /// Destination controls for the next recording: the folder on top and the
+    /// meeting name directly under it, both left-aligned to a shared width so
+    /// their leading edges line up.
+    private var recordingDestination: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            folderPicker
+            meetingNameField
+        }
         .frame(maxWidth: 280, alignment: .leading)
     }
 
