@@ -8,6 +8,7 @@ import SwiftUI
 /// the toolbar now, recordings live in the All Transcriptions folder.
 struct HomeView: View {
     @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var hotkeys: HotkeySettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
@@ -44,7 +45,6 @@ struct HomeView: View {
             VStack(spacing: 24) {
                 header
                 heroAction
-                sourceToggles
                 if actions.isRecording {
                     // Pause/Resume sits under the hero Record/Stop button so
                     // it's reachable even in Live AI background mode, where
@@ -52,6 +52,9 @@ struct HomeView: View {
                     RecordingPauseButton()
                         .controlSize(.large)
                 }
+                sourceToggles
+                meetingNameField
+                folderPicker
                 dictationHint
             }
             .padding(.horizontal, 24)
@@ -163,6 +166,57 @@ struct HomeView: View {
         .controlSize(.small)
         .disabled(isRecording)
         .frame(maxWidth: 280, alignment: .leading)
+    }
+
+    /// Optional meeting name for the next recording. Empty falls back to the
+    /// auto-generated date-stamped title. Editable during a recording too,
+    /// since it's applied when the recording is saved.
+    private var meetingNameField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "text.cursor")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            TextField("Meeting name (optional)", text: $actions.nextRecordingTitle)
+                .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("home.record.meetingName")
+        }
+        .controlSize(.small)
+        .frame(maxWidth: 280)
+    }
+
+    /// Optional destination folder for the next recording. Sticky across
+    /// launches (stored on the controller). "None" lands in All Transcriptions,
+    /// where the user can still drag it into a folder later. Editable during a
+    /// recording too — the folder is applied when the recording is saved, so
+    /// changing it mid-capture takes effect.
+    private var folderPicker: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("Save to")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Menu {
+                Button(actions.nextRecordingFolder == nil ? "✓ All Transcriptions" : "All Transcriptions") {
+                    actions.nextRecordingFolder = nil
+                }
+                if !store.folders.isEmpty {
+                    Divider()
+                    ForEach(store.folders, id: \.self) { folder in
+                        Button(actions.nextRecordingFolder == folder ? "✓ \(folder)" : folder) {
+                            actions.nextRecordingFolder = folder
+                        }
+                    }
+                }
+            } label: {
+                Text(actions.nextRecordingFolder ?? "All Transcriptions")
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .accessibilityIdentifier("home.record.folder.menu")
+        }
+        .controlSize(.small)
     }
 
     /// Discrete reminder of the two global dictation hotkeys. Reads live

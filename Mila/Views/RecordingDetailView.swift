@@ -19,6 +19,8 @@ struct RecordingDetailView: View {
     @State private var isEditingTitle = false
     @State private var titleDraft = ""
     @FocusState private var titleFieldFocused: Bool
+    @State private var showingNewFolderAlert = false
+    @State private var newFolderName = ""
 
     var body: some View {
         VStack(spacing: 0) {
@@ -68,6 +70,8 @@ struct RecordingDetailView: View {
                     Text(recording.createdAt, format: .dateTime)
                     Text("·")
                     Text(formatDuration(recording.duration))
+                    Text("·")
+                    folderMenu
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -76,6 +80,48 @@ struct RecordingDetailView: View {
             actionButtons
         }
         .padding()
+        .alert("New Folder", isPresented: $showingNewFolderAlert) {
+            TextField("Folder name", text: $newFolderName)
+            Button("Create") {
+                let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !name.isEmpty { store.assign(recording, toFolder: name) }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("File this recording into a new folder.")
+        }
+    }
+
+    /// Change the recording's Mila folder inline. Mirrors the sidebar
+    /// context-menu assignment but keeps it reachable from the open recording.
+    private var folderMenu: some View {
+        Menu {
+            Button(recording.folder == nil ? "✓ None" : "None") {
+                store.assign(recording, toFolder: nil)
+            }
+            if !store.folders.isEmpty {
+                Divider()
+                ForEach(store.folders, id: \.self) { folder in
+                    Button(recording.folder == folder ? "✓ \(folder)" : folder) {
+                        store.assign(recording, toFolder: folder)
+                    }
+                }
+            }
+            Divider()
+            Button("New Folder…") {
+                newFolderName = ""
+                showingNewFolderAlert = true
+            }
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "folder")
+                Text(recording.folder ?? "No folder")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Choose the folder this recording is filed under")
+        .accessibilityIdentifier("detail.folder.menu")
     }
 
     /// Click-to-edit title. Pressing Return or losing focus commits the new

@@ -12,6 +12,7 @@ import TranscriptionCore
 /// vs. transcript volumes can drag the divider to fit their preference.
 struct LiveAIRecordingView: View {
     @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var store: RecordingStore
     // NOTE: `session` is deliberately NOT observed here. RecordingSession
     // is a fat ObservableObject that also @Publishes micLevel/systemLevel
     // at ~50 Hz; holding it here re-evaluated this whole body (including
@@ -77,6 +78,16 @@ struct LiveAIRecordingView: View {
     // MARK: - Header
 
     private var header: some View {
+        VStack(spacing: 10) {
+            controlsRow
+            metaRow
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(.regularMaterial)
+    }
+
+    private var controlsRow: some View {
         HStack(spacing: 12) {
             Button {
                 Task { await actions.stopRecording() }
@@ -122,9 +133,51 @@ struct LiveAIRecordingView: View {
                 ThinkingIndicator(isThinking: aiSession.isThinking)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .background(.regularMaterial)
+    }
+
+    /// Meeting name + destination folder for the recording being captured.
+    /// Both are editable mid-recording — the name and folder are applied
+    /// when the recording is saved (`QuickActionsController.stopRecording`),
+    /// so changing them here at any point up to Stop takes effect.
+    private var metaRow: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.cursor")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                TextField("Meeting name", text: $actions.nextRecordingTitle)
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+                    .accessibilityIdentifier("liveAI.meetingName")
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Menu {
+                    Button(actions.nextRecordingFolder == nil ? "✓ All Transcriptions" : "All Transcriptions") {
+                        actions.nextRecordingFolder = nil
+                    }
+                    if !store.folders.isEmpty {
+                        Divider()
+                        ForEach(store.folders, id: \.self) { folder in
+                            Button(actions.nextRecordingFolder == folder ? "✓ \(folder)" : folder) {
+                                actions.nextRecordingFolder = folder
+                            }
+                        }
+                    }
+                } label: {
+                    Text(actions.nextRecordingFolder ?? "All Transcriptions")
+                        .font(.callout)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityIdentifier("liveAI.folder.menu")
+            }
+        }
     }
 
     // MARK: - Action items pane
@@ -411,15 +464,40 @@ struct LiveAIRecordingView: View {
                     // queried in production.
                     Color.clear.frame(height: 1).id("bottom-anchor")
                 }
+                // Scroll on BOTH a new line (segments.count) and the
+                // in-progress last line growing in place (fullText, which is
+                // @Published and recomputed as that segment expands). Both
+                // route through `scrollToBottom`, which hops to the next
+                // runloop so the just-changed content is laid out FIRST —
+                // scrolling synchronously here targets the pre-update height
+                // and stops short of the newest words (worse under LazyVStack,
+                // whose just-appended row isn't measured yet at this instant).
                 .onChange(of: transcriber.segments.count) { _, _ in
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo("bottom-anchor", anchor: .bottom)
-                    }
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: transcriber.fullText) { _, _ in
+                    scrollToBottom(proxy)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.primary.opacity(0.02))
+    }
+
+    /// Pin the transcript to its newest line. Deferred to the next runloop
+    /// via `DispatchQueue.main.async` so the segment that just changed (an
+    /// appended line, or the in-progress last line that just grew) is laid
+    /// out BEFORE we scroll — a synchronous `scrollTo` inside `onChange`
+    /// runs in the same update cycle and lands on the stale, pre-update
+    /// content height, leaving the latest words below the fold. The
+    /// `bottom-anchor` sits after the LazyVStack (non-lazy, always
+    /// measured) so it's a stable scroll target once layout settles.
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo("bottom-anchor", anchor: .bottom)
+            }
+        }
     }
 
     /// Save the accumulated live transcript as an SRT to a user-chosen

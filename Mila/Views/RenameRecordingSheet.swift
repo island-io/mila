@@ -17,6 +17,11 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var summarizer: RecordingSummarizer
 
     @State private var title: String
+    /// Mila folder the recording should be filed under (nil = unfiled).
+    /// Seeded from the recording and applied on Save via `store.assign`.
+    @State private var selectedFolder: String?
+    @State private var showingNewFolderField = false
+    @State private var newFolderName = ""
     @State private var isFetchingName = false
     @State private var llmError: String?
     /// Set once the user types in the title field (or accepts a manual
@@ -40,6 +45,7 @@ struct RenameRecordingSheet: View {
     init(initialRecording: Recording) {
         self.initialRecording = initialRecording
         _title = State(initialValue: initialRecording.title)
+        _selectedFolder = State(initialValue: initialRecording.folder)
     }
 
     /// Live recording (transcript fills in here as Whisper finishes).
@@ -136,6 +142,8 @@ struct RenameRecordingSheet: View {
                         }
                     }
                 }
+
+                folderPicker
 
                 transcriptionStatus
             }
@@ -351,6 +359,58 @@ struct RenameRecordingSheet: View {
         }
     }
 
+    /// Pick the Mila folder this recording is filed under. Existing folders +
+    /// "None", plus an inline "New Folder…" field. Applied on Save.
+    private var folderPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Folder").font(.callout.weight(.semibold))
+            HStack(spacing: 8) {
+                Menu {
+                    Button(selectedFolder == nil ? "✓ None" : "None") {
+                        selectedFolder = nil
+                    }
+                    if !store.folders.isEmpty {
+                        Divider()
+                        ForEach(store.folders, id: \.self) { folder in
+                            Button(selectedFolder == folder ? "✓ \(folder)" : folder) {
+                                selectedFolder = folder
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("New Folder…") {
+                        newFolderName = ""
+                        showingNewFolderField = true
+                    }
+                } label: {
+                    Label(selectedFolder ?? "No folder", systemImage: "folder")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityIdentifier("rename.folder.menu")
+                Spacer()
+            }
+            if showingNewFolderField {
+                HStack(spacing: 8) {
+                    TextField("New folder name", text: $newFolderName)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { commitNewFolder() }
+                        .accessibilityIdentifier("rename.newFolder.field")
+                    Button("Add") { commitNewFolder() }
+                        .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Cancel") { showingNewFolderField = false }
+                }
+            }
+        }
+    }
+
+    private func commitNewFolder() {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        selectedFolder = name
+        showingNewFolderField = false
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Name this recording").font(.title3.weight(.semibold))
@@ -439,7 +499,19 @@ struct RenameRecordingSheet: View {
     }
 
     private func save() {
+        applyFolder()
         coordinator.dismiss(savingTitle: title)
+    }
+
+    /// File the recording under the chosen folder (auto-creates it) before the
+    /// sheet tears down. No-op when the folder is unchanged. Runs before the
+    /// Obsidian export (which fires off the summary hook) so the note nests
+    /// under the right Mila folder.
+    private func applyFolder() {
+        guard let rec = store.recordings.first(where: { $0.id == initialRecording.id }) else { return }
+        if rec.folder != selectedFolder {
+            store.assign(rec, toFolder: selectedFolder)
+        }
     }
 
     /// Save the title, dismiss the sheet, then run the action in the
@@ -466,6 +538,7 @@ struct RenameRecordingSheet: View {
         let summarySnapshot = summary
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let tool = llm.tool
+        applyFolder()
         coordinator.dismiss(savingTitle: title)
         coordinator.sendToLLM(recordingID: recordingID,
                               tool: tool,

@@ -64,6 +64,21 @@ final class QuickActionsController: ObservableObject {
     /// new app and the user has to re-grant access.
     @Published var microphonePermissionMissing = false
 
+    /// Mila folder the *next* recording is filed into (nil = All Transcriptions).
+    /// Always defaults to All Transcriptions on launch — the choice is
+    /// per-session only and deliberately NOT persisted across launches, so a
+    /// folder picked for one session never silently becomes the default for
+    /// the next one. Set from the Home record controls; applied when the
+    /// recording is saved in `stopRecording`.
+    @Published var nextRecordingFolder: String?
+
+    /// User-entered meeting name for the *next* recording (empty = use the
+    /// auto-generated date-stamped title). Set from the Home controls and
+    /// the live recording screen; applied when the recording is saved in
+    /// `stopRecording`, then cleared so a name typed for one meeting never
+    /// silently carries into the next one.
+    @Published var nextRecordingTitle: String = ""
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -591,6 +606,12 @@ final class QuickActionsController: ObservableObject {
             }
         }()
 
+        // A user-entered meeting name (from Home or the live recording
+        // screen) overrides the auto-generated date-stamped title. Cleared
+        // below once the recording is built so it doesn't carry over.
+        let finalTitle = Self.resolvedRecordingTitle(userProvided: nextRecordingTitle,
+                                                     defaultTitle: title)
+
         // A mic-only recording that captured zero frames produces an empty
         // WAV → empty transcript → silent ".failed". Tell the user why
         // (the recording itself is still saved, so the rename sheet appears
@@ -624,7 +645,7 @@ final class QuickActionsController: ObservableObject {
         // so the initial-status gate is segment-presence, not mode.
         let initialStatus: TranscriptionStatus = initialTranscriptSegments.isEmpty ? .pending : .running
         let recording = Recording(
-            title: title,
+            title: finalTitle,
             duration: duration,
             source: source,
             audioFileName: outputURL.lastPathComponent,
@@ -632,12 +653,22 @@ final class QuickActionsController: ObservableObject {
             language: languageSettings.current.rawValue,
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
+            folder: nextRecordingFolder,
             appName: appName,
             summary: initialSummary.isEmpty ? nil : initialSummary,
             actionItems: initialItems.isEmpty ? nil : initialItems,
             speakerNames: liveTranscriber?.speakerNames ?? [:]
         )
         store.add(recording)
+        // Clear the one-shot meeting name so the next recording starts with
+        // a fresh, auto-generated title unless the user names it again.
+        nextRecordingTitle = ""
+        // Register the chosen folder in the store's folder list (and dedup
+        // case-insensitively) so the recording isn't orphaned out of both
+        // "All Transcriptions" and the folder.
+        if nextRecordingFolder != nil {
+            store.assign(recording, toFolder: nextRecordingFolder)
+        }
         // The recording is persisted — close the live sidecar with its id
         // so an external poller's next get_live_transcript sees
         // `completed` + the handoff id (the inline drain below keeps
@@ -1109,22 +1140,6 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
-    var elapsed: TimeInterval { session.elapsed }
-    var micLevel: Float { session.micLevel }
-    var systemLevel: Float { session.systemLevel }
-
-    private func defaultTitle(prefix: String) -> String {
-        let f = DateFormatter()
-        f.dateStyle = .medium
-        f.timeStyle = .short
-        return "\(prefix) · \(f.string(from: Date()))"
-    }
-
-    private func audioDuration(at url: URL) -> Double {
-        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
-        return Double(file.length) / file.processingFormat.sampleRate
-    }
-}
     /// True while an active recording is paused. Reads straight off the
     /// session's published state so the UI's Pause/Resume affordances stay
     /// in sync without a separate mirrored flag.
@@ -1159,3 +1174,28 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
+    var elapsed: TimeInterval { session.elapsed }
+    var micLevel: Float { session.micLevel }
+    var systemLevel: Float { session.systemLevel }
+
+    /// Resolve the title a recording should be saved with: the user-entered
+    /// meeting name (trimmed) when they typed one, otherwise the
+    /// auto-generated date-stamped default. Pure + `static` so it's
+    /// unit-testable without a real recording session.
+    static func resolvedRecordingTitle(userProvided: String, defaultTitle: String) -> String {
+        let trimmed = userProvided.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? defaultTitle : trimmed
+    }
+
+    private func defaultTitle(prefix: String) -> String {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return "\(prefix) · \(f.string(from: Date()))"
+    }
+
+    private func audioDuration(at url: URL) -> Double {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        return Double(file.length) / file.processingFormat.sampleRate
+    }
+}
