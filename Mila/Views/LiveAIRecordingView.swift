@@ -12,7 +12,6 @@ import TranscriptionCore
 /// vs. transcript volumes can drag the divider to fit their preference.
 struct LiveAIRecordingView: View {
     @EnvironmentObject private var actions: QuickActionsController
-    @EnvironmentObject private var store: RecordingStore
     // NOTE: `session` is deliberately NOT observed here. RecordingSession
     // is a fat ObservableObject that also @Publishes micLevel/systemLevel
     // at ~50 Hz; holding it here re-evaluated this whole body (including
@@ -25,6 +24,10 @@ struct LiveAIRecordingView: View {
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var llmSettings: LLMSettings
+
+    /// Debounce handle for the live transcript auto-scroll (see
+    /// `scrollToBottom`). Coalesces the per-tick scroll requests.
+    @State private var pendingScroll: DispatchWorkItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -145,10 +148,10 @@ struct LiveAIRecordingView: View {
                 Image(systemName: "text.cursor")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                TextField("Meeting name", text: $actions.nextRecordingTitle)
+                NextRecordingMeetingNameField(placeholder: "Meeting name",
+                                              accessibilityID: "liveAI.meetingName")
                     .textFieldStyle(.plain)
                     .font(.callout)
-                    .accessibilityIdentifier("liveAI.meetingName")
             }
 
             Spacer(minLength: 12)
@@ -157,25 +160,8 @@ struct LiveAIRecordingView: View {
                 Image(systemName: "folder")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Menu {
-                    Button(actions.nextRecordingFolder == nil ? "✓ All Transcriptions" : "All Transcriptions") {
-                        actions.nextRecordingFolder = nil
-                    }
-                    if !store.folders.isEmpty {
-                        Divider()
-                        ForEach(store.folders, id: \.self) { folder in
-                            Button(actions.nextRecordingFolder == folder ? "✓ \(folder)" : folder) {
-                                actions.nextRecordingFolder = folder
-                            }
-                        }
-                    }
-                } label: {
-                    Text(actions.nextRecordingFolder ?? "All Transcriptions")
-                        .font(.callout)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .accessibilityIdentifier("liveAI.folder.menu")
+                NextRecordingFolderPicker(accessibilityID: "liveAI.folder.menu")
+                    .font(.callout)
             }
         }
     }
@@ -493,11 +479,20 @@ struct LiveAIRecordingView: View {
     /// `bottom-anchor` sits after the LazyVStack (non-lazy, always
     /// measured) so it's a stable scroll target once layout settles.
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.async {
+        // Debounce: `fullText` changes on every partial-transcript tick (many
+        // per second as the in-progress line grows). Firing a fresh
+        // `withAnimation` scroll per tick stacks animations and adds
+        // main-thread work to the transcript re-render storm. Coalesce to one
+        // scroll per short window; deferring via `asyncAfter` also lets the
+        // just-changed content lay out first so we land on the newest line.
+        pendingScroll?.cancel()
+        let work = DispatchWorkItem {
             withAnimation(.easeOut(duration: 0.18)) {
                 proxy.scrollTo("bottom-anchor", anchor: .bottom)
             }
         }
+        pendingScroll = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
     }
 
     /// Save the accumulated live transcript as an SRT to a user-chosen

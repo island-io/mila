@@ -13,7 +13,6 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var coordinator: PostRecordingCoordinator
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var llm: LLMSettings
-    @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var summarizer: RecordingSummarizer
 
     @State private var title: String
@@ -95,28 +94,6 @@ struct RenameRecordingSheet: View {
             || summarizer.isSummarizing(liveRecording.id)
     }
 
-    /// "Transcribing…", "Identifying speakers…", "Done", "Failed",
-    /// "Waiting in queue" — drives the progress indicator inside the sheet.
-    private var transcriptionLabel: String {
-        let live = liveRecording
-        if transcription.activeRecordingID == live.id {
-            let pct = Int(transcription.progress * 100)
-            return "Transcribing… \(pct)%"
-        }
-        // The offline re-diarize pass: the transcript text is already final
-        // (status is .completed), so "Transcribing" would be wrong — the
-        // pyannote subprocess is only re-clustering speaker labels.
-        if transcription.diarizingRecordingID == live.id {
-            return "Identifying speakers…"
-        }
-        switch live.status {
-        case .pending:   return "Waiting to transcribe…"
-        case .running:   return "Transcribing…"
-        case .completed: return "Transcript ready"
-        case .failed:    return "Transcription failed"
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Fixed top: identity + status. Never scrolls, so the title field
@@ -152,7 +129,7 @@ struct RenameRecordingSheet: View {
 
                 folderPicker
 
-                transcriptionStatus
+                RenameTranscriptionStatusRow(recordingID: initialRecording.id)
             }
             .padding(20)
 
@@ -482,44 +459,6 @@ struct RenameRecordingSheet: View {
             .isEmpty
     }
 
-    @ViewBuilder
-    private var transcriptionStatus: some View {
-        HStack(spacing: 10) {
-            statusIcon
-            Text(transcriptionLabel)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            if transcription.activeRecordingID == liveRecording.id {
-                ProgressView(value: transcription.progress)
-                    .progressViewStyle(.linear)
-                    .frame(maxWidth: 140)
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    @ViewBuilder
-    private var statusIcon: some View {
-        // While the offline re-diarize is in flight the transcript is done
-        // but speaker labels aren't — show a spinner, not the green check,
-        // to match the "Identifying speakers…" label.
-        if transcription.diarizingRecordingID == liveRecording.id {
-            ProgressView().controlSize(.small)
-        } else {
-            switch liveRecording.status {
-            case .completed:
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-            case .failed:
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-            default:
-                ProgressView().controlSize(.small)
-            }
-        }
-    }
-
     private func save() {
         applyFolder()
         coordinator.dismiss(savingTitle: title)
@@ -604,6 +543,82 @@ struct RenameRecordingSheet: View {
             // when withTaskCancellationHandler's onCancel beat us to it.
             if Task.isCancelled { return }
             llmError = error.localizedDescription
+        }
+    }
+}
+
+/// Isolated transcription-status row for the rename sheet.
+///
+/// This is the ONLY part of the sheet that observes `TranscriptionService`, so
+/// the high-frequency `progress` updates during batch transcription re-render
+/// just this small leaf — not the whole sheet. Previously the sheet held
+/// `@EnvironmentObject transcription`, so every progress tick rebuilt the
+/// entire body including the folder `Menu`; opening that menu mid-transcription
+/// then collided with the NSMenu's modal tracking loop and beachballed the app.
+private struct RenameTranscriptionStatusRow: View {
+    @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var transcription: TranscriptionService
+    let recordingID: UUID
+
+    private var status: TranscriptionStatus {
+        store.recordings.first(where: { $0.id == recordingID })?.status ?? .pending
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            statusIcon
+            Text(label)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if transcription.activeRecordingID == recordingID {
+                ProgressView(value: transcription.progress)
+                    .progressViewStyle(.linear)
+                    .frame(maxWidth: 140)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// "Transcribing… NN%", "Identifying speakers…", "Transcript ready",
+    /// "Transcription failed", "Waiting to transcribe…".
+    private var label: String {
+        if transcription.activeRecordingID == recordingID {
+            let pct = Int(transcription.progress * 100)
+            return "Transcribing… \(pct)%"
+        }
+        // The offline re-diarize pass: the transcript text is already final
+        // (status is .completed), so "Transcribing" would be wrong — the
+        // pyannote subprocess is only re-clustering speaker labels.
+        if transcription.diarizingRecordingID == recordingID {
+            return "Identifying speakers…"
+        }
+        switch status {
+        case .pending:   return "Waiting to transcribe…"
+        case .running:   return "Transcribing…"
+        case .completed: return "Transcript ready"
+        case .failed:    return "Transcription failed"
+        }
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        // While the offline re-diarize is in flight the transcript is done
+        // but speaker labels aren't — show a spinner, not the green check,
+        // to match the "Identifying speakers…" label.
+        if transcription.diarizingRecordingID == recordingID {
+            ProgressView().controlSize(.small)
+        } else {
+            switch status {
+            case .completed:
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            default:
+                ProgressView().controlSize(.small)
+            }
         }
     }
 }

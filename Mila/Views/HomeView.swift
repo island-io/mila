@@ -8,7 +8,6 @@ import SwiftUI
 /// the toolbar now, recordings live in the All Transcriptions folder.
 struct HomeView: View {
     @EnvironmentObject private var actions: QuickActionsController
-    @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var hotkeys: HotkeySettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
@@ -186,9 +185,9 @@ struct HomeView: View {
             Image(systemName: "text.cursor")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            TextField("Meeting name (optional)", text: $actions.nextRecordingTitle)
+            NextRecordingMeetingNameField(placeholder: "Meeting name (optional)",
+                                          accessibilityID: "home.record.meetingName")
                 .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("home.record.meetingName")
         }
         .controlSize(.small)
         .frame(maxWidth: 280)
@@ -207,24 +206,7 @@ struct HomeView: View {
             Text("Save to")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            Menu {
-                Button(actions.nextRecordingFolder == nil ? "✓ All Transcriptions" : "All Transcriptions") {
-                    actions.nextRecordingFolder = nil
-                }
-                if !store.folders.isEmpty {
-                    Divider()
-                    ForEach(store.folders, id: \.self) { folder in
-                        Button(actions.nextRecordingFolder == folder ? "✓ \(folder)" : folder) {
-                            actions.nextRecordingFolder = folder
-                        }
-                    }
-                }
-            } label: {
-                Text(actions.nextRecordingFolder ?? "All Transcriptions")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .accessibilityIdentifier("home.record.folder.menu")
+            NextRecordingFolderPicker(accessibilityID: "home.record.folder.menu")
         }
         .controlSize(.small)
     }
