@@ -446,6 +446,76 @@ final class RecordingStoreTests: XCTestCase {
                        "Whitespace-only summary must be treated as empty")
     }
 
+    // MARK: - Empty Trash (bulk permanent delete)
+
+    /// `emptyTrash()` removes every trashed recording (metadata + on-disk
+    /// audio) in one pass while leaving live recordings untouched, and
+    /// returns the count it removed.
+    func test_empty_trash_removes_only_trashed_recordings_and_their_files() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+
+        // Two trashed recordings with real audio on disk.
+        let trashedURLs: [URL] = try (0..<2).map { i in
+            let url = store.freshAudioURL(suggestedName: "Trashed\(i)")
+            try Data(repeating: 0, count: 512).write(to: url)
+            let rec = Recording(title: "Trashed\(i)", source: .microphone,
+                                audioFileName: url.lastPathComponent)
+            store.add(rec)
+            store.softDelete(rec)
+            return url
+        }
+
+        // One live recording that must survive.
+        let liveURL = store.freshAudioURL(suggestedName: "Live")
+        try Data(repeating: 0, count: 512).write(to: liveURL)
+        let live = Recording(title: "Live", source: .microphone,
+                             audioFileName: liveURL.lastPathComponent)
+        store.add(live)
+
+        let removed = store.emptyTrash()
+
+        XCTAssertEqual(removed, 2)
+        XCTAssertTrue(store.recordings(in: .recentlyDeleted).isEmpty)
+        XCTAssertEqual(store.recordings.map(\.id), [live.id])
+        for url in trashedURLs {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path),
+                           "Trashed audio should be gone")
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: liveURL.path),
+                      "Live recording's audio must be untouched")
+
+        // Removal persists across relaunch.
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.map(\.id), [live.id])
+    }
+
+    /// Emptying an already-empty trash is a no-op that reports zero.
+    func test_empty_trash_is_noop_when_trash_empty() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let live = Recording(title: "Live", source: .microphone, audioFileName: "l.wav")
+        store.add(live)
+
+        XCTAssertEqual(store.emptyTrash(), 0)
+        XCTAssertEqual(store.recordings.map(\.id), [live.id])
+    }
+
+    /// Bulk empty must tombstone trashed Voice-Memo imports (same contract as
+    /// the per-row permanent delete) so the next sync doesn't resurrect them.
+    func test_empty_trash_tombstones_trashed_voice_memo_imports() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let memo = voiceMemoImport("a", fromFolderID: "FOLDER-1")
+        store.add(memo)
+        store.softDelete(memo)
+
+        store.emptyTrash()
+
+        XCTAssertTrue(store.voiceMemoTombstones.contains("unique-a"),
+                      "Emptying the trash must tombstone deleted voice-memo imports")
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertTrue(reloaded.voiceMemoTombstones.contains("unique-a"),
+                      "Tombstones from Empty Trash must persist across relaunch")
+    }
+
     // MARK: - Stopping a queued/running transcription
 
     /// Stopping a `.running` recording from the Queue moves it to Recently

@@ -58,6 +58,14 @@ struct ContentView: View {
                 }
             }
             .toolbar {
+                // Empty Trash sits on the leading side and only while the
+                // Recently Deleted view is open — a destructive bulk action
+                // has no place in the toolbar of a normal recordings list.
+                if isViewingTrash {
+                    ToolbarItem(placement: .destructiveAction) {
+                        EmptyTrashButton()
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
                     InputDevicePickerToolbarItem()
                 }
@@ -209,6 +217,14 @@ struct ContentView: View {
             // flicker.
             NotificationCenter.default.post(name: .milaSidebarVisibilityDidChange, object: nil)
         }
+    }
+
+    /// True while the detail pane is showing the "Recently Deleted" list —
+    /// gates the toolbar's "Empty Trash" action so it doesn't appear over
+    /// any other view.
+    private var isViewingTrash: Bool {
+        if case .category(.recentlyDeleted) = selection { return true }
+        return false
     }
 
     /// True iff the detail pane is currently rendering `LiveAIRecordingView`
