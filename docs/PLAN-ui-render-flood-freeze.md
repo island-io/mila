@@ -193,6 +193,58 @@ answering the open questions, so the plan's recommended defaults were used):
   recording screen / detail view during active transcription and confirm no
   beachball (optionally `sample Mila` while the menu is open).
 
+## Follow-up 2026-07-20 — Step 1 was necessary but INSUFFICIENT
+
+The user reported the freeze STILL reproduced when opening the folder menu on
+the live recording window during recording. Root cause: Step 1 leaf-isolated
+the menu's *content* (`NextRecordingFolderPicker` / `RecordingFolderMenu`), but
+the menu's **ancestors** still re-rendered every tick. `LiveAIRecordingView`
+held `@EnvironmentObject transcriber/diarizer/aiSession` at the top level, so
+its whole body — including `header`/`metaRow` (which host the folder menu) —
+re-executed on every partial-transcript / AI tick. Reconciling the ancestors
+of an OPEN NSMenu-backed control (nested modal tracking runloop) beachballs the
+app. Same latent bug in `RecordingDetailView`, which held
+`@EnvironmentObject transcription` and read `progress` in its body while
+hosting `RecordingFolderMenu`.
+
+Fix: push the high-frequency observation DOWN out of the menu's ancestors.
+
+- **`LiveAIRecordingView` (done).** Extracted `LiveTranscriptPane` (owns
+  `LiveTranscriber` + the scroll debounce/`exportLiveSRT`), `ActionItemsPane`
+  (owns `LiveAISession` + `LiveTranscriber` for speaker names + the AI-pane RTL
+  logic), and `LiveThinkingIndicator` (owns `LiveAISession` for the header
+  "Thinking…" dot). Removed `transcriber`/`diarizer`/`aiSession` (and the
+  now-dead `diarizer` subscription) + the `pendingScroll` `@State` from the
+  parent. The parent now observes only `actions` / `languageSettings` /
+  `liveAISettings` / `llmSettings` — none tick during recording — so the header
+  + folder menu no longer re-render at transcript cadence. `bulletsFromSummary`
+  kept static on `LiveAIRecordingView` so `LiveAIBulletsTests` is unaffected.
+- **`RecordingDetailView` (done).** Extracted `RecordingDetailActionButtons`
+  (owns `TranscriptionService` for the `busy` gate + `enqueue`) and
+  `RecordingTranscriptArea` (owns `TranscriptionService` `progress`/active/
+  queued state + `ModelManager`). Removed `@EnvironmentObject transcription`
+  (and the now-unused `modelManager`) from the parent. `EmptyTranscriptPlaceholder`
+  + `emptyTranscriptPlaceholder` kept on `RecordingDetailView` so
+  `RecordingDetailPlaceholderTests` is unaffected.
+
+Surroundings: `RenameRecordingSheet` was already correctly isolated
+(`RenameTranscriptionStatusRow` leaf). `HomeView` still holds
+`@EnvironmentObject transcription` but only shows its folder menu when NOT
+recording; a background batch job could still flood it — noted as a lower-risk
+optional follow-up, not done here.
+
+### Verification (follow-up)
+
+- `make build` — BUILD SUCCEEDED.
+- `xcodebuild ... -only-testing:MilaTests/LiveAIBulletsTests
+  -only-testing:MilaTests/RecordingDetailPlaceholderTests test` — TEST
+  SUCCEEDED. No lint errors on either edited view.
+- **Manual freeze repro still outstanding:** open the folder menu on the live
+  recording window AND the recording detail view during active transcription;
+  confirm no beachball (optionally `sample Mila` while the menu is open — the
+  main thread should be idle in menu tracking, not in SwiftUI/AttributeGraph
+  re-render).
+
 ## Blockers hit
 
 _(none)_

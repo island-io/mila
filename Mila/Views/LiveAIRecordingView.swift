@@ -10,6 +10,15 @@ import TranscriptionCore
 /// The pane heights default to a balanced 50/50 — we use a `VSplitView`
 /// rather than fixed fractions so users with very different action-item
 /// vs. transcript volumes can drag the divider to fit their preference.
+///
+/// IMPORTANT: this top-level view deliberately does NOT observe any of the
+/// high-frequency publishers (`LiveTranscriber`, `LiveSpeakerDiarizer`,
+/// `LiveAISession`). Those live inside the `LiveTranscriptPane` /
+/// `ActionItemsPane` / `LiveThinkingIndicator` leaves. If the parent
+/// observed them, its whole body — including the `header` that hosts the
+/// folder `Menu` — would re-render at transcript cadence, and reconciling
+/// an OPEN NSMenu-backed control mid-tracking beachballs the app. Keeping
+/// the flood out of the menu's ancestors is what stops that freeze.
 struct LiveAIRecordingView: View {
     @EnvironmentObject private var actions: QuickActionsController
     // NOTE: `session` is deliberately NOT observed here. RecordingSession
@@ -18,16 +27,9 @@ struct LiveAIRecordingView: View {
     // the growing transcript ForEach) on every mic-level tick. The
     // elapsed clock now lives in the `RecordingElapsedLabel` leaf so only
     // that tiny Text re-renders at audio cadence — not the transcript.
-    @EnvironmentObject private var transcriber: LiveTranscriber
-    @EnvironmentObject private var diarizer: LiveSpeakerDiarizer
-    @EnvironmentObject private var aiSession: LiveAISession
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var llmSettings: LLMSettings
-
-    /// Debounce handle for the live transcript auto-scroll (see
-    /// `scrollToBottom`). Coalesces the per-tick scroll requests.
-    @State private var pendingScroll: DispatchWorkItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -39,13 +41,13 @@ struct LiveAIRecordingView: View {
             // Mila is hearing in real time.
             if aiActive {
                 VSplitView {
-                    actionItemsPane
+                    ActionItemsPane(language: language)
                         .frame(minHeight: 140)
-                    liveTranscriptPane
+                    LiveTranscriptPane(language: language)
                         .frame(minHeight: 140)
                 }
             } else {
-                liveTranscriptPane
+                LiveTranscriptPane(language: language)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -54,29 +56,7 @@ struct LiveAIRecordingView: View {
     /// Recording's current language. Drives RTL handling for the
     /// transcript pane + friendly speaker labels.
     private var language: String { languageSettings.current.rawValue }
-    private var isRTL: Bool { language == "he" }
     private var aiActive: Bool { liveAISettings.enabled && llmSettings.isConfigured }
-
-    /// RTL for the AI pane (summary + action items). The AI output is its
-    /// own language setting; for `.auto` we detect from the actual emitted
-    /// text — summary + ALL item texts combined — so a short individual
-    /// item with an embedded English name ("…ל-Cursor") doesn't mis-detect
-    /// while its neighbours are clearly Hebrew. One verdict for the whole
-    /// pane keeps every row aligned the same way. Drives EXPLICIT
-    /// `.trailing` alignment (never `\.layoutDirection`) — see the live
-    /// transcript pane: flipping layoutDirection mis-measured inside the
-    /// split view / open sidebar and shoved Hebrew to the left.
-    private var aiOutputIsRTL: Bool {
-        switch liveAISettings.outputLanguage {
-        case .hebrew: return true
-        case .english: return false
-        case .auto:
-            if language == "he" { return true }
-            let combined = aiSession.summary + " "
-                + aiSession.actionItems.map(\.text).joined(separator: " ")
-            return combined.isPredominantlyHebrew
-        }
-    }
 
     // MARK: - Header
 
@@ -133,7 +113,7 @@ struct LiveAIRecordingView: View {
             }
 
             if aiActive {
-                ThinkingIndicator(isThinking: aiSession.isThinking)
+                LiveThinkingIndicator()
             }
         }
     }
@@ -166,10 +146,56 @@ struct LiveAIRecordingView: View {
         }
     }
 
-    // MARK: - Action items pane
+    /// Split a rolling summary paragraph into one bullet per sentence.
+    /// Falls back to the whole string as a single bullet when no
+    /// sentence boundary is found — better than showing nothing.
+    ///
+    /// Uses Foundation's `.bySentences` tokenizer (same as
+    /// `AIOverviewSection.summaryAttributed`, so the live pane and the
+    /// detail pane split the same summary identically). The previous
+    /// naive split on every '.', '!', '?' character turned "Budget is
+    /// 3.5 million." into two bullets — and, despite its comment, never
+    /// actually included the Hebrew full stop in the separator set.
+    ///
+    /// Kept static on `LiveAIRecordingView` (rather than on the pane leaf)
+    /// so `MilaTests/LiveAIBulletsTests` can exercise it without building
+    /// the view.
+    static func bulletsFromSummary(_ s: String) -> [String] {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+        let sourceLines: [String]
+        if trimmed.contains("\n") {
+            // Already has line structure (often the LLM's own bullets).
+            sourceLines = trimmed.components(separatedBy: "\n")
+        } else {
+            var sentences: [String] = []
+            trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex,
+                                        options: [.bySentences, .localized]) { sub, _, _, _ in
+                let sentence = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sentence.isEmpty { sentences.append(sentence) }
+            }
+            sourceLines = sentences
+        }
+        let parts = sourceLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? [trimmed] : parts
+    }
+}
 
-    @ViewBuilder
-    private var actionItemsPane: some View {
+// MARK: - Action items pane
+
+/// Summary + action-items pane. Owns the ONLY parent-side dependency on
+/// `LiveAISession` (and on `LiveTranscriber` for live speaker names), so
+/// the AI/transcript flood re-renders this leaf instead of the whole
+/// `LiveAIRecordingView` body (which hosts the folder `Menu`).
+private struct ActionItemsPane: View {
+    @EnvironmentObject private var aiSession: LiveAISession
+    @EnvironmentObject private var liveAISettings: LiveAISettings
+    @EnvironmentObject private var transcriber: LiveTranscriber
+    let language: String
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Image(systemName: "sparkles")
@@ -218,6 +244,27 @@ struct LiveAIRecordingView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    /// RTL for the AI pane (summary + action items). The AI output is its
+    /// own language setting; for `.auto` we detect from the actual emitted
+    /// text — summary + ALL item texts combined — so a short individual
+    /// item with an embedded English name ("…ל-Cursor") doesn't mis-detect
+    /// while its neighbours are clearly Hebrew. One verdict for the whole
+    /// pane keeps every row aligned the same way. Drives EXPLICIT
+    /// `.trailing` alignment (never `\.layoutDirection`) — see the live
+    /// transcript pane: flipping layoutDirection mis-measured inside the
+    /// split view / open sidebar and shoved Hebrew to the left.
+    private var aiOutputIsRTL: Bool {
+        switch liveAISettings.outputLanguage {
+        case .hebrew: return true
+        case .english: return false
+        case .auto:
+            if language == "he" { return true }
+            let combined = aiSession.summary + " "
+                + aiSession.actionItems.map(\.text).joined(separator: " ")
+            return combined.isPredominantlyHebrew
+        }
+    }
+
     /// Render the LLM's rolling summary as a bulleted list. The LLM
     /// usually returns one paragraph (1-3 sentences); we split on
     /// sentence boundaries so each sentence becomes its own bullet
@@ -225,7 +272,7 @@ struct LiveAIRecordingView: View {
     /// for, without forcing a prompt change that would risk
     /// breaking JSON parsing.
     private func summarySection(isRTL: Bool) -> some View {
-        let bullets = Self.bulletsFromSummary(aiSession.summary)
+        let bullets = LiveAIRecordingView.bulletsFromSummary(aiSession.summary)
         return VStack(alignment: isRTL ? .trailing : .leading, spacing: 6) {
             sectionHeader(icon: "text.alignleft", title: "Summary", isRTL: isRTL)
             VStack(alignment: isRTL ? .trailing : .leading, spacing: 4) {
@@ -270,38 +317,6 @@ struct LiveAIRecordingView: View {
         .frame(maxWidth: .infinity, alignment: isRTL ? .trailing : .leading)
     }
 
-    /// Split a rolling summary paragraph into one bullet per sentence.
-    /// Falls back to the whole string as a single bullet when no
-    /// sentence boundary is found — better than showing nothing.
-    ///
-    /// Uses Foundation's `.bySentences` tokenizer (same as
-    /// `AIOverviewSection.summaryAttributed`, so the live pane and the
-    /// detail pane split the same summary identically). The previous
-    /// naive split on every '.', '!', '?' character turned "Budget is
-    /// 3.5 million." into two bullets — and, despite its comment, never
-    /// actually included the Hebrew full stop in the separator set.
-    static func bulletsFromSummary(_ s: String) -> [String] {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
-        let sourceLines: [String]
-        if trimmed.contains("\n") {
-            // Already has line structure (often the LLM's own bullets).
-            sourceLines = trimmed.components(separatedBy: "\n")
-        } else {
-            var sentences: [String] = []
-            trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex,
-                                        options: [.bySentences, .localized]) { sub, _, _, _ in
-                let sentence = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                if !sentence.isEmpty { sentences.append(sentence) }
-            }
-            sourceLines = sentences
-        }
-        let parts = sourceLines
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return parts.isEmpty ? [trimmed] : parts
-    }
-
     private var emptyState: some View {
         VStack(spacing: 8) {
             Image(systemName: "ear")
@@ -320,10 +335,23 @@ struct LiveAIRecordingView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.bottom, 24)
     }
+}
 
-    // MARK: - Live transcript pane
+// MARK: - Live transcript pane
 
-    private var liveTranscriptPane: some View {
+/// Live transcript pane. Owns the ONLY parent-side dependency on
+/// `LiveTranscriber`, so the partial-transcript flood re-renders this leaf
+/// instead of the whole `LiveAIRecordingView` body (which hosts the folder
+/// `Menu`). Also owns the per-tick auto-scroll debounce state.
+private struct LiveTranscriptPane: View {
+    @EnvironmentObject private var transcriber: LiveTranscriber
+    let language: String
+
+    /// Debounce handle for the live transcript auto-scroll (see
+    /// `scrollToBottom`). Coalesces the per-tick scroll requests.
+    @State private var pendingScroll: DispatchWorkItem?
+
+    var body: some View {
         // Detect Hebrew from the accumulated transcript text — much
         // more reliable than the language dropdown, which the user
         // may not have flipped before pressing Record.
@@ -339,7 +367,6 @@ struct LiveAIRecordingView: View {
         // alignment, each Text just stays pinned to whichever edge
         // we name, regardless of how the parent is sized.
         let textAlignment: Alignment = paneIsRTL ? .trailing : .leading
-        let multilineAlignment: TextAlignment = paneIsRTL ? .trailing : .leading
         return VStack(alignment: .leading, spacing: 0) {
             HStack {
                 Image(systemName: "text.quote")
@@ -520,6 +547,18 @@ struct LiveAIRecordingView: View {
         } catch {
             NSAlert(error: error).runModal()
         }
+    }
+}
+
+/// Header "Thinking… / Idle" indicator. Isolated as a leaf that owns the
+/// `LiveAISession` dependency so the AI thinking-state flips (and every
+/// other `LiveAISession` @Published tick) re-render only this small view
+/// rather than the `header` that hosts the folder `Menu`.
+private struct LiveThinkingIndicator: View {
+    @EnvironmentObject private var aiSession: LiveAISession
+
+    var body: some View {
+        ThinkingIndicator(isThinking: aiSession.isThinking)
     }
 }
 

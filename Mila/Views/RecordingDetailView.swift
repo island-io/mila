@@ -8,10 +8,16 @@ import MilaKit
 struct RecordingDetailView: View {
     let recording: Recording
     @EnvironmentObject private var store: RecordingStore
-    @EnvironmentObject private var transcription: TranscriptionService
-    @EnvironmentObject private var modelManager: ModelManager
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    // NOTE: `TranscriptionService` is deliberately NOT observed here. Its
+    // `progress` @Published floods at whisper-tick cadence during an active
+    // transcription; holding it at this level re-rendered the whole body —
+    // including `header`, which hosts the folder `Menu` — on every tick, and
+    // reconciling an OPEN NSMenu-backed control mid-tracking beachballs the
+    // app. The two consumers now live in the `RecordingDetailActionButtons`
+    // and `RecordingTranscriptArea` leaves, so the flood never reaches the
+    // menu's ancestors.
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -33,7 +39,9 @@ struct RecordingDetailView: View {
                     ? { summarizer.regenerate(recording) }
                     : nil
             )
-            transcriptArea
+            RecordingTranscriptArea(recording: recording,
+                                    currentTime: currentTime,
+                                    onSeek: { seek(to: $0) })
                 // Force the transcript area to take the remaining
                 // vertical space and scroll its OWN content rather than
                 // expanding to the segments' intrinsic height. Without
@@ -76,7 +84,7 @@ struct RecordingDetailView: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
-            actionButtons
+            RecordingDetailActionButtons(recording: recording)
         }
         .padding()
     }
@@ -130,7 +138,97 @@ struct RecordingDetailView: View {
         titleDraft = recording.title
     }
 
-    private var actionButtons: some View {
+    /// Whether the user can ask for a fresh summary right now. Gates the
+    /// "Regenerate summary" context-menu entry in `AIOverviewBanner` so
+    /// it never shows up for recordings without an LLM CLI configured
+    /// or without anything to summarise. Mirrors `RecordingSummarizer`'s
+    /// own predicate but adds the "force-allowed even if a summary
+    /// exists" piece — that's the whole point of the affordance.
+    private var canRegenerateSummary: Bool {
+        guard llmSettings.isConfigured else { return false }
+        return !recording.fullText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+    }
+
+    /// What the transcript area shows while a recording has no segments.
+    /// `nil` means no placeholder — the active-transcription progress view
+    /// owns that state.
+    enum EmptyTranscriptPlaceholder: Equatable {
+        /// Queued behind the active transcription — the Transcribe menu is
+        /// disabled (see `busy` in `RecordingDetailActionButtons`), so
+        /// pointing the user at it would be a dead end.
+        case waitingInQueue
+        /// Idle: invite the user to start a transcription themselves.
+        case clickTranscribe
+    }
+
+    /// Decision for the empty-segments placeholder, split out as a pure
+    /// function so RecordingDetailPlaceholderTests can pin the queued
+    /// case without building the view.
+    static func emptyTranscriptPlaceholder(isActive: Bool,
+                                           isQueued: Bool) -> EmptyTranscriptPlaceholder? {
+        if isActive { return nil }
+        return isQueued ? .waitingInQueue : .clickTranscribe
+    }
+
+    @ViewBuilder
+    private var playbackBar: some View {
+        if let player {
+            HStack {
+                PlayPauseButton(player: player)
+                Slider(value: Binding(get: { currentTime },
+                                      set: { seek(to: $0) }),
+                       in: 0...max(recording.duration, 0.1))
+                Text(formatDuration(currentTime))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                    .frame(width: 60, alignment: .trailing)
+            }
+            .padding()
+        }
+    }
+
+    private func configurePlayer() {
+        teardownPlayer()
+        let url = store.audioURL(for: recording)
+        let item = AVPlayerItem(url: url)
+        let p = AVPlayer(playerItem: item)
+        timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30),
+                                                  queue: .main) { time in
+            currentTime = time.seconds.isFinite ? time.seconds : 0
+        }
+        player = p
+    }
+
+    private func teardownPlayer() {
+        if let player, let observer = timeObserver {
+            player.removeTimeObserver(observer)
+        }
+        timeObserver = nil
+        player?.pause()
+        player = nil
+    }
+
+    private func seek(to seconds: Double) {
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        player?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        currentTime = seconds
+    }
+}
+
+/// Header action buttons (re-transcribe, share, copy overview, export SRT).
+/// Owns the parent-side dependency on `TranscriptionService` for its `busy`
+/// gate + `enqueue` calls, so the transcription `progress` flood re-renders
+/// this leaf (a sibling of the folder `Menu`) instead of the `header` that
+/// hosts the menu. The re-transcribe `Menu` is `busy`-disabled during an
+/// active transcription, so it can't be open while this leaf re-renders.
+private struct RecordingDetailActionButtons: View {
+    let recording: Recording
+    @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var transcription: TranscriptionService
+
+    var body: some View {
         let currentLang = RecordingLanguage.fromCode(recording.language)
         let busy = transcription.activeRecordingID == recording.id
                    || transcription.pendingIDs.contains(recording.id)
@@ -215,56 +313,54 @@ struct RecordingDetailView: View {
         transcription.enqueue(prepared, isRetranscription: true)
     }
 
-
-    /// Whether the user can ask for a fresh summary right now. Gates the
-    /// "Regenerate summary" context-menu entry in `AIOverviewBanner` so
-    /// it never shows up for recordings without an LLM CLI configured
-    /// or without anything to summarise. Mirrors `RecordingSummarizer`'s
-    /// own predicate but adds the "force-allowed even if a summary
-    /// exists" piece — that's the whole point of the affordance.
-    private var canRegenerateSummary: Bool {
-        guard llmSettings.isConfigured else { return false }
-        return !recording.fullText
+    /// Whether there's any AI overview content (summary or action items)
+    /// to copy. Gates the header's "Copy summary + action items" button.
+    private var hasOverviewToCopy: Bool {
+        let hasSummary = recording.summary?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty
+            .isEmpty == false
+        let hasItems = !(recording.actionItems ?? []).isEmpty
+        return hasSummary || hasItems
     }
 
-    /// Human-readable name of the whisper model that will run for the
-    /// recording's CURRENT language. Prefers `recording.modelName` once
-    /// transcription has started writing it back to the store (that's
-    /// what the engine actually used), otherwise falls back to the
-    /// model selected for the recording's language.
-    private var activeTranscriptionModelName: String {
-        if let name = recording.modelName, !name.isEmpty { return name }
-        if let model = modelManager.model(for: recording.language) {
-            return model.displayName
+    /// Copy the AI overview (summary + action items) as plain text: the
+    /// summary first, then — separated by a blank line — the action items
+    /// as `•\u{00A0}…` lines. Only the parts that actually exist are
+    /// included, so a summary-only or items-only recording copies cleanly.
+    private func copyOverview() {
+        var parts: [String] = []
+        if let summary = recording.summary?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !summary.isEmpty {
+            parts.append(summary)
         }
-        return modelManager.selectedModel()?.displayName ?? ""
+        let items = recording.actionItems ?? []
+        if !items.isEmpty {
+            parts.append(items.map { "•\u{00A0}\($0.text)" }.joined(separator: "\n"))
+        }
+        guard !parts.isEmpty else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(parts.joined(separator: "\n\n"), forType: .string)
     }
+}
 
-    /// What the transcript area shows while a recording has no segments.
-    /// `nil` means no placeholder — the active-transcription progress view
-    /// owns that state.
-    enum EmptyTranscriptPlaceholder: Equatable {
-        /// Queued behind the active transcription — the Transcribe menu is
-        /// disabled (see `busy` in `actionButtons`), so pointing the user
-        /// at it would be a dead end.
-        case waitingInQueue
-        /// Idle: invite the user to start a transcription themselves.
-        case clickTranscribe
-    }
+/// Transcript area: the active-transcription progress view, the empty-state
+/// placeholders, and the finished transcript list. Owns the parent-side
+/// dependency on `TranscriptionService` (progress + active/queued state), so
+/// the whisper-progress flood re-renders this leaf instead of the parent
+/// body / `header` that hosts the folder `Menu`.
+private struct RecordingTranscriptArea: View {
+    let recording: Recording
+    /// Playback head, owned by `RecordingDetailView`, used to highlight the
+    /// currently-playing segment.
+    let currentTime: Double
+    /// Seek callback into the parent's `AVPlayer`.
+    let onSeek: (Double) -> Void
+    @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var transcription: TranscriptionService
+    @EnvironmentObject private var modelManager: ModelManager
 
-    /// Decision for the empty-segments placeholder, split out as a pure
-    /// function so RecordingDetailPlaceholderTests can pin the queued
-    /// case without building the view.
-    static func emptyTranscriptPlaceholder(isActive: Bool,
-                                           isQueued: Bool) -> EmptyTranscriptPlaceholder? {
-        if isActive { return nil }
-        return isQueued ? .waitingInQueue : .clickTranscribe
-    }
-
-    @ViewBuilder
-    private var transcriptArea: some View {
+    var body: some View {
         if transcription.activeRecordingID == recording.id {
             VStack(spacing: 12) {
                 Spacer()
@@ -286,7 +382,7 @@ struct RecordingDetailView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if recording.segments.isEmpty {
-            let placeholder = Self.emptyTranscriptPlaceholder(
+            let placeholder = RecordingDetailView.emptyTranscriptPlaceholder(
                 isActive: transcription.activeRecordingID == recording.id,
                 isQueued: transcription.pendingIDs.contains(recording.id)
             )
@@ -344,7 +440,7 @@ struct RecordingDetailView: View {
                                        useSpeakerColor: hasMultipleSpeakers,
                                        language: recording.language,
                                        speakerNames: recording.speakerNames,
-                                       onTap: { seek(to: seg.start) },
+                                       onTap: { onSeek(seg.start) },
                                        onAssignName: { raw, name in
                                            store.setSpeakerName(name, forSpeaker: raw,
                                                                 recordingID: recording.id)
@@ -374,48 +470,27 @@ struct RecordingDetailView: View {
         }
     }
 
-    @ViewBuilder
-    private var playbackBar: some View {
-        if let player {
-            HStack {
-                PlayPauseButton(player: player)
-                Slider(value: Binding(get: { currentTime },
-                                      set: { seek(to: $0) }),
-                       in: 0...max(recording.duration, 0.1))
-                Text(formatDuration(currentTime))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(width: 60, alignment: .trailing)
-            }
-            .padding()
+    /// Human-readable name of the whisper model that will run for the
+    /// recording's CURRENT language. Prefers `recording.modelName` once
+    /// transcription has started writing it back to the store (that's
+    /// what the engine actually used), otherwise falls back to the
+    /// model selected for the recording's language.
+    private var activeTranscriptionModelName: String {
+        if let name = recording.modelName, !name.isEmpty { return name }
+        if let model = modelManager.model(for: recording.language) {
+            return model.displayName
         }
+        return modelManager.selectedModel()?.displayName ?? ""
     }
 
-    private func configurePlayer() {
-        teardownPlayer()
-        let url = store.audioURL(for: recording)
-        let item = AVPlayerItem(url: url)
-        let p = AVPlayer(playerItem: item)
-        timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30),
-                                                  queue: .main) { time in
-            currentTime = time.seconds.isFinite ? time.seconds : 0
-        }
-        player = p
-    }
-
-    private func teardownPlayer() {
-        if let player, let observer = timeObserver {
-            player.removeTimeObserver(observer)
-        }
-        timeObserver = nil
-        player?.pause()
-        player = nil
-    }
-
-    private func seek(to seconds: Double) {
-        let time = CMTime(seconds: seconds, preferredTimescale: 600)
-        player?.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
-        currentTime = seconds
+    /// Re-run the transcription pipeline with a different language model.
+    /// Updates the persisted `Recording.language` so the downstream
+    /// `TranscriptionService` picks the right model on its own.
+    private func retranscribe(in language: RecordingLanguage) {
+        guard let prepared = store.prepareForRetranscription(id: recording.id,
+                                                             language: language.rawValue)
+        else { return }
+        transcription.enqueue(prepared, isRetranscription: true)
     }
 
     private func copyTranscript() {
@@ -424,36 +499,6 @@ struct RecordingDetailView: View {
                                                  names: recording.speakerNames)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
-    }
-
-    /// Whether there's any AI overview content (summary or action items)
-    /// to copy. Gates the header's "Copy summary + action items" button.
-    private var hasOverviewToCopy: Bool {
-        let hasSummary = recording.summary?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .isEmpty == false
-        let hasItems = !(recording.actionItems ?? []).isEmpty
-        return hasSummary || hasItems
-    }
-
-    /// Copy the AI overview (summary + action items) as plain text: the
-    /// summary first, then — separated by a blank line — the action items
-    /// as `•\u{00A0}…` lines. Only the parts that actually exist are
-    /// included, so a summary-only or items-only recording copies cleanly.
-    private func copyOverview() {
-        var parts: [String] = []
-        if let summary = recording.summary?
-            .trimmingCharacters(in: .whitespacesAndNewlines),
-           !summary.isEmpty {
-            parts.append(summary)
-        }
-        let items = recording.actionItems ?? []
-        if !items.isEmpty {
-            parts.append(items.map { "•\u{00A0}\($0.text)" }.joined(separator: "\n"))
-        }
-        guard !parts.isEmpty else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(parts.joined(separator: "\n\n"), forType: .string)
     }
 }
 
