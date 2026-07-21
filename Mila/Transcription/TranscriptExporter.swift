@@ -28,15 +28,16 @@ enum TranscriptExporter {
     /// history context menu so users can drop subtitles next to a source
     /// video file. Throws so the caller can surface failures via NSAlert.
     static func writeSRT(for recording: Recording, to url: URL) throws {
-        try writeSRT(segments: recording.segments, to: url)
+        try writeSRT(segments: recording.segments, to: url, names: recording.speakerNames)
     }
 
     /// Raw-segments variant: write an SRT for a segment list that isn't
     /// (yet) attached to a saved `Recording`. Used by the mid-recording
     /// "Export SRT…" button in the live transcript pane, which snapshots
     /// `LiveTranscriber.segments` while the recording is still running.
-    static func writeSRT(segments: [TranscriptSegment], to url: URL) throws {
-        let body = srtBody(for: segments)
+    static func writeSRT(segments: [TranscriptSegment], to url: URL,
+                         names: [String: String] = [:]) throws {
+        let body = srtBody(for: segments, names: names)
         guard !body.isEmpty else {
             throw NSError(domain: "TranscriptExporter", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "No transcript segments to export."])
@@ -47,13 +48,15 @@ enum TranscriptExporter {
     /// Format the SRT content for `recording`. Returns empty string when
     /// there's nothing to write (no segments, or every segment is blank).
     static func srtBody(for recording: Recording) -> String {
-        srtBody(for: recording.segments)
+        srtBody(for: recording.segments, names: recording.speakerNames)
     }
 
     /// Format SRT content for a raw segment list. Returns empty string
     /// when there's nothing to write (no segments, or every segment is
-    /// blank).
-    static func srtBody(for segments: [TranscriptSegment]) -> String {
+    /// blank). `names` substitutes user-assigned speaker names for raw
+    /// diarizer IDs in the cue prefix; unnamed speakers keep the raw ID.
+    static func srtBody(for segments: [TranscriptSegment],
+                        names: [String: String] = [:]) -> String {
         guard !segments.isEmpty else { return "" }
 
         var entries: [String] = []
@@ -62,7 +65,7 @@ enum TranscriptExporter {
             guard !text.isEmpty else { continue }
 
             let seqNum = entries.count + 1
-            let prefix = seg.speaker.map { $0 + ": " } ?? ""
+            let prefix = seg.speaker.map { (names[$0] ?? $0) + ": " } ?? ""
             entries.append("\(seqNum)\n\(formatSRTTime(seg.start)) --> \(formatSRTTime(seg.end))\n\(prefix)\(text)")
         }
         return entries.isEmpty ? "" : entries.joined(separator: "\n\n") + "\n\n"

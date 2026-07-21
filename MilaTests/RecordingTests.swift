@@ -44,6 +44,48 @@ final class RecordingTests: XCTestCase {
                        "fullText key must not appear in the JSON-encoded blob")
     }
 
+    func test_speakerNames_round_trip_and_are_omitted_when_empty() throws {
+        let named = Recording(
+            title: "Named",
+            source: .meeting,
+            audioFileName: "named.wav",
+            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")],
+            speakerNames: ["SPEAKER_00": "Daniel"]
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let decoded = try decoder.decode(Recording.self, from: encoder.encode(named))
+        XCTAssertEqual(decoded.speakerNames, ["SPEAKER_00": "Daniel"])
+
+        // Recordings with no renames must not grow a noise key in
+        // recordings.json.
+        let unnamed = Recording(title: "Plain", source: .microphone, audioFileName: "p.wav")
+        let json = String(data: try encoder.encode(unnamed), encoding: .utf8) ?? ""
+        XCTAssertFalse(json.contains("\"speakerNames\""))
+    }
+
+    func test_legacy_records_without_speakerNames_decode_to_empty_map() throws {
+        let legacy = """
+        {
+          "id": "11111111-2222-3333-4444-555555555555",
+          "title": "Legacy",
+          "createdAt": "2025-01-01T00:00:00Z",
+          "duration": 1.0,
+          "source": "microphone",
+          "audioFileName": "Legacy.wav",
+          "status": "completed",
+          "language": "en"
+        }
+        """
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Recording.self, from: Data(legacy.utf8))
+        XCTAssertEqual(decoded.speakerNames, [:])
+    }
+
     func test_legacy_records_with_inline_fullText_still_decode() throws {
         // Records persisted under the pre-sidecar schema had `fullText`
         // inside the JSON. We have to keep decoding them so the first

@@ -61,6 +61,31 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// Mid-recording copy button: `clipboardText` must match the detail
+    /// view's copy format — the plain fullText join while nobody is
+    /// labelled, speaker-prefixed turns once live diarization kicks in.
+    func test_clipboardText_matches_detail_copy_format() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "hello"),
+            TranscriptSegment(start: 2, end: 3, text: "hi there")
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+
+        // No speakers yet -> plain joined text, no prefixes.
+        XCTAssertEqual(transcriber.clipboardText, "hello hi there")
+
+        transcriber.applySpeakerLabels([
+            (start: 0, end: 1, speaker: "SPEAKER_00"),
+            (start: 2, end: 3, speaker: "SPEAKER_01")
+        ])
+        XCTAssertEqual(transcriber.clipboardText,
+                       "SPEAKER_00: hello\nSPEAKER_01: hi there")
+        _ = transcriber.stop()
+    }
+
     func test_successive_ticks_dedup_overlap_by_time() async {
         // Two ticks. Each whisper call sees the window starting at the
         // same absolute time (0s in this test because the buffer is
@@ -138,6 +163,97 @@ final class LiveTranscriberTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(capturedStart, 0)
         XCTAssertGreaterThan(capturedEnd, capturedStart,
                              "end (\(capturedEnd)) should be after start (\(capturedStart))")
+        _ = transcriber.stop()
+    }
+
+    /// Pausing mid-utterance must cut the current VAD utterance cleanly:
+    /// `pauseBoundary()` flushes the detector so the in-progress speech is
+    /// emitted at the pause point instead of being glued onto whatever is
+    /// said after resume. Without a boundary, the detector holds the speech
+    /// until it next sees ≥400ms of silence.
+    func test_pauseBoundary_emits_in_progress_VAD_utterance() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "midway")])
+        transcriber.useVAD = true
+        transcriber.start(language: "en")
+        // 1.2s of speech energy with NO trailing silence — the detector
+        // holds it as an in-progress utterance that wouldn't emit on its own.
+        let speech = Array(repeating: Float(0.05), count: 16_000 * 12 / 10)
+        transcriber.ingest(ArraySlice(speech))
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "utterance shouldn't emit before a silence/pause boundary")
+
+        transcriber.pauseBoundary()
+        // Await the transcribe the flush scheduled.
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["midway"],
+                       "pauseBoundary should flush the in-progress utterance to whisper")
+        _ = transcriber.stop()
+    }
+
+    // MARK: - Delete a live line
+
+    func test_removeSegment_removes_line_and_recomputes_fullText() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "keep"),
+            TranscriptSegment(start: 2, end: 3, text: "remove me")
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["keep", "remove me"])
+
+        let victim = try! XCTUnwrap(transcriber.segments.first { $0.text == "remove me" })
+        transcriber.removeSegment(id: victim.id)
+
+        XCTAssertEqual(transcriber.segments.map(\.text), ["keep"])
+        XCTAssertEqual(transcriber.fullText, "keep")
+        _ = transcriber.stop()
+    }
+
+    /// A deleted line must not reappear when the fixed-window path
+    /// re-transcribes its rolling buffer on the next tick — the deleted
+    /// time range is suppressed.
+    func test_deleted_line_does_not_reappear_on_next_chunk_tick() async {
+        // Both ticks emit the same two segments; after deleting "beta" it
+        // must stay gone even though tick 2 re-emits it.
+        await stub.setCannedQueue([
+            [
+                TranscriptSegment(start: 0, end: 1, text: "alpha"),
+                TranscriptSegment(start: 2, end: 3, text: "beta")
+            ],
+            [
+                TranscriptSegment(start: 0, end: 1, text: "alpha"),
+                TranscriptSegment(start: 2, end: 3, text: "beta")
+            ]
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["alpha", "beta"])
+
+        let beta = try! XCTUnwrap(transcriber.segments.first { $0.text == "beta" })
+        transcriber.removeSegment(id: beta.id)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["alpha"])
+
+        // Next tick re-emits alpha (already present, skipped) + beta
+        // (suppressed by the deleted range).
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["alpha"],
+                       "deleted line reappeared after a re-transcription tick")
+        _ = transcriber.stop()
+    }
+
+    func test_removeSegment_unknown_id_is_a_noop() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "only")])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        transcriber.removeSegment(id: UUID())
+        XCTAssertEqual(transcriber.segments.map(\.text), ["only"])
         _ = transcriber.stop()
     }
 

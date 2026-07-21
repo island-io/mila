@@ -112,6 +112,13 @@ final class UtteranceDetector {
     private var partial: [Float] = []
     private var samplesIngested: Int = 0
     private var currentStartSample: Int = 0
+    /// Absolute recording-time seconds already elapsed BEFORE the current
+    /// `samplesIngested` counter (which restarts at 0 after a pause
+    /// boundary). Added to every emitted `startSec` so timestamps stay on
+    /// one continuous recording clock across pause/resume. Paused audio is
+    /// never ingested (RecordingSession drops it), so this stays aligned
+    /// with the gapless WAV — no gap is introduced for the paused span.
+    private var clockOffset: Double = 0
     /// Rolling estimate of the room's background RMS, tracked only
     /// during `.silence`. The effective absolute cutoff is
     /// `max(rmsThreshold, noiseFloor * noiseFloorMultiplier)` — so a
@@ -195,6 +202,23 @@ final class UtteranceDetector {
         clearAllState()
     }
 
+    /// Pause boundary: force-emit any in-progress utterance (so post-resume
+    /// audio isn't glued onto it across the paused gap) but PRESERVE the
+    /// recording clock. Unlike `flush()`, which zeroes the sample counter for
+    /// end-of-recording, this folds the audio ingested so far into
+    /// `clockOffset` before the state wipe, so utterances emitted after the
+    /// resume keep their absolute recording-time timestamps. Paused audio is
+    /// never ingested (RecordingSession drops it while paused), so the clock
+    /// stays aligned with the gapless WAV — no gap is introduced.
+    func flushForPause() {
+        let elapsed = clockOffset + Double(samplesIngested) / sampleRate
+        if state == .speech, speechFramesInCurrent >= minUtteranceFrames {
+            emit()
+        }
+        clearAllState()
+        clockOffset = elapsed
+    }
+
     /// Shared state-wipe used by both `reset()` and `flush()`. Wipes
     /// the state machine, in-progress utterance, pre-roll ring buffer,
     /// pending-speech onset buffer, partial-frame accumulator, sample
@@ -211,6 +235,7 @@ final class UtteranceDetector {
         partial.removeAll(keepingCapacity: true)
         samplesIngested = 0
         currentStartSample = 0
+        clockOffset = 0
         noiseFloor = 0.001
         signalEnvelope = 0
         pendingSpeechFrames = 0
@@ -389,7 +414,7 @@ final class UtteranceDetector {
     }
 
     private func emit() {
-        let startSec = max(0, Double(currentStartSample) / sampleRate)
+        let startSec = max(0, clockOffset + Double(currentStartSample) / sampleRate)
         let dur = Double(current.count) / sampleRate
         vadLog.log("VAD emit utterance: startSec=\(startSec, privacy: .public) dur=\(dur, privacy: .public)s noiseFloor=\(self.noiseFloor, privacy: .public) envelope=\(self.signalEnvelope, privacy: .public) speechFrames=\(self.speechFramesInCurrent, privacy: .public)")
         onUtterance?(current, startSec)

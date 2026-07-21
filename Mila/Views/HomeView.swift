@@ -44,7 +44,15 @@ struct HomeView: View {
             VStack(spacing: 24) {
                 header
                 heroAction
+                if actions.isRecording {
+                    // Pause/Resume sits under the hero Record/Stop button so
+                    // it's reachable even in Live AI background mode, where
+                    // the app stays on Home instead of the split-pane view.
+                    RecordingPauseButton()
+                        .controlSize(.large)
+                }
                 sourceToggles
+                recordingDestination
                 dictationHint
             }
             .padding(.horizontal, 24)
@@ -156,6 +164,51 @@ struct HomeView: View {
         .controlSize(.small)
         .disabled(isRecording)
         .frame(maxWidth: 280, alignment: .leading)
+    }
+
+    /// Destination controls for the next recording: the folder on top and the
+    /// meeting name directly under it, both left-aligned to a shared width so
+    /// their leading edges line up.
+    private var recordingDestination: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            folderPicker
+            meetingNameField
+        }
+        .frame(maxWidth: 280, alignment: .leading)
+    }
+
+    /// Optional meeting name for the next recording. Empty falls back to the
+    /// auto-generated date-stamped title. Editable during a recording too,
+    /// since it's applied when the recording is saved.
+    private var meetingNameField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "text.cursor")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            NextRecordingMeetingNameField(placeholder: "Meeting name (optional)",
+                                          accessibilityID: "home.record.meetingName")
+                .textFieldStyle(.roundedBorder)
+        }
+        .controlSize(.small)
+        .frame(maxWidth: 280)
+    }
+
+    /// Optional destination folder for the next recording. Sticky across
+    /// launches (stored on the controller). "None" lands in All Transcriptions,
+    /// where the user can still drag it into a folder later. Editable during a
+    /// recording too — the folder is applied when the recording is saved, so
+    /// changing it mid-capture takes effect.
+    private var folderPicker: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("Save to")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            NextRecordingFolderPicker(accessibilityID: "home.record.folder.menu")
+        }
+        .controlSize(.small)
     }
 
     /// Discrete reminder of the two global dictation hotkeys. Reads live

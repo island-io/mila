@@ -15,6 +15,8 @@ A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optio
   - `Mila/Resources/DiarizationModels/` — bundled pyannote speaker diarization model weights (~31 MB)
   - `MilaTests/` — unit tests
   - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp bindings), WAVReader, WER calculator, and E2E transcription test fixtures
+  - `Packages/MilaKit/` — zero-dependency Swift package shared by the app and the `mila-mcp` helper: TranscriptFormatter, the read-only `StoredRecording` mirror of recordings.json, `MilaStoreReader`, the live-transcript snapshot schema, and the MCP tool handlers
+  - `MilaMCP/` — the `mila-mcp` executable (MCP stdio server over Mila's transcriptions), embedded at `Mila.app/Contents/MacOS/mila-mcp`; see `docs/mcp.md`
   - `scripts/` — release/build scripts (make-dmg.sh, etc.)
 
 ## Conventions
@@ -46,9 +48,14 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - For verification/setup state that should survive app restarts, persist a `verified` flag alongside the verified parameter values (path). On launch, restore only if current values match the persisted ones.
 - Computed `status` properties must check `verificationStatus` before `lastVerifyResult` -- the persisted verified state should take precedence over nil in-memory verify results on launch.
 
+### MCP server (mila-mcp) and MilaKit
+- The app persists two cross-process contracts for the embedded MCP helper: `store-location.json` (written by `RecordingStore` on init + relocate — where recordings.json currently lives) and `live/current.json` (the live-transcript sidecar written during recording by `LiveTranscriptSidecarWriter`). Both live at the DEFAULT app-support root and deliberately do not travel with a relocated recordings folder.
+- **Any change to what `Recording.encode(to:)` writes into recordings.json must be mirrored in MilaKit's `StoredRecording`** — `StoredRecordingDriftTests` in MilaTests is the tripwire. Keep `StoredRecording` decoding lenient (`decodeIfPresent` + defaults) so an older helper survives a newer app's schema.
+- MilaKit must stay dependency-free (in particular: no TranscriptionCore) — it links into `mila-mcp`, which must not drag in the whisper xcframework. Tool logic lives in `MilaMCPToolHandlers` (pure JSON), not in the executable.
+
 ### Tests
 - `TranscriptionService` now requires a `diarizationSettings:` parameter. In tests, always pass `DiarizationSettings(defaults: .init(suiteName: "TestClassName.diarization")!)` to isolate from user defaults.
-- Run tests with `make test` or via Xcode.
+- Run tests with `make test` or via Xcode. Package tests: `make package-test` (TranscriptionCore + MilaKit).
 
 ## Release Process
 - **Release notes are REQUIRED, first.** Every release must add
@@ -66,8 +73,13 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
   literals there.
 - Tags are `v`-prefixed: `v1.2.8`. `CURRENT_PROJECT_VERSION` (the build
   number) must increase monotonically — Sparkle keys updates on it.
-- A local, unsigned DMG for testing: `make dmg` (ad-hoc signed; Gatekeeper
-  shows the right-click → Open prompt on first launch).
+- A local DMG for testing: `make dmg VERSION=<x.y.z>` (the explicit
+  `VERSION=` is required — see the build skill). It signs with the persistent
+  "Mila Local Dev" cert when that cert exists in the login keychain (created
+  by `scripts/install-debug.sh`; keeps TCC mic/recording grants across
+  installs) and falls back to ad-hoc otherwise. To force an ad-hoc build —
+  e.g. to test the Gatekeeper right-click → Open first-launch prompt — run
+  `CODESIGN_IDENTITY=- make dmg VERSION=<x.y.z>`.
 - Notarized, signed release builds and Sparkle appcast publishing are produced
   by a separate, private signing pipeline maintained by the original authors;
   that toolchain is not part of this repository. Forks that want notarized

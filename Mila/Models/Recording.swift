@@ -93,6 +93,13 @@ struct Recording: Identifiable, Codable, Hashable {
     /// upgrade can't mass-delete a user's older imports.
     var voiceMemoFolderUUID: String?
 
+    /// User-assigned display names for diarized speakers, keyed by the raw
+    /// diarizer ID (`SPEAKER_00` → "Daniel"). Segments keep their raw IDs —
+    /// this map is a display overlay resolved at render/export time, so
+    /// re-clustering tooling and the color palette stay keyed on stable IDs.
+    /// Empty for recordings whose speakers were never renamed.
+    var speakerNames: [String: String]
+
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose
@@ -117,7 +124,8 @@ struct Recording: Identifiable, Codable, Hashable {
          summary: String? = nil,
          actionItems: [ActionItem]? = nil,
          voiceMemoUniqueID: String? = nil,
-         voiceMemoFolderUUID: String? = nil) {
+         voiceMemoFolderUUID: String? = nil,
+         speakerNames: [String: String] = [:]) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -136,6 +144,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.actionItems = actionItems
         self.voiceMemoUniqueID = voiceMemoUniqueID
         self.voiceMemoFolderUUID = voiceMemoFolderUUID
+        self.speakerNames = speakerNames
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -170,7 +179,8 @@ struct Recording: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
+             summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
+             speakerNames
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -195,6 +205,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
         self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
+        self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -219,6 +230,9 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(actionItems, forKey: .actionItems)
         try c.encodeIfPresent(voiceMemoUniqueID, forKey: .voiceMemoUniqueID)
         try c.encodeIfPresent(voiceMemoFolderUUID, forKey: .voiceMemoFolderUUID)
+        if !speakerNames.isEmpty {
+            try c.encode(speakerNames, forKey: .speakerNames)
+        }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import OSLog
+import MilaKit
 
 private let postRecordingLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                       category: "PostRecordingCoordinator")
@@ -316,7 +317,8 @@ final class PostRecordingCoordinator: ObservableObject {
             }
             if rec.status != .pending && rec.status != .running {
                 let text = TranscriptFormatter.plainText(segments: rec.segments,
-                                                         fallback: rec.fullText)
+                                                         fallback: rec.fullText,
+                                                         names: rec.speakerNames)
                 return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                     ? nil
                     : text

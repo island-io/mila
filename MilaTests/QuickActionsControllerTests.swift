@@ -62,6 +62,85 @@ final class QuickActionsControllerTests: XCTestCase {
         try await super.tearDown()
     }
 
+    // MARK: - Pause / resume
+
+    /// Pause and resume drive the session state through the controller.
+    /// Uses the fake-start seam so no real mic/engine is needed on CI.
+    func test_pause_and_resume_toggle_session_state() async {
+        let url = store.freshAudioURL(suggestedName: "PauseTest")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertFalse(controller.isPaused)
+
+        controller.pauseRecording()
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertTrue(session.state == .paused)
+
+        // Double-pause is a no-op — stays paused.
+        controller.pauseRecording()
+        XCTAssertTrue(session.state == .paused)
+
+        // togglePause resumes.
+        controller.togglePause()
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertTrue(session.state == .recording)
+
+        _ = await session.stop()
+    }
+
+    /// Pause/resume are guarded no-ops when nothing is recording, so a
+    /// stray keyboard shortcut / menu action can't corrupt session state.
+    func test_pause_is_noop_when_not_recording() {
+        XCTAssertFalse(controller.isRecording)
+        controller.pauseRecording()
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertTrue(session.state == .idle)
+        controller.resumeRecording()
+        XCTAssertTrue(session.state == .idle)
+    }
+
+    // MARK: - Next-recording folder default
+
+    /// The next-recording folder must always default to All Transcriptions
+    /// (nil) on a fresh controller, even if a previous session left a value
+    /// in UserDefaults — the choice is per-session, not sticky across
+    /// launches.
+    func test_nextRecordingFolder_defaults_to_all_transcriptions() {
+        UserDefaults.standard.set("Stale Folder", forKey: "quickActions.nextRecordingFolder")
+        defer { UserDefaults.standard.removeObject(forKey: "quickActions.nextRecordingFolder") }
+        let fresh = QuickActionsController(
+            session: RecordingSession(),
+            store: store,
+            transcription: service,
+            languageSettings: languageSettings,
+            postRecording: PostRecordingCoordinator(
+                store: store,
+                transcription: service,
+                llm: LLMSettings(defaults: UserDefaults(suiteName: "QuickActionsControllerTests.llm2")!)))
+        XCTAssertNil(fresh.nextRecordingFolder,
+                     "next-recording folder must default to All Transcriptions, not a persisted folder")
+    }
+
+    // MARK: - Resolved recording title (meeting name override)
+
+    /// An empty or whitespace-only meeting name falls back to the
+    /// auto-generated date-stamped default title.
+    func test_resolvedRecordingTitle_falls_back_to_default_when_empty() {
+        let def = "Recording · Jul 20, 2026"
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "", defaultTitle: def), def)
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "   \n\t", defaultTitle: def), def)
+    }
+
+    /// A non-empty meeting name wins over the default and is trimmed of
+    /// surrounding whitespace.
+    func test_resolvedRecordingTitle_prefers_trimmed_user_title() {
+        let def = "Recording · Jul 20, 2026"
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "Weekly Sync", defaultTitle: def),
+                       "Weekly Sync")
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "  Weekly Sync  ", defaultTitle: def),
+                       "Weekly Sync")
+    }
+
     // MARK: - File import → enqueue → transcribe
 
     func test_transcribe_file_adds_recording_and_kicks_off_transcription() async throws {

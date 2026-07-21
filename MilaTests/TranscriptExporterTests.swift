@@ -45,6 +45,20 @@ final class TranscriptExporterTests: XCTestCase {
         XCTAssertFalse(body.contains("3\n"))
     }
 
+    func test_srt_body_uses_assigned_names_with_raw_id_fallback() {
+        var rec = makeRecording(segments: [
+            .init(start: 0.0, end: 1.0, text: "Hi", speaker: "SPEAKER_00"),
+            .init(start: 1.0, end: 2.0, text: "Hello", speaker: "SPEAKER_01")
+        ])
+        rec.speakerNames = ["SPEAKER_00": "Daniel"]
+
+        let body = TranscriptExporter.srtBody(for: rec)
+        XCTAssertTrue(body.contains("Daniel: Hi"),
+                      "Named speaker must export under the assigned name")
+        XCTAssertTrue(body.contains("SPEAKER_01: Hello"),
+                      "Unnamed speaker keeps the raw diarizer ID")
+    }
+
     func test_srt_body_uses_commas_for_decimal_separator() {
         let rec = makeRecording(segments: [
             .init(start: 1.5, end: 2.5, text: "Hi")

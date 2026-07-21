@@ -64,6 +64,21 @@ final class QuickActionsController: ObservableObject {
     /// new app and the user has to re-grant access.
     @Published var microphonePermissionMissing = false
 
+    /// Mila folder the *next* recording is filed into (nil = All Transcriptions).
+    /// Always defaults to All Transcriptions on launch — the choice is
+    /// per-session only and deliberately NOT persisted across launches, so a
+    /// folder picked for one session never silently becomes the default for
+    /// the next one. Set from the Home record controls; applied when the
+    /// recording is saved in `stopRecording`.
+    @Published var nextRecordingFolder: String?
+
+    /// User-entered meeting name for the *next* recording (empty = use the
+    /// auto-generated date-stamped title). Set from the Home controls and
+    /// the live recording screen; applied when the recording is saved in
+    /// `stopRecording`, then cleared so a name typed for one meeting never
+    /// silently carries into the next one.
+    @Published var nextRecordingTitle: String = ""
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -124,6 +139,11 @@ final class QuickActionsController: ObservableObject {
     /// diarizer work so the final utterance's speaker label lands
     /// before the transcript is saved.
     var liveDiarizer: LiveSpeakerDiarizer?
+    /// Set after init by MilaApp. `stopRecording` closes the on-disk
+    /// live-transcript sidecar with the saved recording's id so external
+    /// pollers (mila-mcp) can hand off from the live feed to the stored
+    /// transcript.
+    var liveSidecarWriter: LiveTranscriptSidecarWriter?
 
     /// True only while `stopRecording` is running its inline LIVE-PIPELINE
     /// drain — the short, bounded window where it flushes the transcriber
@@ -160,6 +180,13 @@ final class QuickActionsController: ObservableObject {
     /// new recordings are blocked once the library reaches `limitBytes`.
     /// Existing / in-progress recordings are never touched.
     var storageSettings: RecordingStorageSettings?
+
+    /// Late-bound by MilaApp. Obsidian vault destination + exporter. The
+    /// live-transcript save path (below) mirrors the batch path's Obsidian
+    /// wiring: mark the fresh completion pending so the summarizer's
+    /// completion hook writes the note once the summary is ready.
+    var obsidianSettings: ObsidianVaultSettings?
+    var obsidianExporter: ObsidianExporter?
 
     /// Active silence-watch task — cancelled when the recording stops so
     /// we never fire the warning for a recording that's already over.
@@ -550,6 +577,7 @@ final class QuickActionsController: ObservableObject {
             // recording. Cursor (PRRT_kwDOSY2m-s6GOIj-) flagged it.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            liveSidecarWriter?.finish(recordingID: nil)
             isFinalizingRecording = false
             activeJob = .none
             return
@@ -578,6 +606,12 @@ final class QuickActionsController: ObservableObject {
             }
         }()
 
+        // A user-entered meeting name (from Home or the live recording
+        // screen) overrides the auto-generated date-stamped title. Cleared
+        // below once the recording is built so it doesn't carry over.
+        let finalTitle = Self.resolvedRecordingTitle(userProvided: nextRecordingTitle,
+                                                     defaultTitle: title)
+
         // A mic-only recording that captured zero frames produces an empty
         // WAV → empty transcript → silent ".failed". Tell the user why
         // (the recording itself is still saved, so the rename sheet appears
@@ -598,11 +632,7 @@ final class QuickActionsController: ObservableObject {
         // live pane. Now the dialog pops up instantly; the
         // background drain below updates the Recording (and thus
         // the sheet, which observes the store) as more data lands.
-        let initialSegments = liveTranscriber?.segments ?? []
-        let initialTranscriptSegments: [TranscriptSegment] = initialSegments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
+        let initialTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
         let initialSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let initialItems = liveAISession?.actionItems ?? []
@@ -613,9 +643,9 @@ final class QuickActionsController: ObservableObject {
         // the drain task. Mirrors `useLiveTranscript` below: both VAD
         // and chunk modes produce live segments we want to preserve,
         // so the initial-status gate is segment-presence, not mode.
-        let initialStatus: TranscriptionStatus = initialSegments.isEmpty ? .pending : .running
+        let initialStatus: TranscriptionStatus = initialTranscriptSegments.isEmpty ? .pending : .running
         let recording = Recording(
-            title: title,
+            title: finalTitle,
             duration: duration,
             source: source,
             audioFileName: outputURL.lastPathComponent,
@@ -623,11 +653,27 @@ final class QuickActionsController: ObservableObject {
             language: languageSettings.current.rawValue,
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
+            folder: nextRecordingFolder,
             appName: appName,
             summary: initialSummary.isEmpty ? nil : initialSummary,
-            actionItems: initialItems.isEmpty ? nil : initialItems
+            actionItems: initialItems.isEmpty ? nil : initialItems,
+            speakerNames: liveTranscriber?.speakerNames ?? [:]
         )
         store.add(recording)
+        // Clear the one-shot meeting name so the next recording starts with
+        // a fresh, auto-generated title unless the user names it again.
+        nextRecordingTitle = ""
+        // Register the chosen folder in the store's folder list (and dedup
+        // case-insensitively) so the recording isn't orphaned out of both
+        // "All Transcriptions" and the folder.
+        if nextRecordingFolder != nil {
+            store.assign(recording, toFolder: nextRecordingFolder)
+        }
+        // The recording is persisted — close the live sidecar with its id
+        // so an external poller's next get_live_transcript sees
+        // `completed` + the handoff id (the inline drain below keeps
+        // updating the STORED recording, which is what the handoff reads).
+        liveSidecarWriter?.finish(recordingID: recording.id)
         activeJob = .none
         if sleepReason != nil {
             sleepInterruption = SleepInterruption(
@@ -704,7 +750,7 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
-        let finalLiveSegments = liveTranscriber?.segments ?? []
+        let finalTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = liveAISession?.actionItems ?? []
@@ -750,12 +796,8 @@ final class QuickActionsController: ObservableObject {
         //
         // `vadActive` here is whatever was passed in by the caller —
         // typically `liveAISettings.useVAD && liveAISettings.enabled`.
-        let hasLiveSegments = !finalLiveSegments.isEmpty
+        let hasLiveSegments = !finalTranscriptSegments.isEmpty
         let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive
-        let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
-            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
-                              text: ls.text, speaker: ls.speaker)
-        }
         let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
 
         guard var updated = store.recordings.first(where: { $0.id == recording.id }) else {
@@ -769,6 +811,11 @@ final class QuickActionsController: ObservableObject {
             return
         }
         updated.segments = finalTranscriptSegments
+        // Mid-recording speaker renames from the live pane. Snapshotted
+        // here (before `liveTranscriber?.stop()` below) alongside the
+        // segments they label; `finalizeTail` remaps them if the offline
+        // re-diarize pass re-keys the speaker IDs.
+        updated.speakerNames = liveTranscriber?.speakerNames ?? [:]
         // Always preserve fullText when we have live segments — the
         // sheet should show what the user just saw on screen, even
         // for chunk mode while the batch diarization pass is still
@@ -869,9 +916,19 @@ final class QuickActionsController: ObservableObject {
                         wavURL: self.store.audioURL(for: updated),
                         segments: updated.segments,
                         recordingID: id) {
+                        let preRediarize = updated.segments
                         updated.segments = rediarized
                         if var current = self.store.recordings.first(where: { $0.id == id }) {
                             current.segments = rediarized
+                            // The offline pass re-keyed every SPEAKER_NN, so
+                            // names assigned mid-recording (or in the detail
+                            // view while this pass ran — hence the re-fetched
+                            // row's map, not the snapshot's) must follow the
+                            // utterances they labeled onto the new IDs.
+                            current.speakerNames = SpeakerNameRemapper.remap(
+                                names: current.speakerNames,
+                                from: preRediarize,
+                                to: rediarized)
                             self.store.update(current)
                             updated = current
                         }
@@ -889,10 +946,17 @@ final class QuickActionsController: ObservableObject {
                 // enabled + configured conditions. `summarizeIfNeeded` covers
                 // the Live-AI-off case under the normal auto-summary gate.
                 TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
+                // Mark this fresh completion pending for Obsidian export (if
+                // enabled) BEFORE kicking the summarizer, since a skip fires
+                // the completion hook synchronously.
+                let obsidianOn = (self.obsidianSettings?.enabled == true)
+                    && (self.obsidianSettings?.vaultURL != nil)
                 if self.liveAISettings?.enabled == true,
                    self.llmSettings?.isConfigured == true {
+                    if obsidianOn { self.obsidianExporter?.markPending(updated.id) }
                     self.summarizer?.regenerate(updated)
                 } else {
+                    if obsidianOn { self.obsidianExporter?.markPending(updated.id) }
                     self.summarizer?.summarizeIfNeeded(updated)
                 }
                 // Shrink storage: the live transcript is authoritative and the
@@ -1076,9 +1140,52 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
+    /// True while an active recording is paused. Reads straight off the
+    /// session's published state so the UI's Pause/Resume affordances stay
+    /// in sync without a separate mirrored flag.
+    var isPaused: Bool { session.state == .paused }
+
+    /// Pause the active recording. While paused the session drops all
+    /// incoming audio (see `RecordingSession.pause()`), so nothing said
+    /// during the pause is written to the WAV or the live transcript. The
+    /// VAD utterance in progress is flushed so it doesn't span the gap.
+    /// No-op if not recording or already finalizing.
+    func pauseRecording() {
+        guard isRecording, !isFinalizingRecording, !isPaused else { return }
+        session.pause()
+        liveTranscriber?.pauseBoundary()
+    }
+
+    /// Resume a paused recording. Capture picks back up where it left off;
+    /// the paused span is absent from the recording and excluded from the
+    /// elapsed clock. No-op if not currently paused.
+    func resumeRecording() {
+        guard isPaused else { return }
+        session.resume()
+    }
+
+    /// Toggle between paused and recording. Bound to the Pause/Resume UI
+    /// controls and safe to call from a keyboard shortcut / menu.
+    func togglePause() {
+        if isPaused {
+            resumeRecording()
+        } else {
+            pauseRecording()
+        }
+    }
+
     var elapsed: TimeInterval { session.elapsed }
     var micLevel: Float { session.micLevel }
     var systemLevel: Float { session.systemLevel }
+
+    /// Resolve the title a recording should be saved with: the user-entered
+    /// meeting name (trimmed) when they typed one, otherwise the
+    /// auto-generated date-stamped default. Pure + `static` so it's
+    /// unit-testable without a real recording session.
+    static func resolvedRecordingTitle(userProvided: String, defaultTitle: String) -> String {
+        let trimmed = userProvided.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? defaultTitle : trimmed
+    }
 
     private func defaultTitle(prefix: String) -> String {
         let f = DateFormatter()

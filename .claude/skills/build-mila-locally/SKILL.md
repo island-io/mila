@@ -7,7 +7,7 @@ description: Use when building, compiling, or running the Mila app locally from 
 
 ## Overview
 
-Mila builds via **XcodeGen** (`project.yml` is the source of truth, NOT the `.xcodeproj`) driven by a `Makefile`. Local builds are **ad-hoc signed** ("Sign to Run Locally") — that is the only "self-signed" path this repo supports. Notarized Developer-ID builds come from a separate private pipeline and are out of scope here.
+Mila builds via **XcodeGen** (`project.yml` is the source of truth, NOT the `.xcodeproj`) driven by a `Makefile`. Local builds are signed with the persistent self-signed **"Mila Local Dev"** cert when it exists in the login keychain (created on first run of `scripts/install-debug.sh`), falling back to **ad-hoc** ("Sign to Run Locally") otherwise. The stable cert matters: macOS TCC keys mic/screen-recording grants on the signing identity, so ad-hoc builds re-prompt for recording permission after every install. Notarized Developer-ID builds come from a separate private pipeline and are out of scope here.
 
 All build commands run from the repo root (wherever your checkout lives).
 
@@ -19,7 +19,7 @@ All build commands run from the repo root (wherever your checkout lives).
 | Debug build | `make build` | `build/Build/Products/Debug/Mila.app` |
 | Build **and launch** | `make run` | builds Debug, then `open`s it |
 | Release build | `make release-build` | `build-release/Build/Products/Release/Mila.app` |
-| Self-signed DMG | `make dmg VERSION=<x.y.z>` | `Mila-<x.y.z>.dmg` (ad-hoc signed) |
+| Self-signed DMG | `make dmg VERSION=<x.y.z>` | `Mila-<x.y.z>.dmg` (Mila Local Dev cert if present, else ad-hoc) |
 | Run tests | `make test` | XCTest run |
 | Clean | `make clean` | removes `Mila.xcodeproj`, `build`, `build-release`, `*.dmg` |
 
@@ -52,11 +52,14 @@ make dmg VERSION="$VERSION"
 
 ## Verifying the signature
 
-A correct local build is ad-hoc signed:
+A correct local build is signed with the Mila Local Dev cert (or ad-hoc if that cert was never created) and carries the app entitlements:
+
 ```bash
-codesign -dv /Applications/Mila.app 2>&1 | grep -E "Identifier|Signature"
+codesign -dv /Applications/Mila.app 2>&1 | grep -E "Identifier|Signature|Authority"
 # Identifier=io.island.whisper.IslandWhisper
-# Signature=adhoc
+# Authority=Mila Local Dev        (or Signature=adhoc as fallback)
+codesign -d --entitlements - /Applications/Mila.app 2>/dev/null | grep audio-input
+# must list com.apple.security.device.audio-input — if missing, re-sign (below)
 ```
 
 ## Installing a local build into /Applications
@@ -75,10 +78,25 @@ open -a /Applications/Mila.app    # verify it launches
 
 Ad-hoc-signed apps copied (not downloaded) have no quarantine flag, so they launch without the Gatekeeper right-click dance. If the app WAS downloaded, Gatekeeper shows a "right-click → Open" prompt on first launch.
 
+**TCC / recording-permission survival — re-sign if needed.** macOS keys mic and screen-recording grants on the app's signing identity + entitlements. `make dmg` already signs with the "Mila Local Dev" cert and `Mila/Resources/Mila.entitlements` when the cert exists in the login keychain, so a fresh DMG installs cleanly over a `scripts/install-debug.sh` install without re-prompting. But if the installed app is ad-hoc signed or missing entitlements (older DMG, cert created after the DMG was built — symptom: macOS asks for recording permission on every use), re-sign it in place:
+
+```bash
+SHA=$(security find-certificate -c "Mila Local Dev" -a -Z \
+      ~/Library/Keychains/login.keychain-db 2>/dev/null | awk '/SHA-1 hash/ {print $NF}' | head -1)
+if [ -z "$SHA" ]; then
+  echo "no 'Mila Local Dev' cert — run scripts/install-debug.sh once to create it" >&2
+else
+  codesign --force --sign "$SHA" \
+    --entitlements Mila/Resources/Mila.entitlements /Applications/Mila.app
+fi
+```
+
+If the cert doesn't exist yet, run `scripts/install-debug.sh` once to create it (or accept ad-hoc + per-install re-prompts).
+
 ## Common Mistakes
 
 - **Running `make dmg` without `VERSION=`** → the `MARKETING_VERSION: command not found` failure above. Always pass it.
 - **Editing `Mila.xcodeproj` directly** → overwritten on next `make project`. Edit `project.yml` instead.
 - **Hardcoding a version in `Info.plist`** → it must stay `$(MARKETING_VERSION)` / `$(CURRENT_PROJECT_VERSION)`; bump versions only in `project.yml`.
-- **Expecting a Developer-ID / notarized build** → not available locally; this repo only ad-hoc signs.
+- **Expecting a Developer-ID / notarized build** → not available locally; local builds sign with the Mila Local Dev cert or ad-hoc. (`CODESIGN_IDENTITY=- make dmg` forces ad-hoc, e.g. to test the Gatekeeper first-launch prompt.)
 - **`rm`-ing an old `/Applications/Mila.app`** → use `trash` so it's recoverable.

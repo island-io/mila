@@ -27,6 +27,19 @@ extension String {
         }
         return speakerColorPalette[index % speakerColorPalette.count]
     }
+
+    /// Speaker color that honors user-assigned names: when two raw IDs
+    /// share the same assigned name (the user's fix for an over-split
+    /// speaker), both take the color of the lowest raw ID carrying that
+    /// name so they read as one person. Unnamed IDs keep their own color.
+    func speakerColor(names: [String: String]) -> Color {
+        guard let name = names[self] else { return speakerColor }
+        let canonical = names
+            .filter { $0.value == name }
+            .keys
+            .min() ?? self
+        return canonical.speakerColor
+    }
 }
 
 /// Segment types that carry a diarizer speaker ID — `TranscriptSegment`

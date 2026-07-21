@@ -1,4 +1,5 @@
 import XCTest
+import MilaKit
 @testable import Mila
 
 @MainActor
@@ -62,6 +63,45 @@ final class RecordingStoreTests: XCTestCase {
         let reloaded = RecordingStore(rootDirectory: tempRoot)
         XCTAssertTrue(reloaded.voiceMemoTombstones.contains("memo-unique-123"),
                       "Tombstones must persist across store instances")
+    }
+
+    func test_setSpeakerName_sets_clears_and_persists() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Meeting", source: .meeting,
+                            audioFileName: "meeting.wav",
+                            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")])
+        store.add(rec)
+
+        store.setSpeakerName("  Daniel ", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(store.recordings.first?.speakerNames, ["SPEAKER_00": "Daniel"],
+                       "Name must be trimmed and stored keyed by the raw ID")
+
+        // Survives a relaunch via recordings.json.
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, ["SPEAKER_00": "Daniel"])
+
+        // nil (and empty/whitespace) clears the assignment.
+        reloaded.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, [:])
+        reloaded.setSpeakerName("Noa", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        reloaded.setSpeakerName("   ", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, [:])
+    }
+
+    func test_setSpeakerName_regenerates_srt_sidecar_for_completed_recording() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Meeting", source: .meeting,
+                            audioFileName: "meeting.wav",
+                            status: .completed,
+                            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")])
+        store.add(rec)
+
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+
+        let srtURL = store.recordingsDirectory.appendingPathComponent("meeting.srt")
+        let srt = try String(contentsOf: srtURL, encoding: .utf8)
+        XCTAssertTrue(srt.contains("Daniel: hi"),
+                      "The on-disk .srt sidecar must be rewritten with the assigned name")
     }
 
     func test_permanently_deleting_non_import_leaves_no_tombstone() {
@@ -557,5 +597,30 @@ final class RecordingStoreTests: XCTestCase {
         store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
         XCTAssertEqual(store.softDeleteVoiceMemos(fromFolderID: "FOLDER-UNKNOWN"), 0)
         XCTAssertFalse(store.recordings.first?.isTrashed ?? true)
+    }
+
+    // MARK: - Store-location pointer (mila-mcp discovery contract)
+
+    func test_init_writes_store_location_pointer_at_root() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let pointer = try XCTUnwrap(StoreLocationPointer.read(from: tempRoot))
+        XCTAssertEqual(pointer.recordingsDirectory, store.recordingsDirectory.path)
+        XCTAssertEqual(pointer.storeFile, store.storeURL.path)
+    }
+
+    func test_relocate_updates_pointer_and_reset_restores_it() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let custom = tempRoot.appendingPathComponent("Elsewhere", isDirectory: true)
+
+        store.relocateRecordings(to: custom)
+        var pointer = try XCTUnwrap(StoreLocationPointer.read(from: tempRoot))
+        XCTAssertEqual(pointer.recordingsDirectory, custom.path)
+        XCTAssertEqual(pointer.storeFile,
+                       custom.appendingPathComponent("recordings.json").path)
+
+        store.relocateRecordings(to: nil)
+        pointer = try XCTUnwrap(StoreLocationPointer.read(from: tempRoot))
+        XCTAssertEqual(pointer.recordingsDirectory,
+                       store.defaultRecordingsDirectory.path)
     }
 }

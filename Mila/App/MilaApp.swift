@@ -247,8 +247,20 @@ struct MilaApp: App {
     /// SwiftUI redraws and so its in-flight task table survives
     /// alongside everything else.
     @StateObject private var recordingSummarizer: RecordingSummarizer
+    /// Obsidian vault destination + its exporter. The exporter is held as a
+    /// StateObject purely so it stays alive — the completion hooks capture it
+    /// weakly.
+    @StateObject private var obsidianVaultSettings: ObsidianVaultSettings
+    @StateObject private var obsidianExporter: ObsidianExporter
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
+    /// Persistent, app-wide list of speaker names — the pick-list behind
+    /// the transcript's speaker rename popover.
+    @StateObject private var speakerDirectory: SpeakerDirectory
+    /// Mirrors the live transcript to `live/current.json` for external
+    /// tools (mila-mcp). Not observed by any view; held as a StateObject
+    /// purely so it survives SwiftUI re-inits like the other singletons.
+    @StateObject private var liveSidecarWriter: LiveTranscriptSidecarWriter
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -412,6 +424,19 @@ struct MilaApp: App {
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
                                              liveAISettings: liveAI)
+        // Obsidian vault destination. When enabled, a completed recording is
+        // written into the vault as a Markdown note (summary + action items,
+        // transcript fallback) once its summary is ready, then optionally
+        // committed + pushed to git. Off by default.
+        let obsidianSettings = ObsidianVaultSettings()
+        let obsidian = ObsidianExporter(settings: obsidianSettings)
+        // Write the note once the summary state is final. Gated on `pending`
+        // so a launch-time backfill sweep never re-files the back-catalogue.
+        summarizer.onSummaryFinished = { [weak obsidian] rec in
+            guard let obsidian, obsidian.isPending(rec.id) else { return }
+            obsidian.export(rec)
+            obsidian.clearPending(rec.id)
+        }
         // Wire the post-transcription summary hook. Fires for every
         // recording that the queue successfully completes — the
         // summarizer's own `shouldSummarize` gate skips work if a
@@ -422,16 +447,27 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
+            // Obsidian export is driven off the summarizer's completion hook.
+            // Mark this fresh completion pending so the hook knows to write it
+            // (backfilled recordings are never marked, hence never re-filed).
+            let obsidianOn = (obsidianSettings?.enabled == true) && (obsidianSettings?.vaultURL != nil)
             if wasRetranscription {
                 // `regenerate` bypasses the "already has a summary" gate by
                 // design (it's also the manual on-demand path), so it does
                 // NOT consult `summaryEnabled` itself. Guard the AUTOMATIC
                 // re-transcription trigger here so a transcript-only user
                 // doesn't get a summary regenerated behind their back.
-                guard llm?.summaryEnabled ?? true else { return }
+                guard llm?.summaryEnabled ?? true else {
+                    // No summary will be regenerated — export immediately with
+                    // the transcript fallback (no summarizer hook to wait for).
+                    if obsidianOn { obsidian?.export(rec) }
+                    return
+                }
+                if obsidianOn { obsidian?.markPending(rec.id) }
                 summarizer?.regenerate(rec)
             } else {
+                if obsidianOn { obsidian?.markPending(rec.id) }
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
@@ -454,6 +490,14 @@ struct MilaApp: App {
         actions.liveDiarizer = liveDiar
         actions.summarizer = summarizer
         actions.storageSettings = storage
+        actions.obsidianSettings = obsidianSettings
+        actions.obsidianExporter = obsidian
+        // Live-transcript sidecar for external tools (mila-mcp). Anchored
+        // to the store's original root so tests / UI-test temp stores stay
+        // isolated from the user's real app-support directory.
+        let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
+        sidecarWriter.cleanupAtLaunch()
+        actions.liveSidecarWriter = sidecarWriter
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -483,6 +527,8 @@ struct MilaApp: App {
         _liveSpeakerDiarizer = StateObject(wrappedValue: liveDiar)
         _liveAISession = StateObject(wrappedValue: liveSession)
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
+        _obsidianVaultSettings = StateObject(wrappedValue: obsidianSettings)
+        _obsidianExporter = StateObject(wrappedValue: obsidian)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
         // backfill from its `start()` launch task (below), so constructing
@@ -494,6 +540,8 @@ struct MilaApp: App {
                                             languageSettings: langSettings)
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
+        _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
+        _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -545,6 +593,9 @@ struct MilaApp: App {
                 .environmentObject(meetingDetectionSettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
+                .environmentObject(speakerDirectory)
+                .environmentObject(obsidianVaultSettings)
+                .environmentObject(obsidianExporter)
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -598,6 +649,9 @@ struct MilaApp: App {
                 .environmentObject(liveAISettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
+                .environmentObject(speakerDirectory)
+                .environmentObject(obsidianVaultSettings)
+                .environmentObject(obsidianExporter)
         }
     }
 
@@ -810,7 +864,7 @@ struct MilaApp: App {
                     }
                     await Self.pumpFixtureWAVOnce(path: wavPath, to: sessionRef, agcEnabled: true)
                 }
-            case .stopping:
+            case .paused, .stopping:
                 break
             case .idle:
                 pumpTask?.cancel()
@@ -1023,6 +1077,7 @@ struct MilaApp: App {
         // drain belongs here (sleep/lock/quit path) or to
         // `stopRecording` (Stop-button path).
         let actionsRef: QuickActionsController? = actions
+        let sidecarWriter = liveSidecarWriter
 
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
@@ -1049,9 +1104,18 @@ struct MilaApp: App {
         // The state observer below runs forever now; the `.recording`
         // branch is where we gate on `aiSettings.isLiveAIAvailable`.
 
+        var priorLiveState: RecordingSession.State = .idle
         for await state in sessionRef.$state.values {
+            let previousLiveState = priorLiveState
+            priorLiveState = state
             switch state {
             case .recording:
+                // Resume from pause: the live pipeline is already wired and
+                // the accumulated transcript is intact. Re-running the setup
+                // below would call `transcriber.start()`, which resets
+                // `segments` / `fullText` and wipes everything the user has
+                // seen so far. A pause→resume must be a no-op here.
+                if previousLiveState == .paused { break }
                 guard aiSettings.isLiveAIAvailable else {
                     // Hardware below the Live AI bar AND no override
                     // flipped. Recording still runs via RecordingSession;
@@ -1078,10 +1142,19 @@ struct MilaApp: App {
                     // to a recording that never ran the LLM loop.
                     // Cursor flagged on c95d2bb.
                     aiSession.cancel()
+                    // Still surface the recording to external pollers
+                    // (mila-mcp): they get an honest "recording, but no
+                    // live text on this hardware" status instead of
+                    // silence.
+                    sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
+                // Open the live-transcript sidecar for this recording so
+                // external tools (mila-mcp) can follow the meeting; the
+                // feed loop below streams content into it.
+                sidecarWriter.begin(title: nil, source: nil, liveAvailable: true)
                 // Live transcription runs on every recording — it's how
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval
@@ -1170,7 +1243,7 @@ struct MilaApp: App {
                     }
 
                 feedTask?.cancel()
-                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, aiSettings, llmSettingsRef] in
+                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
                     var lastFed = ""
                     guard let transcriber else { return }
                     for await _ in transcriber.$segments.values {
@@ -1190,6 +1263,10 @@ struct MilaApp: App {
                         if let diarizer {
                             transcriber.applySpeakerLabels(diarizer.intervals)
                         }
+                        // Mirror the tick to the on-disk live sidecar
+                        // (throttled + deduped inside the writer).
+                        sidecarWriter?.update(segments: transcriber.transcriptSegments,
+                                              speakerNames: transcriber.speakerNames)
                         if aiActive {
                             let text = transcriber.formattedTranscript
                             if text != lastFed, !text.isEmpty {
@@ -1199,6 +1276,13 @@ struct MilaApp: App {
                         }
                     }
                 }
+            case .paused:
+                // A pause suspends capture but keeps the whole live
+                // pipeline intact — RecordingSession simply drops incoming
+                // audio while paused, so the transcriber / diarizer / feed
+                // loop just see a gap and pick back up on resume. No
+                // teardown (that only happens on `.idle`).
+                break
             case .stopping:
                 // Don't tear down yet — RecordingSession.stop() still
                 // flushes the buffered system-audio tail during
@@ -1258,6 +1342,11 @@ struct MilaApp: App {
                     // utterance would lose its speaker label.
                     await diarizer.awaitPending()
                     diarizer.stop()
+                    // Close the live sidecar with no handoff id — this
+                    // teardown path (sleep/lock/quit/cancelAll) has no
+                    // saved Recording yet; the Stop-button path closes
+                    // it from stopRecording with the real id instead.
+                    sidecarWriter.finish(recordingID: nil)
                 }
                 // Note: don't cancel aiSession here — QuickActionsController
                 // still needs to read .summary and .actionItems out of
@@ -1338,6 +1427,11 @@ struct MilaApp: App {
                 // than stranding the row at `.failed` (no self-serve recovery
                 // path). `.running` is reset to `.pending`; an already
                 // `.pending` row is re-enqueued as-is.
+                // A crash skips AVAudioFile.close(), so the WAV header still
+                // advertises 0 audio frames — the transcription reader would
+                // see an empty file. Rewrite the size fields from the physical
+                // length first so the recovered run actually gets the audio.
+                WAVHeaderRepair.repairIfNeeded(at: wavURL)
                 if fixed.status != .pending {
                     fixed.status = .pending
                     statusChanged.append(fixed)
@@ -1365,6 +1459,9 @@ struct MilaApp: App {
         guard !ids.isEmpty else { return }
         for id in ids {
             guard let recording = store.recordings.first(where: { $0.id == id }) else { continue }
+            // Orphan WAVs from a crash have an unfinalized header (see the
+            // reenqueue branch above) — repair it before the batch run reads it.
+            WAVHeaderRepair.repairIfNeeded(at: store.audioURL(for: recording))
             print("MilaApp: re-enqueuing recovered recording \(recording.audioFileName)")
             transcription.enqueue(recording)
         }

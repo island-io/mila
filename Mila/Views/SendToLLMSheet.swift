@@ -1,4 +1,5 @@
 import SwiftUI
+import MilaKit
 
 /// Sheet shown when the user right-clicks a recording and picks
 /// "Send to <LLM>…". Surfaces the prompt that will be sent (editable for
@@ -23,7 +24,8 @@ struct SendToLLMSheet: View {
 
     private var transcript: String {
         TranscriptFormatter.plainText(segments: liveRecording.segments,
-                                      fallback: liveRecording.fullText)
+                                      fallback: liveRecording.fullText,
+                                      names: liveRecording.speakerNames)
     }
 
     var body: some View {
