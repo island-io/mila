@@ -1477,9 +1477,23 @@ struct MilaApp: App {
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
     private func prewarmDefaultModel() {
+        // Skip prewarm under UI tests. No UI test relies on a launch-time
+        // warm — the transcription E2E tests pass `--ui-test-tiny-model-path=`
+        // and load on demand — so warming the (potentially multi-GB) default
+        // model here just burns CPU/IO on every UI-test launch and creates a
+        // whisper/Metal context that XCTest never frees (it exits via
+        // `exit()`, bypassing `gracefulShutdown()`), which is what prints the
+        // ggml-metal teardown backtrace at process exit.
+        guard !isRunningUITests else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
+    }
+
+    /// True when the process was launched by an XCUITest run. Keyed off the
+    /// `--uitests` / `--ui-test-*` launch arguments the UI test targets pass.
+    private var isRunningUITests: Bool {
+        CommandLine.arguments.contains { $0 == "--uitests" || $0.hasPrefix("--ui-test") }
     }
 
     /// Pre-download the two default models on first launch:
