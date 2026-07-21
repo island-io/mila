@@ -1427,6 +1427,11 @@ struct MilaApp: App {
                 // than stranding the row at `.failed` (no self-serve recovery
                 // path). `.running` is reset to `.pending`; an already
                 // `.pending` row is re-enqueued as-is.
+                // A crash skips AVAudioFile.close(), so the WAV header still
+                // advertises 0 audio frames — the transcription reader would
+                // see an empty file. Rewrite the size fields from the physical
+                // length first so the recovered run actually gets the audio.
+                WAVHeaderRepair.repairIfNeeded(at: wavURL)
                 if fixed.status != .pending {
                     fixed.status = .pending
                     statusChanged.append(fixed)
@@ -1454,6 +1459,9 @@ struct MilaApp: App {
         guard !ids.isEmpty else { return }
         for id in ids {
             guard let recording = store.recordings.first(where: { $0.id == id }) else { continue }
+            // Orphan WAVs from a crash have an unfinalized header (see the
+            // reenqueue branch above) — repair it before the batch run reads it.
+            WAVHeaderRepair.repairIfNeeded(at: store.audioURL(for: recording))
             print("MilaApp: re-enqueuing recovered recording \(recording.audioFileName)")
             transcription.enqueue(recording)
         }
