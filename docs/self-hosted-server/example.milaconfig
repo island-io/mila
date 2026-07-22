@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "remoteTranscription": {
+    "enabled": true,
+    "endpoint": "https://mila-asr.your-org.example/v1",
+    "model": "ivrit-ai/whisper-large-v3-turbo-ct2",
+    "apiKey": "YOUR_API_KEY_HERE"
+  },
+  "recordingLanguage": "he"
+}
