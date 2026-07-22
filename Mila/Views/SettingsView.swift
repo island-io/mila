@@ -665,6 +665,8 @@ private struct RemoteBackendSection: View {
             Label(message, systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
                 .font(.caption)
+                .lineLimit(2)
+                .textSelection(.enabled)
         case .failed(let message):
             Label(message, systemImage: "xmark.circle.fill")
                 .foregroundStyle(.red)

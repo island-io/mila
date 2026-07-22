@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import TranscriptionCore
 
 /// Which engine Mila uses to turn audio into text. A single app-wide choice,
 /// mirroring the privacy-first default: on-device whisper.cpp unless the user
@@ -45,8 +46,9 @@ struct RemoteTranscriptionConfig: Sendable, Equatable {
 @MainActor
 final class RemoteTranscriptionSettings: ObservableObject {
     /// Result of the last "Test connection" attempt. Advisory only — it never
-    /// gates transcription (a server may not implement `/models`); it just
-    /// gives the user fast feedback that the endpoint + token are plausible.
+    /// gates transcription. On success it carries the text the server
+    /// transcribed from the bundled sample clip, so the user can confirm the
+    /// endpoint, token, and model actually produce a correct result.
     enum TestStatus: Equatable {
         case idle
         case testing
@@ -212,23 +214,63 @@ final class RemoteTranscriptionSettings: ObservableObject {
         (url.host ?? "").lowercased().hasSuffix("openai.com")
     }
 
-    /// Probe the endpoint with a cheap `GET /models`. Treats any 2xx as
-    /// reachable. Purely advisory — surfaced as a status pill in Settings.
+    /// A short Hebrew clip ("שלום עולם") bundled in the app. `testConnection`
+    /// uploads it and checks a transcription comes back — a genuine end-to-end
+    /// check (auth accepted, model loaded, transcription works) rather than a
+    /// bare `GET /models` that only proves the server answers HTTP.
+    private static let testSampleResource = "ConnectionTestSample"
+    /// The bundled clip is Hebrew; force `he` so the ivrit model (Hebrew-only)
+    /// and multilingual models alike transcribe it accurately, independent of
+    /// the user's recording-language setting.
+    private static let testSampleLanguage = "he"
+
+    /// Send the bundled sample clip to `/audio/transcriptions` and verify the
+    /// server returns a real transcription. Purely advisory — surfaced as a
+    /// status pill in Settings; it never gates transcription. The user sees the
+    /// transcribed text on success, so they can eyeball that it's correct.
     func testConnection() async {
         guard let url = endpointURL else {
             testStatus = .failed("Enter a valid http(s) URL.")
             return
         }
-        testStatus = .testing
-        var request = URLRequest(url: url.appendingPathComponent("models"))
-        request.httpMethod = "GET"
-        request.timeoutInterval = 15
         let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = currentConfig()?.model ?? Self.defaultModel
+        testStatus = .testing
+
+        guard let sampleURL = Bundle.main.url(forResource: Self.testSampleResource,
+                                              withExtension: "wav") else {
+            testStatus = .failed("Missing bundled test clip.")
+            return
+        }
+
+        // Build the request through the exact same path a real recording takes
+        // (WAV → 16 kHz mono → m4a → multipart), so a success genuinely proves
+        // the upload+transcribe pipeline works.
+        let boundary = "MilaBoundary-\(UUID().uuidString)"
+        let body: Data
+        do {
+            let samples = try WAVReader.loadSamples(url: sampleURL)
+            let audio = try await RemoteWhisperEngine.encodeM4A(samples: samples)
+            body = RemoteWhisperEngine.multipartBody(boundary: boundary,
+                                                     audio: audio,
+                                                     model: model,
+                                                     language: Self.testSampleLanguage)
+        } catch {
+            testStatus = .failed("Couldn't prepare the test clip: \(error.localizedDescription)")
+            return
+        }
+
+        var request = URLRequest(url: url.appendingPathComponent("audio/transcriptions"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("multipart/form-data; boundary=\(boundary)",
+                         forHTTPHeaderField: "Content-Type")
         if !key.isEmpty {
             request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
+
         do {
-            let (_, response) = try await urlSession.data(for: request)
+            let (data, response) = try await urlSession.upload(for: request, from: body)
             // Drop the result if the user edited the endpoint/key while the
             // request was in flight — `didSet` already reset status to .idle,
             // and a stale result for the previous values would be misleading.
@@ -238,21 +280,30 @@ final class RemoteTranscriptionSettings: ObservableObject {
                 testStatus = .failed("No HTTP response.")
                 return
             }
-            switch http.statusCode {
-            case 200..<300:
-                testStatus = .ok("Reachable")
-            case 401, 403:
-                testStatus = .failed("Authentication failed (HTTP \(http.statusCode)). Check the API key.")
-            case 404:
-                // Some servers don't implement /models but still transcribe.
-                testStatus = .ok("Reachable (no /models endpoint)")
-            default:
-                testStatus = .failed("Server returned HTTP \(http.statusCode).")
-            }
+            testStatus = Self.evaluateProbe(statusCode: http.statusCode, data: data)
         } catch {
             guard endpointURL == url,
                   apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
             testStatus = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Map a transcription-probe HTTP response to a user-facing status. Pure so
+    /// it's unit-testable without a network or the bundled clip.
+    static func evaluateProbe(statusCode: Int, data: Data) -> TestStatus {
+        switch statusCode {
+        case 401, 403:
+            return .failed("Authentication failed (HTTP \(statusCode)). Check the API key.")
+        case 200..<300:
+            let text = ((try? RemoteWhisperEngine.parseSegments(data: data)) ?? [])
+                .map(\.text).joined()
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else {
+                return .failed("Server accepted the request but returned no transcription — check the model id.")
+            }
+            return .ok("Transcribed the test clip: “\(text)”")
+        default:
+            return .failed("Server returned HTTP \(statusCode).")
         }
     }
 

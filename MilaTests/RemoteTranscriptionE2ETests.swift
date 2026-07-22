@@ -103,7 +103,7 @@ final class RemoteTranscriptionE2ETests: XCTestCase {
     }
 
     @MainActor
-    func test_testConnection_reachesModelsEndpoint() async {
+    func test_testConnection_transcribesSampleClip() async {
         let suite = UserDefaults(suiteName: "RemoteTranscriptionE2ETests.conn")!
         suite.removePersistentDomain(forName: "RemoteTranscriptionE2ETests.conn")
         let settings = RemoteTranscriptionSettings(
@@ -112,11 +112,18 @@ final class RemoteTranscriptionE2ETests: XCTestCase {
         settings.backend = .remote
         settings.endpoint = endpoint.absoluteString
         settings.apiKey = "test-key-123"
+        // testConnection() now uploads the bundled sample clip to
+        // /audio/transcriptions (not a bare GET /models), so it needs a model
+        // the server actually serves: the echo mock echoes whatever model it's
+        // handed, but the real speaches server 404s an unknown model id. Use the
+        // workflow's configured model (real server) or the ivrit default.
+        settings.model = ProcessInfo.processInfo.environment["MILA_REMOTE_MODEL"]
+            ?? "ivrit-ai/whisper-large-v3-turbo-ct2"
 
         await settings.testConnection()
 
         guard case .ok = settings.testStatus else {
-            return XCTFail("Expected .ok, got \(settings.testStatus)")
+            return XCTFail("Expected .ok (the sample clip transcribed), got \(settings.testStatus)")
         }
     }
 
