@@ -1,0 +1,76 @@
+# EXAMPLE exposure — ADAPT THIS TO YOUR OWN INGRESS. There is no single right
+# way to expose a Service; pick whatever your cluster already uses (an Ingress
+# controller, the Gateway API, a cloud LoadBalancer Service, etc.). Do NOT
+# blindly `kubectl apply` this file — it references objects (a Gateway, a TLS
+# secret, an IngressClass) that are specific to your cluster.
+#
+# TLS: terminate HTTPS at your ingress or load balancer and keep the API-key
+# check on (speaches validates the Bearer token). Never send audio over
+# plaintext HTTP across a network you don't fully trust.
+#
+# Replace every `mila-asr.your-org.example` with your real hostname.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# Option 1 (featured) — Kubernetes Gateway API HTTPRoute. This mirrors the setup
+# we run. It requires the Gateway API CRDs plus a GatewayClass/Gateway already
+# installed in your cluster. Point `parentRefs` at YOUR Gateway.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: mila-asr
+  namespace: mila-asr
+  labels:
+    app: mila-asr
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: my-gateway # <- your Gateway
+      namespace: my-gateway-namespace # <- the namespace your Gateway lives in
+  hostnames:
+    - mila-asr.your-org.example
+  rules:
+    - timeouts:
+        # Generous enough for a short per-utterance clip. Match this to your
+        # load balancer's idle timeout — a longer route timeout isn't honored
+        # if the LB drops the connection first.
+        request: 300s
+        backendRequest: 300s
+      matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - group: ""
+          kind: Service
+          name: mila-asr
+          port: 8000
+---
+# Option 2 (alternative) — a standard Kubernetes Ingress (e.g. ingress-nginx).
+# If you use this instead, delete the HTTPRoute above and uncomment this block.
+# Replace the hostname, ingressClassName, and TLS secret with your own.
+#
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: mila-asr
+#   namespace: mila-asr
+#   labels:
+#     app: mila-asr
+# spec:
+#   ingressClassName: nginx            # adapt to your ingress controller
+#   tls:
+#     - hosts:
+#         - mila-asr.your-org.example
+#       secretName: mila-asr-tls       # a TLS cert Secret you provide
+#   rules:
+#     - host: mila-asr.your-org.example
+#       http:
+#         paths:
+#           - path: /
+#             pathType: Prefix
+#             backend:
+#               service:
+#                 name: mila-asr
+#                 port:
+#                   number: 8000

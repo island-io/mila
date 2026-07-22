@@ -1,0 +1,99 @@
+# OPTIONAL — AWS + Karpenter ONLY.
+#
+# This is how WE provision an on-demand NVIDIA T4 (g4dn.xlarge) node just for
+# this workload, using Karpenter on EKS. You do NOT need any of this if your
+# cluster already has a GPU node pool (GKE/AKS managed node pools, a manually
+# provisioned GPU node, etc.). All you truly need is a node that advertises
+# `nvidia.com/gpu`, which means the NVIDIA device plugin must be installed
+# (Bottlerocket's NVIDIA AMI variant, below, bundles it).
+#
+# Replace every REPLACE_WITH_... placeholder with your own AWS values.
+apiVersion: karpenter.sh/v1
+kind: NodePool
+metadata:
+  name: gpu
+spec:
+  disruption:
+    consolidateAfter: 300s # drop the node 5 min after the pod is gone
+    consolidationPolicy: WhenEmptyOrUnderutilized
+  # Cap GPUs so a mis-scheduled pod can't fan out an expensive fleet.
+  limits:
+    nvidia.com/gpu: "2"
+  template:
+    metadata:
+      labels:
+        dedicated: gpu
+        nvidia.com/gpu: "present"
+    spec:
+      expireAfter: Never
+      nodeClassRef:
+        name: gpu
+        group: karpenter.k8s.aws
+        kind: EC2NodeClass
+      requirements:
+        - key: kubernetes.io/os
+          operator: In
+          values: ["linux"]
+        - key: kubernetes.io/arch
+          operator: In
+          values: ["amd64"]
+        - key: node.kubernetes.io/instance-type
+          operator: In
+          values: ["g4dn.xlarge"] # 1x NVIDIA T4, 4 vCPU, 16 GiB — cheapest single-GPU box
+        - key: karpenter.sh/capacity-type
+          operator: In
+          values: ["on-demand"]
+      # Taint the GPU node so only this workload lands on it. The Deployment's
+      # `nvidia.com/gpu` toleration matches the first taint; add a matching
+      # toleration for `dedicated=gpu` (and/or a nodeSelector) if you want to
+      # strictly pin the pod here.
+      taints:
+        - effect: NoSchedule
+          key: nvidia.com/gpu
+          value: present
+        - effect: NoSchedule
+          key: dedicated
+          value: gpu
+---
+apiVersion: karpenter.k8s.aws/v1
+kind: EC2NodeClass
+metadata:
+  name: gpu
+spec:
+  # Bottlerocket's NVIDIA variant ships the GPU driver, container toolkit, and
+  # the NVIDIA k8s device plugin — so no separate device-plugin DaemonSet is
+  # needed. Karpenter resolves the nvidia variant automatically for a GPU
+  # instance type. Pin a version you've tested rather than tracking @latest.
+  amiFamily: Bottlerocket
+  amiSelectorTerms:
+    - alias: bottlerocket@latest
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        deleteOnTermination: true
+        volumeSize: 10Gi
+        volumeType: gp3
+        encrypted: true
+    - deviceName: /dev/xvdb # room for the CUDA image (~8 GB) + ephemeral storage
+      ebs:
+        deleteOnTermination: true
+        volumeSize: 100Gi
+        volumeType: gp3
+        encrypted: true
+  metadataOptions:
+    httpEndpoint: enabled
+    httpPutResponseHopLimit: 1
+    httpTokens: required
+  # The IAM role Karpenter attaches to nodes it launches (your cluster's
+  # Karpenter node role).
+  role: REPLACE_WITH_YOUR_KARPENTER_NODE_ROLE
+  # Tag-based discovery of your subnets and security groups. The standard
+  # Karpenter convention tags them with `karpenter.sh/discovery: <cluster>`.
+  securityGroupSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: REPLACE_WITH_YOUR_CLUSTER_NAME
+  subnetSelectorTerms:
+    - tags:
+        karpenter.sh/discovery: REPLACE_WITH_YOUR_CLUSTER_NAME
+  tags:
+    managed-by: karpenter
