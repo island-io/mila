@@ -29,6 +29,14 @@ spec:
         - key: nvidia.com/gpu
           operator: Exists
           effect: NoSchedule
+        # The optional gpu-nodepool.example.yaml also taints its nodes
+        # `dedicated=gpu:NoSchedule`, so tolerate that too or the pod stays
+        # Pending on that pool. Tolerating a taint that isn't present is a
+        # no-op, so this is safe even on plain (nvidia-only-tainted) GPU nodes.
+        - key: dedicated
+          operator: Equal
+          value: gpu
+          effect: NoSchedule
       # Optional: if you keep a dedicated GPU node pool (see
       # gpu-nodepool.example.yaml), label its nodes and pin this workload to
       # them, e.g.:
@@ -42,6 +50,15 @@ spec:
           # tested; check https://github.com/speaches-ai/speaches for releases.
           image: ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cuda
           imagePullPolicy: IfNotPresent
+          # Baseline hardening. runAsNonRoot / readOnlyRootFilesystem are left
+          # off because the upstream image writes to its cache and may run as
+          # root; add them if your image supports it (with writable mounts).
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
           ports:
             - name: http
               containerPort: 8000
