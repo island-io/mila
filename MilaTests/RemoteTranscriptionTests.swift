@@ -201,18 +201,52 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         }
         XCTAssertTrue(message.contains("401"), "Failure should name the status code: \(message)")
     }
+
+    // MARK: - evaluateProbe (pure response → status mapping)
+
+    func test_evaluateProbe_returnsTranscriptOn2xx() {
+        let json = Data(#"{"text":"שלום עולם","segments":[{"start":0,"end":1,"text":"שלום עולם"}]}"#.utf8)
+        guard case .ok(let msg) = RemoteTranscriptionSettings.evaluateProbe(statusCode: 200, data: json) else {
+            return XCTFail("Expected .ok for a 2xx with a transcription")
+        }
+        XCTAssertTrue(msg.contains("שלום עולם"), "The success status must surface the transcribed text: \(msg)")
+    }
+
+    func test_evaluateProbe_emptyTranscriptFails() {
+        // A 2xx that transcribes to nothing (wrong model id, silent clip) is a
+        // failure, not a pass — GET /models would have wrongly called this "ok".
+        let json = Data(#"{"text":"   ","segments":[]}"#.utf8)
+        guard case .failed = RemoteTranscriptionSettings.evaluateProbe(statusCode: 200, data: json) else {
+            return XCTFail("Expected .failed when the server returns no transcription")
+        }
+    }
+
+    func test_evaluateProbe_authFails() {
+        guard case .failed(let msg) = RemoteTranscriptionSettings.evaluateProbe(statusCode: 403, data: Data()) else {
+            return XCTFail("Expected .failed for 403")
+        }
+        XCTAssertTrue(msg.localizedCaseInsensitiveContains("auth"))
+    }
+
+    func test_evaluateProbe_serverErrorNamesStatus() {
+        guard case .failed(let msg) = RemoteTranscriptionSettings.evaluateProbe(statusCode: 502, data: Data()) else {
+            return XCTFail("Expected .failed for 502")
+        }
+        XCTAssertTrue(msg.contains("502"))
+    }
 }
 
-/// Returns 200 for any request — lets `testConnection()` reach `.ok` without a
-/// real server.
+/// Returns 200 + a valid transcription for any request — lets `testConnection()`
+/// reach `.ok` (which now parses the transcribed text) without a real server.
 private final class StubOKURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let response = HTTPURLResponse(url: request.url!, statusCode: 200,
                                        httpVersion: nil, headerFields: nil)!
+        let json = #"{"text":"שלום עולם","segments":[{"start":0,"end":1,"text":"שלום עולם"}]}"#
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-        client?.urlProtocol(self, didLoad: Data("{}".utf8))
+        client?.urlProtocol(self, didLoad: Data(json.utf8))
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
