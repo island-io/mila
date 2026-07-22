@@ -17,7 +17,17 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.9.0-beta.1"
+    MARKETING_VERSION: "1.9.0"
+    # 1.9.0:
+    #   * First stable of the 1.9.0 line. Everything from 1.9.0-beta.1
+    #     (remote transcription backend, iPhone Voice Memos sync, neural VAD,
+    #     LLM auto-summary, opt-in beta channel, large bug sweep) PLUS: speaker
+    #     renaming with a searchable name directory (#88), adaptive gain for
+    #     quiet built-in mics (#101), diarization repair-loop + stalled-clock
+    #     system-audio fixes (#91), TCC-surviving DMG signing (#84), the Record
+    #     button no longer blocking on the final summary (#87), .milaconfig
+    #     double-click setup (#102), and a real Test-connection transcription
+    #     check (#104). See RELEASE_NOTES/v1.9.0.md.
     # 1.9.0-beta.1:
     #   * First beta on the new opt-in beta channel. Everything merged since
     #     1.8.14: remote transcription backend, iPhone Voice Memos sync
@@ -88,7 +98,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "52"
+    CURRENT_PROJECT_VERSION: "53"
 
 packages:
   TranscriptionCore:
