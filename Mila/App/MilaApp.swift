@@ -252,6 +252,8 @@ struct MilaApp: App {
     /// Persistent, app-wide list of speaker names — the pick-list behind
     /// the transcript's speaker rename popover.
     @StateObject private var speakerDirectory: SpeakerDirectory
+    /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
+    @StateObject private var configImporter: MilaConfigImporter
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -464,6 +466,15 @@ struct MilaApp: App {
             settings: meetingSettings,
             actions: actions
         )
+        // Applies `.milaconfig` files. Given the settings objects it's allowed
+        // to mutate; the open event is routed in from `MilaAppDelegate`.
+        let configImporter = MilaConfigImporter(
+            remote: remoteSettings,
+            language: langSettings,
+            liveAI: liveAI,
+            diarization: diarSettings,
+            meetingDetection: meetingSettings
+        )
         _store = StateObject(wrappedValue: store)
         _storageSettings = StateObject(wrappedValue: storage)
         _modelManager = StateObject(wrappedValue: mgr)
@@ -498,6 +509,7 @@ struct MilaApp: App {
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
+        _configImporter = StateObject(wrappedValue: configImporter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -550,6 +562,28 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(configImporter)
+                .sheet(item: Binding(
+                    get: { configImporter.pending },
+                    set: { if $0 == nil { configImporter.cancel() } }
+                )) { pending in
+                    MilaConfigConfirmationView(
+                        pending: pending,
+                        onApply: { configImporter.confirm() },
+                        onCancel: { configImporter.cancel() }
+                    )
+                }
+                .alert(
+                    "Couldn't import configuration",
+                    isPresented: Binding(
+                        get: { configImporter.errorMessage != nil },
+                        set: { if !$0 { configImporter.errorMessage = nil } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { }
+                } message: {
+                    Text(configImporter.errorMessage ?? "")
+                }
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -604,6 +638,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(configImporter)
         }
     }
 
@@ -642,6 +677,10 @@ struct MilaApp: App {
         appDelegate.dictation = dictation
         appDelegate.modelManager = modelManager
         appDelegate.actions = actions
+        // Route `.milaconfig` opens through the importer, and drain any that
+        // arrived during a cold launch (before this wiring ran).
+        appDelegate.configImporter = configImporter
+        appDelegate.flushBufferedConfigOpens()
         appDelegate.startScreenLockObserversIfNeeded()
     }
 
@@ -1434,9 +1473,41 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var dictation: DictationController?
     weak var modelManager: ModelManager?
     weak var actions: QuickActionsController?
+    weak var configImporter: MilaConfigImporter?
 
     private var didShutDown = false
     private var screenLockObserversInstalled = false
+    /// `.milaconfig` URLs delivered by a cold launch (double-click while Mila
+    /// was not running) before `wireDelegate()` connected the importer. Drained
+    /// by `flushBufferedConfigOpens()`.
+    private var bufferedConfigURLs: [URL] = []
+
+    /// macOS calls this when the user double-clicks / drops a file the app
+    /// declares it opens (`CFBundleDocumentTypes` in Info.plist). We only claim
+    /// `.milaconfig`; anything else is ignored.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let configURLs = urls.filter {
+            $0.pathExtension.lowercased() == MilaConfig.fileExtension
+        }
+        guard !configURLs.isEmpty else { return }
+        Task { @MainActor in
+            if let importer = self.configImporter {
+                configURLs.forEach { importer.handleOpen($0) }
+            } else {
+                // Cold launch: hold until the importer is wired in.
+                self.bufferedConfigURLs.append(contentsOf: configURLs)
+            }
+        }
+    }
+
+    /// Deliver any config opens that arrived before the importer was wired.
+    @MainActor
+    func flushBufferedConfigOpens() {
+        guard let importer = configImporter, !bufferedConfigURLs.isEmpty else { return }
+        let urls = bufferedConfigURLs
+        bufferedConfigURLs.removeAll()
+        urls.forEach { importer.handleOpen($0) }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if didShutDown { return .terminateNow }

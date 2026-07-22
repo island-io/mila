@@ -158,6 +158,23 @@ targets:
             UTTypeConformsTo:
               - public.data
             UTTypeTagSpecification: {}
+          # `.milaconfig` — a shareable JSON settings file. Declaring the type
+          # (extension -> UTI) plus the CFBundleDocumentTypes entry below is what
+          # lets a double-clicked `.milaconfig` launch/foreground Mila and route
+          # through MilaAppDelegate.application(_:open:) -> MilaConfigImporter.
+          - UTTypeIdentifier: io.island.mila.config
+            UTTypeDescription: Mila Configuration
+            UTTypeConformsTo:
+              - public.json
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - milaconfig
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: Mila Configuration
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - io.island.mila.config
         # Sparkle auto-update feed. The appcast is a static file published to
         # GitHub Pages; release binaries are attached to GitHub Releases. Forks
         # that want their own update channel should point this at their own
