@@ -63,10 +63,12 @@ spec:
   # Bottlerocket's NVIDIA variant ships the GPU driver, container toolkit, and
   # the NVIDIA k8s device plugin — so no separate device-plugin DaemonSet is
   # needed. Karpenter resolves the nvidia variant automatically for a GPU
-  # instance type. Pin a version you've tested rather than tracking @latest.
+  # instance type. NOTE: the family alias must be `bottlerocket@<ver>`, NOT
+  # `bottlerocket-nvidia@…` (not a valid Karpenter alias). Pin a version you've
+  # tested — bump to a current Bottlerocket release as needed.
   amiFamily: Bottlerocket
   amiSelectorTerms:
-    - alias: bottlerocket@latest
+    - alias: bottlerocket@v1.62.0
   blockDeviceMappings:
     - deviceName: /dev/xvda
       ebs:
