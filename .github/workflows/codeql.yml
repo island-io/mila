@@ -26,7 +26,7 @@ jobs:
       actions: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -43,7 +43,7 @@ jobs:
       # Initialize BEFORE the build so CodeQL's tracer observes Swift
       # compilation (manual build mode — autobuild can't drive XcodeGen).
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@v4.37.1
         with:
           languages: swift
           build-mode: manual
@@ -72,6 +72,6 @@ jobs:
             | cat
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@v4.37.1
         with:
           category: "/language:swift"

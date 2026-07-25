@@ -19,11 +19,11 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: changes
         with:
           filters: |
@@ -36,7 +36,7 @@ jobs:
       - name: Cache pyannote venv
         if: steps.changes.outputs.relevant == 'true'
         id: venv-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/diar-venv
           key: diar-venv-${{ runner.os }}-py3.11-${{ env.VENV_VERSION }}

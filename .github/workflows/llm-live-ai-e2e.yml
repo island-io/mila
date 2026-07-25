@@ -28,8 +28,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: changes
         with:
           filters: |
@@ -39,7 +39,7 @@ jobs:
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6.3.0
         if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
@@ -56,8 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: dorny/paths-filter@v3
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
         id: changes
         with:
           filters: |
@@ -67,7 +67,7 @@ jobs:
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6.3.0
         if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
@@ -90,10 +90,10 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: changes
         with:
           filters: |
@@ -115,7 +115,7 @@ jobs:
       - name: Cache diarization bundle
         if: steps.changes.outputs.relevant == 'true'
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -140,13 +140,13 @@ jobs:
             -only-testing:MilaUITests/DetailLayoutUITests \
             -derivedDataPath build-uitests \
             CODE_SIGNING_ALLOWED=NO || (echo "UI tests failed — vision check skipped" && exit 1)
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.changes.outputs.relevant == 'true' && (always())
         with:
           name: ui-screenshots
           path: /tmp/mila-ui-screenshots/
           if-no-files-found: warn
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6.3.0
         if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: "3.12"
