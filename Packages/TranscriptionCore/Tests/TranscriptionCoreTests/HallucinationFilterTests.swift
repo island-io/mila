@@ -72,4 +72,22 @@ final class HallucinationFilterTests: XCTestCase {
         let output = WhisperEngine.cleanWhisperText(input)
         XCTAssertEqual(output, "")
     }
+
+    func test_cuts_at_earliest_credit_fragment_not_array_order() {
+        // "dimatorzok" appears BEFORE "subtitles by" in the text but AFTER
+        // it in the fragment list. Cutting at the first array-order match
+        // would keep the hallucinated "DimaTorzok"; the cut must happen at
+        // the earliest match in the text, blanking the whole segment.
+        let input = "DimaTorzok Subtitles by Amara.org"
+        let output = WhisperEngine.cleanWhisperText(input)
+        XCTAssertEqual(output, "")
+    }
+
+    func test_earliest_cut_still_preserves_preceding_speech() {
+        // Real speech followed by BOTH credit fragments out of array order:
+        // only the speech survives.
+        let input = "Мы обсуждали технологии. DimaTorzok Subtitles by Amara.org"
+        let output = WhisperEngine.cleanWhisperText(input)
+        XCTAssertEqual(output, "Мы обсуждали технологии.")
+    }
 }

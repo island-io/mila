@@ -557,13 +557,14 @@ public actor WhisperEngine {
             "dimatorzok"
         ]
         
-        var keptText = text
-        for fragment in creditFragments {
-            if let range = text.range(of: fragment, options: .caseInsensitive) {
-                keptText = String(text[..<range.lowerBound])
-                break
-            }
-        }
+        // Cut at the EARLIEST credit fragment in the text, not the first
+        // match in array order: "DimaTorzok Subtitles by Amara.org" must
+        // truncate at "DimaTorzok" (position 0), not at "subtitles by",
+        // which would retain the hallucinated name.
+        let firstCreditStart = creditFragments
+            .compactMap { text.range(of: $0, options: .caseInsensitive)?.lowerBound }
+            .min()
+        let keptText = firstCreditStart.map { String(text[..<$0]) } ?? text
         
         let trimmedKept = keptText.trimmingCharacters(in: .whitespacesAndNewlines)
         let hasAlphanumerics = trimmedKept.unicodeScalars.contains { scalar in

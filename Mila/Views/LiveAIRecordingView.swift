@@ -68,9 +68,17 @@ struct LiveAIRecordingView: View {
         case .english: return false
         case .russian: return false
         case .auto:
-            if language == "he" { return true }
+            // Auto may route the output to a language other than the
+            // recording's dropdown — a predominantly-Cyrillic transcript
+            // yields Russian output even when the recording is set to
+            // Hebrew (see `LiveAISession`'s promptLanguageName) — so
+            // detect from the emitted text itself and fall back to the
+            // recording language only before any output exists.
             let combined = aiSession.summary + " "
                 + aiSession.actionItems.map(\.text).joined(separator: " ")
+            if combined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return language == "he"
+            }
             return combined.isPredominantlyHebrew
         }
     }

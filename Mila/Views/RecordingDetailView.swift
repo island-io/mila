@@ -207,6 +207,13 @@ struct RecordingDetailView: View {
     /// Updates the persisted `Recording.language` so the downstream
     /// `TranscriptionService` picks the right model on its own.
     private func retranscribe(in language: RecordingLanguage) {
+        // Gate before mutating the store: a busy (active/queued) recording must
+        // not have its status/language flipped under an in-flight pass, because
+        // `enqueue` would then no-op the re-run while the store mutation stuck.
+        // (Mirrors `RecordingContextMenu.retranscribe`.)
+        guard transcription.activeRecordingID != recording.id,
+              !transcription.pendingIDs.contains(recording.id)
+        else { return }
         // Mutate only language+status on the LIVE record so we don't clobber a
         // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
         guard let prepared = store.prepareForRetranscription(id: recording.id,
@@ -364,6 +371,11 @@ struct RecordingDetailView: View {
                 }
                 .contextMenu {
                     let currentLang = RecordingLanguage.fromCode(recording.language)
+                    // Same busy gate as the toolbar menu + RecordingContextMenu:
+                    // re-transcribing an active/queued recording would flip its
+                    // persisted language/status under the in-flight job.
+                    let isBusy = transcription.activeRecordingID == recording.id
+                        || transcription.pendingIDs.contains(recording.id)
                     Menu("Re-transcribe in") {
                         ForEach(RecordingLanguage.allCases) { lang in
                             if lang != currentLang {
@@ -373,6 +385,7 @@ struct RecordingDetailView: View {
                             }
                         }
                     }
+                    .disabled(isBusy)
                     Button("Copy transcript") { copyTranscript() }
                         .disabled(recording.fullText.isEmpty)
                 }
