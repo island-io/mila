@@ -65,6 +65,19 @@ struct Recording: Identifiable, Codable, Hashable {
     /// microphone-only or system-wide system-audio captures.
     var appName: String?
 
+    /// User-assigned display names for diarized speakers. Maps raw
+    /// diarizer IDs (`SPEAKER_00`, `SPEAKER_01`, …) to custom names
+    /// ("John", "Sarah"). Empty when no speakers have been renamed.
+    /// Raw IDs stay in `TranscriptSegment.speaker` for color stability
+    /// and tooling compatibility; this dictionary is the override layer.
+    var speakerNames: [String: String] = [:]
+
+    /// Per-speaker voice embeddings (256-dim centroids). Populated from the
+    /// live diarizer pool at end of recording, or extracted after batch
+    /// diarization. Used to create voice profiles when the user names a
+    /// speaker, even on older recordings.
+    var speakerEmbeddings: [String: [Float]] = [:]
+
     /// Rolling Live-AI summary captured at the moment recording stopped.
     /// nil for any recording that ran without Live AI mode active.
     var summary: String?
@@ -93,13 +106,6 @@ struct Recording: Identifiable, Codable, Hashable {
     /// upgrade can't mass-delete a user's older imports.
     var voiceMemoFolderUUID: String?
 
-    /// User-assigned display names for diarized speakers, keyed by the raw
-    /// diarizer ID (`SPEAKER_00` → "Daniel"). Segments keep their raw IDs —
-    /// this map is a display overlay resolved at render/export time, so
-    /// re-clustering tooling and the color palette stay keyed on stable IDs.
-    /// Empty for recordings whose speakers were never renamed.
-    var speakerNames: [String: String]
-
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose
@@ -125,7 +131,8 @@ struct Recording: Identifiable, Codable, Hashable {
          actionItems: [ActionItem]? = nil,
          voiceMemoUniqueID: String? = nil,
          voiceMemoFolderUUID: String? = nil,
-         speakerNames: [String: String] = [:]) {
+         speakerNames: [String: String] = [:],
+         speakerEmbeddings: [String: [Float]] = [:]) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -140,14 +147,22 @@ struct Recording: Identifiable, Codable, Hashable {
         self.deletedAt = deletedAt
         self.folder = folder
         self.appName = appName
+        self.speakerNames = speakerNames
+        self.speakerEmbeddings = speakerEmbeddings
         self.summary = summary
         self.actionItems = actionItems
         self.voiceMemoUniqueID = voiceMemoUniqueID
         self.voiceMemoFolderUUID = voiceMemoFolderUUID
-        self.speakerNames = speakerNames
     }
 
     var isTrashed: Bool { deletedAt != nil }
+
+    /// Resolved display name for a raw speaker ID. Returns the user's
+    /// custom name from `speakerNames` if set, otherwise falls back to
+    /// the locale-aware friendly label ("Speaker A" / "דובר א׳").
+    func displayName(for rawSpeaker: String, language: String) -> String {
+        speakerNames[rawSpeaker] ?? rawSpeaker.friendlySpeakerLabel(language: language)
+    }
 
     /// File name (relative to recordings directory) of the sidecar `.txt`
     /// holding the plain-text transcript. Derived from `audioFileName` so a
@@ -179,8 +194,8 @@ struct Recording: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames
+             speakerNames, speakerEmbeddings,
+             summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -201,11 +216,12 @@ struct Recording: Identifiable, Codable, Hashable {
         self.deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         self.folder = try c.decodeIfPresent(String.self, forKey: .folder)
         self.appName = try c.decodeIfPresent(String.self, forKey: .appName)
+        self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        self.speakerEmbeddings = try c.decodeIfPresent([String: [Float]].self, forKey: .speakerEmbeddings) ?? [:]
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
         self.actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
         self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
-        self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -226,13 +242,16 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
         try c.encodeIfPresent(folder, forKey: .folder)
         try c.encodeIfPresent(appName, forKey: .appName)
+        if !speakerNames.isEmpty {
+            try c.encode(speakerNames, forKey: .speakerNames)
+        }
+        if !speakerEmbeddings.isEmpty {
+            try c.encode(speakerEmbeddings, forKey: .speakerEmbeddings)
+        }
         try c.encodeIfPresent(summary, forKey: .summary)
         try c.encodeIfPresent(actionItems, forKey: .actionItems)
         try c.encodeIfPresent(voiceMemoUniqueID, forKey: .voiceMemoUniqueID)
         try c.encodeIfPresent(voiceMemoFolderUUID, forKey: .voiceMemoFolderUUID)
-        if !speakerNames.isEmpty {
-            try c.encode(speakerNames, forKey: .speakerNames)
-        }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

@@ -304,6 +304,110 @@ enum SpeakerDiarizer {
         return try JSONDecoder().decode([SpeakerTurn].self, from: result.stdout)
     }
 
+    /// Extract per-speaker embeddings from a WAV file by running
+    /// diarization and then embedding each speaker's longest turn.
+    /// Returns a dictionary mapping speaker IDs to 256-dim embeddings.
+    static func extractEmbeddings(wavURL: URL, pythonPath: String) async throws -> [String: [Float]] {
+        guard let modelsPath = bundledModelsPath else { return [:] }
+        var pythonInputURL = wavURL
+        var tempWAVToCleanUp: URL?
+        if wavURL.pathExtension.lowercased() != "wav" {
+            pythonInputURL = try AudioCompressor.decodeToTempWAV(wavURL)
+            tempWAVToCleanUp = pythonInputURL
+        }
+        defer {
+            if let temp = tempWAVToCleanUp { try? FileManager.default.removeItem(at: temp) }
+        }
+        let resolvedPython = resolvePython(userConfigured: pythonPath)
+        let extraEnv = pythonEnvironment()
+
+        let script = """
+        import json, sys, os, types
+
+        try:
+            import speechbrain.utils.importutils as _sbiu
+            _orig_ensure = _sbiu.LazyModule.ensure_module
+            def _safe_ensure(self, *a, **kw):
+                try:
+                    return _orig_ensure(self, *a, **kw)
+                except ImportError:
+                    self.lazy_module = types.ModuleType(self.target)
+                    return self.lazy_module
+            _sbiu.LazyModule.ensure_module = _safe_ensure
+        except Exception:
+            pass
+
+        import torch
+        _orig_torch_load = torch.load
+        def _patched_torch_load(*args, **kwargs):
+            kwargs["weights_only"] = False
+            return _orig_torch_load(*args, **kwargs)
+        torch.load = _patched_torch_load
+
+        import soundfile as sf
+        import tempfile
+        from pyannote.audio import Pipeline
+
+        wav_path = sys.argv[1]
+        models_dir = sys.argv[2]
+
+        config_path = os.path.join(models_dir, "config.yaml")
+        with open(config_path) as f:
+            config_text = f.read().replace("__MODELS_DIR__", models_dir)
+
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        tmp.write(config_text)
+        tmp.close()
+
+        try:
+            pipeline = Pipeline.from_pretrained(tmp.name)
+            if torch.backends.mps.is_available():
+                pipeline.to(torch.device("mps"))
+
+            diar = pipeline(wav_path)
+            annotation = getattr(diar, "speaker_diarization", diar)
+
+            turns = []
+            for turn, _, speaker in annotation.itertracks(yield_label=True):
+                turns.append({"start": turn.start, "end": turn.end, "speaker": speaker})
+
+            embedder = getattr(pipeline, "_embedding", None)
+            embeddings = {}
+            if embedder is not None:
+                longest = {}
+                for t in turns:
+                    sp = t["speaker"]
+                    dur = t["end"] - t["start"]
+                    if sp not in longest or dur > (longest[sp]["end"] - longest[sp]["start"]):
+                        longest[sp] = t
+                samples, sr = sf.read(wav_path, dtype="float32")
+                if samples.ndim > 1:
+                    samples = samples.mean(axis=1)
+                for sp, t in longest.items():
+                    start_sample = int(t["start"] * sr)
+                    end_sample = int(t["end"] * sr)
+                    chunk = samples[start_sample:end_sample]
+                    if len(chunk) < sr * 0.3:
+                        continue
+                    wave = torch.from_numpy(chunk).unsqueeze(0).unsqueeze(0)
+                    emb = embedder(wave)
+                    arr = emb.detach().cpu().numpy().flatten()
+                    embeddings[sp] = arr.tolist()
+
+            json.dump(embeddings, sys.stdout)
+        finally:
+            os.unlink(tmp.name)
+        """
+
+        let result = try await runPython(
+            path: resolvedPython,
+            arguments: ["-c", script, pythonInputURL.path, modelsPath],
+            environment: extraEnv
+        )
+        guard result.exitCode == 0, !result.stdout.isEmpty else { return [:] }
+        return (try? JSONDecoder().decode([String: [Float]].self, from: result.stdout)) ?? [:]
+    }
+
     struct VerifyResult: Codable {
         let pyannoteInstalled: Bool
         let torchInstalled: Bool

@@ -379,6 +379,10 @@ final class RecordingStore: ObservableObject {
     /// `SPEAKER_NN` IDs — the name is a display overlay resolved at
     /// render/export time. Regenerates the `.srt` sidecar for completed
     /// recordings so the on-disk export matches what the UI shows.
+    ///
+    /// This is the primary rename entry point (used by the #88 speaker
+    /// picker). The voice-recognition layer additionally saves a voice
+    /// profile at the call site when an embedding is available.
     func setSpeakerName(_ name: String?, forSpeaker rawID: String, recordingID: UUID) {
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -393,6 +397,54 @@ final class RecordingStore: ObservableObject {
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
+    }
+
+    /// Reassign a single segment to a different speaker. Used when the
+    /// diarizer wrongly grouped two different people under the same ID.
+    /// If `newSpeaker` doesn't exist in the recording yet, it's created
+    /// as the next `SPEAKER_NN` ID.
+    func reassignSegment(in recording: Recording, segmentID: UUID, to newSpeaker: String) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard let segIdx = recordings[idx].segments.firstIndex(where: { $0.id == segmentID }) else { return }
+        recordings[idx].segments[segIdx].speaker = newSpeaker
+        persist()
+    }
+
+    /// Create a new speaker ID for a recording (next available SPEAKER_NN).
+    func nextSpeakerID(in recording: Recording) -> String {
+        let existing = Set(recording.segments.compactMap(\.speaker))
+        var n = 0
+        while existing.contains(String(format: "SPEAKER_%02d", n)) { n += 1 }
+        return String(format: "SPEAKER_%02d", n)
+    }
+
+    /// All custom speaker names the user has assigned across every
+    /// recording, sorted alphabetically. Powers the autocomplete when
+    /// renaming a speaker and the Speakers directory view.
+    var allSpeakerNames: [String] {
+        let names = Set(recordings.flatMap(\.speakerNames.values))
+        return names.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    /// Rename a speaker globally across all recordings. Every recording
+    /// that has `oldName` in its `speakerNames` values gets updated to
+    /// `newName`. A single `persist()` call flushes all changes at once.
+    func renameSpeakerGlobally(from oldName: String, to newName: String) {
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != oldName else { return }
+        var changed = false
+        for idx in recordings.indices {
+            for (rawID, name) in recordings[idx].speakerNames where name == oldName {
+                recordings[idx].speakerNames[rawID] = trimmed
+                changed = true
+            }
+        }
+        if changed { persist() }
+    }
+
+    /// Recordings that contain a specific named speaker.
+    func recordings(forSpeaker name: String) -> [Recording] {
+        recordings.filter { $0.speakerNames.values.contains(name) }
     }
 
     /// Move a recording into a folder (or unfile it with nil). Auto-creates

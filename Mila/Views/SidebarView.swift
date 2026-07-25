@@ -8,6 +8,7 @@ enum SidebarSelection: Hashable {
     /// Video) live behind a single "More" page so Home stays focused
     /// on the one big Record button.
     case more
+    case speakers
     case category(HistoryCategory)
     /// Catch-all view for recordings the user hasn't filed anywhere
     /// yet — labelled "All Transcriptions" in the sidebar so users
@@ -60,6 +61,8 @@ struct SidebarView: View {
                     .tag(SidebarSelection.queue)
                 Label("More", systemImage: "ellipsis.circle")
                     .tag(SidebarSelection.more)
+                Label("Speakers", systemImage: "person.3")
+                    .tag(SidebarSelection.speakers)
             }
 
             Section("Folders") {

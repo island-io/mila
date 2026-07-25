@@ -705,6 +705,39 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
+        // `currentProfiles()` returns EVERY pool entry, including ones
+        // `seedPool` pre-loaded from stored voice profiles at recording
+        // start (see MilaApp) that were never matched to a real utterance.
+        // Only speakers that actually spoke — i.e. that produced at least
+        // one diarized interval — count as recognised/observed for this
+        // recording. Otherwise a seeded-but-silent profile would tag the
+        // recording with someone who never spoke and, worse, feed its stale
+        // seed centroid back into that person's profile on the next update.
+        let usedSpeakerIDs: Set<String> = Set((liveDiarizer?.intervals ?? []).map(\.speaker))
+        // Auto-populate speakerNames for speakers recognised from stored
+        // voice profiles. The live diarizer pool entries that were seeded
+        // from a profile carry `profileName`; map those back to the
+        // recording's speakerNames so the user sees real names immediately.
+        let recognisedSpeakerNames: [String: String] = {
+            guard let diar = liveDiarizer else { return [:] }
+            var names: [String: String] = [:]
+            for entry in diar.currentProfiles() where usedSpeakerIDs.contains(entry.id) {
+                if let profileName = entry.profileName {
+                    names[entry.id] = profileName
+                }
+            }
+            return names
+        }()
+        // Snapshot live pool embeddings for the recording so naming a
+        // speaker later (on an older recording) can still save a voice profile.
+        let liveEmbeddings: [String: [Float]] = {
+            guard let diar = liveDiarizer else { return [:] }
+            var embs: [String: [Float]] = [:]
+            for entry in diar.currentProfiles() where usedSpeakerIDs.contains(entry.id) {
+                embs[entry.id] = entry.centroid
+            }
+            return embs
+        }()
         let finalLiveSegments = liveTranscriber?.segments ?? []
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -782,6 +815,15 @@ final class QuickActionsController: ObservableObject {
         updated.fullText = hasLiveSegments ? finalFullText : ""
         updated.summary = finalSummary.isEmpty ? nil : finalSummary
         updated.actionItems = finalItems.isEmpty ? nil : finalItems
+        // Auto-assign names from recognised voice profiles — but only for
+        // speakers the user did NOT already name mid-recording. A manual
+        // rename always wins over a silent auto-ID guess (a wrong guess is
+        // worse than no label).
+        for (rawID, name) in recognisedSpeakerNames where updated.speakerNames[rawID] == nil {
+            updated.speakerNames[rawID] = name
+        }
+        // Store live pool embeddings on the recording.
+        updated.speakerEmbeddings.merge(liveEmbeddings) { _, new in new }
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         store.update(updated)
 

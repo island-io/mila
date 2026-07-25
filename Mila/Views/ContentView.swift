@@ -301,6 +301,8 @@ struct ContentView: View {
             QueueView(selection: $selection)
         case .more:
             MoreView()
+        case .speakers:
+            SpeakersView(selection: $selection)
         case .category(let cat):
             HistoryListView(category: cat, search: search, selection: $selection)
         case .defaultFolder:

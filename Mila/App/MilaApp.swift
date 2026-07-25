@@ -255,6 +255,10 @@ struct MilaApp: App {
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
     @StateObject private var updater = UpdaterViewModel()
+    /// Cross-recording voice-recognition profiles. Constructed in `init()`
+    /// via `_speakerProfileStore = StateObject(wrappedValue:)` like every
+    /// other app-wide store, per the project's Environment Objects convention.
+    @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
@@ -510,6 +514,7 @@ struct MilaApp: App {
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
         _configImporter = StateObject(wrappedValue: configImporter)
+        _speakerProfileStore = StateObject(wrappedValue: SpeakerProfileStore())
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -539,6 +544,7 @@ struct MilaApp: App {
                 .environmentObject(liveAISettings)
                 .environmentObject(liveTranscriber)
                 .environmentObject(liveSpeakerDiarizer)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(liveAISession)
                 .environmentObject(updater)
                 .frame(minWidth: 1000, minHeight: 640)
@@ -639,6 +645,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
                 .environmentObject(configImporter)
+                .environmentObject(speakerProfileStore)
         }
     }
 
@@ -1183,6 +1190,7 @@ struct MilaApp: App {
                 // By the time this runs, the session has already been freshly
                 // started for this recording.
                 diarizer.reset()
+                diarizer.seedPool(with: speakerProfileStore.seedEntries())
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.

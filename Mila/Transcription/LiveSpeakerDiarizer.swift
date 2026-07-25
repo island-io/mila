@@ -60,9 +60,13 @@ final class LiveSpeakerDiarizer: ObservableObject {
     private var processQueue: Task<Void, Never>?
 
     struct SpeakerProfile {
-        let id: String
+        var id: String
         var centroid: [Float]
         var sampleCount: Int
+        /// Name of the speaker from a stored profile, if this pool entry
+        /// was seeded from a known voice profile. Nil for speakers first
+        /// encountered in this recording.
+        var profileName: String?
     }
 
     private struct EmbedResponse: Decodable {
@@ -211,6 +215,29 @@ final class LiveSpeakerDiarizer: ObservableObject {
         intervals.removeAll()
     }
 
+    /// Pre-populate the pool with known speaker profiles so returning
+    /// speakers are auto-recognised. Call after `reset()` at recording
+    /// start. Each entry gets a fresh `SPEAKER_NN` ID (pool-order) and
+    /// a low `sampleCount` so the centroid can adapt to current-session
+    /// acoustics on the first few matches.
+    func seedPool(with entries: [(id: String, name: String, centroid: [Float], sampleCount: Int)]) {
+        for entry in entries {
+            let id = String(format: "SPEAKER_%02d", pool.count)
+            pool.append(SpeakerProfile(
+                id: id,
+                centroid: entry.centroid,
+                sampleCount: min(entry.sampleCount, 3),
+                profileName: entry.name
+            ))
+        }
+    }
+
+    /// Snapshot the current pool for persistence. Returns entries for
+    /// each speaker with their final centroid and sample count.
+    func currentProfiles() -> [(id: String, centroid: [Float], sampleCount: Int, profileName: String?)] {
+        pool.map { ($0.id, $0.centroid, $0.sampleCount, $0.profileName) }
+    }
+
     /// Fire-and-track variant of `process(...)`. Chains the call onto
     /// `processQueue` so the FIFO order matches the daemon's, and
     /// `awaitPending()` can join the tail. Use this from the live-
@@ -325,7 +352,7 @@ final class LiveSpeakerDiarizer: ObservableObject {
             return pool[chosen.idx].id
         }
         let nextID = String(format: "SPEAKER_%02d", pool.count)
-        pool.append(SpeakerProfile(id: nextID, centroid: embedding, sampleCount: 1))
+        pool.append(SpeakerProfile(id: nextID, centroid: embedding, sampleCount: 1, profileName: nil))
         return nextID
     }
 

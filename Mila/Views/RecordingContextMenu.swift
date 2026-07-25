@@ -138,10 +138,21 @@ private struct RecordingContextMenu: ViewModifier {
                 transcription.enqueue(prepared, isRetranscription: true)
             }
             .disabled(isBusy)
-            Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
-                retranscribe(recording, in: currentLang.other)
+            if currentLang == .auto {
+                Button("Re-transcribe in 🇬🇧 English") {
+                    retranscribe(recording, in: .english)
+                }
+                .disabled(isBusy)
+                Button("Re-transcribe in 🇮🇱 Hebrew") {
+                    retranscribe(recording, in: .hebrew)
+                }
+                .disabled(isBusy)
+            } else {
+                Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
+                    retranscribe(recording, in: currentLang.other)
+                }
+                .disabled(isBusy)
             }
-            .disabled(isBusy)
             if llm.isConfigured {
                 Divider()
                 Button("Send to \(llm.tool.displayName)…") {

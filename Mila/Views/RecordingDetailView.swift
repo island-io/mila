@@ -11,6 +11,10 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var modelManager: ModelManager
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    /// Cross-recording voice-recognition store. Naming a speaker via the
+    /// picker also upserts a voice profile from the recording's stored
+    /// embedding, so a returning speaker is auto-identified next time.
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -301,6 +305,15 @@ struct RecordingDetailView: View {
             }
         } else {
             VStack(spacing: 0) {
+                if transcription.diarizingRecordingID == recording.id {
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text("Identifying speakers…")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.vertical, 6)
+                }
                 // Transcript-area copy button, on the right just below the
                 // AI-overview banner's divider. Mirrors the consolidated
                 // copy model: this grabs the transcript; the header button
@@ -335,6 +348,7 @@ struct RecordingDetailView: View {
                         let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
+                                       recording: recording,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,
                                        showSpeaker: hasSpeakers,
                                        useSpeakerColor: hasMultipleSpeakers,
@@ -344,6 +358,20 @@ struct RecordingDetailView: View {
                                        onAssignName: { raw, name in
                                            store.setSpeakerName(name, forSpeaker: raw,
                                                                 recordingID: recording.id)
+                                           // Voice-recognition layer: upsert a voice
+                                           // profile from this recording's stored
+                                           // embedding so the named speaker is
+                                           // auto-identified in future recordings.
+                                           // `updateProfile` merges by name, so
+                                           // assigning an existing name folds the
+                                           // new sample into that person's centroid.
+                                           if let name, !name.isEmpty,
+                                              let embedding = recording.speakerEmbeddings[raw],
+                                              !embedding.isEmpty {
+                                               profileStore.updateProfile(name: name,
+                                                                          embedding: embedding,
+                                                                          sampleCount: 1)
+                                           }
                                        })
                         }
                     }
@@ -564,6 +592,7 @@ private struct AIOverviewBanner: View {
 
 private struct SegmentRow: View {
     let segment: TranscriptSegment
+    let recording: Recording
     let isActive: Bool
     let showSpeaker: Bool
     /// Whether to color the speaker label per-speaker rather than the
@@ -581,6 +610,9 @@ private struct SegmentRow: View {
     /// Persists a rename picked from the label's popover:
     /// (raw speaker ID, chosen name or nil-to-reset).
     let onAssignName: (String, String?) -> Void
+
+    /// Store access for the segment-level Reassign / Split context menu.
+    @EnvironmentObject private var store: RecordingStore
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -613,5 +645,23 @@ private struct SegmentRow: View {
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
+        .contextMenu {
+            if let raw = segment.speaker, !raw.isEmpty {
+                let otherSpeakers = Array(Set(recording.segments.compactMap(\.speaker)).filter { $0 != raw }).sorted()
+                if !otherSpeakers.isEmpty {
+                    Menu("Reassign to") {
+                        ForEach(otherSpeakers, id: \.self) { other in
+                            Button(recording.displayName(for: other, language: language)) {
+                                store.reassignSegment(in: recording, segmentID: segment.id, to: other)
+                            }
+                        }
+                    }
+                }
+                Button("Split to new speaker") {
+                    let newID = store.nextSpeakerID(in: recording)
+                    store.reassignSegment(in: recording, segmentID: segment.id, to: newID)
+                }
+            }
+        }
     }
 }
