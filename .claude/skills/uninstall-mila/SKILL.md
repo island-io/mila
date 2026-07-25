@@ -11,6 +11,22 @@ Mila stores user recordings/transcripts and large regenerable assets in the SAME
 
 Mila's bundle identifier is **`io.island.whisper.IslandWhisper`** (Island.io origin) — system caches/prefs are filed under that ID, NOT under "Mila". A search for "Mila" alone misses them.
 
+## Two uninstall modes
+
+There are two reasons to "uninstall", and they keep/delete different things. Figure out which one the user wants first — when they say something like "uninstall to reinstall the update" or "prep for a fresh install", it's **reinstall-prep**, NOT a wipe.
+
+| | **Reinstall-prep** (default when goal is a fresh/updated install) | **Full reset / wipe** (only when user explicitly says so) |
+|---|---|---|
+| App bundle | Remove | Remove |
+| Build artifacts (`build/`, `build-release/`, DerivedData) | Remove | Remove |
+| Caches / HTTPStorages / WebKit | Remove | Remove |
+| TCC privacy grants | Reset | Reset |
+| Recordings + `recordings.json` + `folders.json` | **Keep** (back up anyway) | **Keep** (back up anyway) |
+| `Models/` + `torch-site-packages/` (7.2 GB regenerable) | **Keep** (instant reinstall) | Delete only if user opts in |
+| Preferences plist (settings) | **Keep** (comes back configured) | Delete + clear `cfprefsd` |
+
+**Reinstall-prep is the common case.** Its whole point is that after reinstalling the updated app, everything comes back exactly as it was — same recordings, same downloaded models, same selected model/language/diarization/LLM settings — with zero re-download and zero re-configuration. So for reinstall-prep you do NOT need to ask the keep-by-default questions: keep both by definition. Only ask (or offer the wipe options) when the user's intent is genuinely to remove Mila for good or to troubleshoot with a clean slate.
+
 ## The Iron Rules
 
 1. **Back up recordings BEFORE deleting anything.** Copy `Recordings/` + `recordings.json` + `folders.json` to a safe location outside Application Support (e.g. `~/Desktop/Mila-Recordings-Backup-<date>`). Verify file counts match before proceeding.
@@ -80,8 +96,15 @@ trash /Applications/Mila.app 2>/dev/null || true
 # trashing an unrelated build/ tree if REPO is wrong.
 REPO="${MILA_REPO:-$HOME/ClonedProjects/mila}"
 if [ -f "$REPO/project.yml" ]; then
-  trash "$REPO/build" 2>/dev/null || true   # only the build/ output, NOT the repo itself
+  # `build/` (make) and `build-release/` (xcodebuild release) are both output
+  # dirs; the .dSYM lives under build-release/. Trash both, NOT the repo itself.
+  for b in "$REPO/build" "$REPO/build-release"; do [ -e "$b" ] && trash "$b" || true; done
 fi
+# ZSH GOTCHA: an unmatched glob (`Mila-*` with no DerivedData) raises
+# "no matches found" and, under `set -e`, ABORTS THE WHOLE SCRIPT before the
+# caches/TCC steps below ever run. Guard with NULL_GLOB (or run this block in
+# bash) so a no-match is a silent skip, not a fatal error.
+setopt NULL_GLOB 2>/dev/null || shopt -s nullglob 2>/dev/null || true
 for d in "$HOME/Library/Developer/Xcode/DerivedData/"Mila-*; do [ -d "$d" ] && trash "$d"; done
 
 # 4. Remove system footprint (bundle id, NOT "Mila").
@@ -174,6 +197,8 @@ ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
 - **Using `rm`.** Always `trash` so the user can recover.
 - **Deleting `Models/`/`torch-site-packages/` without asking.** These are keep-by-default; deleting them forces multi-GB re-downloads on reinstall.
 - **Wiping the preferences plist on a routine uninstall.** That destroys the user's settings (model, language, diarization, LLM config). Keep it unless the user explicitly wants a full reset — and if they do, clear `cfprefsd` too or it gets rewritten.
-- **Trashing the source repo.** Only `build/` inside your `mila` checkout is an artifact; the rest is source.
+- **Trashing the source repo.** Only `build/` and `build-release/` inside your `mila` checkout are artifacts; the rest is source.
+- **Letting a zsh unmatched glob abort the script mid-uninstall.** Under zsh + `set -e`, the DerivedData `Mila-*` loop dies with "no matches found" when there's no such dir, silently skipping the caches removal and TCC reset. Guard with `setopt NULL_GLOB` (done in the procedure). If you split the uninstall across Bash calls, put caches + TCC in their OWN call so a glob failure earlier can't strand them.
+- **Treating a reinstall-prep as a full wipe.** When the goal is to install an updated build, keep `Models/`, `torch-site-packages/`, AND the preferences plist — deleting them forces a 7 GB re-download and re-configuration for no reason. Only wipe when the user explicitly wants Mila gone for good or a clean-slate reset.
 - **Leaving TCC privacy grants behind.** A file-based uninstall does NOT clear the "Screen & System Audio Recording", Microphone, etc. grants — they live in the system TCC databases, not in files, and linger as orphan entries. Run `tccutil reset All io.island.whisper.IslandWhisper` (no sudo needed) as a standard step.
 - **Trying to `sqlite3`-edit the system TCC.db directly.** It's SIP-protected and needs Full Disk Access even to read. Use `tccutil reset`, which goes through the TCC daemon and works without sudo.
