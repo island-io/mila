@@ -110,7 +110,13 @@ final class ModelManager: NSObject, ObservableObject {
     init(modelsDirectory: URL) {
         self.modelsDirectory = modelsDirectory
         let lastUsed = UserDefaults.standard.string(forKey: "selectedModelName")
-        self.selectedModelName = lastUsed ?? WhisperModel.ivritLarge.name
+        let defaultModel: WhisperModel
+        if Locale.current.language.languageCode?.identifier == "he" {
+            defaultModel = .ivritLarge
+        } else {
+            defaultModel = .openaiTurbo
+        }
+        self.selectedModelName = lastUsed ?? defaultModel.name
         super.init()
         try? FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         refreshInstalled()

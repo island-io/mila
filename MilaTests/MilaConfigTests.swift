@@ -218,11 +218,15 @@ final class MilaConfigImporterTests: XCTestCase {
     func test_plannedChanges_emptyWhenConfigMatchesCurrent() {
         let h = makeHarness()
         defer { KeychainHelper.delete(key: h.keychainKey) }
-        // Current: backend .local, language .hebrew (defaults).
+        // Current: backend .local + whatever language a fresh install
+        // defaults to. Reference the live value rather than hardcoding it
+        // so this test tracks the fresh-install default (English as of the
+        // Russian-language PR; Hebrew before that) instead of breaking
+        // every time the default changes.
         let config = MilaConfig(
             version: 1,
             remoteTranscription: .init(enabled: false),
-            recordingLanguage: "he"
+            recordingLanguage: h.language.current.rawValue
         )
         XCTAssertTrue(h.importer.plannedChanges(for: config).isEmpty)
     }

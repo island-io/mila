@@ -182,6 +182,15 @@ struct HomeView: View {
                     .font(.system(.caption, design: .monospaced))
                     .foregroundStyle(.primary.opacity(0.7))
             }
+            Text("·")
+                .foregroundStyle(.tertiary)
+            HStack(spacing: 4) {
+                Text("🇷🇺")
+                Text("dictate")
+                Text(hotkeys.binding(for: .dictateRussian).displayName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.primary.opacity(0.7))
+            }
         }
         .font(.caption)
         .foregroundStyle(.secondary)

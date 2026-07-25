@@ -23,10 +23,13 @@ final class HotkeySettingsTests: XCTestCase {
         let settings = HotkeySettings(defaults: defaults)
         let english = settings.binding(for: .dictateEnglish)
         let hebrew = settings.binding(for: .dictateHebrew)
+        let russian = settings.binding(for: .dictateRussian)
         XCTAssertEqual(english.keyCode, UInt32(kVK_ANSI_2))
         XCTAssertEqual(english.modifiers, UInt32(cmdKey))
         XCTAssertEqual(hebrew.keyCode, UInt32(kVK_ANSI_3))
         XCTAssertEqual(hebrew.modifiers, UInt32(cmdKey))
+        XCTAssertEqual(russian.keyCode, UInt32(kVK_ANSI_4))
+        XCTAssertEqual(russian.modifiers, UInt32(cmdKey))
     }
 
     func test_set_binding_persists_across_instances() {
@@ -40,6 +43,9 @@ final class HotkeySettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.binding(for: .dictateHebrew),
                        HotkeyAction.defaults[.dictateHebrew]!,
                        "Hebrew binding must not be touched when only English changes")
+        XCTAssertEqual(reloaded.binding(for: .dictateRussian),
+                       HotkeyAction.defaults[.dictateRussian]!,
+                       "Russian binding must not be touched when only English changes")
     }
 
     func test_reset_to_default_clears_persisted_value() {

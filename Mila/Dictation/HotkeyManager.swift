@@ -94,6 +94,7 @@ struct HotkeyBinding: Codable, Equatable, Hashable {
 enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
     case dictateEnglish
     case dictateHebrew
+    case dictateRussian
 
     var id: String { rawValue }
 
@@ -101,6 +102,7 @@ enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
         switch self {
         case .dictateEnglish: return "en"
         case .dictateHebrew:  return "he"
+        case .dictateRussian: return "ru"
         }
     }
 
@@ -108,6 +110,7 @@ enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
         switch self {
         case .dictateEnglish: return "English dictation"
         case .dictateHebrew:  return "Hebrew dictation"
+        case .dictateRussian: return "Russian dictation"
         }
     }
 
@@ -116,6 +119,7 @@ enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
         switch self {
         case .dictateEnglish: return 1
         case .dictateHebrew:  return 2
+        case .dictateRussian: return 3
         }
     }
 
@@ -128,6 +132,8 @@ enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
         .dictateEnglish: HotkeyBinding(keyCode: UInt32(kVK_ANSI_2),
                                        modifiers: UInt32(cmdKey)),
         .dictateHebrew:  HotkeyBinding(keyCode: UInt32(kVK_ANSI_3),
+                                       modifiers: UInt32(cmdKey)),
+        .dictateRussian: HotkeyBinding(keyCode: UInt32(kVK_ANSI_4),
                                        modifiers: UInt32(cmdKey))
     ]
 }

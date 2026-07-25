@@ -243,9 +243,9 @@ actor RemoteWhisperEngine: RemoteTranscribing {
 
         if let segments = parsed.segments, !segments.isEmpty {
             let mapped = segments.compactMap { seg -> TranscriptSegment? in
-                let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !text.isEmpty else { return nil }
-                return TranscriptSegment(start: seg.start, end: seg.end, text: seg.text)
+                let cleaned = WhisperEngine.cleanWhisperText(seg.text)
+                guard !cleaned.isEmpty else { return nil }
+                return TranscriptSegment(start: seg.start, end: seg.end, text: cleaned)
             }
             if !mapped.isEmpty { return mapped }
         }
@@ -253,9 +253,11 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         // No segment array (server returned `response_format=json`, or an empty
         // segment list with a top-level transcript). Fall back to one segment
         // spanning the whole clip.
-        if let text = parsed.text?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !text.isEmpty {
-            return [TranscriptSegment(start: 0, end: parsed.duration ?? 0, text: text)]
+        if let rawText = parsed.text {
+            let cleaned = WhisperEngine.cleanWhisperText(rawText)
+            if !cleaned.isEmpty {
+                return [TranscriptSegment(start: 0, end: parsed.duration ?? 0, text: cleaned)]
+            }
         }
 
         throw RemoteError.emptyResult

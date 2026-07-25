@@ -350,7 +350,10 @@ public actor WhisperEngine {
             let t1 = Double(whisper_full_get_segment_t1(ctx, Int32(i))) / 100.0
             let cText = whisper_full_get_segment_text(ctx, Int32(i))
             let text = cText.flatMap { String(cString: $0) } ?? ""
-            segments.append(TranscriptSegment(start: t0, end: t1, text: text))
+            let cleanedText = Self.cleanWhisperText(text)
+            if !cleanedText.isEmpty {
+                segments.append(TranscriptSegment(start: t0, end: t1, text: cleanedText))
+            }
         }
         return segments
     }
@@ -526,6 +529,51 @@ public actor WhisperEngine {
         var out = samples
         for i in 0..<out.count { out[i] = max(-1, min(1, out[i] * gain)) }
         return out
+    }
+
+    /// Strip Whisper subtitle-credit hallucinations ("Субтитры создавал
+    /// DimaTorzok", "Subtitles by Amara.org", "DimaTorzok", …).
+    ///
+    /// Whisper emits these as a bare segment or tagged onto the tail of a real
+    /// one. The credit is always trailing — a name or "Amara.org" follows the
+    /// phrase — so we cut from the first credit fragment to the end of the
+    /// segment and keep any real speech that preceded it. When the whole
+    /// segment was a credit, the remainder has no letters or digits and we
+    /// return "", which the caller drops via its `isEmpty` guard.
+    ///
+    /// Matching is a case-insensitive substring search rather than an exact
+    /// equality check: whisper credits come with trailing names, casing
+    /// variants, and occasional leading punctuation, so an exact match
+    /// ("subtitles by" == "subtitles by amara") would let real hallucinations
+    /// through. The fragments are specific enough that false positives on
+    /// legitimate speech are negligible.
+    public static func cleanWhisperText(_ text: String) -> String {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
+
+        let creditFragments = [
+            "субтитры создавал",
+            "субтитры создали",
+            "subtitles by",
+            "dimatorzok"
+        ]
+        
+        // Cut at the EARLIEST credit fragment in the text, not the first
+        // match in array order: "DimaTorzok Subtitles by Amara.org" must
+        // truncate at "DimaTorzok" (position 0), not at "subtitles by",
+        // which would retain the hallucinated name.
+        let firstCreditStart = creditFragments
+            .compactMap { text.range(of: $0, options: .caseInsensitive)?.lowerBound }
+            .min()
+        let keptText = firstCreditStart.map { String(text[..<$0]) } ?? text
+        
+        let trimmedKept = keptText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasAlphanumerics = trimmedKept.unicodeScalars.contains { scalar in
+            CharacterSet.alphanumerics.contains(scalar)
+        }
+        guard hasAlphanumerics else { return "" }
+        
+        let leadingWhitespace = text.prefix(while: { $0.isWhitespace })
+        return leadingWhitespace + trimmedKept
     }
 }
 

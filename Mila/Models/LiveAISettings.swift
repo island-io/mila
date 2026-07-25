@@ -174,6 +174,7 @@ final class LiveAISettings: ObservableObject {
         case auto = "auto"
         case english = "en"
         case hebrew = "he"
+        case russian = "ru"
 
         var id: String { rawValue }
 
@@ -187,6 +188,7 @@ final class LiveAISettings: ObservableObject {
             case .auto:    return "the same language as the transcript below"
             case .english: return "English"
             case .hebrew:  return "Hebrew"
+            case .russian: return "Russian"
             }
         }
 
@@ -195,6 +197,7 @@ final class LiveAISettings: ObservableObject {
             case .auto:    return "Auto"
             case .english: return "English"
             case .hebrew:  return "Hebrew"
+            case .russian: return "Russian"
             }
         }
     }

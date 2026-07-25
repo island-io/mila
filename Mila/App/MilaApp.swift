@@ -609,6 +609,9 @@ struct MilaApp: App {
                 Button("Hebrew Dictation (\(hotkeySettings.binding(for: .dictateHebrew).displayName))") {
                     Task { await dictation.toggle(action: .dictateHebrew) }
                 }
+                Button("Russian Dictation (\(hotkeySettings.binding(for: .dictateRussian).displayName))") {
+                    Task { await dictation.toggle(action: .dictateRussian) }
+                }
             }
             // Surface the diagnostic-report action under Help so a user
             // with a bug to report can hand off a zip without us asking
@@ -1442,8 +1445,14 @@ struct MilaApp: App {
         // local weights. (The Models tab still offers manual downloads, and
         // switching back to local re-triggers this on next launch.)
         guard !remoteTranscriptionSettings.isActive else { return }
-        modelManager.setSelected(WhisperModel.ivritLarge)
-        for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {
+        let isHebrewSystem = Locale.current.language.languageCode?.identifier == "he"
+        if UserDefaults.standard.string(forKey: "selectedModelName") == nil {
+            modelManager.setSelected(isHebrewSystem ? WhisperModel.ivritLarge : WhisperModel.openaiTurbo)
+        }
+        let modelsToInstall = isHebrewSystem
+            ? [WhisperModel.ivritLarge, WhisperModel.openaiTurbo]
+            : [WhisperModel.openaiTurbo]
+        for model in modelsToInstall {
             if !modelManager.isInstalled(model) && modelManager.downloads[model.name] == nil {
                 modelManager.download(model)
             }
