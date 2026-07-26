@@ -19,6 +19,13 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # setup-swift's only v3 tag is the 3.0.0-beta.1 pre-release. Its
+      # Swiftly-based installer fails GPG verification on the Ubuntu runner
+      # ("gpg: Can't check signature: No public key"), which reds the
+      # e2e-transcription job. Stay on v2.x until a stable v3 ships.
+      - dependency-name: "swift-actions/setup-swift"
+        versions: ["3.x"]
 
   - package-ecosystem: "docker"
     directory: "/docker/speaches-hebrew"

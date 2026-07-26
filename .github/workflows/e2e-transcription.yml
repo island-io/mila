@@ -17,12 +17,12 @@ jobs:
 
     steps:
       - name: Checkout with submodules
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           submodules: recursive
 
-      - uses: dorny/paths-filter@d1c1ffe0248fe513906c8e24db8ea791d46f8590 # v3.0.3
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
         id: changes
         with:
           filters: |
@@ -52,7 +52,7 @@ jobs:
 
       - name: Cache whisper.cpp build
         if: steps.changes.outputs.relevant == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: whisper-build-cache
         with:
           path: |
@@ -78,13 +78,18 @@ jobs:
 
       - name: Install Swift
         if: steps.changes.outputs.relevant == 'true'
+        # HELD at v2.4.0 on purpose: setup-swift's only v3 tag is the
+        # 3.0.0-beta.1 pre-release, whose Swiftly-based installer fails GPG
+        # verification on the Ubuntu runner ("gpg: Can't check signature: No
+        # public key") and kills this job. Dependabot is told to skip 3.x in
+        # .github/dependabot.yml — revisit when a stable v3 ships.
         uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:
           swift-version: '5.10'
 
       - name: Cache whisper model
         if: steps.changes.outputs.relevant == 'true'
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/whisper-models
           key: whisper-model-ggml-tiny-v1
