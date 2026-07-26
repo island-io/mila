@@ -17,7 +17,7 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.9.0"
+    MARKETING_VERSION: "1.9.1"
     # 1.9.0:
     #   * First stable of the 1.9.0 line. Everything from 1.9.0-beta.1
     #     (remote transcription backend, iPhone Voice Memos sync, neural VAD,
@@ -98,7 +98,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "53"
+    CURRENT_PROJECT_VERSION: "54"
 
 packages:
   TranscriptionCore:
