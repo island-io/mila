@@ -1304,11 +1304,15 @@ struct MilaApp: App {
                     await diarizer.awaitPending()
                     diarizer.stop()
                 }
-                // Note: don't cancel aiSession here — QuickActionsController
-                // still needs to read .summary and .actionItems out of
-                // it when assembling the saved Recording. The NEXT
-                // recording clears these via `liveAISession?.start()` at
-                // record-start (in QuickActionsController).
+                // Note: don't cancel aiSession here — this handler fires
+                // during `session.stop()`, BEFORE QuickActionsController
+                // has read .summary / .actionItems for the saved
+                // Recording, and `cancel()` clears both. `stopRecording`
+                // cancels it itself once that snapshot is safely in the
+                // store (it's the only path that knows when that is); on
+                // the paths that don't go through `stopRecording`
+                // (cancelAll / app quit), the next recording's
+                // `liveAISession?.start()` resets it.
                 sessionRef.onLiveSamples = nil
             }
         }
