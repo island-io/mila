@@ -19,6 +19,11 @@ run it locally any time: `scripts/check-release-notes.sh 1.8.14`.
 - Audience is **end users**, not developers — describe what changed for *them*.
 - Markdown. A short bulleted list works best (it renders to `<ul><li>` in the
   appcast); bold the lead of each bullet.
+- **Keep each bullet on ONE line — never hard-wrap it.** The appcast converter is
+  line-oriented: a bullet wrapped across several lines renders as a truncated
+  `<li>` followed by one loose `<p>` per continuation line, and inline `*emphasis*`
+  in those continuation lines comes through as literal asterisks. Long lines are
+  correct here; v1.9.1 shipped a mangled "What's New" popup this way.
 - Cover only the user-visible changes in this version.
 
 Example (`v1.8.14.md`):
