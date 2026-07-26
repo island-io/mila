@@ -550,6 +550,10 @@ final class QuickActionsController: ObservableObject {
             // recording. Cursor (PRRT_kwDOSY2m-s6GOIj-) flagged it.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // Same reason as the normal-path clear below: the meeting is
+            // over either way, so its notes must not carry into the next
+            // recording.
+            liveAISettings?.meetingContext = ""
             isFinalizingRecording = false
             activeJob = .none
             return
@@ -766,6 +770,11 @@ final class QuickActionsController: ObservableObject {
             // pipelines below before returning.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // Third exit from a finished recording, and it needs the same
+            // clear as the other two — otherwise cancelling the rename
+            // sheet is enough to carry this meeting's notes into the next
+            // recording. (CodeRabbit on #111.)
+            liveAISettings?.meetingContext = ""
             isFinalizingRecording = false
             return
         }
@@ -796,6 +805,14 @@ final class QuickActionsController: ObservableObject {
         // Cleanup: `.idle` handler skipped these because the flag was set.
         liveTranscriber?.stop()
         liveDiarizer?.stop()
+        // Per-meeting background notes die with the meeting. Cleared HERE
+        // (not in `LiveAISession.start()`) because a recording can begin
+        // before the user has pasted anything — clearing at start would
+        // wipe notes prepared for the meeting about to happen. Leaving
+        // them set is what produced blended "previous call + this call"
+        // summaries when the agenda lived in the persistent `prompt`
+        // instead: see LiveAISettings.meetingContext.
+        liveAISettings?.meetingContext = ""
         // Free the record button NOW. The heavy tail below (offline
         // re-diarize subprocess / summarizer LLM call / m4a transcode, or
         // the batch-transcription enqueue) touches only the on-disk WAV,
