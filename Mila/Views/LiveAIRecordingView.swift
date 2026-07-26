@@ -25,6 +25,12 @@ struct LiveAIRecordingView: View {
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var llmSettings: LLMSettings
 
+    /// Whether the per-meeting notes editor is open. Collapsed by
+    /// default so the pane still leads with the AI's output; the toggle
+    /// in the header shows a filled icon when notes exist so a user who
+    /// pasted an agenda can see that at a glance without opening it.
+    @State private var isContextExpanded = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -143,10 +149,15 @@ struct LiveAIRecordingView: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
+                contextToggle
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)
             .padding(.bottom, 8)
+
+            if isContextExpanded {
+                contextEditor
+            }
 
             // Two bulleted sections, summary on top, action items
             // below. Both are live — the LLM re-emits a refreshed
@@ -175,6 +186,57 @@ struct LiveAIRecordingView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    // MARK: - Per-meeting context
+
+    /// Header affordance for the notes editor. Filled icon = notes are
+    /// set for this meeting; hollow = none.
+    private var contextToggle: some View {
+        let hasContext = !liveAISettings.meetingContext
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return Button {
+            isContextExpanded.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: hasContext ? "doc.text.fill" : "doc.text")
+                Text("Context")
+                    .font(.caption)
+            }
+            .foregroundStyle(hasContext ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+        }
+        .buttonStyle(.plain)
+        .help("Notes for THIS meeting only — an agenda, attendees, acronyms. Mila uses them to interpret what it hears, and clears them when the recording stops.")
+        .accessibilityIdentifier("liveAI.context.toggle")
+    }
+
+    private var contextEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextEditor(text: $liveAISettings.meetingContext)
+                .font(.system(.caption, design: .monospaced))
+                .frame(height: 90)
+                .padding(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color.secondary.opacity(0.25))
+                )
+                .accessibilityIdentifier("liveAI.context.field")
+            HStack {
+                Text("Background for this meeting only — agenda, attendees, acronyms. Not summarised and never turned into action items; cleared when the recording stops.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Clear") {
+                    liveAISettings.meetingContext = ""
+                }
+                .controlSize(.small)
+                .disabled(liveAISettings.meetingContext.isEmpty)
+                .accessibilityIdentifier("liveAI.context.clear")
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 12)
     }
 
     /// Render the LLM's rolling summary as a bulleted list. The LLM

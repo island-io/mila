@@ -125,6 +125,24 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(prompt, forKey: Keys.prompt) }
     }
 
+    /// Background notes for the CURRENT meeting only — an agenda, a list
+    /// of attendees, acronyms the model won't know. Injected into every
+    /// Live AI tick as a clearly-labelled non-transcript block (see
+    /// `LiveAISession.promptWithContext`) and cleared by
+    /// `QuickActionsController.stopRecording` when the recording ends.
+    ///
+    /// Deliberately NOT persisted to `UserDefaults` and deliberately not
+    /// part of `prompt`. Both properties are what makes this safe:
+    /// users used to paste the agenda into the `prompt` editor in
+    /// Settings, which is a permanent template — so every LATER recording
+    /// was told the previous meeting's agenda was its context and the
+    /// model produced a blended "previous call + this call" summary plus
+    /// action items lifted straight from the stale agenda (stamped
+    /// `timestamp_seconds: 0`, since they were never said out loud).
+    /// In-memory + cleared-at-stop means a meeting's context can never
+    /// outlive the meeting, even across an app relaunch.
+    @Published var meetingContext: String = ""
+
     /// Output language for the LLM's summary and action items.
     /// Default English. The recording can still be in any language —
     /// this only controls what the AI's commentary comes back in.

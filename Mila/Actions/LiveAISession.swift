@@ -81,6 +81,36 @@ final class LiveAISession: ObservableObject {
         )
     }
 
+    /// Append the user's per-meeting background notes to `prompt` as an
+    /// explicitly-fenced non-transcript block. Returns `prompt` unchanged
+    /// when there are no notes.
+    ///
+    /// The guard rails in the block text are the whole point. Notes are
+    /// almost always an agenda ("Wojtek's team — recruitment going better;
+    /// flying in beginning of August"), which reads exactly like a
+    /// transcript of decisions already taken. Without being told
+    /// otherwise the model summarises the AGENDA and emits an action item
+    /// per bullet — the user then sees a summary of a meeting that hasn't
+    /// happened yet mixed into the one that has. So we say three things:
+    /// this is not transcript, don't summarise it, don't mine it for
+    /// items.
+    ///
+    /// `static` + pure so the wire format is unit-testable without a
+    /// subprocess.
+    static func promptWithContext(_ prompt: String, context: String) -> String {
+        let notes = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !notes.isEmpty else { return prompt }
+        return """
+        \(prompt)
+
+        ---
+        BACKGROUND NOTES (supplied by the user before this meeting — these are NOT part of the transcript and describe what the user PLANNED to discuss):
+        \(notes)
+
+        Use the notes only to interpret what you actually hear: names, spellings, acronyms, and which topic is being discussed. Do NOT summarise the notes, and do NOT turn them into action items. Every action item and every sentence of the summary must come from the transcript itself — if something in the notes never comes up in the conversation, it does not appear in your output at all.
+        """
+    }
+
     /// Pure throttle core: how long to wait before the next tick may
     /// *start*, given the previous tick's start time and the configured
     /// minimum spacing. `0` means "start now". Exposed `static` so it can
@@ -304,8 +334,13 @@ final class LiveAISession: ObservableObject {
                 return "Hebrew"
             }
         }()
-        let prompt = liveAISettings.prompt
-            .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
+        // Read the per-meeting notes at TICK time, not at `start()` — a
+        // meeting-detector auto-start beats the user to the pane, so the
+        // agenda usually gets pasted a minute into the recording.
+        let prompt = Self.promptWithContext(
+            liveAISettings.prompt
+                .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
+            context: liveAISettings.meetingContext)
         let model = liveAISettings.model
         let useSession = (sessionID != nil)
         // Cold-start the first tick gets a longer timeout (see

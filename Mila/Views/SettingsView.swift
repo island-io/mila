@@ -1618,6 +1618,15 @@ private struct LiveAISettingsTab: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            // This prompt is a permanent template, so anything meeting-
+            // specific pasted here silently applies to every LATER
+            // recording — which produced blended "previous meeting + this
+            // meeting" summaries and action items lifted from a stale
+            // agenda. Point users at the per-meeting Context box instead.
+            Text("This prompt is reused for every recording. For notes about one specific meeting (agenda, attendees, acronyms), use the **Context** box in the recording pane — it's cleared when that recording stops.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
