@@ -295,6 +295,10 @@ enum LLMRunner {
         if timeout > 0 { request.timeoutInterval = timeout }
 
         do {
+            // Already cancelled before we even dispatch (e.g. the rename sheet
+            // closed while the transcript was still being assembled)? Don't
+            // spend the round trip — or the tokens. (CodeRabbit #2.)
+            try Task.checkCancellation()
             let (http, data) = try await transport.send(request)
             // A cooperative cancellation (Task.cancel, or a custom/test
             // transport that throws CancellationError) would otherwise fall

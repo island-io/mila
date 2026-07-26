@@ -74,6 +74,65 @@ final class LLMSettingsOpenAIReadinessTests: XCTestCase {
         XCTAssertTrue(s.isConfigured)
     }
 
+    /// AC-READY-05 (CodeRabbit #3) — a *named hosted* preset with no API key is
+    /// not ready: every request would come back 401, so auto-title / auto-summary
+    /// must not fire at all. Mirrors `RemoteTranscriptionSettings.isConfigured`,
+    /// which likewise refuses to call OpenAI's endpoint without a token.
+    func test_isConfigured_falseForHostedPreset_whenAPIKeyMissing() {
+        let key = "LLMSettingsOpenAI.\(#function).apiKey"
+        KeychainHelper.delete(key: key)
+        defer { KeychainHelper.delete(key: key) }
+        let suite = UserDefaults(suiteName: "LLMSettingsOpenAI.\(#function)")!
+        suite.removePersistentDomain(forName: "LLMSettingsOpenAI.\(#function)")
+        let s = LLMSettings(defaults: suite, apiKeyKeychainKey: key)
+
+        s.tool = .openaiCompatible
+        s.applyPreset(.openai, previous: .custom)   // fills base URL + model
+        XCTAssertFalse(s.isConfigured,
+                       "A hosted preset without an API key is enabled, not ready")
+        s.openAIAPIKey = "sk-live"
+        XCTAssertTrue(s.isConfigured,
+                      "Supplying the key completes the hosted preset")
+    }
+
+    /// AC-READY-05 — the key requirement must not lock out anonymous endpoints:
+    /// a local Ollama and a `.custom` (self-hosted / LAN) endpoint stay ready
+    /// without one, because we can't know whether they enforce auth.
+    func test_isConfigured_trueWithoutAPIKey_forLocalAndCustomEndpoints() {
+        let key = "LLMSettingsOpenAI.\(#function).apiKey"
+        KeychainHelper.delete(key: key)
+        defer { KeychainHelper.delete(key: key) }
+        let suite = UserDefaults(suiteName: "LLMSettingsOpenAI.\(#function)")!
+        suite.removePersistentDomain(forName: "LLMSettingsOpenAI.\(#function)")
+        let s = LLMSettings(defaults: suite, apiKeyKeychainKey: key)
+
+        s.tool = .openaiCompatible
+        s.applyPreset(.ollamaLocal, previous: .custom)
+        XCTAssertTrue(s.isConfigured, "A local Ollama needs no API key")
+
+        s.openAIProvider = .custom
+        s.openAIBaseURL = "http://llm.corp.internal:8000/v1"
+        s.openAIModelName = "internal-model"
+        XCTAssertTrue(s.isConfigured,
+                      "A self-hosted custom endpoint is assumed open unless a key is given")
+    }
+
+    /// The readiness rule itself, pinned directly so the intent survives a
+    /// refactor of `isConfigured`.
+    func test_requiresAPIKeyForReadiness_hostedYes_localAndCustomNo() {
+        XCTAssertTrue(LLMSettings.requiresAPIKeyForReadiness(
+            provider: .openai, baseURL: "https://api.openai.com/v1"))
+        XCTAssertTrue(LLMSettings.requiresAPIKeyForReadiness(
+            provider: .groq, baseURL: "https://api.groq.com/openai/v1"))
+        XCTAssertFalse(LLMSettings.requiresAPIKeyForReadiness(
+            provider: .ollamaLocal, baseURL: "http://localhost:11434/v1"))
+        XCTAssertFalse(LLMSettings.requiresAPIKeyForReadiness(
+            provider: .custom, baseURL: "https://anything.example/v1"))
+        // A named preset repointed at a local proxy needs no key either.
+        XCTAssertFalse(LLMSettings.requiresAPIKeyForReadiness(
+            provider: .openai, baseURL: "http://localhost:8080/v1"))
+    }
+
     /// AC-READY — the existing CLI tools stay configured regardless of OpenAI state.
     func test_isConfigured_trueForClaude_regardlessOfOpenAIFields() {
         let s = makeSettings()
@@ -419,6 +478,49 @@ final class OpenAIRequestBuilderTests: XCTestCase {
                                                           apiKey: "k", jsonMode: false,
                                                           temperature: nil)) { error in
             XCTAssertEqual(error as? OpenAIRequestError, .invalidEndpoint("https://api.open ai.com/v1"))
+        }
+    }
+
+    /// AC-REQ-11 (CodeRabbit #4) — `URL(string:)` happily parses a scheme-less
+    /// string as a *relative* URL with no host, which then dies deep inside
+    /// `URLSession` as an opaque "unsupported URL". Require an absolute
+    /// http(s) URL with a host so the user gets the actionable Settings message
+    /// instead.
+    func test_makeRequest_throwsInvalidEndpoint_forSchemeLessOrNonHTTPBaseURL() {
+        for bad in ["api.openai.com/v1",          // no scheme ⇒ no host
+                    "/v1",                        // path only
+                    "ftp://example.com/v1",       // wrong scheme
+                    "file:///tmp/v1",             // wrong scheme, no host
+                    "https:///v1"] {              // scheme but empty host
+            XCTAssertThrowsError(
+                try OpenAIClient.makeRequest(baseURL: bad, model: "m", prompt: "p",
+                                             transcript: "t", summary: "",
+                                             apiKey: "k", jsonMode: false,
+                                             temperature: nil),
+                "\(bad) must be rejected as an invalid endpoint") { error in
+                    guard let typed = error as? OpenAIRequestError,
+                          case .invalidEndpoint = typed else {
+                        XCTFail("expected .invalidEndpoint for \(bad), got \(error)")
+                        return
+                    }
+                }
+        }
+    }
+
+    /// The validation must not reject legitimate endpoints — http and https,
+    /// with or without a port or a path prefix.
+    func test_makeRequest_acceptsValidHTTPAndHTTPSBaseURLs() throws {
+        for good in ["http://localhost:11434/v1",
+                     "https://api.groq.com/openai/v1",
+                     "http://192.168.1.10:8000/v1",
+                     "https://example.com"] {
+            let r = try OpenAIClient.makeRequest(baseURL: good, model: "m", prompt: "p",
+                                                 transcript: "t", summary: "",
+                                                 apiKey: "k", jsonMode: false,
+                                                 temperature: nil)
+            XCTAssertEqual(r.url?.absoluteString, "\(good)/chat/completions")
+            XCTAssertFalse(r.httpBody?.isEmpty ?? true,
+                           "a valid endpoint must still get a JSON body")
         }
     }
 
@@ -1204,13 +1306,19 @@ final class OpenAILiveAISplitTests: XCTestCase {
         await waitUntilIdle(session)
 
         XCTAssertEqual(log.calls.count, 1)
-        XCTAssertTrue(log.calls[0].jsonMode,
+        // `XCTAssertEqual` doesn't halt, so subscripting `[0]` would trap on a
+        // regression that fires zero ticks. Unwrap first. (CodeRabbit #5.)
+        guard let call = log.calls.first else {
+            XCTFail("expected exactly one tick call, got \(log.calls.count)")
+            return
+        }
+        XCTAssertTrue(call.jsonMode,
                       "Live AI OpenAI ticks must request JSON mode for reliable envelopes.")
-        XCTAssertEqual(log.calls[0].temperature, 0.2,
+        XCTAssertEqual(call.temperature, 0.2,
                        "Live AI OpenAI ticks must use a low temperature (0.2) for stable output.")
         // The OpenAI config is threaded from llmSettings into the LLMCall.
-        XCTAssertEqual(log.calls[0].openAIBaseURL, "http://localhost:11434/v1")
-        XCTAssertEqual(log.calls[0].model, "test-model")
+        XCTAssertEqual(call.openAIBaseURL, "http://localhost:11434/v1")
+        XCTAssertEqual(call.model, "test-model")
     }
 
     // MARK: - AC-LIVEAI-05 — parser tolerates ```json fences from local models

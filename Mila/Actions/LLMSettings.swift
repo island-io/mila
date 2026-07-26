@@ -315,21 +315,46 @@ final class LLMSettings: ObservableObject {
         }
     }
 
+    /// Whether a blank API key makes the configured endpoint unusable, so
+    /// `isConfigured` must report "not ready" rather than let auto-title /
+    /// auto-summary fire requests that are guaranteed to come back 401.
+    ///
+    /// Mirrors `RemoteTranscriptionSettings.requiresAPIKey`: a *named hosted*
+    /// preset (OpenAI, Groq, OpenRouter, DeepSeek, Ollama Cloud) always needs a
+    /// token; a local server and a `.custom` endpoint do not — a self-hosted or
+    /// LAN box is assumed open unless the user supplies one, and guessing
+    /// otherwise would lock those users out of the feature entirely.
+    static func requiresAPIKeyForReadiness(provider: OpenAIProvider,
+                                           baseURL: String) -> Bool {
+        switch provider {
+        case .ollamaLocal, .custom:
+            return false
+        default:
+            // A named preset repointed at localhost (e.g. a local proxy) is
+            // local-server territory too — don't demand a key there either.
+            return !OpenAILocality.isLocal(baseURL: baseURL)
+        }
+    }
+
     /// Convenience the UI uses to decide whether to surface the rename /
     /// run-action buttons at all. "Enabled AND ready" (per
     /// `.claude/rules/feature-gates.md`): the OpenAI tool needs a non-blank
     /// base URL AND a non-blank model name — without a model, auto-title/summary
     /// would launch HTTP requests guaranteed to fail (issue celarent7/mila#3/#4,
-    /// CodeRabbit #3). The API key stays optional so local/anonymous endpoints
-    /// (e.g. Ollama at localhost) count as configured without one. The CLI tools
-    /// are ready as soon as they're selected.
+    /// CodeRabbit #3) — plus an API key whenever the selected provider is a
+    /// named hosted one (see `requiresAPIKeyForReadiness`). Local/anonymous and
+    /// `.custom` endpoints stay configured without a key. The CLI tools are
+    /// ready as soon as they're selected.
     var isConfigured: Bool {
         switch tool {
         case .none:             return false
         case .openaiCompatible:
             let url = openAIBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             let model = openAIModelName.trimmingCharacters(in: .whitespacesAndNewlines)
-            return !url.isEmpty && !model.isEmpty
+            guard !url.isEmpty, !model.isEmpty else { return false }
+            guard Self.requiresAPIKeyForReadiness(provider: openAIProvider,
+                                                  baseURL: url) else { return true }
+            return !openAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         default:                return true
         }
     }

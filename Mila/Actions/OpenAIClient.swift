@@ -150,9 +150,12 @@ enum OpenAIClient {
     /// always `false`. `temperature` is included iff non-nil.
     ///
     /// Throws `OpenAIRequestError.invalidEndpoint` if the trimmed base URL
-    /// can't be parsed into a URL (e.g. it contains a space). `baseURL` is
-    /// free-text user input — the builder must not assume it's well-formed
-    /// (issue celarent7/mila#1).
+    /// can't be parsed into an *absolute* `http`/`https` URL with a host —
+    /// e.g. it contains a space (`URL(string:)` returns nil), omits the scheme
+    /// (`api.openai.com/v1` parses as a relative path with no host and would
+    /// fail deep inside `URLSession` with an opaque "unsupported URL"), or uses
+    /// a scheme `URLSession` can't POST to. `baseURL` is free-text user input —
+    /// the builder must not assume it's well-formed (issue celarent7/mila#1).
     static func makeRequest(baseURL: String,
                             model: String,
                             prompt: String,
@@ -163,7 +166,11 @@ enum OpenAIClient {
                             temperature: Double?) throws -> URLRequest {
         let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
             .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: "\(trimmedBase)/chat/completions") else {
+        guard let url = URL(string: "\(trimmedBase)/chat/completions"),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host, !host.isEmpty
+        else {
             throw OpenAIRequestError.invalidEndpoint(trimmedBase)
         }
         var request = URLRequest(url: url)
@@ -185,7 +192,10 @@ enum OpenAIClient {
             max_tokens: nil,
             stream: false
         )
-        request.httpBody = try? JSONEncoder().encode(body)
+        // `try`, not `try?`: silently dropping the body would POST an empty
+        // request that the endpoint rejects with an unhelpful 400. The function
+        // already throws, so let the encoding error surface.
+        request.httpBody = try JSONEncoder().encode(body)
         return request
     }
 
