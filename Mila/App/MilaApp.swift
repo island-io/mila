@@ -1303,12 +1303,29 @@ struct MilaApp: App {
                     // utterance would lose its speaker label.
                     await diarizer.awaitPending()
                     diarizer.stop()
+                    // This branch owns the whole teardown, so kill the Live
+                    // AI session with the rest of it: otherwise a tick
+                    // deferred by the min-interval floor can still wake and
+                    // spawn a `claude` child while the app is tearing down
+                    // AVAudioEngine (CodeRabbit on #113). Safe to clear
+                    // `summary` / `actionItems` here — the only path that
+                    // reaches this branch today is `cancelAll()` at app
+                    // termination, which by design does NOT flush a WAV or
+                    // assemble a Recording (the orphan WAV is recovered on
+                    // next launch instead), so there is no snapshot to
+                    // protect. Sleep and screen-lock both route through
+                    // `stopRecording`, which owns finalize and cancels the
+                    // session itself once its snapshot is stored.
+                    aiSession.cancel()
                 }
-                // Note: don't cancel aiSession here — QuickActionsController
-                // still needs to read .summary and .actionItems out of
-                // it when assembling the saved Recording. The NEXT
-                // recording clears these via `liveAISession?.start()` at
-                // record-start (in QuickActionsController).
+                // Note: no aiSession.cancel() out here, outside the branch
+                // above — this handler fires during `session.stop()`,
+                // BEFORE QuickActionsController has read .summary /
+                // .actionItems for the saved Recording, and `cancel()`
+                // clears both. When `stopRecording` owns finalize it
+                // cancels the session itself, after its snapshot is
+                // safely in the store; it's the only path that knows
+                // when that is.
                 sessionRef.onLiveSamples = nil
             }
         }

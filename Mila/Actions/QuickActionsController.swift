@@ -550,6 +550,10 @@ final class QuickActionsController: ObservableObject {
             // recording. Cursor (PRRT_kwDOSY2m-s6GOIj-) flagged it.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // Nothing was captured, so there's no snapshot to protect —
+            // shut the Live AI session down with the rest of the pipeline.
+            // See the normal path for why this matters.
+            liveAISession?.cancel()
             // Same reason as the normal-path clear below: the meeting is
             // over either way, so its notes must not carry into the next
             // recording.
@@ -770,6 +774,9 @@ final class QuickActionsController: ObservableObject {
             // pipelines below before returning.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // The row this snapshot belonged to is gone, so there is
+            // nothing left to read `summary` / `actionItems` for.
+            liveAISession?.cancel()
             // Third exit from a finished recording, and it needs the same
             // clear as the other two — otherwise cancelling the rename
             // sheet is enough to carry this meeting's notes into the next
@@ -805,6 +812,30 @@ final class QuickActionsController: ObservableObject {
         // Cleanup: `.idle` handler skipped these because the flag was set.
         liveTranscriber?.stop()
         liveDiarizer?.stop()
+        // Shut the Live AI session down too — deliberately AFTER the
+        // snapshot above, because `cancel()` clears `summary` /
+        // `actionItems` and those are what we just saved.
+        //
+        // Left running, the session outlives the recording in two ways:
+        //
+        //   1. A `pendingKickTask` sleeping out the min-interval floor
+        //      wakes up after the meeting is over and spawns a full
+        //      `claude --resume` subprocess whose result lands on a
+        //      Recording that was already written — observed 2026-07-26:
+        //      stop at 13:33:58, a tick at 13:34:49. `finalizeTail`
+        //      regenerates the summary from the complete transcript
+        //      anyway, so that call was never anything but waste.
+        //   2. The session's stable sandbox
+        //      (`/tmp/island-mila-llm-session-<uuid>`, plus a
+        //      `~/.claude/projects/` dir per recording) is only removed by
+        //      `cancel()` — so it survived until the NEXT recording called
+        //      `start()`, and forever if the app quit first.
+        //
+        // Not done in `wireLiveAIPipeline`'s `.idle` handler: that fires
+        // during `session.stop()` above, i.e. BEFORE the snapshot, and it
+        // deliberately leaves the session alone for exactly that reason.
+        // This is the one place that knows the snapshot is already safe.
+        liveAISession?.cancel()
         // Per-meeting background notes die with the meeting. Cleared HERE
         // (not in `LiveAISession.start()`) because a recording can begin
         // before the user has pasted anything — clearing at start would
