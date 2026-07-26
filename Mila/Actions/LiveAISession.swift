@@ -137,6 +137,13 @@ final class LiveAISession: ObservableObject {
     /// tick retries the create.
     private var sessionEstablished: Bool = false
 
+    /// The per-meeting notes as they were on the last SUCCESSFUL tick.
+    /// Compared against the current notes on every tick to detect a
+    /// mid-recording edit, which forces a session restart (see `kick()`).
+    /// Tracked separately from the prompt because in session mode already-
+    /// sent notes live on in the conversation history.
+    private var lastContextSent: String = ""
+
     /// The length of `latestTranscript` we last actually shipped to the
     /// LLM. With a live session the model already has the previous
     /// transcript in its conversation history, so we only need to send
@@ -176,6 +183,7 @@ final class LiveAISession: ObservableObject {
         sessionID = (llmSettings.tool == .claude) ? UUID() : nil
         sessionEstablished = false
         lastTranscriptSent = ""
+        lastContextSent = ""
         // os_log (NOT print) so the session UUID lands in diagnostic reports.
         // A fresh `start()` per recording is the invariant that prevents
         // cross-recording `--resume` bleed; logging the new id makes a
@@ -255,6 +263,7 @@ final class LiveAISession: ObservableObject {
         sessionID = nil
         sessionEstablished = false
         lastTranscriptSent = ""
+        lastContextSent = ""
     }
 
     /// Feed the latest full transcript. Routes through the min-interval
@@ -337,10 +346,34 @@ final class LiveAISession: ObservableObject {
         // Read the per-meeting notes at TICK time, not at `start()` — a
         // meeting-detector auto-start beats the user to the pane, so the
         // agenda usually gets pasted a minute into the recording.
+        let context = liveAISettings.meetingContext
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Editing or clearing the notes mid-recording has to actually take
+        // effect, and in session mode the prompt is only half the story: a
+        // `--resume` tick carries every earlier turn, so notes already sent
+        // stay in the model's conversation history no matter what the next
+        // prompt says. Dropping the block would leave the model still
+        // reading from the version the user just deleted. So a change in
+        // the notes restarts the Claude session: fresh UUID, and
+        // `lastTranscriptSent` reset so the first tick of the new session
+        // re-ships the whole transcript alongside the current notes.
+        // Costs one full-transcript call, only when the user edits notes
+        // mid-meeting. (CodeRabbit on #111.)
+        if sessionEstablished, context != lastContextSent, let stale = sessionID {
+            liveAILog.log("context changed — restarting session (was \(stale.uuidString.prefix(8), privacy: .public))")
+            sessionID = UUID()
+            sessionEstablished = false
+            lastTranscriptSent = ""
+            // The abandoned session's stable sandbox is nobody's job
+            // otherwise: `cancel()` only cleans up the CURRENT sessionID.
+            // Safe to remove now — `kick()` only runs with no call in
+            // flight, so no live child process is chdir'd into it.
+            LLMRunner.cleanupStableSandbox(key: stale.uuidString)
+        }
         let prompt = Self.promptWithContext(
             liveAISettings.prompt
                 .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
-            context: liveAISettings.meetingContext)
+            context: context)
         let model = liveAISettings.model
         let useSession = (sessionID != nil)
         // Cold-start the first tick gets a longer timeout (see
@@ -460,6 +493,10 @@ TRANSCRIPT SO FAR:
                 self.lastError = nil
                 if useSession {
                     self.lastTranscriptSent = snapshot
+                    // Only a delivered tick counts as "the model has these
+                    // notes" — a failed call must not suppress the restart
+                    // check on the next one.
+                    self.lastContextSent = context
                     // First successful call establishes the session;
                     // future ticks must use --resume.
                     self.sessionEstablished = true

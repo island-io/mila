@@ -770,6 +770,11 @@ final class QuickActionsController: ObservableObject {
             // pipelines below before returning.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // Third exit from a finished recording, and it needs the same
+            // clear as the other two — otherwise cancelling the rename
+            // sheet is enough to carry this meeting's notes into the next
+            // recording. (CodeRabbit on #111.)
+            liveAISettings?.meetingContext = ""
             isFinalizingRecording = false
             return
         }
