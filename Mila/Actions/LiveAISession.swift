@@ -367,8 +367,14 @@ final class LiveAISession: ObservableObject {
             // The abandoned session's stable sandbox is nobody's job
             // otherwise: `cancel()` only cleans up the CURRENT sessionID.
             // Safe to remove now — `kick()` only runs with no call in
-            // flight, so no live child process is chdir'd into it.
-            LLMRunner.cleanupStableSandbox(key: stale.uuidString)
+            // flight, so no live child process is chdir'd into it. Off the
+            // main actor for the same reason `cancel()` defers it: a
+            // recursive directory removal is a blocking syscall and this is
+            // the tick path.
+            let staleKey = stale.uuidString
+            Task.detached(priority: .utility) {
+                LLMRunner.cleanupStableSandbox(key: staleKey)
+            }
         }
         let prompt = Self.promptWithContext(
             liveAISettings.prompt
