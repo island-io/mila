@@ -57,7 +57,10 @@ struct LiveAIRecordingView: View {
     /// transcript pane + friendly speaker labels.
     private var language: String { languageSettings.current.rawValue }
     private var isRTL: Bool { language == "he" }
-    private var aiActive: Bool { liveAISettings.enabled && llmSettings.isConfigured }
+    private var aiActive: Bool {
+        liveAISettings.enabled && llmSettings.isConfigured
+            && !llmSettings.liveAIDisabledByRemoteOpenAI
+    }
 
     /// RTL for the AI pane (summary + action items). The AI output is its
     /// own language setting; for `.auto` we detect from the actual emitted

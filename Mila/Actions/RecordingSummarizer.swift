@@ -52,7 +52,11 @@ final class RecordingSummarizer: ObservableObject {
         _ executablePathOverride: String?,
         _ model: String?,
         _ extraArgs: [String],
-        _ timeout: TimeInterval
+        _ timeout: TimeInterval,
+        _ openAIBaseURL: String?,
+        _ openAIAPIKey: String?,
+        _ jsonMode: Bool,
+        _ transport: OpenAITransport?
     ) async throws -> String
 
     private let runLLM: RunLLM
@@ -96,7 +100,7 @@ final class RecordingSummarizer: ObservableObject {
     init(store: RecordingStore,
          llmSettings: LLMSettings,
          liveAISettings: LiveAISettings,
-         runLLM: @escaping RunLLM = { tool, prompt, transcript, executableOverride, model, extraArgs, timeout in
+         runLLM: @escaping RunLLM = { tool, prompt, transcript, executableOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport in
              try await LLMRunner.run(
                  tool: tool,
                  prompt: prompt,
@@ -104,7 +108,11 @@ final class RecordingSummarizer: ObservableObject {
                  executablePathOverride: executableOverride,
                  model: model,
                  extraArgs: extraArgs,
-                 timeout: timeout
+                 timeout: timeout,
+                 openAIBaseURL: openAIBaseURL,
+                 openAIAPIKey: openAIAPIKey,
+                 jsonMode: jsonMode,
+                 transport: transport
              )
          }) {
         self.store = store
@@ -314,7 +322,15 @@ final class RecordingSummarizer: ObservableObject {
         let executableOverride = llmSettings.executablePath.isEmpty
             ? nil
             : llmSettings.executablePath
-        let model = liveAISettings.model
+        // OpenAI-compatible runs use the endpoint's model name from
+        // `llmSettings.openAIModelName`; CLI runs use Live AI's model
+        // override. Mirrors `LiveAISession.kick`'s tool-conditional selection
+        // (issue celarent7/mila#4 — previously this always sent
+        // `liveAISettings.model`, e.g. "claude-sonnet-4-6", to the OpenAI
+        // endpoint, which 404'd on model-not-found).
+        let model = (tool == .openaiCompatible)
+            ? llmSettings.openAIModelName
+            : liveAISettings.model
         let extraArgs = llmSettings.extraArgsTokens
         let promptLanguageName: String = {
             switch liveAISettings.outputLanguage {
@@ -330,6 +346,12 @@ final class RecordingSummarizer: ObservableObject {
             .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
         let transcript = recording.fullText
         let timeout = timeoutSeconds
+        // OpenAI-compatible config captured up front so the detached call
+        // doesn't depend on `self` (mirrors tool/prompt/etc. above). Summary
+        // is free-text, so `jsonMode` is false; `transport` stays nil so the
+        // production `URLSession` default applies.
+        let openAIBaseURL = llmSettings.openAIBaseURL
+        let openAIAPIKey = llmSettings.openAIAPIKey
         let startedAt = Date()
         // Captured strongly: the runner closure holds no reference to
         // `self`, so this can't create a retain cycle, and capturing it
@@ -366,7 +388,11 @@ final class RecordingSummarizer: ObservableObject {
                     executableOverride,
                     model.isEmpty ? nil : model,
                     extraArgs,
-                    timeout
+                    timeout,
+                    openAIBaseURL,
+                    openAIAPIKey,
+                    false,
+                    nil
                 )
                 let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !cleaned.isEmpty else {

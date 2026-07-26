@@ -124,7 +124,7 @@ final class RecordingSummarizerTests: XCTestCase {
     func test_summarize_stores_output_on_recording_and_writes_sidecar() async throws {
         llm.tool = .claude
         liveAI.model = ""
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             "A concise summary of the meeting."
         }
 
@@ -172,7 +172,7 @@ final class RecordingSummarizerTests: XCTestCase {
         // argv this way proves the one-shot `-p` shape without a subprocess.
         var capturedArgs: [String] = []
         var callCount = 0
-        useStubRunner { tool, prompt, transcript, _, model, extraArgs, _ in
+        useStubRunner { tool, prompt, transcript, _, model, extraArgs, _, _, _, _, _ in
             callCount += 1
             let composed = LLMRunner.composedPrompt(prompt, transcript: transcript)
             capturedArgs = tool.arguments(prompt: composed, model: model) + extraArgs
@@ -213,7 +213,7 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
         // Stub returns empty output — the production runner trims stdout, so
         // an empty return models a CLI that printed nothing useful.
-        useStubRunner { _, _, _, _, _, _, _ in "" }
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "" }
 
         let audioURL = store.freshAudioURL(suggestedName: "Empty")
         try Data("x".utf8).write(to: audioURL)
@@ -240,7 +240,7 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
 
         let gate = TestGate()
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             // Block until the test has patched the store, then return the
             // (now stale) CLI output.
             await gate.wait()
@@ -282,7 +282,7 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
         llm.summaryEnabled = false
         var called = false
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             called = true
             return "SHOULD NOT RUN"
         }
@@ -315,7 +315,7 @@ final class RecordingSummarizerTests: XCTestCase {
     func test_regenerate_works_even_when_auto_summary_disabled() async throws {
         llm.tool = .claude
         llm.summaryEnabled = false
-        useStubRunner { _, _, _, _, _, _, _ in "ON DEMAND" }
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "ON DEMAND" }
 
         let audioURL = store.freshAudioURL(suggestedName: "Manual")
         try Data("x".utf8).write(to: audioURL)
@@ -352,7 +352,7 @@ final class RecordingSummarizerTests: XCTestCase {
     /// synchronously and the assertion is deterministic.
     func test_regenerate_overwrites_existing_summary() async throws {
         llm.tool = .claude
-        useStubRunner { _, _, _, _, _, _, _ in "REGENERATED" }
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "REGENERATED" }
 
         let audioURL = store.freshAudioURL(suggestedName: "Regen")
         try Data("x".utf8).write(to: audioURL)
@@ -378,7 +378,7 @@ final class RecordingSummarizerTests: XCTestCase {
     func test_regenerate_noops_when_llm_not_configured() async throws {
         llm.tool = .none
         var called = false
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             called = true
             return "should not reach here"
         }
@@ -407,7 +407,7 @@ final class RecordingSummarizerTests: XCTestCase {
     func test_regenerate_noops_when_transcript_empty() async throws {
         llm.tool = .claude
         var called = false
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             called = true
             return "should not reach here"
         }
@@ -441,7 +441,7 @@ final class RecordingSummarizerTests: XCTestCase {
     func test_is_summarizing_tracks_in_flight_state() async throws {
         llm.tool = .claude
         let gate = TestGate()
-        useStubRunner { _, _, _, _, _, _, _ in
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             await gate.wait()
             return "done"
         }
@@ -469,6 +469,41 @@ final class RecordingSummarizerTests: XCTestCase {
         await summarizer.awaitInFlight(rec.id)
         XCTAssertFalse(summarizer.isSummarizing(rec.id),
                        "isSummarizing should clear after CLI returns")
+    }
+
+    // MARK: - OpenAI-compatible model threading (issue celarent7/mila#4)
+
+    /// The OpenAI-compatible summarizer must send `openAIModelName` (the
+    /// user's configured endpoint model), NOT `liveAISettings.model` (a Live
+    /// AI CLI override such as "claude-sonnet-4-6"). The latter 404's at the
+    /// endpoint as model-not-found. Mirrors `LiveAISession.kick`'s
+    /// tool-conditional selection.
+    func test_summarize_threadsOpenAIModelName_forOpenAICompatible() async throws {
+        llm.tool = .openaiCompatible
+        llm.openAIBaseURL = "https://api.openai.com/v1"
+        llm.openAIModelName = "gpt-4o-mini"
+        // Live AI's model is intentionally a *different* name — if the
+        // summarizer used it (the bug), the stub would record it here.
+        liveAI.model = "claude-sonnet-4-6"
+
+        var capturedModel: String? = ""
+        useStubRunner { _, _, _, _, model, _, _, _, _, _, _ in
+            capturedModel = model
+            return "A concise summary."
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Meeting")
+        try Data("not-audio".utf8).write(to: audioURL)
+        let rec = Recording(title: "Meeting", source: .microphone,
+                            audioFileName: audioURL.lastPathComponent,
+                            fullText: "we discussed the roadmap")
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(capturedModel, "gpt-4o-mini",
+                       "The OpenAI summary path must send openAIModelName, not the Live AI model")
     }
 
     // MARK: - Helpers

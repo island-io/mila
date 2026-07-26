@@ -489,8 +489,18 @@ struct RenameRecordingSheet: View {
                 prompt: llm.namePrompt,
                 transcript: transcript,
                 executablePathOverride: llm.executablePath.isEmpty ? nil : llm.executablePath,
+                // Only the HTTP path needs a model from settings — the CLIs pick
+                // their own. Passing `openAIModelName` unconditionally would append
+                // `--model <openai-model>` to every `claude` / `cursor-agent`
+                // invocation for anyone who has ever configured an endpoint,
+                // breaking the CLI path (AC-REGRESS-01).
+                model: llm.tool == .openaiCompatible && !llm.openAIModelName.isEmpty
+                    ? llm.openAIModelName : nil,
                 extraArgs: llm.extraArgsTokens,
-                timeout: llm.cliTimeout
+                timeout: llm.cliTimeout,
+                openAIBaseURL: llm.openAIBaseURL,
+                openAIAPIKey: llm.openAIAPIKey,
+                jsonMode: false
             )
             let cleaned = PostRecordingCoordinator.cleanedTitle(from: suggestion)
             if cleaned.isEmpty {

@@ -805,28 +805,99 @@ private struct LLMSettingsTab: View {
             }
             .pickerStyle(.segmented)
 
+            if settings.isOpenAICompatible {
+                openAISection
+            } else {
+                HStack {
+                    Text("Executable path").frame(width: 130, alignment: .leading)
+                    TextField("(use $PATH)", text: $settings.executablePath)
+                        .textFieldStyle(.roundedBorder)
+                }
+                .font(.callout)
+                Text("Leave blank to look up the binary on $PATH. Set this if `claude` / `cursor-agent` lives somewhere a GUI app won't see by default (e.g. ~/.local/bin, an asdf shim).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack {
+                    Text("Extra CLI args").frame(width: 130, alignment: .leading)
+                    TextField("(none) e.g. --model claude-sonnet-4-6", text: $settings.extraArgs)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.callout, design: .monospaced))
+                }
+                .font(.callout)
+                Text("Appended to every run (name suggestion, auto-summary, Send action, and the test below). Shell-style quoting is supported; for most CLIs a flag here overrides an earlier one. Live AI manages its own model and is unaffected.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    /// OpenAI-compatible endpoint configuration, shown only when the tool
+    /// picker is on "OpenAI Compatible": a provider preset (which fills the
+    /// base URL + default model), editable base URL / model name, a
+    /// Keychain-backed API key, and a remote-host privacy disclaimer.
+    private var openAISection: some View {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Executable path").frame(width: 130, alignment: .leading)
-                TextField("(use $PATH)", text: $settings.executablePath)
+                Text("Provider").frame(width: 130, alignment: .leading)
+                Picker("Provider", selection: $settings.openAIProvider) {
+                    ForEach(OpenAIProvider.allCases) { preset in
+                        Text(preset.displayName).tag(preset)
+                    }
+                }
+                .pickerStyle(.menu)
+                .onChange(of: settings.openAIProvider) { oldPreset, newPreset in
+                    // Pass the PREVIOUS provider explicitly: the Picker
+                    // binding has already set `openAIProvider` to
+                    // `newPreset` by the time `.onChange` fires, so
+                    // `applyPreset` cannot derive the old value itself
+                    // (issue celarent7/mila#2).
+                    settings.applyPreset(newPreset, previous: oldPreset)
+                }
+            }
+            .font(.callout)
+
+            HStack {
+                Text("Base URL").frame(width: 130, alignment: .leading)
+                TextField("https://api.openai.com/v1", text: $settings.openAIBaseURL)
                     .textFieldStyle(.roundedBorder)
             }
             .font(.callout)
-            Text("Leave blank to look up the binary on $PATH. Set this if `claude` / `cursor-agent` lives somewhere a GUI app won't see by default (e.g. ~/.local/bin, an asdf shim).")
+            Text("The OpenAI-compatible /chat/completions endpoint. A trailing slash is ignored.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
             HStack {
-                Text("Extra CLI args").frame(width: 130, alignment: .leading)
-                TextField("(none) e.g. --model claude-sonnet-4-6", text: $settings.extraArgs)
+                Text("Model name").frame(width: 130, alignment: .leading)
+                TextField("gpt-4o-mini", text: $settings.openAIModelName)
                     .textFieldStyle(.roundedBorder)
-                    .font(.system(.callout, design: .monospaced))
             }
             .font(.callout)
-            Text("Appended to every run (name suggestion, auto-summary, Send action, and the test below). Shell-style quoting is supported; for most CLIs a flag here overrides an earlier one. Live AI manages its own model and is unaffected.")
+
+            HStack {
+                Text("API key").frame(width: 130, alignment: .leading)
+                SecureField("Required for most providers", text: $settings.openAIAPIKey)
+                    .textFieldStyle(.roundedBorder)
+            }
+            .font(.callout)
+            Text("Stored in your Keychain. Leave blank only for a local server without auth (e.g. Ollama Local).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            if !OpenAILocality.isLocal(baseURL: settings.openAIBaseURL) {
+                Label {
+                    Text("This endpoint is on a remote server, so your transcript text is sent off your machine for processing. Choose a provider you trust.")
+                        .font(.caption)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 
@@ -842,10 +913,19 @@ private struct LLMSettingsTab: View {
         }
     }
 
+    /// Help text under the timeout stepper. Worded for an HTTP request when
+    /// the OpenAI endpoint is active, for a CLI process otherwise.
+    private var timeoutHelp: String {
+        if settings.isOpenAICompatible {
+            return "Maximum time Mila waits for the endpoint to respond before giving up. Applies to title generation, auto-summary, and the Send-action button."
+        }
+        return "Maximum time Mila waits for a CLI response before giving up. Applies to title generation, auto-summary, and the Send-action button. Raise this if your prompt uses agentic tools (e.g. calendar lookup) that need extra time to complete."
+    }
+
     private var timeoutSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text("CLI timeout").frame(width: 100, alignment: .leading)
+                Text(settings.timeoutLabel).frame(width: 100, alignment: .leading)
                 Stepper(value: $settings.cliTimeout, in: 30...900, step: 30) {
                     EmptyView()
                 }
@@ -858,7 +938,7 @@ private struct LLMSettingsTab: View {
                     .font(.callout)
             }
             .font(.callout)
-            Text("Maximum time Mila waits for a CLI response before giving up. Applies to title generation, auto-summary, and the Send-action button. Raise this if your prompt uses agentic tools (e.g. calendar lookup) that need extra time to complete.")
+            Text(timeoutHelp)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -907,7 +987,7 @@ private struct LLMSettingsTab: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Test")
                 .font(.title3.weight(.semibold))
-            Text("Run the configured prompt against a sample transcript to see exactly what Mila sends and what your CLI returns. Use this to debug a tool that isn't working — the command shown below is the literal one Mila runs, so you can copy it into a terminal yourself.")
+            Text("Run the configured prompt against a sample transcript to see exactly what Mila sends and what your \(settings.isOpenAICompatible ? "endpoint" : "CLI") returns. Use this to debug a tool that isn't working — the \(settings.isOpenAICompatible ? "request shown below is the literal one Mila sends" : "command shown below is the literal one Mila runs"), so you can copy it into a terminal yourself.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -927,9 +1007,15 @@ private struct LLMSettingsTab: View {
                 .overlay(RoundedRectangle(cornerRadius: 6)
                     .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1))
 
-            Text("The test uses your configured Extra CLI args (above), so it reproduces exactly what a real run does.")
-                .font(.caption).foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            if !settings.isOpenAICompatible {
+                Text("The test uses your configured Extra CLI args (above), so it reproduces exactly what a real run does.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("The test uses your configured Base URL, Model name, and API key (above), so it reproduces exactly what a real run does.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
 
             HStack(spacing: 10) {
                 Button {
@@ -973,18 +1059,26 @@ private struct LLMTestResultView: View {
             if !result.command.isEmpty {
                 labeledBlock("Command", text: result.command, copyable: true)
             }
+            // OpenAI HTTP path: show the JSON body that was POSTed, for
+            // copy-paste debugging. Empty for the CLI path.
+            if !result.requestBody.isEmpty {
+                labeledBlock("Request body", text: result.requestBody, copyable: true)
+            }
             if let error = result.setupError {
                 labeledBlock("Problem", text: error, copyable: false)
             }
             if result.didLaunch {
+                let outputLabel = isHTTP ? "Response" : "Output (stdout)"
+                let diagLabel = isHTTP ? "Error" : "Diagnostics (stderr)"
                 if !result.stdout.isEmpty {
-                    labeledBlock("Output (stdout)", text: result.stdout, copyable: true)
+                    labeledBlock(outputLabel, text: result.stdout, copyable: true)
                 }
                 if !trimmed(result.stderr).isEmpty {
-                    labeledBlock("Diagnostics (stderr)", text: result.stderr, copyable: true)
+                    labeledBlock(diagLabel, text: result.stderr, copyable: true)
                 }
                 if result.stdout.isEmpty && trimmed(result.stderr).isEmpty {
-                    Text("The CLI produced no output.")
+                    Text(isHTTP ? "The endpoint returned no content."
+                                : "The CLI produced no output.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
@@ -992,6 +1086,10 @@ private struct LLMTestResultView: View {
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
     }
+
+    /// True for the OpenAI HTTP diagnostic path (which populates `url`),
+    /// false for the CLI path. Picks Response/Error vs stdout/stderr labels.
+    private var isHTTP: Bool { !result.url.isEmpty }
 
     private var statusLine: some View {
         HStack(spacing: 8) {
@@ -1018,9 +1116,13 @@ private struct LLMTestResultView: View {
 
     private var statusText: String {
         if result.succeeded { return "Success" }
-        if result.timedOut { return "Timed out — the CLI didn't respond in time" }
+        if result.timedOut {
+            return isHTTP ? "Timed out — the endpoint didn't respond in time"
+                          : "Timed out — the CLI didn't respond in time"
+        }
         if let error = result.setupError, !result.didLaunch { return error }
         if let code = result.exitCode { return "CLI exited with status \(code)" }
+        if let status = result.httpStatus { return "HTTP \(status)" }
         return "Failed"
     }
 

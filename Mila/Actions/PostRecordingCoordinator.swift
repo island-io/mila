@@ -30,6 +30,28 @@ final class PostRecordingCoordinator: ObservableObject {
     private let transcription: TranscriptionService
     private let llm: LLMSettings
 
+    /// Injectable LLM-run seam so tests can assert what `PostRecordingCoordinator`
+    /// sends to `LLMRunner` (e.g. that the OpenAI path threads `openAIModelName`
+    /// — issue celarent7/mila#3) without spawning a CLI or hitting the network.
+    /// Mirrors `RecordingSummarizer.RunLLM`, including its `@MainActor` isolation,
+    /// so test stubs that capture/mutate main-actor variables stay data-race-clean
+    /// under Swift 6 strict concurrency (CodeRabbit #7). Defaults to `LLMRunner.run`.
+    typealias RunLLM = @MainActor (
+        _ tool: LLMTool,
+        _ prompt: String,
+        _ transcript: String,
+        _ summary: String,
+        _ executablePathOverride: String?,
+        _ model: String?,
+        _ extraArgs: [String],
+        _ timeout: TimeInterval,
+        _ openAIBaseURL: String?,
+        _ openAIAPIKey: String?,
+        _ jsonMode: Bool,
+        _ transport: OpenAITransport?
+    ) async throws -> String
+    private let runLLM: RunLLM
+
     /// LLM work spawned from inside the rename sheet (manual Suggest) plus
     /// the background auto-suggest job. Tracked here — not in the sheet's view
     /// state — so the Cancel button can kill it even after the sheet is
@@ -60,10 +82,26 @@ final class PostRecordingCoordinator: ObservableObject {
 
     init(store: RecordingStore,
          transcription: TranscriptionService,
-         llm: LLMSettings) {
+         llm: LLMSettings,
+         runLLM: @escaping RunLLM = { tool, prompt, transcript, summary, executablePathOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport in
+        try await LLMRunner.run(
+            tool: tool,
+            prompt: prompt,
+            transcript: transcript,
+            summary: summary,
+            executablePathOverride: executablePathOverride,
+            model: model,
+            extraArgs: extraArgs,
+            timeout: timeout,
+            openAIBaseURL: openAIBaseURL,
+            openAIAPIKey: openAIAPIKey,
+            jsonMode: jsonMode,
+            transport: transport)
+    }) {
         self.store = store
         self.transcription = transcription
         self.llm = llm
+        self.runLLM = runLLM
     }
 
     /// Open the rename sheet for a freshly-added recording. Called by
@@ -110,6 +148,16 @@ final class PostRecordingCoordinator: ObservableObject {
         let prompt = llm.namePrompt
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let cliTimeout = llm.cliTimeout
+        let openAIBaseURL = llm.openAIBaseURL
+        let openAIAPIKey = llm.openAIAPIKey
+        // OpenAI-compatible runs need the model name threaded explicitly
+        // (the CLIs pick their own; the HTTP path can't). Captured up front
+        // like the other OpenAI fields so the detached call doesn't touch
+        // `self.llm` (issue celarent7/mila#3 — otherwise the request POSTs
+        // an empty model name and the suggestion fails silently).
+        let openAIModelName = llm.openAIModelName
+        let openAIModel: String? = (tool == .openaiCompatible && !openAIModelName.isEmpty)
+            ? openAIModelName : nil
         let waitTimeout = transcriptWaitTimeout
         autoSuggestingIDs.insert(id)
         let task = Task { @MainActor [weak self] in
@@ -128,13 +176,19 @@ final class PostRecordingCoordinator: ObservableObject {
             }
             if Task.isCancelled { return }
             do {
-                let suggestion = try await LLMRunner.run(
-                    tool: tool,
-                    prompt: prompt,
-                    transcript: transcript,
-                    executablePathOverride: executableOverride,
-                    timeout: cliTimeout
-                )
+                let suggestion = try await runLLM(
+                    tool,
+                    prompt,
+                    transcript,
+                    "",                       // summary — title path has none
+                    executableOverride,
+                    openAIModel,
+                    [],                       // extraArgs — title path has none
+                    cliTimeout,
+                    openAIBaseURL,
+                    openAIAPIKey,
+                    false,
+                    nil)
                 if Task.isCancelled { return }
                 let title = Self.cleanedTitle(from: suggestion)
                 guard !title.isEmpty else { return }
@@ -246,6 +300,14 @@ final class PostRecordingCoordinator: ObservableObject {
         postStatus("Sending to \(toolName)…")
 
         let timeout = transcriptWaitTimeout
+        // Capture the OpenAI endpoint config at click time. The Task below may
+        // wait on `awaitTranscript` (potentially long) before reading endpoint
+        // values; reading `self.llm` inside it would pair a mid-flight Settings
+        // edit with the click-time `tool`/`prompt`. Snapshot up front instead —
+        // mirrors `armAutoSuggestTitle` (CodeRabbit #8, issue celarent7/mila#8).
+        let openAIBaseURL = llm.openAIBaseURL
+        let openAIAPIKey = llm.openAIAPIKey
+        let openAIModelName = llm.openAIModelName
         let task = Task { @MainActor [weak self] in
             defer {
                 // Only relinquish the slot if we finished on our own. If we
@@ -272,15 +334,25 @@ final class PostRecordingCoordinator: ObservableObject {
             }
             if Task.isCancelled { return }
             do {
-                let output = try await LLMRunner.run(
-                    tool: tool,
-                    prompt: prompt,
-                    transcript: resolved,
-                    summary: summary,
-                    executablePathOverride: executableOverride,
-                    extraArgs: extraArgs,
-                    timeout: cliTimeout
-                )
+                // OpenAI-compatible runs need the model name threaded (the
+                // HTTP path can't pick its own). Issue celarent7/mila#3.
+                // `openAIModelName`/`openAIBaseURL`/`openAIAPIKey` are the
+                // click-time captures from above (#8).
+                let openAIModel: String? = (tool == .openaiCompatible && !openAIModelName.isEmpty)
+                    ? openAIModelName : nil
+                let output = try await runLLM(
+                    tool,
+                    prompt,
+                    resolved,
+                    summary,
+                    executableOverride,
+                    openAIModel,
+                    extraArgs,
+                    cliTimeout,
+                    openAIBaseURL,
+                    openAIAPIKey,
+                    false,
+                    nil)
                 let preview = output
                     .replacingOccurrences(of: "\n", with: " ")
                     .prefix(80)
