@@ -67,13 +67,14 @@ enum OpenAIProvider: String, CaseIterable, Identifiable, Codable {
 
 /// Which local LLM CLI Mila will shell out to for naming
 /// recordings and running post-recording actions. We deliberately keep this
-/// to a closed set of two so the Settings UI can show working defaults +
-/// concrete examples — supporting arbitrary CLIs would force the user to
-/// know shell-quoting rules.
+/// to a closed set of known CLIs so the Settings UI can show working
+/// defaults + concrete examples — supporting arbitrary CLIs would force the
+/// user to know shell-quoting rules.
 enum LLMTool: String, CaseIterable, Identifiable, Codable {
     case none
     case claude
     case cursor
+    case gemini
     case openaiCompatible = "openai_compatible"
 
     var id: String { rawValue }
@@ -83,6 +84,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         case .none:            return "Off"
         case .claude:          return "Claude (claude CLI)"
         case .cursor:          return "Cursor (cursor-agent CLI)"
+        case .gemini:          return "Gemini (gemini CLI)"
         case .openaiCompatible: return "OpenAI Compatible"
         }
     }
@@ -95,6 +97,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         case .none:            return ""
         case .claude:          return "claude"
         case .cursor:          return "cursor-agent"
+        case .gemini:          return "gemini"
         case .openaiCompatible: return ""
         }
     }
@@ -153,6 +156,21 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
                 args.append(contentsOf: ["--model", m])
             }
             // session intentionally ignored — see doc above.
+            return args
+        case .gemini:
+            // `gemini -p <prompt>` runs one-shot and streams the answer to
+            // stdout. `--skip-trust` is the gemini analogue of cursor's `-f`:
+            // we always launch in an isolated, empty sandbox dir (for TCC
+            // safety) which gemini treats as an untrusted workspace and
+            // otherwise refuses to run in headless mode. `-m` pins a model
+            // (e.g. gemini-2.5-flash); the CLI's configured default is used
+            // when omitted.
+            var args: [String] = ["-p", prompt, "--skip-trust"]
+            if hasModel, let m = trimmedModel {
+                args.append(contentsOf: ["-m", m])
+            }
+            // session intentionally ignored — gemini's -p mode has no
+            // documented conversation-resume flag.
             return args
         }
     }

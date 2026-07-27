@@ -1060,11 +1060,11 @@ private struct AIProviderSettingsTab: View {
     // MARK: Tool
 
     private var toolRow: some View {
-        // A pop-up menu, not a full-width segmented control: four options of
+        // A pop-up menu, not a full-width segmented control: five options of
         // very uneven length stretched across the pane gave "Off" a segment
         // the size of a button.
         fieldRow("Tool",
-                 help: "Claude and Cursor shell out to a CLI on this Mac, using the login you already set up. OpenAI Compatible calls any /chat/completions endpoint over HTTP, including a local Ollama.") {
+                 help: "Claude, Cursor and Gemini shell out to a CLI on this Mac, using the login you already set up. OpenAI Compatible calls any /chat/completions endpoint over HTTP, including a local Ollama.") {
             Picker("Tool", selection: $settings.tool) {
                 ForEach(LLMTool.allCases) { tool in
                     Text(tool.displayName).tag(tool)
@@ -1083,7 +1083,7 @@ private struct AIProviderSettingsTab: View {
     private var cliFields: some View {
         VStack(alignment: .leading, spacing: 6) {
             fieldRow("Executable",
-                     help: "Set this when `claude` / `cursor-agent` lives somewhere a GUI app won't see by default — ~/.local/bin, an asdf shim, a Homebrew prefix that isn't on the system PATH.") {
+                     help: "Set this when `claude` / `cursor-agent` / `gemini` lives somewhere a GUI app won't see by default — ~/.local/bin, an asdf shim, a Homebrew prefix that isn't on the system PATH.") {
                 TextField("(use $PATH)", text: $settings.executablePath)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()
