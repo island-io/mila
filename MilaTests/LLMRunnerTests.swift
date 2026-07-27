@@ -654,15 +654,37 @@ final class LLMRunnerTests: XCTestCase {
             throw XCTSkip("gemini CLI not installed on this machine")
         }
         let transcript = "We agreed to migrate the staging ECR to the new account by Friday and Uri will open the PR."
-        let result = try await LLMRunner.run(
-            tool: .gemini,
-            prompt: LLMSettings.defaultNamePrompt,
-            transcript: transcript,
-            executablePathOverride: geminiPath,
-            timeout: 120
-        )
+        let result: String
+        do {
+            result = try await LLMRunner.run(
+                tool: .gemini,
+                prompt: LLMSettings.defaultNamePrompt,
+                transcript: transcript,
+                executablePathOverride: geminiPath,
+                timeout: 120
+            )
+        } catch let error as LLMRunnerError {
+            // An installed-but-unusable CLI is an environment problem, not a
+            // regression in our argv/plumbing: gemini exits non-zero when the
+            // machine isn't logged in, or when the account's tier is no longer
+            // eligible (Google retired free-tier Code Assist for this client).
+            // Skip rather than fail so the suite stays green off a login.
+            guard case .nonZeroExit(_, let stderr) = error,
+                  Self.looksLikeGeminiAuthFailure(stderr) else { throw error }
+            throw XCTSkip("gemini CLI is installed but not usable on this machine (auth/tier): \(stderr.prefix(200))")
+        }
         XCTAssertFalse(result.isEmpty, "gemini returned empty output")
         XCTAssertLessThan(result.count, 200,
                           "gemini reply looks like prose, not a title: \(result)")
+    }
+
+    /// Whether a `gemini` non-zero exit is an auth/eligibility problem (skip)
+    /// rather than a real failure of the invocation we're testing (fail).
+    private static func looksLikeGeminiAuthFailure(_ stderr: String) -> Bool {
+        let s = stderr.lowercased()
+        return s.contains("error authenticating")
+            || s.contains("ineligibletiererror")
+            || s.contains("please login")
+            || s.contains("not authenticated")
     }
 }
