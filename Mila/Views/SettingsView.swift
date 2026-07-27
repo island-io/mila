@@ -49,7 +49,9 @@ struct SettingsView: View {
                 .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
                 .tag(SettingsTab.updates)
         }
-        .frame(width: 560, height: 560)
+        // Wide enough that the full 10-tab bar fits and the last tab
+        // (Updates) stays clickable — at 560 it can clip off the right edge.
+        .frame(width: 640, height: 560)
         .padding(20)
         .onChange(of: SettingsNavigation.shared.pendingTab, initial: true) { _, newTab in
             if let tab = newTab {
