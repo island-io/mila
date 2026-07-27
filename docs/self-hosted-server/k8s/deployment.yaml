@@ -67,6 +67,12 @@ spec:
             # float32. Use int8_float16 if you're tight on VRAM.
             - name: WHISPER__COMPUTE_TYPE
               value: float16
+            # Never unload an idle model. Matters with two models: the cache is
+            # an emptyDir, so an evicted model doesn't just reload from disk on
+            # the next request — it re-downloads. Drop this if you're tight on
+            # VRAM and would rather trade the cold load.
+            - name: STT_MODEL_TTL
+              value: "-1"
             # Point the HuggingFace cache at the mounted volume (see below).
             - name: HF_HOME
               value: /home/ubuntu/.cache/huggingface
@@ -111,14 +117,18 @@ spec:
                   - /bin/sh
                   - -c
                   - |
+                    # Every curl is bounded: postStart holds the container out of
+                    # Running until this script exits, so an unbounded request
+                    # against a wedged server would stall the rollout forever.
                     for i in $(seq 1 60); do
-                      curl -sf http://127.0.0.1:8000/health && break || sleep 5
+                      curl -sf --connect-timeout 5 --max-time 10 \
+                        http://127.0.0.1:8000/health && break || sleep 5
                     done
                     for model in \
                       ivrit-ai/whisper-large-v3-turbo-ct2 \
                       deepdml/faster-whisper-large-v3-turbo-ct2; do
                       for j in $(seq 1 30); do
-                        curl -sf -X POST \
+                        curl -sf --connect-timeout 5 --max-time 600 -X POST \
                           -H "Authorization: Bearer $API_KEY" \
                           "http://127.0.0.1:8000/v1/models/$model" \
                           && break || sleep 10

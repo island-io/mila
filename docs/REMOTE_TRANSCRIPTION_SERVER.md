@@ -121,7 +121,9 @@ Mila's `.m4a` encoding keeps roughly 1.5 hours of audio under that.
   network you don't trust.
 - **Language.** Mila forwards the recording language (`he` / `en`), and uses it
   to pick which model id to send when you've set an **English model** (Settings
-  → Models). There's no auto-detect — the speaker picks the language in the
-  toolbar, because the model is chosen *from* that choice.
+  → Models). Leave that field empty — as this quickstart does — and *every*
+  language uses **Model**, which is what you want for a multilingual server.
+  There's no auto-detect: the speaker picks the language in the toolbar, because
+  the model is chosen *from* that choice.
 - **Diarization** still runs locally (it reads the on-disk audio), so speaker
   labels work regardless of which transcription backend you choose.

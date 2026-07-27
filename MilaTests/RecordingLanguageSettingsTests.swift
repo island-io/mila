@@ -63,6 +63,16 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         XCTAssertEqual(RecordingLanguage.fromCode(""), .hebrew)
     }
 
+    /// Only `en` and its regional forms are English. A bare prefix match would
+    /// route anything starting with those letters to the English model, against
+    /// the documented "unrecognised → Hebrew" contract.
+    func test_language_code_decoding_does_not_prefix_match_unrelated_codes() {
+        XCTAssertEqual(RecordingLanguage.fromCode("en_GB"), .english)
+        XCTAssertEqual(RecordingLanguage.fromCode("enochian"), .hebrew)
+        XCTAssertEqual(RecordingLanguage.fromCode("held"), .hebrew,
+                       "Unrecognised codes land on Hebrew either way, but not via a prefix match")
+    }
+
     /// Auto-detect was removed: the language is always an explicit choice, and
     /// the toolbar picker is `allCases`-driven, so this guards the picker's
     /// contents too.

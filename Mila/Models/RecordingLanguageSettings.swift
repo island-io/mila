@@ -53,9 +53,17 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
     /// before the rename) and for the retired `"auto"`.
     static func fromCode(_ code: String) -> RecordingLanguage {
         let normalized = code.lowercased()
-        if normalized == "iw" || normalized.hasPrefix("he") { return .hebrew }
-        if normalized.hasPrefix("en") { return .english }
+        if normalized == "iw" || isVariant(normalized, of: "he") { return .hebrew }
+        if isVariant(normalized, of: "en") { return .english }
         return .hebrew
+    }
+
+    /// Whether `code` is `base` or a regional form of it (`en-US`, `en_GB`).
+    /// A bare `hasPrefix` would also swallow unrelated codes that merely start
+    /// with those letters — `"enochian"` must fall back to Hebrew like any
+    /// other unrecognised value, not pick the English model.
+    private static func isVariant(_ code: String, of base: String) -> Bool {
+        code == base || code.hasPrefix("\(base)-") || code.hasPrefix("\(base)_")
     }
 }
 
