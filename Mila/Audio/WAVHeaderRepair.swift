@@ -110,8 +110,14 @@ enum WAVHeaderRepair {
     }
 
     /// Repair the WAV at `url` in place if its header is unfinalized. Returns
-    /// `true` iff a fix was written. Safe to call on any file: non-WAVs,
-    /// already-finalized WAVs, and unreadable paths are no-ops.
+    /// `true` iff both size fields were written and flushed. Safe to call on any
+    /// file: non-WAVs, already-finalized WAVs, and unreadable paths are no-ops.
+    ///
+    /// A `false` return means "don't rely on this file being fixed", not
+    /// "nothing was touched" — if the RIFF write lands and the `data` write
+    /// fails, the file has been partially updated. That's safe to retry:
+    /// `plan` keys the decision off the `data` field alone, so a later call
+    /// re-derives the same plan and converges.
     @discardableResult
     static func repairIfNeeded(at url: URL) -> Bool {
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
@@ -141,6 +147,15 @@ enum WAVHeaderRepair {
         let okRiff = write(plan.newRiffSize, at: plan.riffSizeOffset)
         let okData = write(plan.newDataSize, at: plan.dataSizeOffset)
         guard okRiff && okData else { return false }
+        // Force the header out to durable storage. This path only runs because
+        // a crash already cost us the clean close(); leaving the fix sitting in
+        // the page cache would let a second crash lose it again.
+        do {
+            try handle.synchronize()
+        } catch {
+            wavRepairLog.error("WAV header fsync failed: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
         wavRepairLog.log("repaired unfinalized WAV header for \(url.lastPathComponent, privacy: .public) (data size -> \(plan.newDataSize))")
         return true
     }
