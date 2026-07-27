@@ -69,7 +69,8 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         // single-model behaviour for every language.
         XCTAssertEqual(settings.model(for: "he"), "ivrit-ai/whisper-large-v3-turbo-ct2")
         XCTAssertEqual(settings.model(for: "en"), "ivrit-ai/whisper-large-v3-turbo-ct2")
-        XCTAssertEqual(settings.model(for: "auto"), "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.model(for: "auto"), "ivrit-ai/whisper-large-v3-turbo-ct2",
+                       "Legacy auto must not resolve to a model the user never configured")
     }
 
     func test_modelForLanguage_routesEnglishAndAutoToEnglishModel() {
@@ -81,8 +82,9 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
                        "Legacy Hebrew code must route like `he`")
         XCTAssertEqual(settings.model(for: "en"), "deepdml/faster-whisper-large-v3-turbo-ct2")
         XCTAssertEqual(settings.model(for: "en-US"), "deepdml/faster-whisper-large-v3-turbo-ct2")
-        // Auto's contract is "don't render English as Hebrew", which only the
-        // multilingual model can honour. See `model(for:)`.
+        // Auto-detect is retired as a user choice, but recordings made under it
+        // keep "auto" on disk and can be re-transcribed. Only the multilingual
+        // model can serve a detect-the-language request.
         XCTAssertEqual(settings.model(for: "auto"), "deepdml/faster-whisper-large-v3-turbo-ct2")
     }
 

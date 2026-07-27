@@ -214,16 +214,10 @@ final class RemoteTranscriptionSettings: ObservableObject {
     ///
     /// * `he` (and legacy `iw`/unrecognised codes) → `model`, the primary.
     /// * `en` → `englishModel`.
-    /// * `auto` → `englishModel`.
-    ///
-    /// Auto goes to the English model rather than the primary because `auto`'s
-    /// whole contract is "detect per utterance, don't render English as
-    /// Hebrew". Only a multilingual model can honour that; a Hebrew-only
-    /// primary would defeat the setting the moment someone spoke English. This
-    /// deliberately differs from `ModelManager.model(for:)`, which keeps the
-    /// user's selected model on auto — that's sound locally, where *both*
-    /// shipped models are multilingual-capable, and unsound here, where the
-    /// primary may not be.
+    /// * legacy `auto` → `englishModel`, the only one that can serve a
+    ///   detect-the-language request. Auto-detect was retired as a user
+    ///   choice (see `RecordingLanguage`), but recordings made under it keep
+    ///   the string on disk and can still be re-transcribed.
     ///
     /// With `englishModel` empty every language resolves to the primary, so a
     /// single-model endpoint behaves exactly as it did before this existed.
@@ -231,9 +225,10 @@ final class RemoteTranscriptionSettings: ObservableObject {
         let primary = Self.resolve(model)
         let english = englishModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !english.isEmpty else { return primary }
+        if languageCode.lowercased() == "auto" { return english }
         switch RecordingLanguage.fromCode(languageCode) {
-        case .hebrew:          return primary
-        case .english, .auto:  return english
+        case .hebrew:   return primary
+        case .english:  return english
         }
     }
 

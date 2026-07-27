@@ -26,7 +26,8 @@ struct MilaConfig: Codable, Equatable {
     var version: Int
 
     var remoteTranscription: RemoteTranscription?
-    /// ISO-style language code for new recordings: `"he"`, `"en"`, or `"auto"`.
+    /// ISO-style language code for new recordings: `"he"` or `"en"`. Anything
+    /// else — including the retired `"auto"` — is read as Hebrew.
     var recordingLanguage: String?
     var liveAI: LiveAI?
     var diarization: Toggle?

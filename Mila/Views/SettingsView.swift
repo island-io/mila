@@ -613,7 +613,7 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                 }
-                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English and auto-detect recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
+                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

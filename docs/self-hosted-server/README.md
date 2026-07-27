@@ -129,8 +129,8 @@ Set them in Mila under Settings → Models:
 | Model         | `ivrit-ai/whisper-large-v3-turbo-ct2`      |
 | English model | `deepdml/faster-whisper-large-v3-turbo-ct2` |
 
-Hebrew recordings use **Model**; English and Auto-detect use **English model**.
-Leave *English model* blank if your endpoint is already multilingual (OpenAI's
+Hebrew recordings use **Model**; English recordings use **English model**. Leave
+*English model* blank if your endpoint is already multilingual (OpenAI's
 `whisper-1`, or a plain `Systran/faster-whisper-large-v3` deployment) — then
 every language uses **Model**.
 
@@ -259,9 +259,8 @@ To distribute it:
   flags this in the UI. Self-hosting keeps it on infrastructure you control.
 - **Diarization still runs locally** in Mila (it reads the on-disk audio), so
   speaker labels work regardless of which transcription backend you pick.
-- **Language.** Mila forwards the recording language (`he` / `en`); on
-  Auto-detect it omits the field and lets the server detect it. The language
-  also picks *which model id* is sent: Hebrew → **Model**, English and
-  Auto-detect → **English model** (when set). Auto goes to the multilingual
-  model on purpose — a Hebrew-only model would render detected English as
-  Hebrew, which is exactly what Auto-detect exists to avoid.
+- **Language.** Mila forwards the recording language (`he` / `en`), which also
+  picks *which model id* is sent: Hebrew → **Model**, English → **English
+  model** (when set). There's no auto-detect: the model is chosen *from* the
+  language, so detection would mean picking a specialist before knowing what
+  language it needs to handle. Speakers pick the language in the toolbar.
