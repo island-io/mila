@@ -117,6 +117,10 @@ final class MilaConfigImporter: ObservableObject {
             if let model = r.model, model != remote.model {
                 out.append(.init(label: "Model", value: model))
             }
+            if let englishModel = r.englishModel, englishModel != remote.englishModel {
+                out.append(.init(label: "English model",
+                                 value: englishModel.isEmpty ? "Same as Model" : englishModel))
+            }
             if let apiKey = r.apiKey, apiKey != remote.apiKey {
                 out.append(.init(label: "API key", value: Self.mask(apiKey)))
             }
@@ -156,6 +160,7 @@ final class MilaConfigImporter: ObservableObject {
             // stale stored one.
             if let endpoint = r.endpoint { remote.endpoint = endpoint }
             if let model = r.model { remote.model = model }
+            if let englishModel = r.englishModel { remote.englishModel = englishModel }
             if let apiKey = r.apiKey { remote.apiKey = apiKey }
             if let enabled = r.enabled { remote.backend = enabled ? .remote : .local }
         }

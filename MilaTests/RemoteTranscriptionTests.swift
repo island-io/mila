@@ -60,6 +60,68 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(config?.model, RemoteTranscriptionSettings.defaultModel)
     }
 
+    // MARK: - Per-language model routing
+
+    func test_modelForLanguage_withoutEnglishModel_alwaysUsesPrimary() {
+        let settings = makeSettings()
+        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+        // Empty englishModel is the default and must preserve the old
+        // single-model behaviour for every language.
+        XCTAssertEqual(settings.model(for: "he"), "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.model(for: "en"), "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.model(for: "auto"), "ivrit-ai/whisper-large-v3-turbo-ct2")
+    }
+
+    func test_modelForLanguage_routesEnglishAndAutoToEnglishModel() {
+        let settings = makeSettings()
+        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+        settings.englishModel = "deepdml/faster-whisper-large-v3-turbo-ct2"
+        XCTAssertEqual(settings.model(for: "he"), "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.model(for: "iw"), "ivrit-ai/whisper-large-v3-turbo-ct2",
+                       "Legacy Hebrew code must route like `he`")
+        XCTAssertEqual(settings.model(for: "en"), "deepdml/faster-whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.model(for: "en-US"), "deepdml/faster-whisper-large-v3-turbo-ct2")
+        // Auto's contract is "don't render English as Hebrew", which only the
+        // multilingual model can honour. See `model(for:)`.
+        XCTAssertEqual(settings.model(for: "auto"), "deepdml/faster-whisper-large-v3-turbo-ct2")
+    }
+
+    func test_modelForLanguage_trimsWhitespace() {
+        let settings = makeSettings()
+        settings.model = "  primary  "
+        settings.englishModel = "  english  "
+        XCTAssertEqual(settings.model(for: "he"), "primary")
+        XCTAssertEqual(settings.model(for: "en"), "english")
+        // Whitespace-only is indistinguishable from unset.
+        settings.englishModel = "   "
+        XCTAssertEqual(settings.model(for: "en"), "primary")
+    }
+
+    func test_currentConfig_bakesInTheLanguageRoutedModel() {
+        let settings = makeSettings()
+        settings.backend = .remote
+        settings.endpoint = "https://example.com/v1"
+        settings.model = "hebrew-model"
+        settings.englishModel = "english-model"
+        XCTAssertEqual(settings.currentConfig(for: "en")?.model, "english-model")
+        XCTAssertEqual(settings.currentConfig(for: "he")?.model, "hebrew-model")
+        // No language (the connection probe) → primary.
+        XCTAssertEqual(settings.currentConfig()?.model, "hebrew-model")
+    }
+
+    func test_englishModel_persistsAcrossInstances() {
+        let suite = UserDefaults(suiteName: "RemoteTranscriptionSettingsTests.\(#function)")!
+        suite.removePersistentDomain(forName: "RemoteTranscriptionSettingsTests.\(#function)")
+        let key = "RemoteTranscriptionSettingsTests.\(#function).apiKey"
+
+        let first = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: key)
+        XCTAssertEqual(first.englishModel, "", "Must default to empty (= use primary)")
+        first.englishModel = "deepdml/faster-whisper-large-v3-turbo-ct2"
+
+        let second = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: key)
+        XCTAssertEqual(second.englishModel, "deepdml/faster-whisper-large-v3-turbo-ct2")
+    }
+
     func test_localBackend_doesNotReadKeychain() {
         // Seed a real token under an isolated key, then construct with the
         // default (local) backend. A local-only user must come up with an empty

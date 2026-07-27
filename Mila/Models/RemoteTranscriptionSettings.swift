@@ -83,6 +83,25 @@ final class RemoteTranscriptionSettings: ObservableObject {
         }
     }
 
+    /// Optional second model id, used for English and auto-detect recordings.
+    ///
+    /// Exists because a server's main model may be *language-specific*: the
+    /// ivrit.ai finetune Mila's own server runs is Hebrew-only, and sending it
+    /// English audio yields English speech rendered with Hebrew words spliced
+    /// in — `language=en` is honoured by the decoder but can't fix weights that
+    /// were never trained multilingual. A single model id had no way to express
+    /// "Hebrew here, English there".
+    ///
+    /// Empty (the default) means "use `model` for every language", which is
+    /// correct for genuinely multilingual endpoints like OpenAI's `whisper-1`
+    /// and preserves the pre-existing behaviour for anyone already configured.
+    @Published var englishModel: String {
+        didSet {
+            guard englishModel != oldValue else { return }
+            defaults.set(englishModel, forKey: Keys.englishModel)
+        }
+    }
+
     /// The bearer token. Stored in the Keychain, never in `UserDefaults`. The
     /// `@Published` mirror lets SwiftUI bind a `SecureField` directly; every
     /// edit writes through to the Keychain.
@@ -124,6 +143,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
             ?? .local
         self.endpoint = defaults.string(forKey: Keys.endpoint) ?? Self.defaultEndpoint
         self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
+        self.englishModel = defaults.string(forKey: Keys.englishModel) ?? ""
         // Start empty and defer the Keychain read. Reading the token at launch
         // unconditionally pops the macOS "Mila wants to use confidential
         // information stored in your keychain" prompt for *every* user — even
@@ -188,14 +208,51 @@ final class RemoteTranscriptionSettings: ObservableObject {
         return true
     }
 
+    /// The model id to send for a recording in `languageCode` — the remote
+    /// mirror of `ModelManager.model(for:)`, which does the same routing for the
+    /// on-device backend.
+    ///
+    /// * `he` (and legacy `iw`/unrecognised codes) → `model`, the primary.
+    /// * `en` → `englishModel`.
+    /// * `auto` → `englishModel`.
+    ///
+    /// Auto goes to the English model rather than the primary because `auto`'s
+    /// whole contract is "detect per utterance, don't render English as
+    /// Hebrew". Only a multilingual model can honour that; a Hebrew-only
+    /// primary would defeat the setting the moment someone spoke English. This
+    /// deliberately differs from `ModelManager.model(for:)`, which keeps the
+    /// user's selected model on auto — that's sound locally, where *both*
+    /// shipped models are multilingual-capable, and unsound here, where the
+    /// primary may not be.
+    ///
+    /// With `englishModel` empty every language resolves to the primary, so a
+    /// single-model endpoint behaves exactly as it did before this existed.
+    func model(for languageCode: String) -> String {
+        let primary = Self.resolve(model)
+        let english = englishModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !english.isEmpty else { return primary }
+        switch RecordingLanguage.fromCode(languageCode) {
+        case .hebrew:          return primary
+        case .english, .auto:  return english
+        }
+    }
+
+    /// Trim a user-entered model id, falling back to the default when blank.
+    private static func resolve(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? defaultModel : trimmed
+    }
+
     /// Snapshot for the engine, or `nil` if the endpoint can't be parsed.
-    func currentConfig() -> RemoteTranscriptionConfig? {
+    ///
+    /// Pass the recording's language so the right model id is baked into the
+    /// snapshot; omit it (the connection probe does) to get the primary model.
+    func currentConfig(for languageCode: String? = nil) -> RemoteTranscriptionConfig? {
         guard let url = endpointURL else { return nil }
-        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         return RemoteTranscriptionConfig(
             endpoint: url,
             apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
-            model: trimmedModel.isEmpty ? Self.defaultModel : trimmedModel
+            model: languageCode.map(model(for:)) ?? Self.resolve(model)
         )
     }
 
@@ -311,6 +368,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
         static let backend = "transcription.backend"
         static let endpoint = "remote.endpoint"
         static let model = "remote.model"
+        static let englishModel = "remote.model.en"
         static let apiKey = "remote.apiKey"
     }
 }

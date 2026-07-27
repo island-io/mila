@@ -43,6 +43,10 @@ struct MilaConfig: Codable, Equatable {
         var endpoint: String?
         /// Model id the server expects, e.g. `ivrit-ai/whisper-large-v3-turbo-ct2`.
         var model: String?
+        /// Optional model id for English and auto-detect recordings, for servers
+        /// whose main model is language-specific (the ivrit.ai finetune is
+        /// Hebrew-only). Absent or empty means `model` handles every language.
+        var englishModel: String?
         /// Bearer token. Stored in the Keychain on apply, never in UserDefaults.
         var apiKey: String?
     }

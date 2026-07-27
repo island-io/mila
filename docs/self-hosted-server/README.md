@@ -108,15 +108,35 @@ What the [Deployment](./k8s/deployment.yaml) does:
   VRAM of float32.
 - Uses `/health` for the startup / readiness / liveness probes (that endpoint is
   auth-free on this image).
-- Runs a **`postStart` hook** that waits for the server, then pre-registers the
+- Runs a **`postStart` hook** that waits for the server, then pre-registers each
   model (`POST /v1/models/{id}`) so the first user request doesn't pay the full
   cold download. It's non-fatal — speaches also lazy-loads on first use.
-- Caches the model in a pod-local **`emptyDir`** (re-downloaded on restart,
-  ~1–2 min; swap for a PVC if you want it to persist).
+- Caches the models in a pod-local **`emptyDir`** (re-downloaded on restart,
+  ~1–2 min each; swap for a PVC if you want it to persist).
 
-**Changing the model:** edit the `model_id` in the deployment's `postStart`
-hook and set the matching id in your `.milaconfig` / Mila settings. For a
-multilingual deployment use `Systran/faster-whisper-large-v3`.
+**Two models, and why.** The `ivrit-ai` finetune is **Hebrew-only**. Send it
+English audio and you get English speech with Hebrew words spliced in — the
+`language=en` field is honoured by the decoder but can't fix weights that were
+never trained multilingual. So the deployment warms a second, multilingual
+model (`deepdml/faster-whisper-large-v3-turbo-ct2`, a CT2 build of Whisper
+large-v3-turbo) and Mila routes to it per recording language. Both stay
+resident under `STT_MODEL_TTL=-1` at ~1.6 GB VRAM each.
+
+Set them in Mila under Settings → Models:
+
+| Field         | Value                                      |
+| ------------- | ------------------------------------------ |
+| Model         | `ivrit-ai/whisper-large-v3-turbo-ct2`      |
+| English model | `deepdml/faster-whisper-large-v3-turbo-ct2` |
+
+Hebrew recordings use **Model**; English and Auto-detect use **English model**.
+Leave *English model* blank if your endpoint is already multilingual (OpenAI's
+`whisper-1`, or a plain `Systran/faster-whisper-large-v3` deployment) — then
+every language uses **Model**.
+
+**Changing a model:** edit the ids in the deployment's `postStart` hook and set
+the matching ids in your `.milaconfig` / Mila settings. If you only ever
+transcribe Hebrew, drop the second id from both places.
 
 Watch it come up (the first boot downloads the model, so give it a few minutes):
 
@@ -174,12 +194,13 @@ in business.
 
 In Mila: **Settings → Models → Remote**.
 
-| Field    | Value                                     |
-| -------- | ----------------------------------------- |
-| Backend  | **Remote**                                |
-| Base URL | `https://mila-asr.your-org.example/v1`    |
-| Model    | `ivrit-ai/whisper-large-v3-turbo-ct2`     |
-| API key  | the key you created in Step 2             |
+| Field         | Value                                       |
+| ------------- | ------------------------------------------- |
+| Backend       | **Remote**                                  |
+| Base URL      | `https://mila-asr.your-org.example/v1`      |
+| Model         | `ivrit-ai/whisper-large-v3-turbo-ct2`       |
+| English model | `deepdml/faster-whisper-large-v3-turbo-ct2` |
+| API key       | the key you created in Step 2               |
 
 Click **Test connection**. Once it's green, record — Mila uploads each recording
 and asks for `verbose_json`, so timestamps (and therefore SRT export + speaker
@@ -205,6 +226,7 @@ See [`example.milaconfig`](./example.milaconfig):
     "enabled": true,
     "endpoint": "https://mila-asr.your-org.example/v1",
     "model": "ivrit-ai/whisper-large-v3-turbo-ct2",
+    "englishModel": "deepdml/faster-whisper-large-v3-turbo-ct2",
     "apiKey": "YOUR_API_KEY_HERE"
   },
   "recordingLanguage": "he"
@@ -238,4 +260,8 @@ To distribute it:
 - **Diarization still runs locally** in Mila (it reads the on-disk audio), so
   speaker labels work regardless of which transcription backend you pick.
 - **Language.** Mila forwards the recording language (`he` / `en`); on
-  Auto-detect it omits the field and lets the server detect it.
+  Auto-detect it omits the field and lets the server detect it. The language
+  also picks *which model id* is sent: Hebrew → **Model**, English and
+  Auto-detect → **English model** (when set). Auto goes to the multilingual
+  model on purpose — a Hebrew-only model would render detected English as
+  Hebrew, which is exactly what Auto-detect exists to avoid.
