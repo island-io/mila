@@ -608,6 +608,16 @@ private struct RemoteBackendSection: View {
                         .autocorrectionDisabled()
                 }
 
+                fieldRow(label: "English model") {
+                    TextField("Same as above", text: $remote.englishModel)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                }
+                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 fieldRow(label: "API key") {
                     SecureField("Stored in your Keychain", text: $remote.apiKey)
                         .textFieldStyle(.roundedBorder)

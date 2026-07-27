@@ -326,7 +326,8 @@ final class TranscriptionService: ObservableObject {
         // path. Misconfiguration degrades to an empty result (same contract as
         // a missing local model) rather than throwing into the live loop.
         if remoteSettings.isActive {
-            guard remoteSettings.isConfigured, let config = remoteSettings.currentConfig() else {
+            guard remoteSettings.isConfigured,
+                  let config = remoteSettings.currentConfig(for: language) else {
                 serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
                 return []
             }
@@ -517,7 +518,11 @@ final class TranscriptionService: ObservableObject {
         let localModel: WhisperModel?
         let modelDisplayName: String
         if useRemote {
-            guard remoteSettings.isConfigured, let config = remoteSettings.currentConfig() else {
+            // Language-routed: a server whose primary model is Hebrew-only (the
+            // ivrit.ai finetune) needs the English model id for English audio,
+            // or the transcript comes back with Hebrew words spliced in.
+            guard remoteSettings.isConfigured,
+                  let config = remoteSettings.currentConfig(for: working.language) else {
                 lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
                 markFailed(recording)
                 return

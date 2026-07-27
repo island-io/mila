@@ -7,18 +7,17 @@ import Combine
 /// digging into Settings.
 ///
 /// Persisted to `UserDefaults` so the choice sticks across launches.
+/// The language is always an explicit choice — there is deliberately no
+/// auto-detect option. Detection sounds free but isn't: it can only be as good
+/// as the model behind it, and the model itself is picked *from* this setting
+/// (Hebrew → the ivrit.ai finetune, English → the multilingual one, and the
+/// same split for a remote endpoint's two model ids). "Let the model decide"
+/// therefore meant "guess which specialist to ask before knowing the
+/// language", which produced worse transcripts than simply saying which
+/// language you're about to speak. Legacy `"auto"` values are read as Hebrew.
 enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
     case hebrew = "he"
     case english = "en"
-    /// Let whisper detect the language of each utterance instead of forcing
-    /// one. Whisper's `detect_language` runs per `whisper_full` call, and the
-    /// live path transcribes one VAD-bounded utterance per call — so this
-    /// handles code-switching (a Hebrew meeting with the odd English
-    /// sentence) without rendering the English *as Hebrew*, which is what
-    /// forcing `he` on a Hebrew-specialised model does. Keeps the user's
-    /// selected model (see `ModelManager.model(for:)`), so a Hebrew user's
-    /// Hebrew accuracy isn't traded away for the multilingual generalist.
-    case auto = "auto"
 
     var id: String { rawValue }
 
@@ -26,43 +25,45 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
         switch self {
         case .hebrew:  return "Hebrew"
         case .english: return "English"
-        case .auto:    return "Auto-detect"
         }
     }
 
     /// Regional flag emoji used in the toolbar picker. Hebrew shows the
     /// Israeli flag; English shows the British flag (matches the user's
-    /// "Israel and UK" mental model); Auto shows a globe.
+    /// "Israel and UK" mental model).
     var flagEmoji: String {
         switch self {
         case .hebrew:  return "🇮🇱"
         case .english: return "🇬🇧"
-        case .auto:    return "🌐"
         }
     }
 
     /// The opposite-language pair, used by the right-click "Re-transcribe in
-    /// the other language" menu item on a recording. Auto-detected
-    /// recordings offer a re-transcribe forced to Hebrew (the dominant
-    /// language for our users) as the manual override.
+    /// the other language" menu item on a recording.
     var other: RecordingLanguage {
         switch self {
         case .hebrew:  return .english
         case .english: return .hebrew
-        case .auto:    return .hebrew
         }
     }
 
     /// Best-effort decode of an ISO-style language string (`"he"`, `"he-IL"`,
-    /// `"iw"`, `"en"`, `"en-US"`, `"auto"`, …). Falls back to Hebrew for
-    /// legacy recordings that pre-date the per-language UX (those were always
-    /// Hebrew before the rename).
+    /// `"iw"`, `"en"`, `"en-US"`, …). Falls back to Hebrew for legacy
+    /// recordings that pre-date the per-language UX (those were always Hebrew
+    /// before the rename) and for the retired `"auto"`.
     static func fromCode(_ code: String) -> RecordingLanguage {
         let normalized = code.lowercased()
-        if normalized == "auto" { return .auto }
-        if normalized == "iw" || normalized.hasPrefix("he") { return .hebrew }
-        if normalized.hasPrefix("en") { return .english }
+        if normalized == "iw" || isVariant(normalized, of: "he") { return .hebrew }
+        if isVariant(normalized, of: "en") { return .english }
         return .hebrew
+    }
+
+    /// Whether `code` is `base` or a regional form of it (`en-US`, `en_GB`).
+    /// A bare `hasPrefix` would also swallow unrelated codes that merely start
+    /// with those letters — `"enochian"` must fall back to Hebrew like any
+    /// other unrecognised value, not pick the English model.
+    private static func isVariant(_ code: String, of base: String) -> Bool {
+        code == base || code.hasPrefix("\(base)-") || code.hasPrefix("\(base)_")
     }
 }
 
@@ -81,11 +82,19 @@ final class RecordingLanguageSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        if let raw = defaults.string(forKey: Self.key),
-           let stored = RecordingLanguage(rawValue: raw) {
+        let raw = defaults.string(forKey: Self.key)
+        if let raw, let stored = RecordingLanguage(rawValue: raw) {
             self.current = stored
         } else {
+            // Unrecognised — a fresh install, or the retired `"auto"` left in
+            // defaults by an older build. Fall back to Hebrew and rewrite the
+            // key: `current`'s `didSet` doesn't fire from `init`, so without
+            // this the stale value would sit in the plist until the user
+            // touched the picker.
             self.current = .hebrew
+            if raw != nil {
+                defaults.set(RecordingLanguage.hebrew.rawValue, forKey: Self.key)
+            }
         }
     }
 }
