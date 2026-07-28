@@ -436,6 +436,9 @@ struct LiveAIRecordingView: View {
                                                        } else {
                                                            transcriber.speakerNames.removeValue(forKey: raw)
                                                        }
+                                                   },
+                                                   onDelete: { id in
+                                                       transcriber.removeSegment(id: id)
                                                    })
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                 // Identifier is applied to the inner Text
@@ -714,6 +717,11 @@ private struct TranscriptLineView: View {
     /// Persists a rename picked from the label's popover mid-recording:
     /// (raw speaker ID, chosen name or nil-to-reset).
     var onAssignName: (String, String?) -> Void = { _, _ in }
+    /// Deletes this line from the live transcript. Wired to
+    /// `LiveTranscriber.removeSegment(id:)`.
+    var onDelete: (UUID) -> Void = { _ in }
+
+    @State private var hovering = false
 
     var body: some View {
         // We rely on the PARENT pane's layoutDirection. That mirrors the
@@ -750,8 +758,41 @@ private struct TranscriptLineView: View {
                 // outer wrapper-level identifier was a no-op (SwiftUI
                 // didn't materialize an a11y node there).
                 .accessibilityIdentifier("liveTranscript.segment")
+            // Hover-revealed delete button. Kept out of the layout-direction
+            // flip (its own LTR) so the trash icon sits on the trailing edge
+            // regardless of the line's script. Always present but near-
+            // invisible until hover so rows don't jump when the button
+            // appears.
+            deleteButton
+                .opacity(hovering ? 1 : 0)
+                .environment(\.layoutDirection, .leftToRight)
         }
         .environment(\.layoutDirection, lineRTL ? .rightToLeft : .leftToRight)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+        // Right-click / control-click also offers delete, for when the
+        // hover button is easy to miss.
+        .contextMenu {
+            Button(role: .destructive) {
+                onDelete(segment.id)
+            } label: {
+                Label("Delete line", systemImage: "trash")
+            }
+        }
+    }
+
+    private var deleteButton: some View {
+        Button {
+            onDelete(segment.id)
+        } label: {
+            Image(systemName: "trash")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help("Delete this line from the transcript")
+        .accessibilityLabel("Delete line")
+        .accessibilityIdentifier("liveTranscript.deleteLine")
     }
 }
 
