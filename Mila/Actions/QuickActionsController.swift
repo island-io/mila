@@ -161,6 +161,13 @@ final class QuickActionsController: ObservableObject {
     /// Existing / in-progress recordings are never touched.
     var storageSettings: RecordingStorageSettings?
 
+    /// Late-bound by MilaApp. Obsidian vault destination + exporter. The
+    /// live-transcript save path (below) mirrors the batch path's Obsidian
+    /// wiring: mark the fresh completion pending so the summarizer's
+    /// completion hook writes the note once the summary is ready.
+    var obsidianSettings: ObsidianVaultSettings?
+    var obsidianExporter: ObsidianExporter?
+
     /// Active silence-watch task — cancelled when the recording stops so
     /// we never fire the warning for a recording that's already over.
     private var silenceWatchTask: Task<Void, Never>?
@@ -978,10 +985,17 @@ final class QuickActionsController: ObservableObject {
                 // enabled + configured conditions. `summarizeIfNeeded` covers
                 // the Live-AI-off case under the normal auto-summary gate.
                 TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
+                // Mark this fresh completion pending for Obsidian export (if
+                // enabled) BEFORE kicking the summarizer, since a skip fires
+                // the completion hook synchronously.
+                let obsidianOn = (self.obsidianSettings?.enabled == true)
+                    && (self.obsidianSettings?.vaultURL != nil)
                 if self.liveAISettings?.enabled == true,
                    self.llmSettings?.isConfigured == true {
+                    if obsidianOn { self.obsidianExporter?.markPending(updated.id) }
                     self.summarizer?.regenerate(updated)
                 } else {
+                    if obsidianOn { self.obsidianExporter?.markPending(updated.id) }
                     self.summarizer?.summarizeIfNeeded(updated)
                 }
                 // Shrink storage: the live transcript is authoritative and the
