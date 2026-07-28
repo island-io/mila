@@ -165,6 +165,73 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    // MARK: - Delete a live line
+
+    func test_removeSegment_removes_line_and_recomputes_fullText() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "keep"),
+            TranscriptSegment(start: 2, end: 3, text: "remove me")
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["keep", "remove me"])
+
+        let victim = try! XCTUnwrap(transcriber.segments.first { $0.text == "remove me" })
+        transcriber.removeSegment(id: victim.id)
+
+        XCTAssertEqual(transcriber.segments.map(\.text), ["keep"])
+        XCTAssertEqual(transcriber.fullText, "keep")
+        _ = transcriber.stop()
+    }
+
+    /// A deleted line must not reappear when the fixed-window path
+    /// re-transcribes its rolling buffer on the next tick — the deleted
+    /// time range is suppressed.
+    func test_deleted_line_does_not_reappear_on_next_chunk_tick() async {
+        // Both ticks emit the same two segments; after deleting "beta" it
+        // must stay gone even though tick 2 re-emits it.
+        await stub.setCannedQueue([
+            [
+                TranscriptSegment(start: 0, end: 1, text: "alpha"),
+                TranscriptSegment(start: 2, end: 3, text: "beta")
+            ],
+            [
+                TranscriptSegment(start: 0, end: 1, text: "alpha"),
+                TranscriptSegment(start: 2, end: 3, text: "beta")
+            ]
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["alpha", "beta"])
+
+        let beta = try! XCTUnwrap(transcriber.segments.first { $0.text == "beta" })
+        transcriber.removeSegment(id: beta.id)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["alpha"])
+
+        // Next tick re-emits alpha (already present, skipped) + beta
+        // (suppressed by the deleted range).
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["alpha"],
+                       "deleted line reappeared after a re-transcription tick")
+        _ = transcriber.stop()
+    }
+
+    func test_removeSegment_unknown_id_is_a_noop() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "only")])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        transcriber.removeSegment(id: UUID())
+        XCTAssertEqual(transcriber.segments.map(\.text), ["only"])
+        _ = transcriber.stop()
+    }
+
     func test_formattedTranscript_uses_timestamps_one_line_per_segment() async {
         await stub.setDefaultCanned([
             TranscriptSegment(start: 0, end: 1, text: "first"),
