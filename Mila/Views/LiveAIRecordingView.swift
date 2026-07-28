@@ -30,6 +30,9 @@ struct LiveAIRecordingView: View {
     /// in the header shows a filled icon when notes exist so a user who
     /// pasted an agenda can see that at a glance without opening it.
     @State private var isContextExpanded = false
+    /// Debounce handle for the live transcript auto-scroll (see
+    /// `scrollToBottom`). Coalesces the per-tick scroll requests.
+    @State private var pendingScroll: DispatchWorkItem?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -478,20 +481,29 @@ struct LiveAIRecordingView: View {
         .background(Color.primary.opacity(0.02))
     }
 
-    /// Pin the transcript to its newest line. Deferred to the next runloop
-    /// via `DispatchQueue.main.async` so the segment that just changed (an
-    /// appended line, or the in-progress last line that just grew) is laid
-    /// out BEFORE we scroll — a synchronous `scrollTo` inside `onChange`
-    /// runs in the same update cycle and lands on the stale, pre-update
-    /// content height, leaving the latest words below the fold. The
+    /// Pin the transcript to its newest line. Deferred off the current update
+    /// cycle so the segment that just changed (an appended line, or the
+    /// in-progress last line that just grew) is laid out BEFORE we scroll —
+    /// a synchronous `scrollTo` inside `onChange` runs in the same update
+    /// cycle and lands on the stale, pre-update content height, leaving the
+    /// latest words below the fold. The
     /// `bottom-anchor` sits after the LazyVStack (non-lazy, always
     /// measured) so it's a stable scroll target once layout settles.
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        DispatchQueue.main.async {
+        // Debounce: `fullText` changes on every partial-transcript tick (many
+        // per second as the in-progress line grows). Firing a fresh
+        // `withAnimation` scroll per tick stacks animations and adds
+        // main-thread work to the transcript re-render storm. Coalesce to one
+        // scroll per short window; deferring also lets the just-changed
+        // content lay out first so we land on the newest line.
+        pendingScroll?.cancel()
+        let work = DispatchWorkItem {
             withAnimation(.easeOut(duration: 0.18)) {
                 proxy.scrollTo("bottom-anchor", anchor: .bottom)
             }
         }
+        pendingScroll = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
     }
 
     /// Save the accumulated live transcript as an SRT to a user-chosen
