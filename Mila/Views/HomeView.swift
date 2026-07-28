@@ -51,6 +51,7 @@ struct HomeView: View {
                     // the app stays on Home instead of the split-pane view.
                     RecordingPauseButton(prominent: true)
                 }
+                recordingDestination
                 dictationHint
             }
             .padding(.horizontal, 24)
@@ -162,6 +163,50 @@ struct HomeView: View {
         .controlSize(.small)
         .disabled(isRecording)
         .frame(maxWidth: 280, alignment: .leading)
+    }
+
+    /// Destination controls for the next recording: the folder on top and the
+    /// meeting name directly under it, both left-aligned to a shared width so
+    /// their leading edges line up.
+    private var recordingDestination: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            folderPicker
+            meetingNameField
+        }
+        .frame(maxWidth: 280, alignment: .leading)
+    }
+
+    /// Optional meeting name for the next recording. Empty falls back to the
+    /// auto-generated date-stamped title. Editable during a recording too,
+    /// since it's applied when the recording is saved.
+    private var meetingNameField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "text.cursor")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            NextRecordingMeetingNameField(placeholder: "Meeting name (optional)",
+                                          accessibilityID: "home.record.meetingName")
+                .textFieldStyle(.roundedBorder)
+        }
+        .controlSize(.small)
+        .frame(maxWidth: 280)
+    }
+
+    /// Optional destination folder for the next recording. Per-session only —
+    /// it resets to All Transcriptions on launch so a folder picked once never
+    /// silently becomes the default. Editable during a recording too, since the
+    /// folder is applied when the recording is saved.
+    private var folderPicker: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Text("Save to")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            NextRecordingFolderPicker(accessibilityID: "home.record.folder.menu")
+        }
+        .controlSize(.small)
     }
 
     /// Discrete reminder of the two global dictation hotkeys. Reads live

@@ -89,6 +89,16 @@ struct LiveAIRecordingView: View {
     // MARK: - Header
 
     private var header: some View {
+        VStack(spacing: 10) {
+            controlsRow
+            metaRow
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+        .background(.regularMaterial)
+    }
+
+    private var controlsRow: some View {
         HStack(spacing: 12) {
             Button {
                 Task { await actions.stopRecording() }
@@ -134,9 +144,34 @@ struct LiveAIRecordingView: View {
                 ThinkingIndicator(isThinking: aiSession.isThinking)
             }
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 12)
-        .background(.regularMaterial)
+    }
+
+    /// Meeting name + destination folder for the recording being captured.
+    /// Both are editable mid-recording — the name and folder are applied
+    /// when the recording is saved (`QuickActionsController.stopRecording`),
+    /// so changing them here at any point up to Stop takes effect.
+    private var metaRow: some View {
+        HStack(spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "text.cursor")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                NextRecordingMeetingNameField(placeholder: "Meeting name",
+                                              accessibilityID: "liveAI.meetingName")
+                    .textFieldStyle(.plain)
+                    .font(.callout)
+            }
+
+            Spacer(minLength: 12)
+
+            HStack(spacing: 6) {
+                Image(systemName: "folder")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                NextRecordingFolderPicker(accessibilityID: "liveAI.folder.menu")
+                    .font(.callout)
+            }
+        }
     }
 
     // MARK: - Action items pane
