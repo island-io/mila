@@ -458,15 +458,40 @@ struct LiveAIRecordingView: View {
                     // queried in production.
                     Color.clear.frame(height: 1).id("bottom-anchor")
                 }
+                // Scroll on BOTH a new line (segments.count) and the
+                // in-progress last line growing in place (fullText, which is
+                // @Published and recomputed as that segment expands). Both
+                // route through `scrollToBottom`, which hops to the next
+                // runloop so the just-changed content is laid out FIRST —
+                // scrolling synchronously here targets the pre-update height
+                // and stops short of the newest words (worse under LazyVStack,
+                // whose just-appended row isn't measured yet at this instant).
                 .onChange(of: transcriber.segments.count) { _, _ in
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo("bottom-anchor", anchor: .bottom)
-                    }
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: transcriber.fullText) { _, _ in
+                    scrollToBottom(proxy)
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.primary.opacity(0.02))
+    }
+
+    /// Pin the transcript to its newest line. Deferred to the next runloop
+    /// via `DispatchQueue.main.async` so the segment that just changed (an
+    /// appended line, or the in-progress last line that just grew) is laid
+    /// out BEFORE we scroll — a synchronous `scrollTo` inside `onChange`
+    /// runs in the same update cycle and lands on the stale, pre-update
+    /// content height, leaving the latest words below the fold. The
+    /// `bottom-anchor` sits after the LazyVStack (non-lazy, always
+    /// measured) so it's a stable scroll target once layout settles.
+    private func scrollToBottom(_ proxy: ScrollViewProxy) {
+        DispatchQueue.main.async {
+            withAnimation(.easeOut(duration: 0.18)) {
+                proxy.scrollTo("bottom-anchor", anchor: .bottom)
+            }
+        }
     }
 
     /// Save the accumulated live transcript as an SRT to a user-chosen
