@@ -13,10 +13,21 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var coordinator: PostRecordingCoordinator
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var llm: LLMSettings
-    @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var summarizer: RecordingSummarizer
 
     @State private var title: String
+    /// Mila folder the recording should be filed under (nil = unfiled).
+    /// Seeded from the recording and applied on Save via `store.assign`.
+    @State private var selectedFolder: String?
+    /// Mirrors `userEditedTitle` for the folder: while false, the picker
+    /// tracks the stored recording's folder (so a folder chosen on the
+    /// recording screen shows up here even when SwiftUI reuses this sheet's
+    /// `@State` across presentations and the init seed goes stale). Once the
+    /// user picks a folder in this sheet we stop mirroring so their choice
+    /// isn't clobbered.
+    @State private var userEditedFolder = false
+    @State private var showingNewFolderField = false
+    @State private var newFolderName = ""
     @State private var isFetchingName = false
     @State private var llmError: String?
     /// Set once the user types in the title field (or accepts a manual
@@ -40,6 +51,7 @@ struct RenameRecordingSheet: View {
     init(initialRecording: Recording) {
         self.initialRecording = initialRecording
         _title = State(initialValue: initialRecording.title)
+        _selectedFolder = State(initialValue: initialRecording.folder)
     }
 
     /// Live recording (transcript fills in here as Whisper finishes).
@@ -82,28 +94,6 @@ struct RenameRecordingSheet: View {
             || summarizer.isSummarizing(liveRecording.id)
     }
 
-    /// "Transcribing…", "Identifying speakers…", "Done", "Failed",
-    /// "Waiting in queue" — drives the progress indicator inside the sheet.
-    private var transcriptionLabel: String {
-        let live = liveRecording
-        if transcription.activeRecordingID == live.id {
-            let pct = Int(transcription.progress * 100)
-            return "Transcribing… \(pct)%"
-        }
-        // The offline re-diarize pass: the transcript text is already final
-        // (status is .completed), so "Transcribing" would be wrong — the
-        // pyannote subprocess is only re-clustering speaker labels.
-        if transcription.diarizingRecordingID == live.id {
-            return "Identifying speakers…"
-        }
-        switch live.status {
-        case .pending:   return "Waiting to transcribe…"
-        case .running:   return "Transcribing…"
-        case .completed: return "Transcript ready"
-        case .failed:    return "Transcription failed"
-        }
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Fixed top: identity + status. Never scrolls, so the title field
@@ -137,7 +127,9 @@ struct RenameRecordingSheet: View {
                     }
                 }
 
-                transcriptionStatus
+                folderPicker
+
+                RenameTranscriptionStatusRow(recordingID: initialRecording.id)
             }
             .padding(20)
 
@@ -222,6 +214,14 @@ struct RenameRecordingSheet: View {
         // back over the stored suggestion.
         .onAppear {
             if !userEditedTitle { title = liveRecording.title }
+            if !userEditedFolder { selectedFolder = liveRecording.folder }
+        }
+        // Keep the folder in sync with the stored recording until the user
+        // picks one here — mirrors the title mirroring above. This is what
+        // carries a folder chosen on the recording screen into the sheet even
+        // if the init-seeded `@State` was stale.
+        .onChange(of: liveRecording.folder) { _, newFolder in
+            if !userEditedFolder { selectedFolder = newFolder }
         }
         // Mirror a background auto-suggestion into the field as it lands —
         // but only until the user expresses their own preference. The
@@ -351,6 +351,65 @@ struct RenameRecordingSheet: View {
         }
     }
 
+    /// Pick the Mila folder this recording is filed under. Existing folders +
+    /// "None", plus an inline "New Folder…" field. Applied on Save.
+    private var folderPicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Folder").font(.callout.weight(.semibold))
+            HStack(spacing: 8) {
+                Menu {
+                    Button(selectedFolder == nil ? "✓ None" : "None") {
+                        chooseFolder(nil)
+                    }
+                    if !store.folders.isEmpty {
+                        Divider()
+                        ForEach(store.folders, id: \.self) { folder in
+                            Button(selectedFolder == folder ? "✓ \(folder)" : folder) {
+                                chooseFolder(folder)
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("New Folder…") {
+                        newFolderName = ""
+                        showingNewFolderField = true
+                    }
+                } label: {
+                    Label(selectedFolder ?? "No folder", systemImage: "folder")
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityIdentifier("rename.folder.menu")
+                Spacer()
+            }
+            if showingNewFolderField {
+                HStack(spacing: 8) {
+                    TextField("New folder name", text: $newFolderName)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { commitNewFolder() }
+                        .accessibilityIdentifier("rename.newFolder.field")
+                    Button("Add") { commitNewFolder() }
+                        .disabled(newFolderName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("Cancel") { showingNewFolderField = false }
+                }
+            }
+        }
+    }
+
+    private func commitNewFolder() {
+        let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+        chooseFolder(name)
+        showingNewFolderField = false
+    }
+
+    /// Record an explicit in-sheet folder choice and stop mirroring the
+    /// stored recording's folder so the user's pick is never clobbered.
+    private func chooseFolder(_ folder: String?) {
+        selectedFolder = folder
+        userEditedFolder = true
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Name this recording").font(.title3.weight(.semibold))
@@ -400,46 +459,20 @@ struct RenameRecordingSheet: View {
             .isEmpty
     }
 
-    @ViewBuilder
-    private var transcriptionStatus: some View {
-        HStack(spacing: 10) {
-            statusIcon
-            Text(transcriptionLabel)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-            if transcription.activeRecordingID == liveRecording.id {
-                ProgressView(value: transcription.progress)
-                    .progressViewStyle(.linear)
-                    .frame(maxWidth: 140)
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-
-    @ViewBuilder
-    private var statusIcon: some View {
-        // While the offline re-diarize is in flight the transcript is done
-        // but speaker labels aren't — show a spinner, not the green check,
-        // to match the "Identifying speakers…" label.
-        if transcription.diarizingRecordingID == liveRecording.id {
-            ProgressView().controlSize(.small)
-        } else {
-            switch liveRecording.status {
-            case .completed:
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-            case .failed:
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
-            default:
-                ProgressView().controlSize(.small)
-            }
-        }
-    }
-
     private func save() {
+        applyFolder()
         coordinator.dismiss(savingTitle: title)
+    }
+
+    /// File the recording under the chosen folder (auto-creates it) before the
+    /// sheet tears down. No-op when the folder is unchanged. Runs before
+    /// `dismiss` on every exit path so anything triggered by the save sees the
+    /// recording already filed.
+    private func applyFolder() {
+        guard let rec = store.recordings.first(where: { $0.id == initialRecording.id }) else { return }
+        if rec.folder != selectedFolder {
+            store.assign(rec, toFolder: selectedFolder)
+        }
     }
 
     /// Save the title, dismiss the sheet, then run the action in the
@@ -466,6 +499,7 @@ struct RenameRecordingSheet: View {
         let summarySnapshot = summary
         let executableOverride = llm.executablePath.isEmpty ? nil : llm.executablePath
         let tool = llm.tool
+        applyFolder()
         coordinator.dismiss(savingTitle: title)
         coordinator.sendToLLM(recordingID: recordingID,
                               tool: tool,
@@ -520,6 +554,82 @@ struct RenameRecordingSheet: View {
             // when withTaskCancellationHandler's onCancel beat us to it.
             if Task.isCancelled { return }
             llmError = error.localizedDescription
+        }
+    }
+}
+
+/// Isolated transcription-status row for the rename sheet.
+///
+/// This is the ONLY part of the sheet that observes `TranscriptionService`, so
+/// the high-frequency `progress` updates during batch transcription re-render
+/// just this small leaf — not the whole sheet. Previously the sheet held
+/// `@EnvironmentObject transcription`, so every progress tick rebuilt the
+/// entire body including the folder `Menu`; opening that menu mid-transcription
+/// then collided with the NSMenu's modal tracking loop and beachballed the app.
+private struct RenameTranscriptionStatusRow: View {
+    @EnvironmentObject private var store: RecordingStore
+    @EnvironmentObject private var transcription: TranscriptionService
+    let recordingID: UUID
+
+    private var status: TranscriptionStatus {
+        store.recordings.first(where: { $0.id == recordingID })?.status ?? .pending
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            statusIcon
+            Text(label)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if transcription.activeRecordingID == recordingID {
+                ProgressView(value: transcription.progress)
+                    .progressViewStyle(.linear)
+                    .frame(maxWidth: 140)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// "Transcribing… NN%", "Identifying speakers…", "Transcript ready",
+    /// "Transcription failed", "Waiting to transcribe…".
+    private var label: String {
+        if transcription.activeRecordingID == recordingID {
+            let pct = Int(transcription.progress * 100)
+            return "Transcribing… \(pct)%"
+        }
+        // The offline re-diarize pass: the transcript text is already final
+        // (status is .completed), so "Transcribing" would be wrong — the
+        // pyannote subprocess is only re-clustering speaker labels.
+        if transcription.diarizingRecordingID == recordingID {
+            return "Identifying speakers…"
+        }
+        switch status {
+        case .pending:   return "Waiting to transcribe…"
+        case .running:   return "Transcribing…"
+        case .completed: return "Transcript ready"
+        case .failed:    return "Transcription failed"
+        }
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        // While the offline re-diarize is in flight the transcript is done
+        // but speaker labels aren't — show a spinner, not the green check,
+        // to match the "Identifying speakers…" label.
+        if transcription.diarizingRecordingID == recordingID {
+            ProgressView().controlSize(.small)
+        } else {
+            switch status {
+            case .completed:
+                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            default:
+                ProgressView().controlSize(.small)
+            }
         }
     }
 }
