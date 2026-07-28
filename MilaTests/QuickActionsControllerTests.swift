@@ -62,6 +62,43 @@ final class QuickActionsControllerTests: XCTestCase {
         try await super.tearDown()
     }
 
+    // MARK: - Pause / resume
+
+    /// Pause and resume drive the session state through the controller.
+    /// Uses the fake-start seam so no real mic/engine is needed on CI.
+    func test_pause_and_resume_toggle_session_state() async {
+        let url = store.freshAudioURL(suggestedName: "PauseTest")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertFalse(controller.isPaused)
+
+        controller.pauseRecording()
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertTrue(session.state == .paused)
+
+        // Double-pause is a no-op — stays paused.
+        controller.pauseRecording()
+        XCTAssertTrue(session.state == .paused)
+
+        // togglePause resumes.
+        controller.togglePause()
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertTrue(session.state == .recording)
+
+        _ = await session.stop()
+    }
+
+    /// Pause/resume are guarded no-ops when nothing is recording, so a
+    /// stray keyboard shortcut / menu action can't corrupt session state.
+    func test_pause_is_noop_when_not_recording() {
+        XCTAssertFalse(controller.isRecording)
+        controller.pauseRecording()
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertTrue(session.state == .idle)
+        controller.resumeRecording()
+        XCTAssertTrue(session.state == .idle)
+    }
+
     // MARK: - File import → enqueue → transcribe
 
     func test_transcribe_file_adds_recording_and_kicks_off_transcription() async throws {

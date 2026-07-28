@@ -141,6 +141,30 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// Pausing mid-utterance must cut the current VAD utterance cleanly:
+    /// `pauseBoundary()` flushes the detector so the in-progress speech is
+    /// emitted at the pause point instead of being glued onto whatever is
+    /// said after resume. Without a boundary, the detector holds the speech
+    /// until it next sees ≥400ms of silence.
+    func test_pauseBoundary_emits_in_progress_VAD_utterance() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "midway")])
+        transcriber.useVAD = true
+        transcriber.start(language: "en")
+        // 1.2s of speech energy with NO trailing silence — the detector
+        // holds it as an in-progress utterance that wouldn't emit on its own.
+        let speech = Array(repeating: Float(0.05), count: 16_000 * 12 / 10)
+        transcriber.ingest(ArraySlice(speech))
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "utterance shouldn't emit before a silence/pause boundary")
+
+        transcriber.pauseBoundary()
+        // Await the transcribe the flush scheduled.
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["midway"],
+                       "pauseBoundary should flush the in-progress utterance to whisper")
+        _ = transcriber.stop()
+    }
+
     func test_formattedTranscript_uses_timestamps_one_line_per_segment() async {
         await stub.setDefaultCanned([
             TranscriptSegment(start: 0, end: 1, text: "first"),

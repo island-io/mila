@@ -10,7 +10,7 @@ private let recLog = Logger(subsystem: "io.island.whisper.IslandWhisper", catego
 /// Orchestrates microphone + system audio capture into a single mono 16kHz WAV file.
 @MainActor
 final class RecordingSession: ObservableObject {
-    enum State { case idle, recording, stopping }
+    enum State { case idle, recording, paused, stopping }
     @Published private(set) var state: State = .idle
     @Published private(set) var elapsed: TimeInterval = 0
     @Published private(set) var micLevel: Float = 0
@@ -39,6 +39,17 @@ final class RecordingSession: ObservableObject {
     private(set) var fileURL: URL?
     private var audioFile: AVAudioFile?
     private var startTime: Date?
+    /// Wall-clock instant the current pause began. `nil` unless
+    /// `state == .paused`. Used to accumulate `totalPaused` on resume so
+    /// `elapsed` never counts paused time.
+    private var pausedAt: Date?
+    /// Total wall-clock time spent paused so far this session. Subtracted
+    /// from the raw `now - startTime` so `elapsed` reflects only the audio
+    /// that actually made it into the WAV (paused spans are dropped by the
+    /// capture-gate in `consumeMic` / `consumeSystem`), keeping `elapsed`
+    /// aligned with both the on-disk duration and the live segment
+    /// timestamps.
+    private var totalPaused: TimeInterval = 0
     private var timerTask: Task<Void, Never>?
     private var micTask: Task<Void, Never>?
     private var systemTask: Task<Void, Never>?
@@ -147,15 +158,66 @@ final class RecordingSession: ObservableObject {
         }
 
         startTime = Date()
+        pausedAt = nil
+        totalPaused = 0
         state = .recording
+        startElapsedTimer()
+    }
+
+    /// Drives the `elapsed` clock while a session is active. Kept running
+    /// across pauses (`state == .paused`) but only advances the published
+    /// value while `.recording`, so a pause freezes the timer instead of
+    /// letting it jump forward by the paused span on resume.
+    private func startElapsedTimer() {
+        timerTask?.cancel()
         timerTask = Task { @MainActor [weak self] in
-            while let self, self.state == .recording {
-                if let start = self.startTime {
-                    self.elapsed = Date().timeIntervalSince(start)
+            while let self, self.state == .recording || self.state == .paused {
+                if self.state == .recording, let start = self.startTime {
+                    self.elapsed = Self.elapsed(now: Date(), startTime: start,
+                                                totalPaused: self.totalPaused)
                 }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
+    }
+
+    /// Pure elapsed-time computation: raw wall clock since `startTime`
+    /// minus the time already spent paused. Factored out so the
+    /// pause-accounting math is unit-testable without an audio engine.
+    static func elapsed(now: Date, startTime: Date, totalPaused: TimeInterval) -> TimeInterval {
+        max(0, now.timeIntervalSince(startTime) - totalPaused)
+    }
+
+    /// Suspend capture without tearing down the engine. While paused,
+    /// `consumeMic` / `consumeSystem` drop every incoming buffer, so nothing
+    /// is written to the WAV or forwarded to the live transcriber — the
+    /// paused span is genuinely absent from the recording. The mic /
+    /// system-audio engines keep running (we just discard their output)
+    /// rather than stopping, which avoids the fragile fresh-engine-per-
+    /// session bring-up on resume.
+    func pause() {
+        guard state == .recording else { return }
+        pausedAt = Date()
+        // Drop any system-audio the jitter buffer parked before the pause so
+        // it isn't mixed in on resume — otherwise a pre-pause tail would be
+        // glued onto post-pause audio with the paused gap collapsed out.
+        pendingSystem.removeAll(keepingCapacity: false)
+        state = .paused
+        recLog.log("pause: source=\(self.source.rawValue, privacy: .public) elapsed=\(self.elapsed, privacy: .public)")
+    }
+
+    /// Resume a paused session. Accumulates the just-finished pause into
+    /// `totalPaused` so `elapsed` skips it, and clears any system-audio that
+    /// arrived while paused before capture resumes.
+    func resume() {
+        guard state == .paused else { return }
+        if let pausedAt {
+            totalPaused += Date().timeIntervalSince(pausedAt)
+        }
+        pausedAt = nil
+        pendingSystem.removeAll(keepingCapacity: false)
+        state = .recording
+        recLog.log("resume: source=\(self.source.rawValue, privacy: .public) totalPaused=\(self.totalPaused, privacy: .public)")
     }
 
     /// UI-test seam: flip state to .recording without spinning up
@@ -176,19 +238,14 @@ final class RecordingSession: ObservableObject {
         // Skip AVAudioFile setup — the test injects samples directly
         // into onLiveSamples; nothing should be writing to disk.
         startTime = Date()
+        pausedAt = nil
+        totalPaused = 0
         state = .recording
-        timerTask = Task { @MainActor [weak self] in
-            while let self, self.state == .recording {
-                if let start = self.startTime {
-                    self.elapsed = Date().timeIntervalSince(start)
-                }
-                try? await Task.sleep(nanoseconds: 200_000_000)
-            }
-        }
+        startElapsedTimer()
     }
 
     func stop() async -> URL? {
-        guard state == .recording else { return fileURL }
+        guard state == .recording || state == .paused else { return fileURL }
         state = .stopping
         // Snapshot the mic frame count BEFORE teardown so the caller can tell
         // a genuinely-empty mic session apart from a normal one. A fake
@@ -211,6 +268,8 @@ final class RecordingSession: ObservableObject {
         audioFile = nil
         fileURL = nil
         startTime = nil
+        pausedAt = nil
+        totalPaused = 0
         elapsed = 0
         isFakeForTesting = false
         state = .idle
@@ -231,6 +290,8 @@ final class RecordingSession: ObservableObject {
         audioFile = nil
         fileURL = nil
         startTime = nil
+        pausedAt = nil
+        totalPaused = 0
         elapsed = 0
         isFakeForTesting = false
         pendingSystem.removeAll(keepingCapacity: false)
@@ -240,6 +301,10 @@ final class RecordingSession: ObservableObject {
     // MARK: - Mixing
 
     private func consumeMic(_ buffer: AVAudioPCMBuffer) async {
+        // Paused: discard the buffer entirely so nothing reaches the WAV or
+        // the live transcriber. The engine keeps running; we just drop its
+        // output until `resume()`.
+        guard state == .recording else { return }
         let samples = AudioConvert.samples(from: buffer)
         await MainActor.run { self.micLevel = AudioMeter.level(from: buffer) }
         if source == .microphone {
@@ -263,6 +328,10 @@ final class RecordingSession: ObservableObject {
     }
 
     private func consumeSystem(_ buffer: AVAudioPCMBuffer) async {
+        // Paused: drop system audio too (both the inline `.systemAudio`
+        // write and the `.meeting` jitter-buffer append) so the paused span
+        // is absent from the recording.
+        guard state == .recording else { return }
         let samples = AudioConvert.samples(from: buffer)
         await MainActor.run { self.systemLevel = AudioMeter.level(from: buffer) }
         if source == .systemAudio {

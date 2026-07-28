@@ -961,7 +961,7 @@ struct MilaApp: App {
                     }
                     await Self.pumpFixtureWAVOnce(path: wavPath, to: sessionRef, agcEnabled: true)
                 }
-            case .stopping:
+            case .paused, .stopping:
                 break
             case .idle:
                 pumpTask?.cancel()
@@ -1200,9 +1200,18 @@ struct MilaApp: App {
         // The state observer below runs forever now; the `.recording`
         // branch is where we gate on `aiSettings.isLiveAIAvailable`.
 
+        var priorLiveState: RecordingSession.State = .idle
         for await state in sessionRef.$state.values {
+            let previousLiveState = priorLiveState
+            priorLiveState = state
             switch state {
             case .recording:
+                // Resume from pause: the live pipeline is already wired and
+                // the accumulated transcript is intact. Re-running the setup
+                // below would call `transcriber.start()`, which resets
+                // `segments` / `fullText` and wipes everything the user has
+                // seen so far. A pause→resume must be a no-op here.
+                if previousLiveState == .paused { break }
                 guard aiSettings.isLiveAIAvailable else {
                     // Hardware below the Live AI bar AND no override
                     // flipped. Recording still runs via RecordingSession;
@@ -1351,6 +1360,13 @@ struct MilaApp: App {
                         }
                     }
                 }
+            case .paused:
+                // A pause suspends capture but keeps the whole live
+                // pipeline intact — RecordingSession simply drops incoming
+                // audio while paused, so the transcriber / diarizer / feed
+                // loop just see a gap and pick back up on resume. No
+                // teardown (that only happens on `.idle`).
+                break
             case .stopping:
                 // Don't tear down yet — RecordingSession.stop() still
                 // flushes the buffered system-audio tail during

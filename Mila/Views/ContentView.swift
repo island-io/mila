@@ -489,10 +489,13 @@ private struct RecordingChip: View {
     var body: some View {
         HStack(spacing: 10) {
             Circle()
-                .fill(Color.red)
+                .fill(session.state == .paused ? Color.orange : Color.red)
                 .frame(width: 8, height: 8)
             Text(formatDuration(session.elapsed))
                 .font(.callout.monospacedDigit())
+                .foregroundStyle(session.state == .paused ? .orange : .primary)
+            RecordingPauseButton(compact: true)
+                .buttonStyle(.borderless)
             Button {
                 Task { await actions.stopRecording() }
             } label: {

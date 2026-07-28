@@ -1218,4 +1218,39 @@ final class QuickActionsController: ObservableObject {
         guard let file = try? AVAudioFile(forReading: url) else { return nil }
         return Double(file.length) / file.processingFormat.sampleRate
     }
+
+    /// True while an active recording is paused. Reads straight off the
+    /// session's published state so the UI's Pause/Resume affordances stay
+    /// in sync without a separate mirrored flag.
+    var isPaused: Bool { session.state == .paused }
+
+    /// Pause the active recording. While paused the session drops all
+    /// incoming audio (see `RecordingSession.pause()`), so nothing said
+    /// during the pause is written to the WAV or the live transcript. The
+    /// VAD utterance in progress is flushed so it doesn't span the gap.
+    /// No-op if not recording or already finalizing.
+    func pauseRecording() {
+        guard isRecording, !isFinalizingRecording, !isPaused else { return }
+        session.pause()
+        liveTranscriber?.pauseBoundary()
+    }
+
+    /// Resume a paused recording. Capture picks back up where it left off;
+    /// the paused span is absent from the recording and excluded from the
+    /// elapsed clock. No-op if not currently paused.
+    func resumeRecording() {
+        guard isPaused else { return }
+        session.resume()
+    }
+
+    /// Toggle between paused and recording. Bound to the Pause/Resume UI
+    /// controls and safe to call from a keyboard shortcut / menu.
+    func togglePause() {
+        if isPaused {
+            resumeRecording()
+        } else {
+            pauseRecording()
+        }
+    }
 }
+

@@ -112,6 +112,8 @@ struct LiveAIRecordingView: View {
             // the Home Record button to confirm it isn't stuck "Finalizing").
             .accessibilityIdentifier("liveAI.stop")
 
+            RecordingPauseButton()
+
             VStack(alignment: .leading, spacing: 2) {
                 Text(aiActive ? "Recording — Live AI" : "Recording")
                     .font(.callout.weight(.semibold))
@@ -638,9 +640,55 @@ private struct RecordingElapsedLabel: View {
 
     var body: some View {
         let t = Int(session.elapsed.rounded())
-        Text(String(format: "%02d:%02d", t / 60, t % 60))
+        let clock = String(format: "%02d:%02d", t / 60, t % 60)
+        // Show "Paused" alongside the (frozen) clock so the user gets clear
+        // feedback that capture is suspended. This leaf already observes the
+        // session, so folding the paused state in here keeps the larger
+        // view body from re-rendering.
+        Text(session.state == .paused ? "Paused · \(clock)" : clock)
             .font(.caption.monospacedDigit())
-            .foregroundStyle(.secondary)
+            .foregroundStyle(session.state == .paused ? .orange : .secondary)
+    }
+}
+
+/// Pause / Resume control for the active recording. Isolated as a leaf that
+/// observes `RecordingSession` so its paused-state flip doesn't re-render
+/// larger views (which the session's high-frequency level updates would
+/// otherwise churn). Pausing drops all audio until resume, so nothing said
+/// during the pause is recorded. Used by the Live AI header, Home, and the
+/// floating recording chip.
+struct RecordingPauseButton: View {
+    @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var session: RecordingSession
+    /// Icon-only rendering for the compact floating chip; labeled pill
+    /// everywhere else.
+    var compact: Bool = false
+
+    var body: some View {
+        let paused = session.state == .paused
+        Button {
+            actions.togglePause()
+        } label: {
+            if compact {
+                Image(systemName: paused ? "play.fill" : "pause.fill")
+                    .foregroundStyle(paused ? Color.accentColor : .primary)
+            } else {
+                HStack(spacing: 6) {
+                    Image(systemName: paused ? "play.fill" : "pause.fill")
+                    Text(paused ? "Resume" : "Pause")
+                        .font(.callout.weight(.semibold))
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(Color.primary.opacity(0.08),
+                            in: RoundedRectangle(cornerRadius: 8))
+            }
+        }
+        .buttonStyle(.plain)
+        .disabled(actions.isFinalizingRecording)
+        .help(paused ? "Resume recording" : "Pause recording (audio during the pause isn't recorded)")
+        .accessibilityLabel(paused ? "Resume recording" : "Pause recording")
+        .accessibilityIdentifier(paused ? "recording.resume" : "recording.pause")
     }
 }
 
