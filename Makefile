@@ -27,7 +27,7 @@ help:
 	@echo "  models-coreml-tiny - Download ggml-tiny + sibling -encoder.mlmodelc into ~/.cache/whisper-coreml-test/ (for CI ANE verification test)"
 	@echo "  dmg           - Build a release DMG (VERSION=<x.y.z>) suitable for upload"
 	@echo "  e2e           - Run E2E transcription tests (requires ggml-tiny.bin)"
-	@echo "  package-test  - Run TranscriptionCore package unit tests"
+	@echo "  package-test  - Run TranscriptionCore + MilaKit package unit tests"
 	@echo "  bundle-diarization - Produce the bundled Python + pyannote.audio runtime under Mila/Resources/PythonRuntime/"
 	@echo "  clean         - Remove generated project and build artifacts"
 
@@ -118,6 +118,7 @@ models-coreml-tiny:
 
 package-test:
 	cd Packages/TranscriptionCore && swift test
+	cd Packages/MilaKit && swift test
 
 # Produces Mila/Resources/PythonRuntime/ — a relocatable Python
 # 3.11 with pyannote.audio (and deps) pre-installed, minus torch which
