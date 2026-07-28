@@ -13,7 +13,12 @@ import MilaKit
 struct MilaMCPMain {
 
     static func main() async throws {
-        let handlers = MilaMCPToolHandlers()
+        // MILA_ROOT overrides the app-support root — for tests and
+        // debugging against a fixture store; unset in normal use.
+        let root = ProcessInfo.processInfo.environment["MILA_ROOT"]
+            .map { URL(fileURLWithPath: $0, isDirectory: true) }
+            ?? StoreLocationPointer.defaultRoot()
+        let handlers = MilaMCPToolHandlers(root: root)
 
         let tools: [Tool] = try MilaMCPToolHandlers.toolSpecs.map { spec in
             let schemaData = try JSONSerialization.data(withJSONObject: spec.inputSchema)
