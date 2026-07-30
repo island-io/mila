@@ -17,7 +17,24 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.9.1"
+    MARKETING_VERSION: "1.9.2-beta.1"
+    # 1.9.2-beta.1:
+    #   * Beta of the 1.9.2 line. Remote transcription now routes per
+    #     recording language — a Hebrew-only server model (ivrit.ai) no
+    #     longer returns Hebrew words for English speech; set the new
+    #     Settings → Models → "English model" id (#122). The Auto-detect
+    #     recording language is REMOVED in the same change: the speech
+    #     model is chosen from the language, so detection meant picking a
+    #     specialist before knowing the language (#123). Plus: Live AI can
+    #     talk to any OpenAI-compatible endpoint instead of requiring a
+    #     local claude/cursor-agent CLI (#95), and stopping a recording now
+    #     cancels the Live AI session instead of letting one more tick fire
+    #     and leaking its session sandbox (#113).
+    #     See RELEASE_NOTES/v1.9.2-beta.1.md.
+    # 1.9.1:
+    #   * Live AI gained a per-recording Context box, so one meeting's
+    #     agenda no longer leaks into the next meeting's summary via the
+    #     global system prompt. See RELEASE_NOTES/v1.9.1.md.
     # 1.9.0:
     #   * First stable of the 1.9.0 line. Everything from 1.9.0-beta.1
     #     (remote transcription backend, iPhone Voice Memos sync, neural VAD,
@@ -98,7 +115,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "54"
+    CURRENT_PROJECT_VERSION: "55"
 
 packages:
   TranscriptionCore:
