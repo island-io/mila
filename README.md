@@ -41,7 +41,7 @@ running through `whisper.cpp` (GPU via Metal).
   copy/share transcript, RTL rendering for Hebrew.
 - **Auto-discard accidental clips** — very short recordings with no speech are
   dropped automatically (threshold configurable in **Settings → Storage**).
-- **Opt into pre-release builds** via **Settings → Updates**.
+- **Opt into pre-release builds** via **Settings → General → Updates**.
 
 ## System requirements
 
