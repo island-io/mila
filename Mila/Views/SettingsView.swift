@@ -49,7 +49,26 @@ struct SettingsView: View {
                 .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
                 .tag(SettingsTab.updates)
         }
-        .frame(width: 560, height: 560)
+        // The width is load-bearing: it has to hold the whole tab strip.
+        // AppKit's NSTabView collapses whatever doesn't fit into a `>>`
+        // overflow menu, which reads as a stray "expand button" and makes
+        // the collapsed tabs look disabled (reported in #131, fixed here
+        // per #137).
+        //
+        // Measured on macOS 26 at the default system font: the ten tab
+        // items occupy a 599 pt run (widest single item — "Voice Memos" —
+        // is 82 pt).
+        //
+        // The strip is NOT laid out inside this 700 pt frame. `.padding(20)`
+        // below sizes the Settings window to 740 pt, and AppKit draws the
+        // tab strip edge-to-edge across the whole window, so the run has the
+        // full 740 pt to sit in — measured item origins are 70 pt from the
+        // left window edge and 71 pt from the right. That is why 560 failed:
+        // it gave the strip 600 pt for a 599 pt run.
+        //
+        // If you add a tab, re-check Settings for the `>>` chevron rather
+        // than assuming it still fits.
+        .frame(width: 700, height: 560)
         .padding(20)
         .onChange(of: SettingsNavigation.shared.pendingTab, initial: true) { _, newTab in
             if let tab = newTab {
