@@ -280,6 +280,24 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(relaunched.model(for: "en"), "whisper-1")
     }
 
+    /// The reverse sequence, end to end: a value the user typed against a
+    /// multilingual primary must survive a detour through an ivrit primary and
+    /// back. It was never Mila's to withdraw at any point along the way.
+    func test_prefill_withdrawal_userValueSurvivesARoundTripThroughIvrit() {
+        let settings = makeUpgrading(from: "whisper-1")
+        XCTAssertEqual(settings.englishModel, "", "Precondition: multilingual, nothing pre-filled")
+
+        settings.englishModel = "my-own/english-model"   // typed by hand
+        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+        XCTAssertEqual(settings.englishModel, "my-own/english-model",
+                       "The prefill must not overwrite a value the user already typed")
+
+        settings.model = "whisper-1"
+        XCTAssertEqual(settings.englishModel, "my-own/english-model",
+                       "…and the withdrawal must not eat it on the way back either")
+        XCTAssertEqual(settings.model(for: "en"), "my-own/english-model")
+    }
+
     /// An `englishModel` that predates this code has no auto-filled marker, so
     /// it must be treated as the user's and never withdrawn.
     func test_prefill_withdrawal_leavesPreExistingValuesAlone() {
