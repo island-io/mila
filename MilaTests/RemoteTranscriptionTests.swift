@@ -210,6 +210,85 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(settings.englishModel, RemoteTranscriptionSettings.defaultEnglishModel)
     }
 
+    // MARK: - Withdrawing a pre-filled English model
+
+    /// The mirror of the prefill. A pre-filled id only makes sense against the
+    /// ivrit primary that caused it — carried over to a multilingual endpoint it
+    /// names a model that endpoint doesn't have, breaking English outright,
+    /// which is the exact failure the prefill is narrow to avoid.
+    func test_prefill_isWithdrawn_whenPrimaryLeavesIvrit() {
+        let settings = makeUpgrading(from: "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.englishModel, RemoteTranscriptionSettings.defaultEnglishModel,
+                       "Precondition: pre-filled for the ivrit primary")
+
+        settings.model = "whisper-1"
+        XCTAssertEqual(settings.englishModel, "",
+                       "A pre-filled id must not outlive the ivrit primary")
+        XCTAssertEqual(settings.model(for: "en"), "whisper-1",
+                       "English must route to the new multilingual primary")
+        XCTAssertEqual(settings.model(for: "he"), "whisper-1")
+    }
+
+    /// Withdrawal is scoped to values Mila wrote. A model id the user typed is
+    /// theirs and survives any change of primary.
+    func test_prefill_withdrawal_leavesAUserValueAlone() {
+        let settings = makeUpgrading(from: "ivrit-ai/whisper-large-v3-turbo-ct2",
+                                     englishModel: "my-own/english-model")
+        settings.model = "whisper-1"
+        XCTAssertEqual(settings.englishModel, "my-own/english-model",
+                       "Only auto-filled values are withdrawn")
+    }
+
+    /// A value the user typed over the pre-filled one becomes theirs, so the
+    /// later switch away from ivrit must not withdraw it either.
+    func test_prefill_withdrawal_leavesAValueTypedOverThePrefillAlone() {
+        let settings = makeUpgrading(from: "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.englishModel, RemoteTranscriptionSettings.defaultEnglishModel)
+        settings.englishModel = "my-own/english-model"   // user overrides the prefill
+
+        settings.model = "whisper-1"
+        XCTAssertEqual(settings.englishModel, "my-own/english-model")
+    }
+
+    /// Withdrawing is not the same as the user clearing: going back to an ivrit
+    /// primary must pre-fill again rather than treat the blank as a decision.
+    func test_prefill_refillsAfterRoundTripThroughAMultilingualPrimary() {
+        let settings = makeUpgrading(from: "ivrit-ai/whisper-large-v3-turbo-ct2")
+        settings.model = "whisper-1"
+        XCTAssertEqual(settings.englishModel, "")
+
+        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+        XCTAssertEqual(settings.englishModel, RemoteTranscriptionSettings.defaultEnglishModel,
+                       "A withdrawal must not be recorded as an explicit clear")
+    }
+
+    /// The invariant holds across a relaunch too, not just an in-session edit —
+    /// e.g. the primary was changed by a `.milaconfig` on a previous launch.
+    func test_prefill_isWithdrawnOnLaunch_whenPersistedPrimaryIsNotIvrit() {
+        let name = "RemoteTranscriptionSettingsTests.prefill.\(#function)"
+        let suite = UserDefaults(suiteName: name)!
+        suite.removePersistentDomain(forName: name)
+        suite.set("ivrit-ai/whisper-large-v3-turbo-ct2", forKey: "remote.model")
+
+        let first = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: "\(name).apiKey")
+        XCTAssertEqual(first.englishModel, RemoteTranscriptionSettings.defaultEnglishModel)
+        // Primary swapped out from under the auto-filled value, then relaunch.
+        suite.set("whisper-1", forKey: "remote.model")
+
+        let relaunched = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: "\(name).apiKey")
+        XCTAssertEqual(relaunched.englishModel, "")
+        XCTAssertEqual(relaunched.model(for: "en"), "whisper-1")
+    }
+
+    /// An `englishModel` that predates this code has no auto-filled marker, so
+    /// it must be treated as the user's and never withdrawn.
+    func test_prefill_withdrawal_leavesPreExistingValuesAlone() {
+        let settings = makeUpgrading(from: "whisper-1", englishModel: "legacy/english-model")
+        XCTAssertEqual(settings.englishModel, "legacy/english-model")
+        settings.model = "Systran/faster-whisper-large-v3"
+        XCTAssertEqual(settings.englishModel, "legacy/english-model")
+    }
+
     func test_localBackend_doesNotReadKeychain() {
         // Seed a real token under an isolated key, then construct with the
         // default (local) backend. A local-only user must come up with an empty

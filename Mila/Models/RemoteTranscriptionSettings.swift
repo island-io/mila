@@ -80,9 +80,13 @@ final class RemoteTranscriptionSettings: ObservableObject {
         didSet {
             guard model != oldValue else { return }
             defaults.set(model, forKey: Keys.model)
-            // Pointing at a Hebrew-only model is exactly when an English model
-            // is needed, so fill it in at that moment rather than waiting for
-            // the user to notice English transcripts coming back in Hebrew.
+            // Reconcile in BOTH directions. Pointing at a Hebrew-only model is
+            // exactly when an English model is needed, so fill it in at that
+            // moment rather than waiting for the user to notice English
+            // transcripts coming back in Hebrew — and drop the pre-filled id
+            // again when the primary stops being Hebrew-only, because it
+            // belongs to that primary and breaks the next one.
+            clearAutoFilledEnglishModelIfNeeded()
             prefillEnglishModelIfNeeded()
         }
     }
@@ -104,15 +108,20 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// rather than left blank. Shipping it blank meant upgrading changed nothing
     /// until the user found the field — the bug was "fixed" in the binary and
     /// still happening on screen. Clearing it by hand is respected and never
-    /// re-filled.
+    /// re-filled, and a pre-filled value is withdrawn again if the primary
+    /// stops being Hebrew-only.
     @Published var englishModel: String {
         didSet {
             guard englishModel != oldValue else { return }
             defaults.set(englishModel, forKey: Keys.englishModel)
+            guard !isProgrammaticWrite else { return }
+            // Past here the edit is the user's, so the value is theirs: Mila no
+            // longer owns it and must not withdraw it on a later model change.
+            defaults.set(false, forKey: Keys.englishModelAutoFilled)
             // An explicit clear is a decision, not an absence. Record it so no
             // later prefill (a fresh launch, or editing `model`) overrides it.
             if englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               !oldValue.isEmpty, !isPrefilling {
+               !oldValue.isEmpty {
                 defaults.set(true, forKey: Keys.englishModelCleared)
             }
         }
@@ -188,6 +197,13 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // per-language routing existed has a blank English model, and a blank
         // one means "use the Hebrew model for English too" — i.e. the bug this
         // shipped to fix, still happening. Fill it in on first launch.
+        //
+        // The withdraw side runs here too, so "an auto-filled English model
+        // implies a Hebrew-only primary" holds at every point, not just across
+        // an in-session model edit. A no-op for anyone upgrading: the
+        // auto-filled flag is only ever set by Mila's own prefill, so a value
+        // that predates this code is treated as the user's and left alone.
+        clearAutoFilledEnglishModelIfNeeded()
         prefillEnglishModelIfNeeded()
     }
 
@@ -207,14 +223,38 @@ final class RemoteTranscriptionSettings: ObservableObject {
         guard englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !defaults.bool(forKey: Keys.englishModelCleared) else { return }
         guard Self.isHebrewOnlyModel(model) else { return }
-        isPrefilling = true
+        isProgrammaticWrite = true
         englishModel = Self.defaultEnglishModel
-        isPrefilling = false
+        defaults.set(true, forKey: Keys.englishModelAutoFilled)
+        isProgrammaticWrite = false
     }
 
-    /// True only while `prefillEnglishModelIfNeeded` is assigning, so the
-    /// `englishModel` write-back can tell a programmatic fill from a user edit.
-    private var isPrefilling = false
+    /// Withdraw an auto-filled `englishModel` once the primary is no longer
+    /// Hebrew-only — the other half of the prefill, and the same reasoning.
+    ///
+    /// The pre-filled id exists only to serve an ivrit primary. Leaving it
+    /// behind when the user switches to a multilingual endpoint would send that
+    /// endpoint a model id it doesn't have and break English outright, which is
+    /// precisely the failure `prefillEnglishModelIfNeeded` refuses to cause in
+    /// the first place. Withdrawing it restores "English uses the primary".
+    ///
+    /// Only touches values Mila wrote itself (`Keys.englishModelAutoFilled`). A
+    /// model id the user typed is theirs and survives any primary change; so
+    /// does an explicit clear, which leaves nothing to withdraw.
+    private func clearAutoFilledEnglishModelIfNeeded() {
+        guard !Self.isHebrewOnlyModel(model) else { return }
+        guard defaults.bool(forKey: Keys.englishModelAutoFilled) else { return }
+        isProgrammaticWrite = true
+        // Not a user clear, so this must not set `Keys.englishModelCleared` —
+        // switching back to an ivrit primary should pre-fill again.
+        englishModel = ""
+        defaults.set(false, forKey: Keys.englishModelAutoFilled)
+        isProgrammaticWrite = false
+    }
+
+    /// True only while this class is assigning `englishModel` itself, so the
+    /// write-back can tell its own fill/withdraw from a user edit.
+    private var isProgrammaticWrite = false
 
     /// Lazily read the bearer token from the Keychain the first time the remote
     /// backend is selected. Idempotent (guarded by `hasLoadedAPIKey`) and
@@ -429,6 +469,10 @@ final class RemoteTranscriptionSettings: ObservableObject {
         /// Set once the user empties `englishModel` by hand, so the prefill
         /// never overrides that choice on a later launch or model edit.
         static let englishModelCleared = "remote.model.en.cleared"
+        /// True while the current `englishModel` is one Mila pre-filled rather
+        /// than one the user typed — so it can be withdrawn again if the primary
+        /// stops being Hebrew-only, without ever discarding the user's own value.
+        static let englishModelAutoFilled = "remote.model.en.autofilled"
         static let apiKey = "remote.apiKey"
     }
 }
