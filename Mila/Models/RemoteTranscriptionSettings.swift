@@ -80,6 +80,10 @@ final class RemoteTranscriptionSettings: ObservableObject {
         didSet {
             guard model != oldValue else { return }
             defaults.set(model, forKey: Keys.model)
+            // Pointing at a Hebrew-only model is exactly when an English model
+            // is needed, so fill it in at that moment rather than waiting for
+            // the user to notice English transcripts coming back in Hebrew.
+            prefillEnglishModelIfNeeded()
         }
     }
 
@@ -92,13 +96,25 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// were never trained multilingual. A single model id had no way to express
     /// "Hebrew here, English there".
     ///
-    /// Empty (the default) means "use `model` for every language", which is
-    /// correct for genuinely multilingual endpoints like OpenAI's `whisper-1`
-    /// and preserves the pre-existing behaviour for anyone already configured.
+    /// Empty means "use `model` for every language", which is correct for
+    /// genuinely multilingual endpoints like OpenAI's `whisper-1`.
+    ///
+    /// **Pre-filled for Hebrew-only endpoints.** When `model` is an ivrit.ai id
+    /// this is populated with `defaultEnglishModel` (see `prefillEnglishModelIfNeeded`)
+    /// rather than left blank. Shipping it blank meant upgrading changed nothing
+    /// until the user found the field — the bug was "fixed" in the binary and
+    /// still happening on screen. Clearing it by hand is respected and never
+    /// re-filled.
     @Published var englishModel: String {
         didSet {
             guard englishModel != oldValue else { return }
             defaults.set(englishModel, forKey: Keys.englishModel)
+            // An explicit clear is a decision, not an absence. Record it so no
+            // later prefill (a fresh launch, or editing `model`) overrides it.
+            if englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !oldValue.isEmpty, !isPrefilling {
+                defaults.set(true, forKey: Keys.englishModelCleared)
+            }
         }
     }
 
@@ -121,6 +137,22 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     static let defaultEndpoint = "https://api.openai.com/v1"
     static let defaultModel = "whisper-1"
+
+    /// The English/multilingual model pre-filled for Hebrew-only endpoints: a
+    /// CTranslate2 build of Whisper large-v3-turbo, which is what Mila's own
+    /// `mila-asr` server warms alongside the ivrit finetune. Turbo rather than
+    /// full large-v3 because the live path sends one utterance at a time and
+    /// latency shows.
+    static let defaultEnglishModel = "deepdml/faster-whisper-large-v3-turbo-ct2"
+
+    /// Whether `modelID` names a Hebrew-only ivrit.ai finetune — the case that
+    /// needs a separate English model. Substring match on `ivrit`, which covers
+    /// every published variant (`ivrit-ai/whisper-large-v3-turbo-ct2`,
+    /// `ivrit-ai/whisper-large-v3-ggml`, …) and any local rehost that keeps the
+    /// name. Pure + `static` so the prefill rule is testable on its own.
+    static func isHebrewOnlyModel(_ modelID: String) -> Bool {
+        modelID.lowercased().contains("ivrit")
+    }
 
     private let defaults: UserDefaults
     private let urlSession: URLSession
@@ -152,7 +184,37 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // it's the restored choice, otherwise lazily in `backend.didSet`).
         self.apiKey = ""
         if backend == .remote { loadAPIKeyIfNeeded() }
+        // Upgrade path: everyone already pointed at an ivrit.ai endpoint before
+        // per-language routing existed has a blank English model, and a blank
+        // one means "use the Hebrew model for English too" — i.e. the bug this
+        // shipped to fix, still happening. Fill it in on first launch.
+        prefillEnglishModelIfNeeded()
     }
+
+    /// Set `englishModel` to `defaultEnglishModel` when the primary model is
+    /// Hebrew-only and the user hasn't chosen otherwise.
+    ///
+    /// Deliberately narrow — it fires only for ivrit.ai primaries. A blank
+    /// English model is *correct* for a multilingual endpoint (OpenAI's
+    /// `whisper-1`, a plain `Systran/faster-whisper-large-v3` deployment), and
+    /// filling one in there would send a model id the server doesn't have and
+    /// break English outright. Wrong-language text is bad; a hard failure is
+    /// worse.
+    ///
+    /// No-ops when: the field already has a value, the user explicitly cleared
+    /// it (`Keys.englishModelCleared`), or the primary isn't ivrit.
+    private func prefillEnglishModelIfNeeded() {
+        guard englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !defaults.bool(forKey: Keys.englishModelCleared) else { return }
+        guard Self.isHebrewOnlyModel(model) else { return }
+        isPrefilling = true
+        englishModel = Self.defaultEnglishModel
+        isPrefilling = false
+    }
+
+    /// True only while `prefillEnglishModelIfNeeded` is assigning, so the
+    /// `englishModel` write-back can tell a programmatic fill from a user edit.
+    private var isPrefilling = false
 
     /// Lazily read the bearer token from the Keychain the first time the remote
     /// backend is selected. Idempotent (guarded by `hasLoadedAPIKey`) and
@@ -364,6 +426,9 @@ final class RemoteTranscriptionSettings: ObservableObject {
         static let endpoint = "remote.endpoint"
         static let model = "remote.model"
         static let englishModel = "remote.model.en"
+        /// Set once the user empties `englishModel` by hand, so the prefill
+        /// never overrides that choice on a later launch or model edit.
+        static let englishModelCleared = "remote.model.en.cleared"
         static let apiKey = "remote.apiKey"
     }
 }
