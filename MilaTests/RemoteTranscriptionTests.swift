@@ -64,13 +64,26 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
 
     func test_modelForLanguage_withoutEnglishModel_alwaysUsesPrimary() {
         let settings = makeSettings()
-        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
-        // Empty englishModel is the default and must preserve the old
-        // single-model behaviour for every language.
+        // A multilingual primary is the case that stays blank — the prefill is
+        // ivrit-only (see `test_prefill_leavesMultilingualEndpointsAlone`), so
+        // this exercises the resolver's "empty means use the primary" fallback.
+        settings.model = "Systran/faster-whisper-large-v3"
+        XCTAssertEqual(settings.englishModel, "", "Precondition: nothing pre-filled here")
+        XCTAssertEqual(settings.model(for: "he"), "Systran/faster-whisper-large-v3")
+        XCTAssertEqual(settings.model(for: "en"), "Systran/faster-whisper-large-v3")
+        XCTAssertEqual(settings.model(for: "auto"), "Systran/faster-whisper-large-v3",
+                       "Legacy auto must not resolve to a model the user never configured")
+    }
+
+    /// The same fallback with an ivrit primary, which only stays blank once the
+    /// user has cleared the field by hand. Their clear must route every language
+    /// back to the primary rather than resurrecting the pre-filled English id.
+    func test_modelForLanguage_ivritPrimaryWithClearedEnglishModel_usesPrimary() {
+        let settings = makeUpgrading(from: "ivrit-ai/whisper-large-v3-turbo-ct2", cleared: true)
+        XCTAssertEqual(settings.englishModel, "")
         XCTAssertEqual(settings.model(for: "he"), "ivrit-ai/whisper-large-v3-turbo-ct2")
         XCTAssertEqual(settings.model(for: "en"), "ivrit-ai/whisper-large-v3-turbo-ct2")
-        XCTAssertEqual(settings.model(for: "auto"), "ivrit-ai/whisper-large-v3-turbo-ct2",
-                       "Legacy auto must not resolve to a model the user never configured")
+        XCTAssertEqual(settings.model(for: "auto"), "ivrit-ai/whisper-large-v3-turbo-ct2")
     }
 
     func test_modelForLanguage_routesEnglishAndAutoToEnglishModel() {
