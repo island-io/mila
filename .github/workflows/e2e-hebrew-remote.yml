@@ -40,16 +40,12 @@ on:
       - 'MilaTests/RemoteTranscriptionE2ETests.swift'
       - 'docker/speaches-hebrew/**'
       - '.github/workflows/e2e-hebrew-remote.yml'
+  # NOTE: deliberately NOT path-filtered. These jobs are REQUIRED status checks,
+  # and GitHub blocks a PR forever on a required check that never reports — which
+  # is exactly what a workflow-level `paths:` filter causes on an unrelated PR.
+  # The relevance test moved into the `changes` job below; the heavy jobs skip
+  # when it says no, and a skipped job satisfies a required check.
   pull_request:
-    paths:
-      - 'Mila/Transcription/RemoteWhisperEngine.swift'
-      - 'Mila/Models/RemoteTranscriptionSettings.swift'
-      # Keep in sync with the `push` filter: the shared transcription service
-      # routes the remote path, so PRs touching it must run this E2E too.
-      - 'Mila/Transcription/TranscriptionService.swift'
-      - 'MilaTests/RemoteTranscriptionE2ETests.swift'
-      - 'docker/speaches-hebrew/**'
-      - '.github/workflows/e2e-hebrew-remote.yml'
 
 permissions:
   contents: read
@@ -66,12 +62,55 @@ env:
 
 jobs:
   # ----------------------------------------------------------------------------
+  # GATE: is this PR actually touching the remote-transcription path? Cheap
+  # (seconds on a Linux runner) so the two heavy jobs below can be skipped
+  # without costing the workflow its ability to report a status.
+  # ----------------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide whether the remote path changed
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Anything that isn't a PR (push to main, manual dispatch) always runs.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "event=$EVENT -> always run"
+            exit 0
+          fi
+          # Keep this list in sync with the `push` paths filter above.
+          PATTERN='^(Mila/Transcription/RemoteWhisperEngine\.swift|Mila/Models/RemoteTranscriptionSettings\.swift|Mila/Transcription/TranscriptionService\.swift|MilaTests/RemoteTranscriptionE2ETests\.swift|docker/speaches-hebrew/|\.github/workflows/e2e-hebrew-remote\.yml)'
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          echo "=== changed files"; echo "$CHANGED"
+          if echo "$CHANGED" | grep -Eq "$PATTERN"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "=> remote transcription touched, running the real E2E"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "=> nothing on the remote path changed, skipping (reports as success)"
+          fi
+
+  # ----------------------------------------------------------------------------
   # SERVER: Linux. Builds the speaches image from the checkout, runs the
   # container, opens a cloudflared quick tunnel, publishes the tunnel URL as an
   # artifact, then stays alive serving until the client uploads the "done"
   # artifact (or a hard timeout).
   # ----------------------------------------------------------------------------
   speaches-server:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -119,32 +158,67 @@ jobs:
         run: |
           # No account/secret needed — quick tunnels mint a random
           # *.trycloudflare.com hostname. cloudflared logs the URL to stderr.
-          cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 \
-            > tunnel.log 2>&1 &
-          echo $! > tunnel.pid
+          #
+          # RETRIED, because this is the one step in the workflow that depends on
+          # a free third-party service with no SLA. Cloudflare quick tunnels
+          # intermittently fail to register (no URL printed) or register a
+          # hostname that never routes (URL printed, /health never answers), and
+          # a single-attempt bring-up turned that into a red build on a PR whose
+          # own two earlier runs had passed. Each attempt starts a FRESH
+          # cloudflared so a half-registered tunnel isn't reused.
+          attempt_tunnel() {
+            rm -f tunnel.log tunnel.url
+            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 \
+              > tunnel.log 2>&1 &
+            echo $! > tunnel.pid
+            local url=""
+            for i in $(seq 1 45); do
+              url=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              if [ -n "$url" ]; then break; fi
+              sleep 2
+            done
+            if [ -z "$url" ]; then
+              echo "  no tunnel URL appeared within 90s"
+              return 1
+            fi
+            echo "  got $url — checking it proxies to speaches"
+            # A URL is not a working tunnel: verify it actually reaches speaches
+            # before handing it to the client, or the client fails downstream
+            # with something far more confusing than "tunnel didn't come up".
+            for i in $(seq 1 30); do
+              if curl -fsS "$url/health" >/dev/null 2>&1; then
+                echo "  tunnel reaches speaches /health"
+                printf '%s' "$url" > tunnel.url
+                return 0
+              fi
+              sleep 2
+            done
+            echo "  $url never proxied to /health within 60s"
+            return 1
+          }
+
           URL=""
-          for i in $(seq 1 60); do
-            URL=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
-            if [ -n "$URL" ]; then break; fi
-            sleep 2
+          for attempt in 1 2 3; do
+            echo "=== tunnel attempt $attempt/3"
+            if attempt_tunnel; then
+              URL=$(cat tunnel.url)
+              break
+            fi
+            echo "--- cloudflared log for failed attempt $attempt"
+            cat tunnel.log || true
+            # Tear the failed process down before retrying; two cloudflared
+            # processes racing on one port is its own failure mode.
+            if [ -f tunnel.pid ]; then
+              kill "$(cat tunnel.pid)" 2>/dev/null || true
+              wait "$(cat tunnel.pid)" 2>/dev/null || true
+            fi
+            sleep 5
           done
           if [ -z "$URL" ]; then
-            echo "::error::tunnel URL never appeared"; cat tunnel.log; exit 1
+            echo "::error::tunnel never came up after 3 attempts (cloudflare quick tunnel unavailable)"
+            exit 1
           fi
           echo "Tunnel URL: $URL"
-          # Verify the tunnel actually proxies to speaches before handing it
-          # off. Fail fast if it never comes up — handing a dead URL to the
-          # client just produces a confusing downstream test failure.
-          tunnel_ok=""
-          for i in $(seq 1 30); do
-            if curl -fsS "$URL/health" >/dev/null 2>&1; then
-              echo "tunnel reaches speaches /health"; tunnel_ok=1; break
-            fi
-            sleep 2
-          done
-          if [ -z "$tunnel_ok" ]; then
-            echo "::error::tunnel never proxied to speaches /health"; cat tunnel.log; exit 1
-          fi
           # The remote endpoint Mila expects is the OpenAI-style /v1 base.
           printf '%s/v1' "$URL" > endpoint.txt
           echo "endpoint=$(cat endpoint.txt)" >> "$GITHUB_OUTPUT"
@@ -197,6 +271,8 @@ jobs:
   # "done" marker so the server job can tear down.
   # ----------------------------------------------------------------------------
   mila-client:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
     runs-on: macos-26
     timeout-minutes: 45
     steps:
