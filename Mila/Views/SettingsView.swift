@@ -1023,7 +1023,7 @@ private struct AIProviderSettingsTab: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 12) {
                 toolRow
-                AICaption("Shared by every AI feature. Only transcript text is ever sent — never audio.")
+                AICaption("Used by every AI feature. Only transcript text is sent, never audio.")
 
                 if settings.tool != .none {
                     Divider()
@@ -1155,7 +1155,7 @@ private struct AIProviderSettingsTab: View {
 
     private var remoteEndpointWarning: some View {
         Label {
-            Text("Remote endpoint — transcript text leaves your Mac. Pick a provider you trust.")
+            Text("Remote endpoint — transcript text leaves your Mac.")
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
         } icon: {
@@ -1164,6 +1164,7 @@ private struct AIProviderSettingsTab: View {
         }
         .frame(maxWidth: aiCaptionWidth, alignment: .leading)
         .padding(.leading, aiLabelWidth + aiLabelGap)
+        .help("This base URL is not localhost, loopback or .local, so transcript text is sent off your machine for processing. Choose a provider you trust.")
     }
 
     // MARK: Timeout
@@ -1399,7 +1400,7 @@ private struct AIFeaturesSettingsTab: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Text("No AI provider is set up yet — these features stay idle until you pick one in Settings → AI Provider.")
+            Text("No AI provider yet — set one up in Settings → AI Provider.")
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: aiCaptionWidth, alignment: .leading)
@@ -1488,7 +1489,7 @@ private struct LiveAISection: View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.circle.fill")
                 .foregroundStyle(.orange)
-            Text("Your provider is a remote endpoint, so Live AI won't run. Switch to a CLI tool or a local endpoint.")
+            Text("Won't run on a remote endpoint. Use a CLI tool or a local one.")
                 .font(.caption)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: aiCaptionWidth, alignment: .leading)
@@ -1511,10 +1512,11 @@ private struct LiveAISection: View {
             HStack(alignment: .top, spacing: 8) {
                 Image(systemName: "exclamationmark.circle.fill")
                     .foregroundStyle(.orange)
-                Text("Live AI is gated off on Air-class chips, where it couldn't keep up. Recordings still transcribe in the background.")
+                Text("Gated off on Air-class chips. Recordings still transcribe.")
                     .font(.caption)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+                    .help("Live AI was too slow on Air-class chips when this gate was added. With Apple Neural Engine encoder offload it may now keep up — hence the override below. Recordings transcribe in the background either way.")
             }
             Toggle("Try Live AI anyway", isOn: $settings.forceLiveAIOnLowEndHardware)
                 .font(.callout)
@@ -1540,11 +1542,12 @@ private struct LiveAISection: View {
             // recording — which produced blended "previous meeting + this
             // meeting" summaries and action items lifted from a stale
             // agenda. Point users at the per-meeting Context box instead.
-            Text("Reused for every recording — put one meeting's agenda in the recording pane's **Context** box.")
+            Text("Reused for every recording. One meeting's agenda goes in **Context**.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+                .help("Anything meeting-specific pasted here silently applies to every LATER recording, which produced blended \u{201C}previous meeting + this meeting\u{201D} summaries. The Context box in the recording pane is cleared when that recording stops — put per-meeting notes there instead.")
         }
     }
 
