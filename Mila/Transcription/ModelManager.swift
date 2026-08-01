@@ -130,18 +130,11 @@ final class ModelManager: NSObject, ObservableObject {
     /// installed yet (so dictation can still work in offline-but-different
     /// language mode while a download is in flight).
     func model(for languageCode: String) -> WhisperModel? {
-        // "auto" = let whisper detect each utterance's language rather than
-        // forcing one. Keep the user's *selected* model so a Hebrew user
-        // doesn't trade ivrit.ai's Hebrew accuracy for the multilingual
-        // generalist just to catch the occasional English sentence; both
-        // shipped models are multilingual-capable, so detection still routes
-        // English utterances to English text. Fall back to the turbo
-        // (explicitly multilingual) if nothing usable is selected.
-        if languageCode.lowercased() == "auto" {
-            if let selected = selectedModel(), isInstalled(selected) { return selected }
-            if isInstalled(.openaiTurbo) { return .openaiTurbo }
-            return selectedModel() ?? .openaiTurbo
-        }
+        // Legacy `"auto"` (the retired auto-detect option — see
+        // `RecordingLanguage`) resolves through `bestModel` to the turbo, the
+        // explicitly multilingual one, which is the right engine for a
+        // detect-the-language pass. Only reachable by re-transcribing a
+        // recording made before auto-detect was removed.
         let best = WhisperModel.bestModel(for: languageCode)
         if isInstalled(best) { return best }
         return selectedModel().flatMap { isInstalled($0) ? $0 : nil } ?? best

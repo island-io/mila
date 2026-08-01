@@ -62,4 +62,48 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         XCTAssertEqual(RecordingLanguage.fromCode("fr"), .hebrew)
         XCTAssertEqual(RecordingLanguage.fromCode(""), .hebrew)
     }
+
+    /// Only `en` and its regional forms are English. A bare prefix match would
+    /// route anything starting with those letters to the English model, against
+    /// the documented "unrecognised → Hebrew" contract.
+    func test_language_code_decoding_does_not_prefix_match_unrelated_codes() {
+        XCTAssertEqual(RecordingLanguage.fromCode("en_GB"), .english)
+        XCTAssertEqual(RecordingLanguage.fromCode("enochian"), .hebrew)
+        XCTAssertEqual(RecordingLanguage.fromCode("held"), .hebrew,
+                       "Unrecognised codes land on Hebrew either way, but not via a prefix match")
+    }
+
+    /// Auto-detect was removed: the language is always an explicit choice, and
+    /// the toolbar picker is `allCases`-driven, so this guards the picker's
+    /// contents too.
+    func test_only_hebrew_and_english_are_offered() {
+        XCTAssertEqual(RecordingLanguage.allCases, [.hebrew, .english])
+        XCTAssertNil(RecordingLanguage(rawValue: "auto"))
+    }
+
+    /// A recording tagged by an older build still carries `"auto"`; the UI must
+    /// read it as Hebrew rather than crashing or showing a blank language.
+    func test_legacy_auto_code_reads_as_hebrew() {
+        XCTAssertEqual(RecordingLanguage.fromCode("auto"), .hebrew)
+    }
+
+    /// Someone upgrading from a build that had auto-detect has `"auto"` sitting
+    /// in defaults. It must resolve to Hebrew *and* be rewritten, so the stale
+    /// value doesn't linger in the plist.
+    func test_persisted_auto_migrates_to_hebrew() {
+        defaults.set("auto", forKey: "recording.language")
+
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(settings.current, .hebrew)
+        XCTAssertEqual(defaults.string(forKey: "recording.language"), "he",
+                       "The retired value must be rewritten, not just ignored")
+    }
+
+    /// A fresh install has no stored value — don't write one just to migrate
+    /// nothing (that would make "never chosen" indistinguishable from "chose
+    /// Hebrew" for any future first-run logic).
+    func test_fresh_install_does_not_write_a_language() {
+        _ = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertNil(defaults.string(forKey: "recording.language"))
+    }
 }
