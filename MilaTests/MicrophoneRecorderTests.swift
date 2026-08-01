@@ -262,6 +262,22 @@ final class RebuildThrottleTests: XCTestCase {
         XCTAssertTrue(throttle.allow(now: t0.addingTimeInterval(600)))
         XCTAssertEqual(throttle.currentInterval, 1, "the ladder should start over after a quiet spell")
     }
+
+    /// The subtle one, and a real bug caught by CI on the first push: a burst
+    /// that has saturated the backoff arrives *exactly* `maximumInterval`
+    /// apart. If that counted as a quiet spell, the ladder would reset on
+    /// every tick and the effective floor would collapse back to
+    /// `minimumInterval` — the unpaced behaviour, reintroduced one level up.
+    func test_pacing_exactly_at_the_ceiling_is_not_a_quiet_spell() {
+        var throttle = RebuildThrottle(minimumInterval: 1, maximumInterval: 8)
+        var now = t0
+        for _ in 0..<8 {
+            XCTAssertTrue(throttle.allow(now: now))
+            now = now.addingTimeInterval(throttle.currentInterval)
+        }
+        XCTAssertEqual(throttle.currentInterval, 8,
+                       "a burst pacing itself at the ceiling must stay at the ceiling")
+    }
 }
 
 /// End-to-end wiring of the watchdog, driven through the `bringUpOverride`

@@ -99,9 +99,16 @@ struct RebuildThrottle {
 
     private var lastAllowedAt: Date?
     /// Rebuilds allowed in the current burst. Reset once things go quiet for
-    /// `maximumInterval`, so an unrelated device change an hour into a meeting
+    /// `quietPeriod`, so an unrelated device change an hour into a meeting
     /// isn't punished for a storm at the start of it.
     private(set) var streak = 0
+
+    /// Idle time that ends a burst. Twice the ceiling rather than the ceiling
+    /// itself: a burst that has saturated the backoff arrives *exactly* one
+    /// `maximumInterval` apart, and treating that as "quiet" would reset the
+    /// ladder on every tick and cap the backoff at `minimumInterval` forever —
+    /// which is the bug this type exists to prevent, reintroduced one level up.
+    var quietPeriod: TimeInterval { maximumInterval * 2 }
 
     init(minimumInterval: TimeInterval, maximumInterval: TimeInterval) {
         self.minimumInterval = minimumInterval
@@ -123,8 +130,8 @@ struct RebuildThrottle {
         if let last = lastAllowedAt {
             let elapsed = now.timeIntervalSince(last)
             if elapsed < currentInterval { return false }
-            // Quiet for a full backoff ceiling: the previous burst is over.
-            if elapsed >= maximumInterval { streak = 0 }
+            // Quiet for long enough that the previous burst is over.
+            if elapsed >= quietPeriod { streak = 0 }
         }
         lastAllowedAt = now
         streak += 1
