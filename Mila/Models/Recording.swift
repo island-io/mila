@@ -242,12 +242,24 @@ struct Recording: Identifiable, Codable, Hashable {
     /// check so recordings captured before `appName` existed still match.
     /// Used by list rows to surface an app-specific badge (e.g. Zoom-blue,
     /// Teams-purple) instead of the generic source icon.
+    ///
+    /// `appName` is matched against EVERY app before the title fallback is
+    /// tried for any of them — the two passes must not be interleaved. A
+    /// single pass that checks "appName or title" per app lets an earlier
+    /// case win on the weaker signal: a Teams recording (`appName ==
+    /// "Microsoft Teams"`) whose title happens to mention Zoom would be
+    /// badged as Zoom purely because `.zoom` is declared first. `appName` is
+    /// the authoritative signal; the title is only a legacy guess.
     var detectedMeetingApp: MeetingApp? {
-        MeetingApp.allCases.first { app in
-            if let name = appName?.lowercased(), name.contains(app.info.matchSubstring) {
-                return true
-            }
-            return title.lowercased().contains(app.info.matchSubstring)
+        if let name = appName?.lowercased(),
+           let byAppName = MeetingApp.allCases.first(where: {
+               name.contains($0.info.matchSubstring)
+           }) {
+            return byAppName
+        }
+        let loweredTitle = title.lowercased()
+        return MeetingApp.allCases.first {
+            loweredTitle.contains($0.info.matchSubstring)
         }
     }
 }

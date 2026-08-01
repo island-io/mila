@@ -160,6 +160,45 @@ final class RecordingTests: XCTestCase {
                       "Legacy recordings without appName should still match via title")
     }
 
+    /// `appName` is the authoritative signal and must beat a conflicting
+    /// title for EVERY app, not just the first `MeetingApp` case. Regression
+    /// test for the interleaved single-pass match, where a Teams recording
+    /// whose title mentioned Zoom was badged Zoom purely because `.zoom` is
+    /// declared first in `allCases`.
+    func test_detected_meeting_app_prefers_app_name_over_conflicting_title() {
+        let teamsAppZoomTitle = Recording(
+            title: "Zoom sync notes",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "Microsoft Teams"
+        )
+        XCTAssertEqual(teamsAppZoomTitle.detectedMeetingApp, .teams,
+                       "appName must win over a conflicting title regardless of case order")
+
+        // ...and symmetrically, so this isn't just re-encoding the ordering.
+        let zoomAppTeamsTitle = Recording(
+            title: "Teams sync notes",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "zoom.us"
+        )
+        XCTAssertEqual(zoomAppTeamsTitle.detectedMeetingApp, .zoom,
+                       "appName must win over a conflicting title in both directions")
+    }
+
+    /// An `appName` that matches no known meeting app must not suppress the
+    /// legacy title fallback — the two passes are ordered, not exclusive.
+    func test_detected_meeting_app_falls_back_to_title_when_app_name_unknown() {
+        let unknownAppZoomTitle = Recording(
+            title: "Zoom · Yesterday",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "Safari"
+        )
+        XCTAssertEqual(unknownAppZoomTitle.detectedMeetingApp, .zoom,
+                       "An unrecognised appName should still allow the title fallback")
+    }
+
     func test_appName_round_trips_through_codable() throws {
         let original = Recording(
             title: "Standup",
