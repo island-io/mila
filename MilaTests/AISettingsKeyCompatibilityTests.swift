@@ -178,12 +178,27 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         XCTAssertNotEqual(SettingsTab.aiProvider, SettingsTab.models)
         XCTAssertNotEqual(SettingsTab.aiFeatures, SettingsTab.speakers)
 
-        // Every tab tag is unique. The enum is `Int`-raw-valued and the split
-        // inserted a case mid-list, so a hand-written raw value colliding with
-        // a neighbour would silently make two tabs share a tag.
-        let all: [SettingsTab] = [.general, .audio, .models, .aiProvider, .aiFeatures,
-                                  .speakers, .meetings, .voiceMemos, .storage]
-        XCTAssertEqual(Set(all).count, all.count, "Two Settings tabs share a tag")
+        // Pin the raw values. Asserting the cases are merely *distinct* would
+        // be vacuous — `Hashable` is synthesized over the cases, so they never
+        // collide whatever their raw values, and Swift rejects duplicate
+        // explicit raw values at compile time. What the split actually risks
+        // is SHIFTING the implicit raw value of every case after the insertion
+        // point. Nothing persists them today (`SettingsNavigation.pendingTab`
+        // is in-memory only, which is why this PR could renumber freely), so
+        // this is a tripwire for whoever first writes one to disk or a URL.
+        //
+        // The list is also the authoritative tab inventory: nine tabs, which
+        // is what the measured tab-strip run in `SettingsView` assumes. Adding
+        // a tenth needs that measurement redone, not just a line here.
+        XCTAssertEqual(SettingsTab.general.rawValue, 0)
+        XCTAssertEqual(SettingsTab.audio.rawValue, 1)
+        XCTAssertEqual(SettingsTab.models.rawValue, 2)
+        XCTAssertEqual(SettingsTab.aiProvider.rawValue, 3)
+        XCTAssertEqual(SettingsTab.aiFeatures.rawValue, 4)
+        XCTAssertEqual(SettingsTab.speakers.rawValue, 5)
+        XCTAssertEqual(SettingsTab.meetings.rawValue, 6)
+        XCTAssertEqual(SettingsTab.voiceMemos.rawValue, 7)
+        XCTAssertEqual(SettingsTab.storage.rawValue, 8)
     }
 
     // MARK: - Controls the two-tab split moved between screens

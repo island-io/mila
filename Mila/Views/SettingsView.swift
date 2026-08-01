@@ -1353,20 +1353,20 @@ private struct AIFeaturesSettingsTab: View {
                 Divider()
 
                 AIFeatureRow(title: "Live AI mode",
-                             caption: liveAI.isLiveAIAvailable
-                                 ? "Show action items while the recording runs."
-                                 : "Not available on this Mac — expand for the override.",
+                             caption: liveAICaption,
                              help: "During a recording Mila streams the transcript to your provider every few seconds and surfaces action items in real time. The home screen swaps to a split-pane recording view as soon as you press Record.",
                              isOn: $liveAI.enabled,
-                             // Hardware gate: the switch stays visible (so the
-                             // user knows the feature exists) but is inert on
-                             // Macs where Live AI can't keep up. The persisted
-                             // value still round-trips.
-                             toggleDisabled: !liveAI.isLiveAIAvailable,
+                             // Both gates grey the switch out rather than
+                             // hiding it, so the user can still see the
+                             // feature exists. The persisted value keeps
+                             // round-tripping either way.
+                             toggleDisabled: !liveAI.isLiveAIAvailable
+                                 || settings.liveAIDisabledByRemoteOpenAI,
                              toggleIdentifier: "liveAI.enabled.toggle",
                              identifier: "ai.section.liveAI",
                              isExpanded: $showLiveAI) {
-                    LiveAISection(settings: liveAI)
+                    LiveAISection(settings: liveAI,
+                                  disabledByRemoteEndpoint: settings.liveAIDisabledByRemoteOpenAI)
                 }
 
                 Spacer(minLength: 0)
@@ -1374,6 +1374,23 @@ private struct AIFeaturesSettingsTab: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 4)
         }
+    }
+
+    /// Live AI has two independent gates on top of the user's own switch, and
+    /// a switch that reads "on" while the feature is inert is exactly the
+    /// legibility problem this redesign is fixing. Say which gate is closed.
+    ///
+    /// Hardware comes first: its override lives one click away in the expanded
+    /// body, whereas the remote-endpoint gate is only cleared by changing the
+    /// provider on the other tab.
+    private var liveAICaption: String {
+        if !liveAI.isLiveAIAvailable {
+            return "Not available on this Mac — expand for the override."
+        }
+        if settings.liveAIDisabledByRemoteOpenAI {
+            return "Off while the provider is a remote endpoint."
+        }
+        return "Show action items while the recording runs."
     }
 
     /// Shown once, at the top, instead of repeating "no provider" inside every
@@ -1443,6 +1460,10 @@ private struct AIFeaturesSettingsTab: View {
 /// per tick rather than inheriting the CLI default.
 private struct LiveAISection: View {
     @ObservedObject var settings: LiveAISettings
+    /// `LLMSettings.liveAIDisabledByRemoteOpenAI`, passed as a plain `Bool`
+    /// rather than the whole settings object so this view doesn't re-render on
+    /// every unrelated provider edit.
+    let disabledByRemoteEndpoint: Bool
     @State private var showAdvanced: Bool = false
 
     var body: some View {
@@ -1450,10 +1471,34 @@ private struct LiveAISection: View {
             if !settings.isLiveAIAvailable {
                 hardwareDisabledNotice
             }
+            if disabledByRemoteEndpoint {
+                remoteEndpointDisabledNotice
+            }
             promptEditor
             advancedDisclosure
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// Live AI is gated to local endpoints (`liveAIDisabledByRemoteOpenAI`),
+    /// and `LiveAISession` enforces that silently — so without this the switch
+    /// could be on, the recording could run, and no action items would ever
+    /// appear with nothing on screen explaining why.
+    private var remoteEndpointDisabledNotice: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
+            Text("Your provider is a remote endpoint, so Live AI won't run. Switch to a CLI tool or a local endpoint.")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 6))
+        .help("Every Live AI tick re-sends the whole transcript. A hosted OpenAI-compatible endpoint bills that in full each time with no prompt-cache discount, so Mila restricts the live loop to CLI tools and local endpoints (localhost, loopback, .local).")
+        .accessibilityIdentifier("liveAI.remoteEndpointDisabled")
     }
 
     /// Banner shown when this Mac is below the hardware bar for Live

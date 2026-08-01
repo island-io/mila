@@ -90,7 +90,7 @@ final class RecordingSummarizer: ObservableObject {
     private var cancellables: Set<AnyCancellable> = []
 
     /// Timeout for the one-shot summary call. Reads from `LLMSettings.cliTimeout`
-    /// so it follows the user's preference set in Settings → AI Features.
+    /// so it follows the user's preference set in Settings → AI Provider.
     var timeoutSeconds: TimeInterval { llmSettings.cliTimeout }
 
     /// `runLLM` defaults to the real CLI invocation (`LLMRunner.run`).
