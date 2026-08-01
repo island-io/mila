@@ -1237,7 +1237,7 @@ struct MilaApp: App {
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval
                 // setting before start() so the running loop picks it
-                // up (default 5s, settable in Settings → Live AI).
+                // up (default 5s, settable in Settings → AI Features).
                 transcriber.chunkSeconds = aiSettings.chunkSeconds
                 transcriber.useVAD = aiSettings.useVAD
                 // Attach the neural-VAD speech gate (drops noise-only

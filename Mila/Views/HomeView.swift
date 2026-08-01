@@ -185,7 +185,7 @@ struct HomeView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
-        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → Hotkeys.")
+        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → General.")
         .accessibilityIdentifier("home.dictation.hint")
     }
 

@@ -29,7 +29,9 @@ running through `whisper.cpp` (GPU via Metal).
   a persistent directory that's reused across recordings.
 - **AI summaries and titles** — after each recording, Mila shells out to a
   local Claude/Cursor/OpenAI-compatible CLI to auto-name the recording and
-  generate an AI overview. Configure and test in **Settings → LLM**.
+  generate an AI overview. Point Mila at a provider once in
+  **Settings → AI Provider**, then turn features on and edit their prompts in
+  **Settings → AI Features** (which also hosts Live AI mode).
 - **iPhone Voice Memos sync** — Mila watches the folders iCloud syncs from your
   iPhone and auto-transcribes new recordings. Set up in **Settings → Voice Memos**.
 - **One-click team setup with `.milaconfig` files** — double-click a config file
