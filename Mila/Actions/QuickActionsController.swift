@@ -562,7 +562,14 @@ final class QuickActionsController: ObservableObject {
             activeJob = .none
             return
         }
-        let duration = max(durationBeforeStop, audioDuration(at: outputURL))
+        // Prefer what's actually on disk over the wall clock. For a healthy
+        // recording the two agree; when they don't, the file is the truth and
+        // the wall clock is a claim the user can't act on — the diagnostic
+        // report that prompted this showed a 26:24 row whose audio was 24
+        // seconds long, because `max()` always let the timer win. Fall back to
+        // the wall clock only when the file can't be read at all.
+        let capturedDuration = audioDuration(at: outputURL)
+        let duration = capturedDuration > 0 ? capturedDuration : durationBeforeStop
         let (title, source, appName): (String, RecordingSource, String?) = {
             switch captured {
             case .recordingMic:
@@ -594,6 +601,21 @@ final class QuickActionsController: ObservableObject {
         if source == .microphone, session.lastMicFrameCount == 0 {
             transcription.lastError = "Microphone captured no audio. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
             quickActionsLog.error("mic-only recording captured 0 frames — surfaced audio-input guidance to the user")
+        }
+
+        // Capture that died PART way through used to be completely silent: the
+        // row showed the full wall-clock length and the transcript just stopped
+        // early, so a lost meeting looked like a bad transcription. Say it out
+        // loud instead. `transcription.lastError` is only set when nothing more
+        // specific claimed it (the 0-frame case above is strictly better
+        // guidance for its own situation).
+        if Self.capturedAudioFellShort(source: source,
+                                       wallClock: durationBeforeStop,
+                                       captured: capturedDuration) {
+            quickActionsLog.error("captured only \(capturedDuration, privacy: .public)s of audio for a \(durationBeforeStop, privacy: .public)s recording (source=\(source.rawValue, privacy: .public), micRebuilds=\(self.session.mic.restartCount, privacy: .public)) — capture died mid-session")
+            if transcription.lastError == nil {
+                transcription.lastError = "Only \(formatDuration(capturedDuration)) of audio was captured for a \(formatDuration(durationBeforeStop)) recording — capture stopped early. This usually means the input device changed or went away mid-recording (headphones unplugged, a USB mic removed, or another app taking over the device). Pinning a specific input in Settings ▸ Audio Input makes it less likely."
+            }
         }
 
         // ---- IMMEDIATE: build a tentative Recording from whatever
@@ -1127,6 +1149,36 @@ final class QuickActionsController: ObservableObject {
             try? await Task.sleep(nanoseconds: pollNs)
         }
         return !Task.isCancelled
+    }
+
+    /// Wall-clock length a recording must reach before a short-capture warning
+    /// is worth showing. Below this, the gap between "time the engine was up"
+    /// and "audio on disk" is dominated by bring-up and teardown latency, and
+    /// warning would just be noise on every quick voice memo.
+    nonisolated static let shortCaptureMinimumWallClock: TimeInterval = 30
+    /// Fraction of the wall clock that must make it to disk. 0.8 tolerates
+    /// normal bring-up/teardown loss and a rebuild or two, while still
+    /// catching the real failure (24s of a 1584s recording = 1.5%).
+    nonisolated static let shortCaptureRatio: Double = 0.8
+
+    /// Whether a finished recording captured far less audio than the user
+    /// spent recording — i.e. capture died part way through.
+    ///
+    /// `.systemAudio` is exempt: ScreenCaptureKit only delivers buffers while
+    /// something is actually playing, so a short file there is expected rather
+    /// than a fault. Mic and meeting sources both have the mic as a continuous
+    /// clock, so their file length should track the wall clock closely.
+    ///
+    /// Pure, static and `nonisolated` so the policy can be unit tested without
+    /// a recording, an audio device, or a hop to the main actor.
+    nonisolated static func capturedAudioFellShort(source: RecordingSource,
+                                                   wallClock: TimeInterval,
+                                                   captured: TimeInterval) -> Bool {
+        guard source == .microphone || source == .meeting else { return false }
+        // captured == 0 is a different failure with its own, better message
+        // (and its own log line) — don't double up on it here.
+        guard captured > 0, wallClock >= shortCaptureMinimumWallClock else { return false }
+        return captured < wallClock * shortCaptureRatio
     }
 
     // MARK: - Helpers

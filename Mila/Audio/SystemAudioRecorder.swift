@@ -3,7 +3,10 @@ import AVFoundation
 @preconcurrency import ScreenCaptureKit
 import CoreMedia
 import Combine
+import OSLog
 import TranscriptionCore
+
+private let sysLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "SystemAudioRecorder")
 
 /// Captures system audio (optionally limited to a single application like Zoom) via ScreenCaptureKit.
 ///
@@ -49,6 +52,19 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     private var stream: SCStream?
     private let audioOutput = AudioStreamOutput()
 
+    /// True between `start()` and `stop()` — i.e. "the app still wants system
+    /// audio", as opposed to `isRunning` which tracks whether a live SCStream
+    /// exists right now. The two diverge exactly when SCK kills the stream
+    /// from its side, which is the window where a restart is the right move.
+    private var wantsCapture = false
+
+    /// Self-restarts after an SCK-side stream death in the current session.
+    /// Bounded so a permanently broken capture (revoked TCC) logs a handful of
+    /// attempts instead of spinning for the length of a meeting.
+    private var restartAttempts = 0
+    private let maxRestartAttempts = 5
+    private(set) var restartCount = 0
+
     /// Serial delivery queue for the audio sample callbacks. `.global()`
     /// is a CONCURRENT queue: two SCK callbacks can run in parallel, and
     /// the per-buffer Task hop the old code used added a second unordered
@@ -77,7 +93,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
                 .sorted { $0.applicationName.lowercased() < $1.applicationName.lowercased() }
             self.availableApps = unique.filter { !$0.applicationName.isEmpty }
         } catch {
-            print("SCShareableContent error: \(error)")
+            sysLog.error("SCShareableContent failed: \(error.localizedDescription, privacy: .public)")
             self.availableApps = []
         }
     }
@@ -96,7 +112,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         }
     }
 
-    static func isPermissionError(_ error: Error) -> Bool {
+    nonisolated static func isPermissionError(_ error: Error) -> Bool {
         let nsError = error as NSError
         // SCStreamErrorDomain code -3801 = userDeclined
         if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain"
@@ -113,6 +129,22 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 
     func start() async throws {
         guard !isRunning else { return }
+        wantsCapture = true
+        restartAttempts = 0
+        restartCount = 0
+        do {
+            try await bringUpStream()
+        } catch {
+            wantsCapture = false
+            throw error
+        }
+    }
+
+    /// The SCStream bring-up proper. Split out of `start()` so a mid-session
+    /// restart re-runs exactly the same setup (fresh shareable content, fresh
+    /// filter) without resetting the restart budget or the `wantsCapture`
+    /// intent.
+    private func bringUpStream() async throws {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -167,6 +199,9 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     }
 
     func stop() async {
+        // Clear the intent first so a `didStopWithError` callback racing this
+        // teardown can't kick off a restart of a capture the user just ended.
+        wantsCapture = false
         // Deliberately NOT gated on `isRunning`: when SCK killed the stream
         // itself (`didStopWithError` flips isRunning to false), the old
         // `guard isRunning` made this a no-op and the dead SCStream stayed
@@ -176,7 +211,14 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
             level = 0
             return
         }
-        do { try await stream.stopCapture() } catch { print("stopCapture: \(error)") }
+        if restartCount > 0 {
+            sysLog.error("system-audio capture was restarted \(self.restartCount, privacy: .public)x this session after SCK killed the stream")
+        }
+        do {
+            try await stream.stopCapture()
+        } catch {
+            sysLog.error("stopCapture failed: \(error.localizedDescription, privacy: .public)")
+        }
         self.stream = nil
         self.isRunning = false
         self.level = 0
@@ -194,7 +236,12 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 extension SystemAudioRecorder: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
         let message = error.localizedDescription
-        print("SCStream stopped with error: \(message)")
+        // Logger, not print: `print` output never reaches OSLog, so when a
+        // user's meeting lost its app-audio leg mid-recording the diagnostic
+        // bundle had no trace of it at all — the SCStream teardown was only
+        // visible through ScreenCaptureKit's own internal log lines, which
+        // don't say who asked for it or why.
+        sysLog.error("SCStream stopped with error: \(message, privacy: .public)")
         Task { @MainActor in
             // Only act for the CURRENTLY active stream — a stale callback
             // from a previous session's stream arriving after a restart
@@ -209,6 +256,63 @@ extension SystemAudioRecorder: SCStreamDelegate {
             self.isRunning = false
             self.level = 0
             self.lastStreamError = message
+            await self.restartAfterStreamDeath(error)
+        }
+    }
+
+    /// Whether an SCK-side stream death should be retried.
+    ///
+    /// Pure and `nonisolated` so `SystemAudioRestartPolicyTests` can cover the
+    /// decisions without ScreenCaptureKit, a Screen Recording grant, or a real
+    /// `SCStream` to hand to the delegate.
+    enum RestartDecision: Equatable {
+        /// `stop()` already ran — the user ended the recording, so a dead
+        /// stream is expected rather than something to repair.
+        case sessionOver
+        /// A revoked or stale grant fails identically every time; retrying
+        /// just buries the real reason under repeated failures.
+        case permissionDenied
+        case budgetExhausted
+        case retry
+    }
+
+    nonisolated static func restartDecision(wantsCapture: Bool,
+                                            attemptsSoFar: Int,
+                                            maxAttempts: Int,
+                                            error: Error) -> RestartDecision {
+        guard wantsCapture else { return .sessionOver }
+        if isPermissionError(error) { return .permissionDenied }
+        guard attemptsSoFar < maxAttempts else { return .budgetExhausted }
+        return .retry
+    }
+
+    /// Try to get the app-audio leg back after SCK killed the stream mid-
+    /// recording. Losing it silently costs the whole other side of a meeting,
+    /// so a bounded retry is well worth a brief gap.
+    private func restartAfterStreamDeath(_ error: Error) async {
+        switch Self.restartDecision(wantsCapture: wantsCapture,
+                                    attemptsSoFar: restartAttempts,
+                                    maxAttempts: maxRestartAttempts,
+                                    error: error) {
+        case .sessionOver:
+            return
+        case .permissionDenied:
+            sysLog.error("not restarting system audio: Screen & System Audio Recording permission was denied or revoked mid-capture")
+            return
+        case .budgetExhausted:
+            sysLog.error("giving up on system-audio capture after \(self.maxRestartAttempts, privacy: .public) restart attempts — the rest of this recording is microphone-only")
+            return
+        case .retry:
+            break
+        }
+        restartAttempts += 1
+        let attempt = restartAttempts
+        do {
+            try await bringUpStream()
+            restartCount += 1
+            sysLog.log("system-audio capture restarted (attempt #\(attempt, privacy: .public)) — app audio is being captured again")
+        } catch {
+            sysLog.error("system-audio restart attempt #\(attempt, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
