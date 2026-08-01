@@ -16,7 +16,7 @@ running through `whisper.cpp` (GPU via Metal).
 - **Dictate in two languages** with separate global hotkeys:
     - `⌘2` — English dictation (OpenAI `large-v3-turbo`)
     - `⌘3` — Hebrew dictation (ivrit.ai `large-v3`)
-  Both hotkeys are user-configurable in **Settings → Hotkeys**.
+  Both hotkeys are user-configurable in **Settings → General**.
 - **Transcribe on-device** with ivrit.ai `large-v3` (Hebrew) or OpenAI
   `large-v3-turbo` (English / multilingual). Audio never leaves your Mac.
 - **Transcribe on a remote server** — point Mila at any OpenAI-compatible
