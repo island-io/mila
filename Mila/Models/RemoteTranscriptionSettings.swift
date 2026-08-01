@@ -80,6 +80,49 @@ final class RemoteTranscriptionSettings: ObservableObject {
         didSet {
             guard model != oldValue else { return }
             defaults.set(model, forKey: Keys.model)
+            // Reconcile in BOTH directions. Pointing at a Hebrew-only model is
+            // exactly when an English model is needed, so fill it in at that
+            // moment rather than waiting for the user to notice English
+            // transcripts coming back in Hebrew — and drop the pre-filled id
+            // again when the primary stops being Hebrew-only, because it
+            // belongs to that primary and breaks the next one.
+            reconcileEnglishModelForCurrentPrimary()
+        }
+    }
+
+    /// Optional second model id, used for English and auto-detect recordings.
+    ///
+    /// Exists because a server's main model may be *language-specific*: the
+    /// ivrit.ai finetune Mila's own server runs is Hebrew-only, and sending it
+    /// English audio yields English speech rendered with Hebrew words spliced
+    /// in — `language=en` is honoured by the decoder but can't fix weights that
+    /// were never trained multilingual. A single model id had no way to express
+    /// "Hebrew here, English there".
+    ///
+    /// Empty means "use `model` for every language", which is correct for
+    /// genuinely multilingual endpoints like OpenAI's `whisper-1`.
+    ///
+    /// **Pre-filled for Hebrew-only endpoints.** When `model` is an ivrit.ai id
+    /// this is populated with `defaultEnglishModel` (see `prefillEnglishModelIfNeeded`)
+    /// rather than left blank. Shipping it blank meant upgrading changed nothing
+    /// until the user found the field — the bug was "fixed" in the binary and
+    /// still happening on screen. Clearing it by hand is respected and never
+    /// re-filled, and a pre-filled value is withdrawn again if the primary
+    /// stops being Hebrew-only.
+    @Published var englishModel: String {
+        didSet {
+            guard englishModel != oldValue else { return }
+            defaults.set(englishModel, forKey: Keys.englishModel)
+            guard !isProgrammaticWrite else { return }
+            // Past here the edit is the user's, so the value is theirs: Mila no
+            // longer owns it and must not withdraw it on a later model change.
+            defaults.set(false, forKey: Keys.englishModelAutoFilled)
+            // An explicit clear is a decision, not an absence. Record it so no
+            // later prefill (a fresh launch, or editing `model`) overrides it.
+            if englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !oldValue.isEmpty {
+                defaults.set(true, forKey: Keys.englishModelCleared)
+            }
         }
     }
 
@@ -103,6 +146,22 @@ final class RemoteTranscriptionSettings: ObservableObject {
     static let defaultEndpoint = "https://api.openai.com/v1"
     static let defaultModel = "whisper-1"
 
+    /// The English/multilingual model pre-filled for Hebrew-only endpoints: a
+    /// CTranslate2 build of Whisper large-v3-turbo, which is what Mila's own
+    /// `mila-asr` server warms alongside the ivrit finetune. Turbo rather than
+    /// full large-v3 because the live path sends one utterance at a time and
+    /// latency shows.
+    static let defaultEnglishModel = "deepdml/faster-whisper-large-v3-turbo-ct2"
+
+    /// Whether `modelID` names a Hebrew-only ivrit.ai finetune — the case that
+    /// needs a separate English model. Substring match on `ivrit`, which covers
+    /// every published variant (`ivrit-ai/whisper-large-v3-turbo-ct2`,
+    /// `ivrit-ai/whisper-large-v3-ggml`, …) and any local rehost that keeps the
+    /// name. Pure + `static` so the prefill rule is testable on its own.
+    static func isHebrewOnlyModel(_ modelID: String) -> Bool {
+        modelID.lowercased().contains("ivrit")
+    }
+
     private let defaults: UserDefaults
     private let urlSession: URLSession
     /// Keychain item the API token is stored under. Injectable so tests /
@@ -124,6 +183,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
             ?? .local
         self.endpoint = defaults.string(forKey: Keys.endpoint) ?? Self.defaultEndpoint
         self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
+        self.englishModel = defaults.string(forKey: Keys.englishModel) ?? ""
         // Start empty and defer the Keychain read. Reading the token at launch
         // unconditionally pops the macOS "Mila wants to use confidential
         // information stored in your keychain" prompt for *every* user — even
@@ -132,7 +192,84 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // it's the restored choice, otherwise lazily in `backend.didSet`).
         self.apiKey = ""
         if backend == .remote { loadAPIKeyIfNeeded() }
+        // Upgrade path: everyone already pointed at an ivrit.ai endpoint before
+        // per-language routing existed has a blank English model, and a blank
+        // one means "use the Hebrew model for English too" — i.e. the bug this
+        // shipped to fix, still happening. Fill it in on first launch.
+        //
+        // The withdraw side runs here too, so "an auto-filled English model
+        // implies a Hebrew-only primary" holds at every point, not just across
+        // an in-session model edit. A no-op for anyone upgrading: the
+        // auto-filled flag is only ever set by Mila's own prefill, so a value
+        // that predates this code is treated as the user's and left alone.
+        reconcileEnglishModelForCurrentPrimary()
     }
+
+    /// Bring `englishModel` into line with the current primary, by running both
+    /// halves of the rule. Exactly one of them can act on any given primary —
+    /// the withdrawal only for a non-ivrit `model`, the prefill only for an
+    /// ivrit one — so this is about never running one without the other, not
+    /// about sequencing them. Every entry point (`init`, `model.didSet`) goes
+    /// through here so a third one can't arrive with only half the rule.
+    private func reconcileEnglishModelForCurrentPrimary() {
+        clearAutoFilledEnglishModelIfNeeded()
+        prefillEnglishModelIfNeeded()
+    }
+
+    /// Assign `englishModel` on Mila's own behalf and record whether the value
+    /// is one Mila owns, without `englishModel.didSet` mistaking the write for
+    /// a user edit. `defer` rather than a trailing assignment so an early
+    /// return added later can't leave the flag stuck `true` — which would
+    /// silently stop the next real user edit from claiming ownership.
+    private func setEnglishModelProgrammatically(_ value: String, autoFilled: Bool) {
+        isProgrammaticWrite = true
+        defer { isProgrammaticWrite = false }
+        englishModel = value
+        defaults.set(autoFilled, forKey: Keys.englishModelAutoFilled)
+    }
+
+    /// Set `englishModel` to `defaultEnglishModel` when the primary model is
+    /// Hebrew-only and the user hasn't chosen otherwise.
+    ///
+    /// Deliberately narrow — it fires only for ivrit.ai primaries. A blank
+    /// English model is *correct* for a multilingual endpoint (OpenAI's
+    /// `whisper-1`, a plain `Systran/faster-whisper-large-v3` deployment), and
+    /// filling one in there would send a model id the server doesn't have and
+    /// break English outright. Wrong-language text is bad; a hard failure is
+    /// worse.
+    ///
+    /// No-ops when: the field already has a value, the user explicitly cleared
+    /// it (`Keys.englishModelCleared`), or the primary isn't ivrit.
+    private func prefillEnglishModelIfNeeded() {
+        guard englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard !defaults.bool(forKey: Keys.englishModelCleared) else { return }
+        guard Self.isHebrewOnlyModel(model) else { return }
+        setEnglishModelProgrammatically(Self.defaultEnglishModel, autoFilled: true)
+    }
+
+    /// Withdraw an auto-filled `englishModel` once the primary is no longer
+    /// Hebrew-only — the other half of the prefill, and the same reasoning.
+    ///
+    /// The pre-filled id exists only to serve an ivrit primary. Leaving it
+    /// behind when the user switches to a multilingual endpoint would send that
+    /// endpoint a model id it doesn't have and break English outright, which is
+    /// precisely the failure `prefillEnglishModelIfNeeded` refuses to cause in
+    /// the first place. Withdrawing it restores "English uses the primary".
+    ///
+    /// Only touches values Mila wrote itself (`Keys.englishModelAutoFilled`). A
+    /// model id the user typed is theirs and survives any primary change; so
+    /// does an explicit clear, which leaves nothing to withdraw.
+    private func clearAutoFilledEnglishModelIfNeeded() {
+        guard !Self.isHebrewOnlyModel(model) else { return }
+        guard defaults.bool(forKey: Keys.englishModelAutoFilled) else { return }
+        // Not a user clear, so this must not set `Keys.englishModelCleared` —
+        // switching back to an ivrit primary should pre-fill again.
+        setEnglishModelProgrammatically("", autoFilled: false)
+    }
+
+    /// True only while this class is assigning `englishModel` itself, so the
+    /// write-back can tell its own fill/withdraw from a user edit.
+    private var isProgrammaticWrite = false
 
     /// Lazily read the bearer token from the Keychain the first time the remote
     /// backend is selected. Idempotent (guarded by `hasLoadedAPIKey`) and
@@ -188,14 +325,46 @@ final class RemoteTranscriptionSettings: ObservableObject {
         return true
     }
 
+    /// The model id to send for a recording in `languageCode` — the remote
+    /// mirror of `ModelManager.model(for:)`, which does the same routing for the
+    /// on-device backend.
+    ///
+    /// * `he` (and legacy `iw`/unrecognised codes) → `model`, the primary.
+    /// * `en` → `englishModel`.
+    /// * legacy `auto` → `englishModel`, the only one that can serve a
+    ///   detect-the-language request. Auto-detect was retired as a user
+    ///   choice (see `RecordingLanguage`), but recordings made under it keep
+    ///   the string on disk and can still be re-transcribed.
+    ///
+    /// With `englishModel` empty every language resolves to the primary, so a
+    /// single-model endpoint behaves exactly as it did before this existed.
+    func model(for languageCode: String) -> String {
+        let primary = Self.resolve(model)
+        let english = englishModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !english.isEmpty else { return primary }
+        if languageCode.lowercased() == "auto" { return english }
+        switch RecordingLanguage.fromCode(languageCode) {
+        case .hebrew:   return primary
+        case .english:  return english
+        }
+    }
+
+    /// Trim a user-entered model id, falling back to the default when blank.
+    private static func resolve(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? defaultModel : trimmed
+    }
+
     /// Snapshot for the engine, or `nil` if the endpoint can't be parsed.
-    func currentConfig() -> RemoteTranscriptionConfig? {
+    ///
+    /// Pass the recording's language so the right model id is baked into the
+    /// snapshot; omit it (the connection probe does) to get the primary model.
+    func currentConfig(for languageCode: String? = nil) -> RemoteTranscriptionConfig? {
         guard let url = endpointURL else { return nil }
-        let trimmedModel = model.trimmingCharacters(in: .whitespacesAndNewlines)
         return RemoteTranscriptionConfig(
             endpoint: url,
             apiKey: apiKey.trimmingCharacters(in: .whitespacesAndNewlines),
-            model: trimmedModel.isEmpty ? Self.defaultModel : trimmedModel
+            model: languageCode.map(model(for:)) ?? Self.resolve(model)
         )
     }
 
@@ -311,6 +480,14 @@ final class RemoteTranscriptionSettings: ObservableObject {
         static let backend = "transcription.backend"
         static let endpoint = "remote.endpoint"
         static let model = "remote.model"
+        static let englishModel = "remote.model.en"
+        /// Set once the user empties `englishModel` by hand, so the prefill
+        /// never overrides that choice on a later launch or model edit.
+        static let englishModelCleared = "remote.model.en.cleared"
+        /// True while the current `englishModel` is one Mila pre-filled rather
+        /// than one the user typed — so it can be withdrawn again if the primary
+        /// stops being Hebrew-only, without ever discarding the user's own value.
+        static let englishModelAutoFilled = "remote.model.en.autofilled"
         static let apiKey = "remote.apiKey"
     }
 }
