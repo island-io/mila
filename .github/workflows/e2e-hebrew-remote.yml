@@ -92,7 +92,24 @@ jobs:
           fi
           # Keep this list in sync with the `push` paths filter above.
           PATTERN='^(Mila/Transcription/RemoteWhisperEngine\.swift|Mila/Models/RemoteTranscriptionSettings\.swift|Mila/Transcription/TranscriptionService\.swift|MilaTests/RemoteTranscriptionE2ETests\.swift|docker/speaches-hebrew/|\.github/workflows/e2e-hebrew-remote\.yml)'
-          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")
+          # THREE-dot (merge-base) diff — the same comparison GitHub's own
+          # "Files changed" tab shows: what THIS branch did, ignoring whatever
+          # `main` picked up since we forked off it. A two-dot
+          # `git diff BASE HEAD` also reports every file main touched in the
+          # meantime, and `base.sha` moves as main moves, so a long-lived PR
+          # that never went near the remote path would eventually "change"
+          # e.g. TranscriptionService.swift and burn a Docker build plus a
+          # macOS runner for nothing. Needs the merge base to be present —
+          # hence `fetch-depth: 0` on the checkout above; do not shallow it.
+          if ! CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" 2>"${RUNNER_TEMP}/diff.err"); then
+            # Fail OPEN. If we can't compute the diff (unfetched base ref,
+            # force-pushed base, conflicted PR with no merge ref) we'd rather
+            # pay for the E2E than silently skip it and report a green check
+            # that tested nothing.
+            echo "::warning::could not diff ${BASE_SHA}...${HEAD_SHA}: $(cat "${RUNNER_TEMP}/diff.err"). Running the E2E rather than skipping it."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           echo "=== changed files"; echo "$CHANGED"
           if echo "$CHANGED" | grep -Eq "$PATTERN"; then
             echo "relevant=true" >> "$GITHUB_OUTPUT"
