@@ -585,7 +585,19 @@ final class MicrophoneRecorder: ObservableObject {
         if let override = bringUpOverride {
             // Test path: no CoreAudio, but still exercise the full decision
             // and the timeout wrapper.
-            try? await Self.withTimeout(seconds: bringUpTimeout) { try await override() }
+            //
+            // Success and failure are kept as distinct as they are on the real
+            // path below: a bring-up that threw installed no engine, so it must
+            // not re-arm the grace window or register a new notification
+            // source. Otherwise the seam would quietly misreport a *failed*
+            // mid-session rebuild as a successful one — and the grace window is
+            // exactly what a test of this area is measuring.
+            do {
+                try await Self.withTimeout(seconds: bringUpTimeout) { try await override() }
+            } catch {
+                micLog.error("mic rebuild #\(attempt, privacy: .public) (reason: \(reason, privacy: .public)) failed: \(error.localizedDescription, privacy: .public) — the watchdog will retry")
+                return
+            }
             guard captureEpoch == epoch else { return }
             lastBringUpAt = Date()
             // Mirror the real path: a rebuild installs a new engine, so the

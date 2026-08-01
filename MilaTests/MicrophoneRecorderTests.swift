@@ -509,6 +509,39 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         await mic.stop()
     }
 
+    /// A rebuild that FAILS installed no engine, so it must not re-arm the
+    /// grace window or swap in a new notification source. Without this the
+    /// seam would report a failed mid-session rebuild as a successful one —
+    /// and the grace window is precisely what the tests above measure through
+    /// it. (CodeRabbit caught the asymmetry against the real-engine path.)
+    func test_a_failed_rebuild_does_not_rearm_the_grace_window() async throws {
+        let counter = OSAllocatedUnfairLock(initialState: 0)
+        let mic = MicrophoneRecorder()
+        mic.bringUpTimeout = 1.0
+        mic.captureStallTimeout = 3600
+        mic.watchdogInterval = 3600
+        mic.configurationChangeGracePeriod = 0.1
+        mic.minimumRebuildInterval = 1.0
+        mic.maximumRebuildInterval = 4.0
+        // First bring-up succeeds (start); every rebuild after it fails.
+        mic.bringUpOverride = {
+            let n = counter.withLock { c -> Int in c += 1; return c }
+            if n > 1 { throw MicrophoneError.noInputDevice }
+        }
+
+        try await mic.start()
+        let sourceAfterStart = mic.configurationChangeSource
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        postConfigurationChange(to: mic)
+        await waitUntil { mic.restartCount >= 1 }
+
+        XCTAssertEqual(mic.restartCount, 1, "the failed attempt still spends a rebuild slot")
+        XCTAssertTrue(mic.configurationChangeSource === sourceAfterStart,
+                      "a rebuild that threw installed no engine — there is no new source to observe")
+        await mic.stop()
+    }
+
     /// A rebuild storm must not be able to outlive the recording either.
     func test_configuration_change_after_stop_is_ignored() async throws {
         let (mic, bringUps) = makeRecorder(grace: 0.1)
