@@ -28,7 +28,7 @@ enum OpenAIRequestError: LocalizedError, Equatable {
         case .emptyOutput:
             return "The model returned no content."
         case .invalidEndpoint(let baseURL):
-            return "“\(baseURL)” is not a valid endpoint URL. Check the Base URL in Settings → LLM (it must look like https://api.openai.com/v1)."
+            return "“\(baseURL)” is not a valid endpoint URL. Check the Base URL in Settings → AI Provider (it must look like https://api.openai.com/v1)."
         }
     }
 }

@@ -157,3 +157,29 @@ final class AudioConvertTests: XCTestCase {
         return buffer
     }
 }
+
+/// `AudioSignal.isSilent` is the "did capture produce anything at all?"
+/// predicate that keeps a zero-frame session off the network (issue #147). It
+/// deliberately is NOT a loudness gate — see the quiet-audio case.
+final class AudioSignalTests: XCTestCase {
+
+    func test_emptyBufferIsSilent() {
+        XCTAssertTrue(AudioSignal.isSilent([]))
+    }
+
+    func test_allZerosIsSilent() {
+        XCTAssertTrue(AudioSignal.isSilent([Float](repeating: 0, count: 48_000)))
+    }
+
+    func test_oneNonZeroSampleIsNotSilent() {
+        var samples = [Float](repeating: 0, count: 48_000)
+        samples[47_999] = -0.000_01
+        XCTAssertFalse(AudioSignal.isSilent(samples),
+                       "the predicate must not discard real, quiet audio — that's a separate, louder threshold")
+    }
+
+    func test_normalAudioIsNotSilent() {
+        let samples = (0..<1_600).map { Float(sin(Double($0) * 0.1)) * 0.3 }
+        XCTAssertFalse(AudioSignal.isSilent(samples))
+    }
+}

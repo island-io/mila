@@ -172,6 +172,26 @@ final class StreamingWhisperConverter {
     }
 }
 
+/// Predicates about a raw sample buffer, shared by every path that has to
+/// decide "is there anything here at all?".
+enum AudioSignal {
+    /// True when a buffer carries no signal whatsoever: no samples, or nothing
+    /// but exact digital silence.
+    ///
+    /// Deliberately the strictest possible test. It is NOT the "too quiet to
+    /// be speech" gate — that's `TranscriptionService.minimumAudioPeak`, which
+    /// only the batch path applies, because a quiet-but-real utterance is
+    /// still worth transcribing. This one answers the narrower question "did
+    /// capture produce anything?", which is safe to apply even to a 300ms live
+    /// utterance: a live microphone, in a silent room, still delivers dither
+    /// and noise, never a run of exact zeros.
+    ///
+    /// O(1) for real audio — `contains` returns at the first non-zero sample.
+    static func isSilent(_ samples: [Float]) -> Bool {
+        !samples.contains { $0 != 0 }
+    }
+}
+
 /// Computes a 0...1 RMS level from an audio buffer for VU meters.
 enum AudioMeter {
     static func level(from buffer: AVAudioPCMBuffer) -> Float {

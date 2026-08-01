@@ -18,10 +18,16 @@ struct HistoryListView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
-                Text(category.displayName)
-                    .font(.title2.weight(.semibold))
-                    .padding(.horizontal, 24)
-                    .padding(.top, 16)
+                HStack {
+                    Text(category.displayName)
+                        .font(.title2.weight(.semibold))
+                    if category == .recentlyDeleted {
+                        Spacer()
+                        EmptyTrashButton()
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 16)
 
                 BucketedRecordingsView(
                     recordings: store.recordings(in: category),
@@ -244,6 +250,39 @@ private struct HistoryRow: View {
         if t.count <= 140 { return t }
         let end = t.index(t.startIndex, offsetBy: 140)
         return String(t[..<end]) + "…"
+    }
+}
+
+/// Bulk "Empty Trash" action shared by the "Recently Deleted" list header
+/// and the window toolbar (both placements so the affordance is easy to
+/// find). Gated behind a confirmation dialog — like the per-row "Delete
+/// Permanently", there's no undo. Disabled while the trash is empty.
+struct EmptyTrashButton: View {
+    @EnvironmentObject private var store: RecordingStore
+    @State private var confirming = false
+
+    var body: some View {
+        let count = store.recordings(in: .recentlyDeleted).count
+        Button(role: .destructive) {
+            confirming = true
+        } label: {
+            Label("Empty Trash", systemImage: "trash.slash")
+        }
+        .disabled(count == 0)
+        .help("Permanently delete everything in the trash")
+        .accessibilityIdentifier("trash.empty")
+        .confirmationDialog(
+            "Empty Trash?",
+            isPresented: $confirming,
+            titleVisibility: .visible
+        ) {
+            Button("Delete \(count) Recording\(count == 1 ? "" : "s")", role: .destructive) {
+                store.emptyTrash()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("The audio files and any transcripts will be permanently deleted. This can't be undone.")
+        }
     }
 }
 

@@ -49,6 +49,11 @@ final class TranscriptionService: ObservableObject {
     /// to clipping levels and produce ghost transcripts.
     static let minimumAudioPeak: Float = 0.005
 
+    /// Shown when capture produced no samples at all — the microphone's
+    /// problem, surfaced as the microphone's problem. See the guard in
+    /// `transcribeOnceSegments`.
+    static let noAudioCapturedMessage = "No audio was captured, so there was nothing to transcribe. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
+
     private let engine: any TranscribingEngine
     private let store: RecordingStore
     private let modelManager: ModelManager
@@ -321,6 +326,19 @@ final class TranscriptionService: ObservableObject {
     }
 
     func transcribeOnceSegments(samples: [Float], language: String, audioCtx: Int32?) async -> [TranscriptSegment] {
+        // Nothing was captured: don't hand it to any backend. The remote one
+        // uploads a header-only file and gets back `HTTP 500: Failed to decode
+        // audio.`, which the user reads as "the transcription server is down"
+        // — a diagnosis they can neither confirm nor act on, when the real
+        // problem is on this machine. Say what actually happened instead.
+        // The local backend fails the same way, just more quietly. (issue #147)
+        if AudioSignal.isSilent(samples) {
+            serviceLog.error("transcribeOnceSegments: REFUSING to transcribe \(samples.count, privacy: .public) samples with no signal — capture produced nothing")
+            if lastError == nil {
+                lastError = Self.noAudioCapturedMessage
+            }
+            return []
+        }
         // Remote backend: route dictation/live utterances to the configured
         // endpoint too, so the user's "global backend" choice holds for every
         // path. Misconfiguration degrades to an empty result (same contract as
@@ -661,6 +679,15 @@ final class TranscriptionService: ObservableObject {
                 }
             }()
 
+            // Per-run coalescer: whisper fires its progress callback many
+            // times/sec from a background compute thread. Funnelling each tick
+            // through its own `Task { @MainActor }` flooded the main actor (one
+            // @Published mutation + full re-render per tick) and applied values
+            // out of order. The coalescer bounds outstanding work to a single
+            // pending main-actor flush and keeps `progress` monotonic. Local to
+            // this run so there's no cross-recording state to reset.
+            let progressCoalescer = ProgressCoalescer()
+
             async let transcribeTask = activeEngine.transcribe(
                 samples: samples,
                 language: working.language,
@@ -674,11 +701,15 @@ final class TranscriptionService: ObservableObject {
                 // e2e short-clip case (en_numbers_and_dates 5.17s,
                 // 0.29 → 0.36 on ggml-tiny).
                 audioCtx: 0,
-                progress: { [weak self] p in
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        guard self.activeRecordingID == recordingID else { return }
-                        self.progress = Double(p)
+                progress: { [weak self, progressCoalescer] p in
+                    // Cheap, lock-guarded, no allocation on the hot path.
+                    // Only schedule a main-actor flush when one isn't already
+                    // pending — that's what caps the flood.
+                    guard progressCoalescer.offer(Double(p)) else { return }
+                    Task { @MainActor [weak self, progressCoalescer] in
+                        let latest = progressCoalescer.flush()
+                        guard let self, self.activeRecordingID == recordingID else { return }
+                        self.progress = latest
                     }
                 },
                 // Polled by whisper.cpp's abort_callback between every
@@ -836,6 +867,40 @@ final class TranscriptionService: ObservableObject {
         print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(duration)s + empty transcript (issue #61)")
         store.permanentlyDelete(recording)
         return true
+    }
+}
+
+/// Coalesces high-frequency progress callbacks (fired from whisper.cpp's
+/// background compute thread) into at most one pending main-actor update, and
+/// keeps the reported value monotonic.
+///
+/// The previous code spawned a fresh `Task { @MainActor }` per whisper tick — an
+/// unbounded flood of main-actor hops, each mutating `@Published progress` and
+/// re-rendering every observing view. Worse, independent `Task`s have no
+/// ordering guarantee, so a late-running earlier value could clobber a later
+/// one, freezing the bar short of 100%. This bounds outstanding work to one
+/// flush and applies `max`, so progress only ever moves forward.
+///
+/// `offer` runs on the compute thread and returns `true` when the caller should
+/// schedule a main-actor flush (none pending). `flush` runs on the main actor,
+/// returns the latest value, and clears the pending flag.
+final class ProgressCoalescer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var latest: Double = 0
+    private var scheduled = false
+
+    func offer(_ value: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        latest = max(latest, value)
+        if scheduled { return false }
+        scheduled = true
+        return true
+    }
+
+    func flush() -> Double {
+        lock.lock(); defer { lock.unlock() }
+        scheduled = false
+        return latest
     }
 }
 

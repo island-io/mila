@@ -63,13 +63,40 @@ enum AudioDeviceManager {
         return inputs.first(where: { !$0.isVirtual })
     }
 
+    /// The device an engine's input unit is currently bound to, or nil if it
+    /// can't be read. A fresh `AVAudioEngine` comes up on the system default
+    /// input, so this is usually already the device we're about to select.
+    static func currentInputDeviceID(on engine: AVAudioEngine) -> AudioDeviceID? {
+        guard let unit = engine.inputNode.audioUnit else { return nil }
+        var deviceID: AudioDeviceID = 0
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(
+            unit,
+            kAudioOutputUnitProperty_CurrentDevice,
+            kAudioUnitScope_Global,
+            0,
+            &deviceID,
+            &size
+        )
+        return status == noErr ? deviceID : nil
+    }
+
     /// Force an existing `AVAudioEngine`'s input node to read from the given device.
     /// Must be called before `engine.start()` and *after* touching `engine.inputNode`.
+    ///
+    /// Setting `kAudioOutputUnitProperty_CurrentDevice` reconfigures the I/O
+    /// unit, and a reconfiguration can make the engine post
+    /// `AVAudioEngineConfigurationChange` — which the recorder's mid-session
+    /// recovery listens for. When the unit is *already* on the device we want
+    /// (the common case: the user's pinned input is also the system default),
+    /// that notification buys nothing and costs a rebuild, so skip the write
+    /// entirely. See issue #147.
     static func setInputDevice(_ device: Device, on engine: AVAudioEngine) throws {
         guard let unit = engine.inputNode.audioUnit else {
             throw NSError(domain: "AudioDeviceManager", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Engine has no input audio unit."])
         }
+        if currentInputDeviceID(on: engine) == device.id { return }
         var deviceID = device.id
         let status = AudioUnitSetProperty(
             unit,
