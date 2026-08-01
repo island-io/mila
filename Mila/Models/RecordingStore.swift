@@ -538,6 +538,37 @@ final class RecordingStore: ObservableObject {
         }
     }
 
+    /// Permanently delete every trashed recording in one pass — the bulk
+    /// "Empty Trash" action. Applies the same per-recording cleanup as
+    /// `permanentlyDelete(_:)` (audio + `.txt`/`.summary.txt`/`.srt` sidecars,
+    /// plus a Voice-Memos tombstone so a deleted import doesn't resync), but
+    /// batches the store + tombstone writes so a full bin doesn't trigger one
+    /// persist per row. Returns the number of recordings removed; a no-op that
+    /// skips persisting when the trash is already empty.
+    @discardableResult
+    func emptyTrash() -> Int {
+        let trashed = recordings.filter { $0.isTrashed }
+        guard !trashed.isEmpty else { return 0 }
+
+        var tombstonedAny = false
+        for recording in trashed {
+            try? fileManager.removeItem(at: audioURL(for: recording))
+            try? fileManager.removeItem(at: transcriptURL(for: recording))
+            try? fileManager.removeItem(at: summaryURL(for: recording))
+            try? fileManager.removeItem(at: subtitleURL(for: recording))
+            if let memoID = recording.voiceMemoUniqueID {
+                voiceMemoTombstones.insert(memoID)
+                tombstonedAny = true
+            }
+        }
+
+        let trashedIDs = Set(trashed.map(\.id))
+        recordings.removeAll { trashedIDs.contains($0.id) }
+        if tombstonedAny { persistTombstones() }
+        persist()
+        return trashed.count
+    }
+
     func recordings(in category: HistoryCategory) -> [Recording] {
         switch category {
         case .recentlyDeleted:
