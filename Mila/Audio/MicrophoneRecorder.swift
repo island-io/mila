@@ -70,6 +70,75 @@ struct CaptureStallDetector {
     }
 }
 
+/// Pure, clock-injected minimum-interval + exponential-backoff gate for
+/// *notification-driven* engine rebuilds.
+///
+/// `AVAudioEngineConfigurationChange` does not mean "something broke" — it
+/// means "the I/O unit was reconfigured", and binding the input device during
+/// our own bring-up is itself a reconfiguration. On at least one Mac that made
+/// the recovery path self-sustaining: bind → notification → rebuild → bind →
+/// notification, measured at ~150ms per cycle, which never let the tap live
+/// long enough to deliver a single buffer (issue #147). The whole
+/// `maxMidSessionRestarts` budget — documented as "60 attempts at ≥1s apart" —
+/// was spent in about nine seconds, and the macOS microphone indicator
+/// flickered for the entire recording.
+///
+/// The watchdog path is naturally spaced by `captureStallTimeout`; this gate
+/// gives the notification path the same property, so the budget spans minutes
+/// the way its comment always claimed. Throttled notifications are not lost
+/// work: capture that is genuinely dead stops growing the frame count, so
+/// `CaptureStallDetector` picks it up within `captureStallTimeout`.
+///
+/// A value type with an injected `now`, like `CaptureStallDetector`, so the
+/// policy is unit-testable exactly and without sleeping.
+struct RebuildThrottle {
+    /// Floor between the first rebuild and the second one.
+    let minimumInterval: TimeInterval
+    /// Ceiling the doubling backoff saturates at.
+    let maximumInterval: TimeInterval
+
+    private var lastAllowedAt: Date?
+    /// Rebuilds allowed in the current burst. Reset once things go quiet for
+    /// `quietPeriod`, so an unrelated device change an hour into a meeting
+    /// isn't punished for a storm at the start of it.
+    private(set) var streak = 0
+
+    /// Idle time that ends a burst. Twice the ceiling rather than the ceiling
+    /// itself: a burst that has saturated the backoff arrives *exactly* one
+    /// `maximumInterval` apart, and treating that as "quiet" would reset the
+    /// ladder on every tick and cap the backoff at `minimumInterval` forever —
+    /// which is the bug this type exists to prevent, reintroduced one level up.
+    var quietPeriod: TimeInterval { maximumInterval * 2 }
+
+    init(minimumInterval: TimeInterval, maximumInterval: TimeInterval) {
+        self.minimumInterval = minimumInterval
+        self.maximumInterval = max(minimumInterval, maximumInterval)
+    }
+
+    /// How long after the last allowed rebuild the next one may happen.
+    /// Zero before the first rebuild — the first configuration change of a
+    /// session is always acted on immediately.
+    var currentInterval: TimeInterval {
+        guard streak > 0 else { return 0 }
+        let scaled = minimumInterval * pow(2, Double(streak - 1))
+        return min(scaled, maximumInterval)
+    }
+
+    /// Whether a rebuild may proceed at `now`. Mutating: an allowed rebuild
+    /// starts the clock for the next one and lengthens the backoff.
+    mutating func allow(now: Date) -> Bool {
+        if let last = lastAllowedAt {
+            let elapsed = now.timeIntervalSince(last)
+            if elapsed < currentInterval { return false }
+            // Quiet for long enough that the previous burst is over.
+            if elapsed >= quietPeriod { streak = 0 }
+        }
+        lastAllowedAt = now
+        streak += 1
+        return true
+    }
+}
+
 /// Pulls samples from the user's preferred input device using `AVAudioEngine`.
 /// Emits whisper-format buffers (16kHz mono Float32) on `audioStream`.
 ///
@@ -152,9 +221,34 @@ final class MicrophoneRecorder: ObservableObject {
 
     /// Hard cap on rebuild attempts within one recording. A permanently dead
     /// input would otherwise have us rebuilding in a loop for the length of a
-    /// meeting. 60 attempts at ≥1s apart still rides out a device that's
-    /// unplugged for a minute; past that we stop trying and say so in the log.
+    /// meeting. Combined with the pacing below (the watchdog fires at most
+    /// once per `captureStallTimeout`, the notification path is gated by
+    /// `RebuildThrottle`), 60 attempts span minutes rather than seconds; past
+    /// that we stop trying and say so in the log.
     var maxMidSessionRestarts = 60
+
+    /// Configuration changes arriving this soon after a bring-up are treated
+    /// as OUR OWN doing and ignored.
+    ///
+    /// `bringUp` binds the chosen input with
+    /// `kAudioOutputUnitProperty_CurrentDevice`, and on some machines that
+    /// bind is itself enough to make the engine post
+    /// `AVAudioEngineConfigurationChange` — indistinguishable, at the
+    /// notification, from a device being yanked. Reacting to it rebuilt the
+    /// engine, which bound the device again, which posted again (issue #147).
+    ///
+    /// The cost of the window is that a device genuinely lost in the first
+    /// fraction of a second of a recording is not repaired by the *fast*
+    /// path — the stall watchdog still catches it `captureStallTimeout` later,
+    /// so the failure mode is a few seconds of delay, not a lost recording.
+    var configurationChangeGracePeriod: TimeInterval = 0.75
+
+    /// Floor between two notification-driven rebuilds (doubling up to
+    /// `maximumRebuildInterval`). See `RebuildThrottle`.
+    var minimumRebuildInterval: TimeInterval = 1.0
+
+    /// Ceiling for the notification-path backoff.
+    var maximumRebuildInterval: TimeInterval = 30.0
 
     /// Rebuild attempts made during the current session — surfaced in the
     /// stop log so a diagnostic report shows "capture was repaired 3 times"
@@ -163,6 +257,27 @@ final class MicrophoneRecorder: ObservableObject {
 
     private var watchdogTask: Task<Void, Never>?
     private var configChangeObserver: NSObjectProtocol?
+
+    /// The object whose `AVAudioEngineConfigurationChange` notifications we're
+    /// currently observing — the live `AVAudioEngine` in production.
+    ///
+    /// Held (rather than just registered for) for two reasons: `NotificationCenter`
+    /// does not retain the object an observer is scoped to, and it gives the
+    /// `bringUpOverride` test path — which has no real engine — a stand-in to
+    /// post to. Tests exercise the REAL observer, the real notification name
+    /// and the real handler policy; only the poster of the notification is
+    /// simulated. Re-read it after every rebuild: production installs a fresh
+    /// engine (and so a fresh source) each time, and a faithful test does the
+    /// same.
+    private(set) var configurationChangeSource: AnyObject?
+
+    /// When the most recent successful bring-up finished — the start of the
+    /// `configurationChangeGracePeriod` window.
+    private var lastBringUpAt: Date?
+
+    /// Paces notification-driven rebuilds. Rebuilt per session in `start()`.
+    private var rebuildThrottle = RebuildThrottle(minimumInterval: 1.0, maximumInterval: 30.0)
+
     /// Guards against a configuration-change notification and a watchdog tick
     /// both deciding to rebuild at the same moment.
     private var isRebuilding = false
@@ -210,6 +325,7 @@ final class MicrophoneRecorder: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
             configChangeObserver = nil
         }
+        configurationChangeSource = nil
         if let existing = engine {
             existing.inputNode.removeTap(onBus: 0)
             existing.stop()
@@ -225,12 +341,21 @@ final class MicrophoneRecorder: ObservableObject {
         restartCount = 0
         isRebuilding = false
         captureEpoch += 1
+        lastBringUpAt = nil
+        rebuildThrottle = RebuildThrottle(minimumInterval: minimumRebuildInterval,
+                                          maximumInterval: maximumRebuildInterval)
 
         if let override = bringUpOverride {
             try await Self.withTimeout(seconds: bringUpTimeout) {
                 try await override()
             }
             isRunning = true
+            lastBringUpAt = Date()
+            // Observe on the test path too, against a stand-in source: the
+            // configuration-change handling and its pacing are the part of
+            // this class most in need of coverage, and the real path can't be
+            // driven in CI (no microphone, no CoreAudio device to reconfigure).
+            observeConfigurationChanges(on: ConfigurationChangeSource())
             // Start the watchdog on the test path too: with no real tap the
             // frame count never grows, so a test can drive the full
             // stall → rebuild loop by counting override invocations.
@@ -259,7 +384,13 @@ final class MicrophoneRecorder: ObservableObject {
                                                  stats: sessionStats)
         self.engine = result.engine
         isRunning = true
+        lastBringUpAt = Date()
         micLog.log("mic started: \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch agc=\(agcEnabled ? "on" : "off", privacy: .public)")
+        // Registered only now, i.e. after the device bind inside the bring-up
+        // has returned. That ordering alone is NOT enough (the notification is
+        // posted asynchronously and can land after we register, which is why
+        // `configurationChangeGracePeriod` exists), but it does drop the
+        // changes that are already in flight by this point.
         observeConfigurationChanges(on: result.engine)
         startCaptureWatchdog()
     }
@@ -298,16 +429,26 @@ final class MicrophoneRecorder: ObservableObject {
 
     // MARK: - Mid-session recovery
 
+    /// Stand-in notification source used on the `bringUpOverride` path, where
+    /// there is no `AVAudioEngine` to scope the observer to. Its only job is to
+    /// be an identity a test can post to.
+    final class ConfigurationChangeSource: NSObject {}
+
     /// Watch one engine for the configuration change that silently kills the
     /// tap. Re-registered after every rebuild, since the notification is
     /// scoped to a specific engine instance.
-    private func observeConfigurationChanges(on engine: AVAudioEngine) {
+    ///
+    /// Takes `AnyObject` rather than `AVAudioEngine` so the override path can
+    /// register the same observer against a `ConfigurationChangeSource` — see
+    /// `configurationChangeSource`.
+    private func observeConfigurationChanges(on source: AnyObject) {
         if let existing = configChangeObserver {
             NotificationCenter.default.removeObserver(existing)
         }
+        configurationChangeSource = source
         configChangeObserver = NotificationCenter.default.addObserver(
             forName: NSNotification.Name.AVAudioEngineConfigurationChange,
-            object: engine,
+            object: source,
             queue: nil
         ) { [weak self] _ in
             // The callback arrives on an AVFoundation-internal dispatch queue,
@@ -322,6 +463,26 @@ final class MicrophoneRecorder: ObservableObject {
 
     private func handleConfigurationChange() async {
         guard isRunning else { return }
+        let now = Date()
+
+        // 1. Did we cause this ourselves? Our own bring-up binds the input
+        //    device, and on some machines that bind posts a configuration
+        //    change. Acting on it re-binds, which posts again — the ~150ms
+        //    self-sustaining loop of issue #147, during which the tap never
+        //    lives long enough to deliver one buffer.
+        if let lastBringUpAt, now.timeIntervalSince(lastBringUpAt) < configurationChangeGracePeriod {
+            micLog.log("ignoring AVAudioEngineConfigurationChange \(now.timeIntervalSince(lastBringUpAt), privacy: .public)s after bring-up — inside the \(self.configurationChangeGracePeriod, privacy: .public)s grace window, so this is our own device selection echoing back; the stall watchdog still covers a device that really did go away")
+            return
+        }
+
+        // 2. Pace what's left. The watchdog is spaced by `captureStallTimeout`;
+        //    without this the notification path had no spacing at all, so the
+        //    rebuild budget could be spent in seconds.
+        guard rebuildThrottle.allow(now: now) else {
+            micLog.error("AVAudioEngine configuration changed again within \(self.rebuildThrottle.currentInterval, privacy: .public)s of the last rebuild — throttling this one (streak=\(self.rebuildThrottle.streak, privacy: .public)); if capture really is dead the stall watchdog will rebuild it")
+            return
+        }
+
         // No "is it really broken?" probe here on purpose: the documented
         // behaviour is that the engine has ALREADY stopped itself by the time
         // this notification is posted, so capture is dead either way and
@@ -424,7 +585,24 @@ final class MicrophoneRecorder: ObservableObject {
         if let override = bringUpOverride {
             // Test path: no CoreAudio, but still exercise the full decision
             // and the timeout wrapper.
-            try? await Self.withTimeout(seconds: bringUpTimeout) { try await override() }
+            //
+            // Success and failure are kept as distinct as they are on the real
+            // path below: a bring-up that threw installed no engine, so it must
+            // not re-arm the grace window or register a new notification
+            // source. Otherwise the seam would quietly misreport a *failed*
+            // mid-session rebuild as a successful one — and the grace window is
+            // exactly what a test of this area is measuring.
+            do {
+                try await Self.withTimeout(seconds: bringUpTimeout) { try await override() }
+            } catch {
+                micLog.error("mic rebuild #\(attempt, privacy: .public) (reason: \(reason, privacy: .public)) failed: \(error.localizedDescription, privacy: .public) — the watchdog will retry")
+                return
+            }
+            guard captureEpoch == epoch else { return }
+            lastBringUpAt = Date()
+            // Mirror the real path: a rebuild installs a new engine, so the
+            // notification source is new too.
+            observeConfigurationChanges(on: ConfigurationChangeSource())
             return
         }
 
@@ -456,6 +634,7 @@ final class MicrophoneRecorder: ObservableObject {
                 return
             }
             engine = result.engine
+            lastBringUpAt = Date()
             observeConfigurationChanges(on: result.engine)
             micLog.log("mic capture rebuilt (attempt #\(attempt, privacy: .public), reason: \(reason, privacy: .public)) at \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch — recording continues")
         } catch {
@@ -482,6 +661,8 @@ final class MicrophoneRecorder: ObservableObject {
             NotificationCenter.default.removeObserver(observer)
             configChangeObserver = nil
         }
+        configurationChangeSource = nil
+        lastBringUpAt = nil
         if let s = stats?.withLock({ $0 }) {
             micLog.log("mic stopping: buffers=\(s.buffers, privacy: .public) frames=\(s.frames, privacy: .public) conversionFailures=\(s.conversionFailures, privacy: .public) rebuilds=\(self.restartCount, privacy: .public)")
             if s.frames == 0 {
@@ -554,8 +735,14 @@ final class MicrophoneRecorder: ObservableObject {
             }
             let nativeFormat = input.inputFormat(forBus: 0)
             micLog.log("native input format: \(nativeFormat.sampleRate, privacy: .public)Hz \(nativeFormat.channelCount, privacy: .public)ch")
-            guard nativeFormat.sampleRate > 0 else {
-                micLog.error("input format reports sampleRate=0 — no usable input device; throwing noInputDevice")
+            // Both halves matter. A rebuild that lands on the wrong AUHAL —
+            // issue #147 saw the *output* device selected, leaving an
+            // "Input render format: 0 ch, 0 Hz" node — must be reported as a
+            // failed bring-up rather than adopted as a working engine that
+            // will never deliver a buffer. The caller logs the failure and the
+            // watchdog retries, instead of the session silently going quiet.
+            guard nativeFormat.sampleRate > 0, nativeFormat.channelCount > 0 else {
+                micLog.error("input format reports \(nativeFormat.sampleRate, privacy: .public)Hz \(nativeFormat.channelCount, privacy: .public)ch — no usable input device; throwing noInputDevice")
                 throw MicrophoneError.noInputDevice
             }
             // One converter for the whole session: resampling is stateful,

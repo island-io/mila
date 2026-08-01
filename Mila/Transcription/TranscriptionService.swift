@@ -49,6 +49,11 @@ final class TranscriptionService: ObservableObject {
     /// to clipping levels and produce ghost transcripts.
     static let minimumAudioPeak: Float = 0.005
 
+    /// Shown when capture produced no samples at all — the microphone's
+    /// problem, surfaced as the microphone's problem. See the guard in
+    /// `transcribeOnceSegments`.
+    static let noAudioCapturedMessage = "No audio was captured, so there was nothing to transcribe. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
+
     private let engine: any TranscribingEngine
     private let store: RecordingStore
     private let modelManager: ModelManager
@@ -321,6 +326,19 @@ final class TranscriptionService: ObservableObject {
     }
 
     func transcribeOnceSegments(samples: [Float], language: String, audioCtx: Int32?) async -> [TranscriptSegment] {
+        // Nothing was captured: don't hand it to any backend. The remote one
+        // uploads a header-only file and gets back `HTTP 500: Failed to decode
+        // audio.`, which the user reads as "the transcription server is down"
+        // — a diagnosis they can neither confirm nor act on, when the real
+        // problem is on this machine. Say what actually happened instead.
+        // The local backend fails the same way, just more quietly. (issue #147)
+        if AudioSignal.isSilent(samples) {
+            serviceLog.error("transcribeOnceSegments: REFUSING to transcribe \(samples.count, privacy: .public) samples with no signal — capture produced nothing")
+            if lastError == nil {
+                lastError = Self.noAudioCapturedMessage
+            }
+            return []
+        }
         // Remote backend: route dictation/live utterances to the configured
         // endpoint too, so the user's "global backend" choice holds for every
         // path. Misconfiguration degrades to an empty result (same contract as

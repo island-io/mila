@@ -32,6 +32,7 @@ protocol RemoteTranscribing: TranscribingEngine {
 actor RemoteWhisperEngine: RemoteTranscribing {
     enum RemoteError: LocalizedError {
         case notConfigured
+        case noAudioCaptured
         case http(status: Int, body: String)
         case badResponse
         case emptyResult
@@ -40,6 +41,8 @@ actor RemoteWhisperEngine: RemoteTranscribing {
             switch self {
             case .notConfigured:
                 return "Remote transcription endpoint is not configured."
+            case .noAudioCaptured:
+                return "No audio was captured, so there was nothing to transcribe. Check that the input in Settings ▸ Audio Input is connected and not muted."
             case .http(let status, let body):
                 let detail = Self.shortMessage(from: body)
                 return "Remote server returned HTTP \(status)\(detail.map { ": \($0)" } ?? "")."
@@ -102,6 +105,17 @@ actor RemoteWhisperEngine: RemoteTranscribing {
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         guard let config else { throw RemoteError.notConfigured }
         if isCancelled?() == true { throw CancellationError() }
+
+        // Never POST audio with nothing in it. A capture session that
+        // delivered zero frames encodes to a header-only file, and the server
+        // answers — correctly — `HTTP 500: {"detail":"Failed to decode
+        // audio."}`, which reads to the user as a server outage and is
+        // completely unactionable. The failure belongs to the microphone, so
+        // say so here rather than letting the network report it. (issue #147)
+        guard !AudioSignal.isSilent(samples) else {
+            remoteLog.error("transcribe: REFUSING to upload \(samples.count, privacy: .public) samples with no signal — nothing was captured")
+            throw RemoteError.noAudioCaptured
+        }
 
         progress?(0.05)
         let audioData = try await Self.encodeM4A(samples: samples)

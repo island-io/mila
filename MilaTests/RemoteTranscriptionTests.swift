@@ -592,6 +592,32 @@ final class RemoteWhisperEngineParsingTests: XCTestCase {
         XCTAssertTrue(text.contains("--B--"), "Must be terminated with the closing boundary")
     }
 
+    /// Issue #147, at the transport layer: whatever else went wrong upstream,
+    /// audio with nothing in it must never be POSTed. The endpoint here points
+    /// at a port nothing listens on, so a network error would prove the guard
+    /// leaked; `.noAudioCaptured` proves it refused before the request.
+    func test_refusesToUploadEmptyAudio() async {
+        let engine = RemoteWhisperEngine()
+        await engine.configure(RemoteTranscriptionConfig(
+            endpoint: URL(string: "http://127.0.0.1:1/v1")!,
+            apiKey: "",
+            model: "whisper-1"))
+
+        do {
+            _ = try await engine.transcribe(samples: [], language: "en",
+                                            audioCtx: 0, progress: nil, isCancelled: nil)
+            XCTFail("Expected .noAudioCaptured; the engine uploaded empty audio")
+        } catch let error as RemoteWhisperEngine.RemoteError {
+            guard case .noAudioCaptured = error else {
+                return XCTFail("Expected .noAudioCaptured, got \(error)")
+            }
+            XCTAssertTrue(error.localizedDescription.contains("No audio was captured"),
+                          "the message has to name the real problem, not the server's decode failure")
+        } catch {
+            XCTFail("Expected .noAudioCaptured, got \(error) — the request reached the network")
+        }
+    }
+
     func test_multipartBodyOmitsLanguageWhenAuto() {
         let body = RemoteWhisperEngine.multipartBody(boundary: "B",
                                                      audio: Data(),
