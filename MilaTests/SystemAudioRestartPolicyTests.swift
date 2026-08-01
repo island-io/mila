@@ -37,6 +37,18 @@ final class SystemAudioRestartPolicyTests: XCTestCase {
                        .sessionOver)
     }
 
+    /// A restart loop that wakes up during a *later* recording must also bail:
+    /// `wantsCapture` is true again by then, so the loop passes the epoch check
+    /// (`stillOwns`) in as the intent flag rather than the raw boolean. Adopting
+    /// there would drop the new session's live stream without stopping it.
+    func test_restart_loop_superseded_by_a_new_session_is_not_retried() {
+        XCTAssertEqual(SystemAudioRecorder.restartDecision(wantsCapture: false,
+                                                          attemptsSoFar: 1,
+                                                          maxAttempts: 5,
+                                                          error: genericError),
+                       .sessionOver)
+    }
+
     func test_permission_failures_are_not_retried() {
         XCTAssertEqual(SystemAudioRecorder.restartDecision(wantsCapture: true,
                                                           attemptsSoFar: 0,

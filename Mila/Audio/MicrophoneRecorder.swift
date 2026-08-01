@@ -167,6 +167,14 @@ final class MicrophoneRecorder: ObservableObject {
     /// both deciding to rebuild at the same moment.
     private var isRebuilding = false
 
+    /// Bumped by every `start()` and `stop()`. A rebuild captures the value it
+    /// began with, because `isRunning` alone cannot tell "my session is still
+    /// live" from "a *later* session is". A stop → start cycle inside a
+    /// rebuild's bring-up (up to `bringUpTimeout`) would otherwise let the
+    /// stale rebuild install its engine over the new session's — leaking a
+    /// running engine, and with it a permanently hot microphone.
+    private var captureEpoch = 0
+
     /// Smoothed digital gain applied to every captured float frame before
     /// it's yielded to consumers. Built fresh on each `start()` so a low-
     /// volume mic doesn't inherit a stale gain from a previous session.
@@ -216,6 +224,7 @@ final class MicrophoneRecorder: ObservableObject {
 
         restartCount = 0
         isRebuilding = false
+        captureEpoch += 1
 
         if let override = bringUpOverride {
             try await Self.withTimeout(seconds: bringUpTimeout) {
@@ -394,7 +403,12 @@ final class MicrophoneRecorder: ObservableObject {
         isRebuilding = true
         restartCount += 1
         let attempt = restartCount
-        defer { isRebuilding = false }
+        let epoch = captureEpoch
+        // Only clear the flag if this rebuild still belongs to the live
+        // session: a stale one finishing late must not clear a *new* session's
+        // in-flight rebuild. `start()` resets the flag itself, so nothing is
+        // left stuck.
+        defer { if captureEpoch == epoch { isRebuilding = false } }
 
         let old = engine
         engine = nil
@@ -429,8 +443,11 @@ final class MicrophoneRecorder: ObservableObject {
             // headphones just died. Adopting the engine now would hand it to a
             // session that no longer exists: nothing would ever tear it down,
             // and the microphone would stay hot for the rest of the process.
-            guard isRunning else {
-                micLog.error("mic rebuild #\(attempt, privacy: .public) finished after the recording ended — tearing down the orphaned engine")
+            // The epoch check covers the nastier variant — a whole stop/start
+            // cycle during the bring-up, where `isRunning` is true again but
+            // belongs to a different recording with its own live engine.
+            guard isRunning, captureEpoch == epoch else {
+                micLog.error("mic rebuild #\(attempt, privacy: .public) finished after its session ended — tearing down the orphaned engine")
                 let orphan = result.engine
                 await Task.detached(priority: .userInitiated) {
                     orphan.inputNode.removeTap(onBus: 0)
@@ -455,7 +472,10 @@ final class MicrophoneRecorder: ObservableObject {
     func stop() async {
         guard isRunning else { return }
         // Kill the watchdog and the notification hook FIRST: a rebuild racing
-        // the teardown below would leave a hot engine nobody owns.
+        // the teardown below would leave a hot engine nobody owns. Bump the
+        // epoch too, so a rebuild already inside its bring-up abandons itself
+        // even if a new recording starts before it returns.
+        captureEpoch += 1
         watchdogTask?.cancel()
         watchdogTask = nil
         if let observer = configChangeObserver {

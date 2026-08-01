@@ -65,6 +65,22 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     private let maxRestartAttempts = 5
     private(set) var restartCount = 0
 
+    /// Bumped by every `start()` and `stop()`. A restart loop captures the
+    /// value it began with and abandons itself as soon as it no longer
+    /// matches, because `wantsCapture` alone cannot tell "my session still
+    /// wants capture" from "a *later* session does". Without this, a
+    /// stop → start inside a restart's backoff window (or inside its bring-up)
+    /// would let the stale loop hand `stream` a replacement it built for the
+    /// previous recording — leaking the new session's live stream, which then
+    /// keeps capturing for the rest of the process while both streams feed the
+    /// same continuation. Same epoch guard `LiveTranscriber` uses.
+    private var captureEpoch = 0
+
+    /// Does the session that started this work still own the recorder?
+    private func stillOwns(epoch: Int) -> Bool {
+        wantsCapture && captureEpoch == epoch
+    }
+
     /// Serial delivery queue for the audio sample callbacks. `.global()`
     /// is a CONCURRENT queue: two SCK callbacks can run in parallel, and
     /// the per-buffer Task hop the old code used added a second unordered
@@ -129,11 +145,13 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 
     func start() async throws {
         guard !isRunning else { return }
+        captureEpoch += 1
+        let epoch = captureEpoch
         wantsCapture = true
         restartAttempts = 0
         restartCount = 0
         do {
-            try await bringUpStream()
+            try await bringUpStream(epoch: epoch)
         } catch {
             wantsCapture = false
             throw error
@@ -144,7 +162,13 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     /// restart re-runs exactly the same setup (fresh shareable content, fresh
     /// filter) without resetting the restart budget or the `wantsCapture`
     /// intent.
-    private func bringUpStream() async throws {
+    ///
+    /// Returns whether the new stream was actually adopted: this suspends
+    /// twice (shareable content, `startCapture`), and a `stop()` — or a whole
+    /// stop/start cycle — can land in between, in which case the stream is
+    /// released here rather than installed on top of a newer session's.
+    @discardableResult
+    private func bringUpStream(epoch: Int) async throws -> Bool {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -193,15 +217,29 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         // it's idle until startCapture below.
         sampleQueue.sync { audioOutput.resetConverter() }
         try await stream.startCapture()
+        // Adopt only if this is still the session that asked. Assigning
+        // `self.stream` unconditionally would drop a newer session's stream on
+        // the floor without stopping it — it would keep capturing screen and
+        // audio for the rest of the process, and both streams would push
+        // samples into the same continuation.
+        guard epoch == captureEpoch else {
+            sysLog.error("system-audio bring-up finished after its session ended (epoch \(epoch, privacy: .public) ≠ \(self.captureEpoch, privacy: .public)) — releasing the stream instead of adopting it")
+            try? await stream.stopCapture()
+            return false
+        }
         self.stream = stream
         self.isRunning = true
         self.lastStreamError = nil
+        return true
     }
 
     func stop() async {
         // Clear the intent first so a `didStopWithError` callback racing this
-        // teardown can't kick off a restart of a capture the user just ended.
+        // teardown can't kick off a restart of a capture the user just ended,
+        // and bump the epoch so any restart already in flight abandons itself
+        // even if a new recording sets `wantsCapture` back to true meanwhile.
         wantsCapture = false
+        captureEpoch += 1
         // Deliberately NOT gated on `isRunning`: when SCK killed the stream
         // itself (`didStopWithError` flips isRunning to false), the old
         // `guard isRunning` made this a no-op and the dead SCStream stayed
@@ -296,9 +334,10 @@ extension SystemAudioRecorder: SCStreamDelegate {
         // therefore be terminal and the retry budget would be decoration, even
         // though the common causes (a display being reconfigured, no display
         // available for a moment) clear on their own within a second or two.
+        let epoch = captureEpoch
         var cause = error
         while true {
-            switch Self.restartDecision(wantsCapture: wantsCapture,
+            switch Self.restartDecision(wantsCapture: stillOwns(epoch: epoch),
                                         attemptsSoFar: restartAttempts,
                                         maxAttempts: maxRestartAttempts,
                                         error: cause) {
@@ -321,19 +360,13 @@ extension SystemAudioRecorder: SCStreamDelegate {
             // single display reconfiguration. `Task.sleep` suspends rather than
             // blocking, so the main actor stays free throughout.
             try? await Task.sleep(nanoseconds: UInt64(Self.restartBackoff(attempt: attempt) * 1_000_000_000))
-            guard wantsCapture else { return }
+            guard stillOwns(epoch: epoch) else { return }
 
             do {
-                try await bringUpStream()
-                // Same hazard as the mic side: `bringUpStream` suspends, and
-                // `stop()` can run while it does. A stream adopted after the
-                // recording ended would keep capturing for the rest of the
-                // process, since nothing is left to stop it.
-                guard wantsCapture else {
-                    sysLog.error("system-audio restart #\(attempt, privacy: .public) finished after the recording ended — releasing the orphaned stream")
-                    await stop()
-                    return
-                }
+                // `bringUpStream` re-checks the epoch at the moment it would
+                // adopt, and releases the stream itself if the session moved
+                // on — so a stale loop can never replace a live stream.
+                guard try await bringUpStream(epoch: epoch) else { return }
                 restartCount += 1
                 sysLog.log("system-audio capture restarted (attempt #\(attempt, privacy: .public)) — app audio is being captured again")
                 return
