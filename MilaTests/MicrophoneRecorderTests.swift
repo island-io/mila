@@ -177,6 +177,93 @@ final class CaptureStallDetectorTests: XCTestCase {
     }
 }
 
+/// Policy coverage for the rebuild pacing added after issue #147: binding the
+/// input device during bring-up made the engine post
+/// `AVAudioEngineConfigurationChange` on the reporter's Mac, the handler
+/// rebuilt immediately, the rebuild re-bound the device, and the whole thing
+/// went round at ~150ms — ~7 microphone start/stop cycles per second, with the
+/// tap never alive long enough to deliver one buffer.
+///
+/// `maxMidSessionRestarts = 60` did not save it: its "60 attempts at ≥1s
+/// apart" comment described the watchdog's cadence, and the notification path
+/// had no cadence at all, so the whole budget burned in about nine seconds.
+final class RebuildThrottleTests: XCTestCase {
+
+    private let t0 = Date(timeIntervalSince1970: 2_000_000)
+
+    /// The first configuration change of a session is always acted on
+    /// immediately — pacing must not make a genuine device swap feel broken.
+    func test_first_rebuild_is_immediate() {
+        var throttle = RebuildThrottle(minimumInterval: 1, maximumInterval: 30)
+        XCTAssertEqual(throttle.currentInterval, 0)
+        XCTAssertTrue(throttle.allow(now: t0))
+    }
+
+    /// The regression, stated as policy: a burst of notifications at the
+    /// observed ~150ms cadence must collapse to a single rebuild.
+    func test_a_storm_of_changes_collapses_to_one_rebuild() {
+        var throttle = RebuildThrottle(minimumInterval: 1, maximumInterval: 30)
+        var allowed = 0
+        for step in 0..<60 {                       // 9 seconds at 150ms
+            if throttle.allow(now: t0.addingTimeInterval(Double(step) * 0.15)) { allowed += 1 }
+        }
+        // 9 seconds spans the 1s floor and then the 2s and 4s backoff steps.
+        XCTAssertLessThanOrEqual(allowed, 4,
+                                 "60 changes in 9s must not mean 60 rebuilds; allowed \(allowed)")
+        XCTAssertGreaterThanOrEqual(allowed, 1, "the first change must still be acted on")
+    }
+
+    /// Documents the behaviour being replaced: with no minimum interval, every
+    /// single notification is a rebuild. This is what shipped in 1.9.2-beta.2.
+    func test_without_a_minimum_interval_every_change_rebuilds() {
+        var throttle = RebuildThrottle(minimumInterval: 0, maximumInterval: 0)
+        var allowed = 0
+        for step in 0..<60 {
+            if throttle.allow(now: t0.addingTimeInterval(Double(step) * 0.15)) { allowed += 1 }
+        }
+        XCTAssertEqual(allowed, 60)
+    }
+
+    func test_backoff_doubles_and_saturates_at_the_ceiling() {
+        var throttle = RebuildThrottle(minimumInterval: 1, maximumInterval: 8)
+        var now = t0
+        var intervals: [TimeInterval] = []
+        for _ in 0..<6 {
+            XCTAssertTrue(throttle.allow(now: now))
+            intervals.append(throttle.currentInterval)
+            // Advance exactly to the next permitted moment.
+            now = now.addingTimeInterval(throttle.currentInterval)
+        }
+        XCTAssertEqual(intervals, [1, 2, 4, 8, 8, 8])
+    }
+
+    /// The budget has to span minutes, which was the whole claim of the
+    /// `maxMidSessionRestarts` comment. Walk the ladder for the real defaults.
+    func test_the_rebuild_budget_spans_minutes_not_seconds() {
+        var throttle = RebuildThrottle(minimumInterval: 1, maximumInterval: 30)
+        var now = t0
+        for _ in 0..<60 {
+            XCTAssertTrue(throttle.allow(now: now))
+            now = now.addingTimeInterval(throttle.currentInterval)
+        }
+        let spanned = now.timeIntervalSince(t0)
+        XCTAssertGreaterThan(spanned, 20 * 60,
+                             "60 notification-driven rebuilds should span many minutes, not the ~9s of the bug; spanned \(spanned)s")
+    }
+
+    /// Backoff must not punish an unrelated event much later in a long
+    /// meeting: a quiet spell means the burst is over.
+    func test_a_quiet_spell_resets_the_backoff() {
+        var throttle = RebuildThrottle(minimumInterval: 1, maximumInterval: 10)
+        XCTAssertTrue(throttle.allow(now: t0))
+        XCTAssertTrue(throttle.allow(now: t0.addingTimeInterval(1)))
+        XCTAssertEqual(throttle.currentInterval, 2)
+        // 10 minutes later, the user unplugs their headphones.
+        XCTAssertTrue(throttle.allow(now: t0.addingTimeInterval(600)))
+        XCTAssertEqual(throttle.currentInterval, 1, "the ladder should start over after a quiet spell")
+    }
+}
+
 /// End-to-end wiring of the watchdog, driven through the `bringUpOverride`
 /// seam: with no real tap the frame count never grows, so a stalled session is
 /// exactly what the recorder sees when a device dies. Counting bring-ups tells
@@ -263,5 +350,146 @@ final class MicrophoneWatchdogTests: XCTestCase {
         try await Task.sleep(nanoseconds: 600_000_000)
         XCTAssertEqual(bringUps(), afterStop,
                        "no bring-ups may happen after stop() — the watchdog must be cancelled")
+    }
+}
+
+/// The configuration-change path, driven through the REAL observer.
+///
+/// Issue #147: on the reporter's Mac, `bringUp()`'s own
+/// `kAudioOutputUnitProperty_CurrentDevice` bind made AVAudioEngine post
+/// `AVAudioEngineConfigurationChange`; the handler rebuilt at once, the
+/// rebuild re-bound the device, and the loop sustained itself at ~150ms until
+/// the user hit Stop — `buffers=0 frames=0 rebuilds=13`, a header-only WAV,
+/// and an `HTTP 500: Failed to decode audio.` that looked like a server
+/// outage.
+///
+/// Why these tests can run on a headless CI runner with no microphone: the
+/// recorder registers its observer against `configurationChangeSource` — the
+/// live `AVAudioEngine` in production, a stand-in object on the
+/// `bringUpOverride` path. Everything under test is real (the observer, the
+/// notification name, the handler, the grace window, the throttle, the rebuild
+/// budget); only the *poster* of the notification is simulated, which is
+/// exactly the part CoreAudio would otherwise have to provide.
+///
+/// The watchdog is parked (`captureStallTimeout` far beyond the test's
+/// lifetime) in every test here so the only thing that can rebuild capture is
+/// the notification path being measured.
+@MainActor
+final class MicrophoneConfigurationChangeTests: XCTestCase {
+
+    private func makeRecorder() -> (MicrophoneRecorder, @Sendable () -> Int) {
+        let counter = OSAllocatedUnfairLock(initialState: 0)
+        let mic = MicrophoneRecorder()
+        mic.bringUpTimeout = 1.0
+        // Park the stall watchdog: it has its own tests, and here it would be
+        // a second source of rebuilds.
+        mic.captureStallTimeout = 3600
+        mic.watchdogInterval = 3600
+        mic.configurationChangeGracePeriod = 0.2
+        mic.minimumRebuildInterval = 1.0
+        mic.maximumRebuildInterval = 4.0
+        mic.bringUpOverride = { counter.withLock { $0 += 1 } }
+        return (mic, { counter.withLock { $0 } })
+    }
+
+    private func postConfigurationChange(to mic: MicrophoneRecorder) {
+        // Re-read the source every time: production installs a brand-new
+        // engine on each rebuild, and it is the new engine that posts the next
+        // change. Posting to a stale source would make the loop untestable —
+        // the second notification would simply go nowhere.
+        guard let source = mic.configurationChangeSource else {
+            return XCTFail("recorder registered no configuration-change source")
+        }
+        NotificationCenter.default.post(
+            name: NSNotification.Name.AVAudioEngineConfigurationChange,
+            object: source)
+    }
+
+    /// Fix (1): the notification our own device bind provokes must not be
+    /// mistaken for the world changing.
+    func test_self_inflicted_change_during_bring_up_does_not_rebuild() async throws {
+        let (mic, bringUps) = makeRecorder()
+        try await mic.start()
+        XCTAssertEqual(bringUps(), 1)
+
+        // Same instant as the bring-up — this is what the bind itself posts.
+        postConfigurationChange(to: mic)
+        try await Task.sleep(nanoseconds: 100_000_000)
+
+        XCTAssertEqual(mic.restartCount, 0,
+                       "a configuration change inside the bring-up grace window is our own doing — rebuilding it is what started the loop")
+        XCTAssertEqual(bringUps(), 1, "the engine must not have been torn down and rebuilt")
+        await mic.stop()
+    }
+
+    /// The counterweight to the test above, and the risk the grace window
+    /// carries: suppressing self-inflicted changes must NOT blind the recorder
+    /// to a device that genuinely went away.
+    func test_change_after_the_grace_window_still_rebuilds() async throws {
+        let (mic, bringUps) = makeRecorder()
+        try await mic.start()
+        try await Task.sleep(nanoseconds: 300_000_000)   // past the 0.2s window
+
+        postConfigurationChange(to: mic)
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        XCTAssertEqual(mic.restartCount, 1,
+                       "a real device change must still be repaired promptly")
+        XCTAssertEqual(bringUps(), 2)
+        await mic.stop()
+    }
+
+    /// Fix (2), and the shape of the actual bug: a *storm* of changes — each
+    /// one provoked by the rebuild that answered the last — must be bounded.
+    ///
+    /// Before the fix this produced one rebuild per notification: the
+    /// reporter's log shows 13 rebuilds in the ~2s before they hit Stop, and
+    /// the 60-rebuild budget would have been gone in nine seconds.
+    func test_a_storm_of_configuration_changes_is_bounded() async throws {
+        let (mic, bringUps) = makeRecorder()
+        try await mic.start()
+        try await Task.sleep(nanoseconds: 300_000_000)   // past the grace window
+
+        // Post continuously for a fixed WALL-CLOCK window at roughly the
+        // cadence observed in the bug (~150ms, compressed to 15ms here).
+        // Wall-clock rather than a fixed iteration count so a slow CI runner
+        // stretches the number of posts, not the window the policy is judged
+        // over.
+        var posts = 0
+        let deadline = Date().addingTimeInterval(0.6)
+        while Date() < deadline {
+            postConfigurationChange(to: mic)
+            posts += 1
+            try await Task.sleep(nanoseconds: 15_000_000)
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        XCTAssertGreaterThan(posts, 10, "the burst should have delivered plenty of notifications")
+        // Floor is 1s and the burst is 0.6s, so one rebuild is the expected
+        // answer; the bound is 2 purely for CI clock jitter. The point is that
+        // the count tracks the POLICY, not the number of notifications.
+        XCTAssertLessThanOrEqual(mic.restartCount, 2,
+                                 "\(posts) configuration changes in 0.6s produced \(mic.restartCount) rebuilds — the notification path is not paced")
+        XCTAssertLessThanOrEqual(bringUps(), 3)
+        await mic.stop()
+    }
+
+    /// A rebuild storm must not be able to outlive the recording either.
+    func test_configuration_change_after_stop_is_ignored() async throws {
+        let (mic, bringUps) = makeRecorder()
+        try await mic.start()
+        let source = mic.configurationChangeSource
+        try await Task.sleep(nanoseconds: 300_000_000)
+        await mic.stop()
+
+        if let source {
+            NotificationCenter.default.post(
+                name: NSNotification.Name.AVAudioEngineConfigurationChange,
+                object: source)
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertEqual(mic.restartCount, 0)
+        XCTAssertEqual(bringUps(), 1, "no bring-up may happen after stop()")
     }
 }

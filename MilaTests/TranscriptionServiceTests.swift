@@ -113,6 +113,90 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertNotNil(svc.lastError, "A live remote failure must surface, not silently empty the pane")
     }
 
+    // MARK: - Empty capture never reaches the network (issue #147)
+
+    /// A recording session that delivered zero frames used to be encoded to a
+    /// header-only file and POSTed anyway; the server answered
+    /// `HTTP 500: {"detail":"Failed to decode audio."}` and the user read that
+    /// as "the transcription server is down". The microphone's failure has to
+    /// be reported as the microphone's failure, and the upload must not happen.
+    func test_zeroFrameCapture_neverReachesTheUploadPath() async {
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.emptyAudio")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.emptyAudio")
+        let keychainKey = "TranscriptionServiceTests.emptyAudio.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "http://localhost:8080/v1"
+        let counting = CountingRemoteEngine()
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.emptyAudio.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: counting)
+
+        let segs = await svc.transcribeOnceSegments(samples: [], language: "en", audioCtx: nil)
+
+        XCTAssertTrue(segs.isEmpty)
+        let calls = await counting.transcribeCalls
+        XCTAssertEqual(calls, 0, "empty audio must never be handed to the remote backend")
+        XCTAssertEqual(svc.lastError, TranscriptionService.noAudioCapturedMessage,
+                       "the user must be told nothing was captured, not shown the server's decode error")
+    }
+
+    /// Same for a buffer that has samples but no signal — a muted or dead
+    /// input device. There is nothing to transcribe and nothing to upload.
+    func test_digitalSilence_neverReachesTheUploadPath() async {
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.silentAudio")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.silentAudio")
+        let keychainKey = "TranscriptionServiceTests.silentAudio.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "http://localhost:8080/v1"
+        let counting = CountingRemoteEngine()
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.silentAudio.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: counting)
+
+        let segs = await svc.transcribeOnceSegments(samples: [Float](repeating: 0, count: 16_000),
+                                                    language: "en", audioCtx: nil)
+
+        XCTAssertTrue(segs.isEmpty)
+        let calls = await counting.transcribeCalls
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(svc.lastError, TranscriptionService.noAudioCapturedMessage)
+    }
+
+    /// The guard is the strictest possible one, so ordinary quiet speech is
+    /// still transcribed — a 0.2s utterance at -60 dBFS must go through.
+    func test_quietButRealAudio_isStillTranscribed() async {
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.quietAudio")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.quietAudio")
+        let keychainKey = "TranscriptionServiceTests.quietAudio.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "http://localhost:8080/v1"
+        let counting = CountingRemoteEngine()
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.quietAudio.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: counting)
+
+        var samples = [Float](repeating: 0, count: 3_200)   // 0.2s @ 16kHz
+        samples[1_000] = 0.001
+        let segs = await svc.transcribeOnceSegments(samples: samples, language: "en", audioCtx: nil)
+
+        XCTAssertEqual(segs.count, 1, "quiet is not the same as empty")
+        let calls = await counting.transcribeCalls
+        XCTAssertEqual(calls, 1)
+        XCTAssertNil(svc.lastError)
+    }
+
     // MARK: - Single recording happy path
 
     func test_enqueue_single_recording_marks_running_then_completed() async throws {
@@ -876,6 +960,24 @@ private final class Probe401URLProtocol: URLProtocol {
         client?.urlProtocolDidFinishLoading(self)
     }
     override func stopLoading() {}
+}
+
+/// Counts how many times the service actually handed audio to the remote
+/// backend. Used to prove that a session which captured nothing never reaches
+/// the upload path at all.
+private actor CountingRemoteEngine: RemoteTranscribing {
+    private(set) var transcribeCalls = 0
+    func configure(_ config: RemoteTranscriptionConfig) async {}
+    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
+    func shutdown() async {}
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        transcribeCalls += 1
+        return [TranscriptSegment(start: 0, end: 1, text: "uploaded")]
+    }
 }
 
 /// A remote engine that always throws an HTTP 401 — stands in for a
