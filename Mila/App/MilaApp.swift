@@ -35,8 +35,18 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     private(set) var controller: SPUStandardUpdaterController!
     @Published var canCheckForUpdates = false
 
+    /// Mirrors Sparkle's own `automaticallyChecksForUpdates` (persisted by
+    /// Sparkle in the host bundle's defaults — we deliberately do NOT keep a
+    /// second user default for it, per `SPUUpdater.h`). Kept in sync via KVO so
+    /// the Settings toggle reflects changes Sparkle makes itself (e.g. the
+    /// second-launch permission prompt). Write through
+    /// `setAutomaticallyChecksForUpdates(_:)`.
+    @Published var automaticallyChecksForUpdates = true
+
     /// UserDefaults key for the "Enable beta version" opt-in. Read live by
-    /// `allowedChannels(for:)` and written by the toggle in Settings → Updates.
+    /// `allowedChannels(for:)` and by the pre-release guard in
+    /// `updater(_:shouldProceedWithUpdate:updateCheck:)`; written by the toggle
+    /// in Settings → General ▸ Updates.
     static let betaChannelDefaultsKey = "updates.betaChannel"
 
     /// The update we want the custom popup to show. Non-nil iff a scheduled
@@ -69,6 +79,9 @@ final class UpdaterViewModel: NSObject, ObservableObject,
         controller.updater.publisher(for: \.canCheckForUpdates)
             .receive(on: DispatchQueue.main)
             .assign(to: &$canCheckForUpdates)
+        controller.updater.publisher(for: \.automaticallyChecksForUpdates)
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$automaticallyChecksForUpdates)
 
         // UI-test seam: force the "What's New" popup to appear with fixture
         // release-notes content, without needing a live appcast / a newer
@@ -87,6 +100,13 @@ final class UpdaterViewModel: NSObject, ObservableObject,
                 """
             )
         }
+    }
+
+    /// Write-through for the "Automatically check for updates" toggle. Sparkle
+    /// persists the value itself; the KVO mirror above pushes it back into
+    /// `automaticallyChecksForUpdates` so the UI stays consistent.
+    func setAutomaticallyChecksForUpdates(_ enabled: Bool) {
+        controller.updater.automaticallyChecksForUpdates = enabled
     }
 
     /// User picked "Check for Updates…" from the menu. Flag it so the
@@ -129,6 +149,87 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     /// toggle takes effect on the next check — no relaunch needed.
     nonisolated func allowedChannels(for updater: SPUUpdater) -> Set<String> {
         UserDefaults.standard.bool(forKey: Self.betaChannelDefaultsKey) ? ["beta"] : []
+    }
+
+    /// Pure version classifier: does this marketing version string denote a
+    /// pre-release? Matches the `-beta` / `-alpha` / `-rc` suffix conventions
+    /// this project actually tags with (`1.9.2-beta.1`), case-insensitively.
+    /// A plain `1.9.2` — or an empty/unknown string, which must never be
+    /// treated as a beta — is not a pre-release.
+    ///
+    /// The marker has to be a *complete* token, guarded on both sides, because
+    /// anything we can't positively classify must fail open:
+    /// - a leading `-`, so a build named `Alpharetta` (`1.0.0 Alpharetta`) or a
+    ///   `-superbeta` suffix isn't misread;
+    /// - and nothing but a non-letter after it, so an unknown label like
+    ///   `1.0.0-betamax` or `1.0.0-alphabet` is treated as unclassifiable
+    ///   (allowed) rather than silently refused. A digit still counts as a
+    ///   terminator so the common `1.9.2-beta1` spelling keeps matching,
+    ///   alongside `-beta`, `-beta.1` and `-beta-1`.
+    ///
+    /// Kept `static`, `nonisolated` and side-effect-free so it's callable from
+    /// Sparkle's nonisolated delegate callbacks and unit-testable without
+    /// constructing an updater (see `UpdaterPrereleaseGuardTests`).
+    nonisolated static func isPrerelease(_ shortVersionString: String) -> Bool {
+        let v = shortVersionString.lowercased()
+        return ["-beta", "-alpha", "-rc"].contains { marker in
+            var searchStart = v.startIndex
+            while let hit = v.range(of: marker, range: searchStart..<v.endIndex) {
+                // A complete token: end-of-string, or followed by something
+                // that isn't a letter (`.`, `-`, `+`, a digit, whitespace…).
+                if hit.upperBound == v.endIndex || !v[hit.upperBound].isLetter {
+                    return true
+                }
+                searchStart = hit.upperBound
+            }
+            return false
+        }
+    }
+
+    /// Defensive, client-side beta gate — the last line of defence in front of
+    /// `allowedChannels(for:)`.
+    ///
+    /// Channel filtering is only as good as the appcast: an item tagged
+    /// `<sparkle:channel>beta</sparkle:channel>` is hidden from users who
+    /// haven't opted in, but an item that is a beta and *forgot* the tag lands
+    /// in the DEFAULT channel and is therefore offered to everyone. That is
+    /// exactly what happened when `1.9.2-beta.1` was published without the
+    /// channel element: every stable user was offered a beta regardless of the
+    /// opt-in. The feed and the publishing pipeline were fixed separately —
+    /// this hook makes the client refuse such an item anyway, so a single
+    /// mis-tagged release can't push betas at people again.
+    ///
+    /// `shouldProceedWithUpdate` is the right hook: per `SPUUpdaterDelegate.h`,
+    /// throwing here means "the user is not shown this updateItem nor is the
+    /// update downloaded or installed" — it gates *offering* the update, unlike
+    /// `didFindValidUpdate` (informational, too late) or the user-driver hooks
+    /// (which only choose which UI presents an update that's already been
+    /// accepted). It runs for both scheduled and user-initiated checks.
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        shouldProceedWithUpdate updateItem: SUAppcastItem,
+        updateCheck: SPUUpdateCheck
+    ) throws {
+        guard !UserDefaults.standard.bool(forKey: Self.betaChannelDefaultsKey) else { return }
+        // Check both: `displayVersionString` is the marketing version users see
+        // (`1.9.2-beta.1`), but a feed may only carry `sparkle:version`.
+        let candidates = [updateItem.displayVersionString, updateItem.versionString]
+        guard candidates.contains(where: { Self.isPrerelease($0) }) else { return }
+
+        os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+            .error("""
+            Refusing update \(updateItem.displayVersionString, privacy: .public) \
+            (\(updateItem.versionString, privacy: .public)): it is a pre-release \
+            and this user has not opted into the beta channel. The appcast item \
+            is probably missing <sparkle:channel>beta</sparkle:channel>.
+            """)
+        throw NSError(
+            domain: "io.island.mila.updates",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey:
+                "\(updateItem.displayVersionString) is a pre-release build. "
+                + "Enable “Receive beta versions” in Settings ▸ General to install betas."]
+        )
     }
 
     /// Sparkle found a newer valid version. Capture its release notes for the
@@ -639,6 +740,11 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
                 .environmentObject(configImporter)
+                // Settings ▸ General shows the Sparkle-backed
+                // "Automatically check for updates" toggle, so the Settings
+                // scene needs the same single updater instance the main window
+                // and the menu command use — never a second one.
+                .environmentObject(updater)
         }
     }
 

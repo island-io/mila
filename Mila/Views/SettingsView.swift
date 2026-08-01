@@ -3,7 +3,7 @@ import AppKit
 import Carbon.HIToolbox
 
 enum SettingsTab: Int, Hashable {
-    case hotkeys, audio, models, llm, speakers, meetings, liveAI, voiceMemos, storage, updates
+    case general, audio, models, llm, speakers, meetings, liveAI, voiceMemos, storage
 }
 
 @Observable
@@ -14,13 +14,13 @@ final class SettingsNavigation {
 
 /// Standard `Settings` scene. Opened via `Cmd+,` from the menu bar.
 struct SettingsView: View {
-    @State private var selectedTab: SettingsTab = .hotkeys
+    @State private var selectedTab: SettingsTab = .general
 
     var body: some View {
         TabView(selection: $selectedTab) {
-            HotkeysSettingsTab()
-                .tabItem { Label("Hotkeys", systemImage: "command") }
-                .tag(SettingsTab.hotkeys)
+            GeneralSettingsTab()
+                .tabItem { Label("General", systemImage: "gearshape") }
+                .tag(SettingsTab.general)
             AudioSettingsTab()
                 .tabItem { Label("Audio", systemImage: "mic") }
                 .tag(SettingsTab.audio)
@@ -45,9 +45,6 @@ struct SettingsView: View {
             StorageSettingsTab()
                 .tabItem { Label("Storage", systemImage: "externaldrive") }
                 .tag(SettingsTab.storage)
-            UpdatesSettingsTab()
-                .tabItem { Label("Updates", systemImage: "arrow.triangle.2.circlepath") }
-                .tag(SettingsTab.updates)
         }
         // The width is load-bearing: it has to hold the whole tab strip.
         // AppKit's NSTabView collapses whatever doesn't fit into a `>>`
@@ -76,55 +73,6 @@ struct SettingsView: View {
                 SettingsNavigation.shared.pendingTab = nil
             }
         }
-    }
-}
-
-// MARK: - Updates
-
-/// Settings → Updates. Shows the current version and the opt-in beta channel.
-/// The toggle writes `UpdaterViewModel.betaChannelDefaultsKey`, which the
-/// Sparkle updater delegate (`allowedChannels(for:)`) reads to decide whether
-/// to offer `<sparkle:channel>beta</sparkle:channel>` appcast items.
-private struct UpdatesSettingsTab: View {
-    @AppStorage(UpdaterViewModel.betaChannelDefaultsKey) private var betaChannel = false
-
-    private var versionString: String {
-        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
-        let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
-        return "\(v) (\(b))"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Updates")
-                .font(.title3.weight(.semibold))
-            Text("Mila checks for updates automatically and installs them with your approval. You're on version \(versionString).")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Divider()
-
-            Toggle(isOn: $betaChannel) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enable beta version of Mila")
-                    Text("Receive pre-release builds with the newest features before they ship to everyone. Betas can be less stable. Turn this off to stay on stable releases — you'll move back to stable the next time a stable version ships.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .toggleStyle(.switch)
-            .accessibilityIdentifier("updates.beta.toggle")
-
-            Text("After enabling, choose “Check for Updates…” from the Mila menu to fetch the latest beta right away.")
-                .font(.caption)
-                .foregroundStyle(.tertiary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -269,7 +217,13 @@ private struct AudioSettingsTab: View {
 
 // MARK: - Hotkeys
 
-private struct HotkeysSettingsTab: View {
+/// Settings → General. Dictation hotkeys plus the small Updates group (auto
+/// update check + nested beta opt-in). The Updates group used to be its own
+/// tab; it was folded in here because a single toggle and a version string
+/// didn't justify a tenth tab — and the tab strip had already overflowed into
+/// AppKit's ">>" overflow chevron at that width, which is what made the
+/// Updates tab look "disabled" (see PR discussion).
+private struct GeneralSettingsTab: View {
     @EnvironmentObject private var hotkeys: HotkeySettings
 
     /// The action whose hotkey the user is currently re-recording. Nil when
@@ -319,6 +273,10 @@ private struct HotkeysSettingsTab: View {
                     .font(.callout)
                     .foregroundStyle(.red)
             }
+
+            Divider().padding(.vertical, 4)
+
+            UpdatesSettingsSection()
 
             Spacer()
         }
@@ -380,6 +338,64 @@ private struct HotkeysSettingsTab: View {
     private func resetToDefault(_ action: HotkeyAction) {
         hotkeys.resetToDefault(action)
         lastError = nil
+    }
+}
+
+/// The Updates group inside Settings → General: Sparkle's own
+/// "automatically check" preference, with the beta-channel opt-in nested
+/// underneath it, plus the running version.
+///
+/// The auto-check checkbox is bound straight through to the ONE
+/// `SPUUpdater` the app owns (via the injected `UpdaterViewModel`) — Sparkle
+/// persists that value itself, so we deliberately keep no parallel user
+/// default for it. The beta checkbox writes
+/// `UpdaterViewModel.betaChannelDefaultsKey`, which the updater delegate reads
+/// both in `allowedChannels(for:)` (channel filtering) and in
+/// `updater(_:shouldProceedWithUpdate:updateCheck:)` (the defensive
+/// pre-release guard).
+private struct UpdatesSettingsSection: View {
+    @EnvironmentObject private var updater: UpdaterViewModel
+    @AppStorage(UpdaterViewModel.betaChannelDefaultsKey) private var betaChannel = false
+
+    private var versionString: String {
+        let v = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let b = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+        return "\(v) (\(b))"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Updates")
+                .font(.title3.weight(.semibold))
+
+            Toggle("Automatically check for updates", isOn: Binding(
+                get: { updater.automaticallyChecksForUpdates },
+                set: { updater.setAutomaticallyChecksForUpdates($0) }
+            ))
+            .toggleStyle(.checkbox)
+            .accessibilityIdentifier("updates.autoCheck.toggle")
+
+            // Nested under the auto-check box: the beta opt-in. Deliberately
+            // NOT disabled when auto-check is off — a user with automatic
+            // checks disabled can still opt into betas and fetch one by hand
+            // with "Check for Updates…".
+            VStack(alignment: .leading, spacing: 2) {
+                Toggle("Receive beta versions of Mila", isOn: $betaChannel)
+                    .toggleStyle(.checkbox)
+                    .accessibilityIdentifier("updates.beta.toggle")
+                Text("Receive pre-release builds with the newest features before they ship to everyone. Betas can be less stable. Turn this off to stay on stable releases — you'll move back to stable the next time a stable version ships.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.leading, 20)
+
+            Text("You're on version \(versionString). After changing these, choose “Check for Updates…” from the Mila menu to check right away.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
