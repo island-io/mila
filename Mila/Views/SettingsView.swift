@@ -932,10 +932,13 @@ private struct AIFeatureRow<Content: View>: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
+                // `.help` sets the accessibility hint as well as the tooltip,
+                // so it goes on FIRST and the explicit expand/collapse hint
+                // below wins for VoiceOver.
+                .aiHelp(help)
                 .accessibilityIdentifier(identifier)
                 .accessibilityLabel(Text(title))
                 .accessibilityHint(Text(isExpanded ? "Collapse" : "Expand"))
-                .aiHelp(help)
 
                 if let isOn {
                     Toggle("", isOn: isOn)
@@ -1223,14 +1226,22 @@ private struct AIProviderSettingsTab: View {
 
     private var testPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Picker("Prompt to test", selection: $settings.testPromptKind) {
-                ForEach(LLMSettings.TestPromptKind.allCases) { kind in
-                    Text(kind.label).tag(kind)
+            // Labelled above rather than inline, to match the "Sample
+            // transcript" block below it — `.labelsHidden()` alone left a
+            // bare segmented control with nothing saying what it selects.
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Prompt to test")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker("Prompt to test", selection: $settings.testPromptKind) {
+                    ForEach(LLMSettings.TestPromptKind.allCases) { kind in
+                        Text(kind.label).tag(kind)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 320)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 320)
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("Sample transcript")
