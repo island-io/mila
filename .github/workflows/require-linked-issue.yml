@@ -27,9 +27,13 @@ on:
 permissions:
   contents: read
 
+# Serialise runs per PR, but deliberately do NOT cancel in-progress ones: a
+# cancelled run reports a `cancelled` conclusion, which counts as blocking once
+# this is a required check, and rapid edits could leave that as the last word.
+# The job takes ~5s, so there is nothing worth saving by cancelling.
 concurrency:
   group: require-linked-issue-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   require-linked-issue:
