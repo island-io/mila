@@ -1,5 +1,4 @@
 import Foundation
-import MilaKit
 
 /// Writes a completed recording into the configured Obsidian vault as a
 /// Markdown note, then optionally kicks the git sync.
@@ -55,7 +54,13 @@ final class ObsidianExporter: ObservableObject {
         guard let write = writeNote(recording, vault: vault) else { return nil }
 
         if settings.gitSyncEnabled {
-            let title = recording.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            // Single-line: a title with an embedded newline would otherwise
+            // turn the commit subject into a subject + body in the user's
+            // vault history.
+            let title = recording.title
+                .components(separatedBy: .newlines)
+                .joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
             let message = "Add transcript: \(title.isEmpty ? "Untitled recording" : title)"
             kickGitSync(vault: vault, changedPaths: write.changedPaths, commitMessage: message)
         }
@@ -88,6 +93,11 @@ final class ObsidianExporter: ObservableObject {
     /// a rename), or nil when there's nothing to write / the write fails.
     private func writeNote(_ recording: Recording,
                            vault: URL) -> (written: URL, changedPaths: [URL])? {
+        // Never file a recording the user has thrown away. The summary hook
+        // can land after a trash action (the LLM call is in flight when the
+        // user deletes), and "I deleted it and it still turned up in my vault"
+        // is the worst possible surprise from a background exporter.
+        guard !recording.isTrashed else { return nil }
         guard Self.hasContent(recording), let destDir = destinationDirectory(for: recording) else {
             return nil
         }
@@ -130,7 +140,10 @@ final class ObsidianExporter: ObservableObject {
         guard let base = settings.destinationDirectory else { return nil }
         let folder = (recording.folder ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !folder.isEmpty else { return base }
-        let safe = Self.sanitizedTitle(folder)
+        // `directoryComponent`, not `sanitizedTitle`: a Mila folder literally
+        // named ".." would otherwise append a real parent-directory component
+        // and file the note outside the configured subfolder.
+        let safe = ObsidianPathSanitizer.directoryComponent(folder)
         guard !safe.isEmpty else { return base }
         return base.appendingPathComponent(safe, isDirectory: true)
     }
@@ -219,14 +232,15 @@ final class ObsidianExporter: ObservableObject {
     }
 
     /// Strip path-hostile characters and collapse whitespace so the title is a
-    /// safe single-line filename component.
+    /// safe single-line filename component. Length-capped on a UTF-8 budget so
+    /// a very long title can't blow past the 255-byte component limit and make
+    /// the write fail.
+    ///
+    /// Safe to leave leading dots in place here: `fileName` always prefixes the
+    /// date, so the result can never be `.`, `..` or a dotfile. Directory names
+    /// have no such prefix and go through `ObsidianPathSanitizer
+    /// .directoryComponent` instead.
     static func sanitizedTitle(_ title: String) -> String {
-        let invalid = CharacterSet(charactersIn: "/\\:*?\"<>|")
-            .union(.newlines)
-            .union(.controlCharacters)
-        let stripped = title.components(separatedBy: invalid).joined(separator: " ")
-        return stripped
-            .split(whereSeparator: { $0 == " " || $0 == "\t" })
-            .joined(separator: " ")
+        ObsidianPathSanitizer.nameFragment(title)
     }
 }

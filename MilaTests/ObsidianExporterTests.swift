@@ -94,6 +94,56 @@ final class ObsidianExporterTests: XCTestCase {
         XCTAssertTrue(name.contains("My Meeting Q3"))
     }
 
+    /// A title made entirely of stripped characters must still produce a
+    /// usable, visible, non-relative filename — never "", ".md", "..md" or a
+    /// dotfile. The date prefix is what guarantees it.
+    func test_fileName_survives_hostile_titles() {
+        for hostile in ["", "   ", "///", "..", ".", "...", "\u{0000}\u{0007}", "<>|?*\"\\"] {
+            let name = ObsidianExporter.fileName(for: makeRecording(title: hostile))
+            XCTAssertTrue(name.hasPrefix("2026-01-02"),
+                          "\(hostile.debugDescription) should keep the date prefix, got \(name)")
+            XCTAssertTrue(name.hasSuffix(".md"))
+            XCTAssertFalse(name.hasPrefix("."), "must never be a dotfile: \(name)")
+            XCTAssertNotEqual(name, "..md")
+            XCTAssertFalse(name.contains("/"))
+        }
+    }
+
+    /// APFS caps a path component at 255 bytes. A pathological title must be
+    /// truncated rather than making the write fail.
+    func test_fileName_is_capped_to_a_writable_length() throws {
+        let long = String(repeating: "עברית ", count: 200)   // multi-byte, ~2200 bytes
+        let name = ObsidianExporter.fileName(for: makeRecording(title: long))
+        XCTAssertLessThanOrEqual(name.utf8.count, 255)
+        // And it actually writes.
+        let rec = makeRecording(title: long, summary: "S")
+        XCTAssertNotNil(exporter.export(rec))
+    }
+
+    /// A Mila folder literally named ".." must not walk out of the configured
+    /// subfolder. `sanitizedTitle` alone would have let it through.
+    func test_export_folder_named_dotdot_cannot_escape_the_subfolder() throws {
+        settings.subfolder = "Notes"
+        let base = vault.appendingPathComponent("Notes").standardizedFileURL.path
+        for hostile in ["..", ".", "../..", ".hidden"] {
+            let rec = makeRecording(title: "T-\(hostile)", summary: "S", folder: hostile)
+            let url = try XCTUnwrap(exporter.export(rec))
+            let dir = url.deletingLastPathComponent().standardizedFileURL.path
+            XCTAssertTrue(dir == base || dir.hasPrefix(base + "/"),
+                          "folder \(hostile.debugDescription) escaped to \(dir)")
+            XCTAssertFalse(url.lastPathComponent.hasPrefix("."))
+        }
+    }
+
+    /// The summary hook can land after the user has trashed the recording
+    /// (the LLM call was still in flight). A trashed recording is never filed.
+    func test_export_skips_a_trashed_recording() {
+        var rec = makeRecording(summary: "S")
+        rec.deletedAt = Date()
+        XCTAssertNil(exporter.export(rec))
+        XCTAssertEqual(exporter.exportAll([rec]), 0)
+    }
+
     // MARK: - Writing
 
     func test_export_writes_note_into_vault() throws {

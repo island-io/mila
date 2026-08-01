@@ -10,6 +10,15 @@ import AppKit
 /// `ObsidianVaultSettings` for the resolution / fallback rules. Notes are
 /// written after the AI summary lands (falling back to the transcript when
 /// summaries are off), so nothing here blocks recording.
+///
+/// **Visibility contract.** The feature is opt-in and adds no affordance
+/// anywhere else in the app — no toolbar item, no context-menu entry, no
+/// badge. On a fresh install the *only* thing it puts on screen is the single
+/// toggle below, presented as one more card in Settings ▸ Storage rather than
+/// a titled section of its own. Everything else here — the vault picker, the
+/// git options, the backfill button, the error/stale notices — is rendered
+/// only once `settings.enabled` is true, and the backfill button additionally
+/// requires a chosen vault. Keep it that way.
 struct ObsidianSettingsSection: View {
     @EnvironmentObject private var settings: ObsidianVaultSettings
     @EnvironmentObject private var store: RecordingStore
@@ -20,7 +29,6 @@ struct ObsidianSettingsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            header
             enableCard
             if settings.enabled {
                 vaultCard
@@ -28,39 +36,46 @@ struct ObsidianSettingsSection: View {
                 if settings.vaultURL != nil {
                     backfillCard
                 }
-            }
-            if settings.lastResolutionWasStale {
-                staleBookmarkNotice
-            }
-            if let lastError {
-                Text(lastError)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
+                if settings.lastResolutionWasStale {
+                    staleBookmarkNotice
+                }
+                if let lastError {
+                    Text(lastError)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Obsidian vault")
-                .font(.title3.weight(.semibold))
-            Text("When a recording finishes, Mila writes a Markdown note into your vault — the AI summary plus any action items, falling back to the transcript when summaries are off. Notes are written after the summary lands, so this never blocks recording.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
+    /// The whole feature's footprint when it's off: one toggle and one line of
+    /// caption, in the same card shape the rest of the Storage tab uses.
     private var enableCard: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Toggle("Save transcripts to an Obsidian vault", isOn: $settings.enabled)
-                .accessibilityIdentifier("obsidian.enabled.toggle")
-            if settings.enabled && settings.vaultURL == nil {
-                Text("Pick a vault folder below to start filing notes.")
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "text.book.closed.fill")
+                    .foregroundStyle(.tint)
+                Toggle("Save transcripts to an Obsidian vault", isOn: $settings.enabled)
+                    .accessibilityIdentifier("obsidian.enabled.toggle")
+                Spacer()
+            }
+            if settings.enabled {
+                Text("When a recording finishes, Mila writes a Markdown note into your vault — the AI summary plus any action items, falling back to the transcript when summaries are off. Notes are written after the summary lands, so this never blocks recording.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if settings.vaultURL == nil {
+                    Text("Pick a vault folder below to start filing notes.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("Off. Turn this on to file each finished recording into an Obsidian vault as a Markdown note.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(12)
@@ -213,7 +228,7 @@ struct ObsidianSettingsSection: View {
 
     private func revealInFinder() {
         guard let url = settings.vaultURL else { return }
-        NSWorkspace.shared.open(url)
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     /// Backfill: write every non-trashed recording that has content into the

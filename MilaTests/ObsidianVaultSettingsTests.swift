@@ -32,6 +32,69 @@ final class ObsidianVaultSettingsTests: XCTestCase {
         XCTAssertEqual(settings.gitBranch, "main")
     }
 
+    /// Pins the shipped contract: on a fresh install the feature is off, has no
+    /// vault, and the exporter is inert — nothing is written even if something
+    /// calls it. The one thing this can't assert is the UI (no XCUITest here);
+    /// `ObsidianSettingsSection` renders only its toggle while `enabled` is
+    /// false, and the app adds no other Obsidian affordance anywhere.
+    func test_fresh_install_is_disabled_and_exports_nothing() throws {
+        let settings = ObsidianVaultSettings(defaults: defaults)
+        let exporter = ObsidianExporter(settings: settings, defaults: defaults)
+
+        XCTAssertFalse(settings.enabled, "the feature must be opt-in")
+        XCTAssertNil(settings.vaultURL, "no vault until the user picks one")
+        XCTAssertNil(settings.destinationDirectory)
+
+        var rec = Recording(title: "Team Sync", source: .microphone,
+                            audioFileName: "a.wav", fullText: "a transcript")
+        rec.summary = "A summary."
+        XCTAssertNil(exporter.export(rec))
+        XCTAssertEqual(exporter.exportAll([rec]), 0)
+
+        // Enabling alone still isn't enough — a vault is required.
+        settings.enabled = true
+        XCTAssertNil(settings.vaultURL)
+        XCTAssertNil(exporter.export(rec))
+        XCTAssertEqual(exporter.exportAll([rec]), 0)
+    }
+
+    /// `subfolder` is a free-text field. A typed relative path must resolve
+    /// inside the vault, never above it.
+    func test_subfolder_cannot_escape_the_vault() throws {
+        let vault = tempRoot.appendingPathComponent("VaultEscape", isDirectory: true)
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        let settings = ObsidianVaultSettings(defaults: defaults)
+        XCTAssertTrue(settings.setVault(vault))
+        let base = try XCTUnwrap(settings.vaultURL).standardizedFileURL.path
+
+        for hostile in ["../../Desktop", "..", "./..", "../Notes", "Notes/../..", "."] {
+            settings.subfolder = hostile
+            let dest = try XCTUnwrap(settings.destinationDirectory).standardizedFileURL.path
+            XCTAssertTrue(dest == base || dest.hasPrefix(base + "/"),
+                          "subfolder \(hostile.debugDescription) escaped to \(dest)")
+        }
+
+        // A legitimate nested path still works, and a hidden component is
+        // un-hidden rather than dropped.
+        settings.subfolder = "Notes/Meetings"
+        XCTAssertEqual(try XCTUnwrap(settings.destinationDirectory).standardizedFileURL.path,
+                       base + "/Notes/Meetings")
+        settings.subfolder = ".secret"
+        XCTAssertEqual(try XCTUnwrap(settings.destinationDirectory).standardizedFileURL.path,
+                       base + "/secret")
+    }
+
+    func test_path_sanitizer_component_rules() {
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent(".."), "")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("."), "")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent(".hidden"), "hidden")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("Client: Acme"), "Client Acme")
+        XCTAssertEqual(ObsidianPathSanitizer.relativePath("../../a/./b"), "a/b")
+        XCTAssertEqual(ObsidianPathSanitizer.relativePath("///"), "")
+        XCTAssertLessThanOrEqual(
+            ObsidianPathSanitizer.nameFragment(String(repeating: "é", count: 500)).utf8.count, 180)
+    }
+
     func test_setVault_persists_bookmark_and_resolves_on_relaunch() throws {
         let vault = tempRoot.appendingPathComponent("Vault", isDirectory: true)
         try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)

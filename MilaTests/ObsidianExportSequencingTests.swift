@@ -64,6 +64,22 @@ final class ObsidianExportSequencingTests: XCTestCase {
         try await super.tearDown()
     }
 
+    /// Rebuild the summarizer with a stub that fails, keeping the same hook
+    /// wiring MilaApp uses. Models "the LLM call blew up" and, combined with a
+    /// delete, "the user cancelled/deleted while it was in flight".
+    private func useFailingLLM() {
+        struct StubFailure: Error {}
+        summarizer = RecordingSummarizer(store: store, llmSettings: llm, liveAISettings: liveAI,
+                                         runLLM: { _, _, _, _, _, _, _, _, _, _, _ in
+                                             throw StubFailure()
+                                         })
+        summarizer.onSummaryFinished = { [weak exporter] rec in
+            guard let exporter, exporter.isPending(rec.id) else { return }
+            exporter.export(rec)
+            exporter.clearPending(rec.id)
+        }
+    }
+
     private func addRecording(fullText: String = "some transcript") -> Recording {
         let audioURL = store.freshAudioURL(suggestedName: "Rec")
         try? Data("x".utf8).write(to: audioURL)
@@ -110,5 +126,67 @@ final class ObsidianExportSequencingTests: XCTestCase {
         let contents = try String(contentsOf: expected, encoding: .utf8)
         XCTAssertTrue(contents.contains("## Transcript"))
         XCTAssertTrue(contents.contains("the raw transcript body"))
+    }
+
+    /// A failed summary still resolves the pending export — it must not hang
+    /// waiting for a summary that will never arrive.
+    func test_failed_summary_still_exports_the_transcript() async throws {
+        useFailingLLM()
+        let rec = addRecording(fullText: "the raw transcript body")
+        exporter.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expected.path),
+                      "a failed summary must fall back, not stall the export")
+        XCTAssertFalse(exporter.isPending(rec.id), "the pending mark must be cleared")
+    }
+
+    /// Deleted mid-flight: the failure path must not fire the hook with the
+    /// stale enqueue-time copy, or a recording the user just deleted lands in
+    /// the vault anyway.
+    func test_recording_deleted_mid_flight_is_not_exported() async throws {
+        useFailingLLM()
+        let rec = addRecording(fullText: "the raw transcript body")
+        exporter.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        store.permanentlyDelete(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expected.path),
+                       "a recording deleted mid-flight must not be filed")
+    }
+
+    /// Trashed mid-flight: the hook does fire (the row is still in the store),
+    /// but the exporter refuses to file a trashed recording.
+    func test_recording_trashed_mid_flight_is_not_exported() async throws {
+        let rec = addRecording()
+        exporter.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        store.softDelete(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expected.path),
+                       "a recording trashed mid-flight must not be filed")
+    }
+
+    /// The hook fires exactly once per attempt: a second export for the same
+    /// recording only happens on a second, deliberate summarize attempt.
+    func test_hook_fires_once_per_attempt() async throws {
+        final class Recorder { var ids: [UUID] = [] }
+        let fired = Recorder()
+        summarizer.onSummaryFinished = { fired.ids.append($0.id) }
+        let rec = addRecording()
+        summarizer.summarizeIfNeeded(rec)
+        // A duplicate call while the first is in flight is deduped and must
+        // NOT produce a second signal.
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.regenerate(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(fired.ids, [rec.id], "one attempt in flight must yield exactly one signal")
     }
 }

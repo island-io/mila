@@ -45,11 +45,11 @@ struct StorageSettingsTab: View {
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
-                Divider()
-                    .padding(.vertical, 4)
-                // Obsidian vault destination lives under Storage as its own
-                // section rather than a top-level tab (keeps the tab bar from
-                // overflowing).
+                // Obsidian vault destination lives under Storage rather than
+                // in a top-level tab (keeps the tab bar from overflowing), and
+                // renders as one more card in this stack rather than a titled
+                // section — off by default, it's a single toggle. It expands
+                // itself once enabled; see `ObsidianSettingsSection`.
                 ObsidianSettingsSection()
             }
             .frame(maxWidth: .infinity, alignment: .leading)

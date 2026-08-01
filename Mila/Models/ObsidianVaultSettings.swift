@@ -1,6 +1,77 @@
 import Foundation
 import Combine
 
+/// Filesystem-name safety for everything Mila writes into the vault.
+///
+/// Free of actor isolation so both the settings model and `ObsidianExporter`
+/// share one implementation. Two of the three inputs are free text the user
+/// typed (the vault subfolder field) or named elsewhere in the app (a Mila
+/// folder name, a recording title), so all three go through here before they
+/// become path components.
+enum ObsidianPathSanitizer {
+    /// Illegal / hostile in a macOS path component. `/` is the separator,
+    /// the rest are either reserved on other platforms Obsidian vaults get
+    /// synced to or invisible in a filename.
+    private static let invalid = CharacterSet(charactersIn: "/\\:*?\"<>|")
+        .union(.newlines)
+        .union(.controlCharacters)
+
+    /// Strip path-hostile characters, collapse whitespace, and cap the length
+    /// so the result is a safe single-line name fragment.
+    ///
+    /// This does NOT guarantee a usable *component* on its own — the result
+    /// may be empty, `.` or `..`. Callers that build a directory name must use
+    /// `directoryComponent`; `ObsidianExporter.fileName` is safe because it
+    /// always prefixes the date, so the fragment can never stand alone.
+    ///
+    /// `maxBytes` is a UTF-8 budget, not a character count: HFS+/APFS cap a
+    /// component at 255 bytes, and a title of emoji or Hebrew hits that far
+    /// sooner than 255 characters would suggest. 180 leaves comfortable room
+    /// for the `yyyy-MM-dd ` prefix and the `.md` suffix.
+    static func nameFragment(_ raw: String, maxBytes: Int = 180) -> String {
+        let stripped = raw.components(separatedBy: invalid).joined(separator: " ")
+        let collapsed = stripped
+            .split(whereSeparator: { $0 == " " || $0 == "\t" })
+            .joined(separator: " ")
+        return truncated(collapsed, maxBytes: maxBytes)
+    }
+
+    /// A safe *directory* name: `nameFragment` plus the rules that stop a
+    /// component escaping its parent or hiding itself. Leading dots are
+    /// dropped, so `.`, `..` and `.hidden` collapse to `""`, `""` and
+    /// `"hidden"` — callers treat an empty result as "use the parent".
+    static func directoryComponent(_ raw: String) -> String {
+        var name = nameFragment(raw)
+        while name.hasPrefix(".") { name.removeFirst() }
+        return name.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Sanitize a user-typed vault-relative path (`Notes/Meetings`, and also
+    /// `../../Desktop`) into one that cannot escape the vault: every component
+    /// goes through `directoryComponent`, and components that sanitize to
+    /// nothing (`.`, `..`, empty) are dropped.
+    static func relativePath(_ raw: String) -> String {
+        raw.split(separator: "/")
+            .map { directoryComponent(String($0)) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
+    }
+
+    /// Truncate on a UTF-8 byte budget without splitting a character.
+    private static func truncated(_ value: String, maxBytes: Int) -> String {
+        guard value.utf8.count > maxBytes else { return value }
+        var out = ""
+        var used = 0
+        for character in value {
+            let size = String(character).utf8.count
+            if used + size > maxBytes { break }
+            out.append(character)
+            used += size
+        }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+}
+
 /// User-configurable Obsidian vault destination. When enabled, Mila writes a
 /// Markdown note (summary + action items, with a transcript fallback) into the
 /// chosen vault folder after every recording finishes — and, optionally,
@@ -90,11 +161,15 @@ final class ObsidianVaultSettings: ObservableObject {
 
     /// The directory notes are written into: the vault root plus the
     /// configured subfolder. nil when no vault is picked.
+    ///
+    /// `subfolder` is a free-text field, so it is sanitized per component
+    /// rather than merely trimmed — a typed `../../Desktop` must resolve
+    /// inside the vault, not outside it.
     var destinationDirectory: URL? {
         guard let vaultURL else { return nil }
-        let clean = subfolder
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let clean = ObsidianPathSanitizer.relativePath(
+            subfolder.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
         return clean.isEmpty ? vaultURL : vaultURL.appendingPathComponent(clean, isDirectory: true)
     }
 
