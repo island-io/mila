@@ -585,18 +585,16 @@ final class TranscriptionService: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
 
-        // Flip the LIVE row to `.running` instead of writing the whole snapshot
+        // Flip the LIVE row to `.running` rather than writing the whole snapshot
         // back — `await remoteEngine.configure` above is a suspension point the
         // user can rename/file/delete the row through. See `mergePassResult`.
-        // `working` is re-seeded from the persisted row so the rest of the pass
-        // reads the freshest values.
+        // (`working` is deliberately NOT re-seeded from the result: the pass must
+        // keep transcribing the `language` it just resolved a model for.)
         working.status = .running
         working.modelName = modelDisplayName
-        if let started = mergePassResult(id: recording.id, {
+        mergePassResult(id: recording.id) {
             $0.status = working.status
             $0.modelName = working.modelName
-        }) {
-            working = started
         }
 
         let recordingID = recording.id
