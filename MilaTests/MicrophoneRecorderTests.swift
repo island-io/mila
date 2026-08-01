@@ -377,7 +377,13 @@ final class MicrophoneWatchdogTests: XCTestCase {
 @MainActor
 final class MicrophoneConfigurationChangeTests: XCTestCase {
 
-    private func makeRecorder() -> (MicrophoneRecorder, @Sendable () -> Int) {
+    /// `grace` is per-test on purpose. The handler timestamps a notification
+    /// when it RUNS, not when it was posted, so a test that wants a change
+    /// treated as self-inflicted needs a window comfortably longer than any
+    /// plausible main-actor hop on a loaded runner, while a test that wants it
+    /// treated as real needs a short one it can wait out. Neither number is a
+    /// production value; the shipped default is 0.75s.
+    private func makeRecorder(grace: TimeInterval) -> (MicrophoneRecorder, @Sendable () -> Int) {
         let counter = OSAllocatedUnfairLock(initialState: 0)
         let mic = MicrophoneRecorder()
         mic.bringUpTimeout = 1.0
@@ -385,11 +391,22 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         // a second source of rebuilds.
         mic.captureStallTimeout = 3600
         mic.watchdogInterval = 3600
-        mic.configurationChangeGracePeriod = 0.2
+        mic.configurationChangeGracePeriod = grace
         mic.minimumRebuildInterval = 1.0
         mic.maximumRebuildInterval = 4.0
         mic.bringUpOverride = { counter.withLock { $0 += 1 } }
         return (mic, { counter.withLock { $0 } })
+    }
+
+    /// Poll until `condition` holds or `timeout` elapses. Lets a slow runner
+    /// take longer without letting it change the verdict — the assertions that
+    /// follow still have to hold exactly.
+    private func waitUntil(_ timeout: TimeInterval = 3.0,
+                           _ condition: () -> Bool) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline && !condition() {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 
     private func postConfigurationChange(to mic: MicrophoneRecorder) {
@@ -408,13 +425,13 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
     /// Fix (1): the notification our own device bind provokes must not be
     /// mistaken for the world changing.
     func test_self_inflicted_change_during_bring_up_does_not_rebuild() async throws {
-        let (mic, bringUps) = makeRecorder()
+        let (mic, bringUps) = makeRecorder(grace: 1.0)
         try await mic.start()
         XCTAssertEqual(bringUps(), 1)
 
         // Same instant as the bring-up — this is what the bind itself posts.
         postConfigurationChange(to: mic)
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await Task.sleep(nanoseconds: 300_000_000)
 
         XCTAssertEqual(mic.restartCount, 0,
                        "a configuration change inside the bring-up grace window is our own doing — rebuilding it is what started the loop")
@@ -426,15 +443,15 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
     /// carries: suppressing self-inflicted changes must NOT blind the recorder
     /// to a device that genuinely went away.
     func test_change_after_the_grace_window_still_rebuilds() async throws {
-        let (mic, bringUps) = makeRecorder()
+        let (mic, bringUps) = makeRecorder(grace: 0.1)
         try await mic.start()
-        try await Task.sleep(nanoseconds: 300_000_000)   // past the 0.2s window
+        try await Task.sleep(nanoseconds: 400_000_000)   // past the 0.1s window
 
         postConfigurationChange(to: mic)
-        try await Task.sleep(nanoseconds: 500_000_000)
+        await waitUntil { mic.restartCount >= 1 }
 
         XCTAssertEqual(mic.restartCount, 1,
-                       "a real device change must still be repaired promptly")
+                       "a real device change must still be repaired promptly, and exactly once")
         XCTAssertEqual(bringUps(), 2)
         await mic.stop()
     }
@@ -446,9 +463,11 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
     /// reporter's log shows 13 rebuilds in the ~2s before they hit Stop, and
     /// the 60-rebuild budget would have been gone in nine seconds.
     func test_a_storm_of_configuration_changes_is_bounded() async throws {
-        let (mic, bringUps) = makeRecorder()
+        // Short grace window on purpose: what's under test here is the
+        // throttle, not the self-inflicted-change suppression.
+        let (mic, bringUps) = makeRecorder(grace: 0.1)
         try await mic.start()
-        try await Task.sleep(nanoseconds: 300_000_000)   // past the grace window
+        try await Task.sleep(nanoseconds: 400_000_000)   // past the grace window
 
         // Post continuously for a fixed WALL-CLOCK window at roughly the
         // cadence observed in the bug (~150ms, compressed to 15ms here).
@@ -476,10 +495,10 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
 
     /// A rebuild storm must not be able to outlive the recording either.
     func test_configuration_change_after_stop_is_ignored() async throws {
-        let (mic, bringUps) = makeRecorder()
+        let (mic, bringUps) = makeRecorder(grace: 0.1)
         try await mic.start()
         let source = mic.configurationChangeSource
-        try await Task.sleep(nanoseconds: 300_000_000)
+        try await Task.sleep(nanoseconds: 400_000_000)
         await mic.stop()
 
         if let source {
