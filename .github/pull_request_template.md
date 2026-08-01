@@ -1,6 +1,12 @@
+Closes #
+
+<!-- Required: every PR must link an issue (CI check "Linked issue"). `Closes`,
+     `Fixes` or `Resolves` all work, as does the sidebar Development link.
+     No issue yet? Open one first. Genuine trivia: ask for `no-issue-needed`. -->
+
 ## What & why
 
-<!-- What does this change do, and why? Link the issue it addresses (e.g. "Closes #123"). -->
+<!-- What does this change do, and why? -->
 
 ## How it was tested
 

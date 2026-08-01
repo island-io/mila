@@ -1,0 +1,214 @@
+name: Require linked issue
+
+# Enforces the rule in .claude/rules/pull-requests.md: every PR must be linked
+# to a GitHub issue, so the "what was wrong and why" stays a durable, searchable
+# record separate from the "how it was fixed".
+#
+# Why `pull_request` and NOT `pull_request_target`:
+#   * `pull_request_target` runs with a privileged, writable token even for PRs
+#     from forks. That is only safe if the job never checks out or executes PR
+#     code — a footgun we would rather not leave lying around in a repo that
+#     accepts fork contributions.
+#   * `pull_request_target` also always runs the workflow definition from the
+#     BASE branch, so changes to this file could never be tested in the PR that
+#     makes them.
+#   * Fork PRs ARE still checked here: the job runs and passes/fails correctly.
+#     The only degradation is that `GITHUB_TOKEN` is read-only for fork PRs, so
+#     the explanatory comment cannot be posted. The script treats commenting as
+#     best-effort and always writes the same guidance to the failure annotation
+#     and the run summary, which are visible on every run.
+on:
+  pull_request:
+    # `labeled`/`unlabeled` are included beyond the usual set so that applying
+    # or removing the `no-issue-needed` bypass label re-evaluates immediately
+    # instead of leaving a stale red (or green) check.
+    types: [opened, edited, reopened, synchronize, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: require-linked-issue-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  require-linked-issue:
+    name: Linked issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: write # post/update the single explanatory comment
+    steps:
+      # No checkout: this job only reads PR metadata through the API. Nothing
+      # from the PR is ever executed.
+      - name: Check for a linked issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const BYPASS_LABEL = 'no-issue-needed';
+            const MARKER = '<!-- require-linked-issue -->';
+
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const author = pr.user?.login ?? '';
+            const labels = (pr.labels ?? []).map((l) => l.name);
+
+            // ---- comment upsert (best-effort; fork PRs get a read-only token)
+            async function upsertComment(body) {
+              try {
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: pr.number, per_page: 100 },
+                );
+                const mine = comments.find((c) => (c.body ?? '').includes(MARKER));
+                const payload = `${MARKER}\n${body}`;
+                if (mine) {
+                  if ((mine.body ?? '') !== payload) {
+                    await github.rest.issues.updateComment({
+                      owner, repo, comment_id: mine.id, body: payload,
+                    });
+                  }
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: pr.number, body: payload,
+                  });
+                }
+              } catch (err) {
+                // Read-only token (fork PR) or comments disabled. The verdict
+                // still lands via setFailed + the run summary.
+                core.warning(`Could not post the explanatory comment: ${err.message}`);
+              }
+            }
+
+            // Only edits an existing complaint; never opens a new comment just
+            // to say "all good" — that would be pure noise on passing PRs.
+            async function clearComment(reason) {
+              try {
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  { owner, repo, issue_number: pr.number, per_page: 100 },
+                );
+                const mine = comments.find((c) => (c.body ?? '').includes(MARKER));
+                if (mine) {
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: mine.id,
+                    body: `${MARKER}\n:white_check_mark: Linked-issue check passed — ${reason}.`,
+                  });
+                }
+              } catch (err) {
+                core.warning(`Could not update the existing comment: ${err.message}`);
+              }
+            }
+
+            async function pass(reason) {
+              core.info(`PASS: ${reason}`);
+              await core.summary
+                .addHeading('Linked issue: passed', 3)
+                .addRaw(reason)
+                .write();
+              await clearComment(reason);
+            }
+
+            // ---- exemption 1: dependabot. Checked in-script rather than with a
+            // job-level `if:` so the check always reports a real "success"
+            // conclusion — a *skipped* job is a murkier signal for branch
+            // protection than an explicit green one.
+            if (author === 'dependabot[bot]' || context.actor === 'dependabot[bot]') {
+              await pass('dependabot PRs are exempt (they can never have an issue)');
+              return;
+            }
+
+            // ---- exemption 2: maintainer-applied bypass label
+            if (labels.includes(BYPASS_LABEL)) {
+              await pass(`the \`${BYPASS_LABEL}\` label is applied`);
+              return;
+            }
+
+            // ---- primary signal: GitHub's own linkage. This covers both the
+            // sidebar "Development" link and closing keywords GitHub itself
+            // parsed out of the body — it is the authoritative source.
+            let linked = [];
+            try {
+              const res = await github.graphql(
+                `query($owner: String!, $repo: String!, $number: Int!) {
+                   repository(owner: $owner, name: $repo) {
+                     pullRequest(number: $number) {
+                       closingIssuesReferences(first: 20) {
+                         nodes { number url }
+                       }
+                     }
+                   }
+                 }`,
+                { owner, repo, number: pr.number },
+              );
+              linked =
+                res.repository?.pullRequest?.closingIssuesReferences?.nodes ?? [];
+            } catch (err) {
+              core.warning(`closingIssuesReferences query failed: ${err.message}`);
+            }
+
+            if (linked.length > 0) {
+              const list = linked.map((n) => `#${n.number}`).join(', ');
+              await pass(`linked via GitHub's issue linkage to ${list}`);
+              return;
+            }
+
+            // ---- fallback: closing keyword in the PR body. Catches forms the
+            // GraphQL field does not populate (cross-repo `owner/repo#123`) and
+            // any eventual-consistency lag right after an edit.
+            //
+            // HTML comments are stripped first so the placeholder text in
+            // .github/pull_request_template.md cannot satisfy the check.
+            const body = (pr.body ?? '').replace(/<!--[\s\S]*?-->/g, ' ');
+            const CLOSING_RE = new RegExp(
+              String.raw`(?:^|[\s(\[{,;])` +
+                String.raw`(?:clos(?:e|es|ed)|fix(?:es|ed)?|resolv(?:e|es|ed))` +
+                String.raw`\s*:?\s+` +
+                String.raw`(?:https?://github\.com/[\w.-]+/[\w.-]+/issues/\d+` +
+                String.raw`|(?:[\w.-]+/[\w.-]+)?#\d+)`,
+              'gi',
+            );
+            const matches = body.match(CLOSING_RE);
+            if (matches) {
+              await pass(
+                `the PR body contains a closing keyword (\`${matches[0].trim()}\`)`,
+              );
+              return;
+            }
+
+            // ---- no link found
+            const guidance = [
+              '### :link: This PR is not linked to an issue',
+              '',
+              'Every PR in this repo must be connected to a GitHub issue, so the',
+              '*what was wrong and why* survives as a searchable record independent',
+              'of the *how it was fixed*. See `.claude/rules/pull-requests.md`.',
+              '',
+              '**Pick either fix — this check re-runs automatically:**',
+              '',
+              '1. Add a closing keyword to the PR description, near the top:',
+              '',
+              '   ```',
+              '   Closes #123',
+              '   ```',
+              '',
+              '   `Closes`, `Fixes` and `Resolves` all work, in any case.',
+              '2. Or link it from the sidebar: **Development → Link an issue**.',
+              '',
+              "No issue yet? Open one first (`gh issue create`) describing the problem,",
+              'then reference it here.',
+              '',
+              '<sub>Genuinely trivial change (typo, comment tweak)? A maintainer can',
+              `apply the \`${BYPASS_LABEL}\` label to bypass this check. Dependabot PRs`,
+              'are exempt automatically.</sub>',
+            ].join('\n');
+
+            await core.summary.addRaw(guidance).write();
+            await upsertComment(guidance);
+            core.setFailed(
+              'No linked issue found. Add "Closes #<n>" to the PR description, ' +
+                'or link an issue via the sidebar (Development → Link an issue), ' +
+                `or apply the \`${BYPASS_LABEL}\` label for genuine trivia.`,
+            );
