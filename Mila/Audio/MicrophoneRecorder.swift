@@ -330,15 +330,36 @@ final class MicrophoneRecorder: ObservableObject {
     private func startCaptureWatchdog() {
         watchdogTask?.cancel()
         let interval = max(0.01, watchdogInterval)
+        let stallTimeout = captureStallTimeout
         watchdogTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            var detector = CaptureStallDetector(timeout: self.captureStallTimeout)
+            var detector = CaptureStallDetector(timeout: stallTimeout)
+            var seenRebuilds = 0
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
-                guard !Task.isCancelled, self.isRunning else { return }
+                // Re-bind `self` weakly on EVERY iteration rather than once
+                // before the loop. `watchdogTask` is stored on `self`, so a
+                // strong binding held for the loop's lifetime would make the
+                // recorder keep itself alive: the loop only ends on cancel or
+                // `isRunning == false`, both of which come from `stop()`. An
+                // owner that dropped a running recorder without calling
+                // `stop()` would then never see `deinit`, and the engine (and
+                // the hot microphone) would outlive it for the whole process.
+                guard !Task.isCancelled, let self, self.isRunning else { return }
                 // A rebuild is already in flight (or the notification handler
                 // beat us to it) — don't stack a second one on top.
                 if self.isRebuilding { continue }
+                // ANY rebuild invalidates the stall clock, including one driven
+                // by the configuration-change notification, which can't reach
+                // this task-local detector. Frames can't grow while a rebuild
+                // runs, so without this a slow rebuild could be followed
+                // straight away by a second "stall" measured from an `armedAt`
+                // that predates it — costing another audio gap and another
+                // slot of the rebuild budget right after a successful repair.
+                if self.restartCount != seenRebuilds {
+                    seenRebuilds = self.restartCount
+                    detector.reset()
+                    continue
+                }
                 guard detector.observe(frames: self.capturedFrameCount, now: Date()) else { continue }
                 // Budget spent: stop watching instead of re-logging the same
                 // stall every `captureStallTimeout` for the rest of the
@@ -351,6 +372,7 @@ final class MicrophoneRecorder: ObservableObject {
                 }
                 micLog.error("no mic buffers for \(self.captureStallTimeout, privacy: .public)s while recording — treating capture as stalled")
                 await self.rebuildEngine(reason: "capture stalled")
+                seenRebuilds = self.restartCount
                 detector.reset()
             }
         }
@@ -401,6 +423,21 @@ final class MicrophoneRecorder: ObservableObject {
             let result = try await bringUpRealEngine(continuation: audioContinuation,
                                                      gain: agc,
                                                      stats: sessionStats)
+            // `bringUpRealEngine` suspends for up to `bringUpTimeout`, and
+            // `stop()` is free to run on the main actor while it does — which
+            // is exactly what happens when the user hits Stop because their
+            // headphones just died. Adopting the engine now would hand it to a
+            // session that no longer exists: nothing would ever tear it down,
+            // and the microphone would stay hot for the rest of the process.
+            guard isRunning else {
+                micLog.error("mic rebuild #\(attempt, privacy: .public) finished after the recording ended — tearing down the orphaned engine")
+                let orphan = result.engine
+                await Task.detached(priority: .userInitiated) {
+                    orphan.inputNode.removeTap(onBus: 0)
+                    orphan.stop()
+                }.value
+                return
+            }
             engine = result.engine
             observeConfigurationChanges(on: result.engine)
             micLog.log("mic capture rebuilt (attempt #\(attempt, privacy: .public), reason: \(reason, privacy: .public)) at \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch — recording continues")

@@ -55,6 +55,20 @@ final class SystemAudioRestartPolicyTests: XCTestCase {
                        .permissionDenied)
     }
 
+    /// The budget only means something if the attempts are spread over time:
+    /// `didStopWithError` fires once, and a bring-up that throws never creates
+    /// a stream, so without a delay the whole budget would be spent inside a
+    /// single display reconfiguration.
+    func test_backoff_grows_and_covers_a_real_transient_window() {
+        let delays = (1...5).map { SystemAudioRecorder.restartBackoff(attempt: $0) }
+        XCTAssertEqual(delays, [0.5, 1.0, 1.5, 2.0, 2.5])
+        XCTAssertEqual(delays.reduce(0, +), 7.5, accuracy: 0.001,
+                       "five attempts should span several seconds of outage")
+        // Never zero, never negative, even for nonsense input.
+        XCTAssertGreaterThan(SystemAudioRecorder.restartBackoff(attempt: 0), 0)
+        XCTAssertGreaterThan(SystemAudioRecorder.restartBackoff(attempt: -3), 0)
+    }
+
     func test_retries_are_bounded() {
         XCTAssertEqual(SystemAudioRecorder.restartDecision(wantsCapture: true,
                                                           attemptsSoFar: 4,

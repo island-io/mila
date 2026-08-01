@@ -567,9 +567,12 @@ final class QuickActionsController: ObservableObject {
         // the wall clock is a claim the user can't act on — the diagnostic
         // report that prompted this showed a 26:24 row whose audio was 24
         // seconds long, because `max()` always let the timer win. Fall back to
-        // the wall clock only when the file can't be read at all.
-        let capturedDuration = audioDuration(at: outputURL)
-        let duration = capturedDuration > 0 ? capturedDuration : durationBeforeStop
+        // the wall clock only when the file can't be decoded at all — a
+        // readable file reporting zero frames is a real answer, not a failure
+        // to measure, and must not be re-inflated to the full wall clock.
+        let decodedDuration = audioDuration(at: outputURL)
+        let capturedDuration = decodedDuration ?? 0
+        let duration = decodedDuration ?? durationBeforeStop
         let (title, source, appName): (String, RecordingSource, String?) = {
             switch captured {
             case .recordingMic:
@@ -1203,8 +1206,16 @@ final class QuickActionsController: ObservableObject {
         return "\(prefix) · \(f.string(from: Date()))"
     }
 
-    private func audioDuration(at url: URL) -> Double {
-        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+    /// Length of the audio actually on disk, or `nil` if the file can't be
+    /// decoded at all.
+    ///
+    /// The optional matters: a readable WAV containing zero frames is a real
+    /// answer ("we captured nothing"), and must not be confused with "we
+    /// couldn't tell". Returning 0 for both let a completely empty recording
+    /// fall back to the wall clock and be saved at full length — the exact
+    /// lie this change set out to remove.
+    private func audioDuration(at url: URL) -> Double? {
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
         return Double(file.length) / file.processingFormat.sampleRate
     }
 }

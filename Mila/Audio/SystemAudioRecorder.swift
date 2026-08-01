@@ -290,30 +290,64 @@ extension SystemAudioRecorder: SCStreamDelegate {
     /// recording. Losing it silently costs the whole other side of a meeting,
     /// so a bounded retry is well worth a brief gap.
     private func restartAfterStreamDeath(_ error: Error) async {
-        switch Self.restartDecision(wantsCapture: wantsCapture,
-                                    attemptsSoFar: restartAttempts,
-                                    maxAttempts: maxRestartAttempts,
-                                    error: error) {
-        case .sessionOver:
-            return
-        case .permissionDenied:
-            sysLog.error("not restarting system audio: Screen & System Audio Recording permission was denied or revoked mid-capture")
-            return
-        case .budgetExhausted:
-            sysLog.error("giving up on system-audio capture after \(self.maxRestartAttempts, privacy: .public) restart attempts — the rest of this recording is microphone-only")
-            return
-        case .retry:
-            break
+        // Loop rather than attempt once: `didStopWithError` is the only trigger
+        // for this method, and a bring-up that throws never created a stream —
+        // so no further callback can ever arrive. A single failed attempt would
+        // therefore be terminal and the retry budget would be decoration, even
+        // though the common causes (a display being reconfigured, no display
+        // available for a moment) clear on their own within a second or two.
+        var cause = error
+        while true {
+            switch Self.restartDecision(wantsCapture: wantsCapture,
+                                        attemptsSoFar: restartAttempts,
+                                        maxAttempts: maxRestartAttempts,
+                                        error: cause) {
+            case .sessionOver:
+                return
+            case .permissionDenied:
+                sysLog.error("not restarting system audio: Screen & System Audio Recording permission was denied or revoked mid-capture")
+                return
+            case .budgetExhausted:
+                sysLog.error("giving up on system-audio capture after \(self.maxRestartAttempts, privacy: .public) restart attempts — the rest of this recording is microphone-only")
+                return
+            case .retry:
+                break
+            }
+            restartAttempts += 1
+            let attempt = restartAttempts
+
+            // Back off before attempting, growing with each try, so the budget
+            // spans a real transient window instead of being spent inside a
+            // single display reconfiguration. `Task.sleep` suspends rather than
+            // blocking, so the main actor stays free throughout.
+            try? await Task.sleep(nanoseconds: UInt64(Self.restartBackoff(attempt: attempt) * 1_000_000_000))
+            guard wantsCapture else { return }
+
+            do {
+                try await bringUpStream()
+                // Same hazard as the mic side: `bringUpStream` suspends, and
+                // `stop()` can run while it does. A stream adopted after the
+                // recording ended would keep capturing for the rest of the
+                // process, since nothing is left to stop it.
+                guard wantsCapture else {
+                    sysLog.error("system-audio restart #\(attempt, privacy: .public) finished after the recording ended — releasing the orphaned stream")
+                    await stop()
+                    return
+                }
+                restartCount += 1
+                sysLog.log("system-audio capture restarted (attempt #\(attempt, privacy: .public)) — app audio is being captured again")
+                return
+            } catch {
+                cause = error
+                sysLog.error("system-audio restart attempt #\(attempt, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
-        restartAttempts += 1
-        let attempt = restartAttempts
-        do {
-            try await bringUpStream()
-            restartCount += 1
-            sysLog.log("system-audio capture restarted (attempt #\(attempt, privacy: .public)) — app audio is being captured again")
-        } catch {
-            sysLog.error("system-audio restart attempt #\(attempt, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
-        }
+    }
+
+    /// Delay before restart attempt `attempt` (1-based). Grows linearly so five
+    /// attempts cover ~7.5s of a transient outage without a long first wait.
+    nonisolated static func restartBackoff(attempt: Int) -> TimeInterval {
+        0.5 * Double(max(1, attempt))
     }
 }
 
