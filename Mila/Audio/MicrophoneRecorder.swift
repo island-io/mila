@@ -23,6 +23,53 @@ struct MicFrameStats: Sendable {
     var conversionFailures = 0
 }
 
+/// Pure, clock-injected detector for "the input tap has flatlined".
+///
+/// The audio tap is the only thing that grows `MicFrameStats.frames`, and a
+/// live input device delivers buffers *continuously* — a silent room still
+/// arrives as buffers of near-zero samples. So a frame count that stops
+/// growing means capture is dead, not that nobody is talking. That's what
+/// makes this a safe trigger for rebuilding the engine.
+///
+/// Kept as a value type with an injected `now` so the policy can be unit
+/// tested exactly, without sleeping or touching CoreAudio.
+struct CaptureStallDetector {
+    /// How long the frame count may sit still before we call it a stall.
+    let timeout: TimeInterval
+    private var lastFrames: Int?
+    private var armedAt: Date?
+
+    init(timeout: TimeInterval) {
+        self.timeout = timeout
+    }
+
+    /// Feed the current *cumulative* frame count. Returns `true` once the
+    /// count has not moved for `timeout`.
+    ///
+    /// The first call arms the clock rather than reporting a stall, so a
+    /// device that comes up but never delivers its first buffer also trips
+    /// the detector once `timeout` has passed.
+    mutating func observe(frames: Int, now: Date) -> Bool {
+        defer { lastFrames = frames }
+        guard let last = lastFrames, let armedAt else {
+            self.armedAt = now
+            return false
+        }
+        if frames > last {
+            self.armedAt = now
+            return false
+        }
+        return now.timeIntervalSince(armedAt) >= timeout
+    }
+
+    /// Re-arm after a recovery attempt so the next stall is timed from the
+    /// rebuild, not from the last buffer the dead engine happened to deliver.
+    mutating func reset() {
+        lastFrames = nil
+        armedAt = nil
+    }
+}
+
 /// Pulls samples from the user's preferred input device using `AVAudioEngine`.
 /// Emits whisper-format buffers (16kHz mono Float32) on `audioStream`.
 ///
@@ -40,6 +87,25 @@ struct MicFrameStats: Sendable {
 /// (Bluetooth headset moving between A2DP and HFP, AirPods waking up, etc.);
 /// before this fix, a stalled CoreAudio call froze the entire main thread
 /// and made the app unresponsive — including the global hotkeys.
+///
+/// **Mid-session recovery:** bringing the engine up successfully is only half
+/// the job — the input device can also be pulled out from under a *running*
+/// engine. Per Apple's own docs, when the I/O unit sees the input or output
+/// hardware change its sample rate or channel count, "the engine stops
+/// itself" and posts `AVAudioEngineConfigurationChange`. The nodes stay
+/// attached, so nothing looks broken: the tap simply never fires again.
+/// Nobody was listening for that notification, which is how a user's
+/// 26-minute Zoom meeting came back as 24 seconds of audio — their USB
+/// EarPods died 25s in (`AUHAL: Device 860 died!`), CoreAudio re-pointed the
+/// input at the 48kHz built-in mic, and the 44.1kHz tap went quiet for the
+/// remaining 26 minutes while the UI happily showed a growing timer.
+///
+/// Two independent safety nets now cover that:
+///   1. `AVAudioEngineConfigurationChange` → rebuild engine + tap immediately.
+///   2. A `CaptureStallDetector` watchdog → rebuild when frames stop growing
+///      for `captureStallTimeout`, catching stalls that post no notification.
+/// Both keep the session's `AsyncStream`, gain controller and frame counters
+/// intact, so recording continues into the same WAV instead of ending.
 @MainActor
 final class MicrophoneRecorder: ObservableObject {
     @Published private(set) var isRunning = false
@@ -70,7 +136,44 @@ final class MicrophoneRecorder: ObservableObject {
     /// Test seam: when set, replaces the real `AVAudioEngine` bring-up so
     /// `MicrophoneRecorderTests` can simulate slow / stalled / failing
     /// CoreAudio without needing a real microphone or fragile timing in CI.
+    /// Also used for mid-session rebuilds, so a test can count how many times
+    /// the watchdog tried to repair capture.
     var bringUpOverride: (@Sendable () async throws -> Void)?
+
+    /// How long the tap may deliver nothing before the watchdog rebuilds the
+    /// engine. Generous next to a normal buffer interval (4096 frames at
+    /// 44.1kHz ≈ 93ms) so ordinary scheduling jitter can't trip it, and short
+    /// enough that a yanked device costs a few seconds of a meeting instead
+    /// of the rest of it.
+    var captureStallTimeout: TimeInterval = 4.0
+
+    /// Watchdog poll cadence.
+    var watchdogInterval: TimeInterval = 1.0
+
+    /// Hard cap on rebuild attempts within one recording. A permanently dead
+    /// input would otherwise have us rebuilding in a loop for the length of a
+    /// meeting. 60 attempts at ≥1s apart still rides out a device that's
+    /// unplugged for a minute; past that we stop trying and say so in the log.
+    var maxMidSessionRestarts = 60
+
+    /// Rebuild attempts made during the current session — surfaced in the
+    /// stop log so a diagnostic report shows "capture was repaired 3 times"
+    /// rather than leaving an unexplained gap in the audio.
+    private(set) var restartCount = 0
+
+    private var watchdogTask: Task<Void, Never>?
+    private var configChangeObserver: NSObjectProtocol?
+    /// Guards against a configuration-change notification and a watchdog tick
+    /// both deciding to rebuild at the same moment.
+    private var isRebuilding = false
+
+    /// Bumped by every `start()` and `stop()`. A rebuild captures the value it
+    /// began with, because `isRunning` alone cannot tell "my session is still
+    /// live" from "a *later* session is". A stop → start cycle inside a
+    /// rebuild's bring-up (up to `bringUpTimeout`) would otherwise let the
+    /// stale rebuild install its engine over the new session's — leaking a
+    /// running engine, and with it a permanently hot microphone.
+    private var captureEpoch = 0
 
     /// Smoothed digital gain applied to every captured float frame before
     /// it's yielded to consumers. Built fresh on each `start()` so a low-
@@ -101,6 +204,12 @@ final class MicrophoneRecorder: ObservableObject {
         // (defensive — `stop()` should have done this, but a partially-started
         // session that threw mid-way could leak engine/tap state). All cheap,
         // can stay on the main actor.
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
         if let existing = engine {
             existing.inputNode.removeTap(onBus: 0)
             existing.stop()
@@ -113,19 +222,20 @@ final class MicrophoneRecorder: ObservableObject {
         self.audioContinuation = newContinuation
         let continuationForTap = newContinuation!
 
+        restartCount = 0
+        isRebuilding = false
+        captureEpoch += 1
+
         if let override = bringUpOverride {
             try await Self.withTimeout(seconds: bringUpTimeout) {
                 try await override()
             }
             isRunning = true
+            // Start the watchdog on the test path too: with no real tap the
+            // frame count never grows, so a test can drive the full
+            // stall → rebuild loop by counting override invocations.
+            startCaptureWatchdog()
             return
-        }
-
-        // The level callback hops back to the main actor for the @Published
-        // mutation. Captured weakly so a deinit'd recorder doesn't keep the
-        // tap closure alive.
-        let onLevel: @Sendable (Float) -> Void = { [weak self] lvl in
-            Task { @MainActor in self?.level = lvl }
         }
 
         // Build a fresh AGC for this session. Pulls the persisted toggle
@@ -144,7 +254,31 @@ final class MicrophoneRecorder: ObservableObject {
         let sessionStats = OSAllocatedUnfairLock(initialState: MicFrameStats())
         self.stats = sessionStats
 
-        let result = try await Self.withTimeout(
+        let result = try await bringUpRealEngine(continuation: continuationForTap,
+                                                 gain: agc,
+                                                 stats: sessionStats)
+        self.engine = result.engine
+        isRunning = true
+        micLog.log("mic started: \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch agc=\(agcEnabled ? "on" : "off", privacy: .public)")
+        observeConfigurationChanges(on: result.engine)
+        startCaptureWatchdog()
+    }
+
+    /// Bring up a fresh engine + tap against the given session state. Shared
+    /// by `start()` and by mid-session rebuilds, so a repaired engine gets the
+    /// same timeout protection and abandoned-engine teardown as the first one.
+    private func bringUpRealEngine(
+        continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
+        gain: AdaptiveGainController,
+        stats: OSAllocatedUnfairLock<MicFrameStats>
+    ) async throws -> EngineBox {
+        // The level callback hops back to the main actor for the @Published
+        // mutation. Captured weakly so a deinit'd recorder doesn't keep the
+        // tap closure alive.
+        let onLevel: @Sendable (Float) -> Void = { [weak self] lvl in
+            Task { @MainActor in self?.level = lvl }
+        }
+        return try await Self.withTimeout(
             seconds: bringUpTimeout,
             onAbandoned: { box in
                 // The bring-up finished after the timeout already threw.
@@ -155,22 +289,206 @@ final class MicrophoneRecorder: ObservableObject {
                 box.engine.stop()
             }
         ) {
-            try await Self.realBringUp(continuation: continuationForTap,
+            try await Self.realBringUp(continuation: continuation,
                                        onLevel: onLevel,
-                                       gain: agc,
-                                       stats: sessionStats)
+                                       gain: gain,
+                                       stats: stats)
         }
-        self.engine = result.engine
-        isRunning = true
-        micLog.log("mic started: \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch agc=\(agcEnabled ? "on" : "off", privacy: .public)")
+    }
+
+    // MARK: - Mid-session recovery
+
+    /// Watch one engine for the configuration change that silently kills the
+    /// tap. Re-registered after every rebuild, since the notification is
+    /// scoped to a specific engine instance.
+    private func observeConfigurationChanges(on engine: AVAudioEngine) {
+        if let existing = configChangeObserver {
+            NotificationCenter.default.removeObserver(existing)
+        }
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: NSNotification.Name.AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            // The callback arrives on an AVFoundation-internal dispatch queue,
+            // and its docs warn that tearing the engine down *inside* the
+            // handler can deadlock. Hop to the main actor first; the actual
+            // teardown then happens on a detached task from there.
+            Task { @MainActor [weak self] in
+                await self?.handleConfigurationChange()
+            }
+        }
+    }
+
+    private func handleConfigurationChange() async {
+        guard isRunning else { return }
+        // No "is it really broken?" probe here on purpose: the documented
+        // behaviour is that the engine has ALREADY stopped itself by the time
+        // this notification is posted, so capture is dead either way and
+        // there's nothing to preserve by waiting.
+        micLog.error("AVAudioEngine configuration changed mid-session (input hardware format changed or the device died) — capture is dead until rebuilt")
+        await rebuildEngine(reason: "configuration change")
+    }
+
+    /// Poll the session frame count and rebuild if capture flatlines.
+    ///
+    /// Backstop for the notification above: a device can also stop delivering
+    /// without any format change to report (HAL wedge, a device that
+    /// disappears and is replaced by an aggregate at the same rate), and those
+    /// post nothing at all.
+    private func startCaptureWatchdog() {
+        watchdogTask?.cancel()
+        let interval = max(0.01, watchdogInterval)
+        let stallTimeout = captureStallTimeout
+        watchdogTask = Task { @MainActor [weak self] in
+            var detector = CaptureStallDetector(timeout: stallTimeout)
+            var seenRebuilds = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+                // Re-bind `self` weakly on EVERY iteration rather than once
+                // before the loop. `watchdogTask` is stored on `self`, so a
+                // strong binding held for the loop's lifetime would make the
+                // recorder keep itself alive: the loop only ends on cancel or
+                // `isRunning == false`, both of which come from `stop()`. An
+                // owner that dropped a running recorder without calling
+                // `stop()` would then never see `deinit`, and the engine (and
+                // the hot microphone) would outlive it for the whole process.
+                guard !Task.isCancelled, let self, self.isRunning else { return }
+                // A rebuild is already in flight (or the notification handler
+                // beat us to it) — don't stack a second one on top.
+                if self.isRebuilding { continue }
+                // ANY rebuild invalidates the stall clock, including one driven
+                // by the configuration-change notification, which can't reach
+                // this task-local detector. Frames can't grow while a rebuild
+                // runs, so without this a slow rebuild could be followed
+                // straight away by a second "stall" measured from an `armedAt`
+                // that predates it — costing another audio gap and another
+                // slot of the rebuild budget right after a successful repair.
+                if self.restartCount != seenRebuilds {
+                    seenRebuilds = self.restartCount
+                    detector.reset()
+                    continue
+                }
+                guard detector.observe(frames: self.capturedFrameCount, now: Date()) else { continue }
+                // Budget spent: stop watching instead of re-logging the same
+                // stall every `captureStallTimeout` for the rest of the
+                // recording. A stall in a 40-minute meeting would otherwise
+                // bury the diagnostic bundle in hundreds of identical lines —
+                // the same trap `consumeSystem`'s overflow log had to throttle.
+                if self.restartCount >= self.maxMidSessionRestarts {
+                    micLog.error("mic capture is still stalled after \(self.restartCount, privacy: .public) rebuild attempts — giving up and stopping the watchdog; the rest of this recording has no microphone audio")
+                    return
+                }
+                micLog.error("no mic buffers for \(self.captureStallTimeout, privacy: .public)s while recording — treating capture as stalled")
+                await self.rebuildEngine(reason: "capture stalled")
+                seenRebuilds = self.restartCount
+                detector.reset()
+            }
+        }
+    }
+
+    /// Rebuild the engine + tap in place, keeping the session's `AsyncStream`,
+    /// gain controller and frame counters.
+    ///
+    /// The stream MUST survive: `RecordingSession.micTask` is iterating it, so
+    /// finishing the continuation would *end* the recording rather than repair
+    /// it. A brand-new `AVAudioEngine` is equally mandatory — see the class
+    /// note about reusing one leaving the input node permanently silent.
+    private func rebuildEngine(reason: String) async {
+        guard isRunning, !isRebuilding else { return }
+        guard restartCount < maxMidSessionRestarts else {
+            micLog.error("declining to rebuild capture (reason: \(reason, privacy: .public)): already used all \(self.maxMidSessionRestarts, privacy: .public) rebuild attempts this session")
+            return
+        }
+        isRebuilding = true
+        restartCount += 1
+        let attempt = restartCount
+        let epoch = captureEpoch
+        // Only clear the flag if this rebuild still belongs to the live
+        // session: a stale one finishing late must not clear a *new* session's
+        // in-flight rebuild. `start()` resets the flag itself, so nothing is
+        // left stuck.
+        defer { if captureEpoch == epoch { isRebuilding = false } }
+
+        let old = engine
+        engine = nil
+        if let old {
+            // Off-main, and never from inside the notification handler: both
+            // `removeTap` and `stop()` can block on the CoreAudio HAL queue.
+            await Task.detached(priority: .userInitiated) {
+                old.inputNode.removeTap(onBus: 0)
+                old.stop()
+            }.value
+        }
+
+        if let override = bringUpOverride {
+            // Test path: no CoreAudio, but still exercise the full decision
+            // and the timeout wrapper.
+            try? await Self.withTimeout(seconds: bringUpTimeout) { try await override() }
+            return
+        }
+
+        guard let sessionStats = stats, let agc = gain else {
+            micLog.error("mic rebuild #\(attempt, privacy: .public) skipped: session state was already torn down")
+            return
+        }
+
+        do {
+            let result = try await bringUpRealEngine(continuation: audioContinuation,
+                                                     gain: agc,
+                                                     stats: sessionStats)
+            // `bringUpRealEngine` suspends for up to `bringUpTimeout`, and
+            // `stop()` is free to run on the main actor while it does — which
+            // is exactly what happens when the user hits Stop because their
+            // headphones just died. Adopting the engine now would hand it to a
+            // session that no longer exists: nothing would ever tear it down,
+            // and the microphone would stay hot for the rest of the process.
+            // The epoch check covers the nastier variant — a whole stop/start
+            // cycle during the bring-up, where `isRunning` is true again but
+            // belongs to a different recording with its own live engine.
+            guard isRunning, captureEpoch == epoch else {
+                micLog.error("mic rebuild #\(attempt, privacy: .public) finished after its session ended — tearing down the orphaned engine")
+                let orphan = result.engine
+                await Task.detached(priority: .userInitiated) {
+                    orphan.inputNode.removeTap(onBus: 0)
+                    orphan.stop()
+                }.value
+                return
+            }
+            engine = result.engine
+            observeConfigurationChanges(on: result.engine)
+            micLog.log("mic capture rebuilt (attempt #\(attempt, privacy: .public), reason: \(reason, privacy: .public)) at \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch — recording continues")
+        } catch {
+            // Leave `isRunning` true: the watchdog keeps ticking and will
+            // retry, which is what rides out a device that's briefly absent
+            // (unplug → replug) rather than mid-switch.
+            micLog.error("mic rebuild #\(attempt, privacy: .public) (reason: \(reason, privacy: .public)) failed: \(error.localizedDescription, privacy: .public) — the watchdog will retry")
+            if attempt == maxMidSessionRestarts {
+                micLog.error("giving up on mic recovery after \(attempt, privacy: .public) attempts — the rest of this recording will have no microphone audio")
+            }
+        }
     }
 
     func stop() async {
         guard isRunning else { return }
+        // Kill the watchdog and the notification hook FIRST: a rebuild racing
+        // the teardown below would leave a hot engine nobody owns. Bump the
+        // epoch too, so a rebuild already inside its bring-up abandons itself
+        // even if a new recording starts before it returns.
+        captureEpoch += 1
+        watchdogTask?.cancel()
+        watchdogTask = nil
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
         if let s = stats?.withLock({ $0 }) {
-            micLog.log("mic stopping: buffers=\(s.buffers, privacy: .public) frames=\(s.frames, privacy: .public) conversionFailures=\(s.conversionFailures, privacy: .public)")
+            micLog.log("mic stopping: buffers=\(s.buffers, privacy: .public) frames=\(s.frames, privacy: .public) conversionFailures=\(s.conversionFailures, privacy: .public) rebuilds=\(self.restartCount, privacy: .public)")
             if s.frames == 0 {
                 micLog.error("microphone delivered NO audio this session (buffers=\(s.buffers, privacy: .public), conversionFailures=\(s.conversionFailures, privacy: .public)) — the recording will be empty")
+            }
+            if self.restartCount > 0 {
+                micLog.error("capture was rebuilt \(self.restartCount, privacy: .public)x mid-session (input device changed or stalled) — expect a short gap in the audio at each rebuild")
             }
         }
         let toTeardown = engine
@@ -191,6 +509,12 @@ final class MicrophoneRecorder: ObservableObject {
     }
 
     deinit {
+        // Block-based observers are not auto-removed when the observer object
+        // dies, so a recorder torn down mid-session would leave a registration
+        // behind for the lifetime of the process.
+        if let configChangeObserver {
+            NotificationCenter.default.removeObserver(configChangeObserver)
+        }
         audioContinuation.finish()
     }
 

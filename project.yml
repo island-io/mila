@@ -17,7 +17,39 @@ settings:
     SWIFT_STRICT_CONCURRENCY: minimal
     GENERATE_INFOPLIST_FILE: NO
     PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper
-    MARKETING_VERSION: "1.9.1"
+    MARKETING_VERSION: "1.9.2-beta.2"
+    # 1.9.2-beta.2:
+    #   * Recording no longer dies silently when the input device
+    #     changes mid-session. A yanked USB mic / unplugged headset made
+    #     CoreAudio re-point the engine's input at a different sample
+    #     rate; AVAudioEngine stops itself and posts
+    #     AVAudioEngineConfigurationChange, nobody was listening, and
+    #     the tap never fired again — one user's 26-minute meeting was
+    #     saved as 24s of audio. Now rebuilt from the notification plus
+    #     a frame-count watchdog, into the same WAV (#143, closes #142).
+    #   * System-audio (SCK) capture restarts after an SCK-side death,
+    #     with backoff, and logs via Logger instead of print so the
+    #     failure actually reaches diagnostic bundles.
+    #   * Recording duration comes from the audio file, not the
+    #     wall-clock timer, and capture that ends early now warns the
+    #     user instead of looking like a bad transcription.
+    # 1.9.2-beta.1:
+    #   * Beta of the 1.9.2 line. Remote transcription now routes per
+    #     recording language — a Hebrew-only server model (ivrit.ai) no
+    #     longer returns Hebrew words for English speech; set the new
+    #     Settings → Models → "English model" id (#122). The Auto-detect
+    #     recording language is REMOVED in the same change: the speech
+    #     model is chosen from the language, so detection meant picking a
+    #     specialist before knowing the language (#123). Plus: Live AI can
+    #     talk to any OpenAI-compatible endpoint instead of requiring a
+    #     local claude/cursor-agent CLI (#95), and stopping a recording now
+    #     cancels the Live AI session instead of letting one more tick fire
+    #     and leaking its session sandbox (#113).
+    #     See RELEASE_NOTES/v1.9.2-beta.1.md.
+    # 1.9.1:
+    #   * Live AI gained a per-recording Context box, so one meeting's
+    #     agenda no longer leaks into the next meeting's summary via the
+    #     global system prompt. See RELEASE_NOTES/v1.9.1.md.
     # 1.9.0:
     #   * First stable of the 1.9.0 line. Everything from 1.9.0-beta.1
     #     (remote transcription backend, iPhone Voice Memos sync, neural VAD,
@@ -98,7 +130,7 @@ settings:
     #     labels at stop time so the final utterance gets its
     #     speaker label before saving (4 race fixes from Bugbot
     #     review). Still writes the .srt sidecar.
-    CURRENT_PROJECT_VERSION: "54"
+    CURRENT_PROJECT_VERSION: "56"
 
 packages:
   TranscriptionCore:

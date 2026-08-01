@@ -421,3 +421,59 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertEqual(storedB.status, .completed)
     }
 }
+
+/// The short-capture policy that turns "capture died 25 seconds into a
+/// 26-minute meeting" from a silent failure into a warning the user can act
+/// on. Pure inputs, so no recording or audio device is needed.
+final class ShortCapturePolicyTests: XCTestCase {
+
+    func test_healthy_recording_does_not_warn() {
+        // A little loss at each end is normal: engine bring-up and teardown.
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: 600, captured: 599.4))
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone, wallClock: 120, captured: 119))
+    }
+
+    /// The exact shape of the reported bug: 1583.9s on the clock, 24.6s of
+    /// audio on disk.
+    func test_capture_that_died_mid_session_warns() {
+        XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: 1583.9, captured: 24.6))
+    }
+
+    func test_short_recordings_never_warn() {
+        // Below the wall-clock floor, bring-up latency dominates and a warning
+        // would fire on ordinary quick memos.
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone, wallClock: 6, captured: 1))
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone,
+            wallClock: QuickActionsController.shortCaptureMinimumWallClock - 0.1,
+            captured: 1))
+    }
+
+    /// ScreenCaptureKit only delivers buffers while something is playing, so a
+    /// system-audio capture of a mostly-silent app is legitimately far shorter
+    /// than the wall clock.
+    func test_system_audio_only_is_exempt() {
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .systemAudio, wallClock: 1800, captured: 12))
+    }
+
+    /// Zero captured audio has its own, more specific message and log line —
+    /// this policy must not double up on it.
+    func test_zero_capture_is_left_to_the_empty_mic_path() {
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone, wallClock: 600, captured: 0))
+    }
+
+    func test_threshold_boundary() {
+        let wall: TimeInterval = 100
+        let ratio = QuickActionsController.shortCaptureRatio
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: wall, captured: wall * ratio))
+        XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: wall, captured: wall * ratio - 0.5))
+    }
+}
