@@ -47,6 +47,11 @@ make dmg VERSION="$VERSION"
 ## Other known build gotchas
 
 - **PythonRuntime placeholder:** `Mila/Resources/PythonRuntime/` is a `.gitignored` folder reference. If missing, `xcodebuild` fails on the copy-resources phase. The `make project` target auto-creates an empty placeholder (the app falls back to system Python for diarization). For a *real* bundled diarization runtime, run `make bundle-diarization` first (~150-200 MB, slow, cached).
+- **PythonRuntime in a git worktree:** a fresh worktree has no runtime and rebuilding it costs ~150-200 MB. Reuse the main checkout's instead of running `make bundle-diarization` again:
+  ```bash
+  ln -s /path/to/main-checkout/Mila/Resources/PythonRuntime <worktree>/Mila/Resources/PythonRuntime
+  ```
+  The `.gitignore` entry has no trailing slash so it matches the symlink too — never commit it (it points at an absolute path on one machine).
 - **Models are NOT bundled.** Whisper weights download at first launch into `~/Library/Application Support/Mila/Models/` (or pre-fetch with `make models`, ~4.6 GB). A fresh build with no models will prompt/download on first transcription.
 - **`xcodegen` must be installed.** `make bootstrap` installs it via Homebrew if missing.
 

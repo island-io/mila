@@ -78,3 +78,21 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
   that toolchain is not part of this repository. Forks that want notarized
   builds should sign with their own Apple Developer ID and publish their own
   appcast (see `SUFeedURL` / `SUPublicEDKey` in `project.yml`).
+
+### Beta releases (Sparkle beta channel)
+- Publishing a beta takes nothing extra: set `MARKETING_VERSION` to a
+  pre-release version (e.g. `1.9.2-beta.1`), add
+  `RELEASE_NOTES/v1.9.2-beta.1.md`, and tag `v1.9.2-beta.1`. There is **no**
+  Jenkins parameter and **no** manual appcast edit.
+- Beta-ness is derived from the `MARKETING_VERSION` string by the signing
+  pipeline: a bare `X.Y.Z` becomes a normal GitHub Release with no
+  `<sparkle:channel>` (offered to everyone); any `-suffix` becomes a GitHub
+  Release with `prerelease=true` and an appcast item tagged
+  `<sparkle:channel>beta</sparkle:channel>`, offered only to users who ticked
+  Settings → Updates → "Enable beta version".
+- `beta` is the **only** channel the app's Sparkle delegate recognises
+  (`allowedChannels(for:)` in `Mila/App/MilaApp.swift` returns `["beta"]` or
+  `[]`), so `-alpha` / `-rc` versions are tagged `beta` too — there is no
+  separate alpha or rc channel.
+- An appcast item that should be a beta but is missing the channel tag is
+  offered to every user (this happened with 1.9.2-beta.1 on 2026-07-30).
