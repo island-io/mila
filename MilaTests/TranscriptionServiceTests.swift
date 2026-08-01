@@ -932,6 +932,14 @@ final class TranscriptionServiceTests: XCTestCase {
         return live
     }
 
+    /// Drain the WAV→m4a transcode the completion path kicks off in a detached
+    /// `Task`. `waitForIdle` only tracks the queue, so without this the
+    /// compression can outlive the test and write into a `tempRoot` that
+    /// `tearDown` has already deleted. Idempotent — a no-op if it already ran.
+    private func drainPostCompletionCompression(_ id: UUID) async {
+        await store.compressRecordingAudio(id: id)
+    }
+
     func test_rename_during_transcription_survives_the_write_back() async throws {
         let fixture = try TestRecordingFixture.make(in: store, title: "Old name", durationSeconds: 1.0)
         await stub.setDefaultDelay(Self.midPassDelay)
@@ -942,6 +950,7 @@ final class TranscriptionServiceTests: XCTestCase {
         store.rename(live, to: "New name")
 
         await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
 
         let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertEqual(stored.title, "New name",
@@ -962,6 +971,7 @@ final class TranscriptionServiceTests: XCTestCase {
         store.assign(live, toFolder: "Work")
 
         await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
 
         let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertEqual(stored.folder, "Work",
@@ -1008,6 +1018,7 @@ final class TranscriptionServiceTests: XCTestCase {
         store.rename(live, to: "Renamed during re-key")
 
         await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
 
         let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertEqual(stored.title, "Renamed during re-key", "User-owned: the rename wins")
@@ -1034,13 +1045,13 @@ final class TranscriptionServiceTests: XCTestCase {
         store.softDelete(live)
 
         await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
 
         let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertTrue(stored.isTrashed,
                       "A recording the user deleted mid-pass must not be resurrected by the write-back")
-        XCTAssertNotEqual(stored.status, .running,
-                          "It must still leave the running state or the queue shows it forever")
-        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.status, .completed,
+                       "It must still leave the running state or the queue shows it as Transcribing forever")
         XCTAssertEqual(stored.fullText, "still transcribed",
                        "The transcript is kept so a restore isn't empty")
         XCTAssertFalse(completionFired,
