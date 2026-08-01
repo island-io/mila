@@ -86,8 +86,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
             // transcripts coming back in Hebrew — and drop the pre-filled id
             // again when the primary stops being Hebrew-only, because it
             // belongs to that primary and breaks the next one.
-            clearAutoFilledEnglishModelIfNeeded()
-            prefillEnglishModelIfNeeded()
+            reconcileEnglishModelForCurrentPrimary()
         }
     }
 
@@ -203,8 +202,30 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // an in-session model edit. A no-op for anyone upgrading: the
         // auto-filled flag is only ever set by Mila's own prefill, so a value
         // that predates this code is treated as the user's and left alone.
+        reconcileEnglishModelForCurrentPrimary()
+    }
+
+    /// Bring `englishModel` into line with the current primary, by running both
+    /// halves of the rule. Exactly one of them can act on any given primary —
+    /// the withdrawal only for a non-ivrit `model`, the prefill only for an
+    /// ivrit one — so this is about never running one without the other, not
+    /// about sequencing them. Every entry point (`init`, `model.didSet`) goes
+    /// through here so a third one can't arrive with only half the rule.
+    private func reconcileEnglishModelForCurrentPrimary() {
         clearAutoFilledEnglishModelIfNeeded()
         prefillEnglishModelIfNeeded()
+    }
+
+    /// Assign `englishModel` on Mila's own behalf and record whether the value
+    /// is one Mila owns, without `englishModel.didSet` mistaking the write for
+    /// a user edit. `defer` rather than a trailing assignment so an early
+    /// return added later can't leave the flag stuck `true` — which would
+    /// silently stop the next real user edit from claiming ownership.
+    private func setEnglishModelProgrammatically(_ value: String, autoFilled: Bool) {
+        isProgrammaticWrite = true
+        defer { isProgrammaticWrite = false }
+        englishModel = value
+        defaults.set(autoFilled, forKey: Keys.englishModelAutoFilled)
     }
 
     /// Set `englishModel` to `defaultEnglishModel` when the primary model is
@@ -223,10 +244,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
         guard englishModel.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         guard !defaults.bool(forKey: Keys.englishModelCleared) else { return }
         guard Self.isHebrewOnlyModel(model) else { return }
-        isProgrammaticWrite = true
-        englishModel = Self.defaultEnglishModel
-        defaults.set(true, forKey: Keys.englishModelAutoFilled)
-        isProgrammaticWrite = false
+        setEnglishModelProgrammatically(Self.defaultEnglishModel, autoFilled: true)
     }
 
     /// Withdraw an auto-filled `englishModel` once the primary is no longer
@@ -244,12 +262,9 @@ final class RemoteTranscriptionSettings: ObservableObject {
     private func clearAutoFilledEnglishModelIfNeeded() {
         guard !Self.isHebrewOnlyModel(model) else { return }
         guard defaults.bool(forKey: Keys.englishModelAutoFilled) else { return }
-        isProgrammaticWrite = true
         // Not a user clear, so this must not set `Keys.englishModelCleared` —
         // switching back to an ivrit primary should pre-fill again.
-        englishModel = ""
-        defaults.set(false, forKey: Keys.englishModelAutoFilled)
-        isProgrammaticWrite = false
+        setEnglishModelProgrammatically("", autoFilled: false)
     }
 
     /// True only while this class is assigning `englishModel` itself, so the

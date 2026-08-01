@@ -262,6 +262,26 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
                        "A withdrawal must not be recorded as an explicit clear")
     }
 
+    /// The mirror of the refill test, and the case that separates a withdrawal
+    /// from a clear: the user emptied the field by hand, so leaving ivrit and
+    /// coming back must NOT resurrect the pre-filled id. Pins the guard order in
+    /// `prefillEnglishModelIfNeeded` — `cleared` is checked before the primary
+    /// is, so no route back to an ivrit primary can bypass it.
+    func test_prefill_explicitClearSurvivesARoundTripThroughAMultilingualPrimary() {
+        let settings = makeUpgrading(from: "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(settings.englishModel, RemoteTranscriptionSettings.defaultEnglishModel,
+                       "Precondition: pre-filled for the ivrit primary")
+        settings.englishModel = ""   // user empties it by hand
+
+        settings.model = "whisper-1"
+        XCTAssertEqual(settings.englishModel, "")
+
+        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+        XCTAssertEqual(settings.englishModel, "",
+                       "An explicit clear must outlast a round trip through another primary")
+        XCTAssertEqual(settings.model(for: "en"), "ivrit-ai/whisper-large-v3-turbo-ct2")
+    }
+
     /// The invariant holds across a relaunch too, not just an in-session edit —
     /// e.g. the primary was changed by a `.milaconfig` on a previous launch.
     func test_prefill_isWithdrawnOnLaunch_whenPersistedPrimaryIsNotIvrit() {
