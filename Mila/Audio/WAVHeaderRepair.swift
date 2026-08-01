@@ -33,9 +33,11 @@ enum WAVHeaderRepair {
     }
 
     /// Decide whether `header` describes an unfinalized WAV that needs its
-    /// `RIFF`/`data` size fields rewritten. Returns `nil` when the header is
-    /// already finalized, isn't a WAV we recognize, or the file is too small —
-    /// callers treat "no plan" as "leave the file untouched".
+    /// `RIFF`/`data` size fields rewritten. Returns `nil` for anything that
+    /// isn't the crash signature — an already-finalized header, a `data` size
+    /// that is merely wrong rather than zero, a file we don't recognize as a
+    /// WAV, or one too small to hold a header. Callers treat "no plan" as
+    /// "leave the file untouched", so the default is always to do nothing.
     ///
     /// - Parameters:
     ///   - header: the first bytes of the file (the RIFF header + chunk table
@@ -92,12 +94,29 @@ enum WAVHeaderRepair {
         if blockAlign > 1 { available -= available % blockAlign }
         guard available > 0 else { return nil }
 
-        // Only repair a clearly-unfinalized header: the declared `data` size is
-        // smaller than what's physically present (0 on a crash). If it already
-        // matches — or over-claims, a different problem we won't invent data
-        // for — leave it alone. This makes the call idempotent.
-        let declared = u32(dataChunkOffset + 4) ?? 0
-        guard Int(declared) < available else { return nil }
+        // Only repair the exact crash signature: a `data` size still sitting at
+        // the placeholder `0`. `AVAudioFile` writes the header once on open
+        // (JUNK + fmt + FLLR + `data` size 0) and backfills the two size fields
+        // only in `close()` — it never publishes an intermediate size, however
+        // many megabytes have streamed out. So `0` is the whole failure mode.
+        //
+        // The looser rule "declared is smaller than what's on disk" would also
+        // fire on a perfectly healthy WAV whose `data` chunk simply isn't last:
+        // a trailing `LIST`/`INFO`, `cue `, or `id3 ` chunk makes the physical
+        // remainder exceed the declared size, and extending `data` over it
+        // would splice metadata into the audio stream. That matters because the
+        // recordings directory is user-chosen (Settings → Storage) and
+        // `RecordingStore.recoverOrphanRecordings` adopts *every* unreferenced
+        // `.wav` it finds there — foreign files written by other tools really
+        // do reach this code, and this is the user's only copy.
+        //
+        // A size that over-claims (a truncated write) is likewise left alone:
+        // we can't invent the missing audio, and shrinking the field would
+        // discard a reader's chance to salvage what is there.
+        //
+        // Keying off `0` alone also makes the call idempotent and convergent
+        // after a partial write — see `repairIfNeeded`.
+        guard u32(dataChunkOffset + 4) == 0 else { return nil }
 
         // WAV size fields are UInt32; a >4 GiB file can't be described by the
         // format anyway, so bail rather than truncate.

@@ -117,6 +117,98 @@ final class WAVHeaderRepairTests: XCTestCase {
         XCTAssertNil(WAVHeaderRepair.plan(header: tiny, fileSize: tiny.count))
     }
 
+    func test_trailing_chunk_after_data_is_left_alone() {
+        // A healthy WAV whose `data` chunk isn't last: a LIST/INFO trailer
+        // (Audacity, Pro Tools, anything that appends metadata) makes the
+        // physical remainder exceed the declared `data` size. Extending `data`
+        // over it would splice metadata bytes into the audio stream. These
+        // files reach us for real — the recordings directory is user-chosen
+        // and RecordingStore adopts every unreferenced .wav it finds there.
+        let dataCount = 4000
+        var (bytes, _) = canonicalWAV(dataByteCount: dataCount,
+                                      declaredRiffSize: 0,   // patched below
+                                      declaredDataSize: UInt32(dataCount))
+        let listPayload = ascii("INFOINAM") + le32(8) + ascii("My Song\0")
+        bytes += ascii("LIST") + le32(UInt32(listPayload.count)) + listPayload
+        // A healthy file declares the correct RIFF size for the whole thing.
+        bytes.replaceSubrange(4..<8, with: le32(UInt32(bytes.count - 8)))
+
+        XCTAssertNil(WAVHeaderRepair.plan(header: bytes, fileSize: bytes.count),
+                     "A `data` chunk followed by a metadata chunk must not be extended over it.")
+    }
+
+    func test_overclaiming_data_size_is_left_alone() {
+        // Truncated write: the header claims more audio than is on disk. We
+        // can't invent the missing frames, and shrinking the field would take
+        // away a reader's chance to salvage what is there — so: no plan.
+        let (bytes, _) = canonicalWAV(dataByteCount: 4000,
+                                      declaredRiffSize: UInt32(36 + 10_000),
+                                      declaredDataSize: 10_000)
+        XCTAssertNil(WAVHeaderRepair.plan(header: bytes, fileSize: bytes.count),
+                     "An over-claiming `data` size is a different problem; don't rewrite it.")
+    }
+
+    func test_nonzero_stale_data_size_is_left_alone() {
+        // Only the placeholder `0` is treated as "unfinalized". AVAudioFile
+        // never publishes an intermediate size, so a non-zero-but-short size
+        // came from some other writer and is not ours to reinterpret.
+        let (bytes, _) = canonicalWAV(dataByteCount: 4000,
+                                      declaredRiffSize: 36 + 1000,
+                                      declaredDataSize: 1000)
+        XCTAssertNil(WAVHeaderRepair.plan(header: bytes, fileSize: bytes.count))
+    }
+
+    func test_repairIfNeeded_leaves_a_healthy_file_byte_identical() throws {
+        let dataCount = 4000
+        let (bytes, _) = canonicalWAV(dataByteCount: dataCount,
+                                      declaredRiffSize: UInt32(36 + dataCount),
+                                      declaredDataSize: UInt32(dataCount))
+        let url = try writeTemp(bytes)
+        XCTAssertFalse(WAVHeaderRepair.repairIfNeeded(at: url))
+        XCTAssertEqual([UInt8](try Data(contentsOf: url)), bytes,
+                       "A finalized WAV must come back byte-for-byte unchanged.")
+    }
+
+    func test_repair_matches_a_real_AVAudioFile_close() throws {
+        // Ground truth: write a WAV with AVAudioFile, snapshot the bytes while
+        // it is still open (exactly what a crash leaves behind), then close it
+        // and compare. The repair must reproduce close()'s header verbatim.
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wavrepair-live-\(UUID().uuidString).wav")
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVSampleRateKey: 16000.0,
+            AVNumberOfChannelsKey: 1,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false
+        ]
+        var file: AVAudioFile? = try AVAudioFile(forWriting: url, settings: settings,
+                                                 commonFormat: .pcmFormatFloat32,
+                                                 interleaved: false)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file!.processingFormat,
+                                                    frameCapacity: 16_000))
+        buffer.frameLength = 16_000
+        for i in 0..<16_000 { buffer.floatChannelData![0][i] = Float(i % 100) / 100.0 }
+        for _ in 0..<4 { try file!.write(from: buffer) }
+
+        let unclosed = [UInt8](try Data(contentsOf: url))   // the "crashed" file
+        file = nil                                          // close() finalizes the header
+        let finalized = [UInt8](try Data(contentsOf: url))
+
+        XCTAssertEqual(unclosed.count, finalized.count, "close() must not change the file length.")
+        XCTAssertNotEqual(unclosed, finalized, "close() is expected to backfill the size fields.")
+
+        // Put the unfinalized bytes back and let the repair redo close()'s work.
+        try Data(unclosed).write(to: url)
+        XCTAssertTrue(WAVHeaderRepair.repairIfNeeded(at: url))
+        XCTAssertEqual([UInt8](try Data(contentsOf: url)), finalized,
+                       "Repaired header must be byte-identical to what close() writes.")
+    }
+
     func test_frame_flooring_drops_torn_final_frame() {
         // blockAlign = 4 (float32 mono). A crash left 2 extra bytes = a torn
         // frame; the repaired size must floor to a whole-frame multiple.
