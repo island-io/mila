@@ -229,8 +229,8 @@ final class LLMSettings: ObservableObject {
     /// governs the automatic path.
     ///
     /// Defaults to ON (see init) so existing users keep their summaries
-    /// unless they opt out. Surfaced in Settings → LLM next to the name /
-    /// action toggles, which is where users expect to find it.
+    /// unless they opt out. Surfaced in the "Automatic summary" section of
+    /// Settings → AI, alongside the summary prompt it governs.
     @Published var summaryEnabled: Bool {
         didSet { defaults.set(summaryEnabled, forKey: Keys.summaryEnabled) }
     }
@@ -383,7 +383,7 @@ final class LLMSettings: ObservableObject {
 
     // MARK: - Test / diagnostics
     //
-    // Backing state for the Settings → LLM "Test" panel. The transcript /
+    // Backing state for the Settings → AI "Test" panel. The transcript /
     // result here are an ephemeral scratch area for answering "why isn't my
     // LLM working?" — they're not persisted (the extra-args the test uses ARE
     // persisted; see `extraArgs` above). Kept on the app-lifetime settings

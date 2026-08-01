@@ -321,7 +321,7 @@ struct RenameRecordingSheet: View {
                                     text: llm.postActionPrompt)
                     }
                     if !llm.nameGenerationEnabled && !llm.postActionEnabled {
-                        Text("No prompts enabled. Turn on Suggest a name or Run an action in Settings → LLM.")
+                        Text("No prompts enabled. Turn on Suggest a name or Run an action in Settings → AI.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)

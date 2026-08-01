@@ -3,7 +3,10 @@ import AppKit
 import Carbon.HIToolbox
 
 enum SettingsTab: Int, Hashable {
-    case general, audio, models, llm, speakers, meetings, liveAI, voiceMemos, storage
+    /// `ai` replaces the former separate `llm` and `liveAI` tabs: the AI
+    /// provider is now configured once and each AI feature gets its own
+    /// collapsible section inside that single tab.
+    case general, audio, models, ai, speakers, meetings, voiceMemos, storage
 }
 
 @Observable
@@ -27,18 +30,15 @@ struct SettingsView: View {
             ModelsSettingsTab()
                 .tabItem { Label("Models", systemImage: "cube.box") }
                 .tag(SettingsTab.models)
-            LLMSettingsTab()
-                .tabItem { Label("LLM", systemImage: "sparkles") }
-                .tag(SettingsTab.llm)
+            AISettingsTab()
+                .tabItem { Label("AI", systemImage: "sparkles") }
+                .tag(SettingsTab.ai)
             DiarizationSettingsTab()
                 .tabItem { Label("Speakers", systemImage: "person.2") }
                 .tag(SettingsTab.speakers)
             MeetingsSettingsTab()
                 .tabItem { Label("Meetings", systemImage: "video.fill") }
                 .tag(SettingsTab.meetings)
-            LiveAISettingsTab()
-                .tabItem { Label("Live AI", systemImage: "sparkles.tv") }
-                .tag(SettingsTab.liveAI)
             VoiceMemosSettingsTab()
                 .tabItem { Label("Voice Memos", systemImage: "waveform") }
                 .tag(SettingsTab.voiceMemos)
@@ -805,36 +805,139 @@ private struct ModelRow: View {
     }
 }
 
-// MARK: - LLM
+// MARK: - AI
 
-private struct LLMSettingsTab: View {
+/// Settings → AI. One tab for everything LLM-powered.
+///
+/// Layout, top to bottom:
+///   1. **Provider** — configured ONCE and shared by every AI feature: which
+///      tool (Off / Claude CLI / Cursor CLI / OpenAI-compatible endpoint), the
+///      executable path + extra CLI args (CLI tools) or provider / base URL /
+///      model / API key (HTTP), the request timeout, and the output language.
+///   2. **One `DisclosureGroup` per feature** — automatic summary, recording
+///      names, the Send-to-LLM action, Live AI mode, and the test panel. Each
+///      expands independently so the tab stays short.
+///
+/// This replaces the old separate "LLM" and "Live AI" tabs. It is purely a
+/// UI reorganisation: every `UserDefaults` key (`llm.*`, `liveAI.*`) and the
+/// Keychain item behind the API key are unchanged, so an upgrading user keeps
+/// their provider, prompts and toggles exactly as they were.
+private struct AISettingsTab: View {
     @EnvironmentObject private var settings: LLMSettings
+    @EnvironmentObject private var liveAI: LiveAISettings
+
+    // Section expansion state. Only the summary section starts open: it holds
+    // the switch most users come here for, and everything else is opt-in
+    // detail. Not persisted — a fresh Settings window starts from this state.
+    @State private var showSummary = true
+    @State private var showName = false
+    @State private var showAction = false
+    @State private var showLiveAI = false
+    @State private var showTest = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 header
                 toolPicker
-                Divider()
-                summarySection
-                Divider()
                 timeoutSection
+                outputLanguageSection
                 Divider()
-                namePromptSection
-                Divider()
-                actionPromptSection
-                Divider()
-                testSection
+
+                section("Automatic summary",
+                        subtitle: "Summarize every recording when it finishes",
+                        isOn: settings.summaryEnabled,
+                        isExpanded: $showSummary,
+                        identifier: "ai.section.summary") {
+                    summarySection
+                }
+
+                section("Recording names",
+                        subtitle: "Suggest a title from the transcript",
+                        isOn: settings.nameGenerationEnabled,
+                        isExpanded: $showName,
+                        identifier: "ai.section.name") {
+                    namePromptSection
+                }
+
+                section("Send-to-LLM action",
+                        subtitle: "Run your own prompt against a transcript",
+                        isOn: settings.postActionEnabled,
+                        isExpanded: $showAction,
+                        identifier: "ai.section.action") {
+                    actionPromptSection
+                }
+
+                section("Live AI mode",
+                        subtitle: "Action items while the recording runs",
+                        isOn: liveAI.enabled && liveAI.isLiveAIAvailable,
+                        isExpanded: $showLiveAI,
+                        identifier: "ai.section.liveAI") {
+                    LiveAISection(settings: liveAI, llm: settings)
+                }
+
+                section("Test",
+                        subtitle: "Run a prompt against a sample transcript",
+                        isOn: nil,
+                        isExpanded: $showTest,
+                        identifier: "ai.section.test") {
+                    testSection
+                }
+
+                Spacer(minLength: 0)
             }
             .padding(.vertical, 4)
         }
     }
 
+    // MARK: Section chrome
+
+    /// A collapsible feature section: bold title, one-line subtitle, and an
+    /// On/Off pill so the user can see what's configured without expanding
+    /// anything. `isOn: nil` renders no pill (used by the Test section, which
+    /// isn't a feature you turn on).
+    private func section<Content: View>(_ title: String,
+                                        subtitle: String,
+                                        isOn: Bool?,
+                                        isExpanded: Binding<Bool>,
+                                        identifier: String,
+                                        @ViewBuilder content: () -> Content) -> some View {
+        // Materialise the body eagerly: `DisclosureGroup`'s content closure
+        // escapes, and a non-escaping `content` parameter can't be captured
+        // by it. Capturing the built view instead keeps the call sites
+        // trailing-closure shaped without an `@escaping` annotation.
+        let inner = content()
+        return DisclosureGroup(isExpanded: isExpanded) {
+            inner
+                .padding(.top, 8)
+        } label: {
+            HStack(spacing: 8) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.callout.weight(.semibold))
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let isOn {
+                    Text(isOn ? "On" : "Off")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(isOn ? .green : .secondary)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .accessibilityIdentifier(identifier)
+    }
+
+    // MARK: Shared provider configuration
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("LLM integration")
+            Text("AI provider")
                 .font(.title3.weight(.semibold))
-            Text("After a recording finishes transcribing, Mila can shell out to a local LLM CLI (Claude or Cursor) to suggest a name and/or run a custom action with the transcript. Both CLIs run on your machine with whatever auth you already configured for them; we only forward the transcript text — nothing else.")
+            Text("Pick your AI once here — every AI feature below uses it. Mila can shell out to a local CLI (Claude or Cursor) that runs on your machine with the auth you already configured, or talk to any OpenAI-compatible endpoint. Only transcript text is ever forwarded.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -946,18 +1049,6 @@ private struct LLMSettingsTab: View {
         }
     }
 
-    private var summarySection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Toggle("Automatically summarize recordings", isOn: $settings.summaryEnabled)
-                .toggleStyle(.switch)
-                .accessibilityIdentifier("llm.summary.enabled.toggle")
-            Text("When on, Mila runs a one-shot LLM pass after every recording finishes and stores the result as the recording's AI Overview. Turn this off to keep Mila transcript-only. Existing summaries are kept, and any recording that still has one can be refreshed from its right-click \u{201C}Regenerate summary\u{201D} action.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
     /// Help text under the timeout stepper. Worded for an HTTP request when
     /// the OpenAI endpoint is active, for a CLI process otherwise.
     private var timeoutHelp: String {
@@ -970,7 +1061,7 @@ private struct LLMSettingsTab: View {
     private var timeoutSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                Text(settings.timeoutLabel).frame(width: 100, alignment: .leading)
+                Text(settings.timeoutLabel).frame(width: 130, alignment: .leading)
                 Stepper(value: $settings.cliTimeout, in: 30...900, step: 30) {
                     EmptyView()
                 }
@@ -990,6 +1081,73 @@ private struct LLMSettingsTab: View {
         }
     }
 
+    /// Output language is genuinely one knob shared by two features: it fills
+    /// the `{{LANGUAGE}}` slot in BOTH the post-recording summary prompt and
+    /// the Live AI tick prompt (`RecordingSummarizer` and `LiveAISession` read
+    /// the same `LiveAISettings.outputLanguage`). It used to be buried in the
+    /// Live AI tab, which hid it from the many users who only ever get the
+    /// automatic summary — so it lives up here with the provider now. The
+    /// persisted key (`liveAI.outputLanguage`) is unchanged.
+    private var outputLanguageSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Output language").frame(width: 130, alignment: .leading)
+                Picker("Output language", selection: $liveAI.outputLanguage) {
+                    ForEach(LiveAISettings.OutputLanguage.allCases) { lang in
+                        Text(lang.displayName).tag(lang)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 240)
+                Spacer()
+            }
+            .font(.callout)
+            Text("Language the AI writes its summaries and action items in. Auto matches whatever language was spoken. Your recordings can be in any language either way.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: Automatic summary
+
+    private var summarySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Automatically summarize recordings", isOn: $settings.summaryEnabled)
+                .toggleStyle(.switch)
+                .accessibilityIdentifier("llm.summary.enabled.toggle")
+            Text("When on, Mila runs a one-shot LLM pass after every recording finishes and stores the result as the recording's AI Overview. Turn this off to keep Mila transcript-only. Existing summaries are kept, and any recording that still has one can be refreshed from its right-click \u{201C}Regenerate summary\u{201D} action.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack {
+                Text("Summary prompt")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+                Button("Reset to default") {
+                    liveAI.summaryPrompt = LiveAISettings.defaultSummaryPrompt
+                }
+                .controlSize(.small)
+                .disabled(!settings.summaryEnabled)
+            }
+            TextEditor(text: $liveAI.summaryPrompt)
+                .font(.system(.callout, design: .monospaced))
+                .frame(minHeight: 90, maxHeight: 150)
+                .padding(4)
+                .overlay(RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1))
+                .disabled(!settings.summaryEnabled)
+            Text("Sent once with the full transcript after a recording finishes. `{{LANGUAGE}}` is replaced with the output language you picked above.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: Recording names
+
     private var namePromptSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             Toggle("Suggest a name from the LLM", isOn: $settings.nameGenerationEnabled)
@@ -1007,6 +1165,8 @@ private struct LLMSettingsTab: View {
             }
         }
     }
+
+    // MARK: Send-to-LLM action
 
     private var actionPromptSection: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1030,8 +1190,6 @@ private struct LLMSettingsTab: View {
 
     private var testSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Test")
-                .font(.title3.weight(.semibold))
             Text("Run the configured prompt against a sample transcript to see exactly what Mila sends and what your \(settings.isOpenAICompatible ? "endpoint" : "CLI") returns. Use this to debug a tool that isn't working — the \(settings.isOpenAICompatible ? "request shown below is the literal one Mila sends" : "command shown below is the literal one Mila runs"), so you can copy it into a terminal yourself.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -1090,7 +1248,240 @@ private struct LLMSettingsTab: View {
     }
 }
 
-/// Renders the outcome of a Settings → LLM test run: the exact command (with a
+/// The "Live AI mode" section of Settings → AI: the master toggle, the
+/// per-tick system prompt editor (with reset-to-default), and an Advanced
+/// disclosure holding the Live-AI-only model override plus the cost /
+/// segmentation dials most users never touch.
+///
+/// Provider setup deliberately does NOT live here — Live AI uses whichever
+/// tool is configured at the top of the tab. The one thing it keeps for
+/// itself is `LiveAISettings.model`, because the live loop pins its own
+/// (cheaper) model per tick rather than inheriting the CLI default.
+private struct LiveAISection: View {
+    @ObservedObject var settings: LiveAISettings
+    @ObservedObject var llm: LLMSettings
+    @State private var showAdvanced: Bool = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            intro
+            if !settings.isLiveAIAvailable {
+                hardwareDisabledNotice
+            }
+            masterToggle
+            if !llm.isConfigured && settings.isLiveAIAvailable {
+                notConfiguredHint
+            }
+            promptEditor
+            advancedDisclosure
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var intro: some View {
+        Text("During a recording, Mila streams the transcript to the AI provider above every few seconds and surfaces action items in real time.")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    /// Banner shown when this Mac is below the hardware bar for Live
+    /// AI (currently: any MacBook Air). The toggle stays visible but
+    /// is greyed out — the persisted preference still round-trips,
+    /// so taking the user's settings back to a fast Mac restores the
+    /// previous state without surprises.
+    private var hardwareDisabledNotice: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.circle.fill")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Disabled on this Mac")
+                        .font(.callout.weight(.semibold))
+                    Text("MacBook Air — Live AI was too slow on Air-class chips when this gate was added. With Apple Neural Engine encoder offload it may now keep up. Recordings still transcribe in the background regardless.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Toggle(isOn: $settings.forceLiveAIOnLowEndHardware) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Try Live AI anyway")
+                        .font(.callout)
+                    Text("Override the hardware gate. If transcription lags behind, disable this and use background mode instead.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var masterToggle: some View {
+        Toggle(isOn: $settings.enabled) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Enable Live AI mode")
+                Text("When on, the home screen swaps to a split-pane recording view as soon as you press Record.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .toggleStyle(.switch)
+        // Hardware gate: keep the toggle visible (so the user
+        // knows the feature exists) but block interaction on Macs
+        // where Live AI is too slow to be useful. The persisted
+        // value still round-trips.
+        .disabled(!settings.isLiveAIAvailable)
+    }
+
+    private var notConfiguredHint: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            Text("No AI provider is configured at the top of this tab. The toggle above is a no-op until you pick one there.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.08),
+                    in: RoundedRectangle(cornerRadius: 6))
+    }
+
+    private var promptEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("System prompt")
+                    .font(.callout.weight(.semibold))
+                Spacer()
+                Button("Reset to default") {
+                    settings.prompt = LiveAISettings.defaultPrompt
+                }
+                .controlSize(.small)
+            }
+            TextEditor(text: $settings.prompt)
+                .font(.system(.callout, design: .monospaced))
+                .frame(minHeight: 160)
+                .padding(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color.secondary.opacity(0.25))
+                )
+            Text("Tip: the default prompt asks for a strict JSON array so Mila can parse the response. Free-form prose will be ignored.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            // This prompt is a permanent template, so anything meeting-
+            // specific pasted here silently applies to every LATER
+            // recording — which produced blended "previous meeting + this
+            // meeting" summaries and action items lifted from a stale
+            // agenda. Point users at the per-meeting Context box instead.
+            Text("This prompt is reused for every recording. For notes about one specific meeting (agenda, attendees, acronyms), use the **Context** box in the recording pane — it's cleared when that recording stops.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var advancedDisclosure: some View {
+        DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+            VStack(alignment: .leading, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Model").font(.callout.weight(.semibold))
+                    TextField(LiveAISettings.defaultModel, text: $settings.model)
+                        .textFieldStyle(.roundedBorder)
+                    Text("Passed to the CLI as `--model` for the live loop only. Default is the cheapest current Claude. Leave blank to let your CLI pick.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Auto-segment by silence (beta)", isOn: $settings.useVAD)
+                        .font(.callout.weight(.semibold))
+                    Text("Detect natural pauses (≥400ms silence) and run whisper once per utterance instead of on a fixed timer. Lower latency, cleaner word boundaries. Force-cut at 25s for monologue speakers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Filter non-speech (neural VAD)", isOn: $settings.useNeuralVAD)
+                        .font(.callout.weight(.semibold))
+                        .disabled(!settings.useVAD)
+                    Text("Run a lightweight neural voice detector on each segment and skip ones with no actual speech. Stops whisper from inventing filler text on background noise or silence. Recommended on. Needs auto-segment.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Background mode (hide live pane)", isOn: $settings.backgroundMode)
+                        .font(.callout.weight(.semibold))
+                    Text("Stay on the Home screen during recording. Transcription, speaker labels, and Live AI summary still run in the background and are saved when you stop. Useful on lower-power Macs where rendering the live pane competes with whisper for CPU.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Update every").font(.callout.weight(.semibold))
+                        Spacer()
+                        Text("\(Int(settings.chunkSeconds))s")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $settings.chunkSeconds, in: 15...60, step: 5)
+                        .disabled(settings.useVAD)
+                    Text("How often Mila re-transcribes and re-prompts when auto-segment is off. 30s is the default — matches the whisper window so words don't get cut mid-utterance.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("AI update interval").font(.callout.weight(.semibold))
+                        Spacer()
+                        Text("\(Int(settings.llmMinIntervalSeconds))s")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $settings.llmMinIntervalSeconds, in: 5...60, step: 5)
+                    Text("Minimum time between AI summary updates. The transcript is sent to the LLM at most once per interval, so longer values use less CPU and fewer API calls on long recordings. 20s is the default; the final update when you stop always runs regardless.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text("Speaker similarity threshold").font(.callout.weight(.semibold))
+                        Spacer()
+                        Text(String(format: "%.2f", settings.speakerSimilarityThreshold))
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $settings.speakerSimilarityThreshold, in: 0.5...0.95, step: 0.01)
+                    Text("Higher values make the live diarizer more conservative about merging similar voices into one speaker.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 6)
+        }
+    }
+}
+
+/// Renders the outcome of a Settings → AI test run: the exact command (with a
 /// Copy button), a status line, and the captured stdout/stderr. Designed so a
 /// user who can't get their CLI working can read or copy everything they need
 /// to self-diagnose.
@@ -1610,261 +2001,6 @@ private struct MeetingsSettingsTab: View {
                     .padding(.vertical, 4)
                 }
             }
-        }
-    }
-}
-
-// MARK: - Live AI
-
-/// Settings → Live AI. Hosts the master toggle, the cheap-model override,
-/// the system prompt editor (with reset-to-default), and the two cost
-/// dials that most users will never touch.
-private struct LiveAISettingsTab: View {
-    @EnvironmentObject private var settings: LiveAISettings
-    @EnvironmentObject private var llm: LLMSettings
-    @State private var showAdvanced: Bool = false
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                header
-                if !settings.isLiveAIAvailable {
-                    hardwareDisabledNotice
-                }
-                masterToggle
-                if !llm.isConfigured && settings.isLiveAIAvailable {
-                    notConfiguredHint
-                }
-                Divider()
-                promptEditor
-                advancedDisclosure
-                Spacer(minLength: 0)
-            }
-            .padding(.vertical, 4)
-            .frame(maxWidth: .infinity, alignment: .leading)
-        }
-    }
-
-    /// Banner shown when this Mac is below the hardware bar for Live
-    /// AI (currently: any MacBook Air). The toggle stays visible but
-    /// is greyed out — the persisted preference still round-trips,
-    /// so taking the user's settings back to a fast Mac restores the
-    /// previous state without surprises.
-    private var hardwareDisabledNotice: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(alignment: .top, spacing: 8) {
-                Image(systemName: "exclamationmark.circle.fill")
-                    .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Disabled on this Mac")
-                        .font(.callout.weight(.semibold))
-                    Text("MacBook Air — Live AI was too slow on Air-class chips when this gate was added. With Apple Neural Engine encoder offload it may now keep up. Recordings still transcribe in the background regardless.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Toggle(isOn: $settings.forceLiveAIOnLowEndHardware) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Try Live AI anyway")
-                        .font(.callout)
-                    Text("Override the hardware gate. If transcription lags behind, disable this and use background mode instead.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .toggleStyle(.switch)
-        }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.08),
-                    in: RoundedRectangle(cornerRadius: 6))
-    }
-
-    private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Live AI mode")
-                .font(.title3.weight(.semibold))
-            Text("During a recording, Mila streams the transcript to your LLM every few seconds and surfaces action items in real time. Requires Claude or Cursor CLI set up under LLM.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var masterToggle: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Toggle(isOn: $settings.enabled) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Enable Live AI mode")
-                    Text("Off by default. When on, the home screen swaps to a split-pane recording view as soon as you press Record.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .toggleStyle(.switch)
-            // Hardware gate: keep the toggle visible (so the user
-            // knows the feature exists) but block interaction on Macs
-            // where Live AI is too slow to be useful. The persisted
-            // value still round-trips.
-            .disabled(!settings.isLiveAIAvailable)
-
-            HStack {
-                Text("Output language")
-                    .font(.callout)
-                Spacer()
-                Picker("Output language", selection: $settings.outputLanguage) {
-                    ForEach(LiveAISettings.OutputLanguage.allCases) { lang in
-                        Text(lang.displayName).tag(lang)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(maxWidth: 220)
-            }
-            .disabled(!settings.isLiveAIAvailable)
-        }
-    }
-
-    private var notConfiguredHint: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-            Text("No LLM CLI is configured under Settings → LLM. The toggle above is a no-op until you pick Claude or Cursor there.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .padding(8)
-        .background(Color.orange.opacity(0.08),
-                    in: RoundedRectangle(cornerRadius: 6))
-    }
-
-    private var promptEditor: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("System prompt")
-                    .font(.callout.weight(.semibold))
-                Spacer()
-                Button("Reset to default") {
-                    settings.prompt = LiveAISettings.defaultPrompt
-                }
-                .controlSize(.small)
-            }
-            TextEditor(text: $settings.prompt)
-                .font(.system(.callout, design: .monospaced))
-                .frame(minHeight: 160)
-                .padding(4)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .strokeBorder(Color.secondary.opacity(0.25))
-                )
-            Text("Tip: the default prompt asks for a strict JSON array so Mila can parse the response. Free-form prose will be ignored.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            // This prompt is a permanent template, so anything meeting-
-            // specific pasted here silently applies to every LATER
-            // recording — which produced blended "previous meeting + this
-            // meeting" summaries and action items lifted from a stale
-            // agenda. Point users at the per-meeting Context box instead.
-            Text("This prompt is reused for every recording. For notes about one specific meeting (agenda, attendees, acronyms), use the **Context** box in the recording pane — it's cleared when that recording stops.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var advancedDisclosure: some View {
-        DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
-            VStack(alignment: .leading, spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Model").font(.callout.weight(.semibold))
-                    TextField(LiveAISettings.defaultModel, text: $settings.model)
-                        .textFieldStyle(.roundedBorder)
-                    Text("Passed to the CLI as `--model`. Default is the cheapest current Claude. Leave blank to let your CLI pick.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Auto-segment by silence (beta)", isOn: $settings.useVAD)
-                        .font(.callout.weight(.semibold))
-                    Text("Detect natural pauses (≥400ms silence) and run whisper once per utterance instead of on a fixed timer. Lower latency, cleaner word boundaries. Force-cut at 25s for monologue speakers.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Filter non-speech (neural VAD)", isOn: $settings.useNeuralVAD)
-                        .font(.callout.weight(.semibold))
-                        .disabled(!settings.useVAD)
-                    Text("Run a lightweight neural voice detector on each segment and skip ones with no actual speech. Stops whisper from inventing filler text on background noise or silence. Recommended on. Needs auto-segment.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Background mode (hide live pane)", isOn: $settings.backgroundMode)
-                        .font(.callout.weight(.semibold))
-                    Text("Stay on the Home screen during recording. Transcription, speaker labels, and Live AI summary still run in the background and are saved when you stop. Useful on lower-power Macs where rendering the live pane competes with whisper for CPU.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Update every").font(.callout.weight(.semibold))
-                        Spacer()
-                        Text("\(Int(settings.chunkSeconds))s")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $settings.chunkSeconds, in: 15...60, step: 5)
-                        .disabled(settings.useVAD)
-                    Text("How often Mila re-transcribes and re-prompts when auto-segment is off. 30s is the default — matches the whisper window so words don't get cut mid-utterance.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("AI update interval").font(.callout.weight(.semibold))
-                        Spacer()
-                        Text("\(Int(settings.llmMinIntervalSeconds))s")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $settings.llmMinIntervalSeconds, in: 5...60, step: 5)
-                    Text("Minimum time between AI summary updates. The transcript is sent to the LLM at most once per interval, so longer values use less CPU and fewer API calls on long recordings. 20s is the default; the final update when you stop always runs regardless.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    HStack {
-                        Text("Speaker similarity threshold").font(.callout.weight(.semibold))
-                        Spacer()
-                        Text(String(format: "%.2f", settings.speakerSimilarityThreshold))
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    Slider(value: $settings.speakerSimilarityThreshold, in: 0.5...0.95, step: 0.01)
-                    Text("Higher values make the live diarizer more conservative about merging similar voices into one speaker.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .padding(.top, 6)
         }
     }
 }
