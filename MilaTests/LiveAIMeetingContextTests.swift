@@ -4,7 +4,7 @@ import XCTest
 /// Per-meeting background notes (`LiveAISettings.meetingContext`).
 ///
 /// Origin: a user pasted a meeting agenda into the Live AI system prompt
-/// (Settings → AI → Live AI mode), which is a PERMANENT template. Every later recording was
+/// (Settings → AI Features → Live AI mode), which is a PERMANENT template. Every later recording was
 /// therefore handed the previous meeting's agenda as context, and the model
 /// returned a blended "previous call + this call" summary plus action items
 /// lifted straight from the stale agenda (all stamped

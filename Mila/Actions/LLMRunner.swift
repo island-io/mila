@@ -16,16 +16,16 @@ enum LLMRunnerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .toolDisabled:
-            return "No LLM is configured in Settings → AI."
+            return "No LLM is configured in Settings → AI Provider."
         case .executableNotFound(let name):
-            return "Could not find \(name) on PATH. Install it or set the full path in Settings → AI."
+            return "Could not find \(name) on PATH. Install it or set the full path in Settings → AI Provider."
         case .launchFailed(let err):
             return "Could not launch the LLM CLI: \(err.localizedDescription)"
         case .nonZeroExit(let code, let stderr):
             let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return "LLM CLI exited with status \(code). \(trimmed)"
         case .timedOut(let seconds):
-            return "LLM CLI did not respond within \(seconds)s. If it's running an agentic task (e.g. calendar lookup), raise the timeout in Settings → AI."
+            return "LLM CLI did not respond within \(seconds)s. If it's running an agentic task (e.g. calendar lookup), raise the timeout in Settings → AI Provider."
         case .emptyOutput:
             return "LLM CLI returned no output. Check the prompt or your CLI's auth."
         case .cancelled:
@@ -34,7 +34,7 @@ enum LLMRunnerError: LocalizedError {
     }
 }
 
-/// Everything the Settings → AI test panel needs to explain a run to the
+/// Everything the Settings → AI Provider test panel needs to explain a run to
 /// user. Produced by `LLMRunner.diagnose`. Unlike `LLMRunner.run`, nothing is
 /// thrown away on failure: the user sees the exact command, the exit code, and
 /// both streams so they can self-diagnose (or re-run `command` in a terminal).
@@ -136,7 +136,7 @@ enum LLMRunner {
     /// shape in that case.
     ///
     /// `extraArgs` are appended verbatim after the tool's standard arguments
-    /// — the user's persisted "Extra CLI args" from Settings → AI (e.g.
+    /// — the user's persisted "Extra args" from Settings → AI Provider (e.g.
     /// `--model …`, a permission flag). Empty for callers that manage their
     /// own args (Live AI pins its own model).
     ///
@@ -334,7 +334,7 @@ enum LLMRunner {
 
     /// Run the configured CLI like `run` does, but never throw — capture the
     /// exact command line, exit code, stdout, and stderr and hand them all
-    /// back so the Settings → AI test panel can show the user precisely what
+    /// back so the Settings → AI Provider test panel can show precisely what
     /// happened. This is the "why isn't my LLM working?" debugging path: the
     /// returned `command` is copy-pasteable into a terminal so the user can
     /// reproduce the run themselves.
@@ -426,7 +426,7 @@ enum LLMRunner {
     }
 
     /// Non-throwing HTTP diagnostic for `tool == .openaiCompatible` — the
-    /// "test" path the Settings → AI panel uses to explain an OpenAI endpoint
+    /// "test" path the Settings → AI Provider panel uses to explain an endpoint
     /// to the user. Mirrors `runOpenAICompatible`'s request building but,
     /// because `diagnose` never throws, captures every outcome into the
     /// `LLMTestResult` fields: `url`/`requestBody`/`httpStatus` for the request
@@ -447,7 +447,7 @@ enum LLMRunner {
         guard !trimmedBase.isEmpty else {
             return LLMTestResult(
                 setupError: LLMRunnerError.toolDisabled.errorDescription
-                    ?? "No OpenAI endpoint is configured in Settings → AI.")
+                    ?? "No OpenAI endpoint is configured in Settings → AI Provider.")
         }
         // `makeRequest` throws `invalidEndpoint` for a malformed base URL
         // (issue celarent7/mila#1). `diagnose` never throws, so surface it as

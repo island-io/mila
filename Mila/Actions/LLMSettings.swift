@@ -210,6 +210,11 @@ final class LLMSettings: ObservableObject {
         didSet { defaults.set(postActionPrompt, forKey: Keys.actionPrompt) }
     }
 
+    /// Value `cliTimeout` falls back to when nothing is persisted, and the
+    /// value Settings → AI Provider's "Reset" restores. Named rather than
+    /// repeated as a literal so the two can't drift apart.
+    static let defaultTimeout: TimeInterval = 300
+
     /// Maximum wall-clock seconds Mila allows a post-recording LLM call to
     /// run before killing the subprocess. Applies to title generation, the
     /// auto-summary, and the Send-action button. Live AI's per-tick timeouts
@@ -230,7 +235,7 @@ final class LLMSettings: ObservableObject {
     ///
     /// Defaults to ON (see init) so existing users keep their summaries
     /// unless they opt out. Surfaced in the "Automatic summary" section of
-    /// Settings → AI, alongside the summary prompt it governs.
+    /// Settings → AI Features, alongside the summary prompt it governs.
     @Published var summaryEnabled: Bool {
         didSet { defaults.set(summaryEnabled, forKey: Keys.summaryEnabled) }
     }
@@ -383,7 +388,7 @@ final class LLMSettings: ObservableObject {
 
     // MARK: - Test / diagnostics
     //
-    // Backing state for the Settings → AI "Test" panel. The transcript /
+    // Backing state for the Settings → AI Provider "Test" panel. The transcript /
     // result here are an ephemeral scratch area for answering "why isn't my
     // LLM working?" — they're not persisted (the extra-args the test uses ARE
     // persisted; see `extraArgs` above). Kept on the app-lifetime settings
@@ -487,7 +492,7 @@ final class LLMSettings: ObservableObject {
         // have never seen this key, silently disabling summaries for
         // everyone on upgrade. Treat "key absent" as true.
         self.summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
-        self.cliTimeout = (defaults.object(forKey: Keys.cliTimeout) as? Double) ?? 300
+        self.cliTimeout = (defaults.object(forKey: Keys.cliTimeout) as? Double) ?? Self.defaultTimeout
         self.extraArgs = defaults.string(forKey: Keys.extraArgs) ?? ""
 
         self.openAIProvider = OpenAIProvider(rawValue:

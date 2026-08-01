@@ -1,16 +1,16 @@
 import XCTest
 @testable import Mila
 
-/// Guards the upgrade path for the unified **Settings → AI** tab.
+/// Guards the upgrade path for **Settings → AI Provider** and
+/// **Settings → AI Features**.
 ///
-/// The tab merged what used to be two separate tabs ("LLM" and "Live AI")
-/// into one screen: the provider is configured once at the top and each
-/// feature gets its own collapsible section. That was a pure UI
-/// reorganisation — but the two settings models it drives (`LLMSettings`,
-/// `LiveAISettings`) persist to `UserDefaults` under namespaced string keys,
-/// and renaming or re-scoping any of them would silently reset an upgrading
-/// user's provider, prompts and toggles back to defaults with no error and
-/// nothing to roll back.
+/// Those two tabs replace what used to be two *different* tabs ("LLM" and
+/// "Live AI"): connection config on one screen, the feature switches people
+/// actually revisit on the other. That is a pure UI reorganisation — but the
+/// two settings models it drives (`LLMSettings`, `LiveAISettings`) persist to
+/// `UserDefaults` under namespaced string keys, and renaming or re-scoping any
+/// of them would silently reset an upgrading user's provider, prompts and
+/// toggles back to defaults with no error and nothing to roll back.
 ///
 /// These tests pin the wire format: every key the AI tab writes is asserted
 /// by its literal string, in both directions (a value already on disk is
@@ -19,11 +19,10 @@ import XCTest
 /// their configuration.
 ///
 /// Note the deliberate cross-model sharing: the output-language picker and
-/// the automatic-summary prompt live in the *provider* / *summary* sections
-/// of the AI tab but are backed by `liveAI.outputLanguage` and
-/// `liveAI.summaryPrompt`, because `RecordingSummarizer` and `LiveAISession`
-/// have always read them from `LiveAISettings`. Moving the control did not
-/// move the key.
+/// the automatic-summary prompt both sit on **AI Features** but are backed by
+/// `liveAI.outputLanguage` and `liveAI.summaryPrompt`, because
+/// `RecordingSummarizer` and `LiveAISession` have always read them from
+/// `LiveAISettings`. Moving the control did not move the key.
 @MainActor
 final class AISettingsKeyCompatibilityTests: XCTestCase {
 
@@ -128,8 +127,9 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
     // MARK: - Controls the merge moved between sections
 
     func test_outputLanguage_still_uses_the_liveAI_key() {
-        // Surfaced next to the provider now (it drives BOTH the automatic
-        // summary and the Live AI loop), still persisted where it always was.
+        // Sits at the top of AI Features now — it governs generated content,
+        // not the connection, and drives BOTH the automatic summary and the
+        // Live AI loop. Still persisted where it always was.
         defaults.set("he", forKey: "liveAI.outputLanguage")
         XCTAssertEqual(LiveAISettings(defaults: defaults).outputLanguage, .hebrew)
 
@@ -170,10 +170,52 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
 
     // MARK: - Tab identity
 
-    func test_ai_tab_replaces_both_former_tabs() {
-        // One AI destination, distinct from its neighbours — deep links
+    func test_ai_tabs_replace_both_former_tabs() {
+        // Two AI destinations — provider config and feature switches — each
+        // distinct from the other and from their neighbours. Deep links
         // (`SettingsNavigation.pendingTab`) must resolve to exactly one tag.
-        XCTAssertNotEqual(SettingsTab.ai, SettingsTab.models)
-        XCTAssertNotEqual(SettingsTab.ai, SettingsTab.speakers)
+        XCTAssertNotEqual(SettingsTab.aiProvider, SettingsTab.aiFeatures)
+        XCTAssertNotEqual(SettingsTab.aiProvider, SettingsTab.models)
+        XCTAssertNotEqual(SettingsTab.aiFeatures, SettingsTab.speakers)
+
+        // Every tab tag is unique. The enum is `Int`-raw-valued and the split
+        // inserted a case mid-list, so a hand-written raw value colliding with
+        // a neighbour would silently make two tabs share a tag.
+        let all: [SettingsTab] = [.general, .audio, .models, .aiProvider, .aiFeatures,
+                                  .speakers, .meetings, .voiceMemos, .storage]
+        XCTAssertEqual(Set(all).count, all.count, "Two Settings tabs share a tag")
+    }
+
+    // MARK: - Controls the two-tab split moved between screens
+
+    func test_timeout_default_matches_the_reset_button() {
+        // Settings → AI Provider's "Reset" writes `LLMSettings.defaultTimeout`.
+        // If that drifted from the value used when nothing is persisted, Reset
+        // would quietly move users to a different timeout than a fresh install.
+        XCTAssertEqual(makeLLM().cliTimeout, LLMSettings.defaultTimeout)
+        XCTAssertEqual(LLMSettings.defaultTimeout, 300)
+
+        // And it still round-trips through the documented key.
+        let llm = makeLLM()
+        llm.cliTimeout = 450
+        XCTAssertEqual(defaults.double(forKey: "llm.cli.timeout"), 450)
+    }
+
+    func test_feature_switches_moved_to_row_headers_keep_their_keys() {
+        // The four AI Features rows each expose a real `Toggle` in the row
+        // header instead of an On/Off label plus a switch hidden one
+        // disclosure down. Same four keys behind them.
+        let llm = makeLLM()
+        llm.summaryEnabled = true
+        llm.nameGenerationEnabled = true
+        llm.postActionEnabled = true
+
+        XCTAssertTrue(defaults.bool(forKey: "llm.summary.enabled"))
+        XCTAssertTrue(defaults.bool(forKey: "llm.name.enabled"))
+        XCTAssertTrue(defaults.bool(forKey: "llm.action.enabled"))
+
+        let live = LiveAISettings(defaults: defaults)
+        live.enabled = true
+        XCTAssertTrue(defaults.bool(forKey: "liveAI.enabled"))
     }
 }
