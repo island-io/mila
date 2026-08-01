@@ -52,6 +52,44 @@ final class UpdaterPrereleaseGuardTests: XCTestCase {
     func test_stableVersionContainingMarkerWordIsNotPrerelease() {
         XCTAssertFalse(UpdaterViewModel.isPrerelease("1.0.0 Alpharetta"))
         XCTAssertFalse(UpdaterViewModel.isPrerelease("1.2.3 (arcade)"))
+        XCTAssertFalse(UpdaterViewModel.isPrerelease("1.0.0-superbeta"))
+    }
+
+    /// …and so is the *trailing* boundary. A label that merely starts with a
+    /// marker is a different, unknown token — and unknown must fail OPEN, not
+    /// get refused as a beta. Regression guard for the substring matcher that
+    /// classified `-betamax` as a pre-release.
+    func test_unknownLabelStartingWithMarkerIsNotPrerelease() {
+        XCTAssertFalse(UpdaterViewModel.isPrerelease("1.0.0-betamax"))
+        XCTAssertFalse(UpdaterViewModel.isPrerelease("1.0.0-alphabet"))
+        XCTAssertFalse(UpdaterViewModel.isPrerelease("1.0.0-rcon"))
+        XCTAssertFalse(UpdaterViewModel.isPrerelease("2.0.0-BETAMAX"))
+    }
+
+    /// The trailing guard must not cost us real spellings: any non-letter
+    /// (including a digit) terminates the marker token.
+    func test_markerTokenTerminatorsStillMatch() {
+        for version in [
+            "1.9.2-beta",     // end of string
+            "1.9.2-beta1",    // digit
+            "1.9.2-beta.1",   // dot
+            "1.9.2-beta-1",   // hyphen
+            "1.9.2-beta+42",  // build metadata
+            "1.10.0-rc",
+            "1.10.0-rc2",
+            "2.0.0-alpha.3",
+        ] {
+            XCTAssertTrue(
+                UpdaterViewModel.isPrerelease(version),
+                "\(version) should be classified as a pre-release"
+            )
+        }
+    }
+
+    /// A string can hold both an unknown marker-prefixed label and a real
+    /// marker token; the scan must keep looking past the first near-miss.
+    func test_markerFoundAfterANearMissStillMatches() {
+        XCTAssertTrue(UpdaterViewModel.isPrerelease("1.0.0-betamax-beta.2"))
     }
 
     // MARK: - Beta opt-in default

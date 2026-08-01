@@ -157,14 +157,33 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     /// A plain `1.9.2` — or an empty/unknown string, which must never be
     /// treated as a beta — is not a pre-release.
     ///
-    /// The hyphen is required so a stable version that merely *contains* one of
-    /// these substrings (a hypothetical "1.0.0" build named `Alpharetta`) isn't
-    /// misread. Kept `static`, `nonisolated` and side-effect-free so it's
-    /// callable from Sparkle's nonisolated delegate callbacks and unit-testable
-    /// without constructing an updater (see `UpdaterPrereleaseGuardTests`).
+    /// The marker has to be a *complete* token, guarded on both sides, because
+    /// anything we can't positively classify must fail open:
+    /// - a leading `-`, so a build named `Alpharetta` (`1.0.0 Alpharetta`) or a
+    ///   `-superbeta` suffix isn't misread;
+    /// - and nothing but a non-letter after it, so an unknown label like
+    ///   `1.0.0-betamax` or `1.0.0-alphabet` is treated as unclassifiable
+    ///   (allowed) rather than silently refused. A digit still counts as a
+    ///   terminator so the common `1.9.2-beta1` spelling keeps matching,
+    ///   alongside `-beta`, `-beta.1` and `-beta-1`.
+    ///
+    /// Kept `static`, `nonisolated` and side-effect-free so it's callable from
+    /// Sparkle's nonisolated delegate callbacks and unit-testable without
+    /// constructing an updater (see `UpdaterPrereleaseGuardTests`).
     nonisolated static func isPrerelease(_ shortVersionString: String) -> Bool {
         let v = shortVersionString.lowercased()
-        return ["-beta", "-alpha", "-rc"].contains { v.contains($0) }
+        return ["-beta", "-alpha", "-rc"].contains { marker in
+            var searchStart = v.startIndex
+            while let hit = v.range(of: marker, range: searchStart..<v.endIndex) {
+                // A complete token: end-of-string, or followed by something
+                // that isn't a letter (`.`, `-`, `+`, a digit, whitespace…).
+                if hit.upperBound == v.endIndex || !v[hit.upperBound].isLetter {
+                    return true
+                }
+                searchStart = hit.upperBound
+            }
+            return false
+        }
     }
 
     /// Defensive, client-side beta gate — the last line of defence in front of
