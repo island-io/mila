@@ -971,10 +971,13 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(stored.fullText, "filed")
     }
 
-    /// Edits must also survive a pass that ends in failure — there the ONLY
-    /// pass-owned field is `status`.
-    func test_rename_during_a_failing_pass_survives_the_write_back() async throws {
+    /// Edits must also survive a pass that ends in failure. A pass that comes
+    /// back EMPTY minted no `SPEAKER_NN` ids, so it owns neither the user's
+    /// rename nor their hand-typed speaker names — only `status`.
+    func test_rename_and_speaker_names_survive_a_failing_pass() async throws {
         let fixture = try TestRecordingFixture.make(in: store, title: "Will come back empty", durationSeconds: 1.0)
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: fixture.recording.id)
+        store.setSpeakerName("Maya", forSpeaker: "SPEAKER_01", recordingID: fixture.recording.id)
         await stub.setDefaultDelay(Self.midPassDelay)
         await stub.setDefaultCanned([])   // empty transcript → .failed
 
@@ -987,6 +990,30 @@ final class TranscriptionServiceTests: XCTestCase {
         let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertEqual(stored.title, "Renamed anyway")
         XCTAssertEqual(stored.status, .failed)
+        XCTAssertEqual(stored.speakerNames, ["SPEAKER_00": "Daniel", "SPEAKER_01": "Maya"],
+                       "A pass that produced no segments re-keyed nothing, so it must not wipe the user's speaker names")
+    }
+
+    /// The other side of that contract: a pass that DID produce segments re-keys
+    /// every `SPEAKER_NN`, so the old names would label the wrong voice and must
+    /// be cleared — even though the user's rename in the same window survives.
+    func test_successful_pass_clears_speaker_names_but_keeps_the_rename() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Re-keyed", durationSeconds: 1.0)
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: fixture.recording.id)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "fresh clustering")])
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        store.rename(live, to: "Renamed during re-key")
+
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.title, "Renamed during re-key", "User-owned: the rename wins")
+        XCTAssertTrue(stored.speakerNames.isEmpty,
+                      "Pass-owned: a pass that produced segments re-keyed the ids, so stale names go")
+        XCTAssertEqual(stored.fullText, "fresh clustering")
     }
 
     /// Soft-deleting mid-pass must NOT be undone by the write-back: the

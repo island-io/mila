@@ -812,10 +812,15 @@ final class TranscriptionService: ObservableObject {
                 $0.fullText = working.fullText
                 $0.duration = working.duration
                 $0.modelName = working.modelName
-                // Only a pass that actually produced segments owns this — it
-                // re-keyed every SPEAKER_NN, so the user's old names would now
-                // point at different voices (cleared just above).
-                $0.speakerNames = working.speakerNames
+                // Only a pass that actually produced segments owns this. Such a
+                // pass re-keyed every SPEAKER_NN, so names bound to the old IDs
+                // would now label a different voice — hence the reset above. A
+                // pass that came back EMPTY minted no IDs and owns nothing here,
+                // so the user's speaker names must survive it untouched (they're
+                // hand-typed work, and the next successful pass re-keys anyway).
+                if !enrichedSegments.isEmpty {
+                    $0.speakerNames = working.speakerNames
+                }
             }) else {
                 print("Transcribe: \(working.title) vanished from the store mid-pass — result discarded, row not recreated")
                 return
