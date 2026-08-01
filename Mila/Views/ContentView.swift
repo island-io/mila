@@ -494,8 +494,10 @@ private struct RecordingChip: View {
             Text(formatDuration(session.elapsed))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(session.state == .paused ? .orange : .primary)
+            // `RecordingPauseButton` applies its own `.buttonStyle(.plain)`
+            // internally (closest-to-the-Button wins), so don't restate a
+            // style here — it would read as doing something and do nothing.
             RecordingPauseButton(compact: true)
-                .buttonStyle(.borderless)
             Button {
                 Task { await actions.stopRecording() }
             } label: {

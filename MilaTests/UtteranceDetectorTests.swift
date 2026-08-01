@@ -200,6 +200,47 @@ final class UtteranceDetectorTests: XCTestCase {
             "Post-resume utterance must keep the absolute recording clock (~3.4s+), not restart at 0 — got \(lastStart)")
     }
 
+    /// A pause almost never lands on a 30ms VAD frame boundary: whatever the
+    /// user was doing when they hit the button, `ingest` will be holding a
+    /// sub-frame remainder in `partial`. Those samples ARE in the WAV, so the
+    /// clock offset has to count them — otherwise every post-resume timestamp
+    /// runs up to one frame early against the file, and the error compounds
+    /// across pauses.
+    ///
+    /// Drives thirty pauses at a deliberately awkward, non-frame-aligned
+    /// cadence and checks the clock against the exact amount of audio
+    /// ingested.
+    func test_flushForPause_clock_is_exact_when_the_pause_is_not_frame_aligned() {
+        let det = UtteranceDetector()
+        var starts: [Double] = []
+        det.onUtterance = { _, start in starts.append(start) }
+
+        // 7,679 samples = 15 whole 480-sample frames + a 479-sample
+        // remainder: the worst case, just short of a full frame stranded in
+        // `partial` at every boundary.
+        let oddChunk = 7_679
+        let pauses = 30
+        var totalIngested = 0
+        for _ in 0..<pauses {
+            det.ingest(ArraySlice(Array(repeating: Float(0), count: oddChunk)))
+            totalIngested += oddChunk
+            det.flushForPause()
+        }
+
+        // Now speak. The utterance's absolute start must line up with the
+        // audio ingested so far. Counting only whole frames would leave the
+        // clock 30 × 479 samples ≈ 0.9s in the past.
+        det.ingest(ArraySlice(speech(seconds: 1.0)))
+        det.ingest(ArraySlice(silence(seconds: 0.9)))
+
+        let ingestedSeconds = Double(totalIngested) / sr
+        guard let start = starts.last else {
+            return XCTFail("expected a post-pause utterance, got \(starts)")
+        }
+        XCTAssertEqual(start, ingestedSeconds, accuracy: 0.1,
+            "clock is \(ingestedSeconds - start)s out after \(pauses) non-frame-aligned pauses — the `partial` remainder isn't being counted into the offset")
+    }
+
     func test_reset_clears_state() {
         let det = UtteranceDetector()
         var fired = 0

@@ -667,7 +667,7 @@ struct RecordingPauseButton: View {
     var body: some View {
         let paused = session.state == .paused
         Button {
-            actions.togglePause()
+            Task { await actions.togglePause() }
         } label: {
             if compact {
                 Image(systemName: paused ? "play.fill" : "pause.fill")

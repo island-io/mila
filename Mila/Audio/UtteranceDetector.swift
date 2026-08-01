@@ -210,8 +210,14 @@ final class UtteranceDetector {
     /// resume keep their absolute recording-time timestamps. Paused audio is
     /// never ingested (RecordingSession drops it while paused), so the clock
     /// stays aligned with the gapless WAV — no gap is introduced.
+    ///
+    /// `partial` counts towards the offset even though `clearAllState()` is
+    /// about to throw it away: those samples are in the WAV, they just
+    /// hadn't filled a whole VAD frame yet. Leaving them out would run the
+    /// post-resume clock up to one frame (30ms) early against the file, and
+    /// the error would compound across pauses.
     func flushForPause() {
-        let elapsed = clockOffset + Double(samplesIngested) / sampleRate
+        let elapsed = clockOffset + Double(samplesIngested + partial.count) / sampleRate
         if state == .speech, speechFramesInCurrent >= minUtteranceFrames {
             emit()
         }

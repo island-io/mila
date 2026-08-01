@@ -1229,9 +1229,14 @@ final class QuickActionsController: ObservableObject {
     /// during the pause is written to the WAV or the live transcript. The
     /// VAD utterance in progress is flushed so it doesn't span the gap.
     /// No-op if not recording or already finalizing.
-    func pauseRecording() {
+    ///
+    /// Async because `session.pause()` writes out the system-audio tail that
+    /// was parked at the pause instant. Ordering matters: that tail is
+    /// pre-pause audio and reaches the transcriber through `onLiveSamples`,
+    /// so the detector's pause boundary has to come after it.
+    func pauseRecording() async {
         guard isRecording, !isFinalizingRecording, !isPaused else { return }
-        session.pause()
+        await session.pause()
         liveTranscriber?.pauseBoundary()
     }
 
@@ -1245,12 +1250,11 @@ final class QuickActionsController: ObservableObject {
 
     /// Toggle between paused and recording. Bound to the Pause/Resume UI
     /// controls and safe to call from a keyboard shortcut / menu.
-    func togglePause() {
+    func togglePause() async {
         if isPaused {
             resumeRecording()
         } else {
-            pauseRecording()
+            await pauseRecording()
         }
     }
 }
-
