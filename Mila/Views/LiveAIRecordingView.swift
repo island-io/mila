@@ -663,6 +663,16 @@ struct RecordingPauseButton: View {
     /// Icon-only rendering for the compact floating chip; labeled pill
     /// everywhere else.
     var compact: Bool = false
+    /// Hero sizing, for the Home screen where this sits directly under the
+    /// large Record/Stop button and would otherwise look like an afterthought.
+    ///
+    /// A size knob rather than `.controlSize(.large)` at the call site: this
+    /// button uses `.buttonStyle(.plain)` with its own hardcoded padding, and
+    /// `controlSize` only reaches the *built-in* styles — against a plain
+    /// style it silently does nothing. Same trap as restating `.buttonStyle`
+    /// here, and worth an explicit parameter rather than a modifier that
+    /// reads as doing something and doesn't.
+    var prominent: Bool = false
 
     var body: some View {
         let paused = session.state == .paused
@@ -676,12 +686,12 @@ struct RecordingPauseButton: View {
                 HStack(spacing: 6) {
                     Image(systemName: paused ? "play.fill" : "pause.fill")
                     Text(paused ? "Resume" : "Pause")
-                        .font(.callout.weight(.semibold))
+                        .font((prominent ? Font.body : Font.callout).weight(.semibold))
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 6)
+                .padding(.horizontal, prominent ? 16 : 10)
+                .padding(.vertical, prominent ? 10 : 6)
                 .background(Color.primary.opacity(0.08),
-                            in: RoundedRectangle(cornerRadius: 8))
+                            in: RoundedRectangle(cornerRadius: prominent ? 10 : 8))
             }
         }
         .buttonStyle(.plain)
