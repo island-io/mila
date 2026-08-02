@@ -261,9 +261,13 @@ jobs:
             // the thread still applies, so matching on `commit_id` would count a
             // review of older code as a review of the head (#115 and #124 both
             // have head-`commit_id` comments authored against older commits).
+            // No `?? c.commit_id` fallback: a comment missing
+            // `original_commit_id` would otherwise fall back to the very field
+            // this signal exists to avoid, reopening the false positive (caught
+            // by Copilot on this PR). Absent provenance = not counted.
             const inlineAtHead = inline
               .filter(byBot)
-              .filter((c) => (c.original_commit_id ?? c.commit_id) === head);
+              .filter((c) => c.original_commit_id === head);
 
             // ---- signal (c): the verdict CodeRabbit posts as an issue comment,
             // e.g. "@urisland Review complete. I found no issues in `005bc14`."
