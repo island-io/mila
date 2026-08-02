@@ -1,0 +1,383 @@
+name: Require CodeRabbit review
+
+# Enforces the rule in .claude/rules/pull-requests.md: CodeRabbit must have
+# reviewed *the code that is actually merging* — i.e. the current head commit —
+# not some older revision, and not "nothing at all".
+#
+# Why this exists (2026-08-01/02): ten PRs merged in 24h and seven of them
+# landed code CodeRabbit had never seen.
+#   * #118, #120, #126, #150 — never reviewed at all. The green `CodeRabbit`
+#     status check was read as a pass. IT IS NOT: that check reports success
+#     even when CodeRabbit refused to start the review because the account hit
+#     its per-user review quota ("Review limit reached"). Closing that trap is
+#     the whole point of this workflow.
+#   * #133, #145, #148 — reviewed, then more commits were pushed, and they
+#     merged with the review covering older code.
+#
+# Why `pull_request` and NOT `pull_request_target`:
+#   * `pull_request_target` runs with a privileged, writable token even for PRs
+#     from forks. That is only safe if the job never checks out or executes PR
+#     code — a footgun we would rather not leave lying around in a repo that
+#     accepts fork contributions.
+#   * `pull_request_target` also always runs the workflow definition from the
+#     BASE branch, so changes to this file could never be tested in the PR that
+#     makes them.
+#   * Fork PRs ARE still gated: the `pull_request` run reports pass/fail on the
+#     PR head normally. The only degradation is that `GITHUB_TOKEN` is
+#     read-only for fork PRs, so the explanatory comment and the self-clearing
+#     check run (see below) are best-effort; the verdict still lands via the
+#     failure annotation and the run summary.
+#
+# There is no `actions/checkout` anywhere in this file, by design: the job
+# reads PR metadata through the API only, so nothing from the PR is executed.
+on:
+  pull_request:
+    # `labeled`/`unlabeled` are here so applying or removing the
+    # `coderabbit-not-required` bypass label re-evaluates immediately instead
+    # of leaving a stale red (or green) check.
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+
+# Serialise runs per PR, but deliberately do NOT cancel in-progress ones: a
+# cancelled run reports a `cancelled` conclusion, which counts as blocking once
+# this is a required check, and rapid pushes could leave that as the last word.
+# The job takes ~5s, so there is nothing worth saving by cancelling.
+concurrency:
+  group: >-
+    require-coderabbit-review-${{
+      github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  coderabbit-reviewed-head:
+    # This job name IS the status-check name. See the PR description for the
+    # branch-protection step; it is deliberately not wired up here.
+    name: CodeRabbit reviewed head
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # `issue_comment` fires for plain issues too, and for every human comment.
+    # Only CodeRabbit's own comments can change this verdict, so only those are
+    # worth a run.
+    if: >-
+      github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request != null &&
+       github.event.comment.user.login == 'coderabbitai[bot]')
+    permissions:
+      contents: read
+      pull-requests: write # post/update the single explanatory comment
+      checks: write # re-report on the PR head from comment/review events
+    steps:
+      # No checkout: this job only reads PR metadata through the API.
+      - name: Check that CodeRabbit reviewed the current head
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const BOT = 'coderabbitai[bot]';
+            const BYPASS_LABEL = 'coderabbit-not-required';
+            const MARKER = '<!-- require-coderabbit-review -->';
+            const CHECK_NAME = 'CodeRabbit reviewed head';
+            // A CodeRabbit review summary ("Actionable comments posted: N",
+            // plus the prompt/fingerprint blocks) is comfortably over this.
+            // An empty COMMENTED review — what the bot files whenever it
+            // merely replies in a thread — is 0.
+            const SUBSTANTIVE_BODY_CHARS = 200;
+
+            const { owner, repo } = context.repo;
+
+            // ---- 1. resolve the PR (and its CURRENT head) for this event ----
+            // `pull_request` / `pull_request_review` carry the PR inline.
+            // `issue_comment` does not, so the head is fetched — never taken
+            // from a stale payload.
+            let pr = context.payload.pull_request;
+            if (!pr) {
+              const number =
+                context.payload.issue?.number ?? context.payload.pull_request?.number;
+              if (!number) {
+                core.info('No pull request in this event payload; nothing to check.');
+                return;
+              }
+              pr = (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+            }
+            const number = pr.number;
+            const head = pr.head.sha;
+            const shortHead = head.slice(0, 7);
+            const labels = (pr.labels ?? []).map((l) => l.name);
+
+            core.info(`PR #${number}, head ${head} (event: ${context.eventName})`);
+
+            // ---- 2. helpers -------------------------------------------------
+            const RATE_LIMIT_RE =
+              /review limit reached|you've reached your (?:pr )?review limit/i;
+
+            // The countdown lives inside a blockquote, wrapped in bold markers:
+            //   > **Next review available in:** **12 minutes**
+            function countdownFrom(body) {
+              const m = /Next review available in:([^\n\r]*)/i.exec(body ?? '');
+              return m ? m[1].replace(/[*>`]/g, '').trim() : null;
+            }
+
+            async function listComments() {
+              return github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+            }
+
+            // ---- comment upsert (best-effort; fork PRs get a read-only token)
+            async function upsertComment(body, comments) {
+              try {
+                const all = comments ?? (await listComments());
+                const mine = all.find((c) => (c.body ?? '').includes(MARKER));
+                const payload = `${MARKER}\n${body}`;
+                if (mine) {
+                  if ((mine.body ?? '') !== payload) {
+                    await github.rest.issues.updateComment({
+                      owner, repo, comment_id: mine.id, body: payload,
+                    });
+                  }
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: number, body: payload,
+                  });
+                }
+              } catch (err) {
+                core.warning(`Could not post the explanatory comment: ${err.message}`);
+              }
+            }
+
+            // Only edits an existing complaint; never opens a new comment just
+            // to say "all good" — that would be pure noise on passing PRs.
+            async function clearComment(reason, comments) {
+              try {
+                const all = comments ?? (await listComments());
+                const mine = all.find((c) => (c.body ?? '').includes(MARKER));
+                if (!mine) return;
+                const payload =
+                  `${MARKER}\n:white_check_mark: CodeRabbit has reviewed the current ` +
+                  `head (\`${shortHead}\`) — ${reason}.`;
+                if ((mine.body ?? '') !== payload) {
+                  await github.rest.issues.updateComment({
+                    owner, repo, comment_id: mine.id, body: payload,
+                  });
+                }
+              } catch (err) {
+                core.warning(`Could not update the existing comment: ${err.message}`);
+              }
+            }
+
+            // `pull_request_review` and `issue_comment` runs are attached to the
+            // DEFAULT BRANCH, not to the PR head, so their job status would never
+            // update the PR's check. Re-report explicitly on the head SHA under
+            // the same name — GitHub takes the most recent check run per name, so
+            // this supersedes the red one from the last `pull_request` run and the
+            // gate clears itself the moment the review lands.
+            async function reportOnHead(success, title, summary) {
+              try {
+                await github.rest.checks.create({
+                  owner, repo, name: CHECK_NAME, head_sha: head,
+                  status: 'completed',
+                  conclusion: success ? 'success' : 'failure',
+                  output: { title, summary },
+                });
+                core.info(`Re-reported "${CHECK_NAME}" on ${shortHead}.`);
+              } catch (err) {
+                core.warning(`Could not re-report on the head SHA: ${err.message}`);
+              }
+            }
+
+            // Fail the job only where its own conclusion lands on the PR head
+            // (i.e. `pull_request`). On the other triggers the job stays green
+            // and `reportOnHead` carries the verdict, so a comment on a PR can
+            // never paint the default branch red.
+            const jobStatusIsAuthoritative = context.eventName === 'pull_request';
+
+            async function finish(success, title, detail) {
+              await core.summary
+                .addHeading(`CodeRabbit review: ${success ? 'passed' : 'FAILED'}`, 3)
+                .addRaw(detail)
+                .write();
+              if (!jobStatusIsAuthoritative) await reportOnHead(success, title, detail);
+              if (!success && jobStatusIsAuthoritative) core.setFailed(title);
+            }
+
+            async function pass(reason) {
+              core.info(`PASS: ${reason}`);
+              await clearComment(reason);
+              await finish(
+                true,
+                `CodeRabbit reviewed ${shortHead}`,
+                `:white_check_mark: ${reason}`,
+              );
+            }
+
+            // ---- 3. bypass --------------------------------------------------
+            // Checked in-script rather than with a job-level `if:` so the check
+            // always reports a real "success" conclusion — a *skipped* job is a
+            // murkier signal for branch protection than an explicit green one.
+            //
+            // Dependabot is deliberately NOT exempt: CodeRabbit does review
+            // dependabot PRs, so there is nothing to work around.
+            if (labels.includes(BYPASS_LABEL)) {
+              await pass(`the \`${BYPASS_LABEL}\` label is applied`);
+              return;
+            }
+
+            // ---- 4. gather CodeRabbit's output ------------------------------
+            const [reviews, inline, comments] = await Promise.all([
+              github.paginate(github.rest.pulls.listReviews, {
+                owner, repo, pull_number: number, per_page: 100,
+              }),
+              github.paginate(github.rest.pulls.listReviewComments, {
+                owner, repo, pull_number: number, per_page: 100,
+              }),
+              listComments(),
+            ]);
+            const byBot = (x) => x.user?.login === BOT;
+
+            // ---- signal (a): a substantive review object AT the head commit.
+            // TRAP: `commit_id === head` alone is NOT enough. CodeRabbit files a
+            // COMMENTED review with an EMPTY body every time it replies to a
+            // thread; those carry the head SHA and would wave unreviewed code
+            // through (this nearly happened on #115). A verdict has a body.
+            // A body that is itself a rate-limit notice is not a verdict either.
+            const reviewAtHead = reviews.filter(byBot).find((r) => {
+              const body = r.body ?? '';
+              return (
+                r.commit_id === head &&
+                body.length > SUBSTANTIVE_BODY_CHARS &&
+                !RATE_LIMIT_RE.test(body)
+              );
+            });
+
+            // ---- signal (b): inline review comments authored AGAINST the head.
+            // `original_commit_id` is the commit the comment was written on;
+            // `commit_id` is rolled FORWARD by GitHub to the newest commit where
+            // the thread still applies, so matching on `commit_id` would count a
+            // review of older code as a review of the head (#115 and #124 both
+            // have head-`commit_id` comments authored against older commits).
+            const inlineAtHead = inline
+              .filter(byBot)
+              .filter((c) => (c.original_commit_id ?? c.commit_id) === head);
+
+            // ---- signal (c): the verdict CodeRabbit posts as an issue comment,
+            // e.g. "@urisland Review complete. I found no issues in `005bc14`."
+            // The SHA must be the head's, so an old verdict cannot cover a new
+            // push. Bounded look-ahead keeps it from pairing "Review complete"
+            // with an unrelated SHA elsewhere in a long comment.
+            const shaAfterVerdict = new RegExp(
+              String.raw`review complete[\s\S]{0,500}?\b${shortHead}[0-9a-f]*\b`,
+              'i',
+            );
+            const verdictComment = comments
+              .filter(byBot)
+              .find((c) => {
+                const body = c.body ?? '';
+                return !RATE_LIMIT_RE.test(body) && shaAfterVerdict.test(body);
+              });
+
+            // ---- rate-limit notice: the OPPOSITE of a review. Surfaced so a
+            // human reading the red check knows the bot was blocked by quota
+            // rather than broken. CodeRabbit edits its summary comment in place,
+            // so prefer a notice that names the current head.
+            const rateLimited = comments.filter(byBot).filter((c) =>
+              RATE_LIMIT_RE.test(c.body ?? ''),
+            );
+            const activeLimit =
+              rateLimited.find((c) => (c.body ?? '').includes(head)) ??
+              rateLimited[rateLimited.length - 1];
+
+            core.info(
+              `signals — review@head:${reviewAtHead ? 'yes' : 'no'} ` +
+                `inline@head:${inlineAtHead.length} ` +
+                `verdict:${verdictComment ? 'yes' : 'no'} ` +
+                `rateLimitNotices:${rateLimited.length}`,
+            );
+
+            // ---- 5. verdict -------------------------------------------------
+            if (reviewAtHead) {
+              await pass(
+                `[review summary](${reviewAtHead.html_url}) posted on \`${shortHead}\``,
+              );
+              return;
+            }
+            if (inlineAtHead.length > 0) {
+              await pass(
+                `${inlineAtHead.length} inline review comment(s) written against ` +
+                  `\`${shortHead}\``,
+              );
+              return;
+            }
+            if (verdictComment) {
+              await pass(
+                `CodeRabbit [reported "Review complete"](${verdictComment.html_url}) ` +
+                  `for \`${shortHead}\``,
+              );
+              return;
+            }
+
+            // ---- 6. not reviewed --------------------------------------------
+            const lines = [
+              '### :rabbit: CodeRabbit has not reviewed the current head',
+              '',
+              `The newest commit on this PR is \`${shortHead}\`, and there is no`,
+              "CodeRabbit review covering it. Merging now would land code the bot",
+              'never saw. See `.claude/rules/pull-requests.md`.',
+              '',
+            ];
+
+            if (activeLimit) {
+              const countdown = countdownFrom(activeLimit.body);
+              const stale = !(activeLimit.body ?? '').includes(head);
+              lines.push(
+                '> [!WARNING]',
+                "> **CodeRabbit was rate-limited, not silent.** It posted a",
+                `> [\"Review limit reached\" notice](${activeLimit.html_url}): the`,
+                "> account hit its per-user PR review quota, so the review never",
+                '> started.',
+                countdown
+                  ? `> **Next review available in:** ${countdown}${
+                      stale ? ' _(from an earlier revision — may have elapsed)_' : ''
+                    }`
+                  : '> No countdown was given in the notice.',
+                '>',
+                '> Note that the separate `CodeRabbit` status check goes **green**',
+                '> in this situation. It is not a review.',
+                '',
+              );
+            }
+
+            lines.push(
+              '**How to clear this check — it re-evaluates automatically, no re-run needed:**',
+              '',
+              '1. Wait for the review, or ask for one with a PR comment:',
+              '',
+              '   ```',
+              '   @coderabbitai review',
+              '   ```',
+              '',
+              '   Rate-limited? Wait out the countdown first — a request filed too',
+              '   early is refused and burns nothing but time.',
+              '2. The check clears itself as soon as CodeRabbit posts its review,',
+              '   its inline comments, or a `Review complete` verdict for',
+              `   \`${shortHead}\`.`,
+              '',
+              '<sub>An empty CodeRabbit reply, a review of an *older* commit, or a',
+              'rate-limit notice do not count — that is exactly the gap this check',
+              `closes. A maintainer can apply the \`${BYPASS_LABEL}\` label to`,
+              'bypass it; that is the only escape hatch.</sub>',
+            );
+
+            const guidance = lines.join('\n');
+            await upsertComment(guidance, comments);
+            await finish(
+              false,
+              activeLimit
+                ? `CodeRabbit was rate-limited; ${shortHead} is unreviewed`
+                : `CodeRabbit has not reviewed ${shortHead}`,
+              guidance,
+            );

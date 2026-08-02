@@ -54,3 +54,73 @@ Anything a user could file a bug about does not qualify for the label.
   added.
 - Placeholder text inside HTML comments does not count: the check strips HTML
   comments before matching, so an unfilled `Closes #` template still fails.
+
+## CodeRabbit must have reviewed the code that is merging
+
+**This is enforced by CI** — the `Require CodeRabbit review` workflow
+(`.github/workflows/require-coderabbit-review.yml`, check name **"CodeRabbit
+reviewed head"**) fails any PR whose **current head commit** has no CodeRabbit
+review.
+
+### Do not trust the `CodeRabbit` status check
+
+The `CodeRabbit` status check that the app itself posts goes **green even when
+no review happened**, including when the account hits its per-user review quota
+and the bot refuses to start. Reading it as "reviewed" is what caused the
+2026-08-01/02 incident: of ten PRs merged in 24 hours, seven landed code
+CodeRabbit had never seen — #118, #120, #126 and #150 were never reviewed at
+all, and #133, #145 and #148 were reviewed and then had further commits pushed
+before merge.
+
+### What counts as reviewed
+
+Exactly one of these, and it must point at the **current head SHA**:
+
+1. a review object from `coderabbitai[bot]` with `commit_id == head` **and** a
+   substantive body (>200 chars — the "Actionable comments posted: N" summary
+   qualifies);
+2. inline review comments from `coderabbitai[bot]` whose `original_commit_id`
+   is the head;
+3. an issue comment from `coderabbitai[bot]` reading `Review complete …
+   <short-sha>` for the head, e.g. "Review complete. I found no issues in
+   `005bc14`." — CodeRabbit frequently files its verdict this way and posts no
+   review object at all.
+
+### What does *not* count (the two traps)
+
+- **Empty review objects.** CodeRabbit files a `COMMENTED` review with a
+  zero-length body every time it merely replies in a thread, and that object
+  carries the current head SHA. Matching on `commit_id == head` alone therefore
+  waves unreviewed code straight through. Hence the body-length requirement.
+- **A "Review limit reached" notice.** It is the *opposite* of a review: the
+  quota was exhausted and the review never started. The check refuses it and
+  quotes the "Next review available in: N minutes" countdown in its output, so
+  a red check reads as "blocked on quota", not "the bot is broken".
+
+One more subtlety: for inline comments GitHub rolls `commit_id` *forward* to the
+newest commit where the thread still applies, so it does not prove the comment
+was written against the head. `original_commit_id` — the commit the comment was
+actually authored on — is the one to match.
+
+### Clearing the check
+
+It re-evaluates itself; no manual re-run is needed. Beyond `pull_request`, it
+also triggers on `pull_request_review` (submitted) and on `issue_comment`
+(created, restricted to CodeRabbit's own comments on PRs), so it flips green the
+moment the review lands. Those two events run against the default branch rather
+than the PR head, so the job re-reports the same check name on the head SHA via
+the Checks API; GitHub takes the most recent check run per name, which
+supersedes the earlier red one.
+
+### Escape hatch
+
+- **The `coderabbit-not-required` label bypasses the check** — a deliberate,
+  attributable maintainer action visible in the PR timeline. It is the *only*
+  way past this gate. Adding or removing it re-evaluates immediately.
+- **Dependabot is deliberately not exempt** here (unlike the linked-issue
+  gate): CodeRabbit does review dependabot PRs, so there is nothing to work
+  around.
+
+Rate-limited? Wait out the countdown before commenting `@coderabbitai review` —
+a request filed too early is refused, and repeated requests just churn the
+queue.
