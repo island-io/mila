@@ -897,6 +897,203 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(prepared.status, .pending, "status must be reset to pending")
     }
 
+    // MARK: - Edits made DURING a pass must survive the write-back (issue #152)
+    //
+    // `process` snapshots the row when the pass begins and used to write that
+    // snapshot back wholesale when the pass finished, silently reverting any
+    // edit the user made in the (potentially minutes-long) gap. These pin the
+    // merge: pass-owned fields land, user-owned fields are left alone, and a
+    // deleted recording is never resurrected.
+
+    /// How long the stub pretends to transcribe for in these tests. Long
+    /// enough that the mid-pass edit reliably lands inside the window even on
+    /// a loaded CI box; `liveRowMidPass` asserts it actually did.
+    private static let midPassDelay: Double = 0.8
+
+    /// Block until the pass for `id` is genuinely in flight, then hand back the
+    /// LIVE store row so the test can edit it — exactly like a user clicking
+    /// around the sidebar while a batch transcription runs. Fails loudly if the
+    /// pass already finished, so a mistimed run can never pass by accident.
+    private func liveRowMidPass(_ id: UUID,
+                                timeout: TimeInterval = 3,
+                                file: StaticString = #filePath,
+                                line: UInt = #line) async throws -> Recording {
+        let deadline = Date().addingTimeInterval(timeout)
+        while service.activeRecordingID != id && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        XCTAssertEqual(service.activeRecordingID, id,
+                       "Transcription never became active — can't test the mid-pass window",
+                       file: file, line: line)
+        let live = try XCTUnwrap(store.recordings.first { $0.id == id }, file: file, line: line)
+        XCTAssertEqual(live.status, .running,
+                       "The pass must still be in flight when the test edits the row",
+                       file: file, line: line)
+        return live
+    }
+
+    /// Settle the WAV→m4a transcode the completion path kicks off in a detached
+    /// `Task`. `waitForIdle` only tracks `activeRecordingID` and the queue, so
+    /// without this the transcode can outlive the test and run against a
+    /// `tempRoot` that `tearDown` has already removed.
+    ///
+    /// One `await store.compressRecordingAudio(id:)` is NOT a join on its own:
+    /// the in-flight guard (`compressingIDs`) is taken before the first
+    /// suspension, so if the detached task got there first our call returns
+    /// straight back while its transcode is still running. So kick it — a
+    /// no-op when the detached task already started or already finished — and
+    /// then wait for the observable end state: the row's audio is no longer
+    /// the `.wav`. Returns early if the row is gone (nothing left to settle).
+    private func drainPostCompletionCompression(_ id: UUID,
+                                                timeout: TimeInterval = 5) async {
+        await store.compressRecordingAudio(id: id)
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            guard let current = store.recordings.first(where: { $0.id == id }) else { return }
+            if !current.audioFileName.lowercased().hasSuffix(".wav") { return }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    func test_rename_during_transcription_survives_the_write_back() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Old name", durationSeconds: 1.0)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "the transcript")])
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        store.rename(live, to: "New name")
+
+        await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.title, "New name",
+                       "A rename made while the pass was running must not be reverted by the write-back")
+        XCTAssertEqual(stored.status, .completed, "The pass still owns status")
+        XCTAssertEqual(stored.fullText, "the transcript", "The pass still owns the transcript")
+        XCTAssertEqual(stored.segments.count, 1)
+    }
+
+    func test_folder_assignment_during_transcription_survives_the_write_back() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Filed mid-pass", durationSeconds: 1.0)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "filed")])
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        XCTAssertNil(live.folder)
+        store.assign(live, toFolder: "Work")
+
+        await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.folder, "Work",
+                       "Dropping a recording into a folder mid-pass must not be reverted")
+        XCTAssertEqual(store.recordings(inFolder: "Work").map(\.id), [fixture.recording.id])
+        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.fullText, "filed")
+    }
+
+    /// Edits must also survive a pass that ends in failure. A pass that comes
+    /// back EMPTY minted no `SPEAKER_NN` ids, so it owns neither the user's
+    /// rename nor their hand-typed speaker names — only `status`.
+    func test_rename_and_speaker_names_survive_a_failing_pass() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Will come back empty", durationSeconds: 1.0)
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: fixture.recording.id)
+        store.setSpeakerName("Maya", forSpeaker: "SPEAKER_01", recordingID: fixture.recording.id)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([])   // empty transcript → .failed
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        store.rename(live, to: "Renamed anyway")
+
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.title, "Renamed anyway")
+        XCTAssertEqual(stored.status, .failed)
+        XCTAssertEqual(stored.speakerNames, ["SPEAKER_00": "Daniel", "SPEAKER_01": "Maya"],
+                       "A pass that produced no segments re-keyed nothing, so it must not wipe the user's speaker names")
+    }
+
+    /// The other side of that contract: a pass that DID produce segments re-keys
+    /// every `SPEAKER_NN`, so the old names would label the wrong voice and must
+    /// be cleared — even though the user's rename in the same window survives.
+    func test_successful_pass_clears_speaker_names_but_keeps_the_rename() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Re-keyed", durationSeconds: 1.0)
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: fixture.recording.id)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "fresh clustering")])
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        store.rename(live, to: "Renamed during re-key")
+
+        await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.title, "Renamed during re-key", "User-owned: the rename wins")
+        XCTAssertTrue(stored.speakerNames.isEmpty,
+                      "Pass-owned: a pass that produced segments re-keyed the ids, so stale names go")
+        XCTAssertEqual(stored.fullText, "fresh clustering")
+    }
+
+    /// Soft-deleting mid-pass must NOT be undone by the write-back: the
+    /// recording stays in Recently Deleted. It still reaches a terminal status
+    /// (otherwise it sits in the queue UI as "Transcribing" forever) and keeps
+    /// its transcript for a later restore, but gets none of the user-facing
+    /// completion work — no `.srt` sidecar, no summarizer/LLM spend.
+    func test_soft_delete_during_transcription_is_not_resurrected() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Trashed mid-pass", durationSeconds: 1.0)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "still transcribed")])
+
+        var completionFired = false
+        service.onTranscriptionCompleted = { _, _ in completionFired = true }
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        store.softDelete(live)
+
+        await service.waitForIdle()
+        await drainPostCompletionCompression(fixture.recording.id)
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertTrue(stored.isTrashed,
+                      "A recording the user deleted mid-pass must not be resurrected by the write-back")
+        XCTAssertEqual(stored.status, .completed,
+                       "It must still leave the running state or the queue shows it as Transcribing forever")
+        XCTAssertEqual(stored.fullText, "still transcribed",
+                       "The transcript is kept so a restore isn't empty")
+        XCTAssertFalse(completionFired,
+                       "No summarizer/LLM work for a recording on its way to the trash")
+        let srt = store.recordingsDirectory.appendingPathComponent(stored.subtitleFileName)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: srt.path),
+                       "No stray .srt sidecar for a trashed recording")
+    }
+
+    /// The row can also disappear ENTIRELY mid-pass (hard delete, or emptying
+    /// Recently Deleted). The write-back must not re-add it.
+    func test_hard_delete_during_transcription_does_not_recreate_the_row() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Gone mid-pass", durationSeconds: 1.0)
+        await stub.setDefaultDelay(Self.midPassDelay)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "orphan")])
+
+        service.enqueue(fixture.recording)
+        let live = try await liveRowMidPass(fixture.recording.id)
+        store.permanentlyDelete(live)
+        XCTAssertNil(store.recordings.first { $0.id == fixture.recording.id })
+
+        await service.waitForIdle()
+
+        XCTAssertNil(store.recordings.first { $0.id == fixture.recording.id },
+                     "A hard-deleted recording must not be recreated by the transcription write-back")
+    }
+
     // MARK: - Speaker label normalization
 
     func test_normalizeSpeakerLabels_closes_gaps_from_diarizer_clustering() {

@@ -512,6 +512,12 @@ final class TranscriptionService: ObservableObject {
         // while transcribing with `working.language` (below) could load/persist
         // the wrong model for the language actually transcribed.
         // (The recording may also have been edited or soft-deleted in the gap.)
+        //
+        // NOTE: this snapshot goes stale again the moment the pass starts — the
+        // user keeps editing the row while we transcribe. From here on it is a
+        // local scratch buffer for the pass's own output and is NEVER written
+        // back to the store as-is; every write goes through `mergePassResult`,
+        // which re-reads the live row and applies just the pass-owned fields.
         var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
         // Whether this is the recording's FIRST transcription — the only case
         // the issue-#61 auto-drop gate may discard a recording. A manual
@@ -579,9 +585,17 @@ final class TranscriptionService: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
 
+        // Flip the LIVE row to `.running` rather than writing the whole snapshot
+        // back — `await remoteEngine.configure` above is a suspension point the
+        // user can rename/file/delete the row through. See `mergePassResult`.
+        // (`working` is deliberately NOT re-seeded from the result: the pass must
+        // keep transcribing the `language` it just resolved a model for.)
         working.status = .running
         working.modelName = modelDisplayName
-        store.update(working)
+        mergePassResult(id: recording.id) {
+            $0.status = working.status
+            $0.modelName = working.modelName
+        }
 
         let recordingID = recording.id
         activeRecordingID = recordingID
@@ -651,7 +665,15 @@ final class TranscriptionService: ObservableObject {
                 // transcribable audio is pure list spam. A long-but-silent clip
                 // is over the threshold, so the gate keeps it as .failed.
                 if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: "", isFirstTranscription: isFirstTranscription) { return }
-                store.update(working)
+                // Merge onto the live row rather than writing the snapshot
+                // back (see `mergePassResult`). This branch produced no
+                // transcript, so the only fields the pass owns here are the
+                // status and the (emptied) transcript output.
+                mergePassResult(id: recording.id) {
+                    $0.status = working.status
+                    $0.fullText = working.fullText
+                    $0.segments = working.segments
+                }
                 return
             }
 
@@ -779,17 +801,51 @@ final class TranscriptionService: ObservableObject {
             // keeps any clip that produced text (even a short one) and anything
             // at/over the threshold, so this only ever removes worthless rows.
             if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: text, isFirstTranscription: isFirstTranscription) { return }
-            store.update(working)
-
-            if working.status == .completed {
-                TranscriptExporter.writeSRT(for: working, in: store.recordingsDirectory)
-                onTranscriptionCompleted?(working, hadSummaryBeforeRun)
+            // Merge the pass output onto the LIVE row instead of writing the
+            // snapshot captured minutes ago back over it — see
+            // `mergePassResult` for the full field-ownership table. `nil` means
+            // the row is gone (hard-deleted / trash emptied / just auto-dropped
+            // above); there is nothing to write and nothing to follow up on.
+            guard let persisted = mergePassResult(id: recording.id, {
+                $0.status = working.status
+                $0.segments = working.segments
+                $0.fullText = working.fullText
+                $0.duration = working.duration
+                $0.modelName = working.modelName
+                // Only a pass that actually produced segments owns this. Such a
+                // pass re-keyed every SPEAKER_NN, so names bound to the old IDs
+                // would now label a different voice — hence the reset above. A
+                // pass that came back EMPTY minted no IDs and owns nothing here,
+                // so the user's speaker names must survive it untouched (they're
+                // hand-typed work, and the next successful pass re-keys anyway).
+                if !enrichedSegments.isEmpty {
+                    $0.speakerNames = working.speakerNames
+                }
+            }) else {
+                print("Transcribe: \(working.title) vanished from the store mid-pass — result discarded, row not recreated")
+                return
+            }
+            if persisted.status == .completed {
+                if persisted.isTrashed {
+                    // The user sent this to Recently Deleted mid-pass. It keeps
+                    // its transcript (so a restore isn't empty) but gets none of
+                    // the *user-facing* completion work: no stray `.srt` sidecar
+                    // on disk, and no summarizer/LLM spend on something the user
+                    // just threw away.
+                    print("Transcribe: \(persisted.title) was moved to Recently Deleted mid-pass — transcript saved, skipping SRT + summary")
+                } else {
+                    TranscriptExporter.writeSRT(for: persisted, in: store.recordingsDirectory)
+                    onTranscriptionCompleted?(persisted, hadSummaryBeforeRun)
+                }
                 // Shrink storage: transcode the WAV to m4a now that
                 // transcription + diarization are done reading it. Runs in
                 // the background so it doesn't hold up the queue; playback
                 // and re-transcribe read m4a natively, re-diarize decodes
-                // it. No-op on already-compressed (imported) audio.
-                let compressID = working.id
+                // it. No-op on already-compressed (imported) audio. Trashed
+                // recordings get this too — their audio sits on disk until the
+                // trash is emptied, and a restore shouldn't come back
+                // uncompressed.
+                let compressID = persisted.id
                 Task { await store.compressRecordingAudio(id: compressID) }
             }
         } catch is CancellationError {
@@ -801,8 +857,12 @@ final class TranscriptionService: ObservableObject {
             cancellation.remove(recording.id)
         } catch {
             print("Transcribe error for \(working.title): \(error)")
-            working.status = .failed
-            store.update(working)
+            // A failed pass produced no transcript, so `status` is the ONLY
+            // field it owns here — in particular it must not overwrite
+            // `speakerNames`/`segments`, which it never re-keyed. Merging onto
+            // the live row also means a rename/re-file/soft-delete the user
+            // made while the pass was failing survives (see `mergePassResult`).
+            mergePassResult(id: recording.id) { $0.status = .failed }
             lastError = "Transcription failed: \(error.localizedDescription)"
         }
     }
@@ -835,10 +895,64 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func markFailed(_ recording: Recording) {
-        if var working = store.recordings.first(where: { $0.id == recording.id }) {
-            working.status = .failed
-            store.update(working)
-        }
+        mergePassResult(id: recording.id) { $0.status = .failed }
+    }
+
+    /// Persist the result of a transcription pass by merging it onto the row
+    /// that is in the store **right now**, instead of writing back the snapshot
+    /// captured when the pass started.
+    ///
+    /// **Why.** A batch pass runs for as long as the audio takes — minutes on a
+    /// long meeting — and every non-live recording goes through it
+    /// (`QuickActionsController.finalizeTail` enqueues them). Throughout that
+    /// window the user can rename the recording, drop it into a folder, rename
+    /// speakers, or send it to Recently Deleted from the sidebar. The old
+    /// `store.update(working)` wrote the stale snapshot over the live row and
+    /// silently reverted all of it (issue #152). This is the same discipline the live
+    /// finalize tail already applies ("we update only the segments rather than
+    /// clobbering the row", `QuickActionsController`).
+    ///
+    /// **Field ownership.** `apply` receives the LIVE row and must set ONLY
+    /// pass-owned fields. Anything a future change adds to `Recording` needs to
+    /// be classified into one of these buckets:
+    ///
+    /// * **Pass-owned** — the transcription output and the metadata describing
+    ///   the run that produced it: `status`, `segments`, `fullText`,
+    ///   `duration`, `modelName`, and `speakerNames`. `speakerNames` is
+    ///   pass-owned *only for a pass that produced segments*, because such a
+    ///   pass re-keys every `SPEAKER_NN` and names assigned against the old IDs
+    ///   would then label the wrong voice. A failed/rejected pass must leave it
+    ///   alone.
+    /// * **User-owned** — never written here; the live row always wins:
+    ///   `title`, `folder`, `deletedAt`, `summary`, `actionItems`.
+    /// * **Store-owned** — identity and provenance, also never written here:
+    ///   `id`, `createdAt`, `source`, `audioFileName`, `appName`,
+    ///   `voiceMemoUniqueID`, `voiceMemoFolderUUID`. (`audioFileName` in
+    ///   particular: the post-completion compression renames the file, and
+    ///   restoring the snapshot's name would point the row at a deleted `.wav`.)
+    /// * `language` is deliberately **not** pass-owned. The pass only *reads*
+    ///   it; `RecordingStore.prepareForRetranscription` is the writer, so an
+    ///   in-flight language switch must not be rolled back by an older pass.
+    ///
+    /// **Deleted rows.** Returns `nil` — writing nothing — when the recording
+    /// is gone from the store entirely: hard-deleted from the sidebar, or
+    /// swept by Empty Trash. We never re-`add` it; resurrecting a row the user
+    /// deleted is the failure mode this whole helper exists to prevent. (The
+    /// `autoDropIfShortAndEmpty` gate that runs immediately before the
+    /// completion write also removes the row, so the merge can never fight it
+    /// — but its callers early-return on `true`, so that case never reaches
+    /// here. The `nil` branch is the backstop if that ever changes.)
+    /// A **soft**-deleted row is still written: its
+    /// `deletedAt` is user-owned, so it stays in Recently Deleted, but the
+    /// merge moves it out of `.running` into a terminal status (otherwise it
+    /// would sit in the queue UI as "Transcribing" forever) and keeps the
+    /// transcript around in case the user restores it.
+    @discardableResult
+    private func mergePassResult(id: UUID, _ apply: (inout Recording) -> Void) -> Recording? {
+        guard var live = store.recordings.first(where: { $0.id == id }) else { return nil }
+        apply(&live)
+        store.update(live)
+        return live
     }
 
     /// Permanently delete `recording` when the auto-drop gate flags it as an
