@@ -145,6 +145,102 @@ final class ObsidianVaultSettingsTests: XCTestCase {
             URL(fileURLWithPath: "/private/tmp/VaultOther"), in: root))
     }
 
+    /// The escape a lexical check cannot see: a symlink **inside** the vault
+    /// whose target is outside it. Every path here is spelled entirely under
+    /// the vault, so `standardized` alone reports all of them as contained.
+    func test_isContained_refuses_a_symlink_that_leaves_the_vault() throws {
+        let fm = FileManager.default
+        let vault = tempRoot.appendingPathComponent("SymVault", isDirectory: true)
+        let outside = tempRoot.appendingPathComponent("Outside", isDirectory: true)
+        try fm.createDirectory(at: vault, withIntermediateDirectories: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try fm.createDirectory(at: vault.appendingPathComponent("Real"),
+                               withIntermediateDirectories: true)
+        // Absolute target, relative target, and one nested a level down.
+        try fm.createSymbolicLink(at: vault.appendingPathComponent("Escape"),
+                                  withDestinationURL: outside)
+        try fm.createSymbolicLink(atPath: vault.appendingPathComponent("Up").path,
+                                  withDestinationPath: "../Outside")
+        try fm.createSymbolicLink(atPath: vault.appendingPathComponent("Real/Deep").path,
+                                  withDestinationPath: "../../Outside")
+        // Dangling: the target doesn't exist *yet*. `resolvingSymlinksInPath()`
+        // leaves this one alone — realpath needs the target to exist — which is
+        // the second reason the resolution here is done per component.
+        try fm.createSymbolicLink(atPath: vault.appendingPathComponent("Dangling").path,
+                                  withDestinationPath: "../Outside/NotThere")
+        // A symlink whose target is *inside* the vault. Legitimate: it resolves
+        // back under the root, so the write lands in the vault either way.
+        try fm.createSymbolicLink(at: vault.appendingPathComponent("Inside"),
+                                  withDestinationURL: vault.appendingPathComponent("Real"))
+        // A cycle: unresolvable, so the guard has to fail closed.
+        try fm.createSymbolicLink(atPath: vault.appendingPathComponent("LoopA").path,
+                                  withDestinationPath: "LoopB")
+        try fm.createSymbolicLink(atPath: vault.appendingPathComponent("LoopB").path,
+                                  withDestinationPath: "LoopA")
+
+        for escaping in ["Escape", "Escape/note.md", "Up", "Up/note.md",
+                         "Real/Deep", "Real/Deep/note.md",
+                         "Dangling", "Dangling/note.md", "LoopA", "LoopA/note.md"] {
+            XCTAssertFalse(
+                ObsidianPathSanitizer.isContained(vault.appendingPathComponent(escaping), in: vault),
+                "\(escaping) does not resolve inside the vault but was accepted")
+        }
+        for contained in ["Real", "Real/note.md", "Inside", "Inside/note.md", "NotYet/note.md"] {
+            XCTAssertTrue(
+                ObsidianPathSanitizer.isContained(vault.appendingPathComponent(contained), in: vault),
+                "\(contained) resolves inside the vault but was refused")
+        }
+
+        // A vault the user reached *through* a symlink is still a usable vault:
+        // both sides resolve, so it behaves exactly like the vault it points at.
+        let linked = tempRoot.appendingPathComponent("VaultLink")
+        try fm.createSymbolicLink(atPath: linked.path, withDestinationPath: "SymVault")
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(
+            linked.appendingPathComponent("Real/note.md"), in: linked))
+        XCTAssertFalse(ObsidianPathSanitizer.isContained(
+            linked.appendingPathComponent("Escape/note.md"), in: linked))
+    }
+
+    /// The guard has to give the same answer whether or not the destination
+    /// exists yet — the note being written is by definition not there. The
+    /// filesystem-consulting normalizers can't: they strip a `/private` prefix
+    /// only for paths that already exist, so they render an existing vault as
+    /// `/var/…` and a fresh destination under it as `/private/var/…`.
+    func test_isContained_agrees_for_existing_and_missing_destinations() throws {
+        let fm = FileManager.default
+        let vault = tempRoot.appendingPathComponent("VarVault", isDirectory: true)
+        try fm.createDirectory(at: vault.appendingPathComponent("Notes"),
+                               withIntermediateDirectories: true)
+        let existing = vault.appendingPathComponent("Notes/here.md")
+        try "x".write(to: existing, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(existing, in: vault))
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(
+            vault.appendingPathComponent("Notes/not-yet.md"), in: vault),
+            "a note that hasn't been written yet must still read as contained")
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(
+            vault.appendingPathComponent("NoSuchFolder/not-yet.md"), in: vault),
+            "neither the folder nor the note exists yet")
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(vault, in: vault))
+
+        // The `/var` → `/private/var` split itself, in the one shape every mac
+        // has: `/tmp` is a symlink to `/private/tmp`. Both spellings must
+        // resolve to one path, and identically for a tail that doesn't exist.
+        XCTAssertEqual(ObsidianPathSanitizer.resolvedPath(URL(fileURLWithPath: "/tmp")),
+                       "/private/tmp")
+        XCTAssertEqual(
+            ObsidianPathSanitizer.resolvedPath(URL(fileURLWithPath: "/tmp/MilaNoSuchVault/n.md")),
+            ObsidianPathSanitizer.resolvedPath(
+                URL(fileURLWithPath: "/private/tmp/MilaNoSuchVault/n.md")))
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(
+            URL(fileURLWithPath: "/tmp/MilaNoSuchVault/n.md"),
+            in: URL(fileURLWithPath: "/tmp/MilaNoSuchVault")))
+        // `..` is applied after the components before it are resolved, as the
+        // kernel does — so this is `/private`, not `/`.
+        XCTAssertEqual(ObsidianPathSanitizer.resolvedPath(URL(fileURLWithPath: "/tmp/..")),
+                       "/private")
+    }
+
     func test_setVault_persists_bookmark_and_resolves_on_relaunch() throws {
         let vault = tempRoot.appendingPathComponent("Vault", isDirectory: true)
         try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)

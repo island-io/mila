@@ -69,14 +69,100 @@ enum ObsidianPathSanitizer {
     /// change to the naming rules must not be able to turn into a file written
     /// outside the vault.
     ///
-    /// Deliberately `standardized` (lexical `..`/`.` resolution) and not
-    /// `standardizedFileURL`: the latter consults the filesystem and strips a
-    /// `/private` prefix only when the path already exists, so it compares an
-    /// existing vault against a not-yet-created destination inconsistently.
-    static func isContained(_ candidate: URL, in root: URL) -> Bool {
-        let rootPath = root.standardized.path
-        let path = candidate.standardized.path
-        return path == rootPath || path.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
+    /// **Two checks, and neither one is sufficient alone.**
+    ///
+    ///  1. *Lexical* (`standardized`, no filesystem access): collapses `..`
+    ///     and `.`. This is the only one that means anything for a path whose
+    ///     every component is still hypothetical.
+    ///  2. *Symlink-resolved*: a lexical check is bypassable by a symlink
+    ///     **inside** the vault. `vault/Archive -> ~/Desktop` is spelled
+    ///     entirely under the vault, so it reads as contained, and every byte
+    ///     written through it lands on the Desktop. Both sides go through
+    ///     `resolvedPath` and are compared again.
+    ///
+    /// A symlink pointing *into* the vault is deliberately still allowed:
+    /// resolution lands it back under the root, symlinked folders are a normal
+    /// way to organise a vault, and the property worth enforcing is "the bytes
+    /// land inside the vault" — not "the user may not use symlinks".
+    ///
+    /// Note what is **not** used here. `standardizedFileURL` and
+    /// `resolvingSymlinksInPath()` both consult the filesystem, and both drop a
+    /// leading `/private` only when the path already exists — so an existing
+    /// vault renders as `/var/…` while a not-yet-created destination under it
+    /// renders as `/private/var/…`, and the two never compare equal. That trap
+    /// has bitten this guard twice already. `resolvedPath` resolves the
+    /// components that exist and carries the rest through verbatim, so it
+    /// answers identically for an existing and a not-yet-created destination.
+    ///
+    /// (Time-of-check/time-of-use is out of scope: this is a single-user local
+    /// app, and an attacker who can swap a directory for a symlink between the
+    /// check and the write can already write the file themselves.)
+    static func isContained(_ candidate: URL,
+                            in root: URL,
+                            fileManager: FileManager = .default) -> Bool {
+        guard isBelow(candidate.standardized.path, root: root.standardized.path) else {
+            return false
+        }
+        // Fail closed: an unresolvable path (a symlink cycle) is not contained.
+        guard let realRoot = resolvedPath(root, fileManager: fileManager),
+              let realCandidate = resolvedPath(candidate, fileManager: fileManager) else {
+            return false
+        }
+        return isBelow(realCandidate, root: realRoot)
+    }
+
+    /// Prefix comparison on whole components, so `/v/VaultOther` is not "inside"
+    /// `/v/Vault`.
+    private static func isBelow(_ path: String, root: String) -> Bool {
+        if path == root { return true }
+        return path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
+    }
+
+    /// macOS gives up at 32 symlink hops (`ELOOP`). Matching it means this
+    /// guard never blesses a path the kernel would refuse to walk.
+    private static let symlinkHopBudget = 32
+
+    /// Resolve every symlink along `url`, one component at a time, **without
+    /// requiring the path to exist**.
+    ///
+    /// A component that is not a symlink — including one that isn't there yet —
+    /// is carried through as written, and `..`/`.` are applied only after the
+    /// components before them have been resolved, which is what the kernel
+    /// does. That combination is what `resolvingSymlinksInPath()` can't offer:
+    /// it needs the whole path to exist to do anything, and normalizes
+    /// `/private` conditionally on existence.
+    ///
+    /// Returns nil when the hop budget is exhausted.
+    static func resolvedPath(_ url: URL, fileManager: FileManager = .default) -> String? {
+        var resolved: [String] = []
+        // Reversed, so `popLast()` yields components in order and a symlink's
+        // target can be pushed back on to be walked in turn.
+        var pending = Array(url.pathComponents.reversed())
+        var hops = 0
+
+        while let component = pending.popLast() {
+            switch component {
+            case "", "/", ".":
+                continue
+            case "..":
+                if !resolved.isEmpty { resolved.removeLast() }
+                continue
+            default:
+                break
+            }
+            let next = "/" + (resolved + [component]).joined(separator: "/")
+            guard let target = try? fileManager.destinationOfSymbolicLink(atPath: next) else {
+                resolved.append(component)   // ordinary component, or not there yet
+                continue
+            }
+            hops += 1
+            guard hops <= symlinkHopBudget else { return nil }
+            // An absolute target restarts from `/`; a relative one is walked
+            // from the already-resolved directory that holds the link.
+            if target.hasPrefix("/") { resolved.removeAll() }
+            pending.append(contentsOf: target.split(separator: "/").reversed().map(String.init))
+        }
+        return "/" + resolved.joined(separator: "/")
     }
 
     /// Sanitize a user-typed vault-relative path (`Notes/Meetings`, and also

@@ -115,7 +115,9 @@ final class ObsidianExporter: ObservableObject {
         // Defence in depth, immediately before the first thing that touches
         // the disk: the sanitizer makes an escaping component impossible, and
         // this makes a regression in it non-exploitable rather than silent.
-        guard ObsidianPathSanitizer.isContained(destDir, in: vault) else {
+        // It also covers what no naming rule can — a symlink inside the vault
+        // whose target is outside it, which is spelled entirely under the vault.
+        guard ObsidianPathSanitizer.isContained(destDir, in: vault, fileManager: fileManager) else {
             print("ObsidianExporter: refusing to write outside the vault: \(destDir.path)")
             return nil
         }
@@ -128,6 +130,12 @@ final class ObsidianExporter: ObservableObject {
         }
 
         let target = destDir.appendingPathComponent(Self.fileName(for: recording))
+        // Re-checked for the file itself, not just its directory: the note name
+        // could already exist as a symlink pointing out of the vault.
+        guard ObsidianPathSanitizer.isContained(target, in: vault, fileManager: fileManager) else {
+            print("ObsidianExporter: refusing to write outside the vault: \(target.path)")
+            return nil
+        }
         let newRelative = Self.relativePath(of: target, vault: vault)
         var changedPaths: [URL] = [target]
 
@@ -144,7 +152,7 @@ final class ObsidianExporter: ObservableObject {
         if let prevRelative = index[key], prevRelative != newRelative {
             let old = vault.appendingPathComponent(prevRelative)
             // Never follow a stored path back out of the vault.
-            if ObsidianPathSanitizer.isContained(old, in: vault) {
+            if ObsidianPathSanitizer.isContained(old, in: vault, fileManager: fileManager) {
                 try? fileManager.removeItem(at: old)
                 changedPaths.append(old)
             }
@@ -176,7 +184,7 @@ final class ObsidianExporter: ObservableObject {
         index[legacyKey] = nil
         guard index[key] == nil else { return }
         let candidate = vault.appendingPathComponent(legacy)
-        guard ObsidianPathSanitizer.isContained(candidate, in: vault),
+        guard ObsidianPathSanitizer.isContained(candidate, in: vault, fileManager: fileManager),
               fileManager.fileExists(atPath: candidate.path) else { return }
         index[key] = legacy
     }

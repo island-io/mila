@@ -186,6 +186,58 @@ final class ObsidianExporterTests: XCTestCase {
         }
     }
 
+    /// The traversal hole one layer below the naming rules: a Mila folder (or a
+    /// typed subfolder) whose name matches a **symlink inside the vault** that
+    /// points outside it. Nothing here is a `..` — the path is spelled entirely
+    /// under the vault — so only resolving the link catches it.
+    func test_export_refuses_a_folder_that_symlinks_out_of_the_vault() throws {
+        let fm = FileManager.default
+        let vaultRoot = try XCTUnwrap(settings.vaultURL)
+        let outside = tempRoot.appendingPathComponent("Outside", isDirectory: true)
+        try fm.createDirectory(at: outside, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: vaultRoot.appendingPathComponent("Escape"),
+                                  withDestinationURL: outside)
+        try fm.createSymbolicLink(atPath: vaultRoot.appendingPathComponent("Up").path,
+                                  withDestinationPath: "../Outside")
+
+        for hostile in ["Escape", "Up"] {
+            let rec = makeRecording(title: "Leak \(hostile)", summary: "S", folder: hostile)
+            XCTAssertNil(exporter.export(rec),
+                         "folder \(hostile) wrote through a symlink out of the vault")
+        }
+        XCTAssertTrue(try fm.contentsOfDirectory(atPath: outside.path).isEmpty,
+                      "a note escaped the vault")
+
+        // The same shape via the free-text subfolder field.
+        settings.subfolder = "Escape"
+        XCTAssertNil(exporter.export(makeRecording(title: "Leak subfolder", summary: "S")))
+        XCTAssertTrue(try fm.contentsOfDirectory(atPath: outside.path).isEmpty)
+
+        // And an ordinary subfolder is untouched by any of this.
+        settings.subfolder = ""
+        let ok = try XCTUnwrap(exporter.export(
+            makeRecording(title: "Fine", summary: "S", folder: "Meetings")))
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(ok, in: vaultRoot))
+        XCTAssertTrue(fm.fileExists(atPath: ok.path))
+    }
+
+    /// A symlink whose target is *inside* the vault is a legitimate way to
+    /// organise one, and resolving it lands the note in the vault regardless —
+    /// so it is allowed rather than refused.
+    func test_export_allows_a_folder_symlinked_within_the_vault() throws {
+        let fm = FileManager.default
+        let vaultRoot = try XCTUnwrap(settings.vaultURL)
+        let real = vaultRoot.appendingPathComponent("Real", isDirectory: true)
+        try fm.createDirectory(at: real, withIntermediateDirectories: true)
+        try fm.createSymbolicLink(at: vaultRoot.appendingPathComponent("Alias"),
+                                  withDestinationURL: real)
+
+        let url = try XCTUnwrap(exporter.export(
+            makeRecording(title: "Aliased", summary: "S", folder: "Alias")))
+        XCTAssertTrue(fm.fileExists(atPath: real.appendingPathComponent(url.lastPathComponent).path),
+                      "the note should land in the symlink's target inside the vault")
+    }
+
     /// The summary hook can land after the user has trashed the recording
     /// (the LLM call was still in flight). A trashed recording is never filed.
     func test_export_skips_a_trashed_recording() {
