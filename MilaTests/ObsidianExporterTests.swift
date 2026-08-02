@@ -142,10 +142,20 @@ final class ObsidianExporterTests: XCTestCase {
     /// subfolder. `sanitizedTitle` alone would have let it through.
     func test_export_folder_named_dotdot_cannot_escape_the_subfolder() throws {
         settings.subfolder = "Notes"
-        // `standardized` (lexical), not `standardizedFileURL` — the latter only
-        // strips a `/private` prefix for paths that already exist, so it
-        // renders the existing vault and a fresh destination differently.
-        let base = vault.appendingPathComponent("Notes").standardized.path
+        // Two rules, both learned the hard way:
+        //
+        //  * Derive the expectation from `settings.vaultURL`, not from the raw
+        //    `vault` this test created. `setVault` round-trips through a
+        //    security-scoped bookmark, which resolves `/var/folders/…` to its
+        //    real `/private/var/folders/…`. The exporter writes under the
+        //    resolved one, so comparing against the raw one compares two
+        //    spellings of the same directory.
+        //  * `standardized` (lexical), not `standardizedFileURL`: the latter
+        //    consults the filesystem and strips a `/private` prefix only for
+        //    paths that already exist, so it normalizes an existing directory
+        //    and a fresh one differently.
+        let vaultRoot = try XCTUnwrap(settings.vaultURL)
+        let base = vaultRoot.appendingPathComponent("Notes").standardized.path
         // "../.." is the one that shipped broken: `nameFragment` turns its "/"
         // into a space, so a leading-dots-only strip stopped at that space and
         // handed back a live "..".
@@ -165,11 +175,13 @@ final class ObsidianExporterTests: XCTestCase {
     /// The hostile title/folder combination, checked at the level that
     /// actually matters: nothing lands outside the vault, whatever the inputs.
     func test_export_never_writes_outside_the_vault() throws {
+        // Resolved vault, not the raw one — see the note above.
+        let vaultRoot = try XCTUnwrap(settings.vaultURL)
         settings.subfolder = ". .."
         for folder in ["..", ". ..", "../..", nil] {
             let rec = makeRecording(title: ".. ../..", summary: "S", folder: folder)
             let url = try XCTUnwrap(exporter.export(rec))
-            XCTAssertTrue(ObsidianPathSanitizer.isContained(url, in: vault),
+            XCTAssertTrue(ObsidianPathSanitizer.isContained(url, in: vaultRoot),
                           "wrote outside the vault: \(url.path)")
         }
     }
