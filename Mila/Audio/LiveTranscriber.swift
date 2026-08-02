@@ -212,6 +212,19 @@ final class LiveTranscriber: ObservableObject {
         }
     }
 
+    /// Called when the recording is paused. In VAD mode, close the current
+    /// utterance at the pause point — otherwise resume would append post-pause
+    /// audio onto the same utterance, gluing the two sides of the gap into a
+    /// single segment with a bogus duration. Uses `flushForPause()` (not
+    /// `flush()`) so the detector's recording clock is preserved: post-resume
+    /// utterances keep their absolute timestamps instead of restarting at 0.
+    /// The fixed-window path keeps a plain rolling buffer with no in-flight
+    /// utterance to close, so this is a no-op there (paused audio simply
+    /// never arrives via `ingest`).
+    func pauseBoundary() {
+        detector?.flushForPause()
+    }
+
     func transcribeNow() async {
         if let detector {
             // End-of-recording flush: force-emit any in-progress

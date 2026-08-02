@@ -487,12 +487,21 @@ private struct RecordingChip: View {
     @EnvironmentObject private var session: RecordingSession
 
     var body: some View {
-        HStack(spacing: 10) {
+        // One read of the paused state for the whole chip — the dot, the
+        // clock and the capsule border must agree, or a paused recording
+        // still reads as live from the border alone.
+        let paused = session.state == .paused
+        return HStack(spacing: 10) {
             Circle()
-                .fill(Color.red)
+                .fill(paused ? Color.orange : Color.red)
                 .frame(width: 8, height: 8)
             Text(formatDuration(session.elapsed))
                 .font(.callout.monospacedDigit())
+                .foregroundStyle(paused ? .orange : .primary)
+            // `RecordingPauseButton` applies its own `.buttonStyle(.plain)`
+            // internally (closest-to-the-Button wins), so don't restate a
+            // style here — it would read as doing something and do nothing.
+            RecordingPauseButton(compact: true)
             Button {
                 Task { await actions.stopRecording() }
             } label: {
@@ -506,7 +515,7 @@ private struct RecordingChip: View {
         .padding(.vertical, 6)
         .background(.regularMaterial, in: Capsule())
         .overlay(
-            Capsule().strokeBorder(Color.red.opacity(0.4), lineWidth: 1)
+            Capsule().strokeBorder((paused ? Color.orange : Color.red).opacity(0.4), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
     }

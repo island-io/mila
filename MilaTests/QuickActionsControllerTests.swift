@@ -62,6 +62,77 @@ final class QuickActionsControllerTests: XCTestCase {
         try await super.tearDown()
     }
 
+    // MARK: - Pause / resume
+
+    /// Pause and resume drive the session state through the controller.
+    /// Uses the fake-start seam so no real mic/engine is needed on CI.
+    func test_pause_and_resume_toggle_session_state() async {
+        let url = store.freshAudioURL(suggestedName: "PauseTest")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertFalse(controller.isPaused)
+
+        await controller.pauseRecording()
+        XCTAssertTrue(controller.isPaused)
+        XCTAssertTrue(session.state == .paused)
+
+        // Double-pause is a no-op — stays paused.
+        await controller.pauseRecording()
+        XCTAssertTrue(session.state == .paused)
+
+        // togglePause resumes.
+        await controller.togglePause()
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertTrue(session.state == .recording)
+
+        _ = await session.stop()
+    }
+
+    /// Pause/resume are guarded no-ops when nothing is recording, so a
+    /// stray keyboard shortcut / menu action can't corrupt session state.
+    func test_pause_is_noop_when_not_recording() async {
+        XCTAssertFalse(controller.isRecording)
+        await controller.pauseRecording()
+        XCTAssertFalse(controller.isPaused)
+        XCTAssertTrue(session.state == .idle)
+        controller.resumeRecording()
+        XCTAssertTrue(session.state == .idle)
+    }
+
+    /// Pause is refused while the previous recording is finalizing. The
+    /// finalize window tears the live pipeline down; letting a Pause land in
+    /// it would move the session out from under `stopRecording`.
+    func test_pause_is_refused_while_finalizing() async {
+        let url = store.freshAudioURL(suggestedName: "PauseFinalizing")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.isFinalizingRecording = true
+        await controller.pauseRecording()
+        XCTAssertFalse(controller.isPaused,
+                       "pause must not fire while stopRecording owns the lifecycle")
+        XCTAssertTrue(session.state == .recording)
+        controller.isFinalizingRecording = false
+        _ = await session.stop()
+    }
+
+    // MARK: - Pause and the short-capture heuristic
+
+    /// `stopRecording` warns when the audio on disk is far shorter than the
+    /// wall clock — capture died mid-session. A paused span shortens the WAV
+    /// on purpose, so the warning must not fire for it. This holds only
+    /// because `session.elapsed` subtracts paused time: the wall clock handed
+    /// to the heuristic is recorded time, not door-to-door time.
+    func test_paused_span_does_not_trip_the_short_capture_warning() {
+        // 20 minutes of recording with 10 of them paused: the WAV is 10
+        // minutes and `elapsed` is 10 minutes. They agree.
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: 600, captured: 600))
+        // The regression this guards: if `elapsed` ever counted paused time
+        // again, the same recording would look like it lost half its audio.
+        XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: 1200, captured: 600),
+            "a 600s file against a 1200s clock IS a real short capture — the point is that a pause must not produce this shape")
+    }
+
     // MARK: - File import → enqueue → transcribe
 
     func test_transcribe_file_adds_recording_and_kicks_off_transcription() async throws {

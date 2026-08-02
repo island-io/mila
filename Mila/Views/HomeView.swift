@@ -45,6 +45,12 @@ struct HomeView: View {
                 header
                 heroAction
                 sourceToggles
+                if actions.isRecording {
+                    // Pause/Resume sits under the hero Record/Stop button so
+                    // it's reachable even in Live AI background mode, where
+                    // the app stays on Home instead of the split-pane view.
+                    RecordingPauseButton(prominent: true)
+                }
                 dictationHint
             }
             .padding(.horizontal, 24)

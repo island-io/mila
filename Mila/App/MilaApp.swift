@@ -961,7 +961,7 @@ struct MilaApp: App {
                     }
                     await Self.pumpFixtureWAVOnce(path: wavPath, to: sessionRef, agcEnabled: true)
                 }
-            case .stopping:
+            case .paused, .stopping:
                 break
             case .idle:
                 pumpTask?.cancel()
@@ -988,8 +988,11 @@ struct MilaApp: App {
         let chunkSamples = Int(sampleRate * 0.02)  // 20ms
         let startedAt = Date()
         var pumped = 0
+        var pausedFor: TimeInterval = 0
         var offset = 0
         while offset < samples.count {
+            if Task.isCancelled { return }
+            pausedFor += await Self.waitWhilePaused(session)
             if Task.isCancelled { return }
             let end = min(offset + chunkSamples, samples.count)
             var chunk = Array(samples[offset..<end])
@@ -1000,12 +1003,32 @@ struct MilaApp: App {
             offset = end
             pumped += chunk.count
             let elapsedTarget = Double(pumped) / sampleRate
-            let elapsedReal = Date().timeIntervalSince(startedAt)
+            let elapsedReal = Date().timeIntervalSince(startedAt) - pausedFor
             if elapsedTarget > elapsedReal {
                 let napNs = UInt64((elapsedTarget - elapsedReal) * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: napNs)
             }
         }
+    }
+
+    /// Hold an injection pump while the session is paused, and report how
+    /// long the hold lasted.
+    ///
+    /// The pumps feed `session.onLiveSamples` directly, which sits
+    /// DOWNSTREAM of `RecordingSession`'s paused capture gate — so without
+    /// this they'd keep pushing fixture audio into the live transcriber
+    /// across a pause, and any UI test of pause/resume would be asserting
+    /// against behaviour production doesn't have. Returning the paused
+    /// duration lets the caller shift its real-time pacing baseline; without
+    /// that it would think it had fallen behind and dump the whole paused
+    /// span in one un-paced burst on resume.
+    private static func waitWhilePaused(_ session: RecordingSession) async -> TimeInterval {
+        guard session.state == .paused else { return 0 }
+        let began = Date()
+        while session.state == .paused, !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return Date().timeIntervalSince(began)
     }
 
     /// Read a 16kHz mono WAV from disk and feed it to
@@ -1039,6 +1062,7 @@ struct MilaApp: App {
         let chunkSamples = Int(sampleRate * 0.02)  // 20ms
         let startedAt = Date()
         var pumped = 0
+        var pausedFor: TimeInterval = 0
         // Loop the fixture indefinitely — the test runs for ~2 min but
         // our generated fixture is only ~70s. Without looping, segments
         // plateau halfway through the test and the "no 30s stall"
@@ -1047,6 +1071,9 @@ struct MilaApp: App {
         while !Task.isCancelled {
             var offset = 0
             while offset < samples.count {
+                if Task.isCancelled { return }
+                // Mirror the production capture gate — see `waitWhilePaused`.
+                pausedFor += await Self.waitWhilePaused(session)
                 if Task.isCancelled { return }
                 let end = min(offset + chunkSamples, samples.count)
                 // Copy out the chunk so we can mutate it in place
@@ -1059,9 +1086,10 @@ struct MilaApp: App {
                 offset = end
                 pumped += chunk.count
                 // Pace ourselves: stay one chunk's worth ahead of wall
-                // clock so VAD / whisper run at real-time speed.
+                // clock so VAD / whisper run at real-time speed. The paused
+                // span doesn't count as wall clock we've fallen behind.
                 let elapsedTarget = Double(pumped) / sampleRate
-                let elapsedReal = Date().timeIntervalSince(startedAt)
+                let elapsedReal = Date().timeIntervalSince(startedAt) - pausedFor
                 if elapsedTarget > elapsedReal {
                     let napNs = UInt64((elapsedTarget - elapsedReal) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: napNs)
@@ -1200,9 +1228,28 @@ struct MilaApp: App {
         // The state observer below runs forever now; the `.recording`
         // branch is where we gate on `aiSettings.isLiveAIAvailable`.
 
+        // Epoch of the capture this observer has already wired. `nil` until
+        // the first recording.
+        var wiredCaptureEpoch: Int?
         for await state in sessionRef.$state.values {
             switch state {
             case .recording:
+                // `.recording` is published twice per recording that gets
+                // paused: once at start, once on resume. Only the first is a
+                // new recording — re-running the setup below on a resume
+                // would call `transcriber.start()`, which resets `segments` /
+                // `fullText` and wipes the entire transcript the user has
+                // been reading.
+                //
+                // Keyed on the session's capture epoch rather than on the
+                // previously-observed state, because the `.paused` in between
+                // is not guaranteed to be delivered: `@Published` drops values
+                // published while its `.values` consumer has no outstanding
+                // demand, so a fast pause→resume can arrive here as a bare
+                // second `.recording`. The epoch only moves on a real
+                // `start()`, so it cannot be fooled that way.
+                if wiredCaptureEpoch == sessionRef.captureEpoch { break }
+                wiredCaptureEpoch = sessionRef.captureEpoch
                 guard aiSettings.isLiveAIAvailable else {
                     // Hardware below the Live AI bar AND no override
                     // flipped. Recording still runs via RecordingSession;
@@ -1351,6 +1398,13 @@ struct MilaApp: App {
                         }
                     }
                 }
+            case .paused:
+                // A pause suspends capture but keeps the whole live
+                // pipeline intact — RecordingSession simply drops incoming
+                // audio while paused, so the transcriber / diarizer / feed
+                // loop just see a gap and pick back up on resume. No
+                // teardown (that only happens on `.idle`).
+                break
             case .stopping:
                 // Don't tear down yet — RecordingSession.stop() still
                 // flushes the buffered system-audio tail during
