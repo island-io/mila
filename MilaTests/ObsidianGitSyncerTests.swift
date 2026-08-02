@@ -7,6 +7,9 @@ import XCTest
 /// awaited afterwards.
 private actor FakeGitRunner: GitCommandRunning {
     private(set) var calls: [[String]] = []
+    /// Recorded alongside `calls` so tests can assert *where* each command ran
+    /// — the toplevel resolution is otherwise invisible to these tests.
+    private(set) var directories: [URL] = []
     private let handler: @Sendable ([String]) -> GitCommandResult
 
     init(handler: @escaping @Sendable ([String]) -> GitCommandResult) {
@@ -15,6 +18,7 @@ private actor FakeGitRunner: GitCommandRunning {
 
     func run(_ arguments: [String], in directory: URL) async -> GitCommandResult {
         calls.append(arguments)
+        directories.append(directory)
         return handler(arguments)
     }
 }
@@ -48,6 +52,24 @@ final class ObsidianGitSyncerTests: XCTestCase {
             ["pull", "--rebase", "origin", "refs/heads/main"],
             ["push", "origin", "HEAD:refs/heads/main"],
         ])
+        // The toplevel is resolved from the vault, and everything after it runs
+        // in that toplevel — a regression that kept working in `vault` (a repo
+        // subdirectory) would otherwise still pass every assertion above.
+        let directories = await fake.directories
+        XCTAssertEqual(directories.first, vault)
+        XCTAssertEqual(Set(directories.dropFirst()), [URL(fileURLWithPath: "/repo")])
+    }
+
+    func test_empty_toplevel_falls_back_to_the_vault_directory() async {
+        // `rev-parse` succeeding with no output must not send git commands to
+        // the filesystem root.
+        let fake = FakeGitRunner { _ in ok("") }
+        let syncer = ObsidianGitSyncer(runner: fake)
+        let error = await syncer.sync(vault: vault, changedPaths: [file],
+                                      branch: "main", commitMessage: "m")
+        XCTAssertNil(error)
+        let directories = await fake.directories
+        XCTAssertEqual(Set(directories), [vault])
     }
 
     func test_not_a_repo_returns_error_and_stops() async {

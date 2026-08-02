@@ -205,6 +205,15 @@ struct ProcessGitCommandRunner: GitCommandRunning {
             .joined(separator: ":")
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+        // `sync` classifies a failed commit by substring-matching git's human
+        // output ("nothing to commit"). git translates those messages under a
+        // non-English locale, which would turn a clean no-op re-export into a
+        // reported sync failure — so pin the locale instead of inheriting the
+        // user's. Commit messages are unaffected: git stores the argv bytes
+        // as-is under `i18n.commitEncoding` (UTF-8).
+        env["LC_ALL"] = "C"
+        env["LANG"] = "C"
+        env.removeValue(forKey: "LANGUAGE")
         process.environment = env
 
         let stdinPipe = Pipe()

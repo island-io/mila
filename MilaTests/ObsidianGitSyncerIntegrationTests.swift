@@ -13,6 +13,9 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     private var home: URL!
     private var remote: URL!
     private var vault: URL!
+    /// Original values of the git-config env vars we override on THIS process,
+    /// so `tearDown` can put them back. `nil` value == the var was unset.
+    private var savedEnvironment: [String: String?] = [:]
 
     override func setUpWithError() throws {
         try super.setUpWithError()
@@ -27,6 +30,21 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         // git config (default branch name, gpg signing, hooks).
         home = tempRoot.appendingPathComponent("home", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
+
+        // `runGit` can isolate its own child env, but the code under test runs
+        // through `ProcessGitCommandRunner`, which inherits this process's
+        // environment verbatim. Without overriding these here, the sync steps
+        // would read the developer's / CI machine's real global + system git
+        // config (default branch, gpg signing, hooks, insteadOf rewrites).
+        // `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` need git >= 2.32; the older
+        // `GIT_CONFIG_NOSYSTEM` is set too so isolation still holds below that.
+        let globalConfig = home.appendingPathComponent(".gitconfig")
+        FileManager.default.createFile(atPath: globalConfig.path, contents: nil)
+        setEnvironment([
+            "GIT_CONFIG_GLOBAL": globalConfig.path,
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1"
+        ])
 
         remote = tempRoot.appendingPathComponent("remote.git", isDirectory: true)
         vault = tempRoot.appendingPathComponent("vault", isDirectory: true)
@@ -49,8 +67,26 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        restoreEnvironment()
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
         try super.tearDownWithError()
+    }
+
+    /// Override env vars on this process, remembering the previous values.
+    private func setEnvironment(_ values: [String: String]) {
+        for (key, value) in values {
+            if !savedEnvironment.keys.contains(key) {
+                savedEnvironment[key] = ProcessInfo.processInfo.environment[key]
+            }
+            setenv(key, value, 1)
+        }
+    }
+
+    private func restoreEnvironment() {
+        for (key, value) in savedEnvironment {
+            if let value { setenv(key, value, 1) } else { unsetenv(key) }
+        }
+        savedEnvironment.removeAll()
     }
 
     // MARK: - Tests
