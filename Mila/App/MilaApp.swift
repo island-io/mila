@@ -650,7 +650,7 @@ struct MilaApp: App {
                 .task { await diarizationSettings.startAutoBootstrapIfNeeded() }
                 .onAppear { wireDelegate() }
                 .task { maybeRelocateBundle() }
-                .task { enqueueRecoveredRecordings() }
+                .task { await enqueueRecoveredRecordings() }
                 .task { startMeetingDetectionIfNeeded() }
                 .task { await simulateMeetingEndedIfRequested() }
                 .task { await wireLiveAIPipeline() }
@@ -1482,7 +1482,7 @@ struct MilaApp: App {
     /// no longer pops a modal alert; the recording is just marked
     /// `.failed` in the list so empty orphans don't nag the user at
     /// launch.
-    private func enqueueRecoveredRecordings() {
+    private func enqueueRecoveredRecordings() async {
         // 1. Resurrect stale mid-flight recordings. The current process
         //    hasn't started its worker loop yet, so anything still flagged
         //    `.running` (died mid-transcription) or `.pending` (queued but
@@ -1511,7 +1511,12 @@ struct MilaApp: App {
                 // advertises 0 audio frames — the transcription reader would
                 // see an empty file. Rewrite the size fields from the physical
                 // length first so the recovered run actually gets the audio.
-                WAVHeaderRepair.repairIfNeeded(at: wavURL)
+                // Off the main actor: the repair is blocking file I/O, and in
+                // an iCloud-backed recordings folder opening a dataless `.wav`
+                // can stall for seconds. Awaited here, so the file is repaired
+                // before this row reaches `toEnqueue` (and the `enqueue` pass
+                // below).
+                await WAVHeaderRepair.repairInBackground(at: wavURL)
                 if fixed.status != .pending {
                     fixed.status = .pending
                     statusChanged.append(fixed)
@@ -1540,8 +1545,10 @@ struct MilaApp: App {
         for id in ids {
             guard let recording = store.recordings.first(where: { $0.id == id }) else { continue }
             // Orphan WAVs from a crash have an unfinalized header (see the
-            // reenqueue branch above) — repair it before the batch run reads it.
-            WAVHeaderRepair.repairIfNeeded(at: store.audioURL(for: recording))
+            // reenqueue branch above) — repair it, off the main actor, before
+            // the batch run reads it. Awaited so this recording is only
+            // enqueued once its own repair has finished.
+            await WAVHeaderRepair.repairInBackground(at: store.audioURL(for: recording))
             print("MilaApp: re-enqueuing recovered recording \(recording.audioFileName)")
             transcription.enqueue(recording)
         }

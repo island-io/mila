@@ -262,4 +262,27 @@ final class WAVHeaderRepairTests: XCTestCase {
             .appendingPathComponent("does-not-exist-\(UUID().uuidString).wav")
         XCTAssertFalse(WAVHeaderRepair.repairIfNeeded(at: url))
     }
+
+    // MARK: - repairInBackground()
+
+    /// The launch sweep awaits this variant so the blocking I/O stays off the
+    /// main actor. It must produce the same finished file as the direct call —
+    /// and be finished by the time the `await` returns, since the caller
+    /// enqueues the recording for transcription on the very next line.
+    func test_repairInBackground_completes_before_it_returns() async throws {
+        let (bytes, dataOff) = canonicalWAV(dataByteCount: 4000,
+                                            declaredRiffSize: 36,
+                                            declaredDataSize: 0)
+        let url = try writeTemp(bytes)
+
+        let didRepair = await WAVHeaderRepair.repairInBackground(at: url)
+        XCTAssertTrue(didRepair)
+
+        let fixed = [UInt8](try Data(contentsOf: url))
+        XCTAssertEqual(u32(fixed, 4), UInt32(bytes.count - 8), "RIFF size rewritten.")
+        XCTAssertEqual(u32(fixed, dataOff + 4), 4000, "data size rewritten.")
+
+        let repeated = await WAVHeaderRepair.repairInBackground(at: url)
+        XCTAssertFalse(repeated, "Second call is a no-op once the header is finalized.")
+    }
 }

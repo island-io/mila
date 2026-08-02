@@ -178,4 +178,21 @@ enum WAVHeaderRepair {
         wavRepairLog.log("repaired unfinalized WAV header for \(url.lastPathComponent, privacy: .public) (data size -> \(plan.newDataSize))")
         return true
     }
+
+    /// `repairIfNeeded(at:)` hopped onto a background executor, for callers
+    /// that are actor-isolated (notably the `@MainActor` launch sweep in
+    /// `MilaApp`). The repair itself is tiny — a header read plus an 8-byte
+    /// write — but every step of it is blocking I/O, and the recordings
+    /// directory is user-chosen: in an iCloud-backed folder, merely opening a
+    /// dataless `.wav` can stall for seconds while the file is materialized.
+    /// A launch sweep over dozens of stale rows would hitch the UI for as long
+    /// as that takes. Awaiting the detached task keeps the caller's ordering
+    /// intact — the file is fully repaired before the caller moves on to
+    /// enqueue it.
+    @discardableResult
+    static func repairInBackground(at url: URL) async -> Bool {
+        await Task.detached(priority: .userInitiated) {
+            WAVHeaderRepair.repairIfNeeded(at: url)
+        }.value
+    }
 }
