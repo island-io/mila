@@ -267,14 +267,10 @@ final class LLMRunnerTests: XCTestCase {
     // this fix in the first place.
 
     private func resolve(_ name: String) -> String? {
-        let path = ProcessInfo.processInfo.environment["PATH"] ?? ""
-        let dirs = path.split(separator: ":").map(String.init) + [
-            "\(NSHomeDirectory())/.local/bin",
-            "\(NSHomeDirectory())/.bun/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin"
-        ]
-        for d in dirs {
+        // Reuse the production lookup dirs (incl. nvm/Volta/asdf/npm-global) so
+        // these smoke tests find CLIs installed by a node version manager
+        // rather than spuriously skipping.
+        for d in LLMRunner.searchDirectories() {
             let p = (d as NSString).appendingPathComponent(name)
             if FileManager.default.isExecutableFile(atPath: p) { return p }
         }
@@ -548,5 +544,147 @@ final class LLMRunnerTests: XCTestCase {
                                           temperature: 0.5)
         XCTAssertEqual(out, "cursor-ran",
                        "cursor was diverted away from the CLI spawn path: \(out)")
+    }
+
+    // MARK: - Gemini CLI (LLMTool.gemini)
+
+    func test_gemini_metadata_matches_cli() {
+        XCTAssertEqual(LLMTool.gemini.executableName, "gemini")
+        XCTAssertEqual(LLMTool.gemini.displayName, "Gemini (gemini CLI)")
+        // Must be selectable in the Settings picker (ForEach over allCases).
+        XCTAssertTrue(LLMTool.allCases.contains(.gemini))
+    }
+
+    func test_gemini_arguments_are_prompt_and_skip_trust_by_default() {
+        // `--skip-trust` is always passed: we launch in an isolated sandbox
+        // dir which gemini would otherwise reject as an untrusted workspace.
+        XCTAssertEqual(LLMTool.gemini.arguments(prompt: "Summarize"),
+                       ["-p", "Summarize", "--skip-trust"])
+    }
+
+    func test_gemini_arguments_append_model_with_short_flag() {
+        // Gemini uses `-m`, unlike claude/cursor's `--model`.
+        XCTAssertEqual(
+            LLMTool.gemini.arguments(prompt: "Summarize", model: "gemini-2.5-flash"),
+            ["-p", "Summarize", "--skip-trust", "-m", "gemini-2.5-flash"])
+    }
+
+    func test_gemini_arguments_blank_model_is_omitted() {
+        XCTAssertEqual(LLMTool.gemini.arguments(prompt: "Summarize", model: "   "),
+                       ["-p", "Summarize", "--skip-trust"])
+    }
+
+    func test_gemini_arguments_ignore_session() {
+        // Gemini's -p mode has no conversation-resume flag; a session value
+        // must not leak flags into argv.
+        let args = LLMTool.gemini.arguments(prompt: "Summarize",
+                                            session: .new(UUID()))
+        XCTAssertEqual(args, ["-p", "Summarize", "--skip-trust"])
+    }
+
+    // MARK: - Executable lookup directories
+
+    func test_searchDirectories_includes_version_manager_bins() {
+        let dirs = LLMRunner.searchDirectories(home: "/Users/tester", pathEnv: nil)
+        XCTAssertTrue(dirs.contains("/Users/tester/.volta/bin"), "\(dirs)")
+        XCTAssertTrue(dirs.contains("/Users/tester/.asdf/shims"), "\(dirs)")
+        XCTAssertTrue(dirs.contains("/Users/tester/.npm-global/bin"), "\(dirs)")
+        XCTAssertTrue(dirs.contains("/opt/homebrew/bin"), "\(dirs)")
+    }
+
+    func test_searchDirectories_prepends_PATH_entries_in_order() {
+        let dirs = LLMRunner.searchDirectories(home: "/Users/tester",
+                                               pathEnv: "/a:/b")
+        XCTAssertEqual(Array(dirs.prefix(2)), ["/a", "/b"])
+    }
+
+    func test_searchDirectories_enumerates_nvm_versions_newest_first() throws {
+        // Build a fake home with two nvm node versions; the newer one must
+        // sort ahead so a global CLI installed under it wins.
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-nvm-\(UUID().uuidString)")
+        let nodeRoot = home.appendingPathComponent(".nvm/versions/node")
+        for v in ["v20.1.0", "v22.15.0"] {
+            try FileManager.default.createDirectory(
+                at: nodeRoot.appendingPathComponent("\(v)/bin"),
+                withIntermediateDirectories: true)
+        }
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let dirs = LLMRunner.searchDirectories(home: home.path, pathEnv: nil)
+        let nvmDirs = dirs.filter { $0.contains("/.nvm/versions/node/") }
+        XCTAssertEqual(nvmDirs, [
+            "\(home.path)/.nvm/versions/node/v22.15.0/bin",
+            "\(home.path)/.nvm/versions/node/v20.1.0/bin",
+        ], "nvm version bins must be present, newest first: \(dirs)")
+    }
+
+    func test_childEnvironment_prepends_executable_dir_to_PATH() {
+        // node-shebang CLIs (gemini) need their sibling `node` on PATH; the
+        // resolved binary's own dir must come first so that install wins.
+        let exe = URL(fileURLWithPath: "/Users/tester/.nvm/versions/node/v22.15.0/bin/gemini")
+        let env = LLMRunner.childEnvironment(for: exe, base: ["PATH": "/usr/bin"])
+        let path = env["PATH"] ?? ""
+        let entries = path.split(separator: ":").map(String.init)
+        XCTAssertEqual(entries.first, "/Users/tester/.nvm/versions/node/v22.15.0/bin",
+                       "executable dir must be first: \(path)")
+        XCTAssertTrue(entries.contains("/usr/bin"), "inherited PATH must survive: \(path)")
+        XCTAssertTrue(entries.contains("/opt/homebrew/bin"), "well-known dirs must be added: \(path)")
+    }
+
+    func test_childEnvironment_dedupes_and_preserves_other_vars() {
+        let exe = URL(fileURLWithPath: "/opt/homebrew/bin/claude")
+        let env = LLMRunner.childEnvironment(
+            for: exe, base: ["PATH": "/opt/homebrew/bin", "HOME": "/Users/tester"])
+        let entries = (env["PATH"] ?? "").split(separator: ":").map(String.init)
+        XCTAssertEqual(entries.filter { $0 == "/opt/homebrew/bin" }.count, 1,
+                       "duplicate dirs must be collapsed: \(entries)")
+        XCTAssertEqual(env["HOME"], "/Users/tester", "other env vars must be inherited")
+    }
+
+    func test_searchDirectories_without_nvm_is_stable() {
+        // A home with no ~/.nvm must not crash or inject nvm dirs.
+        let dirs = LLMRunner.searchDirectories(
+            home: "/nonexistent-home-\(UUID().uuidString)", pathEnv: nil)
+        XCTAssertFalse(dirs.contains { $0.contains("/.nvm/versions/node/") })
+    }
+
+    func test_gemini_cli_returns_a_title_for_a_sample_transcript() async throws {
+        guard let geminiPath = resolve("gemini") else {
+            throw XCTSkip("gemini CLI not installed on this machine")
+        }
+        let transcript = "We agreed to migrate the staging ECR to the new account by Friday and Uri will open the PR."
+        let result: String
+        do {
+            result = try await LLMRunner.run(
+                tool: .gemini,
+                prompt: LLMSettings.defaultNamePrompt,
+                transcript: transcript,
+                executablePathOverride: geminiPath,
+                timeout: 120
+            )
+        } catch let error as LLMRunnerError {
+            // An installed-but-unusable CLI is an environment problem, not a
+            // regression in our argv/plumbing: gemini exits non-zero when the
+            // machine isn't logged in, or when the account's tier is no longer
+            // eligible (Google retired free-tier Code Assist for this client).
+            // Skip rather than fail so the suite stays green off a login.
+            guard case .nonZeroExit(_, let stderr) = error,
+                  Self.looksLikeGeminiAuthFailure(stderr) else { throw error }
+            throw XCTSkip("gemini CLI is installed but not usable on this machine (auth/tier): \(stderr.prefix(200))")
+        }
+        XCTAssertFalse(result.isEmpty, "gemini returned empty output")
+        XCTAssertLessThan(result.count, 200,
+                          "gemini reply looks like prose, not a title: \(result)")
+    }
+
+    /// Whether a `gemini` non-zero exit is an auth/eligibility problem (skip)
+    /// rather than a real failure of the invocation we're testing (fail).
+    private static func looksLikeGeminiAuthFailure(_ stderr: String) -> Bool {
+        let s = stderr.lowercased()
+        return s.contains("error authenticating")
+            || s.contains("ineligibletiererror")
+            || s.contains("please login")
+            || s.contains("not authenticated")
     }
 }

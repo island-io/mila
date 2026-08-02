@@ -609,9 +609,10 @@ enum LLMRunner {
         process.arguments = arguments
 
         // Inherit `$PATH` etc. so the CLI can find any helpers it shells out
-        // to. Spawning a Process from a sandboxed-style minimal environment
+        // to, but AUGMENT PATH so node-shebang CLIs find their interpreter.
+        // Spawning a Process from a sandboxed-style minimal environment
         // surprises users whose claude/cursor wrappers source nvm/asdf/etc.
-        process.environment = ProcessInfo.processInfo.environment
+        process.environment = childEnvironment(for: executable)
 
         // CRITICAL: spawn in a fresh, empty temp directory. macOS attributes
         // any file access by the child process to *our* bundle ID, so if
@@ -827,34 +828,82 @@ enum LLMRunner {
 
     /// Walk the user's `$PATH` plus a few common shell-managed locations
     /// (`~/.local/bin`, `/opt/homebrew/bin`, …). GUI apps on macOS inherit
-    /// a stripped-down PATH from launchd, so claude/cursor installed by
+    /// a stripped-down PATH from launchd, so claude/cursor/gemini installed by
     /// Homebrew or a node version manager are typically *not* on the
     /// inherited PATH — falling back to the well-known directories prevents
     /// the "works in Terminal, not in Mila" footgun.
     private static func lookupOnPath(_ name: String) -> URL? {
-        var searchDirs: [String] = []
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
-            searchDirs += path.split(separator: ":").map(String.init)
-        }
-        let home = NSHomeDirectory()
-        searchDirs += [
-            "\(home)/.local/bin",
-            "\(home)/bin",
-            "\(home)/.cargo/bin",
-            "\(home)/.bun/bin",
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/bin"
-        ]
         let fm = FileManager.default
-        for dir in searchDirs {
+        for dir in searchDirectories() {
             let candidate = (dir as NSString).appendingPathComponent(name)
             if fm.isExecutableFile(atPath: candidate) {
                 return URL(fileURLWithPath: candidate)
             }
         }
         return nil
+    }
+
+    /// Environment for the spawned CLI. We inherit Mila's environment (so the
+    /// CLI still sees HOME, npm config, API-key vars, etc.) but *augment* PATH
+    /// so a node-shebang CLI can find its interpreter. `gemini`'s shebang is
+    /// `#!/usr/bin/env node`; a Finder-launched app gets a stripped PATH from
+    /// launchd, so without this it dies with `env: node: No such file or
+    /// directory`. We prepend the resolved executable's own directory (its
+    /// sibling `node` lives there for nvm/npm installs) plus the well-known
+    /// version-manager bins, then the inherited PATH — de-duped, order kept.
+    static func childEnvironment(
+        for executable: URL,
+        base: [String: String] = ProcessInfo.processInfo.environment
+    ) -> [String: String] {
+        var env = base
+        let inherited = base["PATH"]?.split(separator: ":").map(String.init) ?? []
+        var ordered: [String] = [executable.deletingLastPathComponent().path]
+        ordered += searchDirectories(pathEnv: nil)
+        ordered += inherited
+        var seen = Set<String>()
+        let merged = ordered.filter { !$0.isEmpty && seen.insert($0).inserted }
+        env["PATH"] = merged.joined(separator: ":")
+        return env
+    }
+
+    /// Ordered candidate directories for `lookupOnPath`: the inherited `$PATH`
+    /// first, then well-known shell/version-manager `bin` dirs. Node-based CLIs
+    /// (claude, cursor-agent, gemini) are commonly installed as global npm
+    /// packages under a version manager, so those roots are enumerated too.
+    /// Exposed (internal) so the version-manager enumeration is unit-testable.
+    static func searchDirectories(
+        home: String = NSHomeDirectory(),
+        pathEnv: String? = ProcessInfo.processInfo.environment["PATH"],
+        fileManager: FileManager = .default
+    ) -> [String] {
+        var dirs: [String] = []
+        if let pathEnv {
+            dirs += pathEnv.split(separator: ":").map(String.init)
+        }
+        dirs += [
+            "\(home)/.local/bin",
+            "\(home)/bin",
+            "\(home)/.cargo/bin",
+            "\(home)/.bun/bin",
+            "\(home)/.volta/bin",        // Volta
+            "\(home)/.asdf/shims",       // asdf
+            "\(home)/.npm-global/bin",   // custom npm prefix
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin"
+        ]
+        // nvm installs each Node version under
+        // ~/.nvm/versions/node/<version>/bin. A global npm package (claude,
+        // cursor-agent, gemini) lands in whichever version was active at
+        // install time, so search every installed version, newest first.
+        let nvmRoot = "\(home)/.nvm/versions/node"
+        if let versions = try? fileManager.contentsOfDirectory(atPath: nvmRoot) {
+            dirs += versions
+                .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
+                .map { "\(nvmRoot)/\($0)/bin" }
+        }
+        return dirs
     }
 }
 
