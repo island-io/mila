@@ -573,10 +573,10 @@ final class QuickActionsController: ObservableObject {
         let decodedDuration = audioDuration(at: outputURL)
         let capturedDuration = decodedDuration ?? 0
         let duration = decodedDuration ?? durationBeforeStop
-        let (title, source, appName): (String, RecordingSource, String?) = {
+        let (title, source, appName, appBundleID): (String, RecordingSource, String?, String?) = {
             switch captured {
             case .recordingMic:
-                return (defaultTitle(prefix: "Voice Memo"), .microphone, nil)
+                return (defaultTitle(prefix: "Voice Memo"), .microphone, nil, nil)
             case .recording(let withSystemAudio):
                 // Unified Record: mic only when checkbox is off, or
                 // mic + system mix when on. The title stays generic —
@@ -584,15 +584,19 @@ final class QuickActionsController: ObservableObject {
                 let prefix = "Recording"
                 return (defaultTitle(prefix: prefix),
                         withSystemAudio ? .meeting : .microphone,
-                        nil)
+                        nil, nil)
             case .recordingApp(let pid, let includeMic):
-                let app = availableApps.first(where: { $0.processID == pid })?.applicationName
+                let capturedApp = availableApps.first(where: { $0.processID == pid })
+                let app = capturedApp?.applicationName
                 let prefix = app ?? "System Audio"
+                // Persist the bundle ID too: it's the authoritative,
+                // non-localized key `Recording.detectedMeetingApp` prefers
+                // over the display name when picking a meeting-app badge.
                 return (defaultTitle(prefix: prefix),
                         includeMic ? .meeting : .systemAudio,
-                        app)
+                        app, capturedApp?.bundleIdentifier)
             default:
-                return (defaultTitle(prefix: "Recording"), .microphone, nil)
+                return (defaultTitle(prefix: "Recording"), .microphone, nil, nil)
             }
         }()
 
@@ -657,6 +661,7 @@ final class QuickActionsController: ObservableObject {
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
             appName: appName,
+            appBundleID: appBundleID,
             summary: initialSummary.isEmpty ? nil : initialSummary,
             actionItems: initialItems.isEmpty ? nil : initialItems,
             speakerNames: liveTranscriber?.speakerNames ?? [:]

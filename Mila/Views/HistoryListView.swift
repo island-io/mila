@@ -211,7 +211,7 @@ private struct HistoryRow: View {
                 HStack(spacing: 6) {
                     Text(recording.createdAt, format: .dateTime.hour().minute())
                     Text("·")
-                    Text(recording.isZoomRecording ? "Zoom" : recording.source.displayName)
+                    Text(recording.detectedMeetingApp?.info.displayName ?? recording.source.displayName)
                     if transcription.activeRecordingID == recording.id {
                         Text("·")
                         ProgressView(value: transcription.progress)

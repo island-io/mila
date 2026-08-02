@@ -43,19 +43,40 @@ final class MeetingDetector: ObservableObject {
         /// A prefix (not exact) because Zoom may capture under a helper
         /// bundle ID (`us.zoom.*`) rather than `us.zoom.xos`.
         let captureBundlePrefixes: [String]
-        /// Lowercased window-title substrings, fallback path only.
+        /// Lowercased window-title substrings, fallback path only. A hint
+        /// must identify a *meeting* window specifically, not merely the
+        /// app being open — the fallback treats a match as "in a call".
+        /// Empty ⇒ no usable meeting-specific title exists for this app, so
+        /// the fallback never claims a meeting for it (the Core Audio
+        /// signal remains, and no detection beats a false one).
         let meetingTitleHints: [String]
     }
 
-    /// Supported meeting apps. Zoom is the only one implemented now;
-    /// adding Google Meet / Teams later is an entry here (they'd use the
-    /// same mic-capture signal, keyed on their own bundle IDs).
+    /// Supported meeting apps. Adding a new app (e.g. Google Meet) is just
+    /// another entry here — they'd use the same mic-capture signal, keyed
+    /// on their own bundle IDs.
     static let supportedApps: [App] = [
         App(
             bundleID: "us.zoom.xos",
             displayName: "Zoom",
             captureBundlePrefixes: ["us.zoom"],
             meetingTitleHints: ["zoom meeting"]
+        ),
+        App(
+            bundleID: "com.microsoft.teams2",
+            displayName: "Microsoft Teams",
+            captureBundlePrefixes: ["com.microsoft.teams2"],
+            // Deliberately none. Zoom can use a title hint because its
+            // meeting window is titled "Zoom Meeting" while the idle app
+            // window is not; every Teams window — chat, calendar, the
+            // meeting itself — is titled "… | Microsoft Teams", so any
+            // hint broad enough to catch a call also fires for Teams
+            // merely being open, which for most people is all day. On the
+            // fallback path that would mean a bogus "start transcribing?"
+            // on launch and, mid-recording, a bogus "meeting ended → stop
+            // recording?" the moment that window went away. Teams is
+            // therefore detected by mic capture only (macOS 14.4+).
+            meetingTitleHints: []
         )
     ]
 
@@ -274,8 +295,11 @@ final class MeetingDetector: ObservableObject {
     /// True iff a window owned by an app with the given bundle ID has a
     /// title containing one of `app.meetingTitleHints`. Without Screen
     /// Recording permission, window titles for other processes come back
-    /// nil — in that case we conservatively return false.
+    /// nil — in that case we conservatively return false. An app with no
+    /// hints opts out of this fallback entirely.
     private func hasMeetingWindow(for app: App) -> Bool {
+        guard !app.meetingTitleHints.isEmpty else { return false }
+
         let runningPIDs = NSWorkspace.shared.runningApplications
             .filter { $0.bundleIdentifier == app.bundleID }
             .map { $0.processIdentifier }

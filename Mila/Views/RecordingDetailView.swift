@@ -59,9 +59,8 @@ struct RecordingDetailView: View {
                 HStack(spacing: 8) {
                     HStack(spacing: 6) {
                         RecordingSourceBadge(recording: recording, size: 18)
-                        Text(recording.isZoomRecording
-                             ? "Zoom"
-                             : recording.source.displayName)
+                        Text(recording.detectedMeetingApp?.info.displayName
+                             ?? recording.source.displayName)
                     }
                     Text("·")
                     Text(recording.createdAt, format: .dateTime)
