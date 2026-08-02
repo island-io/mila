@@ -84,9 +84,32 @@ Exactly one of these, and it must point at the **current head SHA**:
 3. an issue comment from `coderabbitai[bot]` reading `Review complete …
    <short-sha>` for the head, e.g. "Review complete. I found no issues in
    `005bc14`." — CodeRabbit frequently files its verdict this way and posts no
-   review object at all.
+   review object at all;
+4. an issue comment from `coderabbitai[bot]` carrying the **walkthrough**, whose
+   structured commit line ends at the head:
 
-### What does *not* count (the two traps)
+   > Reviewing files that changed from the base of the PR and between
+   > `<base-sha>` and `<head-sha>`.
+
+   Both the 40-char and abbreviated SHA forms are accepted. The match is
+   anchored on the **second** SHA — the first is the diff base, and matching
+   either would let the base of a later push masquerade as a review of it.
+
+**Why signal 4 exists.** When a review finds *nothing*, CodeRabbit files **no
+review object at all** and posts no "Review complete" line — just one issue
+comment beginning "No actionable comments were generated in the recent review".
+Signals 1–3 all miss that shape, so the gate reported such PRs as unreviewed
+forever. It happened on #163 (walkthrough posted 22 seconds after the PR
+opened, naming head `016d9177`), and an audit of the last 40 PRs found the same
+false negative on #138, #113 and #107. It cost most of a working day: the red
+check was read as a rate limit, then as CodeRabbit refusing incremental
+re-reviews, and empty commits were pushed to force a re-review — all chasing a
+detection bug.
+
+The match is on the SHA, deliberately, and not on the "No actionable comments"
+prose: the prose names no commit, so it cannot prove *which* code was read.
+
+### What does *not* count (the traps)
 
 - **Empty review objects.** CodeRabbit files a `COMMENTED` review with a
   zero-length body every time it merely replies in a thread, and that object
@@ -97,14 +120,37 @@ Exactly one of these, and it must point at the **current head SHA**:
   quotes the "Next review available in: N minutes" countdown in its output, so
   a red check reads as "blocked on quota", not "the bot is broken".
 
+  This one is sharper than it looks. The rate-limit notice **embeds the same
+  `Reviewing files that changed … between <base> and <head>` line as the
+  walkthrough**, naming the head it did *not* review. Across the last 40 PRs,
+  13 rate-limit notices name the then-current head that way — against 4 genuine
+  walkthroughs. Signal 4 therefore vetoes the whole comment body if it matches
+  the rate-limit pattern, exactly as signals 1 and 3 do.
+- **A bare "Action performed / Review finished" acknowledgement.** That ~384-char
+  receipt is what the bot posts for *every* `@coderabbitai` command; it names no
+  commit and is not evidence that a review ran. It is by far the most common
+  CodeRabbit comment on this repo (77 of them in the last 40 PRs), and counting
+  it would reopen the exact hole this gate closes.
+
 One more subtlety: for inline comments GitHub rolls `commit_id` *forward* to the
 newest commit where the thread still applies, so it does not prove the comment
 was written against the head. `original_commit_id` — the commit the comment was
 actually authored on — is the one to match.
 
+### Always paginate
+
+Every comments/reviews read in the workflow goes through `github.paginate` with
+`per_page: 100`, and manual inspection must pass `gh api --paginate`. The API
+default is **30 items per page**: on a chatty PR the newest CodeRabbit comment —
+the one naming the current head — sits past page 1, and an unpaginated read
+returns a stale slice with no error. That produced its own round of wrong
+conclusions during the 2026-08-02 incident, independently of the missing
+walkthrough signal.
+
 ### Clearing the check
 
-It re-evaluates itself; no manual re-run is needed. Beyond `pull_request`, it
+It re-evaluates itself; no manual re-run is needed — any one of the four
+signals above clears it. Beyond `pull_request`, it
 also triggers on `pull_request_review` (submitted) and on `issue_comment`
 (created, restricted to CodeRabbit's own comments on PRs), so it flips green the
 moment the review lands. Those two events run against the default branch rather

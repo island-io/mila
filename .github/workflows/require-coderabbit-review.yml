@@ -123,6 +123,13 @@ jobs:
               return m ? m[1].replace(/[*>`]/g, '').trim() : null;
             }
 
+            // ALWAYS paginated, never a bare list call. The API default is 30
+            // items per page: on a chatty PR the newest CodeRabbit comment —
+            // the one that carries the current head — sits past page 1, and an
+            // unpaginated read silently returns a stale slice. That produced
+            // its own round of wrong conclusions during the 2026-08-02
+            // incident. Same applies to any manual `gh api` check: pass
+            // `--paginate`.
             async function listComments() {
               return github.paginate(github.rest.issues.listComments, {
                 owner, repo, issue_number: number, per_page: 100,
@@ -229,6 +236,8 @@ jobs:
             }
 
             // ---- 4. gather CodeRabbit's output ------------------------------
+            // Every one of these is `github.paginate`d — see listComments above
+            // for why a first-page read is a bug, not an optimisation.
             const [reviews, inline, comments] = await Promise.all([
               github.paginate(github.rest.pulls.listReviews, {
                 owner, repo, pull_number: number, per_page: 100,
@@ -285,6 +294,50 @@ jobs:
                 return !RATE_LIMIT_RE.test(body) && shaAfterVerdict.test(body);
               });
 
+            // ---- signal (d): the walkthrough comment CodeRabbit posts when a
+            // review found NOTHING. That outcome files no review object at all
+            // and no "Review complete" line, so signals (a)-(c) all miss it —
+            // the gate called #163 unreviewed while this comment (posted 22s
+            // after the PR opened) sat on it, which is why this signal exists.
+            //
+            // The proof is the structured commit line inside the walkthrough:
+            //   Reviewing files that changed from the base of the PR and
+            //   between <base-sha> and <head-sha>.
+            // The SECOND sha is the revision that was reviewed; the first is the
+            // diff base. Anchoring on the second is the whole point — matching
+            // either would let the base of a later push masquerade as a review
+            // of it. Prose like "No actionable comments were generated" is
+            // deliberately NOT matched: it names no commit, so it cannot prove
+            // which code was read.
+            //
+            // TRAP: the identical line is embedded inside the RATE-LIMIT notice,
+            // where it names the head CodeRabbit did *not* review (#124 comment
+            // 5101648734, #150 5153138305, #148 5152740708 and #160 5157565115
+            // all name the then-current head that way). Hence the whole-body
+            // RATE_LIMIT_RE veto, as in signals (a) and (c).
+            //
+            // A bare "Action performed / Review finished" acknowledgement — the
+            // ~384-char receipt the bot posts for every `@coderabbitai` command
+            // — carries no commit line and therefore cannot match. That receipt
+            // is not evidence of a review; counting it would reopen exactly the
+            // hole this workflow closes.
+            const REVIEWED_BETWEEN_RE =
+              /reviewing files that changed[\s\S]{0,200}?\bbetween\s+([0-9a-f]{7,40})\s+and\s+([0-9a-f]{7,40})\b/gi;
+
+            // CodeRabbit writes both full and abbreviated SHAs; a >=7-char hex
+            // prefix of the head (as enforced by the pattern) is the head.
+            const namesHead = (sha) => head.startsWith(sha.toLowerCase());
+
+            const walkthroughComment = comments.filter(byBot).find((c) => {
+              const body = c.body ?? '';
+              if (RATE_LIMIT_RE.test(body)) return false;
+              REVIEWED_BETWEEN_RE.lastIndex = 0;
+              for (const m of body.matchAll(REVIEWED_BETWEEN_RE)) {
+                if (namesHead(m[2])) return true;
+              }
+              return false;
+            });
+
             // ---- rate-limit notice: the OPPOSITE of a review. Surfaced so a
             // human reading the red check knows the bot was blocked by quota
             // rather than broken. CodeRabbit edits its summary comment in place,
@@ -300,6 +353,7 @@ jobs:
               `signals — review@head:${reviewAtHead ? 'yes' : 'no'} ` +
                 `inline@head:${inlineAtHead.length} ` +
                 `verdict:${verdictComment ? 'yes' : 'no'} ` +
+                `walkthrough@head:${walkthroughComment ? 'yes' : 'no'} ` +
                 `rateLimitNotices:${rateLimited.length}`,
             );
 
@@ -321,6 +375,14 @@ jobs:
               await pass(
                 `CodeRabbit [reported "Review complete"](${verdictComment.html_url}) ` +
                   `for \`${shortHead}\``,
+              );
+              return;
+            }
+            if (walkthroughComment) {
+              await pass(
+                `CodeRabbit [posted its review walkthrough](${walkthroughComment.html_url}) ` +
+                  `for \`${shortHead}\` — a review that finds nothing files no ` +
+                  'review object, only this comment',
               );
               return;
             }
@@ -373,11 +435,13 @@ jobs:
               '',
               '   Rate-limited? Wait out the countdown first — a request filed too',
               '   early is refused and burns nothing but time.',
-              '2. The check clears itself as soon as CodeRabbit posts its review,',
-              '   its inline comments, or a `Review complete` verdict for',
-              `   \`${shortHead}\`.`,
+              '2. The check clears itself as soon as CodeRabbit posts its review',
+              '   summary, its inline comments, a `Review complete` verdict, or the',
+              '   walkthrough comment it posts when it finds nothing — any of them',
+              `   naming \`${shortHead}\`.`,
               '',
-              '<sub>An empty CodeRabbit reply, a review of an *older* commit, or a',
+              '<sub>An empty CodeRabbit reply, a bare "Action performed / Review',
+              'finished" acknowledgement, a review of an *older* commit, or a',
               'rate-limit notice do not count — that is exactly the gap this check',
               `closes. A maintainer can apply the \`${BYPASS_LABEL}\` label to`,
               'bypass it; that is the only escape hatch.</sub>',
