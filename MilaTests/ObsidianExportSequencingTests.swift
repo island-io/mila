@@ -159,6 +159,24 @@ final class ObsidianExportSequencingTests: XCTestCase {
                        "a recording deleted mid-flight must not be filed")
     }
 
+    /// The same race on the SUCCESS path. `test_recording_deleted_mid_flight…`
+    /// above forces a failure, so it only exercises the `catch` block's
+    /// liveness check; this one lets the summary complete normally so the
+    /// separate guard on the success path (`RecordingSummarizer`'s
+    /// "is this recording still in the store?" lookup) is the thing under test.
+    func test_recording_deleted_mid_flight_is_not_exported_on_the_success_path() async throws {
+        let rec = addRecording(fullText: "the raw transcript body")
+        exporter.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        store.permanentlyDelete(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expected.path),
+                       "a recording deleted mid-flight must not be filed, "
+                       + "even when its summary succeeds")
+    }
+
     /// Trashed mid-flight: the hook does fire (the row is still in the store),
     /// but the exporter refuses to file a trashed recording.
     func test_recording_trashed_mid_flight_is_not_exported() async throws {

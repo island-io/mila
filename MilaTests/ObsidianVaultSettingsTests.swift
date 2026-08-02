@@ -65,11 +65,24 @@ final class ObsidianVaultSettingsTests: XCTestCase {
         try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
         let settings = ObsidianVaultSettings(defaults: defaults)
         XCTAssertTrue(settings.setVault(vault))
-        let base = try XCTUnwrap(settings.vaultURL).standardizedFileURL.path
+        // `standardized`, not `standardizedFileURL`, throughout: the latter
+        // consults the filesystem and drops a `/private` prefix only when the
+        // path exists, so it renders an existing vault as `/var/…` and a
+        // not-yet-created destination under it as `/private/var/…` — the two
+        // then never compare equal. `standardized` is purely lexical, which is
+        // also exactly what a traversal assertion needs (`vault/..` must
+        // collapse so an escape is visible).
+        let base = try XCTUnwrap(settings.vaultURL).standardized.path
 
-        for hostile in ["../../Desktop", "..", "./..", "../Notes", "Notes/../..", "."] {
+        // Traversal shapes. The dot-plus-space and dot-slash-dot families
+        // matter as much as bare `..`: a sanitizer that strips leading dots
+        // only leaves `".."` behind for ". .." (it stops at the space) and for
+        // "../.." (whose `/` becomes a space before the dots are stripped).
+        for hostile in ["../../Desktop", "..", "./..", "../Notes", "Notes/../..", ".",
+                        ". ..", "Notes/. ../. ..", ". . ..", ".\t..", "..\\..",
+                        " ..", ".. ", "....", ". . . ."] {
             settings.subfolder = hostile
-            let dest = try XCTUnwrap(settings.destinationDirectory).standardizedFileURL.path
+            let dest = try XCTUnwrap(settings.destinationDirectory).standardized.path
             XCTAssertTrue(dest == base || dest.hasPrefix(base + "/"),
                           "subfolder \(hostile.debugDescription) escaped to \(dest)")
         }
@@ -77,10 +90,10 @@ final class ObsidianVaultSettingsTests: XCTestCase {
         // A legitimate nested path still works, and a hidden component is
         // un-hidden rather than dropped.
         settings.subfolder = "Notes/Meetings"
-        XCTAssertEqual(try XCTUnwrap(settings.destinationDirectory).standardizedFileURL.path,
+        XCTAssertEqual(try XCTUnwrap(settings.destinationDirectory).standardized.path,
                        base + "/Notes/Meetings")
         settings.subfolder = ".secret"
-        XCTAssertEqual(try XCTUnwrap(settings.destinationDirectory).standardizedFileURL.path,
+        XCTAssertEqual(try XCTUnwrap(settings.destinationDirectory).standardized.path,
                        base + "/secret")
     }
 
@@ -93,6 +106,43 @@ final class ObsidianVaultSettingsTests: XCTestCase {
         XCTAssertEqual(ObsidianPathSanitizer.relativePath("///"), "")
         XCTAssertLessThanOrEqual(
             ObsidianPathSanitizer.nameFragment(String(repeating: "é", count: 500)).utf8.count, 180)
+    }
+
+    /// The dot-stripping rule, pinned input by input. Every one of these
+    /// reduced to a live `".."` under the leading-dots-only rule.
+    func test_path_sanitizer_cannot_produce_a_traversal_component() {
+        for hostile in [". ..", ".\t..", ". . ..", "../..", "..\\..", " ..", ".. ",
+                        "....", ". . . .", ".  ..", "./..", "..;..", "\t. ..\t"] {
+            let component = ObsidianPathSanitizer.directoryComponent(hostile)
+            XCTAssertNotEqual(component, "..", "\(hostile.debugDescription) survived as ..")
+            XCTAssertNotEqual(component, ".", "\(hostile.debugDescription) survived as .")
+            XCTAssertFalse(component.hasPrefix("."),
+                           "\(hostile.debugDescription) produced a dotfile: \(component)")
+        }
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent(". .."), "")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("../.."), "")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent(". . .."), "")
+        XCTAssertEqual(ObsidianPathSanitizer.relativePath("a/. ../. ../Desktop"), "a/Desktop")
+        XCTAssertEqual(ObsidianPathSanitizer.relativePath("Notes/. ../. .."), "Notes")
+
+        // A dot that isn't leading is an ordinary character, not a threat.
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("2026.01 Notes"), "2026.01 Notes")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent(".. Real Name"), "Real Name")
+    }
+
+    /// The containment guard the exporter leans on at write time.
+    func test_isContained_rejects_escapes() {
+        let root = URL(fileURLWithPath: "/private/tmp/Vault")
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(root, in: root))
+        XCTAssertTrue(ObsidianPathSanitizer.isContained(
+            root.appendingPathComponent("Notes/a.md"), in: root))
+        XCTAssertFalse(ObsidianPathSanitizer.isContained(
+            root.appendingPathComponent(".."), in: root))
+        XCTAssertFalse(ObsidianPathSanitizer.isContained(
+            root.appendingPathComponent("Notes/../../Desktop"), in: root))
+        // A sibling whose path merely starts with the same characters.
+        XCTAssertFalse(ObsidianPathSanitizer.isContained(
+            URL(fileURLWithPath: "/private/tmp/VaultOther"), in: root))
     }
 
     func test_setVault_persists_bookmark_and_resolves_on_relaunch() throws {

@@ -45,8 +45,8 @@ final class ObsidianGitSyncerTests: XCTestCase {
             ["rev-parse", "--show-toplevel"],
             ["add", "--all", "--", file.path],
             ["commit", "-m", "Add transcript: T"],
-            ["pull", "--rebase", "origin", "main"],
-            ["push", "origin", "HEAD:main"],
+            ["pull", "--rebase", "origin", "refs/heads/main"],
+            ["push", "origin", "HEAD:refs/heads/main"],
         ])
     }
 
@@ -73,8 +73,8 @@ final class ObsidianGitSyncerTests: XCTestCase {
                                       branch: "main", commitMessage: "m")
         XCTAssertNil(error, "an unchanged note is not a failure")
         let calls = await fake.calls
-        XCTAssertTrue(calls.contains(["pull", "--rebase", "origin", "main"]))
-        XCTAssertTrue(calls.contains(["push", "origin", "HEAD:main"]))
+        XCTAssertTrue(calls.contains(["pull", "--rebase", "origin", "refs/heads/main"]))
+        XCTAssertTrue(calls.contains(["push", "origin", "HEAD:refs/heads/main"]))
     }
 
     func test_rebase_conflict_aborts_and_does_not_push() async {
@@ -117,7 +117,48 @@ final class ObsidianGitSyncerTests: XCTestCase {
         _ = await syncer.sync(vault: vault, changedPaths: [file],
                               branch: "notes", commitMessage: "m")
         let calls = await fake.calls
-        XCTAssertTrue(calls.contains(["pull", "--rebase", "origin", "notes"]))
-        XCTAssertTrue(calls.contains(["push", "origin", "HEAD:notes"]))
+        XCTAssertTrue(calls.contains(["pull", "--rebase", "origin", "refs/heads/notes"]))
+        XCTAssertTrue(calls.contains(["push", "origin", "HEAD:refs/heads/notes"]))
+    }
+
+    // MARK: - Branch validation
+
+    /// `obsidian.git.branch` is free text from Settings and lands in an
+    /// argument position where git reads a leading `-` as an option. A branch
+    /// named `--upload-pack=…` would turn the sync into an arbitrary-command
+    /// execution against the user's vault. Nothing may run at all.
+    func test_a_branch_that_looks_like_an_option_runs_no_git_at_all() async {
+        for hostile in ["--upload-pack=/bin/sh", "-o", "--exec=evil", "-"] {
+            let fake = FakeGitRunner { args in args.first == "rev-parse" ? ok("/repo") : ok() }
+            let syncer = ObsidianGitSyncer(runner: fake)
+            let error = await syncer.sync(vault: vault, changedPaths: [file],
+                                          branch: hostile, commitMessage: "m")
+            XCTAssertNotNil(error, "\(hostile.debugDescription) must be rejected")
+            let calls = await fake.calls
+            XCTAssertTrue(calls.isEmpty,
+                          "\(hostile.debugDescription) reached git as \(calls)")
+        }
+    }
+
+    func test_invalid_branch_names_are_rejected_before_any_command() async {
+        for hostile in ["", " ", "a b", "a~b", "a^b", "a:b", "a..b", "a?b", "a*b",
+                        "a[b", "a\\b", "feature.lock", "/leading", "trailing/",
+                        ".dot", "dot.", "a@{0}", "a\nb", "a\tb"] {
+            let fake = FakeGitRunner { args in args.first == "rev-parse" ? ok("/repo") : ok() }
+            let syncer = ObsidianGitSyncer(runner: fake)
+            let error = await syncer.sync(vault: vault, changedPaths: [file],
+                                          branch: hostile, commitMessage: "m")
+            XCTAssertNotNil(error, "\(hostile.debugDescription) must be rejected")
+            let calls = await fake.calls
+            XCTAssertTrue(calls.isEmpty, "\(hostile.debugDescription) reached git as \(calls)")
+        }
+    }
+
+    /// The names people actually use must keep working.
+    func test_ordinary_branch_names_are_accepted() {
+        for good in ["main", "master", "notes", "feature/obsidian", "v1.9.2",
+                     "user/kobi-vault", "release-2026", "notes_2"] {
+            XCTAssertTrue(ObsidianGitSyncer.isValidBranch(good), good)
+        }
     }
 }

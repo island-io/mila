@@ -40,10 +40,43 @@ enum ObsidianPathSanitizer {
     /// component escaping its parent or hiding itself. Leading dots are
     /// dropped, so `.`, `..` and `.hidden` collapse to `""`, `""` and
     /// `"hidden"` — callers treat an empty result as "use the parent".
+    ///
+    /// The leading run that gets dropped is dots **and the whitespace between
+    /// them**, not dots alone. Stripping only dots left a whole family of
+    /// traversal components intact:
+    ///
+    ///   * `". .."` — the dot-strip stopped at the space and `".."` survived.
+    ///   * `"../.."` — `nameFragment` turns the `/` into a space first, so the
+    ///     dot-strip saw `".. .."`, stopped at the space, and left `".."`.
+    ///
+    /// Either one resolved a note *above* the configured destination.
     static func directoryComponent(_ raw: String) -> String {
         var name = nameFragment(raw)
-        while name.hasPrefix(".") { name.removeFirst() }
-        return name.trimmingCharacters(in: .whitespaces)
+        while let first = name.first, first == "." || first == " " || first == "\t" {
+            name.removeFirst()
+        }
+        name = name.trimmingCharacters(in: .whitespaces)
+        // Belt and braces: whatever the rules above evolve into, a relative
+        // reference must never leave this function.
+        guard name != ".", name != ".." else { return "" }
+        return name
+    }
+
+    /// Final containment guard: true when `candidate` resolves inside `root`.
+    ///
+    /// `directoryComponent` already makes a traversal component impossible, so
+    /// this is defence in depth at the point of the actual write — a future
+    /// change to the naming rules must not be able to turn into a file written
+    /// outside the vault.
+    ///
+    /// Deliberately `standardized` (lexical `..`/`.` resolution) and not
+    /// `standardizedFileURL`: the latter consults the filesystem and strips a
+    /// `/private` prefix only when the path already exists, so it compares an
+    /// existing vault against a not-yet-created destination inconsistently.
+    static func isContained(_ candidate: URL, in root: URL) -> Bool {
+        let rootPath = root.standardized.path
+        let path = candidate.standardized.path
+        return path == rootPath || path.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
     }
 
     /// Sanitize a user-typed vault-relative path (`Notes/Meetings`, and also
@@ -219,7 +252,10 @@ final class ObsidianVaultSettings: ObservableObject {
             defaults.removeObject(forKey: Self.bookmarkKey)
             return
         }
-        accessingURL = resolved
+        // Only record a URL we actually started accessing, so the balancing
+        // `stopAccessingSecurityScopedResource()` in the next resolve can never
+        // be sent for an access that never began.
+        accessingURL = started ? resolved : nil
         vaultURL = resolved
     }
 

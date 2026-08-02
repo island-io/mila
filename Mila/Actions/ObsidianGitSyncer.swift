@@ -41,6 +41,35 @@ actor ObsidianGitSyncer {
         self.runner = runner
     }
 
+    /// `obsidian.git.branch` is a free-text Settings field, and it lands in an
+    /// argument position where git would happily read it as an option: a branch
+    /// named `--upload-pack=/bin/sh` turns `git pull --rebase origin <branch>`
+    /// into a remote-helper override. Reject anything git itself would refuse
+    /// as a ref name, and anything that could be parsed as a flag or a revision
+    /// operator, before a single command runs.
+    ///
+    /// Roughly `git check-ref-format --branch`, minus the exotic rules — this
+    /// is a guard, not a reimplementation.
+    static func isValidBranch(_ branch: String) -> Bool {
+        guard !branch.isEmpty, branch.utf8.count <= 255 else { return false }
+        // The one that actually matters: never parsable as an option.
+        guard !branch.hasPrefix("-") else { return false }
+        guard !branch.hasPrefix("/"), !branch.hasSuffix("/") else { return false }
+        guard !branch.hasPrefix("."), !branch.hasSuffix(".") else { return false }
+        guard !branch.contains(".."), !branch.contains("@{") else { return false }
+        guard !branch.hasSuffix(".lock") else { return false }
+        let forbidden = CharacterSet(charactersIn: " \t~^:?*[]\\\u{7F}")
+            .union(.controlCharacters)
+            .union(.newlines)
+        return branch.rangeOfCharacter(from: forbidden) == nil
+    }
+
+    /// Fully-qualified form of `branch`. Belt and braces alongside
+    /// `isValidBranch`: a `refs/heads/`-prefixed argument can never begin with
+    /// `-`, so it cannot reach git in an option position however the validation
+    /// above evolves. It also removes the tag/branch ambiguity of a bare name.
+    private static func ref(_ branch: String) -> String { "refs/heads/\(branch)" }
+
     /// Run the sync. Returns nil on success, or a human-readable error string
     /// to surface in Settings (the caller stores it on
     /// `ObsidianVaultSettings.lastSyncError`).
@@ -53,6 +82,13 @@ actor ObsidianGitSyncer {
               changedPaths: [URL],
               branch: String,
               commitMessage: String) async -> String? {
+        // Validate before anything is spawned: a hostile branch value must not
+        // reach a git argument list at all.
+        guard Self.isValidBranch(branch) else {
+            return "\"\(branch)\" is not a valid git branch name. "
+                + "Change it in Settings ▸ Storage."
+        }
+
         // Locate the repo toplevel from the vault dir. Doubles as the
         // "is this a git repo?" guard.
         let top = await runner.run(["rev-parse", "--show-toplevel"], in: vault)
@@ -77,14 +113,14 @@ actor ObsidianGitSyncer {
             if !nothingToCommit { return "git commit failed: \(commit.message)" }
         }
 
-        let pull = await runner.run(["pull", "--rebase", "origin", branch], in: toplevel)
+        let pull = await runner.run(["pull", "--rebase", "origin", Self.ref(branch)], in: toplevel)
         guard pull.succeeded else {
             // Never leave the vault mid-rebase.
             _ = await runner.run(["rebase", "--abort"], in: toplevel)
             return "git pull --rebase failed (aborted): \(pull.message)"
         }
 
-        let push = await runner.run(["push", "origin", "HEAD:\(branch)"], in: toplevel)
+        let push = await runner.run(["push", "origin", "HEAD:\(Self.ref(branch))"], in: toplevel)
         guard push.succeeded else { return "git push failed: \(push.message)" }
 
         return nil

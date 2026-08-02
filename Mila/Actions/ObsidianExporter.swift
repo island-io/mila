@@ -51,16 +51,15 @@ final class ObsidianExporter: ObservableObject {
     @discardableResult
     func export(_ recording: Recording) -> URL? {
         guard settings.enabled, let vault = settings.vaultURL else { return nil }
-        guard let write = writeNote(recording, vault: vault) else { return nil }
+        var index = writtenIndex()
+        guard let write = writeNote(recording, vault: vault, index: &index) else { return nil }
+        setWrittenIndex(index)
 
         if settings.gitSyncEnabled {
             // Single-line: a title with an embedded newline would otherwise
             // turn the commit subject into a subject + body in the user's
             // vault history.
-            let title = recording.title
-                .components(separatedBy: .newlines)
-                .joined(separator: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let title = Self.singleLine(recording.title)
             let message = "Add transcript: \(title.isEmpty ? "Untitled recording" : title)"
             kickGitSync(vault: vault, changedPaths: write.changedPaths, commitMessage: message)
         }
@@ -74,31 +73,50 @@ final class ObsidianExporter: ObservableObject {
     func exportAll(_ recordings: [Recording]) -> Int {
         guard settings.enabled, let vault = settings.vaultURL else { return 0 }
 
+        // The index is loaded once and stored once. Per-note persistence would
+        // re-serialize the whole dictionary for every recording, which is what
+        // actually makes a large backfill expensive — not the file writes.
+        var index = writtenIndex()
         var changed: [URL] = []
+        // Counted separately from `changed`: a rename contributes *two* paths
+        // (the new file and the removed old one) for a single written note, so
+        // `changed.count` would over-report both the UI result and the commit
+        // subject after any title or folder change.
+        var written = 0
         for recording in recordings {
-            guard let write = writeNote(recording, vault: vault) else { continue }
+            guard let write = writeNote(recording, vault: vault, index: &index) else { continue }
             changed.append(contentsOf: write.changedPaths)
+            written += 1
         }
+        setWrittenIndex(index)
         guard !changed.isEmpty else { return 0 }
 
         if settings.gitSyncEnabled {
-            let message = "Sync \(changed.count) Mila transcript\(changed.count == 1 ? "" : "s")"
+            let message = "Sync \(written) Mila transcript\(written == 1 ? "" : "s")"
             kickGitSync(vault: vault, changedPaths: changed, commitMessage: message)
         }
-        return changed.count
+        return written
     }
 
     /// File `recording` into the vault (no git). Returns the written file plus
     /// the paths that changed on disk (the new file and any old file removed by
     /// a rename), or nil when there's nothing to write / the write fails.
     private func writeNote(_ recording: Recording,
-                           vault: URL) -> (written: URL, changedPaths: [URL])? {
+                           vault: URL,
+                           index: inout [String: String]) -> (written: URL, changedPaths: [URL])? {
         // Never file a recording the user has thrown away. The summary hook
         // can land after a trash action (the LLM call is in flight when the
         // user deletes), and "I deleted it and it still turned up in my vault"
         // is the worst possible surprise from a background exporter.
         guard !recording.isTrashed else { return nil }
         guard Self.hasContent(recording), let destDir = destinationDirectory(for: recording) else {
+            return nil
+        }
+        // Defence in depth, immediately before the first thing that touches
+        // the disk: the sanitizer makes an escaping component impossible, and
+        // this makes a regression in it non-exploitable rather than silent.
+        guard ObsidianPathSanitizer.isContained(destDir, in: vault) else {
+            print("ObsidianExporter: refusing to write outside the vault: \(destDir.path)")
             return nil
         }
 
@@ -115,12 +133,21 @@ final class ObsidianExporter: ObservableObject {
 
         // Overwrite discipline: if we wrote a differently-named file for this
         // recording before (title changed / moved to another folder), remove it.
-        var index = writtenIndex()
-        let key = recording.id.uuidString
+        //
+        // The key is scoped to the vault. The stored value is a path *relative
+        // to the vault it was written into*, so resolving it against whatever
+        // vault happens to be configured now would, after the user switches
+        // vaults, delete `<newVault>/<oldRelativePath>` — an unrelated file, or
+        // nothing — and orphan the real note in the previous vault.
+        let key = Self.indexKey(vault: vault, id: recording.id)
+        migrateLegacyIndexEntry(&index, key: key, vault: vault, id: recording.id)
         if let prevRelative = index[key], prevRelative != newRelative {
             let old = vault.appendingPathComponent(prevRelative)
-            try? fileManager.removeItem(at: old)
-            changedPaths.append(old)
+            // Never follow a stored path back out of the vault.
+            if ObsidianPathSanitizer.isContained(old, in: vault) {
+                try? fileManager.removeItem(at: old)
+                changedPaths.append(old)
+            }
         }
 
         do {
@@ -130,8 +157,28 @@ final class ObsidianExporter: ObservableObject {
             return nil
         }
         index[key] = newRelative
-        setWrittenIndex(index)
         return (target, changedPaths)
+    }
+
+    /// Index keys written before the index was vault-scoped are bare UUIDs.
+    /// Adopt such an entry into the current vault's namespace only when the
+    /// file it names actually exists in *this* vault — that is the only
+    /// evidence that it is a note we wrote here. Otherwise it belongs to a
+    /// vault the user has since switched away from, and must not be allowed to
+    /// drive a delete. Either way the legacy key is dropped, so the migration
+    /// runs at most once per recording.
+    private func migrateLegacyIndexEntry(_ index: inout [String: String],
+                                         key: String,
+                                         vault: URL,
+                                         id: UUID) {
+        let legacyKey = id.uuidString
+        guard let legacy = index[legacyKey] else { return }
+        index[legacyKey] = nil
+        guard index[key] == nil else { return }
+        let candidate = vault.appendingPathComponent(legacy)
+        guard ObsidianPathSanitizer.isContained(candidate, in: vault),
+              fileManager.fileExists(atPath: candidate.path) else { return }
+        index[key] = legacy
     }
 
     /// The vault destination for `recording`: the configured subfolder, plus a
@@ -171,6 +218,13 @@ final class ObsidianExporter: ObservableObject {
         defaults.set(index, forKey: Self.writtenIndexKey)
     }
 
+    /// Vault-scoped index key. `standardized` (lexical) rather than
+    /// `standardizedFileURL` so the key doesn't change with the filesystem's
+    /// mood — see `ObsidianPathSanitizer.isContained`.
+    static func indexKey(vault: URL, id: UUID) -> String {
+        "\(vault.standardized.path)#\(id.uuidString)"
+    }
+
     private static func relativePath(of url: URL, vault: URL) -> String {
         let base = vault.path.hasSuffix("/") ? vault.path : vault.path + "/"
         if url.path.hasPrefix(base) { return String(url.path.dropFirst(base.count)) }
@@ -192,10 +246,20 @@ final class ObsidianExporter: ObservableObject {
         return false
     }
 
+    /// Markdown headings and list items are line-based constructs, so any user
+    /// text placed on such a line has to be collapsed to one line first — a
+    /// newline in a title would otherwise split the `# ` heading, and one in an
+    /// action item would break the `- [ ] ` checkbox into loose body text.
+    static func singleLine(_ raw: String) -> String {
+        raw.components(separatedBy: .newlines)
+            .joined(separator: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Build the note body: `# title`, then the summary (or a `## Transcript`
     /// fallback), then a `## Action items` checklist when present.
     static func markdown(for recording: Recording) -> String {
-        let title = recording.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = singleLine(recording.title)
         var out = "# \(title.isEmpty ? "Untitled recording" : title)\n"
 
         let summary = (recording.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
@@ -214,7 +278,7 @@ final class ObsidianExporter: ObservableObject {
 
         if let items = recording.actionItems, !items.isEmpty {
             out += "\n## Action items\n\n"
-            out += items.map { "- [ ] \($0.text)" }.joined(separator: "\n")
+            out += items.map { "- [ ] \(singleLine($0.text))" }.joined(separator: "\n")
             out += "\n"
         }
         return out

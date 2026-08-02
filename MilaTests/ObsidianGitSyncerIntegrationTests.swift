@@ -120,9 +120,34 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         process.standardOutput = out
         process.standardError = err
         try process.run()
+
+        // Drain BOTH pipes before waiting for exit. A macOS pipe buffer is
+        // ~64 KB; git writes progress and diagnostics to stderr, so waiting
+        // first lets git block on `write()` while we block on `waitUntilExit()`
+        // — the deadlock `.claude/rules/python-subprocess.md` documents (it
+        // hung transcription on long files once already, PR #15).
+        //
+        // `DispatchGroup` rather than `Task.detached` here because this helper
+        // is synchronous: the rule prefers `Task.detached` specifically to
+        // avoid blocking a cooperative thread from an *async* context, which
+        // this is not.
+        let lock = NSLock()
+        var outData = Data(), errData = Data()
+        let drain = DispatchGroup()
+        for (pipe, isStdout) in [(out, true), (err, false)] {
+            drain.enter()
+            DispatchQueue.global().async {
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                lock.lock()
+                if isStdout { outData = data } else { errData = data }
+                lock.unlock()
+                drain.leave()
+            }
+        }
         process.waitUntilExit()
-        let stdout = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        drain.wait()
+        let stdout = String(data: outData, encoding: .utf8) ?? ""
+        let stderr = String(data: errData, encoding: .utf8) ?? ""
         if process.terminationStatus != 0 {
             throw NSError(domain: "git", code: Int(process.terminationStatus), userInfo: [
                 NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(stderr)\(stdout)"

@@ -228,7 +228,10 @@ struct ObsidianSettingsSection: View {
 
     private func revealInFinder() {
         guard let url = settings.vaultURL else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+        // Open the vault directory itself, matching `StorageSettingsTab`:
+        // `activateFileViewerSelecting([url])` highlights the folder inside its
+        // parent, but for a folder target the user wants to step _into_ it.
+        NSWorkspace.shared.open(url)
     }
 
     /// Backfill: write every non-trashed recording that has content into the

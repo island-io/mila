@@ -32,8 +32,26 @@ final class ObsidianExporterTests: XCTestCase {
         try await super.tearDown()
     }
 
+    /// 2026-01-02T12:00:00Z. Midday rather than the midnight this used to be,
+    /// so the fixture doesn't sit on a date boundary that a local time zone can
+    /// push either way.
+    private static let fixtureDate = Date(timeIntervalSince1970: 1_767_355_200)
+
+    /// The date `ObsidianExporter.fileName` will actually produce for
+    /// `fixtureDate`. Derived, not hard-coded: `fileName` formats in the local
+    /// time zone by design (a user's note should carry the date they recorded
+    /// it), so a literal "2026-01-02" would still be wrong at UTC+13/+14 even
+    /// with a midday fixture. Deriving it pins the contract — "the filename
+    /// starts with the recording's local date" — in every zone.
+    private static let expectedDatePrefix: String = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: fixtureDate)
+    }()
+
     private func makeRecording(title: String = "Team Sync",
-                               createdAt: Date = Date(timeIntervalSince1970: 1_767_312_000), // 2026-01-02 UTC-ish
+                               createdAt: Date = ObsidianExporterTests.fixtureDate,
                                summary: String? = nil,
                                fullText: String = "",
                                folder: String? = nil,
@@ -100,7 +118,7 @@ final class ObsidianExporterTests: XCTestCase {
     func test_fileName_survives_hostile_titles() {
         for hostile in ["", "   ", "///", "..", ".", "...", "\u{0000}\u{0007}", "<>|?*\"\\"] {
             let name = ObsidianExporter.fileName(for: makeRecording(title: hostile))
-            XCTAssertTrue(name.hasPrefix("2026-01-02"),
+            XCTAssertTrue(name.hasPrefix(Self.expectedDatePrefix),
                           "\(hostile.debugDescription) should keep the date prefix, got \(name)")
             XCTAssertTrue(name.hasSuffix(".md"))
             XCTAssertFalse(name.hasPrefix("."), "must never be a dotfile: \(name)")
@@ -124,14 +142,35 @@ final class ObsidianExporterTests: XCTestCase {
     /// subfolder. `sanitizedTitle` alone would have let it through.
     func test_export_folder_named_dotdot_cannot_escape_the_subfolder() throws {
         settings.subfolder = "Notes"
-        let base = vault.appendingPathComponent("Notes").standardizedFileURL.path
-        for hostile in ["..", ".", "../..", ".hidden"] {
+        // `standardized` (lexical), not `standardizedFileURL` — the latter only
+        // strips a `/private` prefix for paths that already exist, so it
+        // renders the existing vault and a fresh destination differently.
+        let base = vault.appendingPathComponent("Notes").standardized.path
+        // "../.." is the one that shipped broken: `nameFragment` turns its "/"
+        // into a space, so a leading-dots-only strip stopped at that space and
+        // handed back a live "..".
+        for hostile in ["..", ".", "../..", ".hidden", ". ..", ".\t..", ". . ..",
+                        "....", " ..", "..\\..", ".. "] {
             let rec = makeRecording(title: "T-\(hostile)", summary: "S", folder: hostile)
             let url = try XCTUnwrap(exporter.export(rec))
-            let dir = url.deletingLastPathComponent().standardizedFileURL.path
+            let dir = url.deletingLastPathComponent().standardized.path
             XCTAssertTrue(dir == base || dir.hasPrefix(base + "/"),
                           "folder \(hostile.debugDescription) escaped to \(dir)")
             XCTAssertFalse(url.lastPathComponent.hasPrefix("."))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: url.path),
+                          "folder \(hostile.debugDescription) reported a path it did not write")
+        }
+    }
+
+    /// The hostile title/folder combination, checked at the level that
+    /// actually matters: nothing lands outside the vault, whatever the inputs.
+    func test_export_never_writes_outside_the_vault() throws {
+        settings.subfolder = ". .."
+        for folder in ["..", ". ..", "../..", nil] {
+            let rec = makeRecording(title: ".. ../..", summary: "S", folder: folder)
+            let url = try XCTUnwrap(exporter.export(rec))
+            XCTAssertTrue(ObsidianPathSanitizer.isContained(url, in: vault),
+                          "wrote outside the vault: \(url.path)")
         }
     }
 
@@ -213,15 +252,99 @@ final class ObsidianExporterTests: XCTestCase {
         let count = exporter.exportAll([a, b, empty])
         XCTAssertEqual(count, 2, "the empty recording should be skipped")
         XCTAssertTrue(FileManager.default.fileExists(
-            atPath: vault.appendingPathComponent("2026-01-02 Alpha.md").path))
+            atPath: vault.appendingPathComponent("\(Self.expectedDatePrefix) Alpha.md").path))
         XCTAssertTrue(FileManager.default.fileExists(
-            atPath: vault.appendingPathComponent("Work/2026-01-02 Beta.md").path),
+            atPath: vault.appendingPathComponent("Work/\(Self.expectedDatePrefix) Beta.md").path),
             "a filed recording should nest under its Mila folder")
     }
 
     func test_exportAll_noop_when_disabled() {
         settings.enabled = false
         XCTAssertEqual(exporter.exportAll([makeRecording(summary: "S")]), 0)
+    }
+
+    /// A rename changes *two* paths (the new file plus the removed old one) for
+    /// a single written note. The returned count — which the Settings backfill
+    /// label and the git commit subject both quote — must count notes, not
+    /// paths.
+    func test_exportAll_counts_notes_not_changed_paths() throws {
+        var rec = makeRecording(title: "Before", summary: "S")
+        XCTAssertEqual(exporter.exportAll([rec]), 1)
+        rec.title = "After"
+        XCTAssertEqual(exporter.exportAll([rec]), 1,
+                       "a rename is still one note, not two changed paths")
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: vault.appendingPathComponent("\(Self.expectedDatePrefix) Before.md").path),
+            "the old note should be removed by the rename")
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: vault.appendingPathComponent("\(Self.expectedDatePrefix) After.md").path))
+    }
+
+    // MARK: - Written index
+
+    /// The index stores a path *relative to the vault it was written into*. If
+    /// the key isn't scoped to that vault, switching vaults and then renaming
+    /// makes the rename cleanup delete `<newVault>/<oldRelativePath>` — some
+    /// unrelated file — and orphan the real note in the old vault.
+    func test_rename_after_a_vault_switch_does_not_delete_in_the_new_vault() throws {
+        var rec = makeRecording(title: "Before", summary: "S")
+        XCTAssertNotNil(exporter.export(rec))
+
+        // A second vault, holding a same-named file the user owns.
+        let other = tempRoot.appendingPathComponent("OtherVault", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        let bystander = other.appendingPathComponent("\(Self.expectedDatePrefix) Before.md")
+        try "not ours".write(to: bystander, atomically: true, encoding: .utf8)
+        XCTAssertTrue(settings.setVault(other))
+
+        rec.title = "After"
+        XCTAssertNotNil(exporter.export(rec))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: bystander.path),
+                      "a rename in a different vault must not delete a file in this one")
+        XCTAssertEqual(try String(contentsOf: bystander, encoding: .utf8), "not ours")
+        // And the note that really was ours is still where we left it.
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: vault.appendingPathComponent("\(Self.expectedDatePrefix) Before.md").path))
+    }
+
+    /// A pre-scoping (bare-UUID) index entry is adopted for the current vault
+    /// when the file it names is actually there, so an upgrade doesn't leave a
+    /// duplicate behind on the first rename.
+    func test_legacy_index_entry_is_migrated_when_the_file_is_present() throws {
+        var rec = makeRecording(title: "Before", summary: "S")
+        let old = try XCTUnwrap(exporter.export(rec))
+
+        // Rewrite the index the way the pre-scoping build stored it.
+        defaults.set([rec.id.uuidString: old.lastPathComponent],
+                     forKey: ObsidianExporter.writtenIndexKey)
+
+        rec.title = "After"
+        XCTAssertNotNil(exporter.export(rec))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: old.path),
+                       "the legacy entry should still drive the rename cleanup")
+    }
+
+    // MARK: - Markdown line safety
+
+    /// Headings and checklist items are line-based: a newline in a title or an
+    /// action item would otherwise split the construct.
+    func test_markdown_flattens_newlines_in_heading_and_action_items() {
+        let rec = makeRecording(title: "Team\nSync", summary: "S",
+                                actionItems: [action("Ship it\nby Friday")])
+        let md = ObsidianExporter.markdown(for: rec)
+        let lines = md.components(separatedBy: "\n")
+        XCTAssertEqual(lines.first, "# Team Sync")
+        XCTAssertTrue(lines.contains("- [ ] Ship it by Friday"))
+
+        // Whatever the line ending, nothing survives that could break a
+        // line-based construct.
+        for raw in ["A\nB", "A\r\nB", "A\rB", "A\u{2028}B"] {
+            let flat = ObsidianExporter.singleLine(raw)
+            XCTAssertFalse(flat.contains("\n"), raw.debugDescription)
+            XCTAssertFalse(flat.contains("\r"), raw.debugDescription)
+            XCTAssertTrue(flat.hasPrefix("A"), raw.debugDescription)
+            XCTAssertTrue(flat.hasSuffix("B"), raw.debugDescription)
+        }
     }
 
     // MARK: - Pending gate
