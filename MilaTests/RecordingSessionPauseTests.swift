@@ -194,6 +194,49 @@ final class RecordingSessionPauseTests: XCTestCase {
                       "a flatlined counter must still trip the watchdog during a pause")
     }
 
+    /// The two tests above pin the *policy* — given a counter that keeps
+    /// growing, no stall is declared. They pass whether or not a pause
+    /// actually leaves the counter growing, because they drive
+    /// `CaptureStallDetector` directly.
+    ///
+    /// This pins the *structural* half they depend on: `pause()` must leave
+    /// `MicrophoneRecorder` running. The frame counter lives inside the audio
+    /// tap, so a pause that stopped the engine (or moved the gate up into the
+    /// tap) would flatline it, the watchdog would read the pause as a yanked
+    /// device, and #147's rebuild loop would be back — with both policy tests
+    /// above still green. This is the assertion that would fail instead.
+    func test_pause_leaves_the_capture_engine_running() async throws {
+        let session = RecordingSession()
+        // Bring the recorder up through its test seam, so there's a genuinely
+        // "running" recorder without a microphone. The watchdog is armed on
+        // this path too and the seam installs no tap, so the frame count never
+        // grows — a long stall timeout keeps it from firing mid-test and
+        // muddying `restartCount`.
+        session.mic.captureStallTimeout = 600
+        session.mic.bringUpOverride = { }
+        try await session.mic.start()
+        XCTAssertTrue(session.mic.isRunning)
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("pause-engine-\(UUID().uuidString).wav")
+        await session.startFakeForTesting(outputURL: url)
+
+        await session.pause()
+        XCTAssertTrue(session.mic.isRunning,
+                      "pause() must not stop the capture engine — a stopped engine stops the frame counter, which is exactly what the stall watchdog treats as a dead device (#147)")
+        XCTAssertEqual(session.mic.restartCount, 0,
+                       "pausing must not provoke a capture rebuild")
+
+        session.resume()
+        XCTAssertTrue(session.mic.isRunning,
+                      "resume() must not depend on a fresh bring-up")
+        XCTAssertEqual(session.mic.restartCount, 0)
+
+        // Teardown stays `stop()`'s job, not `pause()`'s.
+        _ = await session.stop()
+        XCTAssertFalse(session.mic.isRunning, "stop() still tears the engine down")
+    }
+
     // MARK: - Live-pipeline resume detection
 
     /// `MilaApp`'s live-pipeline observer decides "new recording" vs "resumed
