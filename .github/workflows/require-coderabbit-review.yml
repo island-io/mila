@@ -96,13 +96,14 @@ jobs:
             // from a stale payload.
             let pr = context.payload.pull_request;
             if (!pr) {
-              const number =
-                context.payload.issue?.number ?? context.payload.pull_request?.number;
-              if (!number) {
+              const issueNumber = context.payload.issue?.number;
+              if (!issueNumber) {
                 core.info('No pull request in this event payload; nothing to check.');
                 return;
               }
-              pr = (await github.rest.pulls.get({ owner, repo, pull_number: number })).data;
+              pr = (
+                await github.rest.pulls.get({ owner, repo, pull_number: issueNumber })
+              ).data;
             }
             const number = pr.number;
             const head = pr.head.sha;
