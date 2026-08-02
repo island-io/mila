@@ -340,7 +340,7 @@ jobs:
             // evidence of a review; counting it would reopen exactly the hole
             // this workflow closes.
             const REVIEWED_BETWEEN_RE =
-              /reviewing files that changed[\s\S]{0,200}?\bbetween\s+([0-9a-f]{7,40})\s+and\s+([0-9a-f]{7,40})\b/gi;
+              /reviewing files that changed[\s\S]{0,200}?\bbetween\s+`?([0-9a-f]{7,40})`?\s+and\s+`?([0-9a-f]{7,40})`?/gi;
             const NOT_A_VERDICT_RE =
               /<!--[^>]*\b(?:rate limited|review in progress) by coderabbit\.ai\b[^>]*-->/i;
             const VERDICT_RE =
