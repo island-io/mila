@@ -62,6 +62,18 @@ Anything a user could file a bug about does not qualify for the label.
 reviewed head"**) fails any PR whose **current head commit** has no CodeRabbit
 review.
 
+### Triaging a red "CodeRabbit reviewed head"
+
+Read the job log line `signals — review@head:… inline@head:… verdict:…
+walkthrough@head:… rateLimitNotices:…`, then:
+
+- `rateLimitNotices` > 0 and all signals `no` → **quota stall**, not a gap. See
+  *The quota is per PR author* below.
+- all signals `no`, no rate-limit notice, and CodeRabbit has plainly commented
+  on the head → likely a **detector gap**; check the comment against the four
+  signals below before assuming the bot misbehaved.
+- otherwise → **a real gap**: the head genuinely has no review.
+
 ### Do not trust the `CodeRabbit` status check
 
 The `CodeRabbit` status check that the app itself posts goes **green even when
@@ -101,25 +113,19 @@ Exactly one of these, and it must point at the **current head SHA**:
    - an actual verdict string — `No actionable comments were generated` or
      `Actionable comments posted:`.
 
-**Why signal 4 exists.** When a review finds *nothing*, CodeRabbit files **no
-review object at all** and posts no "Review complete" line — just one issue
-comment beginning "No actionable comments were generated in the recent review".
-Signals 1–3 all miss that shape, so the gate reported such PRs as unreviewed
-forever. It happened on #163 (walkthrough posted 22 seconds after the PR
-opened, naming head `016d9177`), and an audit of the last 40 PRs found the same
-false negative on #138, #113 and #107. It cost most of a working day: the red
-check was read as a rate limit, then as CodeRabbit refusing incremental
-re-reviews, and empty commits were pushed to force a re-review — all chasing a
-detection bug.
+**Why signal 4 exists.** A review that finds *nothing* files **no review object
+at all** and posts no "Review complete" line — only that issue comment. Signals
+1–3 all miss it, so the gate called such PRs unreviewed forever: #163
+(walkthrough posted 22s after the PR opened), and #138, #113, #107, #101 in an
+audit of the last 45 PRs. It cost a day of chasing imaginary rate limits.
 
-Both halves are required for a reason. The prose names no commit, so on its own
-it cannot prove *which* code was read. The commit line names commits but only
-says they were **fetched** — CodeRabbit **edits one comment in place** through
-its whole lifecycle, and both the rate-limit notice and the "review in
-progress" placeholder carry that same line while being the opposite of a
-finished review. Only the pair — a head-naming commit line **and** a verdict,
-with no state marker contradicting it — means "a review concluded on this
-commit".
+**Why it needs all three conditions.** The prose names no commit, so it cannot
+prove *which* code was read. The commit line names commits but only says they
+were **fetched** — and CodeRabbit **edits one comment id in place** through its
+whole lifecycle, so the same comment can be a placeholder, then a verdict, then
+a rate-limit notice for the next push. #163's walkthrough is now, in place, a
+rate-limit notice naming a newer head. Only commit line **+** verdict **+** no
+contradicting marker means "a review concluded on this commit".
 
 ### What does *not* count (the traps)
 
@@ -187,6 +193,17 @@ supersedes the earlier red one.
 - **Dependabot is deliberately not exempt** here (unlike the linked-issue
   gate): CodeRabbit does review dependabot PRs, so there is nothing to work
   around.
+
+### The quota is per PR *author*
+
+The review limit is not per repo and not per whoever asks — it belongs to the
+**PR author**, and the notices name them (`@urisland`, `@ValeroK`). Nobody else
+can top it up or review on their behalf, so once an author is out of quota
+their PR can sit unreviewable indefinitely, however many people comment on it.
+
+The way out is to re-open the same branch as a PR from an account that has
+quota (#164 / #165 are the worked example). Preserve authorship with a
+`Co-authored-by:` trailer when you do.
 
 ### When the manual review command actually helps
 
