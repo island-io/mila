@@ -50,9 +50,17 @@ enum ObsidianPathSanitizer {
     ///     dot-strip saw `".. .."`, stopped at the space, and left `".."`.
     ///
     /// Either one resolved a note *above* the configured destination.
+    ///
+    /// "Whitespace" here is the Unicode sense, not `" "`/`"\t"`. `nameFragment`
+    /// collapses only ASCII blanks, so a non-breaking space survives it and used
+    /// to stop the strip loop dead: `"\u{00A0}.hidden"` kept its leading dot and
+    /// produced a dotfile, and `"\u{00A0}.\u{00A0}.."` came through as `". .."`.
+    /// Neither escaped the vault — `nameFragment` has already removed every `/`,
+    /// and a bare `"."`/`".."` is rejected below — but both broke the rule this
+    /// function is documented to enforce.
     static func directoryComponent(_ raw: String) -> String {
         var name = nameFragment(raw)
-        while let first = name.first, first == "." || first == " " || first == "\t" {
+        while let first = name.first, first == "." || first.isWhitespace {
             name.removeFirst()
         }
         name = name.trimmingCharacters(in: .whitespaces)

@@ -111,8 +111,13 @@ final class ObsidianVaultSettingsTests: XCTestCase {
     /// The dot-stripping rule, pinned input by input. Every one of these
     /// reduced to a live `".."` under the leading-dots-only rule.
     func test_path_sanitizer_cannot_produce_a_traversal_component() {
+        // The `\u{00A0}` / `\u{2007}` entries are Unicode blanks that
+        // `nameFragment` does not collapse: they used to stop the strip loop and
+        // let a leading dot through.
         for hostile in [". ..", ".\t..", ". . ..", "../..", "..\\..", " ..", ".. ",
-                        "....", ". . . .", ".  ..", "./..", "..;..", "\t. ..\t"] {
+                        "....", ". . . .", ".  ..", "./..", "..;..", "\t. ..\t",
+                        "\u{00A0}..", "\u{00A0}.hidden", "\u{00A0}.\u{00A0}..",
+                        "\u{2007}.secret", "\u{2003}. .."] {
             let component = ObsidianPathSanitizer.directoryComponent(hostile)
             XCTAssertNotEqual(component, "..", "\(hostile.debugDescription) survived as ..")
             XCTAssertNotEqual(component, ".", "\(hostile.debugDescription) survived as .")
@@ -125,9 +130,17 @@ final class ObsidianVaultSettingsTests: XCTestCase {
         XCTAssertEqual(ObsidianPathSanitizer.relativePath("a/. ../. ../Desktop"), "a/Desktop")
         XCTAssertEqual(ObsidianPathSanitizer.relativePath("Notes/. ../. .."), "Notes")
 
+        // A Unicode blank is stripped exactly like an ASCII one, so the
+        // leading-dot rule holds however the name is spelled.
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("\u{00A0}.hidden"), "hidden")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("\u{00A0}.\u{00A0}.."), "")
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("\u{2007}.secret"), "secret")
+
         // A dot that isn't leading is an ordinary character, not a threat.
         XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("2026.01 Notes"), "2026.01 Notes")
         XCTAssertEqual(ObsidianPathSanitizer.directoryComponent(".. Real Name"), "Real Name")
+        // A Unicode blank *inside* a name is still an ordinary character.
+        XCTAssertEqual(ObsidianPathSanitizer.directoryComponent("Q1\u{00A0}Review"), "Q1\u{00A0}Review")
     }
 
     /// The containment guard the exporter leans on at write time.
