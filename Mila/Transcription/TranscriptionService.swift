@@ -935,11 +935,14 @@ final class TranscriptionService: ObservableObject {
     ///   in-flight language switch must not be rolled back by an older pass.
     ///
     /// **Deleted rows.** Returns `nil` — writing nothing — when the recording
-    /// is gone from the store entirely: hard-deleted, emptied from the trash,
-    /// or just removed by the `autoDropIfShortAndEmpty` gate that runs
-    /// immediately before the completion write. We never re-`add` it;
-    /// resurrecting a row the user deleted is the failure mode this whole
-    /// helper exists to prevent. A **soft**-deleted row is still written: its
+    /// is gone from the store entirely: hard-deleted from the sidebar, or
+    /// swept by Empty Trash. We never re-`add` it; resurrecting a row the user
+    /// deleted is the failure mode this whole helper exists to prevent. (The
+    /// `autoDropIfShortAndEmpty` gate that runs immediately before the
+    /// completion write also removes the row, so the merge can never fight it
+    /// — but its callers early-return on `true`, so that case never reaches
+    /// here. The `nil` branch is the backstop if that ever changes.)
+    /// A **soft**-deleted row is still written: its
     /// `deletedAt` is user-owned, so it stays in Recently Deleted, but the
     /// merge moves it out of `.running` into a terminal status (otherwise it
     /// would sit in the queue UI as "Transcribing" forever) and keeps the

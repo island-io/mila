@@ -932,12 +932,27 @@ final class TranscriptionServiceTests: XCTestCase {
         return live
     }
 
-    /// Drain the WAV→m4a transcode the completion path kicks off in a detached
-    /// `Task`. `waitForIdle` only tracks the queue, so without this the
-    /// compression can outlive the test and write into a `tempRoot` that
-    /// `tearDown` has already deleted. Idempotent — a no-op if it already ran.
-    private func drainPostCompletionCompression(_ id: UUID) async {
+    /// Settle the WAV→m4a transcode the completion path kicks off in a detached
+    /// `Task`. `waitForIdle` only tracks `activeRecordingID` and the queue, so
+    /// without this the transcode can outlive the test and run against a
+    /// `tempRoot` that `tearDown` has already removed.
+    ///
+    /// One `await store.compressRecordingAudio(id:)` is NOT a join on its own:
+    /// the in-flight guard (`compressingIDs`) is taken before the first
+    /// suspension, so if the detached task got there first our call returns
+    /// straight back while its transcode is still running. So kick it — a
+    /// no-op when the detached task already started or already finished — and
+    /// then wait for the observable end state: the row's audio is no longer
+    /// the `.wav`. Returns early if the row is gone (nothing left to settle).
+    private func drainPostCompletionCompression(_ id: UUID,
+                                                timeout: TimeInterval = 5) async {
         await store.compressRecordingAudio(id: id)
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            guard let current = store.recordings.first(where: { $0.id == id }) else { return }
+            if !current.audioFileName.lowercased().hasSuffix(".wav") { return }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
     }
 
     func test_rename_during_transcription_survives_the_write_back() async throws {
