@@ -151,13 +151,128 @@ final class RecordingTests: XCTestCase {
         )
         XCTAssertEqual(teamsByApp.detectedMeetingApp, .teams)
 
+        // Legacy titles were auto-derived from the captured app's display
+        // name, so the full "Microsoft Teams" is what actually shows up on
+        // disk — the bare word "Teams" deliberately does NOT match.
         let teamsByTitle = Recording(
-            title: "Teams · Yesterday",
+            title: "Microsoft Teams · Yesterday",
             source: .systemAudio,
             audioFileName: "x.wav"
         )
         XCTAssertEqual(teamsByTitle.detectedMeetingApp, .teams,
                       "Legacy recordings without appName should still match via title")
+
+        let teamsByBundleID = Recording(
+            title: "Standup · Apr 1",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "Microsoft Teams",
+            appBundleID: "com.microsoft.teams2"
+        )
+        XCTAssertEqual(teamsByBundleID.detectedMeetingApp, .teams,
+                       "A real Teams app-audio capture must still be detected")
+    }
+
+    /// The bundle ID is the authoritative signal — same key Core Audio uses
+    /// for live detection — and must beat both weaker string signals.
+    func test_detected_meeting_app_prefers_bundle_id_over_name_and_title() {
+        let teamsBundleZoomStrings = Recording(
+            title: "Zoom sync notes",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "zoom.us",
+            appBundleID: "com.microsoft.teams2"
+        )
+        XCTAssertEqual(teamsBundleZoomStrings.detectedMeetingApp, .teams,
+                       "appBundleID must win over a conflicting appName and title")
+
+        let zoomBundleTeamsStrings = Recording(
+            title: "Microsoft Teams sync notes",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "Microsoft Teams",
+            appBundleID: "us.zoom.xos"
+        )
+        XCTAssertEqual(zoomBundleTeamsStrings.detectedMeetingApp, .zoom,
+                       "appBundleID must win in both directions, not just by case order")
+    }
+
+    /// A bundle ID belonging to no known meeting app must not suppress the
+    /// weaker passes — the three passes are ordered, not mutually exclusive.
+    func test_detected_meeting_app_falls_back_when_bundle_id_unknown() {
+        let unknownBundleTeamsName = Recording(
+            title: "Standup",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "Microsoft Teams",
+            appBundleID: "com.apple.Safari"
+        )
+        XCTAssertEqual(unknownBundleTeamsName.detectedMeetingApp, .teams,
+                       "An unrecognised appBundleID should still allow the appName pass")
+    }
+
+    /// `"teams"` on its own is a substring of plenty of unrelated app names.
+    /// Only a Teams-specific match may light up the Teams badge.
+    func test_detected_meeting_app_ignores_apps_that_merely_contain_teams() {
+        let teamSpeak = Recording(
+            title: "Standup · Apr 1",
+            source: .systemAudio,
+            audioFileName: "x.wav",
+            appName: "TeamSpeak",
+            appBundleID: "com.teamspeak.TeamSpeak"
+        )
+        XCTAssertNil(teamSpeak.detectedMeetingApp,
+                     "TeamSpeak is not Microsoft Teams — neither its bundle ID nor its name may match")
+
+        let dreamTeams = Recording(
+            title: "Dream Teams · Apr 1",
+            source: .systemAudio,
+            audioFileName: "x.wav"
+        )
+        XCTAssertNil(dreamTeams.detectedMeetingApp,
+                     "A title merely containing 'Teams' must not be read as Microsoft Teams")
+
+        let syncNotes = Recording(
+            title: "teams sync notes",
+            source: .systemAudio,
+            audioFileName: "x.wav"
+        )
+        XCTAssertNil(syncNotes.detectedMeetingApp,
+                     "A bare 'teams' in a title is far too generic to badge as a meeting")
+    }
+
+    /// The title is user-editable and means nothing about where the audio
+    /// came from on a source that never captured another app. Renaming a
+    /// dictation or an imported Voice Memo must not badge it as a meeting.
+    func test_detected_meeting_app_ignores_title_for_non_capture_sources() {
+        for source in [RecordingSource.microphone, .voiceMemo] {
+            let renamedTeams = Recording(
+                title: "Microsoft Teams standup",
+                source: source,
+                audioFileName: "x.wav"
+            )
+            XCTAssertNil(renamedTeams.detectedMeetingApp,
+                         "A \(source.rawValue) recording renamed to mention Teams is not a Teams meeting")
+
+            let renamedZoom = Recording(
+                title: "Zoom call with Dana",
+                source: source,
+                audioFileName: "x.wav"
+            )
+            XCTAssertNil(renamedZoom.detectedMeetingApp,
+                         "A \(source.rawValue) recording renamed to mention Zoom is not a Zoom meeting")
+        }
+
+        // ...but the same title on a real capture source still matches.
+        for source in [RecordingSource.systemAudio, .meeting] {
+            let captured = Recording(
+                title: "Microsoft Teams standup",
+                source: source,
+                audioFileName: "x.wav"
+            )
+            XCTAssertEqual(captured.detectedMeetingApp, .teams,
+                           "The title fallback must survive for \(source.rawValue) captures")
+        }
     }
 
     /// `appName` is the authoritative signal and must beat a conflicting
@@ -204,7 +319,8 @@ final class RecordingTests: XCTestCase {
             title: "Standup",
             source: .systemAudio,
             audioFileName: "x.wav",
-            appName: "zoom.us"
+            appName: "zoom.us",
+            appBundleID: "us.zoom.xos"
         )
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -214,6 +330,8 @@ final class RecordingTests: XCTestCase {
         decoder.dateDecodingStrategy = .iso8601
         let decoded = try decoder.decode(Recording.self, from: data)
         XCTAssertEqual(decoded.appName, "zoom.us")
+        XCTAssertEqual(decoded.appBundleID, "us.zoom.xos")
+        XCTAssertEqual(decoded.detectedMeetingApp, .zoom)
     }
 
     func test_legacy_records_without_appName_decode_with_nil() throws {
@@ -236,6 +354,7 @@ final class RecordingTests: XCTestCase {
         decoder.dateDecodingStrategy = .iso8601
         let decoded = try decoder.decode(Recording.self, from: legacy)
         XCTAssertNil(decoded.appName)
+        XCTAssertNil(decoded.appBundleID)
     }
 
     func test_format_duration_pads_minutes_and_seconds() {

@@ -170,6 +170,7 @@ enum DiagnosticReporter {
         dict["duration_seconds"] = rec.duration
         dict["source"] = rec.source.rawValue
         dict["app_name"] = rec.appName ?? NSNull()
+        dict["app_bundle_id"] = rec.appBundleID ?? NSNull()
         dict["language"] = rec.language
         dict["model_name"] = rec.modelName ?? NSNull()
         dict["status"] = rec.status.rawValue

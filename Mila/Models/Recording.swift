@@ -65,6 +65,15 @@ struct Recording: Identifiable, Codable, Hashable {
     /// microphone-only or system-wide system-audio captures.
     var appName: String?
 
+    /// The captured app's bundle identifier, recorded alongside `appName`
+    /// for app-audio (and meeting) captures. This — not the display name —
+    /// is the authoritative signal for `detectedMeetingApp`: it's the same
+    /// key Core Audio uses for live meeting detection, it isn't localized,
+    /// and it can't be mangled by a rename. nil for microphone-only or
+    /// system-wide captures, and for recordings saved before this field
+    /// existed (those fall back to the `appName`/`title` substrings).
+    var appBundleID: String?
+
     /// Rolling Live-AI summary captured at the moment recording stopped.
     /// nil for any recording that ran without Live AI mode active.
     var summary: String?
@@ -121,6 +130,7 @@ struct Recording: Identifiable, Codable, Hashable {
          deletedAt: Date? = nil,
          folder: String? = nil,
          appName: String? = nil,
+         appBundleID: String? = nil,
          summary: String? = nil,
          actionItems: [ActionItem]? = nil,
          voiceMemoUniqueID: String? = nil,
@@ -140,6 +150,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.deletedAt = deletedAt
         self.folder = folder
         self.appName = appName
+        self.appBundleID = appBundleID
         self.summary = summary
         self.actionItems = actionItems
         self.voiceMemoUniqueID = voiceMemoUniqueID
@@ -179,6 +190,7 @@ struct Recording: Identifiable, Codable, Hashable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
+             appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
              speakerNames
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
@@ -201,6 +213,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         self.folder = try c.decodeIfPresent(String.self, forKey: .folder)
         self.appName = try c.decodeIfPresent(String.self, forKey: .appName)
+        self.appBundleID = try c.decodeIfPresent(String.self, forKey: .appBundleID)
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
         self.actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
@@ -226,6 +239,7 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(deletedAt, forKey: .deletedAt)
         try c.encodeIfPresent(folder, forKey: .folder)
         try c.encodeIfPresent(appName, forKey: .appName)
+        try c.encodeIfPresent(appBundleID, forKey: .appBundleID)
         try c.encodeIfPresent(summary, forKey: .summary)
         try c.encodeIfPresent(actionItems, forKey: .actionItems)
         try c.encodeIfPresent(voiceMemoUniqueID, forKey: .voiceMemoUniqueID)
@@ -236,31 +250,44 @@ struct Recording: Identifiable, Codable, Hashable {
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 
-    /// The known meeting app this recording appears to have come from, if
-    /// any. Checks `appName` first (set when the recording was started via
-    /// the manual "App Audio" picker), falling back to a `title`-substring
-    /// check so recordings captured before `appName` existed still match.
-    /// Used by list rows to surface an app-specific badge (e.g. Zoom-blue,
-    /// Teams-purple) instead of the generic source icon.
+    /// Sources whose recordings can plausibly have come from a meeting app:
+    /// only captures that actually pulled another app's audio. A
+    /// `.microphone` or `.voiceMemo` recording never did, so its (freely
+    /// user-editable) title must not be scanned for app names — otherwise
+    /// renaming a dictation to "teams sync" badges it as a Teams meeting.
+    static let meetingAppSources: Set<RecordingSource> = [.systemAudio, .meeting]
+
+    /// The known meeting app this recording came from, if any. Used by list
+    /// rows to surface an app-specific badge (Zoom-blue, Teams-purple)
+    /// instead of the generic source icon.
     ///
-    /// `appName` is matched against EVERY app before the title fallback is
-    /// tried for any of them — the two passes must not be interleaved. A
-    /// single pass that checks "appName or title" per app lets an earlier
-    /// case win on the weaker signal: a Teams recording (`appName ==
-    /// "Microsoft Teams"`) whose title happens to mention Zoom would be
-    /// badged as Zoom purely because `.zoom` is declared first. `appName` is
-    /// the authoritative signal; the title is only a legacy guess.
+    /// Three passes, strongest signal first, each tried against EVERY app
+    /// before the next one runs for any of them — they must not be
+    /// interleaved. A single pass that checks "bundle ID or appName or
+    /// title" per app lets an earlier case win on a weaker signal: a Teams
+    /// recording whose title happens to mention Zoom would be badged Zoom
+    /// purely because `.zoom` is declared first.
+    ///
+    /// 1. `appBundleID` — authoritative. Same key Core Audio uses for live
+    ///    detection, not localized, not user-editable.
+    /// 2. `appName` — the captured app's (localized) display name, for
+    ///    recordings saved before `appBundleID` existed.
+    /// 3. `title` — a legacy guess for recordings saved before `appName`
+    ///    existed, whose title was auto-derived from the app name. Gated on
+    ///    `meetingAppSources` because the title is user-editable and means
+    ///    nothing on a mic or Voice Memo recording.
+    ///
+    /// Passes 2 and 3 are substring matches, so `MeetingApp.matchSubstring`
+    /// has to stay specific enough not to collide with unrelated apps.
     var detectedMeetingApp: MeetingApp? {
-        if let name = appName?.lowercased(),
-           let byAppName = MeetingApp.allCases.first(where: {
-               name.contains($0.info.matchSubstring)
-           }) {
+        if let appBundleID, let byBundleID = MeetingApp.matching(bundleID: appBundleID) {
+            return byBundleID
+        }
+        if let appName, let byAppName = MeetingApp.matching(text: appName) {
             return byAppName
         }
-        let loweredTitle = title.lowercased()
-        return MeetingApp.allCases.first {
-            loweredTitle.contains($0.info.matchSubstring)
-        }
+        guard Recording.meetingAppSources.contains(source) else { return nil }
+        return MeetingApp.matching(text: title)
     }
 }
 

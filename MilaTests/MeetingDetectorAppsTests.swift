@@ -22,6 +22,27 @@ final class MeetingDetectorAppsTests: XCTestCase {
         }
     }
 
+    /// The live detector (Core Audio bundle IDs) and the saved-recording
+    /// badge (`MeetingApp`) are separate types by design, but they must
+    /// agree on identity: a capture started from a detected meeting has to
+    /// resolve back to a badge-able app from the very bundle ID the
+    /// detection fired on. Otherwise Mila prompts "you're in a Teams
+    /// meeting" and then saves the recording with a generic speaker icon.
+    func test_every_supported_app_maps_back_to_a_meeting_app_badge() {
+        for app in MeetingDetector.supportedApps {
+            XCTAssertNotNil(
+                MeetingApp.matching(bundleID: app.bundleID),
+                "No MeetingApp owns \(app.displayName)'s bundleID (\(app.bundleID))"
+            )
+            for prefix in app.captureBundlePrefixes {
+                XCTAssertNotNil(
+                    MeetingApp.matching(bundleID: prefix),
+                    "No MeetingApp owns \(app.displayName)'s capture prefix (\(prefix))"
+                )
+            }
+        }
+    }
+
     func test_canonical_bundle_id_is_covered_by_its_own_capture_prefixes() {
         for app in MeetingDetector.supportedApps {
             XCTAssertTrue(
