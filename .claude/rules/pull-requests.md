@@ -85,15 +85,21 @@ Exactly one of these, and it must point at the **current head SHA**:
    <short-sha>` for the head, e.g. "Review complete. I found no issues in
    `005bc14`." — CodeRabbit frequently files its verdict this way and posts no
    review object at all;
-4. an issue comment from `coderabbitai[bot]` carrying the **walkthrough**, whose
-   structured commit line ends at the head:
+4. an issue comment from `coderabbitai[bot]` carrying the **walkthrough**. This
+   one needs three things at once, because the commit line alone proves
+   nothing:
+   - the structured commit line, ending at the head:
 
-   > Reviewing files that changed from the base of the PR and between
-   > `<base-sha>` and `<head-sha>`.
+     > Reviewing files that changed from the base of the PR and between
+     > `<base-sha>` and `<head-sha>`.
 
-   Both the 40-char and abbreviated SHA forms are accepted. The match is
-   anchored on the **second** SHA — the first is the diff base, and matching
-   either would let the base of a later push masquerade as a review of it.
+     Both the 40-char and abbreviated forms are accepted. The match is anchored
+     on the **second** SHA — the first is the diff base, and matching either
+     would let the base of a later push masquerade as a review of it;
+   - **no** `rate limited by coderabbit.ai` or `review in progress by
+     coderabbit.ai` HTML state marker in the body;
+   - an actual verdict string — `No actionable comments were generated` or
+     `Actionable comments posted:`.
 
 **Why signal 4 exists.** When a review finds *nothing*, CodeRabbit files **no
 review object at all** and posts no "Review complete" line — just one issue
@@ -106,8 +112,14 @@ check was read as a rate limit, then as CodeRabbit refusing incremental
 re-reviews, and empty commits were pushed to force a re-review — all chasing a
 detection bug.
 
-The match is on the SHA, deliberately, and not on the "No actionable comments"
-prose: the prose names no commit, so it cannot prove *which* code was read.
+Both halves are required for a reason. The prose names no commit, so on its own
+it cannot prove *which* code was read. The commit line names commits but only
+says they were **fetched** — CodeRabbit **edits one comment in place** through
+its whole lifecycle, and both the rate-limit notice and the "review in
+progress" placeholder carry that same line while being the opposite of a
+finished review. Only the pair — a head-naming commit line **and** a verdict,
+with no state marker contradicting it — means "a review concluded on this
+commit".
 
 ### What does *not* count (the traps)
 
@@ -122,15 +134,24 @@ prose: the prose names no commit, so it cannot prove *which* code was read.
 
   This one is sharper than it looks. The rate-limit notice **embeds the same
   `Reviewing files that changed … between <base> and <head>` line as the
-  walkthrough**, naming the head it did *not* review. Across the last 40 PRs,
-  13 rate-limit notices name the then-current head that way — against 4 genuine
-  walkthroughs. Signal 4 therefore vetoes the whole comment body if it matches
-  the rate-limit pattern, exactly as signals 1 and 3 do.
+  walkthrough**, naming the head it did *not* review. Across the last 45 PRs,
+  19 of the 23 head-naming commit lines belong to a rate-limit notice — only 4
+  are genuine walkthroughs. Signal 4 therefore vetoes the whole comment body on
+  both the prose and the `rate limited by coderabbit.ai` marker, and signals 1
+  and 3 veto on the prose too.
+- **A "review in progress" placeholder.** CodeRabbit reuses one comment id and
+  edits it through its lifecycle, so the *same* comment can be a placeholder,
+  then a verdict, then a rate-limit notice for the next push — #163's
+  walkthrough was edited into a rate-limit notice naming a newer head, in
+  place. The placeholder also carries the commit line, so firing on it would
+  pass a review that has not finished. Rejected on its
+  `review in progress by coderabbit.ai` marker, and again by the missing
+  verdict string.
 - **A bare "Action performed / Review finished" acknowledgement.** That ~384-char
-  receipt is what the bot posts for *every* `@coderabbitai` command; it names no
-  commit and is not evidence that a review ran. It is by far the most common
-  CodeRabbit comment on this repo (77 of them in the last 40 PRs), and counting
-  it would reopen the exact hole this gate closes.
+  receipt is what the bot posts for *every* CodeRabbit command; it names no
+  commit, carries no verdict, and is not evidence that a review ran. It is by
+  far the most common CodeRabbit comment on this repo (77 of them in the last
+  40 PRs), and counting it would reopen the exact hole this gate closes.
 
 One more subtlety: for inline comments GitHub rolls `commit_id` *forward* to the
 newest commit where the thread still applies, so it does not prove the comment
@@ -167,6 +188,20 @@ supersedes the earlier red one.
   gate): CodeRabbit does review dependabot PRs, so there is nothing to work
   around.
 
-Rate-limited? Wait out the countdown before commenting `@coderabbitai review` —
-a request filed too early is refused, and repeated requests just churn the
-queue.
+### When the manual review command actually helps
+
+Auto-review is enabled here, so while a review is pending or already done the
+manual review command does nothing but reply "Review finished" — reaching for
+it out of impatience is noise.
+
+The exception matters: a review the **quota refused outright** is never
+retried. No push, no timer, nothing restarts it. Once the countdown in the
+rate-limit notice has elapsed, one manual review command is the only way to get
+that PR reviewed — #165 was reviewed minutes after exactly that. Filed *before*
+the countdown expires it is refused again and burns the attempt, so wait it out
+first.
+
+Note that the gate's own failure comment deliberately does not print the
+command literally: CodeRabbit parses commands out of any comment body, fenced
+or not, so a literal one in an automated comment makes the gate invoke a review
+on every failure (#162 / #163).

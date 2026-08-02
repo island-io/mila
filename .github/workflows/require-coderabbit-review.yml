@@ -300,29 +300,51 @@ jobs:
             // the gate called #163 unreviewed while this comment (posted 22s
             // after the PR opened) sat on it, which is why this signal exists.
             //
-            // The proof is the structured commit line inside the walkthrough:
-            //   Reviewing files that changed from the base of the PR and
-            //   between <base-sha> and <head-sha>.
-            // The SECOND sha is the revision that was reviewed; the first is the
-            // diff base. Anchoring on the second is the whole point — matching
-            // either would let the base of a later push masquerade as a review
-            // of it. Prose like "No actionable comments were generated" is
-            // deliberately NOT matched: it names no commit, so it cannot prove
-            // which code was read.
+            // It takes THREE independent things to count, because the commit
+            // line alone is not proof of anything.
             //
-            // TRAP: the identical line is embedded inside the RATE-LIMIT notice,
-            // where it names the head CodeRabbit did *not* review (#124 comment
-            // 5101648734, #150 5153138305, #148 5152740708 and #160 5157565115
-            // all name the then-current head that way). Hence the whole-body
-            // RATE_LIMIT_RE veto, as in signals (a) and (c).
+            // 1. The structured commit line, naming the head:
+            //      Reviewing files that changed from the base of the PR and
+            //      between <base-sha> and <head-sha>.
+            //    The SECOND sha is the revision that was reviewed; the first is
+            //    the diff base. Anchoring on the second is the point — matching
+            //    either would let the base of a later push masquerade as a
+            //    review of it.
+            //
+            // 2. No "this is not a verdict" state marker. CodeRabbit EDITS ONE
+            //    COMMENT IN PLACE through its whole lifecycle, and two of those
+            //    states carry the very same commit line while being the
+            //    opposite of a review:
+            //      <!-- ... rate limited by coderabbit.ai -->
+            //          the quota refused the review; the line names the head it
+            //          did NOT read. 19 of the 23 head-naming commit lines in
+            //          the last 45 PRs are this. #163's own walkthrough was
+            //          later edited into one of these in place, same comment id.
+            //      <!-- ... review in progress by coderabbit.ai -->
+            //          a placeholder posted while the review is still running;
+            //          firing on it would pass a review that has not finished.
+            //    RATE_LIMIT_RE (prose) is kept alongside the marker: on current
+            //    data the two coincide exactly, and either alone is enough.
+            //
+            // 3. An actual verdict string — "No actionable comments were
+            //    generated" or "Actionable comments posted:". The commit line
+            //    says which commits were *fetched*; only the verdict says a
+            //    review concluded on them. Requiring it is what makes states
+            //    (2) unnecessary to enumerate exhaustively: an unfinished or
+            //    refused review has no verdict to report.
             //
             // A bare "Action performed / Review finished" acknowledgement — the
-            // ~384-char receipt the bot posts for every `@coderabbitai` command
-            // — carries no commit line and therefore cannot match. That receipt
-            // is not evidence of a review; counting it would reopen exactly the
-            // hole this workflow closes.
+            // ~384-char receipt the bot posts for every command, and the single
+            // most common CodeRabbit comment on this repo — has neither a commit
+            // line nor a verdict, so it cannot match. That receipt is not
+            // evidence of a review; counting it would reopen exactly the hole
+            // this workflow closes.
             const REVIEWED_BETWEEN_RE =
               /reviewing files that changed[\s\S]{0,200}?\bbetween\s+([0-9a-f]{7,40})\s+and\s+([0-9a-f]{7,40})\b/gi;
+            const NOT_A_VERDICT_RE =
+              /<!--[^>]*\b(?:rate limited|review in progress) by coderabbit\.ai\b[^>]*-->/i;
+            const VERDICT_RE =
+              /No actionable comments were generated|Actionable comments posted:/i;
 
             // CodeRabbit writes both full and abbreviated SHAs; a >=7-char hex
             // prefix of the head (as enforced by the pattern) is the head.
@@ -330,7 +352,8 @@ jobs:
 
             const walkthroughComment = comments.filter(byBot).find((c) => {
               const body = c.body ?? '';
-              if (RATE_LIMIT_RE.test(body)) return false;
+              if (RATE_LIMIT_RE.test(body) || NOT_A_VERDICT_RE.test(body)) return false;
+              if (!VERDICT_RE.test(body)) return false;
               REVIEWED_BETWEEN_RE.lastIndex = 0;
               for (const m of body.matchAll(REVIEWED_BETWEEN_RE)) {
                 if (namesHead(m[2])) return true;
@@ -423,26 +446,30 @@ jobs:
               '',
               '1. Wait. Automatic review is enabled for this repo, so CodeRabbit',
               '   reviews each push on its own, usually within a couple of minutes.',
-              '   Do NOT comment the manual review command: CodeRabbit says it "is',
-              '   applicable only when automatic reviews are paused", and here it',
-              '   just replies "Review finished" without reviewing anything.',
+              '   While a review is pending or already done, the manual review',
+              '   command does nothing but reply "Review finished" — it "is',
+              '   applicable only when automatic reviews are paused". Do not reach',
+              '   for it out of impatience.',
               '',
-              '   Still nothing after several minutes? The likely cause is that the',
-              '   PR author has exhausted their CodeRabbit review quota — the limit',
-              '   is per author, not per repo, and nobody else can top it up.',
-              '   Re-opening the same branch under an account that has quota gets',
-              '   it reviewed.',
+              '   The exception is a review the quota **refused outright** (the',
+              '   warning above). Nothing retries a refused review — not a push,',
+              '   not a timer — so once the countdown has elapsed, one manual',
+              '   review command is the only way to restart it, and it works',
+              '   (#165). Filed before the countdown expires it is refused again,',
+              '   so wait it out first.',
               '',
-              '   Rate-limited? Wait out the countdown first — a request filed too',
-              '   early is refused and burns nothing but time.',
+              '   Still nothing? The limit is per PR *author*, not per repo, and',
+              '   nobody else can top it up. Re-opening the same branch under an',
+              '   account that has quota gets it reviewed.',
               '2. The check clears itself as soon as CodeRabbit posts its review',
               '   summary, its inline comments, a `Review complete` verdict, or the',
               '   walkthrough comment it posts when it finds nothing — any of them',
               `   naming \`${shortHead}\`.`,
               '',
               '<sub>An empty CodeRabbit reply, a bare "Action performed / Review',
-              'finished" acknowledgement, a review of an *older* commit, or a',
-              'rate-limit notice do not count — that is exactly the gap this check',
+              'finished" acknowledgement, a review of an *older* commit, a review',
+              'still in progress, or a rate-limit notice — even one naming this',
+              'very commit — do not count. That is exactly the gap this check',
               `closes. A maintainer can apply the \`${BYPASS_LABEL}\` label to`,
               'bypass it; that is the only escape hatch.</sub>',
             );
