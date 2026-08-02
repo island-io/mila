@@ -137,7 +137,12 @@ struct RecordingDetailView: View {
         return HStack(spacing: 10) {
             Menu {
                 Button {
-                    transcription.enqueue(recording)
+                    // Route through the live-store chokepoint (same as the
+                    // language-switch action) so status + audioFileName handling
+                    // stays consistent and we never enqueue a stale snapshot
+                    // whose `.wav` a since-run compression already deleted.
+                    guard let prepared = store.prepareForRetranscription(id: recording.id) else { return }
+                    transcription.enqueue(prepared, isRetranscription: true)
                 } label: {
                     Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
                           systemImage: "arrow.clockwise")
@@ -198,11 +203,12 @@ struct RecordingDetailView: View {
     /// Updates the persisted `Recording.language` so the downstream
     /// `TranscriptionService` picks the right model on its own.
     private func retranscribe(in language: RecordingLanguage) {
-        var copy = recording
-        copy.language = language.rawValue
-        copy.status = .pending
-        store.update(copy)
-        transcription.enqueue(copy)
+        // Mutate only language+status on the LIVE record so we don't clobber a
+        // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
+        guard let prepared = store.prepareForRetranscription(id: recording.id,
+                                                             language: language.rawValue)
+        else { return }
+        transcription.enqueue(prepared, isRetranscription: true)
     }
 
 
@@ -232,6 +238,27 @@ struct RecordingDetailView: View {
         return modelManager.selectedModel()?.displayName ?? ""
     }
 
+    /// What the transcript area shows while a recording has no segments.
+    /// `nil` means no placeholder — the active-transcription progress view
+    /// owns that state.
+    enum EmptyTranscriptPlaceholder: Equatable {
+        /// Queued behind the active transcription — the Transcribe menu is
+        /// disabled (see `busy` in `actionButtons`), so pointing the user
+        /// at it would be a dead end.
+        case waitingInQueue
+        /// Idle: invite the user to start a transcription themselves.
+        case clickTranscribe
+    }
+
+    /// Decision for the empty-segments placeholder, split out as a pure
+    /// function so RecordingDetailPlaceholderTests can pin the queued
+    /// case without building the view.
+    static func emptyTranscriptPlaceholder(isActive: Bool,
+                                           isQueued: Bool) -> EmptyTranscriptPlaceholder? {
+        if isActive { return nil }
+        return isQueued ? .waitingInQueue : .clickTranscribe
+    }
+
     @ViewBuilder
     private var transcriptArea: some View {
         if transcription.activeRecordingID == recording.id {
@@ -255,11 +282,23 @@ struct RecordingDetailView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if recording.segments.isEmpty {
-            ContentUnavailableView(
-                "No transcript yet",
-                systemImage: "text.alignleft",
-                description: Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to start.")
+            let placeholder = Self.emptyTranscriptPlaceholder(
+                isActive: transcription.activeRecordingID == recording.id,
+                isQueued: transcription.pendingIDs.contains(recording.id)
             )
+            if placeholder == .waitingInQueue {
+                ContentUnavailableView {
+                    Label("Waiting in queue", systemImage: "clock")
+                } description: {
+                    Text("Transcription will start when the recording ahead of it finishes.")
+                }
+            } else {
+                ContentUnavailableView(
+                    "No transcript yet",
+                    systemImage: "text.alignleft",
+                    description: Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to start.")
+                )
+            }
         } else {
             VStack(spacing: 0) {
                 // Transcript-area copy button, on the right just below the
@@ -290,12 +329,22 @@ struct RecordingDetailView: View {
                         // "Speaker A" so the user gets feedback that the
                         // detection ran (vs. silently failing to detect).
                         let hasSpeakers = recording.segments.contains { $0.speaker != nil }
+                        // Only color speaker labels once there's more than
+                        // one distinct speaker to tell apart — a single-
+                        // speaker recording keeps the plain tint color.
+                        let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,
                                        showSpeaker: hasSpeakers,
+                                       useSpeakerColor: hasMultipleSpeakers,
                                        language: recording.language,
-                                       onTap: { seek(to: seg.start) })
+                                       speakerNames: recording.speakerNames,
+                                       onTap: { seek(to: seg.start) },
+                                       onAssignName: { raw, name in
+                                           store.setSpeakerName(name, forSpeaker: raw,
+                                                                recordingID: recording.id)
+                                       })
                         }
                     }
                     .padding()
@@ -367,7 +416,8 @@ struct RecordingDetailView: View {
 
     private func copyTranscript() {
         let text = TranscriptFormatter.plainText(segments: recording.segments,
-                                                 fallback: recording.fullText)
+                                                 fallback: recording.fullText,
+                                                 names: recording.speakerNames)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
     }
@@ -424,6 +474,14 @@ private struct PlayPauseButton: View {
             if player.timeControlStatus == .playing {
                 player.pause()
             } else {
+                // AVPlayer parks at end-of-item when playback finishes and
+                // a bare play() there is a no-op — the button looked dead
+                // after a memo played to the end until the user dragged the
+                // slider back. Rewind first in that case.
+                if let item = player.currentItem, item.duration.isNumeric,
+                   item.duration.seconds - player.currentTime().seconds <= 0.1 {
+                    player.seek(to: .zero)
+                }
                 player.play()
             }
         } label: {
@@ -508,12 +566,21 @@ private struct SegmentRow: View {
     let segment: TranscriptSegment
     let isActive: Bool
     let showSpeaker: Bool
+    /// Whether to color the speaker label per-speaker rather than the
+    /// default tint — set by the caller once it's seen more than one
+    /// distinct speaker across the recording.
+    let useSpeakerColor: Bool
     /// Recording's language so we can render the raw `SPEAKER_00`
     /// label from pyannote as `Speaker A` / `דובר א׳` in the user's
     /// language — matching the labels the live view + post-recording
     /// action items already show.
     let language: String
+    /// User-assigned speaker names for this recording (raw ID → name).
+    let speakerNames: [String: String]
     let onTap: () -> Void
+    /// Persists a rename picked from the label's popover:
+    /// (raw speaker ID, chosen name or nil-to-reset).
+    let onAssignName: (String, String?) -> Void
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -522,10 +589,15 @@ private struct SegmentRow: View {
             // label "Speaker A" / "דובר א׳" and the actual content.
             // `fixedSize` keeps the label at its natural width.
             if showSpeaker, let raw = segment.speaker, !raw.isEmpty {
-                Text(raw.friendlySpeakerLabel(language: language) + ":")
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.tint)
-                    .fixedSize(horizontal: true, vertical: false)
+                SpeakerLabelButton(
+                    rawID: raw,
+                    names: speakerNames,
+                    language: language,
+                    color: useSpeakerColor ? raw.speakerColor(names: speakerNames) : Color.accentColor,
+                    suffix: ":",
+                    onAssign: { name in onAssignName(raw, name) }
+                )
+                .fixedSize(horizontal: true, vertical: false)
             }
             Text(segment.text)
                 .font(.body)

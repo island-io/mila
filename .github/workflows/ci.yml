@@ -20,7 +20,9 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Show toolchain
         run: |
@@ -38,7 +40,7 @@ jobs:
       # services both workflows.
       - name: Cache diarization bundle
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -53,7 +55,7 @@ jobs:
       # cold-path-only cost.
       - name: Cache whisper tiny + CoreML encoder
         id: tiny-coreml-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/whisper-coreml-test
           key: whisper-tiny-coreml-v1
@@ -95,10 +97,19 @@ jobs:
             build | xcpretty || true
 
       - name: Run unit tests
-        # Scope to MilaTests only. UI tests can't reliably foreground on
-        # hosted runners (see ios-tests.yml for the full explanation);
-        # gating CI on them would mean a permanently red status, which
-        # is worse than no UI-test signal at all.
+        # Scope to ONLY WhisperEngineCoreMLTests — the CoreML/ANE E2E test
+        # that this job uniquely sets up the CoreML model + env for. The
+        # rest of MilaTests is covered by the unit-and-ui-tests job; running
+        # the full suite here too redundantly re-ran subprocess-spawning
+        # tests on this overloaded runner (build + diarization bundle +
+        # whisper download all on one host), which caused contention flakes.
+        # In unit-and-ui-tests WhisperEngineCoreMLTests auto-skips because
+        # MILA_COREML_E2E isn't set there, so coverage doesn't overlap.
+        #
+        # UI tests can't reliably foreground on hosted runners (see
+        # ios-tests.yml for the full explanation); gating CI on them would
+        # mean a permanently red status, which is worse than no UI-test
+        # signal at all.
         #
         # MILA_COREML_E2E + MILA_COREML_MODEL unblock
         # `WhisperEngineCoreMLTests`, which verifies that whisper.cpp's
@@ -126,15 +137,27 @@ jobs:
           # lighter unit-and-ui-tests job and on a good roll. Retry failed
           # tests up to 3× (early-exit on first pass) so load-induced flakes
           # don't red the build. Genuine failures still fail all 3 attempts.
+          #
+          # `-test-timeouts-enabled` + allowances: retries DON'T catch a HANG
+          # (a test that never returns), so a single stuck subprocess test
+          # used to run the whole job out to its 30-min cap. With per-test
+          # timeouts a hung test is force-failed and then retried, bounding a
+          # hang to minutes instead of the full job budget. 240s default
+          # leaves room for the slowest legit test (the model-reenqueue test
+          # awaits waitForIdle TWICE, up to 90s each under this heavy job's
+          # load) while still bounding a true hang.
           xcodebuild \
             -project Mila.xcodeproj \
             -scheme Mila \
             -configuration Debug \
             -derivedDataPath build \
             -destination 'platform=macOS' \
-            -only-testing:MilaTests \
+            -only-testing:MilaTests/WhisperEngineCoreMLTests \
             -retry-tests-on-failure \
             -test-iterations 3 \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 240 \
+            -maximum-test-execution-time-allowance 480 \
             test
 
       - name: Run What's New popup UI test (non-fatal)

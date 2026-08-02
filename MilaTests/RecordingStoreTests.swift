@@ -40,6 +40,78 @@ final class RecordingStoreTests: XCTestCase {
         XCTAssertTrue(third.recordings.isEmpty)
     }
 
+    /// Regression: deleting an imported Voice Memo never stuck — the
+    /// importer dedups against the live store, and the source memo still
+    /// exists in the Voice Memos folder, so the next sync re-imported (and
+    /// re-transcribed) it. Permanent deletion must leave a persistent
+    /// tombstone the importer's dedup set includes.
+    func test_permanently_deleting_voice_memo_import_leaves_persistent_tombstone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Imported memo",
+                            source: .microphone,
+                            audioFileName: "memo.wav",
+                            voiceMemoUniqueID: "memo-unique-123")
+        store.add(rec)
+        XCTAssertTrue(store.voiceMemoTombstones.isEmpty)
+
+        store.permanentlyDelete(rec)
+        XCTAssertTrue(store.voiceMemoTombstones.contains("memo-unique-123"),
+                      "Deleting a voice-memo import must tombstone its unique ID")
+
+        // Survives a relaunch (the importer syncs on every launch).
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertTrue(reloaded.voiceMemoTombstones.contains("memo-unique-123"),
+                      "Tombstones must persist across store instances")
+    }
+
+    func test_setSpeakerName_sets_clears_and_persists() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Meeting", source: .meeting,
+                            audioFileName: "meeting.wav",
+                            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")])
+        store.add(rec)
+
+        store.setSpeakerName("  Daniel ", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(store.recordings.first?.speakerNames, ["SPEAKER_00": "Daniel"],
+                       "Name must be trimmed and stored keyed by the raw ID")
+
+        // Survives a relaunch via recordings.json.
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, ["SPEAKER_00": "Daniel"])
+
+        // nil (and empty/whitespace) clears the assignment.
+        reloaded.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, [:])
+        reloaded.setSpeakerName("Noa", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        reloaded.setSpeakerName("   ", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        XCTAssertEqual(reloaded.recordings.first?.speakerNames, [:])
+    }
+
+    func test_setSpeakerName_regenerates_srt_sidecar_for_completed_recording() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Meeting", source: .meeting,
+                            audioFileName: "meeting.wav",
+                            status: .completed,
+                            segments: [.init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00")])
+        store.add(rec)
+
+        store.setSpeakerName("Daniel", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+
+        let srtURL = store.recordingsDirectory.appendingPathComponent("meeting.srt")
+        let srt = try String(contentsOf: srtURL, encoding: .utf8)
+        XCTAssertTrue(srt.contains("Daniel: hi"),
+                      "The on-disk .srt sidecar must be rewritten with the assigned name")
+    }
+
+    func test_permanently_deleting_non_import_leaves_no_tombstone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Mic recording", source: .microphone,
+                            audioFileName: "plain.wav")
+        store.add(rec)
+        store.permanentlyDelete(rec)
+        XCTAssertTrue(store.voiceMemoTombstones.isEmpty)
+    }
+
     func test_soft_delete_moves_to_recently_deleted_and_restore_returns_it() {
         let store = RecordingStore(rootDirectory: tempRoot)
         let rec = Recording(title: "X", source: .microphone, audioFileName: "x.wav")
@@ -332,6 +404,28 @@ final class RecordingStoreTests: XCTestCase {
                        "permanentlyDelete must remove the summary sidecar too")
     }
 
+    func test_permanently_delete_removes_subtitle_sidecar() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "S", source: .microphone, audioFileName: "s.wav")
+        store.add(rec)
+        // The .srt sidecar is written post-transcription by TranscriptExporter,
+        // not by add() — simulate it landing next to the audio.
+        let srt = store.subtitleURL(for: rec)
+        try "1\n00:00:00,000 --> 00:00:01,000\nhi\n".write(to: srt, atomically: true, encoding: .utf8)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: srt.path))
+
+        store.permanentlyDelete(rec)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: srt.path),
+                       "permanentlyDelete must remove the .srt subtitle sidecar too")
+    }
+
+    func test_subtitle_filename_derived_from_audio_filename() {
+        let rec = Recording(title: "X",
+                            source: .microphone,
+                            audioFileName: "Voice Memo 2024-01-01.m4a")
+        XCTAssertEqual(rec.subtitleFileName, "Voice Memo 2024-01-01.srt")
+    }
+
     func test_summary_filename_derived_from_audio_filename() {
         let rec = Recording(title: "X",
                             source: .microphone,
@@ -351,6 +445,73 @@ final class RecordingStoreTests: XCTestCase {
                        "Whitespace-only summary must be treated as empty")
     }
 
+    // MARK: - Stopping a queued/running transcription
+
+    /// Stopping a `.running` recording from the Queue moves it to Recently
+    /// Deleted (soft-delete) and marks it terminal, so it drops out of the
+    /// Queue and the main list instead of lingering as a "Failed" row — while
+    /// the audio stays recoverable via Restore.
+    func test_stop_transcription_trashes_running_recording() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        var rec = Recording(title: "In progress", source: .microphone, audioFileName: "r.wav")
+        rec.status = .running
+        store.add(rec)
+
+        store.stopTranscription(rec)
+
+        let stored = store.recordings.first { $0.id == rec.id }
+        XCTAssertEqual(stored?.status, .failed)
+        XCTAssertTrue(stored?.isTrashed == true, "Stopped recording should move to Recently Deleted")
+    }
+
+    /// Same for a `.pending` item still waiting its turn.
+    func test_stop_transcription_trashes_pending_recording() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Waiting", source: .microphone,
+                            audioFileName: "p.wav", status: .pending)
+        store.add(rec)
+
+        store.stopTranscription(rec)
+
+        let stored = store.recordings.first { $0.id == rec.id }
+        XCTAssertEqual(stored?.status, .failed)
+        XCTAssertTrue(stored?.isTrashed == true)
+    }
+
+    /// Stopping an already-completed recording is a no-op — we must not trash a
+    /// finished recording or clobber its status if the row is stale (e.g. the
+    /// run finished between the user clicking Stop and the mutation landing).
+    func test_stop_transcription_is_noop_for_completed_recording() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Done", source: .microphone,
+                            audioFileName: "d.wav", status: .completed,
+                            fullText: "hello")
+        store.add(rec)
+
+        store.stopTranscription(rec)
+
+        let stored = store.recordings.first { $0.id == rec.id }
+        XCTAssertEqual(stored?.status, .completed)
+        XCTAssertFalse(stored?.isTrashed == true, "A completed recording must not be trashed by a stale Stop")
+    }
+
+    /// Removing from the Queue reuses `permanentlyDelete`, so both the metadata
+    /// and the on-disk audio go away.
+    func test_permanently_delete_removes_queued_recording_and_audio() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let audioURL = store.freshAudioURL(suggestedName: "Queued")
+        try Data(repeating: 0, count: 1024).write(to: audioURL)
+        let rec = Recording(title: "Queued", source: .microphone,
+                            audioFileName: audioURL.lastPathComponent, status: .running)
+        store.add(rec)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: audioURL.path))
+
+        store.permanentlyDelete(rec)
+
+        XCTAssertNil(store.recordings.first { $0.id == rec.id })
+        XCTAssertFalse(FileManager.default.fileExists(atPath: audioURL.path))
+    }
+
     func test_load_seeds_folders_from_recordings_when_folders_file_missing() throws {
         // Simulates a recordings.json that already references a folder name
         // (e.g. after restoring from backup, or hand-editing the JSON).
@@ -365,5 +526,75 @@ final class RecordingStoreTests: XCTestCase {
 
         let reloaded = RecordingStore(rootDirectory: tempRoot)
         XCTAssertEqual(reloaded.folders, ["Imported"])
+    }
+
+    // MARK: - Voice Memos un-select cleanup (issue #57, part 1)
+
+    /// Build a Voice-Memo import stub with a recorded source folder.
+    private func voiceMemoImport(_ id: String,
+                                 fromFolderID folderID: String?) -> Recording {
+        Recording(title: "Memo \(id)",
+                  source: .voiceMemo,
+                  audioFileName: "\(id).wav",
+                  voiceMemoUniqueID: "unique-\(id)",
+                  voiceMemoFolderUUID: folderID)
+    }
+
+    func test_voiceMemoRecordings_fromFolderID_selectsOnlyMatchingOrigin() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("b", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("c", fromFolderID: "FOLDER-2"))
+        store.add(voiceMemoImport("d", fromFolderID: Recording.voiceMemoUnfiledFolderID))
+        // Legacy import (origin never recorded) + a plain mic recording must
+        // never be selected.
+        store.add(voiceMemoImport("legacy", fromFolderID: nil))
+        store.add(Recording(title: "Mic", source: .microphone, audioFileName: "mic.wav"))
+
+        XCTAssertEqual(Set(store.voiceMemoRecordings(fromFolderID: "FOLDER-1").map(\.voiceMemoUniqueID)),
+                       ["unique-a", "unique-b"])
+        XCTAssertEqual(store.voiceMemoRecordings(fromFolderID: "FOLDER-2").map(\.voiceMemoUniqueID),
+                       ["unique-c"])
+        XCTAssertEqual(store.voiceMemoRecordings(fromFolderID: Recording.voiceMemoUnfiledFolderID).map(\.voiceMemoUniqueID),
+                       ["unique-d"])
+    }
+
+    func test_softDeleteVoiceMemos_movesMatchingToTrash_leavesOthers() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("b", fromFolderID: "FOLDER-1"))
+        store.add(voiceMemoImport("c", fromFolderID: "FOLDER-2"))
+        store.add(voiceMemoImport("legacy", fromFolderID: nil))
+
+        let removed = store.softDeleteVoiceMemos(fromFolderID: "FOLDER-1")
+        XCTAssertEqual(removed, 2)
+
+        // The two FOLDER-1 imports are trashed but still present (restorable).
+        let trashedIDs = Set(store.recordings.filter { $0.isTrashed }.map(\.voiceMemoUniqueID))
+        XCTAssertEqual(trashedIDs, ["unique-a", "unique-b"])
+        // FOLDER-2 and the legacy nil-origin import are untouched.
+        XCTAssertEqual(Set(store.recordings.filter { !$0.isTrashed }.map(\.voiceMemoUniqueID)),
+                       ["unique-c", "unique-legacy"])
+    }
+
+    /// Soft-delete (not permanent) so no tombstone is written — the recordings
+    /// stay in the store, so re-selecting the folder can't create duplicates,
+    /// and the source memos in Voice Memos are never touched.
+    func test_softDeleteVoiceMemos_doesNotTombstone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+
+        store.softDeleteVoiceMemos(fromFolderID: "FOLDER-1")
+        XCTAssertTrue(store.voiceMemoTombstones.isEmpty,
+                      "Un-select cleanup must not tombstone — it's a recoverable soft-delete")
+        XCTAssertEqual(store.recordings.count, 1, "The recording stays in the store")
+        XCTAssertTrue(store.recordings.first?.isTrashed ?? false)
+    }
+
+    func test_softDeleteVoiceMemos_noMatches_returnsZero() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(voiceMemoImport("a", fromFolderID: "FOLDER-1"))
+        XCTAssertEqual(store.softDeleteVoiceMemos(fromFolderID: "FOLDER-UNKNOWN"), 0)
+        XCTAssertFalse(store.recordings.first?.isTrashed ?? true)
     }
 }

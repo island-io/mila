@@ -3,6 +3,7 @@ import AppKit
 import Combine
 import OSLog
 import Sparkle
+import TranscriptionCore
 
 /// Wraps Sparkle's `SPUStandardUpdaterController` so SwiftUI menu items can
 /// observe `canCheckForUpdates` and disable themselves while a check is
@@ -34,6 +35,20 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     private(set) var controller: SPUStandardUpdaterController!
     @Published var canCheckForUpdates = false
 
+    /// Mirrors Sparkle's own `automaticallyChecksForUpdates` (persisted by
+    /// Sparkle in the host bundle's defaults — we deliberately do NOT keep a
+    /// second user default for it, per `SPUUpdater.h`). Kept in sync via KVO so
+    /// the Settings toggle reflects changes Sparkle makes itself (e.g. the
+    /// second-launch permission prompt). Write through
+    /// `setAutomaticallyChecksForUpdates(_:)`.
+    @Published var automaticallyChecksForUpdates = true
+
+    /// UserDefaults key for the "Enable beta version" opt-in. Read live by
+    /// `allowedChannels(for:)` and by the pre-release guard in
+    /// `updater(_:shouldProceedWithUpdate:updateCheck:)`; written by the toggle
+    /// in Settings → General ▸ Updates.
+    static let betaChannelDefaultsKey = "updates.betaChannel"
+
     /// The update we want the custom popup to show. Non-nil iff a scheduled
     /// poll found a newer version we haven't already shown the user.
     /// `ContentView` binds a `.sheet(item:)` to this.
@@ -64,6 +79,9 @@ final class UpdaterViewModel: NSObject, ObservableObject,
         controller.updater.publisher(for: \.canCheckForUpdates)
             .receive(on: DispatchQueue.main)
             .assign(to: &$canCheckForUpdates)
+        controller.updater.publisher(for: \.automaticallyChecksForUpdates)
+            .receive(on: DispatchQueue.main)
+            .assign(to: &$automaticallyChecksForUpdates)
 
         // UI-test seam: force the "What's New" popup to appear with fixture
         // release-notes content, without needing a live appcast / a newer
@@ -82,6 +100,13 @@ final class UpdaterViewModel: NSObject, ObservableObject,
                 """
             )
         }
+    }
+
+    /// Write-through for the "Automatically check for updates" toggle. Sparkle
+    /// persists the value itself; the KVO mirror above pushes it back into
+    /// `automaticallyChecksForUpdates` so the UI stays consistent.
+    func setAutomaticallyChecksForUpdates(_ enabled: Bool) {
+        controller.updater.automaticallyChecksForUpdates = enabled
     }
 
     /// User picked "Check for Updates…" from the menu. Flag it so the
@@ -115,6 +140,97 @@ final class UpdaterViewModel: NSObject, ObservableObject,
     }
 
     // MARK: - SPUUpdaterDelegate
+
+    /// Which appcast channels this app is willing to update to. Sparkle always
+    /// includes the default (stable) channel; returning `["beta"]` additionally
+    /// opts the user into items tagged `<sparkle:channel>beta</sparkle:channel>`.
+    /// So stable users never see beta releases, while users who enable the beta
+    /// toggle get betas AND stable. Read live from defaults so flipping the
+    /// toggle takes effect on the next check — no relaunch needed.
+    nonisolated func allowedChannels(for updater: SPUUpdater) -> Set<String> {
+        UserDefaults.standard.bool(forKey: Self.betaChannelDefaultsKey) ? ["beta"] : []
+    }
+
+    /// Pure version classifier: does this marketing version string denote a
+    /// pre-release? Matches the `-beta` / `-alpha` / `-rc` suffix conventions
+    /// this project actually tags with (`1.9.2-beta.1`), case-insensitively.
+    /// A plain `1.9.2` — or an empty/unknown string, which must never be
+    /// treated as a beta — is not a pre-release.
+    ///
+    /// The marker has to be a *complete* token, guarded on both sides, because
+    /// anything we can't positively classify must fail open:
+    /// - a leading `-`, so a build named `Alpharetta` (`1.0.0 Alpharetta`) or a
+    ///   `-superbeta` suffix isn't misread;
+    /// - and nothing but a non-letter after it, so an unknown label like
+    ///   `1.0.0-betamax` or `1.0.0-alphabet` is treated as unclassifiable
+    ///   (allowed) rather than silently refused. A digit still counts as a
+    ///   terminator so the common `1.9.2-beta1` spelling keeps matching,
+    ///   alongside `-beta`, `-beta.1` and `-beta-1`.
+    ///
+    /// Kept `static`, `nonisolated` and side-effect-free so it's callable from
+    /// Sparkle's nonisolated delegate callbacks and unit-testable without
+    /// constructing an updater (see `UpdaterPrereleaseGuardTests`).
+    nonisolated static func isPrerelease(_ shortVersionString: String) -> Bool {
+        let v = shortVersionString.lowercased()
+        return ["-beta", "-alpha", "-rc"].contains { marker in
+            var searchStart = v.startIndex
+            while let hit = v.range(of: marker, range: searchStart..<v.endIndex) {
+                // A complete token: end-of-string, or followed by something
+                // that isn't a letter (`.`, `-`, `+`, a digit, whitespace…).
+                if hit.upperBound == v.endIndex || !v[hit.upperBound].isLetter {
+                    return true
+                }
+                searchStart = hit.upperBound
+            }
+            return false
+        }
+    }
+
+    /// Defensive, client-side beta gate — the last line of defence in front of
+    /// `allowedChannels(for:)`.
+    ///
+    /// Channel filtering is only as good as the appcast: an item tagged
+    /// `<sparkle:channel>beta</sparkle:channel>` is hidden from users who
+    /// haven't opted in, but an item that is a beta and *forgot* the tag lands
+    /// in the DEFAULT channel and is therefore offered to everyone. That is
+    /// exactly what happened when `1.9.2-beta.1` was published without the
+    /// channel element: every stable user was offered a beta regardless of the
+    /// opt-in. The feed and the publishing pipeline were fixed separately —
+    /// this hook makes the client refuse such an item anyway, so a single
+    /// mis-tagged release can't push betas at people again.
+    ///
+    /// `shouldProceedWithUpdate` is the right hook: per `SPUUpdaterDelegate.h`,
+    /// throwing here means "the user is not shown this updateItem nor is the
+    /// update downloaded or installed" — it gates *offering* the update, unlike
+    /// `didFindValidUpdate` (informational, too late) or the user-driver hooks
+    /// (which only choose which UI presents an update that's already been
+    /// accepted). It runs for both scheduled and user-initiated checks.
+    nonisolated func updater(
+        _ updater: SPUUpdater,
+        shouldProceedWithUpdate updateItem: SUAppcastItem,
+        updateCheck: SPUUpdateCheck
+    ) throws {
+        guard !UserDefaults.standard.bool(forKey: Self.betaChannelDefaultsKey) else { return }
+        // Check both: `displayVersionString` is the marketing version users see
+        // (`1.9.2-beta.1`), but a feed may only carry `sparkle:version`.
+        let candidates = [updateItem.displayVersionString, updateItem.versionString]
+        guard candidates.contains(where: { Self.isPrerelease($0) }) else { return }
+
+        os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+            .error("""
+            Refusing update \(updateItem.displayVersionString, privacy: .public) \
+            (\(updateItem.versionString, privacy: .public)): it is a pre-release \
+            and this user has not opted into the beta channel. The appcast item \
+            is probably missing <sparkle:channel>beta</sparkle:channel>.
+            """)
+        throw NSError(
+            domain: "io.island.mila.updates",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey:
+                "\(updateItem.displayVersionString) is a pre-release build. "
+                + "Enable “Receive beta versions” in Settings ▸ General to install betas."]
+        )
+    }
 
     /// Sparkle found a newer valid version. Capture its release notes for the
     /// custom popup. This fires for both scheduled and user-initiated checks;
@@ -218,6 +334,7 @@ struct MilaApp: App {
     @StateObject private var llmSettings: LLMSettings
     @StateObject private var postRecording: PostRecordingCoordinator
     @StateObject private var diarizationSettings: DiarizationSettings
+    @StateObject private var remoteTranscriptionSettings: RemoteTranscriptionSettings
     @StateObject private var meetingDetectionSettings: MeetingDetectionSettings
     @StateObject private var meetingDetector: MeetingDetector
     @StateObject private var meetingPrompt: MeetingPromptCoordinator
@@ -231,6 +348,13 @@ struct MilaApp: App {
     /// SwiftUI redraws and so its in-flight task table survives
     /// alongside everything else.
     @StateObject private var recordingSummarizer: RecordingSummarizer
+    @StateObject private var voiceMemosSettings: VoiceMemosSettings
+    @StateObject private var voiceMemosImporter: VoiceMemosImporter
+    /// Persistent, app-wide list of speaker names — the pick-list behind
+    /// the transcript's speaker rename popover.
+    @StateObject private var speakerDirectory: SpeakerDirectory
+    /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
+    @StateObject private var configImporter: MilaConfigImporter
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -273,14 +397,21 @@ struct MilaApp: App {
             UserDefaults.standard.set(true, forKey: diarForceOffKey)
         }
         let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false)
-        let svc = TranscriptionService(store: store, modelManager: mgr, diarizationSettings: diarSettings)
+        // Remote transcription backend (opt-in, off by default). Constructed
+        // here so the same instance backs both the Settings UI and the
+        // transcription router.
+        let remoteSettings = RemoteTranscriptionSettings()
+        let svc = TranscriptionService(store: store,
+                                       modelManager: mgr,
+                                       diarizationSettings: diarSettings,
+                                       remoteSettings: remoteSettings)
         let session = RecordingSession()
         let langSettings = RecordingLanguageSettings()
         let audioSettings = AudioInputSettings()
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
         let llm = LLMSettings()
-        let coordinator = PostRecordingCoordinator(store: store, transcription: svc)
+        let coordinator = PostRecordingCoordinator(store: store, transcription: svc, llm: llm)
         let actions = QuickActionsController(session: session,
                                              store: store,
                                              transcription: svc,
@@ -334,6 +465,18 @@ struct MilaApp: App {
         } else if CommandLine.arguments.contains("--ui-test-recording-lang-he") {
             langSettings.current = .hebrew
         }
+        // Force the "All Transcriptions" sidebar section EXPANDED when seeding
+        // a recording for UI tests. `sidebar.allTranscriptions.expanded` is
+        // @AppStorage-backed and is NOT reset by `--ui-test-clean-store` (that
+        // only swaps the recordings store), so its value leaks across runs and
+        // the seeded recording's inline row was present or absent
+        // nondeterministically. Pinning it true makes
+        // `sidebar.recording.Seed Recording` deterministically reachable, which
+        // removes the select-vs-expand flake in
+        // `DetailLayoutUITests.test_recording_detail_renders_within_window_bounds`.
+        if CommandLine.arguments.contains("--ui-test-seed-recording") {
+            UserDefaults.standard.set(true, forKey: "sidebar.allTranscriptions.expanded")
+        }
         // CI E2E: point LLMSettings at a Claude CLI installed on the
         // runner. With ANTHROPIC_API_KEY set in the env, the CLI
         // authenticates non-interactively and Live AI's session loop
@@ -385,12 +528,27 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm] rec, wasRetranscription in
             if wasRetranscription {
+                // `regenerate` bypasses the "already has a summary" gate by
+                // design (it's also the manual on-demand path), so it does
+                // NOT consult `summaryEnabled` itself. Guard the AUTOMATIC
+                // re-transcription trigger here so a transcript-only user
+                // doesn't get a summary regenerated behind their back.
+                guard llm?.summaryEnabled ?? true else { return }
                 summarizer?.regenerate(rec)
             } else {
                 summarizer?.summarizeIfNeeded(rec)
             }
+        }
+        // Auto-drop accidental short+empty captures (issue #61). A recording
+        // that finishes transcription with no text AND under the user's
+        // minimum-duration threshold (Settings ▸ Storage, default 5s, 0 = keep
+        // all) is a hotkey misfire / silence clip — permanently drop it so it
+        // never spams the list. Reads the live threshold each time so a
+        // Settings change takes effect on the next recording without relaunch.
+        svc.shouldAutoDropShortEmpty = { [weak storage] duration, transcript in
+            storage?.shouldAutoDrop(duration: duration, transcript: transcript) ?? false
         }
         // Late-bind the live-AI dependencies onto `actions` so it can
         // attach summary/items to the saved Recording and skip the
@@ -409,11 +567,21 @@ struct MilaApp: App {
             settings: meetingSettings,
             actions: actions
         )
+        // Applies `.milaconfig` files. Given the settings objects it's allowed
+        // to mutate; the open event is routed in from `MilaAppDelegate`.
+        let configImporter = MilaConfigImporter(
+            remote: remoteSettings,
+            language: langSettings,
+            liveAI: liveAI,
+            diarization: diarSettings,
+            meetingDetection: meetingSettings
+        )
         _store = StateObject(wrappedValue: store)
         _storageSettings = StateObject(wrappedValue: storage)
         _modelManager = StateObject(wrappedValue: mgr)
         _transcription = StateObject(wrappedValue: svc)
         _diarizationSettings = StateObject(wrappedValue: diarSettings)
+        _remoteTranscriptionSettings = StateObject(wrappedValue: remoteSettings)
         _session = StateObject(wrappedValue: session)
         _actions = StateObject(wrappedValue: actions)
         _hotkeySettings = StateObject(wrappedValue: hotkeys)
@@ -430,6 +598,19 @@ struct MilaApp: App {
         _liveSpeakerDiarizer = StateObject(wrappedValue: liveDiar)
         _liveAISession = StateObject(wrappedValue: liveSession)
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
+        // Voice Memos (iPhone) folder integration. Settings are opt-in and
+        // default-off; the importer wires up its FSEvents watcher + initial
+        // backfill from its `start()` launch task (below), so constructing
+        // it here is cheap (no DB / filesystem work in init).
+        let vmSettings = VoiceMemosSettings()
+        let vmImporter = VoiceMemosImporter(store: store,
+                                            transcription: svc,
+                                            settings: vmSettings,
+                                            languageSettings: langSettings)
+        _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
+        _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
+        _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
+        _configImporter = StateObject(wrappedValue: configImporter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -455,6 +636,7 @@ struct MilaApp: App {
                 .environmentObject(llmSettings)
                 .environmentObject(postRecording)
                 .environmentObject(diarizationSettings)
+                .environmentObject(remoteTranscriptionSettings)
                 .environmentObject(liveAISettings)
                 .environmentObject(liveTranscriber)
                 .environmentObject(liveSpeakerDiarizer)
@@ -475,8 +657,34 @@ struct MilaApp: App {
                 .task { await injectFixtureWavIfRequested() }
                 .task { await runFinalizeRegressionIfRequested() }
                 .task { recordingSummarizer.backfillIfNeeded() }
+                .task { voiceMemosImporter.start() }
                 .environmentObject(recordingSummarizer)
                 .environmentObject(meetingDetectionSettings)
+                .environmentObject(voiceMemosSettings)
+                .environmentObject(voiceMemosImporter)
+                .environmentObject(speakerDirectory)
+                .environmentObject(configImporter)
+                .sheet(item: Binding(
+                    get: { configImporter.pending },
+                    set: { if $0 == nil { configImporter.cancel() } }
+                )) { pending in
+                    MilaConfigConfirmationView(
+                        pending: pending,
+                        onApply: { configImporter.confirm() },
+                        onCancel: { configImporter.cancel() }
+                    )
+                }
+                .alert(
+                    "Couldn't import configuration",
+                    isPresented: Binding(
+                        get: { configImporter.errorMessage != nil },
+                        set: { if !$0 { configImporter.errorMessage = nil } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { }
+                } message: {
+                    Text(configImporter.errorMessage ?? "")
+                }
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -525,8 +733,18 @@ struct MilaApp: App {
                 .environmentObject(actions)
                 .environmentObject(llmSettings)
                 .environmentObject(diarizationSettings)
+                .environmentObject(remoteTranscriptionSettings)
                 .environmentObject(meetingDetectionSettings)
                 .environmentObject(liveAISettings)
+                .environmentObject(voiceMemosSettings)
+                .environmentObject(voiceMemosImporter)
+                .environmentObject(speakerDirectory)
+                .environmentObject(configImporter)
+                // Settings ▸ General shows the Sparkle-backed
+                // "Automatically check for updates" toggle, so the Settings
+                // scene needs the same single updater instance the main window
+                // and the menu command use — never a second one.
+                .environmentObject(updater)
         }
     }
 
@@ -565,6 +783,10 @@ struct MilaApp: App {
         appDelegate.dictation = dictation
         appDelegate.modelManager = modelManager
         appDelegate.actions = actions
+        // Route `.milaconfig` opens through the importer, and drain any that
+        // arrived during a cold launch (before this wiring ran).
+        appDelegate.configImporter = configImporter
+        appDelegate.flushBufferedConfigOpens()
         appDelegate.startScreenLockObserversIfNeeded()
     }
 
@@ -956,6 +1178,15 @@ struct MilaApp: App {
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
 
+        // Neural-VAD gate, loaded lazily once and reused across
+        // recordings (this loop is long-lived). The bundled Silero
+        // model is ~0.9 MB; load it the first time a recording opts in
+        // and cache the result. `loadAttempted` keeps a failed load
+        // (missing/corrupt model) from retrying every recording — on
+        // failure we simply run without the gate (today's behaviour).
+        var sileroVAD: SileroVAD?
+        var sileroVADLoadAttempted = false
+
         // Hardware gate: re-checked PER-RECORDING (not at function
         // level) so the user can toggle `forceLiveAIOnLowEndHardware`
         // mid-session and have the next recording pick up the change.
@@ -1006,9 +1237,27 @@ struct MilaApp: App {
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval
                 // setting before start() so the running loop picks it
-                // up (default 5s, settable in Settings → Live AI).
+                // up (default 5s, settable in Settings → AI Features).
                 transcriber.chunkSeconds = aiSettings.chunkSeconds
                 transcriber.useVAD = aiSettings.useVAD
+                // Attach the neural-VAD speech gate (drops noise-only
+                // utterances before whisper). Only meaningful on the VAD
+                // path; the fixed-timer path has no per-utterance gate.
+                if aiSettings.useNeuralVAD && aiSettings.useVAD {
+                    if !sileroVADLoadAttempted {
+                        sileroVADLoadAttempted = true
+                        if let vadPath = Bundle.main.path(forResource: "ggml-silero-v5.1.2", ofType: "bin") {
+                            sileroVAD = try? SileroVAD(modelPath: vadPath)
+                        }
+                        if sileroVAD == nil {
+                            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                                .error("Neural VAD enabled but Silero model failed to load — running without the gate")
+                        }
+                    }
+                    transcriber.speechGate = sileroVAD
+                } else {
+                    transcriber.speechGate = nil
+                }
                 // Wire each VAD-bounded utterance into the speaker
                 // diarizer. Without this, diarizer.process is never
                 // called, intervals stays empty, and segments never
@@ -1043,8 +1292,14 @@ struct MilaApp: App {
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.
+                // The session token (claimed synchronously HERE) lets a
+                // stop() that lands before/while the detached body runs
+                // supersede it — otherwise a fast start→stop recording
+                // booted the ~1 GB daemon after the recording ended and
+                // left it idling.
+                let diarSession = diarizer.beginSession()
                 Task.detached(priority: .userInitiated) { [diarizer, diarSettings] in
-                    await diarizer.start(diarization: diarSettings)
+                    await diarizer.start(diarization: diarSettings, session: diarSession)
                 }
                 // Watch for off→on transitions on the Live AI toggle.
                 // The feed loop only kicks when new segments land, so
@@ -1078,6 +1333,7 @@ struct MilaApp: App {
                         // flipped off → ticks stop; the LLM session
                         // preserves whatever it has produced so far.
                         let aiActive = aiSettings.enabled && llmSettingsRef.isConfigured
+                            && !llmSettingsRef.liveAIDisabledByRemoteOpenAI
                         // Speaker labels are a transcription feature,
                         // not an LLM feature — apply them whenever the
                         // diarizer has produced intervals, regardless
@@ -1154,28 +1410,69 @@ struct MilaApp: App {
                     // utterance would lose its speaker label.
                     await diarizer.awaitPending()
                     diarizer.stop()
+                    // This branch owns the whole teardown, so kill the Live
+                    // AI session with the rest of it: otherwise a tick
+                    // deferred by the min-interval floor can still wake and
+                    // spawn a `claude` child while the app is tearing down
+                    // AVAudioEngine (CodeRabbit on #113). Safe to clear
+                    // `summary` / `actionItems` here — the only path that
+                    // reaches this branch today is `cancelAll()` at app
+                    // termination, which by design does NOT flush a WAV or
+                    // assemble a Recording (the orphan WAV is recovered on
+                    // next launch instead), so there is no snapshot to
+                    // protect. Sleep and screen-lock both route through
+                    // `stopRecording`, which owns finalize and cancels the
+                    // session itself once its snapshot is stored.
+                    aiSession.cancel()
                 }
-                // Note: don't cancel aiSession here — QuickActionsController
-                // still needs to read .summary and .actionItems out of
-                // it when assembling the saved Recording. The NEXT
-                // recording clears these via `liveAISession?.start()` at
-                // record-start (in QuickActionsController).
+                // Note: no aiSession.cancel() out here, outside the branch
+                // above — this handler fires during `session.stop()`,
+                // BEFORE QuickActionsController has read .summary /
+                // .actionItems for the saved Recording, and `cancel()`
+                // clears both. When `stopRecording` owns finalize it
+                // cancels the session itself, after its snapshot is
+                // safely in the store; it's the only path that knows
+                // when that is.
                 sessionRef.onLiveSamples = nil
             }
         }
     }
 
+    /// Recovery decision for one recording left over from a previous
+    /// session, factored out of `enqueueRecoveredRecordings` so the launch
+    /// sweep is unit-testable without the App/SwiftUI lifecycle.
+    enum RecoveryAction: Equatable {
+        case reenqueue    // hand back to the transcription worker
+        case markFailed   // audio is gone — stop the row from retrying
+        case leaveAlone   // terminal / already settled
+    }
+
+    /// `.running` (died mid-transcription) and `.pending` (queued but never
+    /// started) are both mid-flight leftovers the fresh worker won't resume
+    /// on its own: re-enqueue when the `.wav` survives, else `.failed`.
+    /// `.completed` / `.failed` are terminal and left untouched.
+    static func recoveryAction(status: TranscriptionStatus, wavExists: Bool) -> RecoveryAction {
+        switch status {
+        case .running, .pending:
+            return wavExists ? .reenqueue : .markFailed
+        case .completed, .failed:
+            return .leaveAlone
+        }
+    }
+
     /// Crash-recovery sweep + stale-status cleanup. Two things happen
     /// here at launch:
-    ///   1. Any recording left in `.running` from a previous session
-    ///      (the app died while whisper was mid-transcription OR while
-    ///      the stop-time live-drain in `QuickActionsController` was
-    ///      still in flight) is reset to `.pending` and re-enqueued for
-    ///      transcription — provided its `.wav` is still on disk.
-    ///      Without re-enqueue, the row would sit in `.running` forever
-    ///      (the worker never publishes it on the new process) and the
-    ///      Queue view's "still-pending fallback" keeps showing it.
-    ///      If the WAV is gone we fall back to `.failed` so the row
+    ///   1. Any recording left mid-flight from a previous session is
+    ///      re-enqueued — both `.running` (the app died while whisper was
+    ///      mid-transcription OR the stop-time live-drain in
+    ///      `QuickActionsController` was still in flight) and `.pending`
+    ///      (queued but never started before the app quit). The worker on
+    ///      this fresh process boots with an empty queue and won't touch
+    ///      either unless we hand it back, so a `.pending` row would
+    ///      otherwise sit in the Queue forever showing "Queued" and a
+    ///      `.running` row would never advance. `.running` is first reset to
+    ///      `.pending`; both are re-enqueued provided the `.wav` is still on
+    ///      disk. If the WAV is gone we fall back to `.failed` so the row
     ///      doesn't loop forever trying to read a missing file.
     ///   2. Orphan .wav files re-attached by RecordingStore as
     ///      `.pending` are enqueued for transcription so the user
@@ -1186,28 +1483,51 @@ struct MilaApp: App {
     /// `.failed` in the list so empty orphans don't nag the user at
     /// launch.
     private func enqueueRecoveredRecordings() {
-        // 1. Reset stale .running recordings. The current process
-        //    hasn't started its worker loop yet — anything still
-        //    flagged .running must be a leftover.
+        // 1. Resurrect stale mid-flight recordings. The current process
+        //    hasn't started its worker loop yet, so anything still flagged
+        //    `.running` (died mid-transcription) or `.pending` (queued but
+        //    never started) is a leftover the new worker won't resume on its
+        //    own. `enqueue` is idempotent, so a row also re-attached as a
+        //    recovered orphan in step 2 is still enqueued at most once.
         let fm = FileManager.default
-        for recording in store.recordings where recording.status == .running {
+        // Collect the status changes and re-enqueues, then persist once at the
+        // end. `store.update(_:)` rewrites the whole recordings file per call,
+        // so a large synced library (dozens of stale `.pending` rows) would
+        // otherwise fire a burst of synchronous full-file writes on launch.
+        var statusChanged: [Recording] = []
+        var toEnqueue: [Recording] = []
+        for recording in store.recordings
+        where recording.status == .running || recording.status == .pending {
             let wavURL = store.audioURL(for: recording)
             var fixed = recording
-            if fm.fileExists(atPath: wavURL.path) {
-                // Stop-time drain or batch worker died mid-transcription;
-                // the audio is still on disk, so re-queue for a fresh
-                // batch run instead of stranding the row at `.failed`
-                // (which has no recovery path the user can self-serve).
-                fixed.status = .pending
-                store.update(fixed)
-                print("MilaApp: re-enqueuing stale .running recording \(recording.audioFileName)")
-                transcription.enqueue(fixed)
-            } else {
+            switch Self.recoveryAction(status: recording.status,
+                                       wavExists: fm.fileExists(atPath: wavURL.path)) {
+            case .reenqueue:
+                // Audio still on disk: re-queue for a fresh batch run rather
+                // than stranding the row at `.failed` (no self-serve recovery
+                // path). `.running` is reset to `.pending`; an already
+                // `.pending` row is re-enqueued as-is.
+                if fixed.status != .pending {
+                    fixed.status = .pending
+                    statusChanged.append(fixed)
+                }
+                print("MilaApp: re-enqueuing stale \(recording.status.rawValue) recording \(recording.audioFileName)")
+                toEnqueue.append(fixed)
+            case .markFailed:
                 fixed.status = .failed
-                store.update(fixed)
-                print("MilaApp: reset stale .running recording \(recording.audioFileName) to .failed (WAV missing)")
+                statusChanged.append(fixed)
+                print("MilaApp: reset stale \(recording.status.rawValue) recording \(recording.audioFileName) to .failed (WAV missing)")
+            case .leaveAlone:
+                break  // unreachable given the `where` filter above
             }
         }
+        store.updateAll(statusChanged)          // single persist for the whole sweep
+        // Recovered rows are re-runs of transcriptions that were already
+        // in flight before the app quit — never a fresh capture. Mark them
+        // as re-transcriptions so the issue-#61 auto-drop gate can't delete
+        // one (e.g. a mid-retranscribe of an empty-transcript recording that
+        // crashed) just because the recovered rerun comes back short + empty.
+        toEnqueue.forEach { transcription.enqueue($0, isRetranscription: true) }
 
         // 2. Auto-enqueue recovered orphans.
         let ids = store.consumePendingRecoveryIDs()
@@ -1229,6 +1549,8 @@ struct MilaApp: App {
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
     private func prewarmDefaultModel() {
+        // No local weights to warm when the remote backend is selected.
+        guard !remoteTranscriptionSettings.isActive else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
     }
 
@@ -1239,6 +1561,11 @@ struct MilaApp: App {
     /// same `URLSession` so they don't actually saturate the network, and
     /// the in-app banner shows whichever is currently selected.
     private func ensureDefaultModelsInstalled() {
+        // Skip the multi-GB local model downloads + CoreML prep entirely for
+        // users who've opted into the remote backend — they don't need any
+        // local weights. (The Models tab still offers manual downloads, and
+        // switching back to local re-triggers this on next launch.)
+        guard !remoteTranscriptionSettings.isActive else { return }
         modelManager.setSelected(WhisperModel.ivritLarge)
         for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {
             if !modelManager.isInstalled(model) && modelManager.downloads[model.name] == nil {
@@ -1270,9 +1597,41 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var dictation: DictationController?
     weak var modelManager: ModelManager?
     weak var actions: QuickActionsController?
+    weak var configImporter: MilaConfigImporter?
 
     private var didShutDown = false
     private var screenLockObserversInstalled = false
+    /// `.milaconfig` URLs delivered by a cold launch (double-click while Mila
+    /// was not running) before `wireDelegate()` connected the importer. Drained
+    /// by `flushBufferedConfigOpens()`.
+    private var bufferedConfigURLs: [URL] = []
+
+    /// macOS calls this when the user double-clicks / drops a file the app
+    /// declares it opens (`CFBundleDocumentTypes` in Info.plist). We only claim
+    /// `.milaconfig`; anything else is ignored.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        let configURLs = urls.filter {
+            $0.pathExtension.lowercased() == MilaConfig.fileExtension
+        }
+        guard !configURLs.isEmpty else { return }
+        Task { @MainActor in
+            if let importer = self.configImporter {
+                configURLs.forEach { importer.handleOpen($0) }
+            } else {
+                // Cold launch: hold until the importer is wired in.
+                self.bufferedConfigURLs.append(contentsOf: configURLs)
+            }
+        }
+    }
+
+    /// Deliver any config opens that arrived before the importer was wired.
+    @MainActor
+    func flushBufferedConfigOpens() {
+        guard let importer = configImporter, !bufferedConfigURLs.isEmpty else { return }
+        let urls = bufferedConfigURLs
+        bufferedConfigURLs.removeAll()
+        urls.forEach { importer.handleOpen($0) }
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if didShutDown { return .terminateNow }

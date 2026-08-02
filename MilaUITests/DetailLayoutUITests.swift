@@ -67,23 +67,42 @@ final class DetailLayoutUITests: XCTestCase {
                       "Sidebar row exists in the tree but isn't on-screen — likely scrolled out.")
     }
 
-    func test_recording_detail_renders_within_window_bounds() {
+    func test_recording_detail_renders_within_window_bounds() throws {
         let app = launchApp()
         attachScreenshot(app, name: "01-home-on-launch")
 
-        // Navigate: All Transcriptions → seeded recording.
+        // Navigate to the seeded recording. The app is launched with
+        // `--ui-test-seed-recording`, which now ALSO pins the
+        // "All Transcriptions" section EXPANDED (see MilaApp.init) — so the
+        // seeded recording's inline sidebar row is deterministically present
+        // on launch, no folder click required.
+        //
+        // Previously the test clicked the folder row and then raced two
+        // possible outcomes (folder *selected* → `history.row.*` in the detail
+        // pane, vs folder *expanded* → inline `sidebar.recording.*`). That
+        // select-vs-expand split was non-deterministic on the macOS-26 runner
+        // and flaked the test (PR #40 tried to accept either, but the disclosure
+        // state itself leaked across runs via @AppStorage, so even the
+        // "expanded" branch wasn't guaranteed). Forcing the expanded state at
+        // launch removes the ambiguity at the source.
         let folder = app.descendants(matching: .any)
             .matching(identifier: "sidebar.folder.default").firstMatch
         XCTAssertTrue(folder.waitForExistence(timeout: 5),
                       "All Transcriptions sidebar row not found")
-        folder.click()
         attachScreenshot(app, name: "02-all-transcriptions-list")
 
-        let row = app.descendants(matching: .any)
-            .matching(identifier: "history.row.Seed Recording").firstMatch
-        XCTAssertTrue(row.waitForExistence(timeout: 5),
-                      "Seeded recording row not in the list")
-        row.click()
+        // `MilaApp.init()` pins `sidebar.allTranscriptions.expanded = true` under
+        // `--ui-test-seed-recording`, so the seeded recording's inline row is
+        // deterministically present on launch. Target it directly: no
+        // `history.row` fallback and no expand-and-retry — that masking would let
+        // this test pass even if the launch-state contract regressed, defeating
+        // the exact flake this PR locks down.
+        let recordingRow = app.descendants(matching: .any)
+            .matching(identifier: "sidebar.recording.Seed Recording").firstMatch
+        XCTAssertTrue(
+            recordingRow.waitForExistence(timeout: 8),
+            "Seeded recording's inline sidebar row (sidebar.recording.Seed Recording) was not present on launch — the --ui-test-seed-recording expanded-disclosure contract in MilaApp.init() may have regressed")
+        recordingRow.click()
 
         // Detail-view title label should exist (the row click landed on
         // RecordingDetailView).

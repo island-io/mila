@@ -205,6 +205,51 @@ final class LiveAIThrottleTests: XCTestCase {
                       "final call should carry the closing transcript delta")
     }
 
+    // MARK: - Regression: a deferred tick must not outlive the recording
+
+    /// `stopRecording` now calls `liveAISession?.cancel()` once the final
+    /// summary/action-item snapshot is in the store. This pins the
+    /// mechanism that makes that call worth anything: a tick which is
+    /// sleeping out the min-interval floor when the recording ends must
+    /// never fire.
+    ///
+    /// Before the cancel was wired in, the sleeping task woke up after the
+    /// meeting was over and spawned a full `claude --resume` subprocess
+    /// against a Recording that had already been written (observed
+    /// 2026-07-26: stop at 13:33:58, tick at 13:34:49).
+    ///
+    /// Unlike the tests above this one uses a SHORT floor deliberately —
+    /// long enough to defer, short enough that an uncancelled task would
+    /// wake inside the test window and be caught.
+    func test_cancel_dropsDeferredTick() async {
+        let clock = TestClock(Date(timeIntervalSinceReferenceDate: 0))
+        let log = CallLog()
+        let session = makeSession(minInterval: 0.5, clock: clock, log: log,
+                                  suite: "ThrottleCancelDeferred")
+
+        session.feed(transcript: "meeting so far")
+        await waitUntilIdle(session)
+        XCTAssertEqual(log.startedAt.count, 1, "first feed should fire")
+
+        // Inside the floor → this one is deferred, not fired: a
+        // pendingKickTask is now sleeping out the remaining ~0.4s.
+        clock.advance(0.1)
+        session.feed(transcript: "meeting so far plus the last sentence")
+        await Task.yield()
+        XCTAssertEqual(log.startedAt.count, 1, "the second feed should be deferred")
+
+        // The recording ends here.
+        session.cancel()
+
+        // Wait past when the deferred tick would have woken. `clock` only
+        // drives the delay computation; the sleep itself is real time, so
+        // this has to be a real wait.
+        try? await Task.sleep(nanoseconds: 900_000_000)
+        XCTAssertEqual(log.startedAt.count, 1,
+                       "a tick deferred at stop time must not fire after cancel()")
+        XCTAssertFalse(session.isThinking)
+    }
+
     // (Removed `test_callFrequency_reduction_over_15min_meeting`: it asserted
     // on a local arithmetic closure, never touching LiveAISession/kickDelay,
     // so it would have passed even with the throttle removed. The pure

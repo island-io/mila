@@ -124,11 +124,13 @@ final class RecordingStore: ObservableObject {
         self.modelsDirectory = rootDirectory.appendingPathComponent("Models", isDirectory: true)
         self.storeURL = rootDirectory.appendingPathComponent("recordings.json")
         self.foldersURL = rootDirectory.appendingPathComponent("folders.json")
+        self.tombstonesURL = rootDirectory.appendingPathComponent("voicememo-tombstones.json")
 
         try? fileManager.createDirectory(at: defaultRecs, withIntermediateDirectories: true)
         try? fileManager.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         load()
         loadFolders()
+        loadTombstones()
     }
 
     /// Switch the recordings directory to `newDirectory`. Clears the
@@ -227,9 +229,22 @@ final class RecordingStore: ObservableObject {
             return
         }
         // Re-fetch by id: the recording may have been edited/removed during
-        // the (off-main) encode. Only swap if it's still the same WAV.
+        // the (off-main) encode. Only swap if it's still the same WAV AND it's
+        // still `.completed`.
+        //
+        // The status re-check closes a race with re-transcription: the user can
+        // right-click "Re-transcribe" on a recording whose post-completion
+        // compression is still in flight. That re-enqueues it and the worker
+        // flips it back to `.running` (synchronously, before it reads the audio
+        // — see `TranscriptionService.process`). If we deleted the source WAV
+        // here while that pass is reading it, the re-transcribe would fail with
+        // "file not found" and the recording would be stuck `.failed` with the
+        // OLD transcript. By bailing when the status is no longer `.completed`,
+        // we leave the WAV untouched for the in-flight pass; that pass will
+        // re-spawn compression when it finishes.
         guard let idx = recordings.firstIndex(where: { $0.id == id }),
-              recordings[idx].audioFileName == rec.audioFileName else {
+              recordings[idx].audioFileName == rec.audioFileName,
+              recordings[idx].status == .completed else {
             try? FileManager.default.removeItem(at: dst)
             return
         }
@@ -276,6 +291,13 @@ final class RecordingStore: ObservableObject {
         recordingsDirectory.appendingPathComponent(recording.summaryFileName)
     }
 
+    /// Path of the per-recording `.srt` subtitle sidecar auto-written after
+    /// transcription. May be absent (recording still pending, or it had no
+    /// segments) — callers should treat absence as "nothing to remove".
+    func subtitleURL(for recording: Recording) -> URL {
+        recordingsDirectory.appendingPathComponent(recording.subtitleFileName)
+    }
+
     func freshAudioURL(suggestedName: String? = nil) -> URL {
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
@@ -300,6 +322,47 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
+    /// Replace several stored records in one pass with a SINGLE persist, vs.
+    /// `update(_:)`'s one full-file rewrite per call. Used by the launch
+    /// crash-recovery sweep, which can flip many stale rows at once (a large
+    /// synced library can leave dozens of `.pending` rows). This is a
+    /// status/metadata bulk update — transcript/summary sidecars are left
+    /// as-is (recovery doesn't change their content). Unknown ids are skipped;
+    /// persists only if something actually changed.
+    func updateAll(_ updated: [Recording]) {
+        var touched = false
+        for recording in updated {
+            guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { continue }
+            recordings[idx] = recording
+            touched = true
+        }
+        if touched { persist() }
+    }
+
+    /// Flip a recording into `.pending` (optionally switching its transcription
+    /// `language`) and return the CURRENT store record, ready to hand to
+    /// `TranscriptionService.enqueue`.
+    ///
+    /// Why this exists instead of the callers doing `var copy = recording;
+    /// copy.language = …; store.update(copy)`: the `recording` a SwiftUI
+    /// context menu has captured can be a STALE snapshot. In particular its
+    /// `audioFileName` may still be the original `.wav` even though the
+    /// post-completion compression has since renamed the file to `.m4a` and
+    /// deleted the WAV. `update`-ing that stale copy would clobber the store's
+    /// correct `.m4a` name back to the dead `.wav`, and the re-transcribe pass
+    /// would then fail with "file not found" — landing `.failed` with the OLD
+    /// transcript still showing. (This was a flaky-CI / real-world re-transcribe
+    /// bug.) By mutating ONLY `language` + `status` on the live record we keep
+    /// the store-owned `audioFileName` intact. Returns nil if the recording is
+    /// gone.
+    func prepareForRetranscription(id: UUID, language: String? = nil) -> Recording? {
+        guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return nil }
+        if let language { recordings[idx].language = language }
+        recordings[idx].status = .pending
+        persist()
+        return recordings[idx]
+    }
+
     /// Rename a recording's user-facing title. No-op if the trimmed title is
     /// empty (we never want a blank entry in the sidebar) or unchanged.
     func rename(_ recording: Recording, to newTitle: String) {
@@ -309,6 +372,27 @@ final class RecordingStore: ObservableObject {
         guard recordings[idx].title != trimmed else { return }
         recordings[idx].title = trimmed
         persist()
+    }
+
+    /// Assign (or clear, with nil/empty) a display name for one raw
+    /// diarizer speaker ID on a recording. Segments keep their raw
+    /// `SPEAKER_NN` IDs — the name is a display overlay resolved at
+    /// render/export time. Regenerates the `.srt` sidecar for completed
+    /// recordings so the on-disk export matches what the UI shows.
+    func setSpeakerName(_ name: String?, forSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let trimmed, !trimmed.isEmpty {
+            guard recordings[idx].speakerNames[rawID] != trimmed else { return }
+            recordings[idx].speakerNames[rawID] = trimmed
+        } else {
+            guard recordings[idx].speakerNames[rawID] != nil else { return }
+            recordings[idx].speakerNames.removeValue(forKey: rawID)
+        }
+        persist()
+        if recordings[idx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
     }
 
     /// Move a recording into a folder (or unfile it with nil). Auto-creates
@@ -375,6 +459,40 @@ final class RecordingStore: ObservableObject {
         }
     }
 
+    /// Mark a queued/in-progress recording as no longer transcribing after the
+    /// user cancelled it from the Queue. We land it in `.failed` — the existing
+    /// terminal state — rather than adding a dedicated `.cancelled` case: the
+    /// Queue only keeps `.pending`/`.running` rows, so a cancelled item drops
+    /// out of the Queue either way, and every status-rendering site (list rows,
+    /// detail view) already handles `.failed`. The recording + its audio stay on
+    /// disk so the user can still re-transcribe it later; use
+    /// `permanentlyDelete` when they want it gone.
+    ///
+    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
+    /// engine's abort flag so the in-flight whisper pass unwinds. That path
+    /// deliberately leaves the store status alone (the discard coordinator owns
+    /// the delete), so a Queue-level cancel must flip the status itself —
+    /// otherwise a `.running` item would sit in the Queue forever. No-op if the
+    /// recording is already in a terminal state.
+    /// Stop a queued/active transcription from the Queue and move the
+    /// recording to "Recently Deleted" rather than leaving a `.failed` row
+    /// cluttering the list. The status also flips to a terminal `.failed` so
+    /// the launch crash-recovery sweep and the Queue don't resurrect it. The
+    /// audio stays on disk (recoverable via Restore), so this is safe for mic
+    /// recordings and re-transcriptions of already-completed recordings — the
+    /// user gets their content back from the trash if they hit Stop by
+    /// mistake. No-op if the recording is already terminal (guards a stale
+    /// click racing a just-finished run). Paired with
+    /// `TranscriptionService.cancel(recordingID:)`, which trips the engine's
+    /// abort flag so the in-flight whisper pass unwinds.
+    func stopTranscription(_ recording: Recording) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+        guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
+        recordings[idx].status = .failed
+        recordings[idx].deletedAt = Date()
+        persist()
+    }
+
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
     func softDelete(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
@@ -389,12 +507,25 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
-    /// Remove the metadata + audio file from disk.
+    /// Remove the metadata + every on-disk file for a recording: the audio
+    /// plus all sidecars (`.txt` transcript, `.summary.txt`, `.srt`
+    /// subtitles). Missing files are ignored — each is best-effort so one
+    /// absent sidecar doesn't strand the others.
     func permanentlyDelete(_ recording: Recording) {
         recordings.removeAll { $0.id == recording.id }
         try? fileManager.removeItem(at: audioURL(for: recording))
         try? fileManager.removeItem(at: transcriptURL(for: recording))
         try? fileManager.removeItem(at: summaryURL(for: recording))
+        try? fileManager.removeItem(at: subtitleURL(for: recording))
+        // Tombstone a deleted Voice-Memos import so the next sync doesn't
+        // resurrect it: the importer's dedup is keyed on the LIVE store, and
+        // the source memo still exists in the Voice Memos folder — deleting
+        // an imported memo silently never stuck before this. (Escape hatch:
+        // a manual File → Open import carries no memo ID and still works.)
+        if let memoID = recording.voiceMemoUniqueID {
+            voiceMemoTombstones.insert(memoID)
+            persistTombstones()
+        }
         persist()
     }
 
@@ -424,6 +555,41 @@ final class RecordingStore: ObservableObject {
     /// All non-trashed recordings filed under `folderName`.
     func recordings(inFolder folderName: String) -> [Recording] {
         recordings.filter { !$0.isTrashed && $0.folder == folderName }
+    }
+
+    /// Live (non-trashed) Voice-Memo imports that originated from the Voice
+    /// Memos folder `folderID` (a `ZFOLDER.ZUUID`, or
+    /// `Recording.voiceMemoUnfiledFolderID` for the unfiled bucket). Only
+    /// `.voiceMemo` recordings with a matching recorded origin are returned —
+    /// legacy imports (nil origin) and the user's own recordings are excluded,
+    /// so the un-select cleanup can never sweep up something it didn't import.
+    func voiceMemoRecordings(fromFolderID folderID: String) -> [Recording] {
+        recordings.filter {
+            !$0.isTrashed
+                && $0.source == .voiceMemo
+                && $0.voiceMemoFolderUUID == folderID
+        }
+    }
+
+    /// Un-select cleanup (issue #57): move every live Voice-Memo import that
+    /// came from `folderID` to Recently Deleted. Soft-delete (not permanent)
+    /// so the user can restore them, and — crucially — so no tombstone is
+    /// written: the recordings stay in the store, so re-selecting the folder
+    /// won't re-import duplicates, and the source memos remain untouched in
+    /// Voice Memos. Returns the number moved to the trash.
+    @discardableResult
+    func softDeleteVoiceMemos(fromFolderID folderID: String) -> Int {
+        let now = Date()
+        var count = 0
+        for idx in recordings.indices where
+            !recordings[idx].isTrashed
+            && recordings[idx].source == .voiceMemo
+            && recordings[idx].voiceMemoFolderUUID == folderID {
+            recordings[idx].deletedAt = now
+            count += 1
+        }
+        if count > 0 { persist() }
+        return count
     }
 
     /// Non-trashed recordings that haven't been filed anywhere yet. These
@@ -598,6 +764,33 @@ final class RecordingStore: ObservableObject {
             try data.write(to: storeURL, options: .atomic)
         } catch {
             print("RecordingStore persist error: \(error)")
+        }
+    }
+
+    // MARK: - Voice-memo tombstones
+
+    /// Voice-memo unique IDs the user permanently deleted from Mila. The
+    /// importer skips these on every sync — without the tombstone, a
+    /// deleted import re-imported (and re-transcribed) on the next FSEvents
+    /// fire or rescan, because the dedup set is built from the live store
+    /// and the source memo still exists in the Voice Memos folder.
+    /// Persisted at the original root (app state, not user content — it
+    /// deliberately does NOT travel with a relocated recordings folder).
+    private(set) var voiceMemoTombstones: Set<String> = []
+    private let tombstonesURL: URL
+
+    private func loadTombstones() {
+        guard let data = try? Data(contentsOf: tombstonesURL),
+              let ids = try? JSONDecoder().decode(Set<String>.self, from: data) else { return }
+        voiceMemoTombstones = ids
+    }
+
+    private func persistTombstones() {
+        do {
+            let data = try JSONEncoder().encode(voiceMemoTombstones)
+            try data.write(to: tombstonesURL, options: .atomic)
+        } catch {
+            print("RecordingStore tombstones persist error: \(error)")
         }
     }
 

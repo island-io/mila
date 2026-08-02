@@ -45,6 +45,29 @@ final class AdaptiveGainControllerTests: XCTestCase {
         return last
     }
 
+    /// Drive `controller` with speech-shaped input: `bursts` repetitions
+    /// of (`voicedSeconds` of `chunk`, then `gapSeconds` of silence).
+    /// The gaps matter — the noise-floor tracker snaps down during them,
+    /// which is what lets the bursts clear the adaptation gate. Returns
+    /// the gained samples of the final *voiced* chunk.
+    private func driveBursts(_ controller: AdaptiveGainController,
+                             chunk: [Float],
+                             bursts: Int,
+                             voicedSeconds: Double = 1.0,
+                             gapSeconds: Double = 0.5,
+                             gapChunk: [Float]? = nil,
+                             sampleRate: Double = 16_000) -> [Float] {
+        let gap = gapChunk ?? [Float](repeating: 0, count: chunk.count)
+        var lastVoiced: [Float] = []
+        for _ in 0..<bursts {
+            lastVoiced = drive(controller, chunk: chunk,
+                               seconds: voicedSeconds, sampleRate: sampleRate)
+            _ = drive(controller, chunk: gap,
+                      seconds: gapSeconds, sampleRate: sampleRate)
+        }
+        return lastVoiced
+    }
+
     /// Convert a linear RMS to dBFS. Returns `-inf` for zero input.
     private func dBFS(_ rmsValue: Float) -> Float {
         guard rmsValue > 0 else { return -.infinity }
@@ -53,26 +76,101 @@ final class AdaptiveGainControllerTests: XCTestCase {
 
     // MARK: - Tests
 
-    /// Constant low-level input (~-34 dBFS RMS, just above the silence
-    /// floor at 0.012) should be raised toward the -26 dBFS target.
-    /// Allow ±2 dB tolerance and ~4 release time-constants to settle.
-    func test_lowLevelSine_settlesNearTarget() {
+    /// Low-level speech-shaped input (~-34 dBFS RMS bursts with silence
+    /// gaps) should be raised toward the -26 dBFS target. Allow ±2 dB
+    /// tolerance and enough voiced time (~5 release time-constants,
+    /// excluding the seeded first burst) to settle.
+    func test_lowLevelBursts_settleNearTarget() {
         let controller = AdaptiveGainController()
-        // RMS ≈ 0.02 (well above the 0.012 silence floor so adaptation
-        // engages). amplitude = 0.02 * sqrt(2) for a sine of that RMS.
+        // RMS ≈ 0.02. amplitude = 0.02 * sqrt(2) for a sine of that RMS.
         let amplitude: Float = 0.02 * sqrt(2)
         // Use 30 ms chunks (matches the live VAD frame size) so the
         // attack/release dt mapping in `process` is realistic.
         let chunk = sine(amplitude: amplitude, durationSeconds: 0.030)
-        // Drive for 8 seconds (4× the release time-constant) so the
-        // smoother is well within ε of steady state.
-        let final = drive(controller, chunk: chunk, seconds: 8.0)
+        let final = driveBursts(controller, chunk: chunk, bursts: 12)
 
         let outRMS = rms(final)
         let outDb = dBFS(outRMS)
         let targetDb = dBFS(AdaptiveGainController.defaultTargetRMS)
         XCTAssertEqual(outDb, targetDb, accuracy: 2.0,
                        "settled RMS \(outDb) dBFS should be within ±2 dB of target \(targetDb) dBFS (gain=\(controller.currentGain))")
+    }
+
+    /// THE regression test for the quiet built-in-mic bug: speech at RMS
+    /// ~0.006 — well below the live VAD's 0.012 cutoff AND below the old
+    /// static adaptation gate (0.012) — must now be amplified above the
+    /// VAD cutoff. With the old gate this speech never adapted the gain,
+    /// the VAD never fired, and the live transcript stayed empty for the
+    /// whole recording (observed on a MacBook Pro built-in mic while a
+    /// headset mic worked).
+    func test_quietSpeechBursts_belowLegacyGate_getAmplifiedAboveVADCutoff() {
+        let controller = AdaptiveGainController()
+        let amplitude: Float = 0.006 * sqrt(2)   // sine RMS ≈ 0.006
+        let chunk = sine(amplitude: amplitude, durationSeconds: 0.030)
+        let final = driveBursts(controller, chunk: chunk, bursts: 8)
+
+        XCTAssertGreaterThan(controller.currentGain, 2.0,
+                             "quiet speech must adapt the gain upward")
+        XCTAssertGreaterThan(rms(final), 0.012,
+                             "boosted speech must clear the live VAD cutoff (0.012)")
+    }
+
+    /// Sustained hum — a signal that never pauses — must NOT be
+    /// amplified, even when it sits above the absolute silence floor.
+    /// The minimum-statistics tracker seeds the noise floor from the
+    /// first frame, so the hum is its own floor and never clears the
+    /// adaptation gate. Amplifying it would push room noise into the
+    /// VAD's trigger range and latch the live transcript into endless
+    /// noise "utterances".
+    func test_sustainedHum_holdsGainAtOne() {
+        let controller = AdaptiveGainController()
+        let amplitude: Float = 0.008 * sqrt(2)   // sine RMS ≈ 0.008
+        let chunk = sine(amplitude: amplitude, durationSeconds: 0.030)
+        _ = drive(controller, chunk: chunk, seconds: 20.0)
+
+        XCTAssertEqual(controller.currentGain, 1.0, accuracy: 1e-3,
+                       "sustained hum must never adapt the gain (observed floor \(controller.observedNoiseFloor))")
+    }
+
+    /// Field regression for the windowed-minimum floor: quiet speech over
+    /// REAL room tone (~0.001 RMS between utterances — not digital
+    /// zeros). An earlier EMA-based floor rose toward the average signal,
+    /// settled above room tone, and parked the adaptation gate on top of
+    /// the speech itself — live transcription silently died in any room
+    /// with elevated tone. The windowed minimum must keep the floor at
+    /// the tone's minimum so speech keeps clearing the gate.
+    func test_quietSpeech_overRealRoomTone_getsAmplified() {
+        let controller = AdaptiveGainController()
+        let speech = sine(amplitude: 0.006 * sqrt(2), durationSeconds: 0.030)
+        let roomTone = sine(amplitude: 0.001 * sqrt(2), durationSeconds: 0.030)
+        let final = driveBursts(controller, chunk: speech, bursts: 8,
+                                gapChunk: roomTone)
+
+        XCTAssertGreaterThan(controller.currentGain, 2.0,
+                             "quiet speech over real room tone must adapt the gain (floor \(controller.observedNoiseFloor))")
+        XCTAssertGreaterThan(rms(final), 0.012,
+                             "boosted speech must clear the live VAD cutoff (0.012)")
+    }
+
+    /// Hum that starts only AFTER a silent stretch (AC kicking in
+    /// mid-recording) briefly clears the gate while the noise floor —
+    /// seeded near zero by the silence — catches up, picking up gain.
+    /// The floor must find the hum within seconds, and the
+    /// sustained-noise relaxation must then unwind the acquired gain so
+    /// the boosted hum ends up back below the VAD's 0.012 trigger
+    /// instead of latching the live transcript into noise "utterances".
+    func test_humAfterSilence_gainRelaxesBackDown() {
+        let controller = AdaptiveGainController()
+        let silence = [Float](repeating: 0, count: 480)   // 30 ms @ 16 kHz
+        _ = drive(controller, chunk: silence, seconds: 5.0)
+
+        let hum = sine(amplitude: 0.008 * sqrt(2), durationSeconds: 0.030)
+        let final = drive(controller, chunk: hum, seconds: 90.0)
+
+        XCTAssertLessThan(controller.currentGain, 1.5,
+                          "gain acquired during the hum onset must relax back down")
+        XCTAssertLessThan(rms(final), 0.012,
+                          "steady hum must not stay boosted into the VAD's trigger range")
     }
 
     /// A full-scale signal should be passed through at gain == 1 —
@@ -120,15 +218,15 @@ final class AdaptiveGainControllerTests: XCTestCase {
     }
 
     /// Silence after a quiet signal should also hold (not continue ramping).
-    /// Pre-condition with a low-level signal (gain converges high), then
-    /// silence — gain must stay at the high value, NOT keep rising.
+    /// Pre-condition with low-level speech bursts (gain converges high),
+    /// then silence — gain must stay at the high value, NOT keep rising.
     func test_silence_doesNotKeepRising() {
         let controller = AdaptiveGainController()
-        // RMS ≈ 0.02 — above the silence floor (0.012) so adaptation
-        // engages and pushes the gain up toward target / RMS = 2.5×.
+        // Burst RMS ≈ 0.02 — adaptation pushes the gain up toward
+        // target / RMS = 2.5×.
         let lowSignal = sine(amplitude: 0.02 * sqrt(2),
                               durationSeconds: 0.030)
-        _ = drive(controller, chunk: lowSignal, seconds: 8.0)
+        _ = driveBursts(controller, chunk: lowSignal, bursts: 12)
         let gainAfterSpeech = controller.currentGain
         // Sanity: gain should be elevated (we were boosting low signal).
         XCTAssertGreaterThan(gainAfterSpeech, 2.0)
@@ -145,13 +243,14 @@ final class AdaptiveGainControllerTests: XCTestCase {
     /// the silence floor, then slam in a near-full-scale buffer; output
     /// must stay inside [-1, +1] thanks to the soft-clipper.
     func test_softClipper_keepsOutputInRange() {
-        // Use a custom controller with a very low silence floor so we can
-        // push the gain near the max with a small-amplitude signal. The
-        // production controller's silence floor (0.012) prevents
-        // amplifying ambient noise — that gate is verified by the
-        // silence tests; here we only care that the soft-clipper handles
-        // large-magnitude post-gain samples correctly.
-        let controller = AdaptiveGainController(silenceFloor: 0.0001)
+        // Use a custom controller with a very low silence floor and the
+        // noise-floor gate disabled (multiplier 0) so a constant
+        // small-amplitude signal can push the gain to the max. The
+        // production gates prevent amplifying ambient noise — verified by
+        // the silence/hum tests; here we only care that the soft-clipper
+        // handles large-magnitude post-gain samples correctly.
+        let controller = AdaptiveGainController(silenceFloor: 0.0001,
+                                                noiseFloorMultiplier: 0)
         let tinyChunk = sine(amplitude: 0.001, durationSeconds: 0.030)
         // Drive for ~10× the release time-constant (2.0s) so the smoother
         // gets to within 0.005% of the max gain. 10s only gets ~99.3% of
@@ -209,15 +308,17 @@ final class AdaptiveGainControllerTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(controller.currentGain, 1.0)
     }
 
-    /// Reset wipes the gain back to 1 (fresh recording starts).
-    func test_reset_clearsGain() {
+    /// Reset wipes the gain back to 1 and forgets the observed noise
+    /// floor (fresh recording starts).
+    func test_reset_clearsGainAndNoiseFloor() {
         let controller = AdaptiveGainController()
-        // RMS ≈ 0.02, just above the silence floor so adaptation engages.
         let lowSignal = sine(amplitude: 0.02 * sqrt(2),
                               durationSeconds: 0.030)
-        _ = drive(controller, chunk: lowSignal, seconds: 8.0)
+        _ = driveBursts(controller, chunk: lowSignal, bursts: 12)
         XCTAssertGreaterThan(controller.currentGain, 1.5)
         controller.reset()
         XCTAssertEqual(controller.currentGain, 1.0)
+        XCTAssertLessThan(controller.observedNoiseFloor, 0,
+                          "reset must forget the previous session's noise floor")
     }
 }

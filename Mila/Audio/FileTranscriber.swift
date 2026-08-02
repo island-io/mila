@@ -10,21 +10,45 @@ enum FileTranscriber {
 
     static func importFile(at sourceURL: URL,
                            into store: RecordingStore,
-                           language: RecordingLanguage = .hebrew) async throws -> Recording {
+                           language: RecordingLanguage = .hebrew,
+                           source: RecordingSource = .systemAudio,
+                           title titleOverride: String? = nil,
+                           createdAt: Date? = nil,
+                           voiceMemoUniqueID: String? = nil,
+                           voiceMemoFolderUUID: String? = nil,
+                           folder: String? = nil) async throws -> Recording {
         let didStart = sourceURL.startAccessingSecurityScopedResource()
         defer { if didStart { sourceURL.stopAccessingSecurityScopedResource() } }
 
-        let title = sourceURL.deletingPathExtension().lastPathComponent
-        let destURL = store.freshAudioURL(suggestedName: title)
+        let title = titleOverride ?? sourceURL.deletingPathExtension().lastPathComponent
+        // `freshAudioURL` appends the suggested name as a path component, so a
+        // title containing "/" (or ":", which Finder maps to "/") would create
+        // nested/invalid paths. Sanitize the stem used for the audio file;
+        // the recording keeps the original `title` for display.
+        let safeStem = title
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let destURL = store.freshAudioURL(suggestedName: safeStem)
 
         let duration = try await reencode(source: sourceURL, destination: destURL)
 
+        // Ensure the destination folder exists in the sidebar list before the
+        // recording references it — `createFolder` is idempotent, so a shared
+        // folder like "Voice Memos" is only created once. Without this the
+        // folder wouldn't appear in the sidebar until the next launch (it's
+        // otherwise only seeded from persisted recordings at load).
+        if let folder { store.createFolder(folder) }
+
         let recording = Recording(
             title: title,
+            createdAt: createdAt ?? Date(),
             duration: duration,
-            source: .systemAudio, // imported file: counts as "from app/system"
+            source: source,
             audioFileName: destURL.lastPathComponent,
-            language: language.rawValue
+            language: language.rawValue,
+            folder: folder,
+            voiceMemoUniqueID: voiceMemoUniqueID,
+            voiceMemoFolderUUID: voiceMemoFolderUUID
         )
         store.add(recording)
         return recording
@@ -58,12 +82,19 @@ enum FileTranscriber {
                 throw NSError(domain: "FileTranscriber", code: 1)
             }
 
+            // One converter for the whole file: resampling is stateful, and
+            // a fresh converter per 32k-frame chunk left a discontinuity at
+            // every chunk edge of the re-encoded WAV (see
+            // StreamingWhisperConverter).
+            let converter = StreamingWhisperConverter(inputFormat: inFile.processingFormat)
+
             var totalFramesIn: AVAudioFramePosition = 0
             while inFile.framePosition < inFile.length {
                 let toRead = min(chunk, AVAudioFrameCount(inFile.length - inFile.framePosition))
                 inputBuffer.frameLength = toRead
                 try inFile.read(into: inputBuffer, frameCount: toRead)
-                let converted = try AudioConvert.toWhisperFormat(inputBuffer)
+                let converted = try converter?.convert(inputBuffer)
+                    ?? AudioConvert.toWhisperFormat(inputBuffer)
                 try outFile.write(from: converted)
                 totalFramesIn += AVAudioFramePosition(toRead)
             }
@@ -75,7 +106,7 @@ enum FileTranscriber {
     static let allowedExtensions: [String] = [
         "wav", "aif", "aiff", "caf",
         "m4a", "mp3", "aac",
-        "mp4", "mov", "m4v", "mkv",
+        "mp4", "mov", "m4v", "mkv", "qta",
         "webm", "ogg", "flac"
     ]
 }

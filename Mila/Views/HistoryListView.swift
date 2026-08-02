@@ -1,6 +1,4 @@
 import SwiftUI
-import AppKit
-import UniformTypeIdentifiers
 
 struct HistoryListView: View {
     let category: HistoryCategory
@@ -171,15 +169,9 @@ private struct HistoryRow: View {
     let recording: Recording
     @Binding var selection: SidebarSelection?
 
-    @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
-    @EnvironmentObject private var llm: LLMSettings
 
     @State private var hovering = false
-    @State private var renameRequest: String?
-    @State private var promptForNewFolder = false
-    @State private var newFolderDraft = ""
-    @State private var showingSendSheet = false
 
     var body: some View {
         let isSelected: Bool = {
@@ -242,135 +234,9 @@ private struct HistoryRow: View {
         .draggable(recording.isTrashed
                    ? RecordingDragPayload(id: UUID())   // unused — won't be matched
                    : RecordingDragPayload(id: recording.id))
-        .contextMenu { contextMenu }
+        .recordingContextMenu(recording: recording, selection: $selection)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("history.row.\(recording.title)")
-        .sheet(item: Binding(
-            get: { renameRequest.map(RenameDraft.init) },
-            set: { if $0 == nil { renameRequest = nil } }
-        )) { draft in
-            RenameSheet(
-                initialTitle: draft.title,
-                onConfirm: { newTitle in
-                    store.rename(recording, to: newTitle)
-                    renameRequest = nil
-                },
-                onCancel: { renameRequest = nil }
-            )
-        }
-        .sheet(isPresented: $promptForNewFolder) {
-            FolderNameSheet(
-                title: "New Folder",
-                confirmLabel: "Create",
-                name: $newFolderDraft,
-                onConfirm: {
-                    if let created = store.createFolder(newFolderDraft) {
-                        store.assign(recording, toFolder: created)
-                    }
-                    promptForNewFolder = false
-                },
-                onCancel: { promptForNewFolder = false }
-            )
-        }
-        .sheet(isPresented: $showingSendSheet) {
-            SendToLLMSheet(recording: recording)
-        }
-    }
-
-    @ViewBuilder
-    private var contextMenu: some View {
-        if recording.isTrashed {
-            Button("Restore") { store.restore(recording) }
-            Divider()
-            Button("Delete Permanently", role: .destructive) {
-                store.permanentlyDelete(recording)
-                if case .recording(let id) = selection, id == recording.id {
-                    selection = .home
-                }
-            }
-        } else {
-            Button("Rename…") {
-                renameRequest = recording.title
-            }
-            Menu("Move to Folder") {
-                Button(recording.folder == nil ? "✓ None" : "None") {
-                    store.assign(recording, toFolder: nil)
-                }
-                if !store.folders.isEmpty {
-                    Divider()
-                    ForEach(store.folders, id: \.self) { folder in
-                        Button(recording.folder == folder ? "✓ \(folder)" : folder) {
-                            store.assign(recording, toFolder: folder)
-                        }
-                    }
-                }
-                Divider()
-                Button("New Folder…") {
-                    newFolderDraft = ""
-                    promptForNewFolder = true
-                }
-            }
-            Divider()
-            let currentLang = RecordingLanguage.fromCode(recording.language)
-            Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
-                transcription.enqueue(recording)
-            }
-            Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
-                retranscribe(recording, in: currentLang.other)
-            }
-            if llm.isConfigured {
-                Divider()
-                Button("Send to \(llm.tool.displayName)…") {
-                    showingSendSheet = true
-                }
-                .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
-            }
-            Divider()
-            Button("Export Subtitles (.srt)…") {
-                exportSRT()
-            }
-            .disabled(recording.segments.isEmpty)
-            Button("Reveal in Finder") {
-                NSWorkspace.shared.activateFileViewerSelecting([store.audioURL(for: recording)])
-            }
-            Divider()
-            Button("Delete", role: .destructive) {
-                store.softDelete(recording)
-                if case .recording(let id) = selection, id == recording.id {
-                    selection = .home
-                }
-            }
-        }
-    }
-
-    /// Switch the recording's stored language and re-enqueue it. The
-    /// `TranscriptionService` reads `recording.language` to pick the right
-    /// model (ivrit.ai for Hebrew, OpenAI for English), so updating the
-    /// store before enqueueing is enough to re-run with the other model.
-    private func retranscribe(_ recording: Recording, in language: RecordingLanguage) {
-        var copy = recording
-        copy.language = language.rawValue
-        copy.status = .pending
-        store.update(copy)
-        transcription.enqueue(copy)
-    }
-
-    /// Save the recording's SRT to a user-chosen location. NSSavePanel lets
-    /// the user place subtitles next to the original video file (the main
-    /// "video → SRT" use case) or anywhere else they like. We use the
-    /// title as the suggested filename so dragging a video produces
-    /// `MyVideo.srt` next to `MyVideo.mp4` by default.
-    private func exportSRT() {
-        let panel = NSSavePanel()
-        panel.title = "Export Subtitles"
-        panel.allowedContentTypes = [.init(filenameExtension: "srt") ?? .data]
-        panel.nameFieldStringValue = recording.title + ".srt"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try TranscriptExporter.writeSRT(for: recording, to: url)
-        } catch {
-            NSAlert(error: error).runModal()
-        }
     }
 
     private var preview: String {
@@ -379,11 +245,6 @@ private struct HistoryRow: View {
         let end = t.index(t.startIndex, offsetBy: 140)
         return String(t[..<end]) + "…"
     }
-}
-
-private struct RenameDraft: Identifiable {
-    let title: String
-    var id: String { title }
 }
 
 struct RenameSheet: View {
@@ -407,7 +268,13 @@ struct RenameSheet: View {
             Text("Rename Recording").font(.title3.weight(.semibold))
             TextField("Title", text: $draft)
                 .textFieldStyle(.roundedBorder)
-                .onSubmit { onConfirm(draft) }
+                // Return must behave like the Save button below — without
+                // the guard it committed a blank title the disabled button
+                // was there to prevent.
+                .onSubmit {
+                    guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    onConfirm(draft)
+                }
                 .accessibilityIdentifier("rename.title.field")
             HStack {
                 Spacer()

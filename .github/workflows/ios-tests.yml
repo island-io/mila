@@ -3,19 +3,7 @@ name: App Tests
 on:
   push:
     branches: [main]
-    paths:
-      - 'Mila/**'
-      - 'MilaTests/**'
-      - 'MilaUITests/**'
-      - 'project.yml'
-      - '.github/workflows/ios-tests.yml'
   pull_request:
-    paths:
-      - 'Mila/**'
-      - 'MilaTests/**'
-      - 'MilaUITests/**'
-      - 'project.yml'
-      - '.github/workflows/ios-tests.yml'
 
 jobs:
   unit-and-ui-tests:
@@ -27,8 +15,9 @@ jobs:
 
     steps:
       - name: Checkout with submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Install xcodegen
@@ -41,7 +30,7 @@ jobs:
       # restores are seconds.
       - name: Cache diarization bundle
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -96,7 +85,12 @@ jobs:
           # (prewarm) flake intermittently under CI runner load. Retry failed
           # tests up to 3× (early-exit on first pass) so a load-induced flake
           # doesn't red the build; genuine failures still fail all 3 attempts.
-          # Mirrors the same flag in ci.yml's build-and-test job.
+          # `-test-timeouts-enabled` + allowances bound a HANG (which retries
+          # can't catch) instead of the 30-min job cap — a stuck subprocess
+          # test used to run this whole job out to timeout. 240s default
+          # leaves room for the slowest legit test (the model-reenqueue test
+          # awaits waitForIdle TWICE, up to 90s each under load) while still
+          # bounding a true hang to minutes. Mirrors ci.yml's build-and-test.
           xcodebuild -project Mila.xcodeproj \
             -scheme Mila \
             -configuration Debug \
@@ -105,6 +99,9 @@ jobs:
             -only-testing:MilaTests \
             -retry-tests-on-failure \
             -test-iterations 3 \
+            -test-timeouts-enabled YES \
+            -default-test-execution-time-allowance 240 \
+            -maximum-test-execution-time-allowance 480 \
             test 2>&1 | tail -200
 
       - name: Run UI tests
@@ -129,7 +126,7 @@ jobs:
 
       - name: Upload test results on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: xcresult
           path: build/Logs/Test/*.xcresult

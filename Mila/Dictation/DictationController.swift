@@ -26,6 +26,10 @@ final class DictationController: ObservableObject {
     private let recorder = MicrophoneRecorder()
     private var samples: [Float] = []
     private var streamTask: Task<Void, Never>?
+    /// True while `start(action:)` is between its entry and setting
+    /// `state = .recording` — the two awaits in that window (mic permission,
+    /// engine bring-up) are where a hotkey double-press could re-enter.
+    private var isStarting = false
 
     /// Live transcriber used to surface partial transcripts in the
     /// dictation overlay AND to remove the post-release transcription
@@ -112,6 +116,19 @@ final class DictationController: ObservableObject {
     // MARK: - Recording
 
     private func start(action: HotkeyAction) async {
+        // Re-entrancy guard: `state` only becomes .recording AFTER the two
+        // awaits below (mic permission + engine bring-up), so a nervous
+        // double-tap of the hotkey inside that window saw .idle twice and
+        // ran two overlapping starts — the second streamTask overwrote the
+        // first without cancelling it and the recorder was restarted
+        // mid-flight. Set synchronously, so the second entry bails.
+        guard !isStarting else {
+            NSSound.beep()
+            return
+        }
+        isStarting = true
+        defer { isStarting = false }
+
         // Storage cap: a full library blocks new dictation clips too
         // (consistent with Settings copy). A beep is the right-sized signal
         // for the hotkey flow — rare edge, and the user can free space.
@@ -291,7 +308,7 @@ final class DictationController: ObservableObject {
 
     private func paste(_ text: String) {
         let pasteboard = NSPasteboard.general
-        let priorContents = pasteboard.string(forType: .string)
+        let priorContents = Self.snapshotPasteboard(pasteboard)
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
@@ -324,12 +341,49 @@ final class DictationController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
             Self.postCommandV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                if let prior = priorContents {
-                    pasteboard.clearContents()
-                    pasteboard.setString(prior, forType: .string)
+                if !priorContents.isEmpty {
+                    Self.restorePasteboard(pasteboard, from: priorContents)
                 }
             }
         }
+    }
+
+    // MARK: - Pasteboard snapshot/restore
+
+    /// Full-fidelity pasteboard snapshot: every item with every type it
+    /// carries. The old `string(forType: .string)`-only snapshot destroyed
+    /// any non-text clipboard content — copy a screenshot, dictate a
+    /// caption, and the screenshot was gone forever (the restore step was
+    /// skipped entirely because the string snapshot came back nil).
+    ///
+    /// Static + pasteboard-parameterized so tests can exercise the round
+    /// trip against a private named pasteboard instead of the user's real
+    /// clipboard.
+    static func snapshotPasteboard(_ pasteboard: NSPasteboard) -> [[NSPasteboard.PasteboardType: Data]] {
+        (pasteboard.pasteboardItems ?? []).map { item in
+            var entry: [NSPasteboard.PasteboardType: Data] = [:]
+            for type in item.types {
+                // Lazily-promised types can resolve to nil; skip those
+                // rather than fail the whole snapshot.
+                if let data = item.data(forType: type) {
+                    entry[type] = data
+                }
+            }
+            return entry
+        }
+    }
+
+    static func restorePasteboard(_ pasteboard: NSPasteboard,
+                                  from snapshot: [[NSPasteboard.PasteboardType: Data]]) {
+        pasteboard.clearContents()
+        let items: [NSPasteboardItem] = snapshot.map { entry in
+            let item = NSPasteboardItem()
+            for (type, data) in entry {
+                item.setData(data, forType: type)
+            }
+            return item
+        }
+        pasteboard.writeObjects(items)
     }
 
     /// Synthesize a Cmd+V at the HID event-tap level. Requires the process

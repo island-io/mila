@@ -49,10 +49,28 @@ final class TranscriptionService: ObservableObject {
     /// to clipping levels and produce ghost transcripts.
     static let minimumAudioPeak: Float = 0.005
 
+    /// Shown when capture produced no samples at all — the microphone's
+    /// problem, surfaced as the microphone's problem. See the guard in
+    /// `transcribeOnceSegments`.
+    static let noAudioCapturedMessage = "No audio was captured, so there was nothing to transcribe. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
+
     private let engine: any TranscribingEngine
     private let store: RecordingStore
     private let modelManager: ModelManager
     private let diarizationSettings: DiarizationSettings
+
+    /// User's transcription backend choice (on-device vs remote API). When the
+    /// remote backend is active + configured, transcription is routed through
+    /// `remoteEngine` instead of the local whisper.cpp `engine`, and the
+    /// local-model install gate is skipped (a remote user may have no `.bin`
+    /// downloaded at all).
+    private let remoteSettings: RemoteTranscriptionSettings
+
+    /// OpenAI-compatible remote engine. Constructed unconditionally but only
+    /// exercised when `remoteSettings.isActive` — cheap to hold idle (no
+    /// weights, just a URLSession). Injectable so tests can substitute an
+    /// engine that fails deterministically (see `RemoteTranscribing`).
+    private let remoteEngine: any RemoteTranscribing
 
     /// Hook fired once per recording that finished transcription
     /// successfully (status == .completed, non-empty text). MilaApp
@@ -71,6 +89,17 @@ final class TranscriptionService: ObservableObject {
     /// summary (the old one now refers to a transcript that no longer
     /// exists). For first-time transcription it's `false`.
     var onTranscriptionCompleted: ((Recording, _ wasRetranscription: Bool) -> Void)?
+
+    /// Auto-drop gate for accidental short+empty captures (issue #61). Wired
+    /// by `MilaApp` to the user's `recordings.minDuration` threshold. Given a
+    /// just-finished recording's duration + transcript, returns `true` when
+    /// the clip should be dropped — i.e. it's BOTH shorter than the threshold
+    /// AND has no transcript (a hotkey misfire / silence). Short clips that
+    /// DID produce text, and anything at/over the threshold, return `false`
+    /// (kept). `nil` — the default, used by every test that doesn't opt in —
+    /// means "never drop", so transcription behaviour is unchanged unless the
+    /// app explicitly wires the gate.
+    var shouldAutoDropShortEmpty: ((_ duration: Double, _ transcript: String) -> Bool)?
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
@@ -97,11 +126,18 @@ final class TranscriptionService: ObservableObject {
     init(store: RecordingStore,
          modelManager: ModelManager,
          diarizationSettings: DiarizationSettings,
-         engine: any TranscribingEngine = WhisperEngine()) {
+         remoteSettings: RemoteTranscriptionSettings? = nil,
+         engine: any TranscribingEngine = WhisperEngine(),
+         remoteEngine: (any RemoteTranscribing)? = nil) {
         self.store = store
         self.modelManager = modelManager
         self.diarizationSettings = diarizationSettings
+        // Default constructed inside this @MainActor init (a default argument
+        // can't, since those evaluate in a nonisolated context). Tests that
+        // don't exercise the remote path simply omit it.
+        self.remoteSettings = remoteSettings ?? RemoteTranscriptionSettings()
         self.engine = engine
+        self.remoteEngine = remoteEngine ?? RemoteWhisperEngine()
         // Bridge the engine's preparation callback onto the main
         // actor so SwiftUI subscribers see flips through `@Published`
         // (which is itself MainActor-isolated). The closure is
@@ -177,12 +213,22 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Public API
 
+    /// IDs enqueued as a manual re-transcribe. Consumed by `process` to make
+    /// the issue-#61 auto-drop gate an *explicit* first-transcription check
+    /// rather than one inferred from an empty transcript — a recording that
+    /// previously failed empty also has empty `fullText`, so inference alone
+    /// could hard-delete it (plus its audio) on a deliberate retry.
+    private var retranscriptionIDs: Set<UUID> = []
+
     /// Enqueue a recording for transcription. Returns immediately.
     /// Calls don't overlap — the queue drains FIFO on a single background task.
     /// Idempotent: re-enqueuing the active or already-queued recording is a no-op.
-    func enqueue(_ recording: Recording) {
+    /// `isRetranscription` marks a deliberate re-run of an existing recording so
+    /// the auto-drop gate never discards it (see `retranscriptionIDs`).
+    func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
         if activeRecordingID == recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
+        if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
         publishPending()
         startWorkerIfNeeded()
@@ -191,7 +237,18 @@ final class TranscriptionService: ObservableObject {
 
     /// Wait until the worker has fully drained the queue and gone idle.
     /// Used by tests to assert post-conditions deterministically.
-    func waitForIdle(timeout: TimeInterval = 30) async {
+    ///
+    /// The loop exits the instant the queue drains, so a healthy run
+    /// returns in milliseconds; `timeout` only caps a stuck run. It was
+    /// 30s, which under the heavy `build-and-test` runner's load was too
+    /// short — the background transcribe Task could be starved past 30s,
+    /// so `waitForIdle` returned WHILE STILL BUSY and the caller asserted
+    /// on stale state (flaked
+    /// `test_changing_recording_language_routes_to_other_model_on_reenqueue`
+    /// et al.). 90s gives the scheduler ample slack without affecting the
+    /// common case; genuine deadlocks are still bounded by the CI
+    /// per-test execution-time allowance.
+    func waitForIdle(timeout: TimeInterval = 90) async {
         let deadline = Date().addingTimeInterval(timeout)
         while (activeRecordingID != nil || !queue.isEmpty) && Date() < deadline {
             try? await Task.sleep(nanoseconds: 20_000_000)
@@ -240,7 +297,84 @@ final class TranscriptionService: ObservableObject {
     /// There is no default — the wrong choice silently degrades transcription
     /// quality on one path or the other, so make every call site declare its
     /// intent.
+    /// Proactively verify a remote transcription backend at recording start so
+    /// a bad API key or unreachable endpoint surfaces IMMEDIATELY — as the
+    /// global "Transcription error" alert — instead of silently emptying the
+    /// live transcript for the whole recording and only erroring on the Stop
+    /// batch pass. No-op for the on-device backend.
+    ///
+    /// Reuses `RemoteTranscriptionSettings.testConnection()` (a cheap
+    /// `GET /models`), which also refreshes the Settings status pill, then
+    /// mirrors a failure into `lastError`. Non-fatal: recording proceeds and
+    /// audio is saved regardless — this only gets the user a fast, actionable
+    /// error rather than a mystery blank pane.
+    func probeRemoteBackendIfActive() async {
+        guard remoteSettings.isActive else { return }
+        guard remoteSettings.isConfigured else {
+            lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
+            return
+        }
+        await remoteSettings.testConnection()
+        // Drop a superseded/cancelled probe: the caller cancels this task when
+        // the recording stops or a newer recording starts, so a late, out-of-
+        // order failure can't overwrite UI state for a recording the user has
+        // already moved past.
+        if Task.isCancelled { return }
+        if case .failed(let message) = remoteSettings.testStatus {
+            lastError = "Remote transcription server check failed: \(message) Your audio is still being recorded — fix the endpoint or API key in Settings → Models, then re-transcribe."
+        }
+    }
+
     func transcribeOnceSegments(samples: [Float], language: String, audioCtx: Int32?) async -> [TranscriptSegment] {
+        // Nothing was captured: don't hand it to any backend. The remote one
+        // uploads a header-only file and gets back `HTTP 500: Failed to decode
+        // audio.`, which the user reads as "the transcription server is down"
+        // — a diagnosis they can neither confirm nor act on, when the real
+        // problem is on this machine. Say what actually happened instead.
+        // The local backend fails the same way, just more quietly. (issue #147)
+        if AudioSignal.isSilent(samples) {
+            serviceLog.error("transcribeOnceSegments: REFUSING to transcribe \(samples.count, privacy: .public) samples with no signal — capture produced nothing")
+            if lastError == nil {
+                lastError = Self.noAudioCapturedMessage
+            }
+            return []
+        }
+        // Remote backend: route dictation/live utterances to the configured
+        // endpoint too, so the user's "global backend" choice holds for every
+        // path. Misconfiguration degrades to an empty result (same contract as
+        // a missing local model) rather than throwing into the live loop.
+        if remoteSettings.isActive {
+            guard remoteSettings.isConfigured,
+                  let config = remoteSettings.currentConfig(for: language) else {
+                serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
+                return []
+            }
+            await remoteEngine.configure(config)
+            do {
+                let segs = try await remoteEngine.transcribe(samples: samples,
+                                                             language: language,
+                                                             audioCtx: audioCtx,
+                                                             progress: nil,
+                                                             isCancelled: nil)
+                return segs
+            } catch {
+                // Log at .error: a remote failure (401/transport/server) repeats
+                // on every utterance for the whole recording and silently empties
+                // the live pane. Error level so it's visible in `log show`
+                // WITHOUT --debug and stands out from the debug firehose.
+                serviceLog.error("transcribeOnceSegments(remote): FAILED error=\(error.localizedDescription, privacy: .public)")
+                // Surface the failure instead of returning a silently-empty
+                // result that's indistinguishable from "no speech". Set once
+                // (only when nothing is already showing) so a per-utterance
+                // failure loop doesn't churn the alert every few seconds — the
+                // record-start probe (`probeRemoteBackendIfActive`) is the
+                // primary, up-front surfacing; this is the mid-recording backstop.
+                if lastError == nil {
+                    lastError = "Live transcription failed: \(error.localizedDescription)"
+                }
+                return []
+            }
+        }
         let candidate = modelManager.model(for: language)
         guard let model = candidate,
               modelManager.isInstalled(model) else {
@@ -264,7 +398,7 @@ final class TranscriptionService: ObservableObject {
             serviceLog.log("transcribeOnceSegments: model=\(model.name, privacy: .public) lang=\(language, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(Date().timeIntervalSince(startedAt), privacy: .public)s segs=\(segs.count, privacy: .public)")
             return segs
         } catch {
-            serviceLog.log("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return []
         }
     }
@@ -315,6 +449,7 @@ final class TranscriptionService: ObservableObject {
     /// global destructors run (which is what triggered SIGABRT on quit).
     func shutdown() async {
         await engine.shutdown()
+        await remoteEngine.shutdown()
     }
 
     /// Abandon the transcription of `recordingID`. If it's still in the queue
@@ -368,26 +503,70 @@ final class TranscriptionService: ObservableObject {
             return
         }
 
-        guard let model = modelManager.model(for: recording.language) else {
-            lastError = "No model selected."
-            markFailed(recording)
-            return
-        }
-        guard modelManager.isInstalled(model) else {
-            lastError = "Whisper model is still downloading. Try again once it's ready."
-            print("Transcribe skipped: model \(model.name) not installed yet")
-            markFailed(recording)
-            return
-        }
-
-        // Re-fetch from the store so we work against the latest persisted version.
-        // (The recording may have been edited or even soft-deleted between
-        //  enqueue() and now.)
+        // Re-fetch from the store BEFORE resolving backend/model/audio so every
+        // downstream choice uses the same live recording snapshot. The enqueued
+        // `recording` can be stale: a re-transcribe-in-other-language switches
+        // the store's `language` (via `prepareForRetranscription`) after the
+        // snapshot was captured, and the previous pass's compression may have
+        // renamed the audio. Picking the model from the stale `recording.language`
+        // while transcribing with `working.language` (below) could load/persist
+        // the wrong model for the language actually transcribed.
+        // (The recording may also have been edited or soft-deleted in the gap.)
         var working = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+        // Whether this is the recording's FIRST transcription — the only case
+        // the issue-#61 auto-drop gate may discard a recording. A manual
+        // re-transcribe must NEVER be dropped even if it comes back empty
+        // (that would delete an existing recording + its audio). Use the
+        // explicit `enqueue(isRetranscription:)` flag (consumed here), AND
+        // require an empty prior `fullText`, so neither a UI retry of a
+        // previously-failed-empty recording nor a recovered re-run is dropped.
+        // Captured before `fullText` is overwritten below. See issue #61 review.
+        let wasRetranscribeEnqueue = retranscriptionIDs.remove(recording.id) != nil
+        let isFirstTranscription = !wasRetranscribeEnqueue
+            && working.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if working.isTrashed {
             print("Transcribe skipped: \(working.title) was deleted before processing")
             return
         }
+
+        // Resolve the backend up front. Remote skips the local-model gate
+        // entirely (a remote-only user may never have downloaded a `.bin`);
+        // local keeps the existing "is the model installed yet?" guards.
+        let useRemote = remoteSettings.isActive
+        let localModel: WhisperModel?
+        let modelDisplayName: String
+        if useRemote {
+            // Language-routed: a server whose primary model is Hebrew-only (the
+            // ivrit.ai finetune) needs the English model id for English audio,
+            // or the transcript comes back with Hebrew words spliced in.
+            guard remoteSettings.isConfigured,
+                  let config = remoteSettings.currentConfig(for: working.language) else {
+                lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
+                markFailed(recording)
+                return
+            }
+            await remoteEngine.configure(config)
+            localModel = nil
+            // Label from the captured config, not remoteSettings — a Settings
+            // edit mid-run must not change what's persisted to this
+            // recording's modelName.
+            modelDisplayName = "Remote · \(config.model)"
+        } else {
+            guard let model = modelManager.model(for: working.language) else {
+                lastError = "No model selected."
+                markFailed(recording)
+                return
+            }
+            guard modelManager.isInstalled(model) else {
+                lastError = "Whisper model is still downloading. Try again once it's ready."
+                print("Transcribe skipped: model \(model.name) not installed yet")
+                markFailed(recording)
+                return
+            }
+            localModel = model
+            modelDisplayName = model.displayName
+        }
+        let activeEngine: any TranscribingEngine = useRemote ? remoteEngine : engine
 
         // Snapshot pre-run summary state so the completion hook can tell
         // the summarizer "this was a re-transcription, force-regenerate."
@@ -401,7 +580,7 @@ final class TranscriptionService: ObservableObject {
             .isEmpty
 
         working.status = .running
-        working.modelName = model.displayName
+        working.modelName = modelDisplayName
         store.update(working)
 
         let recordingID = recording.id
@@ -425,9 +604,24 @@ final class TranscriptionService: ObservableObject {
         await observerSetupTask.value
 
         do {
-            try await engine.loadIfNeeded(modelURL: modelManager.url(for: model),
-                                          displayName: model.displayName)
-            let audioURL = store.audioURL(for: recording)
+            // Local backend needs the whisper weights loaded (and the CoreML
+            // encoder compiled) before transcribing. The remote engine has no
+            // weights — `configure` already ran above.
+            if let localModel {
+                try await engine.loadIfNeeded(modelURL: modelManager.url(for: localModel),
+                                              displayName: localModel.displayName)
+            }
+            // Resolve the audio URL from the freshly re-fetched `working`
+            // record, NOT the stale `recording` snapshot captured at enqueue
+            // time. A re-transcribe (right-click "Re-transcribe in …") enqueues
+            // a snapshot still pointing at the original `.wav`, but the previous
+            // pass's background compression may have since renamed that file to
+            // `.m4a` and deleted the `.wav`. Reading the stale `.wav` path would
+            // then throw "file not found", failing the re-transcribe and leaving
+            // the old transcript in place. `working` always reflects the current
+            // on-disk name. (Paired with the compress/re-transcribe guard in
+            // `RecordingStore.compressRecordingAudio`.)
+            let audioURL = store.audioURL(for: working)
             let samples = try AudioConvert.loadAsWhisperSamples(url: audioURL)
             let durationSeconds = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
             let peak = samples.map { abs($0) }.max() ?? 0
@@ -452,6 +646,11 @@ final class TranscriptionService: ObservableObject {
                 working.status = .failed
                 working.fullText = ""
                 working.segments = []
+                // Auto-drop accidental short+empty captures (issue #61) before
+                // we persist the .failed row: a sub-threshold clip with no
+                // transcribable audio is pure list spam. A long-but-silent clip
+                // is over the threshold, so the gate keeps it as .failed.
+                if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: "", isFirstTranscription: isFirstTranscription) { return }
                 store.update(working)
                 return
             }
@@ -480,7 +679,7 @@ final class TranscriptionService: ObservableObject {
                 }
             }()
 
-            async let transcribeTask = engine.transcribe(
+            async let transcribeTask = activeEngine.transcribe(
                 samples: samples,
                 language: working.language,
                 // Batch path: imported files / post-record full-WAV
@@ -549,11 +748,24 @@ final class TranscriptionService: ObservableObject {
             print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
 
             working.segments = enrichedSegments
+            // The batch pass minted fresh speaker IDs (new clustering, new
+            // segment boundaries) with no alignment to the old ones, so any
+            // user-assigned names are now keyed to meaningless IDs — clear
+            // them rather than mislabel a different voice. Only explicit
+            // re-transcribes of a renamed recording hit this in practice.
+            working.speakerNames = [:]
             working.fullText = text
             if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
                 working.duration = lastEnd
             }
             working.status = text.isEmpty ? .failed : .completed
+            // Auto-drop accidental short+empty captures (issue #61): a clip
+            // that came back with NO transcript AND is under the user's
+            // minimum-duration threshold is a hotkey misfire / silence — drop
+            // it instead of leaving a .failed row cluttering the list. The gate
+            // keeps any clip that produced text (even a short one) and anything
+            // at/over the threshold, so this only ever removes worthless rows.
+            if autoDropIfShortAndEmpty(working, duration: durationSeconds, transcript: text, isFirstTranscription: isFirstTranscription) { return }
             store.update(working)
 
             if working.status == .completed {
@@ -614,6 +826,34 @@ final class TranscriptionService: ObservableObject {
             working.status = .failed
             store.update(working)
         }
+    }
+
+    /// Permanently delete `recording` when the auto-drop gate flags it as an
+    /// accidental short+empty capture (issue #61). Returns `true` if it
+    /// dropped it (the caller should then early-return without persisting a
+    /// `.failed`/`.completed` row). We hard-delete rather than soft-delete:
+    /// these clips have no transcript and no audio worth keeping, so routing
+    /// them through Recently Deleted would just leave orphaned audio on disk
+    /// for the grace period. No-op when the gate isn't wired (tests) or the
+    /// recording has real content / is long enough to keep.
+    private func autoDropIfShortAndEmpty(_ recording: Recording, duration: Double, transcript: String, isFirstTranscription: Bool) -> Bool {
+        // Only auto-drop a recording's FIRST transcription. A manual
+        // re-transcribe of an existing recording that comes back empty must
+        // NOT be deleted — that would destroy content the user already had.
+        guard isFirstTranscription else { return false }
+        // Only auto-drop accidental *local mic captures* (mic recordings +
+        // dictation hotkey misfires — both `.microphone`). Never Voice Memos,
+        // imported files (`.systemAudio`), or meeting captures: those aren't
+        // accidental and/or their source audio wasn't captured in Mila, so
+        // permanently deleting them would be data loss (issue #61 review).
+        guard recording.source == .microphone else { return false }
+        // Use the freshly-decoded audio duration, NOT `recording.duration`,
+        // which can be stale (crash-recovered rows are seeded with 0) and
+        // would let a long-but-silent clip slip under the threshold.
+        guard shouldAutoDropShortEmpty?(duration, transcript) == true else { return false }
+        print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(duration)s + empty transcript (issue #61)")
+        store.permanentlyDelete(recording)
+        return true
     }
 }
 

@@ -4,13 +4,27 @@ import Foundation
 /// identifiers into a label the user actually wants to see — `Speaker A`
 /// in English, `דובר א׳` in Hebrew.
 ///
-/// The raw labels stay in the internal data model (segment metadata,
-/// SRT exports, post-recording sidecar text) because they're stable
-/// across runs and tooling outside Mila (pyannote, third-party
-/// re-clustering scripts) expects them. The conversion only happens
-/// at display time and when feeding text to the LLM, so the LLM sees
-/// the same labels the user sees and emits them back the same way.
+/// The raw labels stay in the internal data model (segment metadata)
+/// because they're stable across runs and tooling outside Mila
+/// (pyannote, third-party re-clustering scripts) expects them. The
+/// conversion happens at display/export time and when feeding text to
+/// the LLM, so the LLM sees the same labels the user sees and emits
+/// them back the same way. When the user has assigned a real name to a
+/// speaker (`Recording.speakerNames`), that name wins everywhere —
+/// UI, clipboard, `.srt` sidecar, LLM feed — via
+/// `displaySpeakerName(names:language:)`.
 extension String {
+    /// The label to show/export for this raw speaker ID: the
+    /// user-assigned name when one exists, otherwise the friendly
+    /// "Speaker A" / "דובר א׳" fallback.
+    func displaySpeakerName(names: [String: String], language: String) -> String {
+        if let name = names[self]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            return name
+        }
+        return friendlySpeakerLabel(language: language)
+    }
+
     func friendlySpeakerLabel(language: String) -> String {
         guard self.hasPrefix("SPEAKER_") else { return self }
         let suffix = self.dropFirst("SPEAKER_".count)

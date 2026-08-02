@@ -165,6 +165,14 @@ final class QuickActionsController: ObservableObject {
     /// we never fire the warning for a recording that's already over.
     private var silenceWatchTask: Task<Void, Never>?
 
+    /// Active record-start remote-backend probe (see `startRecording`).
+    /// Single-owner: superseded when a new recording starts and cancelled
+    /// when one stops, so an older probe — whose `GET /models` is still in
+    /// flight against the same unchanged config (which `testConnection()`
+    /// can't detect as stale) — can't land an out-of-order failure into
+    /// `lastError`/`testStatus` after the user already moved on.
+    private var remoteProbeTask: Task<Void, Never>?
+
     /// Background finalize tasks, keyed by the recording id they're
     /// finalizing. After `stopRecording` drains the live pipeline and
     /// frees the record button, the HEAVY tail of finalization — the
@@ -366,6 +374,7 @@ final class QuickActionsController: ObservableObject {
             activeJob = .recording(withSystemAudio: withSystemAudio)
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
+            armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             screenRecordingPermissionMissing = true
         } catch {
@@ -455,6 +464,7 @@ final class QuickActionsController: ObservableObject {
             activeJob = .recordingApp(processID: app?.processID, includeMic: includeMic)
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
+            armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             screenRecordingPermissionMissing = true
         } catch {
@@ -463,6 +473,30 @@ final class QuickActionsController: ObservableObject {
             } else {
                 transcription.lastError = "Could not start app recording: \(error.localizedDescription)"
             }
+        }
+    }
+
+    /// Proactively verify a remote transcription backend now that capture is
+    /// live. A bad key / unreachable endpoint otherwise stays invisible: the
+    /// live path silently drops every utterance and the error only appears on
+    /// the Stop batch pass (the user recorded a whole meeting before learning
+    /// it failed). Non-blocking — recording already started and audio is being
+    /// saved; this just races an error banner to the user. No-op for the local
+    /// backend. Single-owner: cancel any prior probe so its (possibly stale)
+    /// result can't overwrite UI state for this newer recording. Called from
+    /// every record-start entry point (mic/meeting and app-audio) so no live
+    /// path can fail silently. Cancelled in `stopRecording()`.
+    private func armRemoteProbe() {
+        remoteProbeTask?.cancel()
+        remoteProbeTask = Task { [transcription] in
+            // `cancel()` above is cooperative, so a just-superseded probe can
+            // still get scheduled. Bail before touching `transcription` —
+            // `probeRemoteBackendIfActive()`'s active-but-unconfigured branch
+            // writes `lastError` synchronously, before any await/cancellation
+            // check, so without this guard a stale probe could surface an
+            // error for a recording the user has already moved past.
+            guard !Task.isCancelled else { return }
+            await transcription.probeRemoteBackendIfActive()
         }
     }
 
@@ -485,6 +519,10 @@ final class QuickActionsController: ObservableObject {
         // user already stopped (especially common for sub-10s recordings).
         silenceWatchTask?.cancel()
         silenceWatchTask = nil
+        // Cancel any in-flight record-start remote probe for the same reason:
+        // its failure result must not land after the recording is over.
+        remoteProbeTask?.cancel()
+        remoteProbeTask = nil
         // Release the sleep assertion as soon as the engine is shutting
         // down — keeping it past `stop()` would block idle sleep while
         // the user is just looking at the rename sheet.
@@ -512,11 +550,29 @@ final class QuickActionsController: ObservableObject {
             // recording. Cursor (PRRT_kwDOSY2m-s6GOIj-) flagged it.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // Nothing was captured, so there's no snapshot to protect —
+            // shut the Live AI session down with the rest of the pipeline.
+            // See the normal path for why this matters.
+            liveAISession?.cancel()
+            // Same reason as the normal-path clear below: the meeting is
+            // over either way, so its notes must not carry into the next
+            // recording.
+            liveAISettings?.meetingContext = ""
             isFinalizingRecording = false
             activeJob = .none
             return
         }
-        let duration = max(durationBeforeStop, audioDuration(at: outputURL))
+        // Prefer what's actually on disk over the wall clock. For a healthy
+        // recording the two agree; when they don't, the file is the truth and
+        // the wall clock is a claim the user can't act on — the diagnostic
+        // report that prompted this showed a 26:24 row whose audio was 24
+        // seconds long, because `max()` always let the timer win. Fall back to
+        // the wall clock only when the file can't be decoded at all — a
+        // readable file reporting zero frames is a real answer, not a failure
+        // to measure, and must not be re-inflated to the full wall clock.
+        let decodedDuration = audioDuration(at: outputURL)
+        let capturedDuration = decodedDuration ?? 0
+        let duration = decodedDuration ?? durationBeforeStop
         let (title, source, appName): (String, RecordingSource, String?) = {
             switch captured {
             case .recordingMic:
@@ -548,6 +604,21 @@ final class QuickActionsController: ObservableObject {
         if source == .microphone, session.lastMicFrameCount == 0 {
             transcription.lastError = "Microphone captured no audio. Check System Settings ▸ Privacy & Security ▸ Microphone, and that the input selected in Settings ▸ Audio Input isn't muted, disconnected, or in use by another app."
             quickActionsLog.error("mic-only recording captured 0 frames — surfaced audio-input guidance to the user")
+        }
+
+        // Capture that died PART way through used to be completely silent: the
+        // row showed the full wall-clock length and the transcript just stopped
+        // early, so a lost meeting looked like a bad transcription. Say it out
+        // loud instead. `transcription.lastError` is only set when nothing more
+        // specific claimed it (the 0-frame case above is strictly better
+        // guidance for its own situation).
+        if Self.capturedAudioFellShort(source: source,
+                                       wallClock: durationBeforeStop,
+                                       captured: capturedDuration) {
+            quickActionsLog.error("captured only \(capturedDuration, privacy: .public)s of audio for a \(durationBeforeStop, privacy: .public)s recording (source=\(source.rawValue, privacy: .public), micRebuilds=\(self.session.mic.restartCount, privacy: .public)) — capture died mid-session")
+            if transcription.lastError == nil {
+                transcription.lastError = "Only \(formatDuration(capturedDuration)) of audio was captured for a \(formatDuration(durationBeforeStop)) recording — capture stopped early. This usually means the input device changed or went away mid-recording (headphones unplugged, a USB mic removed, or another app taking over the device). Pinning a specific input in Settings ▸ Audio Input makes it less likely."
+            }
         }
 
         // ---- IMMEDIATE: build a tentative Recording from whatever
@@ -587,7 +658,8 @@ final class QuickActionsController: ObservableObject {
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
             appName: appName,
             summary: initialSummary.isEmpty ? nil : initialSummary,
-            actionItems: initialItems.isEmpty ? nil : initialItems
+            actionItems: initialItems.isEmpty ? nil : initialItems,
+            speakerNames: liveTranscriber?.speakerNames ?? [:]
         )
         store.add(recording)
         activeJob = .none
@@ -650,22 +722,18 @@ final class QuickActionsController: ObservableObject {
         if let diar = liveDiarizer {
             liveTranscriber?.applySpeakerLabels(diar.intervals)
         }
-        // Push one final feed with the post-drain transcript so the
-        // LLM tail covers up to stop. Mirrors `.idle` handler's
-        // behavior; we skip the .idle drain here so we have to do
-        // the feed ourselves. `awaitFinalTick` then drains both the
-        // tick this feed kicks off AND any in-flight tick.
-        if liveAISettings?.enabled == true,
-           llmSettings?.isConfigured == true,
-           let transcriber = liveTranscriber {
-            let text = transcriber.formattedTranscript
-            if !text.isEmpty {
-                // Stop-time flush — bypass the min-interval floor so the
-                // final tick covers up to stop (awaitFinalTick drains it).
-                liveAISession?.feed(transcript: text, immediate: true)
-            }
-        }
-        await liveAISession?.awaitFinalTick()
+        // The final Live-AI summary tick is deliberately NOT awaited here.
+        // It used to run inline (feed the post-drain transcript, then
+        // `awaitFinalTick()` the resulting `claude` call), which held the
+        // Record button on "Finalizing…" for the whole summary subprocess —
+        // several seconds on a real conversation — even though the transcript
+        // was already complete and on screen. We now snapshot whatever the
+        // rolling live summary / action items are RIGHT NOW (for instant
+        // display in the post-record sheet), free the button below the
+        // instant the transcript is saved, and let `finalizeTail` regenerate
+        // the summary from the full transcript in the background. The saved
+        // summary upgrades in place a few seconds later, queue-style.
+        // See island-io/mila#86.
 
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
@@ -731,10 +799,23 @@ final class QuickActionsController: ObservableObject {
             // pipelines below before returning.
             liveTranscriber?.stop()
             liveDiarizer?.stop()
+            // The row this snapshot belonged to is gone, so there is
+            // nothing left to read `summary` / `actionItems` for.
+            liveAISession?.cancel()
+            // Third exit from a finished recording, and it needs the same
+            // clear as the other two — otherwise cancelling the rename
+            // sheet is enough to carry this meeting's notes into the next
+            // recording. (CodeRabbit on #111.)
+            liveAISettings?.meetingContext = ""
             isFinalizingRecording = false
             return
         }
         updated.segments = finalTranscriptSegments
+        // Mid-recording speaker renames from the live pane. Snapshotted
+        // here (before `liveTranscriber?.stop()` below) alongside the
+        // segments they label; `finalizeTail` remaps them if the offline
+        // re-diarize pass re-keys the speaker IDs.
+        updated.speakerNames = liveTranscriber?.speakerNames ?? [:]
         // Always preserve fullText when we have live segments — the
         // sheet should show what the user just saw on screen, even
         // for chunk mode while the batch diarization pass is still
@@ -756,6 +837,38 @@ final class QuickActionsController: ObservableObject {
         // Cleanup: `.idle` handler skipped these because the flag was set.
         liveTranscriber?.stop()
         liveDiarizer?.stop()
+        // Shut the Live AI session down too — deliberately AFTER the
+        // snapshot above, because `cancel()` clears `summary` /
+        // `actionItems` and those are what we just saved.
+        //
+        // Left running, the session outlives the recording in two ways:
+        //
+        //   1. A `pendingKickTask` sleeping out the min-interval floor
+        //      wakes up after the meeting is over and spawns a full
+        //      `claude --resume` subprocess whose result lands on a
+        //      Recording that was already written — observed 2026-07-26:
+        //      stop at 13:33:58, a tick at 13:34:49. `finalizeTail`
+        //      regenerates the summary from the complete transcript
+        //      anyway, so that call was never anything but waste.
+        //   2. The session's stable sandbox
+        //      (`/tmp/island-mila-llm-session-<uuid>`, plus a
+        //      `~/.claude/projects/` dir per recording) is only removed by
+        //      `cancel()` — so it survived until the NEXT recording called
+        //      `start()`, and forever if the app quit first.
+        //
+        // Not done in `wireLiveAIPipeline`'s `.idle` handler: that fires
+        // during `session.stop()` above, i.e. BEFORE the snapshot, and it
+        // deliberately leaves the session alone for exactly that reason.
+        // This is the one place that knows the snapshot is already safe.
+        liveAISession?.cancel()
+        // Per-meeting background notes die with the meeting. Cleared HERE
+        // (not in `LiveAISession.start()`) because a recording can begin
+        // before the user has pasted anything — clearing at start would
+        // wipe notes prepared for the meeting about to happen. Leaving
+        // them set is what produced blended "previous call + this call"
+        // summaries when the agenda lived in the persistent `prompt`
+        // instead: see LiveAISettings.meetingContext.
+        liveAISettings?.meetingContext = ""
         // Free the record button NOW. The heavy tail below (offline
         // re-diarize subprocess / summarizer LLM call / m4a transcode, or
         // the batch-transcription enqueue) touches only the on-disk WAV,
@@ -835,19 +948,42 @@ final class QuickActionsController: ObservableObject {
                         wavURL: self.store.audioURL(for: updated),
                         segments: updated.segments,
                         recordingID: id) {
+                        let preRediarize = updated.segments
                         updated.segments = rediarized
                         if var current = self.store.recordings.first(where: { $0.id == id }) {
                             current.segments = rediarized
+                            // The offline pass re-keyed every SPEAKER_NN, so
+                            // names assigned mid-recording (or in the detail
+                            // view while this pass ran — hence the re-fetched
+                            // row's map, not the snapshot's) must follow the
+                            // utterances they labeled onto the new IDs.
+                            current.speakerNames = SpeakerNameRemapper.remap(
+                                names: current.speakerNames,
+                                from: preRediarize,
+                                to: rediarized)
                             self.store.update(current)
                             updated = current
                         }
                     }
                 }
-                // Write the SRT sidecar + trigger the summarizer ourselves (the
-                // enqueue path normally runs both via its onTranscriptionCompleted
-                // hook).
+                // Write the SRT sidecar, then produce the summary in the
+                // background — the record button is already free while this
+                // runs. `stopRecording` no longer awaits the final Live-AI
+                // summary tick inline (island-io/mila#86), so the rolling
+                // summary snapshotted onto the recording can be a
+                // throttle-interval stale (missing the tail of the
+                // conversation). For a Live-AI recording, regenerate from the
+                // FULL transcript here so the saved summary is complete — this
+                // faithfully replaces the removed inline tick, under the same
+                // enabled + configured conditions. `summarizeIfNeeded` covers
+                // the Live-AI-off case under the normal auto-summary gate.
                 TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
-                self.summarizer?.summarizeIfNeeded(updated)
+                if self.liveAISettings?.enabled == true,
+                   self.llmSettings?.isConfigured == true {
+                    self.summarizer?.regenerate(updated)
+                } else {
+                    self.summarizer?.summarizeIfNeeded(updated)
+                }
                 // Shrink storage: the live transcript is authoritative and the
                 // rediarize above is done reading the WAV, so transcode it to
                 // m4a in the background. (The batch path does this via its own
@@ -1018,6 +1154,36 @@ final class QuickActionsController: ObservableObject {
         return !Task.isCancelled
     }
 
+    /// Wall-clock length a recording must reach before a short-capture warning
+    /// is worth showing. Below this, the gap between "time the engine was up"
+    /// and "audio on disk" is dominated by bring-up and teardown latency, and
+    /// warning would just be noise on every quick voice memo.
+    nonisolated static let shortCaptureMinimumWallClock: TimeInterval = 30
+    /// Fraction of the wall clock that must make it to disk. 0.8 tolerates
+    /// normal bring-up/teardown loss and a rebuild or two, while still
+    /// catching the real failure (24s of a 1584s recording = 1.5%).
+    nonisolated static let shortCaptureRatio: Double = 0.8
+
+    /// Whether a finished recording captured far less audio than the user
+    /// spent recording — i.e. capture died part way through.
+    ///
+    /// `.systemAudio` is exempt: ScreenCaptureKit only delivers buffers while
+    /// something is actually playing, so a short file there is expected rather
+    /// than a fault. Mic and meeting sources both have the mic as a continuous
+    /// clock, so their file length should track the wall clock closely.
+    ///
+    /// Pure, static and `nonisolated` so the policy can be unit tested without
+    /// a recording, an audio device, or a hop to the main actor.
+    nonisolated static func capturedAudioFellShort(source: RecordingSource,
+                                                   wallClock: TimeInterval,
+                                                   captured: TimeInterval) -> Bool {
+        guard source == .microphone || source == .meeting else { return false }
+        // captured == 0 is a different failure with its own, better message
+        // (and its own log line) — don't double up on it here.
+        guard captured > 0, wallClock >= shortCaptureMinimumWallClock else { return false }
+        return captured < wallClock * shortCaptureRatio
+    }
+
     // MARK: - Helpers
 
     var isRecording: Bool {
@@ -1040,8 +1206,16 @@ final class QuickActionsController: ObservableObject {
         return "\(prefix) · \(f.string(from: Date()))"
     }
 
-    private func audioDuration(at url: URL) -> Double {
-        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+    /// Length of the audio actually on disk, or `nil` if the file can't be
+    /// decoded at all.
+    ///
+    /// The optional matters: a readable WAV containing zero frames is a real
+    /// answer ("we captured nothing"), and must not be confused with "we
+    /// couldn't tell". Returning 0 for both let a completely empty recording
+    /// fall back to the wall clock and be saved at full length — the exact
+    /// lie this change set out to remove.
+    private func audioDuration(at url: URL) -> Double? {
+        guard let file = try? AVAudioFile(forReading: url) else { return nil }
         return Double(file.length) / file.processingFormat.sampleRate
     }
 }

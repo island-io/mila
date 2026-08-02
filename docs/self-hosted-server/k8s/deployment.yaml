@@ -1,0 +1,165 @@
+# speaches — an OpenAI-compatible Whisper server — running a CTranslate2 model
+# on a single NVIDIA GPU. Always-on (1 replica); a single GPU can host exactly
+# one pod, so there's no rolling surge.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mila-asr
+  namespace: mila-asr
+  labels:
+    app: mila-asr
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mila-asr
+  strategy:
+    type: Recreate # single GPU: a 2nd pod can't schedule, so no rolling surge
+  template:
+    metadata:
+      labels:
+        app: mila-asr
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      # Many GPU node setups taint their GPU nodes so ordinary pods stay off
+      # them. This toleration lets the pod land on such a node. If your GPU
+      # nodes are NOT tainted this is simply a no-op, so it's safe to leave in.
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+        # The optional gpu-nodepool.example.yaml also taints its nodes
+        # `dedicated=gpu:NoSchedule`, so tolerate that too or the pod stays
+        # Pending on that pool. Tolerating a taint that isn't present is a
+        # no-op, so this is safe even on plain (nvidia-only-tainted) GPU nodes.
+        - key: dedicated
+          operator: Equal
+          value: gpu
+          effect: NoSchedule
+      # Optional: if you keep a dedicated GPU node pool (see
+      # gpu-nodepool.example.yaml), label its nodes and pin this workload to
+      # them, e.g.:
+      #   nodeSelector:
+      #     dedicated: gpu
+      containers:
+        - name: speaches
+          # Upstream public image. The 0.9.0-rc.3 tag serves /health WITHOUT
+          # auth, which the probes below rely on (some tags gate /health behind
+          # the API key, so unauthenticated probes would fail). Pin a tag you've
+          # tested; check https://github.com/speaches-ai/speaches for releases.
+          image: ghcr.io/speaches-ai/speaches:0.9.0-rc.3-cuda
+          imagePullPolicy: IfNotPresent
+          # Baseline hardening. runAsNonRoot / readOnlyRootFilesystem are left
+          # off because the upstream image writes to its cache and may run as
+          # root; add them if your image supports it (with writable mounts).
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # float16 on the GPU: good accuracy, roughly half the VRAM of
+            # float32. Use int8_float16 if you're tight on VRAM.
+            - name: WHISPER__COMPUTE_TYPE
+              value: float16
+            # Never unload an idle model. Matters with two models: the cache is
+            # an emptyDir, so an evicted model doesn't just reload from disk on
+            # the next request — it re-downloads. Drop this if you're tight on
+            # VRAM and would rather trade the cold load.
+            - name: STT_MODEL_TTL
+              value: "-1"
+            # Point the HuggingFace cache at the mounted volume (see below).
+            - name: HF_HOME
+              value: /home/ubuntu/.cache/huggingface
+            # API key that gates the endpoint. Mila sends it as a Bearer token.
+            # Sourced from the mila-asr-secrets Secret (see secret.example.yaml).
+            - name: API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: mila-asr-secrets
+                  key: API_KEY
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 14Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model-cache
+              mountPath: /home/ubuntu/.cache/huggingface
+          # Warm both models on startup so the first user request doesn't pay the
+          # full cold download/load. The hook waits for the server's own /health
+          # to pass, then triggers each download via speaches' registration
+          # endpoint: POST /v1/models/{model_id:path} — a FastAPI ":path"
+          # converter, so the HuggingFace id is passed literally WITH slashes.
+          # Non-fatal (|| true): speaches also lazy-loads a model on the first
+          # request, so a transient network hiccup must not crash-loop the pod.
+          #
+          # Two models, because the ivrit.ai finetune is Hebrew-ONLY: give it
+          # English audio and it returns English speech with Hebrew words
+          # spliced in, no matter what `language` the client sends. The turbo
+          # build covers English (and everything else); Mila picks per recording
+          # language via Settings → Models → "English model". Drop the second id
+          # if you only ever transcribe Hebrew. STT_MODEL_TTL=-1 keeps both
+          # resident — ~1.6 GB VRAM each, comfortable on a 16 GB T4.
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    # Every curl is bounded: postStart holds the container out of
+                    # Running until this script exits, so an unbounded request
+                    # against a wedged server would stall the rollout forever.
+                    for i in $(seq 1 60); do
+                      curl -sf --connect-timeout 5 --max-time 10 \
+                        http://127.0.0.1:8000/health && break || sleep 5
+                    done
+                    for model in \
+                      ivrit-ai/whisper-large-v3-turbo-ct2 \
+                      deepdml/faster-whisper-large-v3-turbo-ct2; do
+                      for j in $(seq 1 30); do
+                        curl -sf --connect-timeout 5 --max-time 600 -X POST \
+                          -H "Authorization: Bearer $API_KEY" \
+                          "http://127.0.0.1:8000/v1/models/$model" \
+                          && break || sleep 10
+                      done
+                    done || true
+          # Hold off readiness/liveness until the server is up. A cold model
+          # download can take a couple of minutes: 60 * 5s = up to 5 min before
+          # the pod is considered failed to start.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+      volumes:
+        - name: model-cache
+          # Pod-local scratch for the HuggingFace model cache. Deliberately an
+          # emptyDir (not a PVC): a ReadWriteOnce cloud volume is often
+          # zone-locked, so a node that comes up in a different zone would leave
+          # the pod stuck attaching it. The model re-downloads on pod restart
+          # (~1-2 min), absorbed by the postStart warm-up hook above. Swap for a
+          # PVC if you want the cache to persist across restarts.
+          emptyDir:
+            sizeLimit: 20Gi

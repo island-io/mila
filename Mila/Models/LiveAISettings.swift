@@ -62,6 +62,21 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(useVAD, forKey: Keys.useVAD) }
     }
 
+    /// When true (and `useVAD` is on), each RMS-detected utterance is
+    /// re-checked by the bundled Silero neural VAD before it reaches
+    /// whisper. Utterances that contain no actual human speech (room
+    /// noise, music, keyboard, AC hum that cleared the energy cutoff)
+    /// are dropped, which kills the "whisper hallucinates filler on
+    /// silence/noise" problem (e.g. the Hebrew `תודה רבה אדוני יושב
+    /// ראש הכנסת`). On by default — the model is ~0.9 MB and the check
+    /// is a few ms per utterance, and it *saves* CPU by skipping
+    /// whisper on noise-only segments. Escape hatch for the rare case
+    /// where it clips genuinely quiet speech. Only meaningful when
+    /// `useVAD` is on (the fixed-timer path has no per-utterance gate).
+    @Published var useNeuralVAD: Bool {
+        didSet { defaults.set(useNeuralVAD, forKey: Keys.useNeuralVAD) }
+    }
+
     /// When true, the recording UI stays on the Home screen (just a
     /// Stop button) instead of switching to the LiveAIRecordingView's
     /// split pane. Transcription + summary continue to run in the
@@ -109,6 +124,24 @@ final class LiveAISettings: ObservableObject {
     @Published var prompt: String {
         didSet { defaults.set(prompt, forKey: Keys.prompt) }
     }
+
+    /// Background notes for the CURRENT meeting only — an agenda, a list
+    /// of attendees, acronyms the model won't know. Injected into every
+    /// Live AI tick as a clearly-labelled non-transcript block (see
+    /// `LiveAISession.promptWithContext`) and cleared by
+    /// `QuickActionsController.stopRecording` when the recording ends.
+    ///
+    /// Deliberately NOT persisted to `UserDefaults` and deliberately not
+    /// part of `prompt`. Both properties are what makes this safe:
+    /// users used to paste the agenda into the `prompt` editor in
+    /// Settings, which is a permanent template — so every LATER recording
+    /// was told the previous meeting's agenda was its context and the
+    /// model produced a blended "previous call + this call" summary plus
+    /// action items lifted straight from the stale agenda (stamped
+    /// `timestamp_seconds: 0`, since they were never said out loud).
+    /// In-memory + cleared-at-stop means a meeting's context can never
+    /// outlive the meeting, even across an app relaunch.
+    @Published var meetingContext: String = ""
 
     /// Output language for the LLM's summary and action items.
     /// Default English. The recording can still be in any language —
@@ -198,10 +231,12 @@ final class LiveAISettings: ObservableObject {
         self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
         // Migrate pre-1.6.1 persisted values (default was 5s, range 3-20s).
         // 5s windows cut words mid-utterance and made the trailing-window
-        // merge stitch together inconsistent segments. 30s = one full
-        // window per tick, non-overlapping, clean boundaries.
+        // merge stitch together inconsistent segments. Only values below
+        // the current slider minimum (15s) are treated as stale — 15 and
+        // 20 are legal choices on today's 15-60s slider and must survive
+        // a relaunch, so they can't be used as a migration marker.
         let raw = defaults.double(forKey: Keys.chunkSeconds)
-        self.chunkSeconds = raw >= 25.0 ? raw : 30.0
+        self.chunkSeconds = raw >= 15.0 ? raw : 30.0
         // Default 20s. `double(forKey:)` returns 0 for an unset key, and
         // 0 is also the legitimate "disable the floor" value — so use a
         // sentinel via object(forKey:) to tell "never set" (→ 20) apart
@@ -210,14 +245,31 @@ final class LiveAISettings: ObservableObject {
         // Default ON: users who never touched the toggle get the
         // cleaner-boundary VAD path. Explicit false is preserved.
         self.useVAD = defaults.object(forKey: Keys.useVAD) as? Bool ?? true
+        // Default ON: the neural-VAD gate is a strict quality win
+        // (drops noise-only utterances that whisper would hallucinate
+        // on) and a CPU win (skips whisper on those). Explicit false
+        // is preserved for users who turned it off.
+        self.useNeuralVAD = defaults.object(forKey: Keys.useNeuralVAD) as? Bool ?? true
         self.backgroundMode = defaults.bool(forKey: Keys.backgroundMode)
         self.forceLiveAIOnLowEndHardware = defaults.bool(forKey: Keys.forceLowEnd)
         let sim = defaults.double(forKey: Keys.simThreshold)
-        // Migrate the old 0.75 default — too strict for wespeaker on
-        // 1-5s VAD utterances; same-speaker cosine sim at that length
-        // sits in 0.5-0.7, so 0.75 split every utterance into a new
-        // SPEAKER_NN. Treat values >= 0.7 as "old default, migrate".
-        self.speakerSimilarityThreshold = (sim > 0 && sim < 0.7) ? sim : 0.55
+        if defaults.bool(forKey: Keys.simThresholdMigrated) {
+            self.speakerSimilarityThreshold = sim > 0 ? sim : 0.55
+        } else {
+            // One-shot migration of the old 0.75 default — too strict for
+            // wespeaker on 1-5s VAD utterances; same-speaker cosine sim at
+            // that length sits in 0.5-0.7, so 0.75 split every utterance
+            // into a new SPEAKER_NN. Treat values >= 0.7 as "old default,
+            // migrate" — but only ONCE: the Settings slider legitimately
+            // offers up to 0.95, so re-running this on every launch would
+            // silently discard a user's chosen threshold. The flag (plus
+            // writing the migrated value back) makes later >= 0.7 values
+            // stick.
+            let migrated = (sim > 0 && sim < 0.7) ? sim : 0.55
+            self.speakerSimilarityThreshold = migrated
+            defaults.set(migrated, forKey: Keys.simThreshold)
+            defaults.set(true, forKey: Keys.simThresholdMigrated)
+        }
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
         let langRaw = defaults.string(forKey: Keys.outputLanguage) ?? OutputLanguage.auto.rawValue
         self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto
@@ -300,9 +352,11 @@ the content.
         static let chunkSeconds = "liveAI.chunkSeconds"
         static let llmMinInterval = "liveAI.llmMinIntervalSeconds"
         static let useVAD = "liveAI.useVAD"
+        static let useNeuralVAD = "liveAI.useNeuralVAD"
         static let backgroundMode = "liveAI.backgroundMode"
         static let forceLowEnd = "liveAI.forceOnLowEndHardware"
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
+        static let simThresholdMigrated = "liveAI.speakerSimilarityThreshold.migrated"
         static let prompt = "liveAI.prompt"
         static let outputLanguage = "liveAI.outputLanguage"
         static let summaryPrompt = "liveAI.summaryPrompt"

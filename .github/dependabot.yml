@@ -1,0 +1,38 @@
+# Dependabot — keep GitHub Actions and the Docker base image current.
+#
+# Scope: this repo pins actions by SHA (see the workflows); Dependabot keeps those
+# pinned SHAs current with a PR + changelog. Swift/SPM deps are declared in
+# project.yml (XcodeGen), which Dependabot does not parse, and the whisper.cpp
+# submodule is governed by .github/whisper-cpp-pin.txt — both are intentionally
+# left out here to avoid fighting those mechanisms.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns: ["*"]
+    ignore:
+      # setup-swift's only v3 tag is the 3.0.0-beta.1 pre-release. Its
+      # Swiftly-based installer fails GPG verification on the Ubuntu runner
+      # ("gpg: Can't check signature: No public key"), which reds the
+      # e2e-transcription job. Stay on v2.x until a stable v3 ships.
+      - dependency-name: "swift-actions/setup-swift"
+        versions: ["3.x"]
+
+  - package-ecosystem: "docker"
+    directory: "/docker/speaches-hebrew"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "docker"

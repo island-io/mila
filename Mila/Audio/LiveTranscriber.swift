@@ -61,6 +61,12 @@ final class LiveTranscriber: ObservableObject {
     /// flat string (e.g. the LLM feed via `formattedTranscript`).
     @Published private(set) var segments: [LiveSegment] = []
 
+    /// User-assigned display names for live speakers (raw `SPEAKER_NN`
+    /// → name), set from the live pane's rename popover mid-recording.
+    /// Copied into the saved `Recording` at stop (QuickActionsController),
+    /// where the post-stop re-diarize remaps them onto the re-keyed IDs.
+    @Published var speakerNames: [String: String] = [:]
+
     var chunkSeconds: Double = 30.0
     var windowSeconds: Double = 30.0
     /// When true, route incoming audio through `UtteranceDetector` and
@@ -75,6 +81,15 @@ final class LiveTranscriber: ObservableObject {
     /// its speaker pool. Each chunk should contain one speaker;
     /// VAD-bounded utterances satisfy that by construction.
     var onUtteranceCaptured: (([Float], Double, Double) -> Void)?
+    /// Optional neural (Silero) speech gate. When set, each VAD-emitted
+    /// utterance is re-checked for actual human speech before whisper
+    /// runs; utterances with none (room noise, music, AC hum that
+    /// cleared the RMS cutoff) are dropped so whisper never hallucinates
+    /// filler on them. Wired in `MilaApp.wireLiveAIPipeline` from
+    /// `LiveAISettings.useNeuralVAD`; nil disables the gate. Only the
+    /// VAD path (`useVAD`) consults it — the fixed-timer path has no
+    /// per-utterance boundary to gate.
+    var speechGate: SileroVAD?
     private let sampleRate: Double = 16_000
 
     private let transcription: TranscriptionService
@@ -126,6 +141,7 @@ final class LiveTranscriber: ObservableObject {
         self.samplesDropped = 0
         self.fullText = ""
         self.segments = []
+        self.speakerNames = [:]
         self.lastError = nil
         self.epoch &+= 1
         liveLog.log("LiveTranscriber.start lang=\(language, privacy: .public) chunk=\(self.chunkSeconds, privacy: .public)s window=\(self.windowSeconds, privacy: .public)s useVAD=\(self.useVAD, privacy: .public) epoch=\(self.epoch, privacy: .public)")
@@ -303,6 +319,25 @@ final class LiveTranscriber: ObservableObject {
         guard scheduledEpoch == epoch else {
             liveLog.log("LiveTranscriber utterance dropped at entry — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
             return
+        }
+        // Neural-VAD gate: drop utterances the RMS detector emitted that
+        // contain no actual human speech (noise that merely cleared the
+        // energy cutoff). Runs BEFORE the diarizer feed and whisper so a
+        // noise burst never produces a hallucinated segment nor pollutes
+        // the speaker pool. Fail-open by construction (`containsSpeech`
+        // returns true on any VAD error), so a broken gate degrades to
+        // today's behaviour rather than silencing the transcript. Cheap
+        // relative to whisper — and when it drops, it skips whisper
+        // entirely, a net CPU win.
+        if let speechGate {
+            let hasSpeech = await speechGate.containsSpeech(samples)
+            // Re-check epoch: the async VAD call could straddle a new
+            // recording, same as the whisper call below.
+            guard scheduledEpoch == epoch else { return }
+            if !hasSpeech {
+                liveLog.log("LiveTranscriber utterance dropped by neural VAD — no speech (samples=\(samples.count) startSec=\(startSec, privacy: .public))")
+                return
+            }
         }
         beginTranscribe()
         defer { endTranscribe() }

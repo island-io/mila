@@ -33,9 +33,11 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
             store: store,
             modelManager: manager,
             diarizationSettings: DiarizationSettings(defaults: .init(suiteName: diarSuite)!),
+            remoteSettings: TestSupport.isolatedRemoteSettings(label: "PostRecordingCoordinatorSendTests"),
             engine: stub
         )
-        coordinator = PostRecordingCoordinator(store: store, transcription: service)
+        coordinator = PostRecordingCoordinator(store: store, transcription: service,
+                                               llm: LLMSettings(defaults: UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.llm")!))
     }
 
     override func tearDown() async throws {
@@ -112,6 +114,54 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         try await waitForBanner(containing: "FAST", timeoutSeconds: 30)
         XCTAssertFalse(coordinator.activityStatus?.contains("SLOW") ?? false,
                        "Replaced send must not surface its output")
+    }
+
+    /// Regression: when a send is cancelled-and-replaced, the REPLACED
+    /// task's self-cleanup must not wipe the REPLACEMENT's handle. Before
+    /// the fix, the first task's unconditional `defer { sendTasks[id] = nil }`
+    /// ran when it unwound with `.cancelled` — `isSending` went false while
+    /// the replacement CLI was still running, and `cancelAndDiscard` could
+    /// no longer reach it (the CLI kept running against a recording that
+    /// was being permanently deleted).
+    func test_replaced_send_does_not_orphan_replacement_handle() async throws {
+        let first = makeScript("""
+            #!/bin/sh
+            sleep 5
+            printf 'FIRST'
+            """)
+        let second = makeScript("""
+            #!/bin/sh
+            sleep 20
+            printf 'SECOND'
+            """)
+        defer {
+            try? FileManager.default.removeItem(at: first)
+            try? FileManager.default.removeItem(at: second)
+        }
+
+        let rec = addCompletedRecording(text: "transcript")
+        coordinator.present(rec)
+
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
+                              transcript: "transcript", summary: "",
+                              executableOverride: first.path)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        // Replace: cancels the first task (its CLI gets SIGTERM'd and it
+        // unwinds through its defer while the second is still running).
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
+                              transcript: "transcript", summary: "",
+                              executableOverride: second.path)
+        // Give the replaced task ample time to unwind and run its cleanup.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        XCTAssertTrue(coordinator.isSending(rec.id),
+                      "The replacement send is still in flight — the replaced task's cleanup must not have cleared its handle")
+
+        // And the handle still works: discard reaches the replacement.
+        coordinator.cancelAndDiscard()
+        try await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertFalse(coordinator.isSending(rec.id),
+                       "cancelAndDiscard must be able to cancel the replacement send")
     }
 
     // MARK: - Discard cancels an in-flight send
@@ -201,7 +251,90 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         XCTAssertFalse(coordinator.isSending(rec.id))
     }
 
+    // MARK: - OpenAI-compatible model threading (issue celarent7/mila#3)
+
+    /// `sendToLLM` must thread `openAIModelName` as the `model` argument for
+    /// the OpenAI-compatible path — otherwise the HTTP request POSTs an empty
+    /// model name and the endpoint rejects it. We inject a `runLLM` stub that
+    /// records the `model` it was handed and returns canned text, so the
+    /// assertion needs no network or CLI.
+    func test_sendToLLM_threadsOpenAIModelName_forOpenAICompatible() async throws {
+        let suite = UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.openai.\(#function)")!
+        suite.removePersistentDomain(forName: "PostRecordingCoordinatorSendTests.openai.\(#function)")
+        let key = "PostRecordingCoordinatorSendTests.openai.\(#function).apiKey"
+        KeychainHelper.delete(key: key)
+        let llm = LLMSettings(defaults: suite, apiKeyKeychainKey: key)
+        llm.tool = .openaiCompatible
+        llm.openAIBaseURL = "https://api.openai.com/v1"
+        llm.openAIModelName = "gpt-4o-mini"
+
+        var capturedModel: String? = nil
+        var callCount = 0
+        let openAICoordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _ in
+                capturedModel = model
+                callCount += 1
+                return "OPENAI ANSWER"
+            })
+
+        let rec = addCompletedRecording(text: "the transcript text")
+        openAICoordinator.sendToLLM(recordingID: rec.id,
+                                    tool: .openaiCompatible,
+                                    prompt: "Summarize",
+                                    transcript: "the transcript text",
+                                    summary: "",
+                                    executableOverride: nil)
+        try await waitFor(callCount > 0)
+        XCTAssertEqual(capturedModel, "gpt-4o-mini",
+                       "The OpenAI path must thread openAIModelName, not an empty model")
+    }
+
+    /// The CLI path must keep passing `nil` for `model` (the CLI picks its
+    /// own) — the OpenAI-model threading must not leak into `.claude`/`.cursor`.
+    func test_sendToLLM_passesNilModel_forCLIPath() async throws {
+        let suite = UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.cli.\(#function)")!
+        suite.removePersistentDomain(forName: "PostRecordingCoordinatorSendTests.cli.\(#function)")
+        let key = "PostRecordingCoordinatorSendTests.cli.\(#function).apiKey"
+        KeychainHelper.delete(key: key)
+        let llm = LLMSettings(defaults: suite, apiKeyKeychainKey: key)
+        llm.tool = .claude
+
+        var capturedModel: String? = "SENTINEL"
+        var callCount = 0
+        let cliCoordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _ in
+                capturedModel = model
+                callCount += 1
+                return "CLI ANSWER"
+            })
+
+        let rec = addCompletedRecording(text: "the transcript text")
+        cliCoordinator.sendToLLM(recordingID: rec.id,
+                                 tool: .claude,
+                                 prompt: "Summarize",
+                                 transcript: "the transcript text",
+                                 summary: "",
+                                 executableOverride: nil)
+        try await waitFor(callCount > 0)
+        XCTAssertNil(capturedModel,
+                     "The CLI path must leave model nil (the CLI chooses its own)")
+    }
+
     // MARK: - Helpers
+
+    /// Wait up to `timeoutSeconds` (default 5) for `condition` to hold, polling
+    /// every 50 ms. Fails the test on timeout — used by the OpenAI seam tests.
+    private func waitFor(_ condition: @autoclosure () async -> Bool,
+                         timeoutSeconds: TimeInterval = 5) async throws {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while Date() < deadline {
+            if await condition() { return }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTFail("Timed out waiting on an injected runLLM stub to fire")
+    }
 
     /// Add a `.completed` recording with the given transcript text, with a
     /// placeholder audio file so `RecordingStore.add` is happy.

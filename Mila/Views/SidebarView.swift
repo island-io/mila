@@ -40,6 +40,16 @@ struct SidebarView: View {
     @State private var newFolderName = ""
     @State private var renameTarget: String?
     @State private var renameDraft = ""
+    /// Inline error shown in the rename sheet when `store.renameFolder`
+    /// rejects the new name (collision). Kept here so the sheet can stay
+    /// open instead of silently no-op'ing and closing.
+    @State private var renameError: String?
+
+    /// Whether the "All Transcriptions" section is expanded to show its
+    /// recordings inline. Persisted so the user's choice survives app
+    /// launches (issue #28).
+    @AppStorage("sidebar.allTranscriptions.expanded")
+    private var allTranscriptionsExpanded = false
 
     var body: some View {
         List(selection: $selection) {
@@ -57,13 +67,27 @@ struct SidebarView: View {
                 // recordings (folder == nil). Lives under "Folders" but is
                 // labeled descriptively so first-time users know that's
                 // where their transcripts show up.
-                folderRow(label: "All Transcriptions",
-                          systemImage: "tray.full",
-                          selection: .defaultFolder,
-                          identifier: "sidebar.folder.default") { payload in
+                //
+                // It doubles as a collapsible section (issue #28): the
+                // disclosure triangle expands an inline list of the
+                // recordings so the user can jump straight to one without
+                // first landing on the all-recordings page. Tapping the
+                // row body still navigates to that page (tag ==
+                // .defaultFolder); only the triangle toggles expansion.
+                let unfiled = store.unfiledRecordings()
+                AllTranscriptionsRow(
+                    expanded: $allTranscriptionsExpanded,
+                    hasRecordings: !unfiled.isEmpty
+                ) { payload in
                     if let id = payload?.id,
                        let rec = store.recordings.first(where: { $0.id == id }) {
                         store.assign(rec, toFolder: nil)
+                    }
+                }
+
+                if allTranscriptionsExpanded {
+                    ForEach(unfiled) { rec in
+                        RecordingSubRow(recording: rec, selection: $selection)
                     }
                 }
 
@@ -80,6 +104,7 @@ struct SidebarView: View {
                     .contextMenu {
                         Button("Rename Folder…") {
                             renameDraft = name
+                            renameError = nil
                             renameTarget = name
                         }
                         Button("Delete Folder", role: .destructive) {
@@ -148,11 +173,17 @@ struct SidebarView: View {
                 title: "Rename Folder",
                 confirmLabel: "Rename",
                 name: $renameDraft,
+                errorText: $renameError,
                 onConfirm: {
-                    if let renamed = store.renameFolder(target.name, to: renameDraft) {
-                        if case .folder(let sel) = selection, sel == target.name {
-                            selection = .folder(renamed)
-                        }
+                    // nil = rejected (name collides with an existing
+                    // folder). Keep the sheet open with an inline error
+                    // instead of silently closing as if it worked.
+                    guard let renamed = store.renameFolder(target.name, to: renameDraft) else {
+                        renameError = "A folder with that name already exists."
+                        return
+                    }
+                    if case .folder(let sel) = selection, sel == target.name {
+                        selection = .folder(renamed)
                     }
                     renameTarget = nil
                 },
@@ -228,6 +259,96 @@ private struct FolderRow: View {
     }
 }
 
+/// Header row for the collapsible "All Transcriptions" section (issue #28).
+///
+/// Mirrors `FolderRow` (selectable + drop destination for unfiling a dragged
+/// recording) but prefixes a disclosure triangle that toggles the inline
+/// recording list independently of selection. The triangle is a `.plain`
+/// Button so clicking it flips `expanded` without also selecting the row;
+/// clicking anywhere else on the row falls through to List selection and
+/// navigates to `.defaultFolder`, exactly as the old plain row did.
+private struct AllTranscriptionsRow: View {
+    @Binding var expanded: Bool
+    /// When there are no unfiled recordings the triangle is hidden (but its
+    /// space is kept) so the label stays aligned with the sibling folders.
+    let hasRecordings: Bool
+    let onDrop: (RecordingDragPayload?) -> Void
+
+    @State private var isTargeted = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(expanded ? 90 : 0))
+                    .frame(width: 12, height: 12)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(!hasRecordings)
+            .opacity(hasRecordings ? 1 : 0)
+            .help(expanded ? "Hide recordings" : "Show recordings")
+            .accessibilityIdentifier("sidebar.folder.default.disclosure")
+
+            Label("All Transcriptions", systemImage: "tray.full")
+            Spacer(minLength: 0)
+        }
+        .contentShape(Rectangle())
+        .dropDestination(for: RecordingDragPayload.self) { items, _ in
+            guard let first = items.first else { return false }
+            onDrop(first)
+            return true
+        } isTargeted: { isTargeted = $0 }
+        .tag(SidebarSelection.defaultFolder)
+        .accessibilityIdentifier("sidebar.folder.default")
+        .listRowBackground(
+            isTargeted
+                ? Color.accentColor.opacity(0.18)
+                : Color.clear
+        )
+    }
+}
+
+/// Inline sub-row shown under an expanded "All Transcriptions" (issue #28):
+/// the recording title as primary text with a smaller, gray timestamp
+/// beneath it. Tagged `.recording(id)` so List selection drives navigation
+/// straight to the transcript page, and `.draggable` so it can still be
+/// filed into a folder by dragging — same payload the history rows use.
+///
+/// Carries the same per-recording `.recordingContextMenu` as the
+/// All Transcripts list so right-click works here too (issue #62): the menu
+/// needs the shared `selection` binding to navigate away if the currently
+/// open recording is deleted from the row.
+private struct RecordingSubRow: View {
+    let recording: Recording
+    @Binding var selection: SidebarSelection?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(recording.title)
+                .font(.callout)
+                .lineLimit(1)
+            Text(recording.createdAt,
+                 format: .dateTime.month().day().hour().minute())
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        // Indent so the sub-rows read as children of the section header
+        // rather than peers of the folder rows.
+        .padding(.leading, 18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
+        .tag(SidebarSelection.recording(recording.id))
+        .draggable(RecordingDragPayload(id: recording.id))
+        .recordingContextMenu(recording: recording, selection: $selection)
+        .accessibilityIdentifier("sidebar.recording.\(recording.title)")
+    }
+}
+
 /// Shared sheet for both creating and renaming folders. Title and confirm
 /// button label are parameterized so the same control serves the sidebar
 /// "+ New Folder" flow, the per-recording "Move to Folder → New Folder…"
@@ -236,16 +357,50 @@ struct FolderNameSheet: View {
     let title: String
     let confirmLabel: String
     @Binding var name: String
+    /// Inline validation message (e.g. a rename collision). Owned by the
+    /// presenting view — its confirm handler sets it and keeps the sheet
+    /// open; the sheet clears it as soon as the user edits the name.
+    /// Defaults to a constant nil so the create-folder call sites (which
+    /// have no failure mode to surface) don't have to thread state through.
+    @Binding var errorText: String?
     let onConfirm: () -> Void
     let onCancel: () -> Void
+
+    init(title: String,
+         confirmLabel: String,
+         name: Binding<String>,
+         errorText: Binding<String?> = .constant(nil),
+         onConfirm: @escaping () -> Void,
+         onCancel: @escaping () -> Void) {
+        self.title = title
+        self.confirmLabel = confirmLabel
+        self._name = name
+        self._errorText = errorText
+        self.onConfirm = onConfirm
+        self.onCancel = onCancel
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.title3.weight(.semibold))
             TextField("Folder name", text: $name)
                 .textFieldStyle(.roundedBorder)
-                .onSubmit { onConfirm() }
+                // Return must behave like the confirm button below — without
+                // the guard it fired onConfirm on a blank name the disabled
+                // button was there to prevent.
+                .onSubmit {
+                    guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+                    onConfirm()
+                }
+                .onChange(of: name) { _, _ in errorText = nil }
                 .accessibilityIdentifier("folder.name.field")
+            if let errorText {
+                Text(errorText)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("folder.name.error")
+            }
             HStack {
                 Spacer()
                 Button("Cancel", action: onCancel)

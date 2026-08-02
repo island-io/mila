@@ -24,7 +24,15 @@ final class TranscriptionServiceTests: XCTestCase {
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
-        service = TranscriptionService(store: store, modelManager: manager, diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.diarization")!), engine: stub)
+        // Inject an isolated, local-backend RemoteTranscriptionSettings so the
+        // service can't read `.standard` and route to a real remote endpoint
+        // (which would bypass the stub). See TestSupport.isolatedRemoteSettings.
+        service = TranscriptionService(
+            store: store,
+            modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.diarization")!),
+            remoteSettings: TestSupport.isolatedRemoteSettings(label: "TranscriptionServiceTests"),
+            engine: stub)
     }
 
     override func tearDown() async throws {
@@ -35,6 +43,158 @@ final class TranscriptionServiceTests: XCTestCase {
             UserDefaults.standard.removeObject(forKey: "selectedModelName")
         }
         try await super.tearDown()
+    }
+
+    // MARK: - Remote backend error surfacing
+    //
+    // Regression coverage for the silent-failure bug: a remote backend with a
+    // bad key (or unreachable endpoint) used to empty the live transcript with
+    // NO visible error — the failure only appeared on the Stop batch pass, and
+    // CI never caught it because the remote E2E suite only tested the happy
+    // path against an accepting mock. These tests pin the two new guards.
+
+    func test_probeRemoteBackendIfActive_isNoopForLocalBackend() async {
+        // The default `service` uses the on-device backend. Probing must do
+        // nothing — never touch the network or the Keychain, never error.
+        XCTAssertNil(service.lastError)
+        await service.probeRemoteBackendIfActive()
+        XCTAssertNil(service.lastError, "Local backend must not be probed")
+    }
+
+    func test_probeRemoteBackendIfActive_surfacesAuthFailure() async {
+        // The record-start probe must turn a 401 into an immediate, actionable
+        // error instead of a blank live pane discovered 13 minutes later.
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [Probe401URLProtocol.self]
+        let session = URLSession(configuration: config)
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.probe401")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.probe401")
+        let keychainKey = "TranscriptionServiceTests.probe401.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(
+            defaults: suite, urlSession: session, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "https://api.openai.com/v1"
+        remote.apiKey = "test-key-123"
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.probe401.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine())
+
+        XCTAssertNil(svc.lastError)
+        await svc.probeRemoteBackendIfActive()
+        XCTAssertNotNil(svc.lastError, "A 401 at record-start must surface immediately")
+        XCTAssertTrue(svc.lastError?.contains("Settings") ?? false,
+                      "Error should point the user at Settings: \(svc.lastError ?? "nil")")
+    }
+
+    func test_liveRemoteFailure_setsLastError() async {
+        // The live/dictation path must surface a remote failure, not return a
+        // silently-empty result indistinguishable from "no speech detected".
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.liveRemoteFail")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.liveRemoteFail")
+        let keychainKey = "TranscriptionServiceTests.liveRemoteFail.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(
+            defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        // Self-hosted endpoint → isConfigured without a key, so routing reaches
+        // the (injected, always-throwing) remote engine.
+        remote.endpoint = "http://localhost:8080/v1"
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.liveRemoteFail.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: ThrowingRemoteEngine())
+
+        XCTAssertNil(svc.lastError)
+        let segs = await svc.transcribeOnceSegments(samples: [0.1, 0.2, 0.3], language: "he", audioCtx: nil)
+        XCTAssertTrue(segs.isEmpty, "A remote failure yields no segments")
+        XCTAssertNotNil(svc.lastError, "A live remote failure must surface, not silently empty the pane")
+    }
+
+    // MARK: - Empty capture never reaches the network (issue #147)
+
+    /// A recording session that delivered zero frames used to be encoded to a
+    /// header-only file and POSTed anyway; the server answered
+    /// `HTTP 500: {"detail":"Failed to decode audio."}` and the user read that
+    /// as "the transcription server is down". The microphone's failure has to
+    /// be reported as the microphone's failure, and the upload must not happen.
+    func test_zeroFrameCapture_neverReachesTheUploadPath() async {
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.emptyAudio")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.emptyAudio")
+        let keychainKey = "TranscriptionServiceTests.emptyAudio.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "http://localhost:8080/v1"
+        let counting = CountingRemoteEngine()
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.emptyAudio.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: counting)
+
+        let segs = await svc.transcribeOnceSegments(samples: [], language: "en", audioCtx: nil)
+
+        XCTAssertTrue(segs.isEmpty)
+        let calls = await counting.transcribeCalls
+        XCTAssertEqual(calls, 0, "empty audio must never be handed to the remote backend")
+        XCTAssertEqual(svc.lastError, TranscriptionService.noAudioCapturedMessage,
+                       "the user must be told nothing was captured, not shown the server's decode error")
+    }
+
+    /// Same for a buffer that has samples but no signal — a muted or dead
+    /// input device. There is nothing to transcribe and nothing to upload.
+    func test_digitalSilence_neverReachesTheUploadPath() async {
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.silentAudio")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.silentAudio")
+        let keychainKey = "TranscriptionServiceTests.silentAudio.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "http://localhost:8080/v1"
+        let counting = CountingRemoteEngine()
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.silentAudio.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: counting)
+
+        let segs = await svc.transcribeOnceSegments(samples: [Float](repeating: 0, count: 16_000),
+                                                    language: "en", audioCtx: nil)
+
+        XCTAssertTrue(segs.isEmpty)
+        let calls = await counting.transcribeCalls
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(svc.lastError, TranscriptionService.noAudioCapturedMessage)
+    }
+
+    /// The guard is the strictest possible one, so ordinary quiet speech is
+    /// still transcribed — a 0.2s utterance at -60 dBFS must go through.
+    func test_quietButRealAudio_isStillTranscribed() async {
+        let suite = UserDefaults(suiteName: "TranscriptionServiceTests.quietAudio")!
+        suite.removePersistentDomain(forName: "TranscriptionServiceTests.quietAudio")
+        let keychainKey = "TranscriptionServiceTests.quietAudio.apiKey"
+        defer { KeychainHelper.delete(key: keychainKey) }
+        let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey)
+        remote.backend = .remote
+        remote.endpoint = "http://localhost:8080/v1"
+        let counting = CountingRemoteEngine()
+        let svc = TranscriptionService(
+            store: store, modelManager: manager,
+            diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "TranscriptionServiceTests.quietAudio.diar")!),
+            remoteSettings: remote, engine: StubWhisperEngine(),
+            remoteEngine: counting)
+
+        var samples = [Float](repeating: 0, count: 3_200)   // 0.2s @ 16kHz
+        samples[1_000] = 0.001
+        let segs = await svc.transcribeOnceSegments(samples: samples, language: "en", audioCtx: nil)
+
+        XCTAssertEqual(segs.count, 1, "quiet is not the same as empty")
+        let calls = await counting.transcribeCalls
+        XCTAssertEqual(calls, 1)
+        XCTAssertNil(svc.lastError)
     }
 
     // MARK: - Single recording happy path
@@ -219,6 +379,174 @@ final class TranscriptionServiceTests: XCTestCase {
         let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertEqual(stored.status, .failed)
         XCTAssertEqual(stored.fullText, "")
+    }
+
+    // MARK: - Auto-drop short + empty recordings (issue #61)
+
+    /// Wire the real gate onto the service so these tests exercise the exact
+    /// production path (`RecordingStorageSettings.shouldAutoDrop` +
+    /// `TranscriptionService.process`), not a test-only shortcut.
+    private func enableAutoDrop(threshold: Double = 5) {
+        service.shouldAutoDropShortEmpty = { duration, transcript in
+            RecordingStorageSettings.shouldAutoDrop(
+                duration: duration, transcript: transcript, threshold: threshold)
+        }
+    }
+
+    func test_short_empty_recording_is_auto_dropped_after_transcription() async throws {
+        enableAutoDrop()
+        // Audible + long enough to reach whisper (passes the silence guard),
+        // but the engine returns no segments → empty transcript, under 5s.
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Hotkey misfire",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        XCTAssertNil(store.recordings.first { $0.id == fixture.recording.id },
+                     "A short recording with an empty transcript must be dropped from the store")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.audioURL.path),
+                       "The dropped recording's audio file must be removed (no orphan)")
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 1, "Drop happens AFTER transcription resolves")
+    }
+
+    func test_short_but_transcribed_recording_is_kept() async throws {
+        // The explicit edge case from the issue: short, but it produced text.
+        enableAutoDrop()
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Short but real",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "quick note to self")
+        ])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .completed)
+        XCTAssertEqual(stored.fullText, "quick note to self")
+    }
+
+    func test_short_empty_recording_is_kept_when_gate_disabled() async throws {
+        // Threshold 0 disables the gate: the short+empty clip stays as .failed
+        // (the pre-#61 behaviour), it is NOT dropped.
+        enableAutoDrop(threshold: 0)
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Kept because gate off",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    func test_short_empty_recording_is_kept_when_no_hook_wired() async throws {
+        // Default: no gate wired at all (every existing caller/test). Behaviour
+        // is unchanged — the short+empty recording lands .failed and stays.
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "No hook",
+                                                    durationSeconds: 1.0)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    /// The gate targets accidental *local mic* captures only. A short, empty
+    /// Voice Memos import must NOT be permanently deleted — it has its own
+    /// handling, and deleting it would tombstone the source memo (issue #61
+    /// review: scope the gate away from imports).
+    func test_voice_memo_short_empty_is_not_auto_dropped() async throws {
+        enableAutoDrop()
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Imported memo",
+                                                    durationSeconds: 1.0,
+                                                    source: .voiceMemo)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id },
+                                   "A Voice Memo import must not be auto-dropped by the mic-capture gate")
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    /// Regression: the gate must use the DECODED audio duration, not
+    /// `recording.duration`, which crash-recovered rows seed with a stale `0`.
+    /// A long-but-empty clip whose stored duration is `0` must stay `.failed`,
+    /// not be deleted as if it were short (issue #61 review).
+    func test_long_empty_recording_is_kept_despite_stale_zero_duration() async throws {
+        enableAutoDrop()
+        let audioURL = store.freshAudioURL(suggestedName: "Long silent")
+        try TestSupport.writeSineWav(at: audioURL, durationSeconds: 6.0)  // > 5s threshold
+        let rec = Recording(title: "Long silent", duration: 0,  // stale — real audio is 6s
+                            source: .microphone, audioFileName: audioURL.lastPathComponent,
+                            language: "he")
+        store.add(rec)
+        await stub.setDefaultCanned([])
+
+        service.enqueue(rec)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == rec.id },
+                                   "A 6s clip must not be dropped just because recording.duration was a stale 0")
+        XCTAssertEqual(stored.status, .failed)
+    }
+
+    /// A manual re-transcribe of an EXISTING recording that comes back empty
+    /// must not be auto-dropped — the recording already had content, and
+    /// deleting it would destroy the user's data. Only first-time captures are
+    /// eligible for auto-drop (issue #61 review).
+    func test_short_empty_retranscribe_of_existing_recording_is_kept() async throws {
+        enableAutoDrop()
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Existing note",
+                                                    durationSeconds: 1.0)
+        var rec = fixture.recording
+        rec.status = .completed
+        rec.fullText = "the note I already transcribed"
+        store.update(rec)                 // now it has prior content
+        await stub.setDefaultCanned([])   // the retry produces nothing
+
+        service.enqueue(rec)
+        await service.waitForIdle()
+
+        XCTAssertNotNil(store.recordings.first { $0.id == rec.id },
+                        "Re-transcribing an existing recording to an empty result must not delete it")
+    }
+
+    /// The silence guard rejects the clip before whisper runs; the auto-drop
+    /// gate must still remove it (short + empty), so accidental sub-0.3s /
+    /// silent captures never even reach the list.
+    func test_silence_rejected_recording_is_auto_dropped_when_short() async throws {
+        enableAutoDrop()
+        let url = store.freshAudioURL(suggestedName: "Silent misfire")
+        try TestSupport.writeSineWav(at: url, durationSeconds: 0.06, amplitude: 0.0001)
+        let recording = Recording(title: "Silent misfire",
+                                  duration: 0.06,
+                                  source: .microphone,
+                                  audioFileName: url.lastPathComponent,
+                                  language: "he")
+        store.add(recording)
+
+        service.enqueue(recording)
+        await service.waitForIdle()
+
+        XCTAssertNil(store.recordings.first { $0.id == recording.id },
+                     "A silence-rejected short clip must be auto-dropped")
+        let calls = await stub.transcribeCalls
+        XCTAssertTrue(calls.isEmpty, "Silence guard still short-circuits before whisper")
     }
 
     // MARK: - User-reported "every empty recording shows the same transcript"
@@ -413,6 +741,36 @@ final class TranscriptionServiceTests: XCTestCase {
                           "User-cancelled recordings must not surface as engine failures")
     }
 
+    /// The Queue's "Stop" button flow: abort the active run via the service AND
+    /// flip the store status (the service leaves it alone). The recording must
+    /// end in a terminal state so it drops out of the Queue instead of showing
+    /// "Transcribing" forever, but the audio + row must survive for a later
+    /// re-transcribe.
+    func test_stop_from_queue_leaves_recording_terminal_and_kept() async throws {
+        let target = try TestRecordingFixture.make(in: store, title: "Stop me")
+        await stub.setDefaultDelay(0.4)
+
+        service.enqueue(target.recording)
+        let deadline = Date().addingTimeInterval(2)
+        while service.activeRecordingID != target.recording.id && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(service.activeRecordingID, target.recording.id)
+
+        // Mirror QueueRow.cancel(): trip the abort flag + stop (move to trash).
+        service.cancel(recordingID: target.recording.id)
+        store.stopTranscription(target.recording)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == target.recording.id })
+        XCTAssertEqual(stored.status, .failed,
+                       "A stopped recording must leave the running/pending Queue state")
+        XCTAssertTrue(stored.isTrashed,
+                      "Stop moves the recording to Recently Deleted so it leaves the list")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: target.audioURL.path),
+                      "Stop keeps the audio (in the trash) so the user can restore / re-transcribe")
+    }
+
     // MARK: - Re-transcribe with the other language
 
     /// Drives the right-click "Re-transcribe in [other language]" path: the
@@ -437,10 +795,11 @@ final class TranscriptionServiceTests: XCTestCase {
                        manager.url(for: .ivritLarge).lastPathComponent,
                        "First pass should hit the Hebrew model")
 
-        var swapped = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
-        swapped.language = "en"
-        swapped.status = .pending
-        store.update(swapped)
+        // Flip the language + re-enqueue through the production chokepoint.
+        // (Previously this clobbered the store with a stale snapshot via
+        // `store.update`, which could rewrite a since-compressed `.m4a` audio
+        // name back to a deleted `.wav` and flake the second pass to `.failed`.)
+        let swapped = try XCTUnwrap(store.prepareForRetranscription(id: fixture.recording.id, language: "en"))
         service.enqueue(swapped)
         await service.waitForIdle()
 
@@ -453,6 +812,89 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(stored.fullText, "second pass")
         XCTAssertEqual(stored.language, "en")
         XCTAssertEqual(stored.status, .completed)
+    }
+
+    /// REGRESSION (flaky CI): re-transcribing a recording whose previous pass's
+    /// background WAV→m4a compression has ALREADY finished must still succeed.
+    ///
+    /// Root cause of the flake: after a completed transcription the service
+    /// kicks off `RecordingStore.compressRecordingAudio`, which renames the
+    /// `.wav` to `.m4a` and deletes the WAV. The re-transcribe path enqueued a
+    /// stale `Recording` snapshot still pointing at the now-deleted `.wav`, so
+    /// the second pass failed with "file not found" — landing `.failed` with the
+    /// OLD transcript still showing. Under CI contention the compression
+    /// regularly won that race; locally it usually didn't, hence the flake.
+    ///
+    /// This test makes that ordering DETERMINISTIC by awaiting the compression
+    /// before re-enqueuing — the second pass must read the recording's CURRENT
+    /// on-disk audio (the `.m4a`), not the stale snapshot's `.wav`.
+    func test_retranscribe_after_audio_compressed_reads_current_file_not_stale_wav() async throws {
+        let fixture = try TestRecordingFixture.make(in: store,
+                                                    title: "Compressed then retranscribed",
+                                                    durationSeconds: 1.0,
+                                                    language: "he")
+        await stub.setCannedQueue([
+            [TranscriptSegment(start: 0, end: 1, text: "first pass")],
+            [TranscriptSegment(start: 0, end: 1, text: "second pass")]
+        ])
+
+        // First pass.
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+        let firstStored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(firstStored.status, .completed)
+        XCTAssertEqual(firstStored.fullText, "first pass")
+
+        // Force the post-completion compression to FULLY complete: this renames
+        // the WAV to .m4a and deletes the WAV — exactly the on-disk state the CI
+        // flake hit when compression won the race against re-transcribe. (The
+        // first pass also auto-kicks a compression; awaiting here is idempotent
+        // and guarantees the on-disk file is the .m4a regardless of which won.)
+        await store.compressRecordingAudio(id: fixture.recording.id)
+        let compressed = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertTrue(compressed.audioFileName.lowercased().hasSuffix(".m4a"),
+                      "Compression should have swapped the audio to .m4a")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.audioURL(for: fixture.recording).path),
+                       "The original .wav (stale snapshot's path) must be gone")
+
+        // Re-transcribe via the store's `prepareForRetranscription` chokepoint
+        // (what the real re-transcribe UI now uses). It must preserve the
+        // current `.m4a` audioFileName rather than clobbering it back to the
+        // deleted `.wav` from a stale snapshot.
+        let prepared = try XCTUnwrap(store.prepareForRetranscription(id: fixture.recording.id))
+        XCTAssertTrue(prepared.audioFileName.lowercased().hasSuffix(".m4a"),
+                      "prepareForRetranscription must keep the compressed .m4a name")
+        service.enqueue(prepared)
+        await service.waitForIdle()
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
+        XCTAssertEqual(stored.status, .completed,
+                       "Re-transcribe must succeed against the compressed .m4a, not fail on the stale .wav")
+        XCTAssertEqual(stored.fullText, "second pass",
+                       "Second pass transcript must overwrite the first")
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 2, "Both passes must have reached the engine")
+    }
+
+    /// Direct unit test for the chokepoint: `prepareForRetranscription` must
+    /// NOT reset the store-owned `audioFileName` even when the previous pass's
+    /// compression has already renamed the audio to `.m4a`. (Regression for the
+    /// stale-snapshot clobber that failed re-transcription with "file not
+    /// found".)
+    func test_prepareForRetranscription_preserves_compressed_audio_filename() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Keep m4a", durationSeconds: 1.0)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "done")])
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+        await store.compressRecordingAudio(id: fixture.recording.id)
+
+        let beforeName = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id }).audioFileName
+        XCTAssertTrue(beforeName.lowercased().hasSuffix(".m4a"))
+
+        let prepared = try XCTUnwrap(store.prepareForRetranscription(id: fixture.recording.id, language: "en"))
+        XCTAssertEqual(prepared.audioFileName, beforeName, "audioFileName must be preserved")
+        XCTAssertEqual(prepared.language, "en", "language must be switched")
+        XCTAssertEqual(prepared.status, .pending, "status must be reset to pending")
     }
 
     // MARK: - Speaker label normalization
@@ -501,5 +943,57 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertEqual(normalized[0].speaker, "SPEAKER_00")
         XCTAssertNil(normalized[1].speaker)
         XCTAssertEqual(normalized[2].speaker, "SPEAKER_01")
+    }
+}
+
+/// Returns 401 for any request — lets the record-start probe reach `.failed`
+/// without a real server. (Distinct from `RemoteTranscriptionTests`' copy so
+/// each test file is self-contained.)
+private final class Probe401URLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 401,
+                                       httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data(#"{"error":{"message":"Incorrect API key provided: test-key-123"}}"#.utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
+}
+
+/// Counts how many times the service actually handed audio to the remote
+/// backend. Used to prove that a session which captured nothing never reaches
+/// the upload path at all.
+private actor CountingRemoteEngine: RemoteTranscribing {
+    private(set) var transcribeCalls = 0
+    func configure(_ config: RemoteTranscriptionConfig) async {}
+    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
+    func shutdown() async {}
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        transcribeCalls += 1
+        return [TranscriptSegment(start: 0, end: 1, text: "uploaded")]
+    }
+}
+
+/// A remote engine that always throws an HTTP 401 — stands in for a
+/// misconfigured remote backend so the live-path error-surfacing can be tested
+/// without a network round-trip.
+private actor ThrowingRemoteEngine: RemoteTranscribing {
+    func configure(_ config: RemoteTranscriptionConfig) async {}
+    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
+    func shutdown() async {}
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        throw RemoteWhisperEngine.RemoteError.http(
+            status: 401,
+            body: #"{"error":{"message":"Incorrect API key provided: test-key-123"}}"#)
     }
 }

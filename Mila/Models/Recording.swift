@@ -5,6 +5,11 @@ enum RecordingSource: String, Codable, CaseIterable, Identifiable {
     case microphone
     case systemAudio
     case meeting
+    /// Imported from the iPhone's Voice Memos app via the iCloud-synced
+    /// folder on this Mac. Distinct from Mila's own mic capture (which is
+    /// `.microphone`) so the origin is visible in the UI and so the sync
+    /// importer can dedup these against `Recording.voiceMemoUniqueID`.
+    case voiceMemo
 
     var id: String { rawValue }
 
@@ -13,6 +18,7 @@ enum RecordingSource: String, Codable, CaseIterable, Identifiable {
         case .microphone: return "Microphone"
         case .systemAudio: return "System audio"
         case .meeting: return "Meeting (mic + system)"
+        case .voiceMemo: return "Voice Memo"
         }
     }
 
@@ -21,6 +27,7 @@ enum RecordingSource: String, Codable, CaseIterable, Identifiable {
         case .microphone: return "mic.fill"
         case .systemAudio: return "speaker.wave.3.fill"
         case .meeting: return "person.2.wave.2.fill"
+        case .voiceMemo: return "waveform"
         }
     }
 }
@@ -67,6 +74,39 @@ struct Recording: Identifiable, Codable, Hashable {
     /// nothing (rare — usually means the LLM CLI returned an error).
     var actionItems: [ActionItem]?
 
+    /// Stable per-recording identifier from the iPhone Voice Memos library
+    /// (`ZCLOUDRECORDING.ZUNIQUEID`) when `source == .voiceMemo`. The sync
+    /// importer keys on this to skip recordings it already imported, so a
+    /// rescan or app restart never re-imports the same memo. nil for every
+    /// non-Voice-Memo recording.
+    var voiceMemoUniqueID: String?
+
+    /// The Voice Memos folder this memo was imported from, keyed by the
+    /// stable `ZFOLDER.ZUUID`, or `Recording.voiceMemoUnfiledFolderID` for
+    /// the unfiled bucket. Set only on `source == .voiceMemo` imports. Lets
+    /// "un-selecting a folder removes its recordings" (issue #57) find every
+    /// recording that came from a given folder without guessing.
+    ///
+    /// nil means "origin not recorded" — either a non-Voice-Memo recording or
+    /// a memo imported before this field existed. Legacy nil is deliberately
+    /// treated as unknown and never swept up by the un-select cleanup, so an
+    /// upgrade can't mass-delete a user's older imports.
+    var voiceMemoFolderUUID: String?
+
+    /// User-assigned display names for diarized speakers, keyed by the raw
+    /// diarizer ID (`SPEAKER_00` → "Daniel"). Segments keep their raw IDs —
+    /// this map is a display overlay resolved at render/export time, so
+    /// re-clustering tooling and the color palette stay keyed on stable IDs.
+    /// Empty for recordings whose speakers were never renamed.
+    var speakerNames: [String: String]
+
+    /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
+    /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
+    /// "imported from Unfiled" distinguishable from a legacy import whose
+    /// origin was never recorded (nil) — the former is cleaned up when the
+    /// user turns Unfiled off, the latter is left alone.
+    static let voiceMemoUnfiledFolderID = "__voicememos.unfiled__"
+
     init(id: UUID = UUID(),
          title: String,
          createdAt: Date = Date(),
@@ -82,7 +122,10 @@ struct Recording: Identifiable, Codable, Hashable {
          folder: String? = nil,
          appName: String? = nil,
          summary: String? = nil,
-         actionItems: [ActionItem]? = nil) {
+         actionItems: [ActionItem]? = nil,
+         voiceMemoUniqueID: String? = nil,
+         voiceMemoFolderUUID: String? = nil,
+         speakerNames: [String: String] = [:]) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -99,6 +142,9 @@ struct Recording: Identifiable, Codable, Hashable {
         self.appName = appName
         self.summary = summary
         self.actionItems = actionItems
+        self.voiceMemoUniqueID = voiceMemoUniqueID
+        self.voiceMemoFolderUUID = voiceMemoFolderUUID
+        self.speakerNames = speakerNames
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -121,10 +167,20 @@ struct Recording: Identifiable, Codable, Hashable {
         (audioFileName as NSString).deletingPathExtension + ".summary.txt"
     }
 
+    /// File name (relative to recordings directory) of the sidecar `.srt`
+    /// subtitle file auto-written after transcription (see
+    /// `TranscriptExporter.writeSRT(for:in:)`). Same derive-from-audio
+    /// convention as the other sidecars so deleting a recording can clean
+    /// up `Foo.srt` alongside `Foo.wav`/`Foo.txt`/`Foo.summary.txt`.
+    var subtitleFileName: String {
+        (audioFileName as NSString).deletingPathExtension + ".srt"
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems
+             summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
+             speakerNames
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -147,6 +203,9 @@ struct Recording: Identifiable, Codable, Hashable {
         self.appName = try c.decodeIfPresent(String.self, forKey: .appName)
         self.summary = try c.decodeIfPresent(String.self, forKey: .summary)
         self.actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
+        self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
+        self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
+        self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -169,6 +228,11 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(appName, forKey: .appName)
         try c.encodeIfPresent(summary, forKey: .summary)
         try c.encodeIfPresent(actionItems, forKey: .actionItems)
+        try c.encodeIfPresent(voiceMemoUniqueID, forKey: .voiceMemoUniqueID)
+        try c.encodeIfPresent(voiceMemoFolderUUID, forKey: .voiceMemoFolderUUID)
+        if !speakerNames.isEmpty {
+            try c.encode(speakerNames, forKey: .speakerNames)
+        }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

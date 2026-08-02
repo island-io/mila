@@ -3,7 +3,10 @@ import AVFoundation
 @preconcurrency import ScreenCaptureKit
 import CoreMedia
 import Combine
+import OSLog
 import TranscriptionCore
+
+private let sysLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "SystemAudioRecorder")
 
 /// Captures system audio (optionally limited to a single application like Zoom) via ScreenCaptureKit.
 ///
@@ -37,11 +40,56 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     @Published var selectedApp: SCRunningApplication?
     @Published private(set) var level: Float = 0
 
+    /// Set when SCK kills the stream from its own side mid-capture (TCC
+    /// revocation, display disconnect). Cleared on the next successful
+    /// `start()`. Lets callers tell "meeting silently lost its app-audio
+    /// leg" apart from a normal stop.
+    @Published private(set) var lastStreamError: String?
+
     let audioStream: AsyncStream<AVAudioPCMBuffer>
     private let audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
 
     private var stream: SCStream?
     private let audioOutput = AudioStreamOutput()
+
+    /// True between `start()` and `stop()` — i.e. "the app still wants system
+    /// audio", as opposed to `isRunning` which tracks whether a live SCStream
+    /// exists right now. The two diverge exactly when SCK kills the stream
+    /// from its side, which is the window where a restart is the right move.
+    private var wantsCapture = false
+
+    /// Self-restarts after an SCK-side stream death in the current session.
+    /// Bounded so a permanently broken capture (revoked TCC) logs a handful of
+    /// attempts instead of spinning for the length of a meeting.
+    private var restartAttempts = 0
+    private let maxRestartAttempts = 5
+    private(set) var restartCount = 0
+
+    /// Bumped by every `start()` and `stop()`. A restart loop captures the
+    /// value it began with and abandons itself as soon as it no longer
+    /// matches, because `wantsCapture` alone cannot tell "my session still
+    /// wants capture" from "a *later* session does". Without this, a
+    /// stop → start inside a restart's backoff window (or inside its bring-up)
+    /// would let the stale loop hand `stream` a replacement it built for the
+    /// previous recording — leaking the new session's live stream, which then
+    /// keeps capturing for the rest of the process while both streams feed the
+    /// same continuation. Same epoch guard `LiveTranscriber` uses.
+    private var captureEpoch = 0
+
+    /// Does the session that started this work still own the recorder?
+    private func stillOwns(epoch: Int) -> Bool {
+        wantsCapture && captureEpoch == epoch
+    }
+
+    /// Serial delivery queue for the audio sample callbacks. `.global()`
+    /// is a CONCURRENT queue: two SCK callbacks can run in parallel, and
+    /// the per-buffer Task hop the old code used added a second unordered
+    /// step — under CPU load, consecutive ~10-20ms chunks could land in
+    /// `audioStream` out of capture order (audible garbling in the saved
+    /// mix). A private serial queue plus a direct yield (below) preserves
+    /// capture order end-to-end.
+    private let sampleQueue = DispatchQueue(label: "io.island.mila.system-audio-samples",
+                                            qos: .userInitiated)
 
     override init() {
         var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation!
@@ -49,6 +97,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         self.audioContinuation = continuation
         super.init()
         self.audioOutput.parent = self
+        self.audioOutput.continuation = continuation
     }
 
     func refreshShareableContent() async {
@@ -60,7 +109,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
                 .sorted { $0.applicationName.lowercased() < $1.applicationName.lowercased() }
             self.availableApps = unique.filter { !$0.applicationName.isEmpty }
         } catch {
-            print("SCShareableContent error: \(error)")
+            sysLog.error("SCShareableContent failed: \(error.localizedDescription, privacy: .public)")
             self.availableApps = []
         }
     }
@@ -79,7 +128,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         }
     }
 
-    static func isPermissionError(_ error: Error) -> Bool {
+    nonisolated static func isPermissionError(_ error: Error) -> Bool {
         let nsError = error as NSError
         // SCStreamErrorDomain code -3801 = userDeclined
         if nsError.domain == "com.apple.ScreenCaptureKit.SCStreamErrorDomain"
@@ -96,6 +145,30 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 
     func start() async throws {
         guard !isRunning else { return }
+        captureEpoch += 1
+        let epoch = captureEpoch
+        wantsCapture = true
+        restartAttempts = 0
+        restartCount = 0
+        do {
+            try await bringUpStream(epoch: epoch)
+        } catch {
+            wantsCapture = false
+            throw error
+        }
+    }
+
+    /// The SCStream bring-up proper. Split out of `start()` so a mid-session
+    /// restart re-runs exactly the same setup (fresh shareable content, fresh
+    /// filter) without resetting the restart budget or the `wantsCapture`
+    /// intent.
+    ///
+    /// Returns whether the new stream was actually adopted: this suspends
+    /// twice (shareable content, `startCapture`), and a `stop()` — or a whole
+    /// stop/start cycle — can land in between, in which case the stream is
+    /// released here rather than installed on top of a newer session's.
+    @discardableResult
+    private func bringUpStream(epoch: Int) async throws -> Bool {
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -133,27 +206,64 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(audioOutput,
                                    type: .audio,
-                                   sampleHandlerQueue: .global(qos: .userInitiated))
+                                   sampleHandlerQueue: sampleQueue)
         try stream.addStreamOutput(audioOutput,
                                    type: .screen,
                                    sampleHandlerQueue: .global(qos: .utility))
+        // `audioOutput` outlives capture sessions — drop the previous
+        // session's resampler state (filter history must not smear the
+        // last recording's tail into this one's first buffers). On the
+        // sample queue, since that's the only context that touches it;
+        // it's idle until startCapture below.
+        sampleQueue.sync { audioOutput.resetConverter() }
         try await stream.startCapture()
+        // Adopt only if this is still the session that asked. Assigning
+        // `self.stream` unconditionally would drop a newer session's stream on
+        // the floor without stopping it — it would keep capturing screen and
+        // audio for the rest of the process, and both streams would push
+        // samples into the same continuation.
+        guard epoch == captureEpoch else {
+            sysLog.error("system-audio bring-up finished after its session ended (epoch \(epoch, privacy: .public) ≠ \(self.captureEpoch, privacy: .public)) — releasing the stream instead of adopting it")
+            try? await stream.stopCapture()
+            return false
+        }
         self.stream = stream
         self.isRunning = true
+        self.lastStreamError = nil
+        return true
     }
 
     func stop() async {
-        guard isRunning, let stream else { return }
-        do { try await stream.stopCapture() } catch { print("stopCapture: \(error)") }
+        // Clear the intent first so a `didStopWithError` callback racing this
+        // teardown can't kick off a restart of a capture the user just ended,
+        // and bump the epoch so any restart already in flight abandons itself
+        // even if a new recording sets `wantsCapture` back to true meanwhile.
+        wantsCapture = false
+        captureEpoch += 1
+        // Deliberately NOT gated on `isRunning`: when SCK killed the stream
+        // itself (`didStopWithError` flips isRunning to false), the old
+        // `guard isRunning` made this a no-op and the dead SCStream stayed
+        // retained for the app's lifetime.
+        guard let stream else {
+            isRunning = false
+            level = 0
+            return
+        }
+        if restartCount > 0 {
+            sysLog.error("system-audio capture was restarted \(self.restartCount, privacy: .public)x this session after SCK killed the stream")
+        }
+        do {
+            try await stream.stopCapture()
+        } catch {
+            sysLog.error("stopCapture failed: \(error.localizedDescription, privacy: .public)")
+        }
         self.stream = nil
         self.isRunning = false
         self.level = 0
     }
 
-    fileprivate func handle(buffer: AVAudioPCMBuffer) {
-        let level = AudioMeter.level(from: buffer)
-        Task { @MainActor in self.level = level }
-        audioContinuation.yield(buffer)
+    fileprivate func publishLevel(_ level: Float) {
+        self.level = level
     }
 
     deinit {
@@ -163,16 +273,138 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
 
 extension SystemAudioRecorder: SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("SCStream stopped with error: \(error)")
+        let message = error.localizedDescription
+        // Logger, not print: `print` output never reaches OSLog, so when a
+        // user's meeting lost its app-audio leg mid-recording the diagnostic
+        // bundle had no trace of it at all — the SCStream teardown was only
+        // visible through ScreenCaptureKit's own internal log lines, which
+        // don't say who asked for it or why.
+        sysLog.error("SCStream stopped with error: \(message, privacy: .public)")
         Task { @MainActor in
+            // Only act for the CURRENTLY active stream — a stale callback
+            // from a previous session's stream arriving after a restart
+            // must not clear the new stream or surface an old error.
+            guard self.stream === stream else { return }
+            // SCK killed the stream from its side (TCC revocation, display
+            // config change, ...). Release the dead stream and record the
+            // failure — before this, `stream` stayed set (leaked) and the
+            // meeting recording silently degraded to mic-only with no
+            // signal anywhere.
+            self.stream = nil
             self.isRunning = false
             self.level = 0
+            self.lastStreamError = message
+            await self.restartAfterStreamDeath(error)
         }
+    }
+
+    /// Whether an SCK-side stream death should be retried.
+    ///
+    /// Pure and `nonisolated` so `SystemAudioRestartPolicyTests` can cover the
+    /// decisions without ScreenCaptureKit, a Screen Recording grant, or a real
+    /// `SCStream` to hand to the delegate.
+    enum RestartDecision: Equatable {
+        /// `stop()` already ran — the user ended the recording, so a dead
+        /// stream is expected rather than something to repair.
+        case sessionOver
+        /// A revoked or stale grant fails identically every time; retrying
+        /// just buries the real reason under repeated failures.
+        case permissionDenied
+        case budgetExhausted
+        case retry
+    }
+
+    nonisolated static func restartDecision(wantsCapture: Bool,
+                                            attemptsSoFar: Int,
+                                            maxAttempts: Int,
+                                            error: Error) -> RestartDecision {
+        guard wantsCapture else { return .sessionOver }
+        if isPermissionError(error) { return .permissionDenied }
+        guard attemptsSoFar < maxAttempts else { return .budgetExhausted }
+        return .retry
+    }
+
+    /// Try to get the app-audio leg back after SCK killed the stream mid-
+    /// recording. Losing it silently costs the whole other side of a meeting,
+    /// so a bounded retry is well worth a brief gap.
+    private func restartAfterStreamDeath(_ error: Error) async {
+        // Loop rather than attempt once: `didStopWithError` is the only trigger
+        // for this method, and a bring-up that throws never created a stream —
+        // so no further callback can ever arrive. A single failed attempt would
+        // therefore be terminal and the retry budget would be decoration, even
+        // though the common causes (a display being reconfigured, no display
+        // available for a moment) clear on their own within a second or two.
+        let epoch = captureEpoch
+        var cause = error
+        while true {
+            switch Self.restartDecision(wantsCapture: stillOwns(epoch: epoch),
+                                        attemptsSoFar: restartAttempts,
+                                        maxAttempts: maxRestartAttempts,
+                                        error: cause) {
+            case .sessionOver:
+                return
+            case .permissionDenied:
+                sysLog.error("not restarting system audio: Screen & System Audio Recording permission was denied or revoked mid-capture")
+                return
+            case .budgetExhausted:
+                sysLog.error("giving up on system-audio capture after \(self.maxRestartAttempts, privacy: .public) restart attempts — the rest of this recording is microphone-only")
+                return
+            case .retry:
+                break
+            }
+            restartAttempts += 1
+            let attempt = restartAttempts
+
+            // Back off before attempting, growing with each try, so the budget
+            // spans a real transient window instead of being spent inside a
+            // single display reconfiguration. `Task.sleep` suspends rather than
+            // blocking, so the main actor stays free throughout.
+            try? await Task.sleep(nanoseconds: UInt64(Self.restartBackoff(attempt: attempt) * 1_000_000_000))
+            guard stillOwns(epoch: epoch) else { return }
+
+            do {
+                // `bringUpStream` re-checks the epoch at the moment it would
+                // adopt, and releases the stream itself if the session moved
+                // on — so a stale loop can never replace a live stream.
+                guard try await bringUpStream(epoch: epoch) else { return }
+                restartCount += 1
+                sysLog.log("system-audio capture restarted (attempt #\(attempt, privacy: .public)) — app audio is being captured again")
+                return
+            } catch {
+                cause = error
+                sysLog.error("system-audio restart attempt #\(attempt, privacy: .public) failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
+    /// Delay before restart attempt `attempt` (1-based). Grows linearly so five
+    /// attempts cover ~7.5s of a transient outage without a long first wait.
+    nonisolated static func restartBackoff(attempt: Int) -> TimeInterval {
+        0.5 * Double(max(1, attempt))
     }
 }
 
 private final class AudioStreamOutput: NSObject, SCStreamOutput {
     weak var parent: SystemAudioRecorder?
+
+    /// Handed over once at recorder init. Yielding directly here — on the
+    /// recorder's serial sample-handler queue — keeps buffers in capture
+    /// order end-to-end (`AsyncStream.Continuation.yield` is thread-safe);
+    /// only the cosmetic level meter hops to the main actor. The old
+    /// per-buffer `Task { @MainActor … yield }` hop gave every chunk its
+    /// own unordered task, so delivery order wasn't guaranteed.
+    var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation?
+
+    /// Session-scoped stateful converter (resampling keeps filter history
+    /// across buffers — see StreamingWhisperConverter). Built lazily from
+    /// the first buffer's format and rebuilt if SCK ever changes it; only
+    /// touched on the serial sample-handler queue.
+    private var converter: StreamingWhisperConverter?
+
+    /// Called (on the sample queue) at the start of each capture session.
+    func resetConverter() {
+        converter = nil
+    }
 
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -181,9 +413,15 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
               CMSampleBufferIsValid(sampleBuffer),
               let buffer = sampleBuffer.toPCMBuffer() else { return }
         do {
-            let converted = try AudioConvert.toWhisperFormat(buffer)
+            if converter == nil || converter?.inputFormat != buffer.format {
+                converter = StreamingWhisperConverter(inputFormat: buffer.format)
+            }
+            let converted = try converter?.convert(buffer)
+                ?? AudioConvert.toWhisperFormat(buffer)
+            continuation?.yield(converted)
+            let level = AudioMeter.level(from: converted)
             Task { @MainActor [weak parent] in
-                parent?.handle(buffer: converted)
+                parent?.publishLevel(level)
             }
         } catch {
             print("System audio convert: \(error)")

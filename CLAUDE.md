@@ -66,10 +66,33 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
   literals there.
 - Tags are `v`-prefixed: `v1.2.8`. `CURRENT_PROJECT_VERSION` (the build
   number) must increase monotonically — Sparkle keys updates on it.
-- A local, unsigned DMG for testing: `make dmg` (ad-hoc signed; Gatekeeper
-  shows the right-click → Open prompt on first launch).
+- A local DMG for testing: `make dmg VERSION=<x.y.z>` (the explicit
+  `VERSION=` is required — see the build skill). It signs with the persistent
+  "Mila Local Dev" cert when that cert exists in the login keychain (created
+  by `scripts/install-debug.sh`; keeps TCC mic/recording grants across
+  installs) and falls back to ad-hoc otherwise. To force an ad-hoc build —
+  e.g. to test the Gatekeeper right-click → Open first-launch prompt — run
+  `CODESIGN_IDENTITY=- make dmg VERSION=<x.y.z>`.
 - Notarized, signed release builds and Sparkle appcast publishing are produced
   by a separate, private signing pipeline maintained by the original authors;
   that toolchain is not part of this repository. Forks that want notarized
   builds should sign with their own Apple Developer ID and publish their own
   appcast (see `SUFeedURL` / `SUPublicEDKey` in `project.yml`).
+
+### Beta releases (Sparkle beta channel)
+- Publishing a beta takes nothing extra: set `MARKETING_VERSION` to a
+  pre-release version (e.g. `1.9.2-beta.1`), add
+  `RELEASE_NOTES/v1.9.2-beta.1.md`, and tag `v1.9.2-beta.1`. There is **no**
+  Jenkins parameter and **no** manual appcast edit.
+- Beta-ness is derived from the `MARKETING_VERSION` string by the signing
+  pipeline: a bare `X.Y.Z` becomes a normal GitHub Release with no
+  `<sparkle:channel>` (offered to everyone); any `-suffix` becomes a GitHub
+  Release with `prerelease=true` and an appcast item tagged
+  `<sparkle:channel>beta</sparkle:channel>`, offered only to users who ticked
+  Settings → Updates → "Enable beta version".
+- `beta` is the **only** channel the app's Sparkle delegate recognises
+  (`allowedChannels(for:)` in `Mila/App/MilaApp.swift` returns `["beta"]` or
+  `[]`), so `-alpha` / `-rc` versions are tagged `beta` too — there is no
+  separate alpha or rc channel.
+- An appcast item that should be a beta but is missing the channel tag is
+  offered to every user (this happened with 1.9.2-beta.1 on 2026-07-30).

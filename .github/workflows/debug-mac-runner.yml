@@ -28,8 +28,9 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
       - name: Show toolchain + runner info
@@ -58,7 +59,7 @@ jobs:
 
       - name: Cache diarization bundle
         id: diar-bundle-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: Mila/Resources/PythonRuntime
           key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
@@ -69,7 +70,7 @@ jobs:
 
       - name: Cache whisper models
         id: whisper-models-cache
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # Mila's default ModelManager location. `make models`
           # populates this directory.
@@ -99,7 +100,7 @@ jobs:
         # limit-access-to-actor=false because we connect from a shell
         # that doesn't necessarily have a GH OAuth token; the random
         # URL is the access control.
-        uses: mxschmitt/action-tmate@v3
+        uses: mxschmitt/action-tmate@35b54afac29c97fb54faba5b513f8fbd1882f113 # v3.24
         with:
           limit-access-to-actor: false
           detached: false

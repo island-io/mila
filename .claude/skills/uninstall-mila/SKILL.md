@@ -1,0 +1,204 @@
+---
+name: uninstall-mila
+description: Use when uninstalling, removing, or deleting the Mila transcription app from a Mac — clearing the app bundle, Dock tile, and system caches/preferences while protecting the user's recordings and transcripts. Covers "uninstall Mila", "remove Mila", "delete Mila but keep my recordings".
+---
+
+# Uninstall Mila
+
+## Overview
+
+Mila stores user recordings/transcripts and large regenerable assets in the SAME folder (`~/Library/Application Support/Mila`). A naive "delete everything Mila" destroys irreplaceable transcripts. This skill removes the app cleanly while **protecting user data by default** and **never deleting the keep-by-default assets without explicit user confirmation**.
+
+Mila's bundle identifier is **`io.island.whisper.IslandWhisper`** (Island.io origin) — system caches/prefs are filed under that ID, NOT under "Mila". A search for "Mila" alone misses them.
+
+## Two uninstall modes
+
+There are two reasons to "uninstall", and they keep/delete different things. Figure out which one the user wants first — when they say something like "uninstall to reinstall the update" or "prep for a fresh install", it's **reinstall-prep**, NOT a wipe.
+
+| | **Reinstall-prep** (default when goal is a fresh/updated install) | **Full reset / wipe** (only when user explicitly says so) |
+|---|---|---|
+| App bundle | Remove | Remove |
+| Build artifacts (`build/`, `build-release/`, DerivedData) | Remove | Remove |
+| Caches / HTTPStorages / WebKit | Remove | Remove |
+| TCC privacy grants | Reset | Reset |
+| Recordings + `recordings.json` + `folders.json` | **Keep** (back up anyway) | **Keep** (back up anyway) |
+| `Models/` + `torch-site-packages/` (7.2 GB regenerable) | **Keep** (instant reinstall) | Delete only if user opts in |
+| Preferences plist (settings) | **Keep** (comes back configured) | Delete + clear `cfprefsd` |
+
+**Reinstall-prep is the common case.** Its whole point is that after reinstalling the updated app, everything comes back exactly as it was — same recordings, same downloaded models, same selected model/language/diarization/LLM settings — with zero re-download and zero re-configuration. So for reinstall-prep you do NOT need to ask the keep-by-default questions: keep both by definition. Only ask (or offer the wipe options) when the user's intent is genuinely to remove Mila for good or to troubleshoot with a clean slate.
+
+## The Iron Rules
+
+1. **Back up recordings BEFORE deleting anything.** Copy `Recordings/` + `recordings.json` + `folders.json` to a safe location outside Application Support (e.g. `~/Desktop/Mila-Recordings-Backup-<date>`). Verify file counts match before proceeding.
+2. **Use `trash`, never `rm`.** Every removal must be reversible.
+3. **Keep-by-default items are NOT deleted unless the user says so.** You MUST ASK the user about each one (see below). Default = keep. This includes the **settings/preferences plist** — never wipe the user's configuration as part of a routine uninstall; preserving it means a reinstall comes back with the same model, language, and settings.
+4. **Never touch the source repo** (your `mila` checkout, wherever it lives) — only its `build/` output is an app artifact.
+
+## What is what (map before you touch)
+
+| Path | Class | Default action |
+|---|---|---|
+| `~/Library/Application Support/Mila/Recordings/` | **User data — irreplaceable** | **Always keep + back up** |
+| `~/Library/Application Support/Mila/recordings.json` | **User data — the index** | **Always keep + back up** |
+| `~/Library/Application Support/Mila/folders.json` | **User data — folder organization** | **Always keep + back up** |
+| `~/Library/Application Support/Mila/Models/` (~6.8 GB) | Regenerable (whisper weights, re-downloaded) | **Keep — ASK before deleting** |
+| `~/Library/Application Support/Mila/torch-site-packages/` (~444 MB) | Regenerable (Python runtime, re-installed) | **Keep — ASK before deleting** |
+| App bundle in `/Applications/Mila.app` | App | Remove |
+| Repo `build/` + `~/Library/Developer/Xcode/DerivedData/Mila-*` | Build artifacts (Dock dev build lives here) | Remove |
+| `~/Library/Preferences/io.island.whisper.IslandWhisper.plist` | **App settings / UserDefaults** (selected model, language, diarization, LLM config, window state) | **Keep — ASK before deleting** |
+| `~/Library/Caches/io.island.whisper.IslandWhisper` | Cache (no user settings) | Remove |
+| `~/Library/HTTPStorages/io.island.whisper.IslandWhisper` | HTTP cache | Remove |
+| `~/Library/WebKit/io.island.whisper.IslandWhisper` | WebKit data | Remove |
+| TCC privacy grants (Screen & System Audio Recording, Microphone, Speech Recognition, Automation/AppleEvents) | System privacy DB (`tccutil`) | Remove (reset) |
+| Dock tile pointing at any `Mila.app` | Dock entry | Remove |
+
+`recordings.json` is the index that ties the audio/transcript files together — it MUST be kept alongside `Recordings/`, or a reinstalled Mila shows an empty library.
+
+## MANDATORY: Ask before deleting keep-by-default items
+
+Before removing the regenerable assets, ask the user explicitly. Default to KEEP if they don't clearly opt in. Recommended question:
+
+> "Mila keeps ~7.2 GB of regenerable data — `Models/` (6.8 GB whisper weights) and `torch-site-packages/` (444 MB Python runtime). Your recordings + `recordings.json` are kept either way. Delete the regenerable data to reclaim space, or keep it so a future reinstall is instant?"
+
+Only delete `Models/` / `torch-site-packages/` if the user chooses to reclaim the space.
+
+**Settings/preferences are also keep-by-default.** Do NOT delete the preferences plist as part of a routine uninstall — it holds the user's configuration (selected model, language, diarization, LLM settings). Only delete it if the user explicitly asks for a **full reset / wipe everything**. If they do, also run `defaults delete io.island.whisper.IslandWhisper` + `killall cfprefsd`, because `cfprefsd` caches prefs in memory and will rewrite the plist on next launch otherwise.
+
+## Procedure
+
+```bash
+# 0. Locate the app & confirm bundle id (sanity check before deleting)
+mdfind -name "Mila.app" 2>/dev/null
+/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" /Applications/Mila.app/Contents/Info.plist   # -> io.island.whisper.IslandWhisper
+
+# 1. BACK UP user data first (always). Fail fast: an incomplete backup must
+#    NEVER let the uninstall proceed.
+set -euo pipefail
+SRC="$HOME/Library/Application Support/Mila"
+DST="$HOME/Desktop/Mila-Recordings-Backup-$(date +%Y-%m-%d)"
+mkdir -p "$DST"
+cp -Rp "$SRC/Recordings" "$DST/"
+cp -p "$SRC/recordings.json" "$DST/"
+[[ -f "$SRC/folders.json" ]] && cp -p "$SRC/folders.json" "$DST/"   # folder map — optional, may not exist yet
+# verify before continuing — counts must match, and the index (plus any
+# existing folder map) must have copied, or the script aborts here:
+echo "src=$(find "$SRC/Recordings" -type f | wc -l)  bak=$(find "$DST/Recordings" -type f | wc -l)"
+test -f "$DST/recordings.json"
+test ! -e "$SRC/folders.json" || test -f "$DST/folders.json"
+
+# 2. Quit the app if running
+pgrep -f "Mila.app/Contents/MacOS" && osascript -e 'quit app "Mila"' || true
+
+# 3. Remove app bundles + build artifacts (to Trash)
+trash /Applications/Mila.app 2>/dev/null || true
+# Build artifacts — only relevant if Mila was built from source. Point REPO at
+# your checkout (or `export MILA_REPO=...`); the project.yml check guards against
+# trashing an unrelated build/ tree if REPO is wrong.
+REPO="${MILA_REPO:-$HOME/ClonedProjects/mila}"
+if [ -f "$REPO/project.yml" ]; then
+  # `build/` (make) and `build-release/` (xcodebuild release) are both output
+  # dirs; the .dSYM lives under build-release/. Trash both, NOT the repo itself.
+  for b in "$REPO/build" "$REPO/build-release"; do [ -e "$b" ] && trash "$b" || true; done
+fi
+# ZSH GOTCHA: an unmatched glob (`Mila-*` with no DerivedData) raises
+# "no matches found" and, under `set -e`, ABORTS THE WHOLE SCRIPT before the
+# caches/TCC steps below ever run. Guard with NULL_GLOB (or run this block in
+# bash) so a no-match is a silent skip, not a fatal error.
+setopt NULL_GLOB 2>/dev/null || shopt -s nullglob 2>/dev/null || true
+for d in "$HOME/Library/Developer/Xcode/DerivedData/"Mila-*; do [ -d "$d" ] && trash "$d"; done
+
+# 4. Remove system footprint (bundle id, NOT "Mila").
+#    NOTE: the Preferences plist is intentionally EXCLUDED here — it holds the
+#    user's settings/configuration and is keep-by-default. Caches/HTTPStorages/
+#    WebKit hold no settings and are safe to remove.
+BID="io.island.whisper.IslandWhisper"
+for p in \
+  "$HOME/Library/Caches/$BID" \
+  "$HOME/Library/HTTPStorages/$BID" \
+  "$HOME/Library/WebKit/$BID" ; do
+  [ -e "$p" ] && trash "$p"
+done
+# NOTE: also reset cfprefsd's in-memory cache if you DID delete the plist, or it
+# may be rewritten on next launch: `defaults delete $BID` + `killall cfprefsd`.
+
+# 4b. Remove macOS privacy (TCC) grants. These are NOT files — they live in the
+#     system TCC databases, so a file-based uninstall leaves them behind as orphan
+#     entries. This is a STANDARD step (not user data): resetting just makes a
+#     future reinstall re-prompt, exactly like a fresh install.
+#     `tccutil reset` talks to the TCC daemon and works WITHOUT sudo, even for the
+#     system-level ScreenCapture service. Verified: exits 0, "Successfully reset".
+#
+#     One command clears every grant Mila accumulated (Microphone, ScreenCapture,
+#     SpeechRecognition, AppleEvents, Calendar, folder access, ...):
+tccutil reset All "$BID"
+#
+#     If you want to reset ONLY the "Screen & System Audio Recording" permission
+#     (Sequoia's new name for Screen Recording; TCC service is still ScreenCapture)
+#     and leave the rest, use the per-service form instead:
+# tccutil reset ScreenCapture "$BID"
+
+# 5. (ONLY IF USER EXPLICITLY OPTED IN) reclaim regenerable data
+# trash "$SRC/Models" "$SRC/torch-site-packages"
+
+# 6. (ONLY IF USER WANTS A FULL RESET, incl. settings) remove preferences
+# trash "$HOME/Library/Preferences/$BID.plist"
+# defaults delete "$BID" 2>/dev/null; killall cfprefsd 2>/dev/null
+```
+
+### Remove the Dock tile
+
+`dockutil` is usually not installed; edit the Dock plist directly (filters out any tile whose label is "Mila" or whose URL contains `Mila.app`):
+
+```bash
+python3 - <<'PY'
+import subprocess, plistlib
+pl = plistlib.loads(subprocess.run(["defaults","export","com.apple.dock","-"],capture_output=True).stdout)
+apps = pl.get("persistent-apps", [])
+def is_mila(e):
+    try:
+        td = e["tile-data"]
+        return td.get("file-label","") == "Mila" or "Mila.app" in td["file-data"].get("_CFURLString","")
+    except Exception:
+        return False
+pl["persistent-apps"] = [e for e in apps if not is_mila(e)]
+subprocess.run(["defaults","import","com.apple.dock","-"],input=plistlib.dumps(pl),check=True)
+print(f"persistent-apps: {len(apps)} -> {len(pl['persistent-apps'])}")
+PY
+killall Dock
+```
+
+## Verify
+
+```bash
+mdfind -name "Mila.app" 2>/dev/null | grep -v "/.Trash/" || echo "(no app outside Trash)"
+# Removable footprint should be gone. The Preferences plist is kept by default,
+# so it's checked separately below — don't list it here or a routine uninstall
+# looks like it failed.
+ls -d ~/Library/{Caches/io.island.whisper.IslandWhisper,HTTPStorages/io.island.whisper.IslandWhisper,WebKit/io.island.whisper.IslandWhisper} 2>/dev/null || echo "(removable footprint gone)"
+# Preferences plist: present on a routine uninstall (kept), absent only after a full reset.
+ls -d ~/Library/Preferences/io.island.whisper.IslandWhisper.plist 2>/dev/null && echo "(prefs kept — routine)" || echo "(prefs removed — full reset)"
+defaults read com.apple.dock persistent-apps 2>/dev/null | grep -i mila || echo "(no Mila in Dock)"
+# TCC privacy grants gone: the user DB is readable only if this terminal has Full
+# Disk Access; ScreenCapture lives in the SIP-protected system DB (needs sudo).
+# The authoritative signal is tccutil's own "Successfully reset" output above.
+# Best-effort check of the user DB (Microphone/SpeechRecognition/AppleEvents):
+sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+  "SELECT service,auth_value FROM access WHERE client='io.island.whisper.IslandWhisper';" \
+  2>/dev/null || echo "(user TCC.db not readable — no FDA; rely on tccutil output)"
+# user data intact:
+ls "$HOME/Library/Application Support/Mila/Recordings" | wc -l
+```
+
+## Common Mistakes
+
+- **Deleting the whole `~/Library/Application Support/Mila` folder.** It contains the irreplaceable `Recordings/` + `recordings.json`. Never blanket-delete it.
+- **Searching only for "Mila".** The prefs/caches are under `io.island.whisper.IslandWhisper`. Search the bundle id too.
+- **Forgetting `recordings.json` / `folders.json`.** Backing up `Recordings/` without the index leaves a reinstall with an empty library; dropping `folders.json` loses the user's folder organization.
+- **Using `rm`.** Always `trash` so the user can recover.
+- **Deleting `Models/`/`torch-site-packages/` without asking.** These are keep-by-default; deleting them forces multi-GB re-downloads on reinstall.
+- **Wiping the preferences plist on a routine uninstall.** That destroys the user's settings (model, language, diarization, LLM config). Keep it unless the user explicitly wants a full reset — and if they do, clear `cfprefsd` too or it gets rewritten.
+- **Trashing the source repo.** Only `build/` and `build-release/` inside your `mila` checkout are artifacts; the rest is source.
+- **Letting a zsh unmatched glob abort the script mid-uninstall.** Under zsh + `set -e`, the DerivedData `Mila-*` loop dies with "no matches found" when there's no such dir, silently skipping the caches removal and TCC reset. Guard with `setopt NULL_GLOB` (done in the procedure). If you split the uninstall across Bash calls, put caches + TCC in their OWN call so a glob failure earlier can't strand them.
+- **Treating a reinstall-prep as a full wipe.** When the goal is to install an updated build, keep `Models/`, `torch-site-packages/`, AND the preferences plist — deleting them forces a 7 GB re-download and re-configuration for no reason. Only wipe when the user explicitly wants Mila gone for good or a clean-slate reset.
+- **Leaving TCC privacy grants behind.** A file-based uninstall does NOT clear the "Screen & System Audio Recording", Microphone, etc. grants — they live in the system TCC databases, not in files, and linger as orphan entries. Run `tccutil reset All io.island.whisper.IslandWhisper` (no sudo needed) as a standard step.
+- **Trying to `sqlite3`-edit the system TCC.db directly.** It's SIP-protected and needs Full Disk Access even to read. Use `tccutil reset`, which goes through the TCC daemon and works without sudo.

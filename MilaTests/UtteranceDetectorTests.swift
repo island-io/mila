@@ -62,6 +62,49 @@ final class UtteranceDetectorTests: XCTestCase {
         XCTAssertLessThan(captured.start, 1.05)
     }
 
+    /// End-to-end regression for the quiet built-in-mic bug: speech at
+    /// RMS 0.006 is below the detector's 0.012 cutoff, so raw it never
+    /// emits — the live transcript stays empty while post-record whisper
+    /// still works. Routed through the AdaptiveGainController first
+    /// (exactly like the mic tap does), the same audio must be boosted
+    /// enough to emit utterances mid-recording.
+    func test_quiet_speech_through_AGC_emits_utterances() {
+        // Raw (no AGC): nothing fires — this is the observed symptom.
+        let rawDet = UtteranceDetector()
+        var rawFired = 0
+        rawDet.onUtterance = { _, _ in rawFired += 1 }
+        rawDet.ingest(silence(seconds: 0.5)[...])
+        for _ in 0..<3 {
+            rawDet.ingest(speech(seconds: 2.0, amp: 0.006)[...])
+            rawDet.ingest(silence(seconds: 0.9)[...])
+        }
+        XCTAssertEqual(rawFired, 0,
+                       "sanity: RMS 0.006 speech is below the raw VAD cutoff")
+
+        // Same audio through the AGC, fed in 30ms chunks like the mic tap.
+        let det = UtteranceDetector()
+        var fired = 0
+        det.onUtterance = { _, _ in fired += 1 }
+        let agc = AdaptiveGainController()
+        func feed(_ samples: [Float]) {
+            let chunkSize = Int(sr * frameMs / 1000)
+            var i = 0
+            while i < samples.count {
+                let end = min(i + chunkSize, samples.count)
+                let boosted = agc.process(Array(samples[i..<end]))
+                det.ingest(boosted[...])
+                i = end
+            }
+        }
+        feed(silence(seconds: 0.5))
+        for _ in 0..<3 {
+            feed(speech(seconds: 2.0, amp: 0.006))
+            feed(silence(seconds: 0.9))
+        }
+        XCTAssertGreaterThanOrEqual(fired, 2,
+                                    "AGC-boosted quiet speech must emit utterances mid-recording (gain=\(agc.currentGain))")
+    }
+
     func test_two_separate_bursts_emit_two_utterances() {
         let det = UtteranceDetector()
         var fired = 0

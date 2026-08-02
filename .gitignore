@@ -19,8 +19,10 @@ default.profraw
 Mila-*.dmg
 
 # Generated diarization Python runtime bundle (built by scripts/build-diarization-bundle.sh,
-# distributed via GitHub release asset; do NOT commit ~150 MB into git)
-Mila/Resources/PythonRuntime/
+# distributed via GitHub release asset; do NOT commit ~150 MB into git).
+# No trailing slash on purpose: in a git worktree this path is often a *symlink*
+# back to the main checkout, and a trailing-slash pattern matches directories only.
+Mila/Resources/PythonRuntime
 
 # macOS
 .DS_Store
@@ -33,3 +35,6 @@ Mila/Resources/PythonRuntime/
 Mila-slack-emoji.png
 __pycache__/
 *.pyc
+
+# Local-only LLM implementation plans / scratch artifacts
+llm-artifacts/

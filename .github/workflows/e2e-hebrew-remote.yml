@@ -1,0 +1,418 @@
+name: E2E Hebrew Remote Transcription
+
+# Real end-to-end Hebrew transcription over HTTP: a Linux job runs the speaches
+# Docker image (an Apache-2.0 ivrit.ai Hebrew CT2 model, OpenAI-compatible on
+# :8000) and exposes it through an ephemeral cloudflared quick tunnel; the macOS
+# MilaTests job points Mila's real `RemoteWhisperEngine` at that tunnel URL and
+# asserts it gets correct Hebrew text back.
+#
+# WHY TWO JOBS + A TUNNEL
+# -----------------------
+# Mila must build with Xcode (macOS runner); Docker only runs on the Linux
+# runner. The two runners are separate VMs with no shared network, so we bridge
+# them with a no-account `*.trycloudflare.com` tunnel. The dynamic tunnel URL is
+# handed from the (long-running) server job to the parallel client job via a
+# workflow artifact the client polls for. The server job stays alive serving
+# until the client signals "done" (another artifact), then tears down.
+#
+# WHY BUILD THE IMAGE IN-JOB (not pull `:latest` from GHCR)
+# ---------------------------------------------------------
+# The server job builds the speaches image from `docker/speaches-hebrew/` in the
+# checkout, so a PR that edits the Dockerfile (or the model) is tested against
+# the code UNDER REVIEW — not the last image published from `main`. The
+# `build-speaches-image.yml` workflow only pushes on `main`/dispatch, so a
+# `:latest` pull would silently test stale bytes on PRs (and fork PRs can't pull
+# a private package at all). Building shares the same `type=gha` layer cache as
+# the publish workflow, so the model bake is paid once and reused.
+#
+# This is heavier and inherently more network-dependent than the default
+# `e2e-remote-transcription` mock-server E2E. It is path-gated and also
+# manually dispatchable so it doesn't run on every push.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'Mila/Transcription/RemoteWhisperEngine.swift'
+      - 'Mila/Models/RemoteTranscriptionSettings.swift'
+      - 'Mila/Transcription/TranscriptionService.swift'
+      - 'MilaTests/RemoteTranscriptionE2ETests.swift'
+      - 'docker/speaches-hebrew/**'
+      - '.github/workflows/e2e-hebrew-remote.yml'
+  # NOTE: deliberately NOT path-filtered. These jobs are REQUIRED status checks,
+  # and GitHub blocks a PR forever on a required check that never reports — which
+  # is exactly what a workflow-level `paths:` filter causes on an unrelated PR.
+  # The relevance test moved into the `changes` job below; the heavy jobs skip
+  # when it says no, and a skipped job satisfies a required check.
+  pull_request:
+
+permissions:
+  contents: read
+  actions: read       # poll run artifacts via the REST API (handoff channel)
+
+concurrency:
+  group: e2e-hebrew-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TUNNEL_ARTIFACT: hebrew-tunnel-url
+  DONE_ARTIFACT: hebrew-client-done
+  HEBREW_MODEL: ivrit-ai/whisper-large-v3-turbo-ct2
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # GATE: is this PR actually touching the remote-transcription path? Cheap
+  # (seconds on a Linux runner) so the two heavy jobs below can be skipped
+  # without costing the workflow its ability to report a status.
+  # ----------------------------------------------------------------------------
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      relevant: ${{ steps.filter.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Decide whether the remote path changed
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Anything that isn't a PR (push to main, manual dispatch) always runs.
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "event=$EVENT -> always run"
+            exit 0
+          fi
+          # Keep this list in sync with the `push` paths filter above.
+          PATTERN='^(Mila/Transcription/RemoteWhisperEngine\.swift|Mila/Models/RemoteTranscriptionSettings\.swift|Mila/Transcription/TranscriptionService\.swift|MilaTests/RemoteTranscriptionE2ETests\.swift|docker/speaches-hebrew/|\.github/workflows/e2e-hebrew-remote\.yml)'
+          # THREE-dot (merge-base) diff — the same comparison GitHub's own
+          # "Files changed" tab shows: what THIS branch did, ignoring whatever
+          # `main` picked up since we forked off it. A two-dot
+          # `git diff BASE HEAD` also reports every file main touched in the
+          # meantime, and `base.sha` moves as main moves, so a long-lived PR
+          # that never went near the remote path would eventually "change"
+          # e.g. TranscriptionService.swift and burn a Docker build plus a
+          # macOS runner for nothing. Needs the merge base to be present —
+          # hence `fetch-depth: 0` on the checkout above; do not shallow it.
+          if ! CHANGED=$(git diff --name-only "${BASE_SHA}...${HEAD_SHA}" 2>"${RUNNER_TEMP}/diff.err"); then
+            # Fail OPEN. If we can't compute the diff (unfetched base ref,
+            # force-pushed base, conflicted PR with no merge ref) we'd rather
+            # pay for the E2E than silently skip it and report a green check
+            # that tested nothing.
+            echo "::warning::could not diff ${BASE_SHA}...${HEAD_SHA}: $(cat "${RUNNER_TEMP}/diff.err"). Running the E2E rather than skipping it."
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "=== changed files"; echo "$CHANGED"
+          if echo "$CHANGED" | grep -Eq "$PATTERN"; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "=> remote transcription touched, running the real E2E"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "=> nothing on the remote path changed, skipping (reports as success)"
+          fi
+
+  # ----------------------------------------------------------------------------
+  # SERVER: Linux. Builds the speaches image from the checkout, runs the
+  # container, opens a cloudflared quick tunnel, publishes the tunnel URL as an
+  # artifact, then stays alive serving until the client uploads the "done"
+  # artifact (or a hard timeout).
+  # ----------------------------------------------------------------------------
+  speaches-server:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      # Build the PR's own image (linux/amd64 == this runner) and load it into
+      # the local docker daemon. `cache-from: type=gha` reuses the layers the
+      # publish workflow baked, so the ~1.6 GB model download isn't repeated.
+      - name: Build speaches image (from the checkout under review)
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: docker/speaches-hebrew
+          platforms: linux/amd64
+          load: true
+          tags: mila-speaches-hebrew:e2e
+          cache-from: type=gha
+
+      - name: Start speaches container
+        run: |
+          docker run -d --name speaches -p 8000:8000 mila-speaches-hebrew:e2e
+          echo "Waiting for speaches /health (model preload can take a few minutes)..."
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "speaches is healthy"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::speaches did not become healthy"; docker logs speaches; exit 1
+
+      - name: Install cloudflared
+        run: |
+          curl -fsSL -o cloudflared \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          chmod +x cloudflared
+          sudo mv cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Open quick tunnel and capture URL
+        id: tunnel
+        run: |
+          # No account/secret needed — quick tunnels mint a random
+          # *.trycloudflare.com hostname. cloudflared logs the URL to stderr.
+          #
+          # RETRIED, because this is the one step in the workflow that depends on
+          # a free third-party service with no SLA. Cloudflare quick tunnels
+          # intermittently fail to register (no URL printed) or register a
+          # hostname that never routes (URL printed, /health never answers), and
+          # a single-attempt bring-up turned that into a red build on a PR whose
+          # own two earlier runs had passed. Each attempt starts a FRESH
+          # cloudflared so a half-registered tunnel isn't reused.
+          attempt_tunnel() {
+            rm -f tunnel.log tunnel.url
+            cloudflared tunnel --no-autoupdate --url http://127.0.0.1:8000 \
+              > tunnel.log 2>&1 &
+            echo $! > tunnel.pid
+            local url=""
+            for i in $(seq 1 45); do
+              url=$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' tunnel.log | head -1 || true)
+              if [ -n "$url" ]; then break; fi
+              sleep 2
+            done
+            if [ -z "$url" ]; then
+              echo "  no tunnel URL appeared within 90s"
+              return 1
+            fi
+            echo "  got $url — checking it proxies to speaches"
+            # A URL is not a working tunnel: verify it actually reaches speaches
+            # before handing it to the client, or the client fails downstream
+            # with something far more confusing than "tunnel didn't come up".
+            for i in $(seq 1 30); do
+              if curl -fsS "$url/health" >/dev/null 2>&1; then
+                echo "  tunnel reaches speaches /health"
+                printf '%s' "$url" > tunnel.url
+                return 0
+              fi
+              sleep 2
+            done
+            echo "  $url never proxied to /health within 60s"
+            return 1
+          }
+
+          URL=""
+          for attempt in 1 2 3; do
+            echo "=== tunnel attempt $attempt/3"
+            if attempt_tunnel; then
+              URL=$(cat tunnel.url)
+              break
+            fi
+            echo "--- cloudflared log for failed attempt $attempt"
+            cat tunnel.log || true
+            # Tear the failed process down before retrying; two cloudflared
+            # processes racing on one port is its own failure mode.
+            if [ -f tunnel.pid ]; then
+              kill "$(cat tunnel.pid)" 2>/dev/null || true
+              wait "$(cat tunnel.pid)" 2>/dev/null || true
+            fi
+            sleep 5
+          done
+          if [ -z "$URL" ]; then
+            echo "::error::tunnel never came up after 3 attempts (cloudflare quick tunnel unavailable)"
+            exit 1
+          fi
+          echo "Tunnel URL: $URL"
+          # The remote endpoint Mila expects is the OpenAI-style /v1 base.
+          printf '%s/v1' "$URL" > endpoint.txt
+          echo "endpoint=$(cat endpoint.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish tunnel URL for the client job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.TUNNEL_ARTIFACT }}
+          path: endpoint.txt
+          retention-days: 1
+
+      # Keep the server alive while the macOS client runs. Poll the run's
+      # artifacts for the client's "done" marker; bail after a hard cap so a
+      # crashed client can't pin the runner for the full timeout.
+      - name: Serve until client done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          DONE_ARTIFACT: ${{ env.DONE_ARTIFACT }}
+        run: |
+          echo "Serving; waiting for client 'done' signal (max ~30 min)..."
+          for i in $(seq 1 180); do
+            count=$(gh api \
+              "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+              --jq "[.artifacts[] | select(.name == \"${DONE_ARTIFACT}\")] | length" \
+              2>/dev/null || echo 0)
+            if [ "$count" != "0" ] && [ -n "$count" ]; then
+              echo "client signalled done"; exit 0
+            fi
+            # If speaches died, fail fast with logs rather than waiting it out.
+            if ! curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
+              echo "::error::speaches became unhealthy while serving"; docker logs speaches; exit 1
+            fi
+            sleep 10
+          done
+          echo "::warning::client never signalled done within the window"
+
+      - name: Teardown
+        if: always()
+        run: |
+          [ -f tunnel.pid ] && kill "$(cat tunnel.pid)" 2>/dev/null || true
+          echo "--- tunnel log ---"; cat tunnel.log 2>/dev/null || true
+          echo "--- speaches log (tail) ---"; docker logs --tail 100 speaches 2>/dev/null || true
+          docker rm -f speaches 2>/dev/null || true
+
+  # ----------------------------------------------------------------------------
+  # CLIENT: macOS. Builds Mila, polls for the tunnel URL artifact, points the
+  # real RemoteWhisperEngine at it, runs the Hebrew E2E test, then uploads the
+  # "done" marker so the server job can tear down.
+  # ----------------------------------------------------------------------------
+  mila-client:
+    needs: changes
+    if: needs.changes.outputs.relevant == 'true'
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Cache diarization bundle
+        id: diar-bundle-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: Mila/Resources/PythonRuntime
+          key: diar-bundle-${{ runner.os }}-${{ hashFiles('scripts/build-diarization-bundle.sh') }}
+
+      - name: Build diarization bundle (cold path only)
+        if: steps.diar-bundle-cache.outputs.cache-hit != 'true'
+        run: make bundle-diarization
+
+      - name: Generate Xcode project
+        run: make project
+
+      - name: Clear SwiftPM caches
+        run: |
+          rm -rf ~/Library/Caches/org.swift.swiftpm
+          rm -rf ~/Library/org.swift.swiftpm
+          rm -rf ~/Library/Developer/Xcode/DerivedData/SourcePackages
+
+      - name: Resolve Swift Package dependencies
+        run: |
+          xcodebuild \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -destination 'platform=macOS' \
+            -resolvePackageDependencies
+
+      # Build the test bundle FIRST so the (slow) tunnel handoff overlaps the
+      # build instead of adding to it. build-for-testing leaves a ready bundle
+      # that `test-without-building` runs once we have the endpoint.
+      - name: Build for testing
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            -only-testing:MilaTests/RemoteTranscriptionE2ETests \
+            build-for-testing
+
+      - name: Wait for tunnel URL from server job
+        id: endpoint
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          TUNNEL_ARTIFACT: ${{ env.TUNNEL_ARTIFACT }}
+        run: |
+          echo "Polling for the '${TUNNEL_ARTIFACT}' artifact..."
+          ART_ID=""
+          for i in $(seq 1 120); do   # up to ~20 min (server may bake/preload)
+            ART_ID=$(gh api \
+              "repos/${REPO}/actions/runs/${RUN_ID}/artifacts" \
+              --jq "[.artifacts[] | select(.name == \"${TUNNEL_ARTIFACT}\")][0].id" \
+              2>/dev/null || true)
+            if [ -n "$ART_ID" ] && [ "$ART_ID" != "null" ]; then break; fi
+            sleep 10
+          done
+          if [ -z "$ART_ID" ] || [ "$ART_ID" = "null" ]; then
+            echo "::error::tunnel URL artifact never appeared"; exit 1
+          fi
+          gh api "repos/${REPO}/actions/artifacts/${ART_ID}/zip" > art.zip
+          unzip -o art.zip -d art >/dev/null
+          ENDPOINT=$(cat art/endpoint.txt)
+          echo "Endpoint: $ENDPOINT"
+          # Health-gate the tunnel from the client side before testing. Fail
+          # fast if it never answers — better a clear "tunnel dead" error here
+          # than a misleading transcription failure in the test step.
+          base="${ENDPOINT%/v1}"
+          tunnel_ok=""
+          for i in $(seq 1 30); do
+            if curl -fsS "${base}/health" >/dev/null 2>&1; then
+              echo "tunnel healthy from client"; tunnel_ok=1; break
+            fi
+            sleep 5
+          done
+          if [ -z "$tunnel_ok" ]; then
+            echo "::error::tunnel endpoint never healthy from client: ${ENDPOINT}"; exit 1
+          fi
+          echo "endpoint=$ENDPOINT" >> "$GITHUB_OUTPUT"
+
+      - name: Run Hebrew remote E2E test
+        env:
+          # xcodebuild strips the TEST_RUNNER_ prefix and forwards the rest into
+          # the test process (same pattern as ci.yml / e2e-remote-transcription).
+          TEST_RUNNER_MILA_REMOTE_TEST_ENDPOINT: ${{ steps.endpoint.outputs.endpoint }}
+          TEST_RUNNER_MILA_REMOTE_HEBREW: "1"
+          TEST_RUNNER_MILA_REMOTE_MODEL: ${{ env.HEBREW_MODEL }}
+          TEST_RUNNER_MILA_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project Mila.xcodeproj \
+            -scheme Mila \
+            -configuration Debug \
+            -derivedDataPath build \
+            -destination 'platform=macOS' \
+            -only-testing:MilaTests/RemoteTranscriptionE2ETests \
+            test-without-building
+
+      - name: Signal server job to tear down
+        if: always()
+        run: |
+          mkdir -p done && date > done/done.txt
+          echo "uploading done marker"
+
+      - name: Upload done marker
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ env.DONE_ARTIFACT }}
+          path: done/done.txt
+          retention-days: 1

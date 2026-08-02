@@ -82,6 +82,34 @@ final class OrganizationUITests: XCTestCase {
                       "Renamed recording did not appear in the list")
     }
 
+    /// Regression test for issue #62: right-clicking a transcript sub-row in
+    /// the expanded "All Transcriptions" sidebar section must surface the same
+    /// per-recording context menu as the All Transcripts list. The bug was
+    /// that `RecordingSubRow` had no `.contextMenu` attached at all, so
+    /// right-click did nothing. Both lists now share `.recordingContextMenu`.
+    func test_sidebar_transcript_subrow_shows_context_menu() {
+        let app = launchApp()
+
+        // `--ui-test-seed-recording` pins the "All Transcriptions" section
+        // open (see `MilaApp.init`), so the seeded recording is reachable as
+        // an inline sidebar sub-row without having to drive the disclosure
+        // triangle.
+        let subRow = app.descendants(matching: .any)
+            .matching(identifier: "sidebar.recording.Seed Recording")
+            .firstMatch
+        XCTAssertTrue(subRow.waitForExistence(timeout: 10),
+                      "Seeded recording sub-row not visible in the sidebar")
+
+        // Right-click must open the per-recording context menu. Before the
+        // fix, `RecordingSubRow` had no `.contextMenu`, so nothing appeared.
+        // "Move to Folder" is unique to this menu, so its presence proves the
+        // menu opened rather than a stray match from elsewhere.
+        subRow.rightClick()
+        let menuItem = app.menuItems["Move to Folder"].firstMatch
+        XCTAssertTrue(menuItem.waitForExistence(timeout: 5),
+                      "Context menu did not appear on sidebar transcript sub-row (issue #62)")
+    }
+
     func test_create_folder_from_sidebar_and_navigate_to_empty_folder() {
         let app = launchApp()
 

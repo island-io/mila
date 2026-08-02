@@ -326,10 +326,11 @@ public actor WhisperEngine {
         }
         params.abort_callback_user_data = userPtr
 
-        let langCString = strdup(language)
+        let lang = Self.languageParams(for: language)
+        let langCString = strdup(lang.language)
         defer { free(langCString) }
         params.language = UnsafePointer(langCString)
-        params.detect_language = (language == "auto" || language.isEmpty)
+        params.detect_language = lang.detectLanguage
 
         let result: Int32 = samples.withUnsafeBufferPointer { ptr in
             whisper_full(ctx, params, ptr.baseAddress, Int32(ptr.count))
@@ -445,6 +446,22 @@ public actor WhisperEngine {
         // 750 — the "discrete safe subdivision of 1500" point that
         // whisper's encoder accepts (see fixture sweep above).
         return 750
+    }
+
+    /// The `(language, detect_language)` pair handed to `whisper_full`.
+    ///
+    /// whisper.cpp already auto-detects — and then TRANSCRIBES — when
+    /// `params.language` is `"auto"` (or NULL). `params.detect_language`
+    /// means something else entirely: "return right after language
+    /// detection, skip transcription" (whisper_full in the pinned v1.8.4:
+    /// `if (params.detect_language) { return 0; }`). Setting it for our
+    /// Auto-detect mode made every local transcription in "auto" succeed
+    /// with ZERO segments — an empty transcript and no error anywhere.
+    /// So: `detect_language` is always false, and an empty language string
+    /// (which whisper would reject in `whisper_lang_id`) normalizes to
+    /// `"auto"`.
+    static func languageParams(for language: String) -> (language: String, detectLanguage: Bool) {
+        (language: language.isEmpty ? "auto" : language, detectLanguage: false)
     }
 
     /// Classify whisper.cpp's init-time log lines into a `CoreMLStatus`.

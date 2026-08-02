@@ -19,7 +19,6 @@ struct HomeView: View {
     @EnvironmentObject private var transcription: TranscriptionService
 
     @Binding var selection: SidebarSelection?
-    let search: String
 
     /// User's preference for capturing the system's audio mix. Defaults
     /// to ON because the main use case is meeting / content
@@ -186,7 +185,7 @@ struct HomeView: View {
         }
         .font(.caption)
         .foregroundStyle(.secondary)
-        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → Hotkeys.")
+        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → General.")
         .accessibilityIdentifier("home.dictation.hint")
     }
 

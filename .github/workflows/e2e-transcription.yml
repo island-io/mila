@@ -3,17 +3,7 @@ name: E2E Transcription
 on:
   push:
     branches: [main]
-    paths:
-      - 'Packages/TranscriptionCore/**'
-      - 'Mila/Transcription/**'
-      - '.github/workflows/e2e-transcription.yml'
-      - '.github/whisper-cpp-pin.txt'
   pull_request:
-    paths:
-      - 'Packages/TranscriptionCore/**'
-      - 'Mila/Transcription/**'
-      - '.github/workflows/e2e-transcription.yml'
-      - '.github/whisper-cpp-pin.txt'
 
 env:
   LIBRARY_PATH: /usr/local/lib
@@ -27,11 +17,23 @@ jobs:
 
     steps:
       - name: Checkout with submodules
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           submodules: recursive
 
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: changes
+        with:
+          filters: |
+            relevant:
+              - 'Packages/TranscriptionCore/**'
+              - 'Mila/Transcription/**'
+              - '.github/workflows/e2e-transcription.yml'
+              - '.github/whisper-cpp-pin.txt'
+
       - name: Verify whisper.cpp submodule hash
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           EXPECTED=$(cat .github/whisper-cpp-pin.txt | tr -d '[:space:]')
           ACTUAL=$(git submodule status Packages/TranscriptionCore/vendor/whisper.cpp | awk '{print $1}' | tr -d '+')
@@ -43,12 +45,14 @@ jobs:
           echo "whisper.cpp submodule at expected commit $EXPECTED"
 
       - name: Install system dependencies
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y cmake build-essential
 
       - name: Cache whisper.cpp build
-        uses: actions/cache@v4
+        if: steps.changes.outputs.relevant == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: whisper-build-cache
         with:
           path: |
@@ -61,7 +65,7 @@ jobs:
           key: whisper-build-${{ hashFiles('.github/whisper-cpp-pin.txt') }}
 
       - name: Build and install whisper.cpp
-        if: steps.whisper-build-cache.outputs.cache-hit != 'true'
+        if: steps.changes.outputs.relevant == 'true' && (steps.whisper-build-cache.outputs.cache-hit != 'true')
         working-directory: Packages/TranscriptionCore/vendor/whisper.cpp
         run: |
           cmake -B build -DCMAKE_INSTALL_PREFIX=/usr/local -DBUILD_SHARED_LIBS=ON
@@ -69,20 +73,29 @@ jobs:
           sudo cmake --install build
 
       - name: Update linker cache
+        if: steps.changes.outputs.relevant == 'true'
         run: sudo ldconfig
 
       - name: Install Swift
-        uses: swift-actions/setup-swift@v2
+        if: steps.changes.outputs.relevant == 'true'
+        # HELD at v2.4.0 on purpose: setup-swift's only v3 tag is the
+        # 3.0.0-beta.1 pre-release, whose Swiftly-based installer fails GPG
+        # verification on the Ubuntu runner ("gpg: Can't check signature: No
+        # public key") and kills this job. Dependabot is told to skip 3.x in
+        # .github/dependabot.yml — revisit when a stable v3 ships.
+        uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:
           swift-version: '5.10'
 
       - name: Cache whisper model
-        uses: actions/cache@v4
+        if: steps.changes.outputs.relevant == 'true'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/whisper-models
           key: whisper-model-ggml-tiny-v1
 
       - name: Download ggml-tiny model
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           mkdir -p ~/.cache/whisper-models
           if [ ! -f ~/.cache/whisper-models/ggml-tiny.bin ]; then
@@ -92,14 +105,17 @@ jobs:
           fi
 
       - name: Run package unit tests
+        if: steps.changes.outputs.relevant == 'true'
         working-directory: Packages/TranscriptionCore
         run: swift test
 
       - name: Build whisper-e2e
+        if: steps.changes.outputs.relevant == 'true'
         working-directory: Packages/TranscriptionCore
         run: swift build --product whisper-e2e -c release
 
       - name: Run E2E transcription tests
+        if: steps.changes.outputs.relevant == 'true'
         working-directory: Packages/TranscriptionCore
         run: |
           swift run -c release whisper-e2e \

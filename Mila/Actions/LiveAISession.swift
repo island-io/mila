@@ -68,6 +68,14 @@ final class LiveAISession: ObservableObject {
         let model: String
         let session: LLMSession
         let timeout: TimeInterval
+        // OpenAI-compatible endpoint config (Phase 6.0.2). Populated from
+        // `llmSettings` by `kick()` (Phase 9 wires Live AI's local/remote
+        // split); defaulted so existing call sites compile unchanged.
+        var openAIBaseURL: String? = nil
+        var openAIAPIKey: String? = nil
+        var jsonMode: Bool = false
+        var temperature: Double? = nil
+        var transport: OpenAITransport? = nil
     }
     var performCall: (LLMCall) async throws -> String = { call in
         try await LLMRunner.run(
@@ -77,8 +85,43 @@ final class LiveAISession: ObservableObject {
             executablePathOverride: call.executablePathOverride,
             model: call.model,
             session: call.session,
-            timeout: call.timeout
+            timeout: call.timeout,
+            openAIBaseURL: call.openAIBaseURL,
+            openAIAPIKey: call.openAIAPIKey,
+            jsonMode: call.jsonMode,
+            temperature: call.temperature,
+            transport: call.transport
         )
+    }
+
+    /// Append the user's per-meeting background notes to `prompt` as an
+    /// explicitly-fenced non-transcript block. Returns `prompt` unchanged
+    /// when there are no notes.
+    ///
+    /// The guard rails in the block text are the whole point. Notes are
+    /// almost always an agenda ("Wojtek's team — recruitment going better;
+    /// flying in beginning of August"), which reads exactly like a
+    /// transcript of decisions already taken. Without being told
+    /// otherwise the model summarises the AGENDA and emits an action item
+    /// per bullet — the user then sees a summary of a meeting that hasn't
+    /// happened yet mixed into the one that has. So we say three things:
+    /// this is not transcript, don't summarise it, don't mine it for
+    /// items.
+    ///
+    /// `static` + pure so the wire format is unit-testable without a
+    /// subprocess.
+    static func promptWithContext(_ prompt: String, context: String) -> String {
+        let notes = context.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !notes.isEmpty else { return prompt }
+        return """
+        \(prompt)
+
+        ---
+        BACKGROUND NOTES (supplied by the user before this meeting — these are NOT part of the transcript and describe what the user PLANNED to discuss):
+        \(notes)
+
+        Use the notes only to interpret what you actually hear: names, spellings, acronyms, and which topic is being discussed. Do NOT summarise the notes, and do NOT turn them into action items. Every action item and every sentence of the summary must come from the transcript itself — if something in the notes never comes up in the conversation, it does not appear in your output at all.
+        """
     }
 
     /// Pure throttle core: how long to wait before the next tick may
@@ -106,6 +149,13 @@ final class LiveAISession: ObservableObject {
     /// (continue). A failed first call keeps this false so the next
     /// tick retries the create.
     private var sessionEstablished: Bool = false
+
+    /// The per-meeting notes as they were on the last SUCCESSFUL tick.
+    /// Compared against the current notes on every tick to detect a
+    /// mid-recording edit, which forces a session restart (see `kick()`).
+    /// Tracked separately from the prompt because in session mode already-
+    /// sent notes live on in the conversation history.
+    private var lastContextSent: String = ""
 
     /// The length of `latestTranscript` we last actually shipped to the
     /// LLM. With a live session the model already has the previous
@@ -146,6 +196,7 @@ final class LiveAISession: ObservableObject {
         sessionID = (llmSettings.tool == .claude) ? UUID() : nil
         sessionEstablished = false
         lastTranscriptSent = ""
+        lastContextSent = ""
         // os_log (NOT print) so the session UUID lands in diagnostic reports.
         // A fresh `start()` per recording is the invariant that prevents
         // cross-recording `--resume` bleed; logging the new id makes a
@@ -225,6 +276,7 @@ final class LiveAISession: ObservableObject {
         sessionID = nil
         sessionEstablished = false
         lastTranscriptSent = ""
+        lastContextSent = ""
     }
 
     /// Feed the latest full transcript. Routes through the min-interval
@@ -243,6 +295,18 @@ final class LiveAISession: ObservableObject {
     /// elapses, or fold into the running call.
     private func scheduleKick(immediate: Bool = false) {
         guard llmSettings.isConfigured, !latestTranscript.isEmpty else { return }
+        // Phase 9 (Option C): a remote OpenAI-compatible endpoint must never
+        // run the Live AI loop (full-transcript re-bill each tick, no
+        // prompt-cache discount). Defense in depth alongside the `aiActive`
+        // gates in `LiveAIRecordingView` / `MilaApp` — drop any deferred tick
+        // too, so a pendingKickTask sleeping out the min-interval floor can't
+        // wake into a stray remote call.
+        guard !llmSettings.liveAIDisabledByRemoteOpenAI else {
+            pendingKickTask?.cancel()
+            pendingKickTask = nil
+            coalesced = false
+            return
+        }
         // Live AI toggled off mid-recording: don't fire, and drop any
         // deferred tick. The feed loop stops calling feed() on toggle-off,
         // but a pendingKickTask already sleeping out the min-interval floor
@@ -285,6 +349,7 @@ final class LiveAISession: ObservableObject {
 
     private func kick() {
         guard llmSettings.isConfigured else { return }
+        guard !llmSettings.liveAIDisabledByRemoteOpenAI else { return }
         guard !latestTranscript.isEmpty else { return }
         let snapshot = latestTranscript
         let tool = llmSettings.tool
@@ -304,9 +369,48 @@ final class LiveAISession: ObservableObject {
                 return "Hebrew"
             }
         }()
-        let prompt = liveAISettings.prompt
-            .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
-        let model = liveAISettings.model
+        // Read the per-meeting notes at TICK time, not at `start()` — a
+        // meeting-detector auto-start beats the user to the pane, so the
+        // agenda usually gets pasted a minute into the recording.
+        let context = liveAISettings.meetingContext
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Editing or clearing the notes mid-recording has to actually take
+        // effect, and in session mode the prompt is only half the story: a
+        // `--resume` tick carries every earlier turn, so notes already sent
+        // stay in the model's conversation history no matter what the next
+        // prompt says. Dropping the block would leave the model still
+        // reading from the version the user just deleted. So a change in
+        // the notes restarts the Claude session: fresh UUID, and
+        // `lastTranscriptSent` reset so the first tick of the new session
+        // re-ships the whole transcript alongside the current notes.
+        // Costs one full-transcript call, only when the user edits notes
+        // mid-meeting. (CodeRabbit on #111.)
+        if sessionEstablished, context != lastContextSent, let stale = sessionID {
+            liveAILog.log("context changed — restarting session (was \(stale.uuidString.prefix(8), privacy: .public))")
+            sessionID = UUID()
+            sessionEstablished = false
+            lastTranscriptSent = ""
+            // The abandoned session's stable sandbox is nobody's job
+            // otherwise: `cancel()` only cleans up the CURRENT sessionID.
+            // Safe to remove now — `kick()` only runs with no call in
+            // flight, so no live child process is chdir'd into it. Off the
+            // main actor for the same reason `cancel()` defers it: a
+            // recursive directory removal is a blocking syscall and this is
+            // the tick path.
+            let staleKey = stale.uuidString
+            Task.detached(priority: .utility) {
+                LLMRunner.cleanupStableSandbox(key: staleKey)
+            }
+        }
+        let prompt = Self.promptWithContext(
+            liveAISettings.prompt
+                .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName),
+            context: context)
+        // OpenAI-compatible ticks use the endpoint's model name from
+        // `LLMSettings.openAIModelName`; CLI ticks use Live AI's model override.
+        let model = (tool == .openaiCompatible)
+            ? llmSettings.openAIModelName
+            : liveAISettings.model
         let useSession = (sessionID != nil)
         // Cold-start the first tick gets a longer timeout (see
         // `firstCallTimeoutSeconds`). All subsequent ticks use the
@@ -395,6 +499,14 @@ TRANSCRIPT SO FAR:
         // cross-recording bleed bug (the session wasn't freshly started); a
         // healthy recording always opens with `.new`.
         liveAILog.log("tick \(kickTag, privacy: .public): session=\(String(describing: llmSession), privacy: .public) established=\(self.sessionEstablished, privacy: .public)")
+        // Capture the OpenAI endpoint config up front (kick-time snapshot).
+        // The Task below captures `[weak self]`, so touching `self.llmSettings`
+        // inside it would either require `self?.` (and read mid-flight state) or
+        // — as the bare access did — implicitly strong-capture self, defeating
+        // the weak capture (a Swift 6 error). Snapshotting here mirrors the
+        // `perform`/`kickSessionID` captures above. (CodeRabbit #1.)
+        let openAIBaseURL = llmSettings.openAIBaseURL
+        let openAIAPIKey = llmSettings.openAIAPIKey
         inFlight = Task { @MainActor [weak self] in
             let llmStart = Date()
             do {
@@ -405,7 +517,15 @@ TRANSCRIPT SO FAR:
                     executablePathOverride: exe,
                     model: model,
                     session: llmSession,
-                    timeout: timeout
+                    timeout: timeout,
+                    // Phase 9: thread the OpenAI-compatible endpoint config so
+                    // local OpenAI Live AI ticks hit `/chat/completions` with
+                    // JSON mode + a low temperature for envelope reliability.
+                    // Remote endpoints never reach here (gated above).
+                    openAIBaseURL: (tool == .openaiCompatible) ? openAIBaseURL : nil,
+                    openAIAPIKey: (tool == .openaiCompatible) ? openAIAPIKey : nil,
+                    jsonMode: tool == .openaiCompatible,
+                    temperature: tool == .openaiCompatible ? 0.2 : nil
                 ))
                 let elapsed = Date().timeIntervalSince(llmStart)
                 let parsed = Self.parseEnvelope(from: raw)
@@ -425,6 +545,10 @@ TRANSCRIPT SO FAR:
                 self.lastError = nil
                 if useSession {
                     self.lastTranscriptSent = snapshot
+                    // Only a delivered tick counts as "the model has these
+                    // notes" — a failed call must not suppress the restart
+                    // check on the next one.
+                    self.lastContextSent = context
                     // First successful call establishes the session;
                     // future ticks must use --resume.
                     self.sessionEstablished = true

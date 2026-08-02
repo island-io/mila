@@ -207,6 +207,57 @@ final class LLMRunnerTests: XCTestCase {
         }
     }
 
+    /// Regression: after a timeout-kill, the pipe drain used to be an
+    /// UNBOUNDED wait for EOF. A grandchild the CLI spawned (MCP server,
+    /// node helper) that inherited stdout/stderr and survived the parent's
+    /// SIGKILL kept the pipes open — `run` then never returned, leaving the
+    /// caller's in-flight slot (summarizer spinner, Live AI tick) stuck
+    /// permanently. The script models that: a background `sleep` inherits
+    /// stdout and outlives its killed parent. `run` must still return
+    /// `.timedOut` promptly instead of waiting out the grandchild.
+    func test_timeout_returns_even_when_grandchild_holds_pipes_open() async {
+        // The grandchild's PID is parked in a file so the test can reap it
+        // on exit — otherwise every run leaves a stray `sleep 60` behind.
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-grandchild-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 60 &
+            echo $! > "\(pidFile.path)"
+            sleep 60
+            """)
+        defer {
+            if let pidText = try? String(contentsOf: pidFile, encoding: .utf8),
+               let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                kill(pid, SIGKILL)
+            }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let started = Date()
+        do {
+            _ = try await LLMRunner.run(tool: .claude,
+                                        prompt: "x",
+                                        transcript: "y",
+                                        executablePathOverride: script.path,
+                                        timeout: 1)
+            XCTFail("Expected timedOut error")
+        } catch let error as LLMRunnerError {
+            guard case .timedOut = error else {
+                XCTFail("Wrong error: \(error)")
+                return
+            }
+        } catch {
+            XCTFail("Wrong error type: \(error)")
+        }
+        let elapsed = Date().timeIntervalSince(started)
+        // Generous CI bound (same flake class as the plain timeout test) —
+        // the point is "returns in seconds, not after the grandchild's 60s".
+        XCTAssertLessThan(elapsed, 40,
+                          "run() must not wait for the orphaned grandchild to release the pipes; took \(elapsed)s")
+    }
+
     // MARK: - Real-CLI smoke tests
     //
     // These hit the actual `claude` / `cursor-agent` binaries if installed.
@@ -249,6 +300,157 @@ final class LLMRunnerTests: XCTestCase {
                           "claude reply looks like prose, not a title: \(result)")
     }
 
+    // MARK: - Argument tokenizer / shell quoting
+
+    func test_tokenize_simple_space_separated() {
+        XCTAssertEqual(LLMRunner.tokenizeArguments("--model sonnet --debug"),
+                       ["--model", "sonnet", "--debug"])
+    }
+
+    func test_tokenize_empty_is_no_args() {
+        XCTAssertEqual(LLMRunner.tokenizeArguments("   "), [])
+    }
+
+    func test_tokenize_double_quotes_keep_spaces_together() {
+        XCTAssertEqual(LLMRunner.tokenizeArguments("--model \"claude sonnet 4\""),
+                       ["--model", "claude sonnet 4"])
+    }
+
+    func test_tokenize_single_quotes_keep_spaces_together() {
+        XCTAssertEqual(LLMRunner.tokenizeArguments("--name 'Big Meeting'"),
+                       ["--name", "Big Meeting"])
+    }
+
+    func test_tokenize_backslash_escapes_space() {
+        XCTAssertEqual(LLMRunner.tokenizeArguments("a\\ b c"),
+                       ["a b", "c"])
+    }
+
+    func test_shellQuote_leaves_safe_tokens_bare() {
+        XCTAssertEqual(LLMRunner.shellQuote("--model"), "--model")
+        XCTAssertEqual(LLMRunner.shellQuote("claude-sonnet-4-6"), "claude-sonnet-4-6")
+    }
+
+    func test_shellQuote_wraps_tokens_with_spaces() {
+        XCTAssertEqual(LLMRunner.shellQuote("hello world"), "'hello world'")
+    }
+
+    func test_shellQuote_escapes_embedded_single_quote() {
+        XCTAssertEqual(LLMRunner.shellQuote("it's"), "'it'\\''s'")
+    }
+
+    func test_shellQuote_empty_is_quoted() {
+        XCTAssertEqual(LLMRunner.shellQuote(""), "''")
+    }
+
+    // MARK: - diagnose() — non-throwing test path
+
+    func test_diagnose_reports_setup_error_when_tool_disabled() async {
+        let result = await LLMRunner.diagnose(tool: .none,
+                                              prompt: "x",
+                                              transcript: "y",
+                                              executablePathOverride: nil)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertFalse(result.didLaunch)
+        XCTAssertNotNil(result.setupError)
+    }
+
+    func test_diagnose_reports_setup_error_for_missing_executable() async {
+        let result = await LLMRunner.diagnose(tool: .claude,
+                                              prompt: "x",
+                                              transcript: "y",
+                                              executablePathOverride: "/definitely/not/here/claude")
+        XCTAssertFalse(result.succeeded)
+        XCTAssertFalse(result.didLaunch)
+        XCTAssertNotNil(result.setupError)
+    }
+
+    func test_diagnose_captures_command_stdout_and_success() async throws {
+        // `/bin/cat` echoes its argv? No — use a script that prints the prompt
+        // arg so we can assert stdout is captured and success is reported.
+        let script = makeScript("""
+            #!/bin/sh
+            printf '%s' "${@: -1}"
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let result = await LLMRunner.diagnose(tool: .claude,
+                                              prompt: "Title please",
+                                              transcript: "the audio",
+                                              executablePathOverride: script.path,
+                                              timeout: 30)
+        XCTAssertTrue(result.succeeded, "expected clean exit: \(result)")
+        XCTAssertEqual(result.exitCode, 0)
+        XCTAssertTrue(result.didLaunch)
+        XCTAssertTrue(result.stdout.contains("Title please"), "stdout: \(result.stdout)")
+        XCTAssertTrue(result.stdout.contains("the audio"), "stdout: \(result.stdout)")
+        // Command is shown for copy/paste and points at the resolved binary.
+        XCTAssertTrue(result.command.contains(script.path), "command: \(result.command)")
+        XCTAssertNil(result.setupError)
+    }
+
+    func test_diagnose_captures_nonzero_exit_without_throwing() async {
+        let result = await LLMRunner.diagnose(tool: .claude,
+                                              prompt: "x",
+                                              transcript: "y",
+                                              executablePathOverride: "/usr/bin/false")
+        XCTAssertFalse(result.succeeded)
+        XCTAssertTrue(result.didLaunch)
+        XCTAssertEqual(result.exitCode, 1)
+        XCTAssertNil(result.setupError)
+    }
+
+    func test_run_appends_extra_args_after_prompt() async throws {
+        // Emit each argument NUL-delimited so we can reconstruct argv exactly
+        // and assert the extra args are the *trailing* tokens — the override
+        // behaviour (a user --model wins) depends on them coming last, not
+        // just being present.
+        let script = makeScript("""
+            #!/bin/sh
+            for a in "$@"; do printf '%s\\0' "$a"; done
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let out = try await LLMRunner.run(tool: .claude,
+                                          prompt: "Title",
+                                          transcript: "body",
+                                          executablePathOverride: script.path,
+                                          extraArgs: ["--model", "some-model"],
+                                          timeout: 30)
+        let argv = out.split(separator: "\0").map(String.init)
+        XCTAssertEqual(Array(argv.suffix(2)), ["--model", "some-model"],
+                       "extra args must be appended after standard args: \(argv)")
+    }
+
+    func test_diagnose_reports_timeout_without_throwing() async throws {
+        // Script ignores args and sleeps past the 1s timeout. diagnose maps
+        // the timeout into the result fields the panel renders, never throws.
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 5
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let result = await LLMRunner.diagnose(tool: .claude,
+                                              prompt: "x",
+                                              transcript: "y",
+                                              executablePathOverride: script.path,
+                                              timeout: 1)
+        XCTAssertFalse(result.succeeded)
+        XCTAssertTrue(result.didLaunch)
+        XCTAssertTrue(result.timedOut)
+        XCTAssertEqual(result.exitCode, -1)
+        XCTAssertNil(result.setupError)
+    }
+
+    func test_diagnose_appends_extra_args_to_command() async {
+        let result = await LLMRunner.diagnose(tool: .claude,
+                                              prompt: "x",
+                                              transcript: "y",
+                                              extraArgs: ["--model", "claude sonnet"],
+                                              executablePathOverride: "/usr/bin/true")
+        // The space-bearing arg must round-trip through shell quoting.
+        XCTAssertTrue(result.command.contains("--model 'claude sonnet'"),
+                      "command: \(result.command)")
+    }
+
     func test_cursor_cli_returns_a_title_for_a_sample_transcript() async throws {
         guard let cursorPath = resolve("cursor-agent") else {
             throw XCTSkip("cursor-agent CLI not installed on this machine")
@@ -270,5 +472,81 @@ final class LLMRunnerTests: XCTestCase {
                        "cursor-agent never saw the transcript — runner regressed: \(result)")
         XCTAssertFalse(result.lowercased().contains("could you paste"),
                        "cursor-agent never saw the transcript — runner regressed: \(result)")
+    }
+
+    // MARK: - Phase 10 — CLI regression guard (OpenAI branch must not leak)
+
+    /// AC-REGRESS-01 — the early `.openaiCompatible` branch added in Phase 6
+    /// must NOT divert `.claude` (or any CLI tool) into the HTTP path, even
+    /// when the new OpenAI params are explicitly passed. We prove it by
+    /// handing `.claude` a non-nil `openAIBaseURL` + `jsonMode` + `temperature`
+    /// AND a `makeScript` stand-in: if the branch were mis-scoped (e.g.
+    /// `tool != .none`), the runner would hit the HTTP transport instead of
+    /// spawning the script, and the marker would never come back. Uses the
+    /// shell-script stand-in (m1) — not `/bin/cat`.
+    func test_run_claude_unchanged_resolvesExecutableAndSpawns() async throws {
+        let script = makeScript("""
+            #!/bin/sh
+            printf 'CLI-PATH-MARKER:%s' "${@: -1}"
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let out = try await LLMRunner.run(
+            tool: .claude,
+            prompt: "hello",
+            transcript: "world",
+            executablePathOverride: script.path,
+            timeout: 30,
+            openAIBaseURL: "http://localhost:11434/v1",
+            openAIAPIKey: "ignored-by-cli-path",
+            jsonMode: true,
+            temperature: 0.5
+        )
+        XCTAssertTrue(out.contains("CLI-PATH-MARKER:"),
+                      "claude was diverted away from the CLI spawn path: \(out)")
+        XCTAssertTrue(out.contains("hello"),
+                      "composed prompt didn't reach the CLI: \(out)")
+    }
+
+    /// AC-REGRESS-02 — the OpenAI branch must not leak into `.none` or
+    /// `.cursor`. `.none` still throws `toolDisabled` (not an OpenAI/HTTP
+    /// error) even with OpenAI params present; `.cursor` still spawns the CLI
+    /// stand-in and ignores the OpenAI params. The existing suite is the
+    /// guard; this test pins the "no leak" invariant explicitly.
+    func test_existingLLMRunnerTestsStillPass() async throws {
+        // .none: OpenAI params present, but tool-disabled wins — no HTTP
+        // attempt, no OpenAIRequestError, just .toolDisabled.
+        do {
+            _ = try await LLMRunner.run(tool: .none,
+                                        prompt: "x", transcript: "y",
+                                        executablePathOverride: nil,
+                                        openAIBaseURL: "http://localhost:11434/v1",
+                                        openAIAPIKey: "k",
+                                        jsonMode: true,
+                                        temperature: 0.5)
+            XCTFail("Expected toolDisabled for .none")
+        } catch let error as LLMRunnerError {
+            guard case .toolDisabled = error else {
+                XCTFail(".none leaked into a non-toolDisabled path: \(error)"); return
+            }
+        } catch {
+            XCTFail("Wrong error type for .none: \(error)")
+        }
+
+        // .cursor: still spawns the CLI stand-in, ignoring the OpenAI params.
+        let script = makeScript("""
+            #!/bin/sh
+            printf 'cursor-ran'
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let out = try await LLMRunner.run(tool: .cursor,
+                                          prompt: "x", transcript: "y",
+                                          executablePathOverride: script.path,
+                                          timeout: 30,
+                                          openAIBaseURL: "http://localhost:11434/v1",
+                                          openAIAPIKey: "k",
+                                          jsonMode: true,
+                                          temperature: 0.5)
+        XCTAssertEqual(out, "cursor-ran",
+                       "cursor was diverted away from the CLI spawn path: \(out)")
     }
 }

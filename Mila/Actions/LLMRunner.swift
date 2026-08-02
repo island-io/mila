@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 /// Errors surfaced from the CLI invocation. The Settings UI / rename sheet
 /// renders `errorDescription` directly so users can self-diagnose path /
@@ -8,29 +9,70 @@ enum LLMRunnerError: LocalizedError {
     case executableNotFound(String)
     case launchFailed(Error)
     case nonZeroExit(code: Int32, stderr: String)
-    case timedOut
+    case timedOut(seconds: Int)
     case emptyOutput
     case cancelled
 
     var errorDescription: String? {
         switch self {
         case .toolDisabled:
-            return "No LLM is configured in Settings → LLM."
+            return "No LLM is configured in Settings → AI Provider."
         case .executableNotFound(let name):
-            return "Could not find \(name) on PATH. Install it or set the full path in Settings → LLM."
+            return "Could not find \(name) on PATH. Install it or set the full path in Settings → AI Provider."
         case .launchFailed(let err):
             return "Could not launch the LLM CLI: \(err.localizedDescription)"
         case .nonZeroExit(let code, let stderr):
             let trimmed = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             return "LLM CLI exited with status \(code). \(trimmed)"
-        case .timedOut:
-            return "LLM CLI did not respond within the timeout."
+        case .timedOut(let seconds):
+            return "LLM CLI did not respond within \(seconds)s. If it's running an agentic task (e.g. calendar lookup), raise the timeout in Settings → AI Provider."
         case .emptyOutput:
             return "LLM CLI returned no output. Check the prompt or your CLI's auth."
         case .cancelled:
             return "LLM call was cancelled."
         }
     }
+}
+
+/// Everything the Settings → AI Provider test panel needs to explain a run to
+/// user. Produced by `LLMRunner.diagnose`. Unlike `LLMRunner.run`, nothing is
+/// thrown away on failure: the user sees the exact command, the exit code, and
+/// both streams so they can self-diagnose (or re-run `command` in a terminal).
+struct LLMTestResult: Equatable {
+    /// The exact, shell-quoted command line that was launched (or would have
+    /// been, if we got far enough to build it). Empty when no tool/executable
+    /// was resolved. For the OpenAI HTTP path this is `POST <url>`.
+    var command: String = ""
+    /// True only when the CLI launched and exited 0, OR the HTTP endpoint
+    /// returned 2xx with parseable content.
+    var succeeded: Bool = false
+    /// Process exit code, or nil when the CLI never launched (setup error).
+    /// Always nil for the OpenAI HTTP path (there is no process).
+    var exitCode: Int32? = nil
+    var stdout: String = ""
+    var stderr: String = ""
+    var durationSeconds: TimeInterval = 0
+    /// Set when something prevented the CLI from even running — no tool
+    /// selected, executable not on PATH, launch failure — or when the OpenAI
+    /// transport couldn't reach the endpoint (network/timeout failure).
+    var setupError: String? = nil
+    var timedOut: Bool = false
+    // OpenAI HTTP diagnostics (Phase 7). Populated only by the
+    // `.openaiCompatible` diagnose branch; empty/nil for the CLI path.
+    /// The full request URL the POST was sent to.
+    var url: String = ""
+    /// HTTP status code of the response, or nil when the request never got a
+    /// response (transport failure). This — not `exitCode` — is the "did the
+    /// HTTP call actually run?" signal for the OpenAI path (AC-DIAG-04).
+    var httpStatus: Int? = nil
+    /// The JSON request body that was sent, for copy-paste / debugging.
+    var requestBody: String = ""
+
+    /// Whether anything actually ran. For the CLI path, "launched a process"
+    /// (`exitCode != nil`); for the OpenAI path, "got an HTTP response"
+    /// (`httpStatus != nil`). False for pure setup failures (no tool selected,
+    /// executable not found, transport couldn't connect).
+    var didLaunch: Bool { exitCode != nil || httpStatus != nil }
 }
 
 /// Spawns the configured `claude` or `cursor-agent` binary with the user's
@@ -93,6 +135,11 @@ enum LLMRunner {
     /// configured) — the wire format collapses to the old transcript-only
     /// shape in that case.
     ///
+    /// `extraArgs` are appended verbatim after the tool's standard arguments
+    /// — the user's persisted "Extra args" from Settings → AI Provider (e.g.
+    /// `--model …`, a permission flag). Empty for callers that manage their
+    /// own args (Live AI pins its own model).
+    ///
     /// `timeout` defaults to 5 minutes. Pass a smaller value for foreground
     /// callers that block UI (e.g. the Suggest button).
     static func run(tool: LLMTool,
@@ -102,8 +149,44 @@ enum LLMRunner {
                     executablePathOverride: String?,
                     model: String? = nil,
                     session: LLMSession = .none,
-                    timeout: TimeInterval = LLMRunner.defaultTimeout) async throws -> String {
+                    extraArgs: [String] = [],
+                    timeout: TimeInterval = LLMRunner.defaultTimeout,
+                    // OpenAI-compatible endpoint config (Phase 6.0). Only
+                    // `transport` is caller-transparent — it defaults to a real
+                    // `URLSession` so CLI-only callers pass nothing and are
+                    // unchanged. `baseURL`/`apiKey`/`jsonMode` default to
+                    // nil/nil/false; callers that can land on
+                    // `.openaiCompatible` MUST thread them (see the plan's
+                    // 6.0.3 call-site audit). `model:` is reused for the
+                    // OpenAI model name (`LLMSettings.openAIModelName`).
+                    openAIBaseURL: String? = nil,
+                    openAIAPIKey: String? = nil,
+                    jsonMode: Bool = false,
+                    temperature: Double? = nil,
+                    transport: OpenAITransport? = nil) async throws -> String {
         guard tool != .none else { throw LLMRunnerError.toolDisabled }
+
+        // OpenAI-compatible HTTP path — handled before any CLI resolution, so
+        // `executablePathOverride` / `session` / `extraArgs` (CLI-only) are
+        // irrelevant here. Defense in depth: `run` has no `LLMSettings`, so it
+        // re-checks the base-URL readiness gate the Settings UI also enforces
+        // via `isConfigured` — a nil/empty base URL can't send anything.
+        if tool == .openaiCompatible {
+            guard let baseURL = openAIBaseURL,
+                  !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { throw LLMRunnerError.toolDisabled }
+            let t = transport ?? URLSessionTransport(URLSession.shared)
+            return try await runOpenAICompatible(prompt: prompt,
+                                                 transcript: transcript,
+                                                 summary: summary,
+                                                 model: model,
+                                                 timeout: timeout,
+                                                 baseURL: baseURL,
+                                                 apiKey: openAIAPIKey ?? "",
+                                                 jsonMode: jsonMode,
+                                                 temperature: temperature,
+                                                 transport: t)
+        }
 
         let executable = try resolveExecutable(tool: tool,
                                                override: executablePathOverride)
@@ -139,12 +222,25 @@ enum LLMRunner {
                 }()
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
-                        let result = try runProcess(executable: executable,
-                                                    arguments: tool.arguments(prompt: fullPrompt, model: model, session: session),
-                                                    timeout: timeout,
-                                                    handle: handle,
-                                                    sandboxKey: sandboxKey)
-                        continuation.resume(returning: result)
+                        let outcome = try executeProcess(executable: executable,
+                                                         arguments: tool.arguments(prompt: fullPrompt, model: model, session: session) + extraArgs,
+                                                         timeout: timeout,
+                                                         handle: handle,
+                                                         sandboxKey: sandboxKey)
+                        // The Swift Task that drove us was cancelled mid-flight
+                        // — `handle` SIGTERM'd the process, so the user-visible
+                        // truth is "we cancelled it", not "the CLI crashed".
+                        if outcome.cancelled {
+                            continuation.resume(throwing: LLMRunnerError.cancelled)
+                        } else if outcome.timedOut {
+                            continuation.resume(throwing: LLMRunnerError.timedOut(seconds: Int(timeout.rounded(.up))))
+                        } else if outcome.exitCode != 0 {
+                            continuation.resume(throwing: LLMRunnerError.nonZeroExit(
+                                code: outcome.exitCode,
+                                stderr: outcome.stderr.isEmpty ? outcome.stdout : outcome.stderr))
+                        } else {
+                            continuation.resume(returning: outcome.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+                        }
                     } catch {
                         continuation.resume(throwing: error)
                     }
@@ -155,11 +251,359 @@ enum LLMRunner {
         }
     }
 
-    private static func runProcess(executable: URL,
-                                   arguments: [String],
-                                   timeout: TimeInterval,
-                                   handle: ProcessHandle,
-                                   sandboxKey: String? = nil) throws -> String {
+    /// HTTP path for `tool == .openaiCompatible`: build the
+    /// `/chat/completions` request via the pure `OpenAIClient.makeRequest`,
+    /// send it through the injectable transport, then decode via the pure
+    /// `OpenAIClient.parse`. `timeout` is applied as the request's
+    /// `timeoutInterval` (and `URLSession.data` surfaces the expiry as
+    /// `URLError.timedOut`); Task cancellation surfaces as
+    /// `URLError.cancelled`. Both are mapped back onto `LLMRunnerError` so
+    /// callers see the same error vocabulary the CLI path produces.
+    ///
+    /// Error mapping:
+    ///  - `OpenAIRequestError` (from `parse`) → rethrown as-is (typed,
+    ///    `LocalizedError`, rendered by the Settings sheet / rename sheet).
+    ///  - `URLError.cancelled` → `.cancelled` (mirrors the CLI's
+    ///    `ProcessHandle`-driven cancellation).
+    ///  - `URLError.timedOut` → `.timedOut(seconds:)`, rounded *up* to match
+    ///    the CLI path's `Int(timeout.rounded(.up))` so AC-TIMEOUT-02's
+    ///    "matches the CLI format" holds.
+    ///  - any other transport failure → `.launchFailed` (the closest existing
+    ///    bucket for "couldn't reach the endpoint").
+    static func runOpenAICompatible(prompt: String,
+                                    transcript: String,
+                                    summary: String,
+                                    model: String?,
+                                    timeout: TimeInterval,
+                                    baseURL: String,
+                                    apiKey: String,
+                                    jsonMode: Bool,
+                                    temperature: Double?,
+                                    transport: OpenAITransport) async throws -> String {
+        // `makeRequest` throws `OpenAIRequestError.invalidEndpoint` for a
+        // malformed base URL (issue celarent7/mila#1). It's an
+        // `OpenAIRequestError`, so the typed-rethrow catch below surfaces it
+        // to the caller as a readable LocalizedError — not a crash.
+        var request = try OpenAIClient.makeRequest(baseURL: baseURL,
+                                               model: model ?? "",
+                                               prompt: prompt,
+                                               transcript: transcript,
+                                               summary: summary,
+                                               apiKey: apiKey,
+                                               jsonMode: jsonMode,
+                                               temperature: temperature)
+        if timeout > 0 { request.timeoutInterval = timeout }
+
+        do {
+            // Already cancelled before we even dispatch (e.g. the rename sheet
+            // closed while the transcript was still being assembled)? Don't
+            // spend the round trip — or the tokens. (CodeRabbit #2.)
+            try Task.checkCancellation()
+            let (http, data) = try await transport.send(request)
+            // A cooperative cancellation (Task.cancel, or a custom/test
+            // transport that throws CancellationError) would otherwise fall
+            // through to `.launchFailed`; surface it as a cancellation so the
+            // banner/auto-suggest callers drop it quietly. (CodeRabbit #2.)
+            try Task.checkCancellation()
+            switch OpenAIClient.parse(data: data, response: http) {
+            case .success(let content):
+                // Re-check after the (possibly slow) transport returned: a
+                // late response to a cancelled task shouldn't be delivered.
+                try Task.checkCancellation()
+                return content
+            case .failure(let error):
+                throw error
+            }
+        } catch let error as OpenAIRequestError {
+            throw error
+        } catch is CancellationError {
+            throw LLMRunnerError.cancelled
+        } catch let urlError as URLError {
+            switch urlError.code {
+            case .cancelled:
+                throw LLMRunnerError.cancelled
+            case .timedOut:
+                throw LLMRunnerError.timedOut(seconds: Int(timeout.rounded(.up)))
+            default:
+                throw LLMRunnerError.launchFailed(urlError)
+            }
+        } catch {
+            throw LLMRunnerError.launchFailed(error)
+        }
+    }
+
+    /// Run the configured CLI like `run` does, but never throw — capture the
+    /// exact command line, exit code, stdout, and stderr and hand them all
+    /// back so the Settings → AI Provider test panel can show precisely what
+    /// happened. This is the "why isn't my LLM working?" debugging path: the
+    /// returned `command` is copy-pasteable into a terminal so the user can
+    /// reproduce the run themselves.
+    ///
+    /// `extraArgs` are appended verbatim after the tool's standard arguments
+    /// — the user types them in the test panel (e.g. `--model claude-sonnet-4-6`,
+    /// `--debug`) so they can probe param changes without us hardcoding a
+    /// model picker. Setup problems (no tool selected, executable not found)
+    /// come back in `setupError` rather than as an exception.
+    static func diagnose(tool: LLMTool,
+                         prompt: String,
+                         transcript: String,
+                         summary: String = "",
+                         extraArgs: [String] = [],
+                         executablePathOverride: String?,
+                         model: String? = nil,
+                         timeout: TimeInterval = 120,
+                         // OpenAI-compatible config (Phase 6.0/7). Same four
+                         // defaulted params as `run`; only `transport` is
+                         // caller-transparent. `diagnose` is non-throwing, so
+                         // the base-URL guard and transport failures come back
+                         // as `setupError` rather than exceptions.
+                         openAIBaseURL: String? = nil,
+                         openAIAPIKey: String? = nil,
+                         jsonMode: Bool = false,
+                         transport: OpenAITransport? = nil) async -> LLMTestResult {
+        guard tool != .none else {
+            return LLMTestResult(setupError: LLMRunnerError.toolDisabled.errorDescription ?? "No LLM configured.")
+        }
+        // OpenAI HTTP path — handled before CLI resolution, so no
+        // `executablePath` is required (AC-DIAG-05).
+        if tool == .openaiCompatible {
+            return await diagnoseOpenAICompatible(prompt: prompt,
+                                                  transcript: transcript,
+                                                  summary: summary,
+                                                  model: model,
+                                                  timeout: timeout,
+                                                  baseURL: openAIBaseURL ?? "",
+                                                  apiKey: openAIAPIKey ?? "",
+                                                  jsonMode: jsonMode,
+                                                  transport: transport)
+        }
+        let executable: URL
+        do {
+            executable = try resolveExecutable(tool: tool, override: executablePathOverride)
+        } catch {
+            let msg = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+            return LLMTestResult(setupError: msg)
+        }
+        let fullPrompt = composedPrompt(prompt, transcript: transcript, summary: summary)
+        let args = tool.arguments(prompt: fullPrompt, model: model) + extraArgs
+        let command = ([executable.path] + args).map(shellQuote).joined(separator: " ")
+        let start = Date()
+        // Bridge Task cancellation to the child process, same as `run` — if
+        // the test is cancelled (Settings closed, a newer run started), SIGTERM
+        // the CLI instead of leaving it alive until the timeout.
+        let handle = ProcessHandle()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let elapsed: () -> TimeInterval = { Date().timeIntervalSince(start) }
+                    do {
+                        let outcome = try executeProcess(executable: executable,
+                                                         arguments: args,
+                                                         timeout: timeout,
+                                                         handle: handle,
+                                                         sandboxKey: nil)
+                        continuation.resume(returning: LLMTestResult(
+                            command: command,
+                            succeeded: !outcome.timedOut && outcome.exitCode == 0,
+                            exitCode: outcome.exitCode,
+                            stdout: outcome.stdout,
+                            stderr: outcome.stderr,
+                            durationSeconds: elapsed(),
+                            timedOut: outcome.timedOut))
+                    } catch {
+                        // Only `launchFailed` reaches here now.
+                        let msg = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+                        continuation.resume(returning: LLMTestResult(
+                            command: command,
+                            durationSeconds: elapsed(),
+                            setupError: msg))
+                    }
+                }
+            }
+        } onCancel: {
+            handle.terminate()
+        }
+    }
+
+    /// Non-throwing HTTP diagnostic for `tool == .openaiCompatible` — the
+    /// "test" path the Settings → AI Provider panel uses to explain an endpoint
+    /// to the user. Mirrors `runOpenAICompatible`'s request building but,
+    /// because `diagnose` never throws, captures every outcome into the
+    /// `LLMTestResult` fields: `url`/`requestBody`/`httpStatus` for the request
+    /// + response, `succeeded` iff 2xx with parseable content, the response
+    /// body in `stdout`, a typed error message in `stderr` for 4xx/5xx, and
+    /// `setupError`/`timedOut` for transport failures (so the panel can tell
+    /// "couldn't reach the endpoint" from "endpoint returned an error").
+    static func diagnoseOpenAICompatible(prompt: String,
+                                         transcript: String,
+                                         summary: String,
+                                         model: String?,
+                                         timeout: TimeInterval,
+                                         baseURL: String,
+                                         apiKey: String,
+                                         jsonMode: Bool,
+                                         transport: OpenAITransport?) async -> LLMTestResult {
+        let trimmedBase = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBase.isEmpty else {
+            return LLMTestResult(
+                setupError: LLMRunnerError.toolDisabled.errorDescription
+                    ?? "No OpenAI endpoint is configured in Settings → AI Provider.")
+        }
+        // `makeRequest` throws `invalidEndpoint` for a malformed base URL
+        // (issue celarent7/mila#1). `diagnose` never throws, so surface it as
+        // a setup problem the test panel can render — not a crash.
+        var request: URLRequest
+        do {
+            request = try OpenAIClient.makeRequest(baseURL: trimmedBase,
+                                                   model: model ?? "",
+                                                   prompt: prompt,
+                                                   transcript: transcript,
+                                                   summary: summary,
+                                                   apiKey: apiKey,
+                                                   jsonMode: jsonMode,
+                                                   temperature: nil)
+        } catch let error as OpenAIRequestError {
+            return LLMTestResult(
+                setupError: error.errorDescription ?? "\(error)",
+                url: "\(trimmedBase)/chat/completions")
+        } catch {
+            return LLMTestResult(setupError: error.localizedDescription)
+        }
+        if timeout > 0 { request.timeoutInterval = timeout }
+        let url = request.url?.absoluteString ?? ""
+        let requestBody = String(data: request.httpBody ?? Data(), encoding: .utf8) ?? ""
+        let command = "POST \(url)"
+        let start = Date()
+        let t = transport ?? URLSessionTransport(URLSession.shared)
+
+        do {
+            let (http, data) = try await t.send(request)
+            let status = http.statusCode
+            let bodyString = String(data: data, encoding: .utf8) ?? ""
+            switch OpenAIClient.parse(data: data, response: http) {
+            case .success(let content):
+                return LLMTestResult(
+                    command: command,
+                    succeeded: true,
+                    stdout: content,
+                    durationSeconds: Date().timeIntervalSince(start),
+                    url: url,
+                    httpStatus: status,
+                    requestBody: requestBody)
+            case .failure(let error):
+                // 4xx/5xx: the endpoint ran (httpStatus set) but didn't
+                // succeed. Surface the readable typed message in stderr and
+                // the raw body in stdout so the user can self-diagnose.
+                return LLMTestResult(
+                    command: command,
+                    succeeded: false,
+                    stdout: bodyString,
+                    stderr: (error as? LocalizedError)?.errorDescription ?? "\(error)",
+                    durationSeconds: Date().timeIntervalSince(start),
+                    url: url,
+                    httpStatus: status,
+                    requestBody: requestBody)
+            }
+        } catch let urlError as URLError {
+            if urlError.code == .timedOut {
+                return LLMTestResult(
+                    command: command,
+                    durationSeconds: Date().timeIntervalSince(start),
+                    setupError: LLMRunnerError.timedOut(
+                        seconds: Int(timeout.rounded(.up))).errorDescription,
+                    timedOut: true,
+                    url: url,
+                    requestBody: requestBody)
+            }
+            return LLMTestResult(
+                command: command,
+                durationSeconds: Date().timeIntervalSince(start),
+                setupError: urlError.localizedDescription,
+                url: url,
+                requestBody: requestBody)
+        } catch {
+            return LLMTestResult(
+                command: command,
+                durationSeconds: Date().timeIntervalSince(start),
+                setupError: error.localizedDescription,
+                url: url,
+                requestBody: requestBody)
+        }
+    }
+
+    /// Split a free-text "extra arguments" string into an argv array, honoring
+    /// single quotes, double quotes, and backslash escapes the way a POSIX
+    /// shell would — so a user can paste `--model "claude sonnet"` and get two
+    /// tokens, not three. Deliberately small: it covers the quoting users
+    /// actually type, not the full shell grammar.
+    static func tokenizeArguments(_ input: String) -> [String] {
+        var args: [String] = []
+        var current = ""
+        var hasToken = false
+        var inSingle = false
+        var inDouble = false
+        let chars = Array(input)
+        var i = 0
+        while i < chars.count {
+            let c = chars[i]
+            if inSingle {
+                if c == "'" { inSingle = false } else { current.append(c) }
+            } else if inDouble {
+                if c == "\"" {
+                    inDouble = false
+                } else if c == "\\", i + 1 < chars.count, chars[i + 1] == "\"" || chars[i + 1] == "\\" {
+                    i += 1
+                    current.append(chars[i])
+                } else {
+                    current.append(c)
+                }
+            } else if c == "'" {
+                inSingle = true; hasToken = true
+            } else if c == "\"" {
+                inDouble = true; hasToken = true
+            } else if c == "\\", i + 1 < chars.count {
+                i += 1
+                current.append(chars[i]); hasToken = true
+            } else if c == " " || c == "\t" || c == "\n" {
+                if hasToken { args.append(current); current = ""; hasToken = false }
+            } else {
+                current.append(c); hasToken = true
+            }
+            i += 1
+        }
+        if hasToken { args.append(current) }
+        return args
+    }
+
+    /// Quote a single argv token for display so the rendered `command` can be
+    /// pasted back into a shell and run as-is. Tokens made only of "safe"
+    /// characters are left bare; everything else is single-quoted with any
+    /// embedded single quotes escaped the classic `'\''` way.
+    static func shellQuote(_ s: String) -> String {
+        if s.isEmpty { return "''" }
+        let safe = CharacterSet(charactersIn:
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_./=:,@+")
+        if s.unicodeScalars.allSatisfy({ safe.contains($0) }) { return s }
+        return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Raw result of a single CLI invocation, before any success/failure
+    /// interpretation. `run` maps this onto its throwing contract; `diagnose`
+    /// surfaces every field verbatim so the Settings test panel can show the
+    /// user exactly what happened (exit code, stdout, stderr) even on failure.
+    struct ProcessOutcome {
+        let stdout: String
+        let stderr: String
+        let exitCode: Int32
+        let timedOut: Bool
+        let cancelled: Bool
+    }
+
+    private static func executeProcess(executable: URL,
+                                       arguments: [String],
+                                       timeout: TimeInterval,
+                                       handle: ProcessHandle,
+                                       sandboxKey: String? = nil) throws -> ProcessOutcome {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -234,18 +678,23 @@ enum LLMRunner {
 
         // Read stdout/stderr eagerly on background queues so a chatty CLI
         // can't deadlock by filling the OS pipe buffer while we waitUntilExit.
-        var outData = Data()
-        var errData = Data()
+        // Chunked reads into lock-guarded boxes (not one readDataToEndOfFile
+        // into a captured var) so the bounded drain below can snapshot what
+        // arrived so far without racing a still-blocked reader.
+        let outBox = OSAllocatedUnfairLock(initialState: Data())
+        let errBox = OSAllocatedUnfairLock(initialState: Data())
         let group = DispatchGroup()
-        group.enter()
-        DispatchQueue.global().async {
-            outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
-        }
-        group.enter()
-        DispatchQueue.global().async {
-            errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            group.leave()
+        for (pipe, box) in [(stdoutPipe, outBox), (stderrPipe, errBox)] {
+            group.enter()
+            DispatchQueue.global().async {
+                let handle = pipe.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData   // blocks until data or EOF
+                    if chunk.isEmpty { break }
+                    box.withLock { $0.append(chunk) }
+                }
+                group.leave()
+            }
         }
 
         // Bounded wait — kill the process if it's still running at deadline.
@@ -256,29 +705,71 @@ enum LLMRunner {
             runningGroup.leave()
         }
         let deadline = DispatchTime.now() + .seconds(Int(timeout.rounded(.up)))
-        if runningGroup.wait(timeout: deadline) == .timedOut {
+        let timedOut = runningGroup.wait(timeout: deadline) == .timedOut
+        if timedOut {
+            // SIGTERM first; if the CLI ignores it, hard-kill after a short
+            // grace period so we don't read half-drained pipes or remove the
+            // sandbox out from under a still-running child.
             process.terminate()
-            _ = group.wait(timeout: .now() + 1)
-            throw LLMRunnerError.timedOut
+            if runningGroup.wait(timeout: .now() + 1) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                // BOUNDED: `waitUntilExit` has been observed never returning
+                // even after a SIGKILL (macOS 26, sampled live — likely a
+                // reaping race inside NSTask). The child is dead-or-dying
+                // either way, and this is the timedOut path so its exit
+                // status is already being discarded — don't hang the caller
+                // (and its awaiting continuation) on the obituary.
+                if runningGroup.wait(timeout: .now() + 5) == .timedOut {
+                    print("LLMRunner: waitUntilExit didn't return after SIGKILL — abandoning the wait")
+                }
+            }
         }
-        group.wait()
-
-        // The Swift Task that drove us was cancelled mid-flight — `handle`
-        // has SIGTERM'd the process so it likely exited with a non-zero
-        // status, but the user-visible truth is "we cancelled it", not
-        // "the CLI crashed".
-        if handle.wasTerminated {
-            throw LLMRunnerError.cancelled
+        // Drain the pipe readers once the process is known to be gone.
+        if timedOut || handle.wasTerminated {
+            // Killed path: BOUNDED. A grandchild that inherited the pipes
+            // and survived the kill (an MCP server or node helper the CLI
+            // spawned) holds them open indefinitely, and an unbounded wait
+            // here hung this method (and the awaiting continuation, and
+            // the caller's in-flight slot) forever. The output is being
+            // discarded anyway (the caller sees .timedOut / .cancelled),
+            // so after the grace we move on; the leaked reader threads
+            // exit when the pipes finally close.
+            if group.wait(timeout: .now() + 3) == .timedOut {
+                print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
+            }
+        } else {
+            // Normal exit: bounded too, but with a GENEROUS grace. Two
+            // opposing constraints meet here:
+            //  * The child closed its write ends when it died, so the
+            //    readers hit EOF as soon as they get CPU — on a loaded
+            //    macos-26 CI VM that can be 10s+ of dispatch latency, and
+            //    a tight 3s bound truncated perfectly good output
+            //    mid-stream (test_runner_spawns_child_in_isolated_temp_
+            //    directory went flaky on CI).
+            //  * EOF is not GUARANTEED even after exit 0 — a helper the
+            //    CLI spawned (MCP server, node daemon) can inherit the
+            //    pipes and keep them open indefinitely; an unbounded wait
+            //    hung the caller forever.
+            // 30s clears any realistic dispatch latency while still
+            // returning the (fully buffered by then) output if a
+            // pipe-holding helper never lets EOF arrive.
+            if group.wait(timeout: .now() + 30) == .timedOut {
+                print("LLMRunner: pipe drain timed out after normal exit — a helper process is still holding stdout/stderr; returning buffered output")
+            }
         }
 
-        let stdout = String(data: outData, encoding: .utf8) ?? ""
-        let stderr = String(data: errData, encoding: .utf8) ?? ""
+        let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
+        let stderr = String(data: errBox.withLock { $0 }, encoding: .utf8) ?? ""
 
-        guard process.terminationStatus == 0 else {
-            throw LLMRunnerError.nonZeroExit(code: process.terminationStatus,
-                                             stderr: stderr.isEmpty ? stdout : stderr)
-        }
-        return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ProcessOutcome(stdout: stdout,
+                              stderr: stderr,
+                              // After a timeout the process was terminated, so
+                              // its status is meaningless — report the standard
+                              // SIGTERM-ish code so callers don't treat it as a
+                              // clean exit.
+                              exitCode: timedOut ? -1 : process.terminationStatus,
+                              timedOut: timedOut,
+                              cancelled: handle.wasTerminated)
     }
 
     /// Create a brand-new empty directory inside the system temp area. The
@@ -380,11 +871,20 @@ enum LLMRunner {
 final class ProcessHandle: @unchecked Sendable {
     private let lock = NSLock()
     private var process: Process?
-    private(set) var wasTerminated = false
+    private var _wasTerminated = false
+
+    /// Lock-protected read: `terminate()` sets the flag from whatever
+    /// thread cancellation lands on while `executeProcess` reads it from
+    /// its own context — an unlocked read is a data race (and could steer
+    /// the drain-path choice wrong).
+    var wasTerminated: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _wasTerminated
+    }
 
     func attach(_ p: Process) {
         lock.lock(); defer { lock.unlock() }
-        if wasTerminated {
+        if _wasTerminated {
             // Cancel beat us to attach — the Task was already cancelled
             // before the Process even started. Reach out and SIGTERM right
             // now so the child doesn't even get a head start.
@@ -396,7 +896,7 @@ final class ProcessHandle: @unchecked Sendable {
 
     func terminate() {
         lock.lock(); defer { lock.unlock() }
-        wasTerminated = true
+        _wasTerminated = true
         process?.terminate()
     }
 }

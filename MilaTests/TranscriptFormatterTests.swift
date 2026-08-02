@@ -77,4 +77,40 @@ final class TranscriptFormatterTests: XCTestCase {
         )
         XCTAssertEqual(formatted, "Untagged opener\nSPEAKER_00: Tagged line")
     }
+
+    func test_assigned_names_replace_raw_ids_and_unnamed_keep_raw() {
+        let segments = [
+            TranscriptSegment(start: 0, end: 1, text: "Hi", speaker: "SPEAKER_00"),
+            TranscriptSegment(start: 1, end: 2, text: "Hello back", speaker: "SPEAKER_01"),
+        ]
+        let formatted = TranscriptFormatter.plainText(
+            segments: segments,
+            fallback: "ignored",
+            names: ["SPEAKER_00": "Daniel"]
+        )
+        XCTAssertEqual(formatted, "Daniel: Hi\nSPEAKER_01: Hello back")
+    }
+
+    func test_two_raw_ids_with_the_same_assigned_name_collapse_into_one_paragraph() {
+        // The user's fix for an over-split speaker: naming both raw IDs
+        // identically must merge their consecutive turns, same as if the
+        // diarizer had gotten it right.
+        let segments = [
+            TranscriptSegment(start: 0, end: 1, text: "First.", speaker: "SPEAKER_00"),
+            TranscriptSegment(start: 1, end: 2, text: "Second.", speaker: "SPEAKER_01"),
+            TranscriptSegment(start: 2, end: 3, text: "Other person.", speaker: "SPEAKER_02"),
+        ]
+        let formatted = TranscriptFormatter.plainText(
+            segments: segments,
+            fallback: "ignored",
+            names: ["SPEAKER_00": "Daniel", "SPEAKER_01": "Daniel"]
+        )
+        XCTAssertEqual(
+            formatted,
+            """
+            Daniel: First. Second.
+            SPEAKER_02: Other person.
+            """
+        )
+    }
 }

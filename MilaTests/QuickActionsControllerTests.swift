@@ -36,7 +36,7 @@ final class QuickActionsControllerTests: XCTestCase {
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
-        service = TranscriptionService(store: store, modelManager: manager, diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "QuickActionsControllerTests.diarization")!), engine: stub)
+        service = TranscriptionService(store: store, modelManager: manager, diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "QuickActionsControllerTests.diarization")!), remoteSettings: TestSupport.isolatedRemoteSettings(label: "QuickActionsControllerTests"), engine: stub)
         session = RecordingSession()
         UserDefaults().removePersistentDomain(forName: languageSuite)
         languageDefaults = UserDefaults(suiteName: languageSuite)
@@ -47,7 +47,8 @@ final class QuickActionsControllerTests: XCTestCase {
                                             languageSettings: languageSettings,
                                             postRecording: PostRecordingCoordinator(
                                                 store: store,
-                                                transcription: service))
+                                                transcription: service,
+                                                llm: LLMSettings(defaults: UserDefaults(suiteName: "QuickActionsControllerTests.llm")!)))
     }
 
     override func tearDown() async throws {
@@ -295,6 +296,74 @@ final class QuickActionsControllerTests: XCTestCase {
                        "the heavy finalize tail must run with the record button free")
     }
 
+    /// island-io/mila#86: `stopRecording` no longer blocks the Record button
+    /// on the final Live-AI summary tick. Instead, for an authoritative
+    /// Live-AI recording, `finalizeTail` regenerates the summary from the FULL
+    /// transcript in the BACKGROUND — so a rolling summary that was a
+    /// throttle-interval stale at stop time (missing the tail of the
+    /// conversation) gets refreshed with the finalize flag already clear.
+    func test_finalize_tail_regenerates_live_ai_summary_in_background() async throws {
+        // Live AI on + claude configured, on isolated suites.
+        let llmSuite = "QuickActionsControllerTests.llm.regen"
+        let liveSuite = "QuickActionsControllerTests.live.regen"
+        UserDefaults().removePersistentDomain(forName: llmSuite)
+        UserDefaults().removePersistentDomain(forName: liveSuite)
+        let llm = LLMSettings(defaults: UserDefaults(suiteName: llmSuite)!)
+        llm.tool = .claude
+        let liveAI = LiveAISettings(defaults: UserDefaults(suiteName: liveSuite)!)
+        liveAI.enabled = true
+        liveAI.model = ""
+        defer {
+            UserDefaults().removePersistentDomain(forName: llmSuite)
+            UserDefaults().removePersistentDomain(forName: liveSuite)
+        }
+
+        // Stubbed summarizer standing in for the real full-transcript claude
+        // call — echoes the transcript so the assertion can prove the summary
+        // was regenerated from the WHOLE transcript, not the stale rolling one.
+        let summarizer = RecordingSummarizer(store: store,
+                                             llmSettings: llm,
+                                             liveAISettings: liveAI,
+                                             runLLM: { _, _, transcript, _, _, _, _, _, _, _, _ in
+            "COMPLETE: \(transcript)"
+        })
+        controller.llmSettings = llm
+        controller.liveAISettings = liveAI
+        controller.summarizer = summarizer
+
+        // A freshly-stopped Live-AI recording: authoritative live segments
+        // covering the whole conversation, but a STALE rolling summary.
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.recordingsDirectory.appendingPathComponent("regen.wav")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.6)
+        var recording = Recording(
+            title: "regen-recording",
+            duration: 0.6,
+            source: .microphone,
+            audioFileName: url.lastPathComponent,
+            status: .completed,
+            language: languageSettings.current.rawValue,
+            segments: [TranscriptSegment(start: 0, end: 0.6,
+                                         text: "the whole conversation including the tail")],
+            fullText: "the whole conversation including the tail"
+        )
+        recording.summary = "stale rolling summary"
+        store.add(recording)
+
+        // The button is already free by the time the tail runs.
+        controller.isFinalizingRecording = false
+        controller.finalizeTail(for: recording, liveTranscriptIsAuthoritative: true)
+        await controller.awaitFinalizeTails()
+        await summarizer.awaitInFlight(recording.id)
+
+        let stored = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(stored.summary, "COMPLETE: the whole conversation including the tail",
+                       "finalizeTail must regenerate the Live-AI summary from the full transcript in the background")
+        XCTAssertFalse(controller.isFinalizingRecording,
+                       "summary regeneration must run with the record button free")
+    }
+
     // MARK: - Re-diarize gate (skip when the live pass found few speakers)
 
     /// The offline re-diarize only fixes the online diarizer's
@@ -350,5 +419,61 @@ final class QuickActionsControllerTests: XCTestCase {
                        "Second recording must NOT show the first recording's transcript")
         XCTAssertEqual(storedA.status, .completed)
         XCTAssertEqual(storedB.status, .completed)
+    }
+}
+
+/// The short-capture policy that turns "capture died 25 seconds into a
+/// 26-minute meeting" from a silent failure into a warning the user can act
+/// on. Pure inputs, so no recording or audio device is needed.
+final class ShortCapturePolicyTests: XCTestCase {
+
+    func test_healthy_recording_does_not_warn() {
+        // A little loss at each end is normal: engine bring-up and teardown.
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: 600, captured: 599.4))
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone, wallClock: 120, captured: 119))
+    }
+
+    /// The exact shape of the reported bug: 1583.9s on the clock, 24.6s of
+    /// audio on disk.
+    func test_capture_that_died_mid_session_warns() {
+        XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: 1583.9, captured: 24.6))
+    }
+
+    func test_short_recordings_never_warn() {
+        // Below the wall-clock floor, bring-up latency dominates and a warning
+        // would fire on ordinary quick memos.
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone, wallClock: 6, captured: 1))
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone,
+            wallClock: QuickActionsController.shortCaptureMinimumWallClock - 0.1,
+            captured: 1))
+    }
+
+    /// ScreenCaptureKit only delivers buffers while something is playing, so a
+    /// system-audio capture of a mostly-silent app is legitimately far shorter
+    /// than the wall clock.
+    func test_system_audio_only_is_exempt() {
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .systemAudio, wallClock: 1800, captured: 12))
+    }
+
+    /// Zero captured audio has its own, more specific message and log line —
+    /// this policy must not double up on it.
+    func test_zero_capture_is_left_to_the_empty_mic_path() {
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .microphone, wallClock: 600, captured: 0))
+    }
+
+    func test_threshold_boundary() {
+        let wall: TimeInterval = 100
+        let ratio = QuickActionsController.shortCaptureRatio
+        XCTAssertFalse(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: wall, captured: wall * ratio))
+        XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
+            source: .meeting, wallClock: wall, captured: wall * ratio - 0.5))
     }
 }

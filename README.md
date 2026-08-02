@@ -16,11 +16,34 @@ running through `whisper.cpp` (GPU via Metal).
 - **Dictate in two languages** with separate global hotkeys:
     - `⌘2` — English dictation (OpenAI `large-v3-turbo`)
     - `⌘3` — Hebrew dictation (ivrit.ai `large-v3`)
-  Both hotkeys are user-configurable in **Settings → Hotkeys**.
-- **Transcribe locally**: ivrit.ai `large-v3` (Hebrew) or OpenAI
+  Both hotkeys are user-configurable in **Settings → General**.
+- **Transcribe on-device** with ivrit.ai `large-v3` (Hebrew) or OpenAI
   `large-v3-turbo` (English / multilingual). Audio never leaves your Mac.
-- Per-segment timestamps, click to seek, copy/share transcript, RTL rendering
-  for Hebrew.
+- **Transcribe on a remote server** — point Mila at any OpenAI-compatible
+  `/v1/audio/transcriptions` endpoint (OpenAI's hosted Whisper API, or a
+  self-hosted server) via **Settings → Models → Backend**. Useful on
+  lower-powered Macs or when you want a Hebrew model too large to run locally.
+  See [Setting up a remote transcription server](#remote-transcription-optional).
+- **Speaker diarization** — identifies who said what, displayed as color-coded
+  per-speaker labels. **Name your speakers**: rename labels to real names from
+  a persistent directory that's reused across recordings.
+- **AI summaries and titles** — after each recording, Mila shells out to a
+  local Claude/Cursor/OpenAI-compatible CLI to auto-name the recording and
+  generate an AI overview. Point Mila at a provider once in
+  **Settings → AI Provider**, then turn features on and edit their prompts in
+  **Settings → AI Features** (which also hosts Live AI mode).
+- **iPhone Voice Memos sync** — Mila watches the folders iCloud syncs from your
+  iPhone and auto-transcribes new recordings. Set up in **Settings → Voice Memos**.
+- **One-click team setup with `.milaconfig` files** — double-click a config file
+  to apply the transcription server, model, language, and more in one step.
+  Perfect for handing a team a ready-made configuration.
+- **Transcription queue** — view queued, in-progress, and recently-deleted jobs;
+  stop or remove any item from the queue at any time.
+- **SRT export** (including mid-recording), per-segment timestamps, click to seek,
+  copy/share transcript, RTL rendering for Hebrew.
+- **Auto-discard accidental clips** — very short recordings with no speech are
+  dropped automatically (threshold configurable in **Settings → Storage**).
+- **Opt into pre-release builds** via **Settings → General → Updates**.
 
 ## System requirements
 
@@ -96,6 +119,26 @@ Models live at:
 
 The app picks them up from that directory automatically.
 
+### Remote transcription (optional)
+
+By default Mila transcribes entirely on-device — audio never leaves your Mac.
+If you'd rather offload transcription (e.g. on a low-powered Mac, or to use a
+Hebrew-tuned model that's too large to run locally), **Settings → Models** lets
+you switch the backend to any OpenAI-compatible `/v1/audio/transcriptions`
+endpoint: OpenAI's own Whisper API, or a self-hosted server. The API key is
+stored in your Keychain, and the UI flags that audio leaves the device while
+this backend is active.
+
+To run [ivrit.ai](https://www.ivrit.ai/)'s Hebrew models (or any other Whisper
+model) behind this API on your own machine, see
+**[docs/REMOTE_TRANSCRIPTION_SERVER.md](docs/REMOTE_TRANSCRIPTION_SERVER.md)**.
+
+To deploy a **shared team server** on Kubernetes (one GPU, many users — Mila
+points at it via the Remote backend, audio stays on infrastructure you control),
+see **[docs/self-hosted-server/](docs/self-hosted-server/)**. That folder
+contains Kubernetes manifests and a step-by-step guide, plus an
+`example.milaconfig` you can hand to teammates for one-click setup.
+
 ## Required permissions
 
 On first use macOS will prompt for the following — all are required for the
@@ -121,6 +164,7 @@ placeholder is configured and discarded.
 ```
 Mila/
 ├── App/MilaApp.swift          # SwiftUI @main entry + AppDelegate
+├── Actions/                   # LLM action runner (title, summary, send-to-LLM)
 ├── Audio/
 │   ├── AudioUtilities.swift            # Conversion to 16k mono Float32
 │   ├── MicrophoneRecorder.swift        # AVAudioEngine input tap
@@ -128,17 +172,25 @@ Mila/
 │   └── RecordingSession.swift          # Mix mic + system → WAV
 ├── Transcription/
 │   ├── ModelManager.swift              # Download / select ggml models
-│   ├── WhisperEngine.swift             # whisper.cpp C bridge
-│   └── TranscriptionService.swift      # Orchestrates jobs
+│   ├── TranscriptionService.swift      # Orchestrates jobs + remote backend
+│   └── SpeakerDiarizer.swift           # pyannote.audio via bundled Python
 ├── Dictation/
 │   ├── HotkeyManager.swift             # Carbon global hotkeys (multi-binding)
 │   └── DictationController.swift       # Mic → Whisper → paste
+├── VoiceMemos/                         # iPhone Voice Memos import + iCloud watcher
 ├── Views/                              # SwiftUI screens incl. Settings
 ├── Models/Recording*.swift             # Persisted recording metadata
 └── Resources/
     ├── Info.plist
-    └── Mila.entitlements
-Packages/WhisperBinary/                 # SPM wrapper for whisper.cpp xcframework
+    ├── Mila.entitlements
+    └── DiarizationModels/              # Bundled pyannote model weights (~31 MB)
+Packages/
+├── TranscriptionCore/                  # Cross-platform Swift package (whisper.cpp bindings, WAVReader)
+└── WhisperBinary/                      # SPM wrapper for whisper.cpp xcframework
+docs/
+├── REMOTE_TRANSCRIPTION_SERVER.md      # Single-host Docker quickstart
+└── self-hosted-server/                 # Shared team server on Kubernetes (K8s manifests + guide)
+docker/speaches-hebrew/                 # Docker image with ivrit.ai Hebrew model pre-loaded
 scripts/make-dmg.sh                     # Builds a release DMG for distribution
 ```
 
@@ -170,6 +222,7 @@ distribution via the App Store you'd:
 
 Newest first. Dates are release dates.
 
+- **1.9.0** (2026-07-22) — Remote transcription server support (OpenAI-compatible API), one-click `.milaconfig` setup files, iPhone Voice Memos sync, named speaker labels, opt-in beta updates, hallucination reduction via neural VAD, adaptive gain for quiet mics, auto-discard of empty clips, stop/remove queue items, no more stuck "Queued" items after relaunch, color-coded speakers, mid-recording SRT export, automatic summaries toggle with configurable timeout, record button no longer waits on the previous summary, collapsible "All Transcriptions" sidebar section, CodeQL security scanning added to CI, and a large sweep of reliability fixes across audio capture, diarization, and UI.
 - **1.8.5** (2026-06-09) — Independent mic / app-audio capture toggles, AAC (`.m4a`) recordings, and a configurable recording-storage cap.
 - **1.8.4** (2026-06-09) — Fixed speaker diarization silently breaking in notarized builds (the bundled Python couldn't load torch's dylibs).
 - **1.8.3** (2026-06-08) — Mic-capture diagnostics, automatic language detection, and a post-recording sheet fix.

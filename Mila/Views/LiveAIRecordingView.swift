@@ -1,5 +1,7 @@
 import SwiftUI
+import AppKit
 import OSLog
+import TranscriptionCore
 
 /// Replaces the Home view while a recording is active AND Live AI mode is
 /// configured + enabled. Two stacked panes (top: action items, bottom:
@@ -22,6 +24,12 @@ struct LiveAIRecordingView: View {
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var llmSettings: LLMSettings
+
+    /// Whether the per-meeting notes editor is open. Collapsed by
+    /// default so the pane still leads with the AI's output; the toggle
+    /// in the header shows a filled icon when notes exist so a user who
+    /// pasted an agenda can see that at a glance without opening it.
+    @State private var isContextExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -49,7 +57,10 @@ struct LiveAIRecordingView: View {
     /// transcript pane + friendly speaker labels.
     private var language: String { languageSettings.current.rawValue }
     private var isRTL: Bool { language == "he" }
-    private var aiActive: Bool { liveAISettings.enabled && llmSettings.isConfigured }
+    private var aiActive: Bool {
+        liveAISettings.enabled && llmSettings.isConfigured
+            && !llmSettings.liveAIDisabledByRemoteOpenAI
+    }
 
     /// RTL for the AI pane (summary + action items). The AI output is its
     /// own language setting; for `.auto` we detect from the actual emitted
@@ -141,10 +152,15 @@ struct LiveAIRecordingView: View {
                         .lineLimit(1)
                         .truncationMode(.tail)
                 }
+                contextToggle
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)
             .padding(.bottom, 8)
+
+            if isContextExpanded {
+                contextEditor
+            }
 
             // Two bulleted sections, summary on top, action items
             // below. Both are live — the LLM re-emits a refreshed
@@ -175,6 +191,57 @@ struct LiveAIRecordingView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
+    // MARK: - Per-meeting context
+
+    /// Header affordance for the notes editor. Filled icon = notes are
+    /// set for this meeting; hollow = none.
+    private var contextToggle: some View {
+        let hasContext = !liveAISettings.meetingContext
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return Button {
+            isContextExpanded.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: hasContext ? "doc.text.fill" : "doc.text")
+                Text("Context")
+                    .font(.caption)
+            }
+            .foregroundStyle(hasContext ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+        }
+        .buttonStyle(.plain)
+        .help("Notes for THIS meeting only — an agenda, attendees, acronyms. Mila uses them to interpret what it hears, and clears them when the recording stops.")
+        .accessibilityIdentifier("liveAI.context.toggle")
+    }
+
+    private var contextEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            TextEditor(text: $liveAISettings.meetingContext)
+                .font(.system(.caption, design: .monospaced))
+                .frame(height: 90)
+                .padding(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .strokeBorder(Color.secondary.opacity(0.25))
+                )
+                .accessibilityIdentifier("liveAI.context.field")
+            HStack {
+                Text("Background for this meeting only — agenda, attendees, acronyms. Not summarised and never turned into action items; cleared when the recording stops.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+                Button("Clear") {
+                    liveAISettings.meetingContext = ""
+                }
+                .controlSize(.small)
+                .disabled(liveAISettings.meetingContext.isEmpty)
+                .accessibilityIdentifier("liveAI.context.clear")
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.bottom, 12)
+    }
+
     /// Render the LLM's rolling summary as a bulleted list. The LLM
     /// usually returns one paragraph (1-3 sentences); we split on
     /// sentence boundaries so each sentence becomes its own bullet
@@ -203,7 +270,8 @@ struct LiveAIRecordingView: View {
             sectionHeader(icon: "checklist", title: "Action items", isRTL: isRTL)
             VStack(alignment: isRTL ? .trailing : .leading, spacing: 4) {
                 ForEach(aiSession.actionItems) { item in
-                    ActionItemRow(item: item, language: language, isRTL: isRTL)
+                    ActionItemRow(item: item, language: language, isRTL: isRTL,
+                                  speakerNames: transcriber.speakerNames)
                 }
             }
         }
@@ -229,14 +297,31 @@ struct LiveAIRecordingView: View {
     /// Split a rolling summary paragraph into one bullet per sentence.
     /// Falls back to the whole string as a single bullet when no
     /// sentence boundary is found — better than showing nothing.
+    ///
+    /// Uses Foundation's `.bySentences` tokenizer (same as
+    /// `AIOverviewSection.summaryAttributed`, so the live pane and the
+    /// detail pane split the same summary identically). The previous
+    /// naive split on every '.', '!', '?' character turned "Budget is
+    /// 3.5 million." into two bullets — and, despite its comment, never
+    /// actually included the Hebrew full stop in the separator set.
     static func bulletsFromSummary(_ s: String) -> [String] {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return [] }
-        // Split on '. ', '! ', '? ' and the Hebrew full stop "׃ " plus
-        // line breaks. Filter empties.
-        let parts = trimmed
-            .split(whereSeparator: { ".!?\n".contains($0) })
-            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+        let sourceLines: [String]
+        if trimmed.contains("\n") {
+            // Already has line structure (often the LLM's own bullets).
+            sourceLines = trimmed.components(separatedBy: "\n")
+        } else {
+            var sentences: [String] = []
+            trimmed.enumerateSubstrings(in: trimmed.startIndex..<trimmed.endIndex,
+                                        options: [.bySentences, .localized]) { sub, _, _, _ in
+                let sentence = (sub ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                if !sentence.isEmpty { sentences.append(sentence) }
+            }
+            sourceLines = sentences
+        }
+        let parts = sourceLines
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
         return parts.isEmpty ? [trimmed] : parts
     }
@@ -289,6 +374,21 @@ struct LiveAIRecordingView: View {
                 if transcriber.isTranscribing {
                     ProgressView().controlSize(.small)
                 }
+                // Mid-recording SRT export (issue #65): save whatever the
+                // live transcript has accumulated so far, without stopping
+                // the recording. The finished recording still gets its
+                // authoritative .srt sidecar on Stop as before.
+                Button {
+                    exportLiveSRT()
+                } label: {
+                    Label("Export SRT…", systemImage: "square.and.arrow.up")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(transcriber.segments.isEmpty ? Color.secondary : Color.accentColor)
+                .disabled(transcriber.segments.isEmpty)
+                .help("Save the transcript so far as an .srt subtitles file — recording keeps going.")
+                .accessibilityIdentifier("liveAI.exportSRT")
             }
             .padding(.horizontal, 18)
             .padding(.top, 14)
@@ -301,8 +401,14 @@ struct LiveAIRecordingView: View {
                     // grew ~linearly with recording length. Lazy keeps it
                     // O(visible) — flat regardless of transcript size.
                     LazyVStack(alignment: .leading, spacing: 6) {
+                        // .debug, not .log: this fires on every SwiftUI
+                        // body invalidation (hundreds per segment), and at
+                        // default persistence it accounted for ~79% of a
+                        // real user's diagnostic bundle. Debug entries
+                        // stream to Console when attached but aren't
+                        // persisted into log collect / diagnostics.
                         let _ = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LiveAIRecordingView")
-                            .log("render segments.count=\(transcriber.segments.count, privacy: .public)")
+                            .debug("render segments.count=\(transcriber.segments.count, privacy: .public)")
                         if transcriber.segments.isEmpty {
                             Text("Listening…")
                                 .font(.callout)
@@ -310,8 +416,22 @@ struct LiveAIRecordingView: View {
                                 .frame(maxWidth: .infinity, alignment: textAlignment)
                                 .accessibilityIdentifier("liveTranscript.listening")
                         } else {
+                            // Only color speaker labels once there's more
+                            // than one distinct speaker to tell apart — a
+                            // single-speaker recording keeps the plain
+                            // tint color.
+                            let hasMultipleSpeakers = transcriber.segments.hasMultipleSpeakers
                             ForEach(transcriber.segments) { seg in
-                                TranscriptLineView(segment: seg, language: language)
+                                TranscriptLineView(segment: seg, language: language,
+                                                   useSpeakerColor: hasMultipleSpeakers,
+                                                   speakerNames: transcriber.speakerNames,
+                                                   onAssignName: { raw, name in
+                                                       if let name {
+                                                           transcriber.speakerNames[raw] = name
+                                                       } else {
+                                                           transcriber.speakerNames.removeValue(forKey: raw)
+                                                       }
+                                                   })
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                 // Identifier is applied to the inner Text
                                 // inside TranscriptLineView (where SwiftUI
@@ -348,6 +468,36 @@ struct LiveAIRecordingView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color.primary.opacity(0.02))
     }
+
+    /// Save the accumulated live transcript as an SRT to a user-chosen
+    /// location — mid-recording, without stopping (issue #65). The
+    /// segment list is snapshotted BEFORE the modal save panel runs, so
+    /// the exported file reflects the transcript as of the button press
+    /// even though the live loop keeps appending while the panel is up.
+    /// Mirrors `RecordingContextMenu.exportSRT` (NSSavePanel + NSAlert on
+    /// failure); the suggested filename matches the date-stamped default
+    /// title a stopped recording would get.
+    private func exportLiveSRT() {
+        let snapshot = transcriber.segments.map { ls in
+            TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
+                              text: ls.text, speaker: ls.speaker)
+        }
+        guard !snapshot.isEmpty else { return }
+        let panel = NSSavePanel()
+        panel.title = "Export Subtitles"
+        panel.allowedContentTypes = [.init(filenameExtension: "srt") ?? .data]
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        panel.nameFieldStringValue = "Recording · \(f.string(from: Date())).srt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try TranscriptExporter.writeSRT(segments: snapshot, to: url,
+                                            names: transcriber.speakerNames)
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
 }
 
 /// Single line with a leading bullet. RTL-aware so Hebrew text flows
@@ -383,6 +533,9 @@ private struct ActionItemRow: View {
     /// / open sidebar and shoved Hebrew action items to the left, which
     /// is the bug this replaces.
     var isRTL: Bool = false
+    /// Live speaker names so the metadata line shows the same label the
+    /// transcript pane does after a mid-recording rename.
+    var speakerNames: [String: String] = [:]
 
     var body: some View {
         let align: Alignment = isRTL ? .trailing : .leading
@@ -410,7 +563,7 @@ private struct ActionItemRow: View {
     @ViewBuilder private var metadataRow: some View {
         HStack(spacing: 8) {
             if let speaker = item.speaker {
-                Text(speaker.friendlySpeakerLabel(language: language))
+                Text(speaker.displaySpeakerName(names: speakerNames, language: language))
                     .font(.caption2.monospaced())
                     .foregroundStyle(.secondary)
             }
@@ -457,6 +610,15 @@ private struct RecordingElapsedLabel: View {
 private struct TranscriptLineView: View {
     let segment: LiveSegment
     let language: String
+    /// Whether to color the speaker label per-speaker rather than the
+    /// default tint — set by the caller once it's seen more than one
+    /// distinct speaker across the live transcript.
+    var useSpeakerColor: Bool = false
+    /// User-assigned live speaker names (raw ID → name).
+    var speakerNames: [String: String] = [:]
+    /// Persists a rename picked from the label's popover mid-recording:
+    /// (raw speaker ID, chosen name or nil-to-reset).
+    var onAssignName: (String, String?) -> Void = { _, _ in }
 
     var body: some View {
         // We rely on the PARENT pane's layoutDirection. That mirrors the
@@ -469,10 +631,15 @@ private struct TranscriptLineView: View {
         let lineRTL = segment.text.isPredominantlyHebrew || language == "he"
         HStack(alignment: .top, spacing: 8) {
             if let sp = segment.speaker {
-                Text(sp.friendlySpeakerLabel(language: language))
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tint)
-                    .frame(minWidth: 96, alignment: .leading)
+                SpeakerLabelButton(
+                    rawID: sp,
+                    names: speakerNames,
+                    language: language,
+                    color: useSpeakerColor ? sp.speakerColor(names: speakerNames) : Color.accentColor,
+                    font: .caption.weight(.semibold),
+                    onAssign: { name in onAssignName(sp, name) }
+                )
+                .frame(minWidth: 96, alignment: .leading)
             } else {
                 Color.clear.frame(width: 96, height: 1)
             }

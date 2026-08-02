@@ -144,11 +144,15 @@ final class HotkeyManager {
 
     private struct RegisteredHotkey {
         let action: HotkeyAction
+        let binding: HotkeyBinding
         let ref: EventHotKeyRef
         var handler: () -> Void
     }
 
     private var registrations: [HotkeyAction: RegisteredHotkey] = [:]
+    /// Registrations parked by `suspendAll()` (capture mode) so
+    /// `resumeAll()` can restore them with their handlers intact.
+    private var suspended: [HotkeyAction: (binding: HotkeyBinding, handler: () -> Void)] = [:]
     private var eventHandler: EventHandlerRef?
     private let signature: OSType = OSType(0x49575350) // 'IWSP'
 
@@ -181,6 +185,7 @@ final class HotkeyManager {
             return false
         }
         registrations[action] = RegisteredHotkey(action: action,
+                                                 binding: binding,
                                                  ref: validRef,
                                                  handler: onPressed)
         print("Hotkey: registered \(action) -> \(binding.displayName)")
@@ -190,6 +195,58 @@ final class HotkeyManager {
     func unregister(_ action: HotkeyAction) {
         if let existing = registrations.removeValue(forKey: action) {
             UnregisterEventHotKey(existing.ref)
+        }
+    }
+
+    /// Whether `action` currently holds a live Carbon registration. False
+    /// means pressing the bound combo does nothing — e.g. another app owns
+    /// it globally and `register` failed. Settings uses this to warn
+    /// instead of silently showing a dead binding as active.
+    func isRegistered(_ action: HotkeyAction) -> Bool {
+        registrations[action] != nil
+    }
+
+    /// Probe whether `binding` can be registered globally right now,
+    /// without keeping the registration: registers a throwaway hotkey and
+    /// releases it immediately. Used by Settings to validate a newly
+    /// captured combo BEFORE persisting it — the old flow persisted first,
+    /// dropped the registration failure on the floor, and (because
+    /// `register` unregisters the previous combo before trying the new
+    /// one) left the user with NO working hotkey at all.
+    func canRegister(_ binding: HotkeyBinding) -> Bool {
+        let id = EventHotKeyID(signature: signature, id: UInt32.max)
+        var ref: EventHotKeyRef?
+        let status = RegisterEventHotKey(binding.keyCode,
+                                         binding.modifiers,
+                                         id,
+                                         GetApplicationEventTarget(),
+                                         0,
+                                         &ref)
+        if let ref { UnregisterEventHotKey(ref) }
+        return status == noErr
+    }
+
+    /// Park every live registration (keeping bindings + handlers) so a
+    /// Settings capture field can see raw keyDowns. Carbon consumes
+    /// registered combos before the responder chain, so without this,
+    /// pressing a currently-bound hotkey while recording a new binding
+    /// STARTED DICTATION instead of being captured. Balanced by
+    /// `resumeAll()`; nested suspends are no-ops.
+    func suspendAll() {
+        guard suspended.isEmpty else { return }
+        for (action, reg) in registrations {
+            suspended[action] = (reg.binding, reg.handler)
+            UnregisterEventHotKey(reg.ref)
+        }
+        registrations.removeAll()
+    }
+
+    /// Restore the registrations parked by `suspendAll()`.
+    func resumeAll() {
+        let toRestore = suspended
+        suspended.removeAll()
+        for (action, entry) in toRestore {
+            register(action, binding: entry.binding, onPressed: entry.handler)
         }
     }
 
