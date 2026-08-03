@@ -6,7 +6,9 @@ import Foundation
 /// Content is **summary + action items** when a summary exists; when it
 /// doesn't (summaries off, LLM unconfigured, or generation failed) it falls
 /// back to **transcript + action items** so export stays independent of the
-/// LLM. One `.md` per recording, `<date> <title>.md`, into `vault/subfolder`.
+/// LLM. One `.md` per recording, `<date> <title>.md`, into `vault/subfolder`
+/// — suffixed with a slice of the recording ID when a different recording has
+/// already taken that name (see `noteTarget`).
 ///
 /// Idempotency: a per-recording seen-index (Drive-importer discipline) maps the
 /// recording ID to its last-written relative path, so a re-transcription (or a
@@ -129,7 +131,18 @@ final class ObsidianExporter: ObservableObject {
             return nil
         }
 
-        let target = destDir.appendingPathComponent(Self.fileName(for: recording))
+        // The key is scoped to the vault. The stored value is a path *relative
+        // to the vault it was written into*, so resolving it against whatever
+        // vault happens to be configured now would, after the user switches
+        // vaults, delete `<newVault>/<oldRelativePath>` — an unrelated file, or
+        // nothing — and orphan the real note in the previous vault.
+        //
+        // Resolved before the filename, because the name this recording gets
+        // depends on what it was called last time — see `noteTarget`.
+        let key = Self.indexKey(vault: vault, id: recording.id)
+        migrateLegacyIndexEntry(&index, key: key, vault: vault, id: recording.id)
+
+        let target = noteTarget(for: recording, in: destDir, vault: vault, index: index, key: key)
         // Re-checked for the file itself, not just its directory: the note name
         // could already exist as a symlink pointing out of the vault.
         guard ObsidianPathSanitizer.isContained(target, in: vault, fileManager: fileManager) else {
@@ -141,14 +154,6 @@ final class ObsidianExporter: ObservableObject {
 
         // Overwrite discipline: if we wrote a differently-named file for this
         // recording before (title changed / moved to another folder), remove it.
-        //
-        // The key is scoped to the vault. The stored value is a path *relative
-        // to the vault it was written into*, so resolving it against whatever
-        // vault happens to be configured now would, after the user switches
-        // vaults, delete `<newVault>/<oldRelativePath>` — an unrelated file, or
-        // nothing — and orphan the real note in the previous vault.
-        let key = Self.indexKey(vault: vault, id: recording.id)
-        migrateLegacyIndexEntry(&index, key: key, vault: vault, id: recording.id)
         if let prevRelative = index[key], prevRelative != newRelative {
             let old = vault.appendingPathComponent(prevRelative)
             // Never follow a stored path back out of the vault.
@@ -166,6 +171,107 @@ final class ObsidianExporter: ObservableObject {
         }
         index[key] = newRelative
         return (target, changedPaths)
+    }
+
+    // MARK: - Note naming
+
+    /// Where this recording's note goes: `<date> <title>.md`, disambiguated
+    /// when that name is already spoken for by a *different* recording.
+    ///
+    /// The plain name is not unique. Titles default to the capture source
+    /// rather than to anything per-recording — two system-audio captures on the
+    /// same day are both "System Audio" — so without this, the second export
+    /// silently overwrote the first and one note was simply lost. The index is
+    /// keyed by recording ID, so it never noticed: both recordings held their
+    /// own entry pointing at the same file, and the rename cleanup saw nothing
+    /// to delete.
+    ///
+    /// **Stickiness is the whole point.** A re-export (re-transcription, a
+    /// summary landing, a backfill sweep) must resolve to the file it wrote
+    /// last time, not to a fresh name — otherwise every pass would leave
+    /// another copy behind. Two things provide it:
+    ///
+    ///  * the candidate names are *derived from the recording ID*, not from a
+    ///    counter over the directory, so they don't shift when neighbouring
+    ///    notes come and go; and
+    ///  * whichever candidate the index already records for this recording wins
+    ///    outright, before any availability check — so a note that had to be
+    ///    disambiguated keeps its suffix even once the plain name frees up.
+    private func noteTarget(for recording: Recording,
+                            in destDir: URL,
+                            vault: URL,
+                            index: [String: String],
+                            key: String) -> URL {
+        let candidates = Self.nameCandidates(for: recording)
+        let previous = index[key]
+
+        // Sticky: the name we wrote for this recording last time, as long as
+        // it's still one of the names this recording would pick today. (After
+        // a retitle none of them match, and the rename path takes over.)
+        for name in candidates {
+            let url = destDir.appendingPathComponent(name)
+            if previous == Self.relativePath(of: url, vault: vault) { return url }
+        }
+
+        // Both signals matter. The index catches the same-day/same-title clash
+        // even when the other note has been synced away or not yet written;
+        // the disk catches what the index can't know about — a note from a
+        // build before this index existed, a copy arriving over git sync, or
+        // a file the user wrote by hand and would not thank us for clobbering.
+        let claimed = Self.pathsClaimedByOtherRecordings(index, vault: vault, id: recording.id)
+        for name in candidates {
+            let url = destDir.appendingPathComponent(name)
+            let relative = Self.relativePath(of: url, vault: vault)
+            if !claimed.contains(relative) && !fileManager.fileExists(atPath: url.path) {
+                return url
+            }
+        }
+        // Unreachable in practice: the last candidate carries the full
+        // recording UUID, which no other recording can produce. Falling back
+        // to it (rather than to the plain name) keeps the worst case a
+        // collision we lose to, never an overwrite.
+        return destDir.appendingPathComponent(candidates[candidates.count - 1])
+    }
+
+    /// The note names this recording will accept, in order of preference:
+    /// the plain `<date> <title>.md`, then the same stem suffixed with a short
+    /// prefix of the recording UUID, then with the whole thing.
+    ///
+    /// Deterministic by construction — the same recording yields the same list
+    /// on every run, which is what lets `noteTarget` be idempotent. The short
+    /// form is what a user will normally see; the full form exists only so the
+    /// list cannot run out, since two distinct recordings can never share it.
+    ///
+    /// Length stays inside the 255-byte component limit: the stem is capped at
+    /// 180 bytes by `ObsidianPathSanitizer.nameFragment` plus an 11-byte date
+    /// prefix, and the longest suffix here adds 37 more.
+    static func nameCandidates(for recording: Recording) -> [String] {
+        let base = fileName(for: recording)
+        let stem = base.hasSuffix(".md") ? String(base.dropLast(3)) : base
+        let uuid = recording.id.uuidString.lowercased()
+        return [base, "\(stem) \(uuid.prefix(8)).md", "\(stem) \(uuid).md"]
+    }
+
+    /// Relative paths inside `vault` that the index records for some recording
+    /// other than `id`.
+    ///
+    /// Legacy bare-UUID keys are skipped on purpose: they carry no vault, so
+    /// attributing their path to *this* vault could suppress the plain name on
+    /// the strength of a note that lives somewhere else entirely.
+    private static func pathsClaimedByOtherRecordings(_ index: [String: String],
+                                                      vault: URL,
+                                                      id: UUID) -> Set<String> {
+        let prefix = "\(vault.standardized.path)#"
+        var claimed: Set<String> = []
+        for (key, relative) in index where key.hasPrefix(prefix) {
+            let suffix = String(key.dropFirst(prefix.count))
+            // A vault path may itself contain "#", so a prefix match alone
+            // doesn't prove the key belongs to this vault — the remainder has
+            // to be exactly a UUID.
+            guard let other = UUID(uuidString: suffix), other != id else { continue }
+            claimed.insert(relative)
+        }
+        return claimed
     }
 
     /// Index keys written before the index was vault-scoped are bare UUIDs.
@@ -293,6 +399,10 @@ final class ObsidianExporter: ObservableObject {
     }
 
     /// `<yyyy-MM-dd> <title>.md`, sanitized for the filesystem.
+    ///
+    /// The *preferred* name, not necessarily the one on disk: it is not unique
+    /// per recording, so `noteTarget` may pick a suffixed variant instead. Use
+    /// `nameCandidates(for:)` for the full set.
     static func fileName(for recording: Recording) -> String {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")

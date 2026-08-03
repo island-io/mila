@@ -344,6 +344,144 @@ final class ObsidianExporterTests: XCTestCase {
             atPath: vault.appendingPathComponent("\(Self.expectedDatePrefix) After.md").path))
     }
 
+    // MARK: - Filename collisions
+
+    /// Titles are not unique. They default to the capture source — see
+    /// `QuickActionsController`, which titles a system-audio capture with the
+    /// foreground app's name or "System Audio" — so two captures on the same
+    /// day routinely want the same `<date> <title>.md`. Before this was
+    /// handled, the second export silently overwrote the first and one note
+    /// was lost: the index is keyed by recording ID, so both recordings held
+    /// an entry pointing at the same file and the rename cleanup saw nothing
+    /// wrong.
+    func test_two_same_day_same_title_recordings_get_distinct_notes() throws {
+        let first = makeRecording(title: "System Audio", summary: "First meeting")
+        let second = makeRecording(title: "System Audio", summary: "Second meeting")
+        XCTAssertNotEqual(first.id, second.id)
+
+        let firstURL = try XCTUnwrap(exporter.export(first))
+        let secondURL = try XCTUnwrap(exporter.export(second))
+
+        XCTAssertNotEqual(firstURL.path, secondURL.path,
+                          "the second recording must not land on the first one's note")
+        XCTAssertEqual(try String(contentsOf: firstURL, encoding: .utf8).contains("First meeting"),
+                       true, "the first note was overwritten")
+        XCTAssertTrue(try String(contentsOf: secondURL, encoding: .utf8).contains("Second meeting"))
+
+        // The first one keeps the clean name; only the loser of the race is
+        // suffixed, and it is suffixed from its own ID.
+        XCTAssertEqual(firstURL.lastPathComponent, "\(Self.expectedDatePrefix) System Audio.md")
+        XCTAssertTrue(secondURL.lastPathComponent.hasPrefix("\(Self.expectedDatePrefix) System Audio "))
+        XCTAssertTrue(secondURL.lastPathComponent
+            .contains(second.id.uuidString.lowercased().prefix(8)))
+
+        XCTAssertEqual(try Self.notes(in: vault).count, 2)
+    }
+
+    /// The idempotency half: re-exporting either recording (a re-transcription,
+    /// a late summary, a backfill sweep) must overwrite *its own* note rather
+    /// than mint a third. The disambiguated name has to be remembered and
+    /// reused, not recomputed against whatever is on disk at the time.
+    func test_reexport_after_a_collision_overwrites_each_recordings_own_note() throws {
+        var first = makeRecording(title: "System Audio", summary: "First v1")
+        var second = makeRecording(title: "System Audio", summary: "Second v1")
+        let firstURL = try XCTUnwrap(exporter.export(first))
+        let secondURL = try XCTUnwrap(exporter.export(second))
+
+        // Re-export in the opposite order, to prove the choice doesn't depend
+        // on who happens to run first.
+        second.summary = "Second v2"
+        first.summary = "First v2"
+        XCTAssertEqual(try XCTUnwrap(exporter.export(second)).path, secondURL.path)
+        XCTAssertEqual(try XCTUnwrap(exporter.export(first)).path, firstURL.path)
+
+        XCTAssertEqual(try Self.notes(in: vault).count, 2, "a re-export must not create a third note")
+        XCTAssertTrue(try String(contentsOf: firstURL, encoding: .utf8).contains("First v2"))
+        XCTAssertTrue(try String(contentsOf: secondURL, encoding: .utf8).contains("Second v2"))
+    }
+
+    /// Same collision, arriving through the backfill path in a single batch —
+    /// where the index is threaded in memory and only persisted at the end, so
+    /// the in-batch claim is the only thing standing between the two notes.
+    func test_exportAll_disambiguates_same_day_same_title_recordings() throws {
+        let a = makeRecording(title: "System Audio", summary: "A")
+        let b = makeRecording(title: "System Audio", summary: "B")
+        let c = makeRecording(title: "System Audio", summary: "C")
+
+        XCTAssertEqual(exporter.exportAll([a, b, c]), 3)
+        XCTAssertEqual(try Self.notes(in: vault).count, 3)
+
+        // And running the same sweep again is a no-op on the file count.
+        XCTAssertEqual(exporter.exportAll([a, b, c]), 3)
+        XCTAssertEqual(try Self.notes(in: vault).count, 3)
+    }
+
+    /// The suffix sticks even once the plain name frees up. Recomputing
+    /// availability on every run would move the note back, renaming a file in
+    /// the user's vault (and breaking their links to it) because an unrelated
+    /// note was deleted.
+    func test_disambiguated_note_keeps_its_name_after_the_plain_one_frees_up() throws {
+        var first = makeRecording(title: "System Audio", summary: "First")
+        let second = makeRecording(title: "System Audio", summary: "Second")
+        let firstURL = try XCTUnwrap(exporter.export(first))
+        let secondURL = try XCTUnwrap(exporter.export(second))
+
+        // The plain name is released — the first recording is retitled.
+        first.title = "Renamed"
+        XCTAssertNotNil(exporter.export(first))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: firstURL.path))
+
+        XCTAssertEqual(try XCTUnwrap(exporter.export(second)).path, secondURL.path,
+                       "the disambiguated note must not migrate back to the plain name")
+    }
+
+    /// A file the exporter has no record of — a note from a build before the
+    /// index existed, a copy landing over git sync, or something the user wrote
+    /// by hand — is not ours to clobber either. The index can't know about it,
+    /// so the on-disk check is what catches this one.
+    func test_export_does_not_clobber_an_unknown_file_with_the_same_name() throws {
+        let vaultRoot = try XCTUnwrap(settings.vaultURL)
+        let squatter = vaultRoot.appendingPathComponent("\(Self.expectedDatePrefix) System Audio.md")
+        try "hand-written".write(to: squatter, atomically: true, encoding: .utf8)
+
+        let rec = makeRecording(title: "System Audio", summary: "Mine")
+        let url = try XCTUnwrap(exporter.export(rec))
+        XCTAssertNotEqual(url.path, squatter.path)
+        XCTAssertEqual(try String(contentsOf: squatter, encoding: .utf8), "hand-written")
+
+        // Still idempotent against it.
+        XCTAssertEqual(try XCTUnwrap(exporter.export(rec)).path, url.path)
+        XCTAssertEqual(try Self.notes(in: vaultRoot).count, 2)
+    }
+
+    /// Candidate names are derived from the recording, so they're stable across
+    /// runs, and every one of them stays a legal path component.
+    func test_nameCandidates_are_distinct_stable_and_writable() {
+        let rec = makeRecording(title: String(repeating: "עברית ", count: 200))
+        let candidates = ObsidianExporter.nameCandidates(for: rec)
+        XCTAssertEqual(candidates, ObsidianExporter.nameCandidates(for: rec), "must be deterministic")
+        XCTAssertEqual(Set(candidates).count, candidates.count, "candidates must be distinct")
+        XCTAssertEqual(candidates.first, ObsidianExporter.fileName(for: rec))
+        for name in candidates {
+            XCTAssertTrue(name.hasSuffix(".md"))
+            XCTAssertFalse(name.contains("/"))
+            XCTAssertFalse(name.hasPrefix("."))
+            XCTAssertLessThanOrEqual(name.utf8.count, 255, name)
+        }
+        // Distinct recordings never share the last-resort candidate.
+        let other = makeRecording(title: "Same")
+        let another = makeRecording(title: "Same")
+        XCTAssertNotEqual(ObsidianExporter.nameCandidates(for: other).last,
+                          ObsidianExporter.nameCandidates(for: another).last)
+    }
+
+    /// Every `.md` under `dir`, recursively.
+    private static func notes(in dir: URL) throws -> [URL] {
+        let fm = FileManager.default
+        guard let walker = fm.enumerator(at: dir, includingPropertiesForKeys: nil) else { return [] }
+        return walker.compactMap { $0 as? URL }.filter { $0.pathExtension == "md" }
+    }
+
     // MARK: - Written index
 
     /// The index stores a path *relative to the vault it was written into*. If
