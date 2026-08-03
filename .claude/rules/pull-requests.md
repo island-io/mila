@@ -67,11 +67,15 @@ review.
 Read the job log line `signals — review@head:… inline@head:… verdict:…
 walkthrough@head:… rateLimitNotices:…`, then:
 
-- `rateLimitNotices` > 0 and all signals `no` → **quota stall**, not a gap. See
+- `review@head:no`, `inline@head:0`, `verdict:no`, `walkthrough@head:no`, **and
+  a rate-limit notice that names the current head** → **quota stall**, not a
+  gap. The count alone is not enough: `rateLimitNotices` tallies every notice on
+  the PR, including ones left on older heads, so a stale notice can dress a real
+  review gap up as a quota problem. Check that a notice names *this* head. See
   *The quota is per PR author* below.
-- all signals `no`, no rate-limit notice, and CodeRabbit has plainly commented
-  on the head → likely a **detector gap**; check the comment against the four
-  signals below before assuming the bot misbehaved.
+- same signals, but no rate-limit notice naming the head, and CodeRabbit has
+  plainly commented on the head → likely a **detector gap**; check the comment
+  against the four signals below before assuming the bot misbehaved.
 - otherwise → **a real gap**: the head genuinely has no review.
 
 ### Do not trust the `CodeRabbit` status check
