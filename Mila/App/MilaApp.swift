@@ -348,6 +348,11 @@ struct MilaApp: App {
     /// SwiftUI redraws and so its in-flight task table survives
     /// alongside everything else.
     @StateObject private var recordingSummarizer: RecordingSummarizer
+    /// Obsidian vault destination + its exporter. The exporter is held as a
+    /// StateObject purely so it stays alive — the completion hooks capture it
+    /// weakly.
+    @StateObject private var obsidianVaultSettings: ObsidianVaultSettings
+    @StateObject private var obsidianExporter: ObsidianExporter
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
     /// Persistent, app-wide list of speaker names — the pick-list behind
@@ -518,6 +523,19 @@ struct MilaApp: App {
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
                                              liveAISettings: liveAI)
+        // Obsidian vault destination. When enabled, a completed recording is
+        // written into the vault as a Markdown note (summary + action items,
+        // transcript fallback) once its summary is ready, then optionally
+        // committed + pushed to git. Off by default.
+        let obsidianSettings = ObsidianVaultSettings()
+        let obsidian = ObsidianExporter(settings: obsidianSettings)
+        // Write the note once the summary state is final. Gated on `pending`
+        // so a launch-time backfill sweep never re-files the back-catalogue.
+        summarizer.onSummaryFinished = { [weak obsidian] rec in
+            guard let obsidian, obsidian.isPending(rec.id) else { return }
+            obsidian.export(rec)
+            obsidian.clearPending(rec.id)
+        }
         // Wire the post-transcription summary hook. Fires for every
         // recording that the queue successfully completes — the
         // summarizer's own `shouldSummarize` gate skips work if a
@@ -528,16 +546,27 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
+            // Obsidian export is driven off the summarizer's completion hook.
+            // Mark this fresh completion pending so the hook knows to write it
+            // (backfilled recordings are never marked, hence never re-filed).
+            let obsidianOn = (obsidianSettings?.enabled == true) && (obsidianSettings?.vaultURL != nil)
             if wasRetranscription {
                 // `regenerate` bypasses the "already has a summary" gate by
                 // design (it's also the manual on-demand path), so it does
                 // NOT consult `summaryEnabled` itself. Guard the AUTOMATIC
                 // re-transcription trigger here so a transcript-only user
                 // doesn't get a summary regenerated behind their back.
-                guard llm?.summaryEnabled ?? true else { return }
+                guard llm?.summaryEnabled ?? true else {
+                    // No summary will be regenerated — export immediately with
+                    // the transcript fallback (no summarizer hook to wait for).
+                    if obsidianOn { obsidian?.export(rec) }
+                    return
+                }
+                if obsidianOn { obsidian?.markPending(rec.id) }
                 summarizer?.regenerate(rec)
             } else {
+                if obsidianOn { obsidian?.markPending(rec.id) }
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
@@ -560,6 +589,8 @@ struct MilaApp: App {
         actions.liveDiarizer = liveDiar
         actions.summarizer = summarizer
         actions.storageSettings = storage
+        actions.obsidianSettings = obsidianSettings
+        actions.obsidianExporter = obsidian
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -598,6 +629,8 @@ struct MilaApp: App {
         _liveSpeakerDiarizer = StateObject(wrappedValue: liveDiar)
         _liveAISession = StateObject(wrappedValue: liveSession)
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
+        _obsidianVaultSettings = StateObject(wrappedValue: obsidianSettings)
+        _obsidianExporter = StateObject(wrappedValue: obsidian)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
         // backfill from its `start()` launch task (below), so constructing
@@ -685,6 +718,8 @@ struct MilaApp: App {
                 } message: {
                     Text(configImporter.errorMessage ?? "")
                 }
+                .environmentObject(obsidianVaultSettings)
+                .environmentObject(obsidianExporter)
         }
         .commands {
             CommandGroup(after: .appInfo) {
@@ -745,6 +780,8 @@ struct MilaApp: App {
                 // scene needs the same single updater instance the main window
                 // and the menu command use — never a second one.
                 .environmentObject(updater)
+                .environmentObject(obsidianVaultSettings)
+                .environmentObject(obsidianExporter)
         }
     }
 

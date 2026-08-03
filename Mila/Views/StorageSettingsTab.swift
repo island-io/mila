@@ -30,23 +30,30 @@ struct StorageSettingsTab: View {
     @State private var compressStatus: String?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            header
-            currentLocationCard
-            storageLimitCard
-            autoDropCard
-            if storage.lastResolutionWasStale {
-                staleBookmarkNotice
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                header
+                currentLocationCard
+                storageLimitCard
+                autoDropCard
+                if storage.lastResolutionWasStale {
+                    staleBookmarkNotice
+                }
+                if let lastError {
+                    Text(lastError)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                // Obsidian vault destination lives under Storage rather than
+                // in a top-level tab (keeps the tab bar from overflowing), and
+                // renders as one more card in this stack rather than a titled
+                // section — off by default, it's a single toggle. It expands
+                // itself once enabled; see `ObsidianSettingsSection`.
+                ObsidianSettingsSection()
             }
-            if let lastError {
-                Text(lastError)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer()
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var header: some View {

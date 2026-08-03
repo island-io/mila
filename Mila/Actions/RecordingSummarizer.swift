@@ -71,6 +71,29 @@ final class RecordingSummarizer: ObservableObject {
     @Published private(set) var inFlightIDs: Set<UUID> = []
     private var inFlight: [UUID: Task<Void, Never>] = [:]
 
+    /// Fired once per summarize attempt, after the recording's summary state
+    /// is final — i.e. after a summary was generated, or synchronously when
+    /// generation was skipped (disabled / not configured / already summarized
+    /// / empty transcript), or when it failed. Passes the latest recording.
+    ///
+    /// The Obsidian exporter uses this to write a note only once the summary +
+    /// action items are ready, falling back to the transcript when no summary
+    /// was produced. It is NOT fired for the dedup early-return (a duplicate
+    /// call while one is already in flight — the in-flight task fires instead)
+    /// or when the recording has been deleted mid-flight (nothing to export;
+    /// this covers the failure and empty-output paths too, not just success —
+    /// `cancel(recordingID:)` is what a permanent delete calls, and that
+    /// surfaces here as a thrown `CancellationError`).
+    ///
+    /// Exactly one of the branches below fires it per attempt, and each one
+    /// returns immediately afterwards, so a single `runSummary` can never fire
+    /// twice. Anything the observer does is its own problem: this is a plain
+    /// synchronous call on the main actor, so an observer that throws is a
+    /// programmer error, but an observer that *fails internally* (e.g. a file
+    /// write that can't complete) cannot stall or corrupt summarisation —
+    /// nothing downstream of the call site depends on it.
+    var onSummaryFinished: ((Recording) -> Void)?
+
     /// Recordings the backfill scan has identified as needing a summary
     /// but hasn't started yet — held here so `maxConcurrent` is enforced
     /// across the whole batch instead of letting all candidates spawn at
@@ -200,6 +223,9 @@ final class RecordingSummarizer: ObservableObject {
     func summarizeIfNeeded(_ recording: Recording) {
         guard shouldSummarize(recording) else {
             logSkip(recording, force: false)
+            // No summary will be generated — signal completion now so a
+            // pending Obsidian export falls back to the transcript.
+            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
             return
         }
         runSummary(for: recording, force: false)
@@ -217,12 +243,14 @@ final class RecordingSummarizer: ObservableObject {
     func regenerate(_ recording: Recording) {
         guard llmSettings.isConfigured else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — LLM not configured")
+            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
             return
         }
         let transcript = recording.fullText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !transcript.isEmpty else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — transcript empty")
+            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
             return
         }
         runSummary(for: recording, force: true)
@@ -397,6 +425,12 @@ final class RecordingSummarizer: ObservableObject {
                 let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !cleaned.isEmpty else {
                     summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): empty CLI output")
+                    // No summary landed — let a pending export fall back to
+                    // the transcript rather than waiting forever. Skip the
+                    // signal entirely if the recording went away mid-flight.
+                    if let self, let current = self.liveRecording(id) {
+                        self.onSummaryFinished?(current)
+                    }
                     return
                 }
                 // The recording may have been deleted between enqueue
@@ -405,20 +439,32 @@ final class RecordingSummarizer: ObservableObject {
                 guard let self else { return }
                 guard var current = self.store.recordings.first(where: { $0.id == id }) else {
                     summarizerLog.log("skipped \(self.shortID(id), privacy: .public): recording is gone")
+                    // Deleted mid-flight — nothing to export, so no signal.
                     return
                 }
                 let existing = (current.summary ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !force, !existing.isEmpty {
                     summarizerLog.log("skipped \(self.shortID(id), privacy: .public): a summary landed mid-flight")
+                    // A summary is present (just from another path) — the
+                    // recording is ready to export.
+                    self.onSummaryFinished?(current)
                     return
                 }
                 current.summary = cleaned
                 self.store.update(current)
                 let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
                 summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) length=\(cleaned.count, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
+                self.onSummaryFinished?(current)
             } catch {
                 summarizerLog.error("failed \(self?.shortID(id) ?? "?", privacy: .public): \(error.localizedDescription, privacy: .public)")
+                // Failed generation — signal so a pending export can still
+                // write the transcript fallback. A permanent delete cancels
+                // the task, which lands here as a CancellationError, so the
+                // store lookup is what stops a deleted recording being filed.
+                if let self, let current = self.liveRecording(id) {
+                    self.onSummaryFinished?(current)
+                }
             }
         }
         inFlight[id] = task
@@ -453,5 +499,21 @@ final class RecordingSummarizer: ObservableObject {
 
     private func shortID(_ id: UUID) -> String {
         String(id.uuidString.prefix(8))
+    }
+
+    /// The freshest copy of a recording from the store, or `fallback` when
+    /// it's no longer there. Used by the SYNCHRONOUS skip paths, where the
+    /// caller handed us the recording a moment ago and the fallback is the
+    /// same object it already holds.
+    private func latestRecording(_ id: UUID, fallback: Recording) -> Recording {
+        store.recordings.first(where: { $0.id == id }) ?? fallback
+    }
+
+    /// The recording as the store currently holds it, or nil when it's gone.
+    /// Used by the ASYNCHRONOUS completion paths, where a delete can land
+    /// between enqueue and completion: firing with the stale enqueue-time copy
+    /// would let an observer act on a row the user just deleted.
+    private func liveRecording(_ id: UUID) -> Recording? {
+        store.recordings.first(where: { $0.id == id })
     }
 }
