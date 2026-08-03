@@ -217,10 +217,26 @@ it out of impatience is noise.
 
 The exception matters: a review the **quota refused outright** is never
 retried. No push, no timer, nothing restarts it. Once the countdown in the
-rate-limit notice has elapsed, one manual review command is the only way to get
-that PR reviewed — #165 was reviewed minutes after exactly that. Filed *before*
-the countdown expires it is refused again and burns the attempt, so wait it out
-first.
+rate-limit notice has elapsed, a manual command is the only way to get that PR
+reviewed. Filed *before* the countdown expires it is refused again and burns
+the attempt, so wait it out first.
+
+**Use the `full review` command, not the plain one.** They are not
+interchangeable. The plain review command is *incremental*: CodeRabbit "does
+not re-review already reviewed commits", so on a head it considers seen it
+replies "Action performed. Review finished." and produces nothing — no review
+object, no verdict, no inline comments. That reply is an acknowledgement that
+the command was processed, **not** evidence a review happened, and mistaking
+one for the other is how a PR can look reviewed when it is not. The `full`
+variant forces a re-review of the whole diff and is what actually recovers a
+stalled PR: on 2026-08-02, a dozen plain requests across #129, #130 and #164
+yielded nothing, while `full review` produced a real review on #164 and again
+on #169 within a minute or two.
+
+So the recovery loop is: wait out the countdown → send the **full** review
+command → poll for a review object at head (or a verdict string), never for the
+`Reviewing files … between … and <head>` line, which the rate-limit notice
+carries too.
 
 Note that the gate's own failure comment deliberately does not print the
 command literally: CodeRabbit parses commands out of any comment body, fenced
