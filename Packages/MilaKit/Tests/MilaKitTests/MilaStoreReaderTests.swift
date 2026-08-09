@@ -121,6 +121,47 @@ final class MilaStoreReaderTests: XCTestCase {
                        ["alpha", "Bravo"])
     }
 
+    /// Regression: the comparator used to be `order == .asc ? ascending :
+    /// !ascending`, which reports `a < b` *and* `b < a` for equal elements —
+    /// not a strict weak ordering, which `sort(by:)` requires. The visible
+    /// symptom was that flipping the direction silently reversed tied
+    /// elements, so "descending by duration" reordered same-length
+    /// recordings for no reason the user could see.
+    ///
+    /// Direction must only decide how *unequal* elements relate; ties are
+    /// untouched by it, so both directions have to agree on their order.
+    func test_ties_are_not_reordered_by_flipping_sort_direction() throws {
+        let reader = try writeStore([
+            rec("first", daysAgo: 1, duration: 60),
+            rec("second", daysAgo: 2, duration: 60),
+            rec("third", daysAgo: 3, duration: 60),
+        ])
+        let ascending = try reader.listRecordings(sort: .duration, order: .asc).map(\.title)
+        let descending = try reader.listRecordings(sort: .duration, order: .desc).map(\.title)
+        XCTAssertEqual(ascending, descending,
+                       "All durations are equal, so neither direction may impose an order.")
+        XCTAssertEqual(Set(descending), ["first", "second", "third"],
+                       "No recording may be dropped or duplicated by the sort.")
+    }
+
+    /// Same defect in the search comparator, reached via `sort: .createdAt`
+    /// where relevance ties don't mask it.
+    func test_search_ties_are_not_reordered_by_flipping_sort_direction() throws {
+        let shared = Date(timeIntervalSince1970: 1_700_000_000)
+        let reader = try writeStore((0..<3).map { i in
+            StoredRecording(title: "Note \(i)", createdAt: shared, duration: 60,
+                            source: "meeting", audioFileName: "n\(i).wav",
+                            status: "completed",
+                            segments: [.init(start: 0, end: 1, text: "budget")])
+        })
+        let ascending = try reader.searchTranscripts(query: "budget", sort: .createdAt,
+                                                     order: .asc).map(\.recording.title)
+        let descending = try reader.searchTranscripts(query: "budget", sort: .createdAt,
+                                                      order: .desc).map(\.recording.title)
+        XCTAssertEqual(ascending, descending)
+        XCTAssertEqual(ascending.count, 3)
+    }
+
     func test_limit_caps_results() throws {
         let reader = try writeStore((0..<5).map { rec("R\($0)", daysAgo: Double($0)) })
         XCTAssertEqual(try reader.listRecordings(limit: 2).count, 2)

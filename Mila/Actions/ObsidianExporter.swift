@@ -1,4 +1,5 @@
 import Foundation
+import MilaKit
 
 /// Writes a completed recording into the configured Obsidian vault as a
 /// Markdown note, then optionally kicks the git sync.

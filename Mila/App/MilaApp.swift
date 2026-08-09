@@ -352,6 +352,7 @@ struct MilaApp: App {
     /// StateObject purely so it stays alive — the completion hooks capture it
     /// weakly.
     @StateObject private var obsidianVaultSettings: ObsidianVaultSettings
+    @StateObject private var mcpAccessSettings: MCPAccessSettings
     @StateObject private var obsidianExporter: ObsidianExporter
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
@@ -532,6 +533,10 @@ struct MilaApp: App {
         // transcript fallback) once its summary is ready, then optionally
         // committed + pushed to git. Off by default.
         let obsidianSettings = ObsidianVaultSettings()
+        // Opt-in gate for the bundled mila-mcp helper. Constructing it
+        // mirrors the persisted flag back out to `mcp-access.json`, so the
+        // helper's view of consent re-converges on every launch.
+        let mcpAccess = MCPAccessSettings()
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
@@ -640,6 +645,7 @@ struct MilaApp: App {
         _liveAISession = StateObject(wrappedValue: liveSession)
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
         _obsidianVaultSettings = StateObject(wrappedValue: obsidianSettings)
+        _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
@@ -730,6 +736,7 @@ struct MilaApp: App {
                     Text(configImporter.errorMessage ?? "")
                 }
                 .environmentObject(obsidianVaultSettings)
+                .environmentObject(mcpAccessSettings)
                 .environmentObject(obsidianExporter)
         }
         .commands {
@@ -792,6 +799,7 @@ struct MilaApp: App {
                 // and the menu command use — never a second one.
                 .environmentObject(updater)
                 .environmentObject(obsidianVaultSettings)
+                .environmentObject(mcpAccessSettings)
                 .environmentObject(obsidianExporter)
         }
     }

@@ -37,11 +37,19 @@ public struct MilaMCPToolHandlers {
     /// temp fixture in tests.
     private let root: URL
     private let now: () -> Date
+    private let source: MilaDataSource
+    /// Injectable so tests can drive both sides of the gate without writing
+    /// to the real app-support directory.
+    private let isAccessEnabled: (URL) -> Bool
 
     public init(root: URL = StoreLocationPointer.defaultRoot(),
-                now: @escaping () -> Date = Date.init) {
+                now: @escaping () -> Date = Date.init,
+                source: MilaDataSource? = nil,
+                isAccessEnabled: @escaping (URL) -> Bool = MCPAccessGate.isEnabled(root:)) {
         self.root = root
         self.now = now
+        self.source = source ?? FileBackedDataSource(root: root)
+        self.isAccessEnabled = isAccessEnabled
     }
 
     // MARK: - Tool definitions
@@ -147,7 +155,14 @@ public struct MilaMCPToolHandlers {
     // MARK: - Dispatch
 
     /// Execute a tool call. Returns the result as a JSON string.
+    ///
+    /// The gate is re-read on **every** call rather than cached at startup:
+    /// an MCP server started by an editor can outlive many Mila sessions, and
+    /// revoking access should take effect immediately, not at the client's
+    /// next restart. It costs one small file read per tool call, and tool
+    /// calls are rare.
     public func handle(tool: String, arguments: [String: Any]) throws -> String {
+        guard isAccessEnabled(root) else { throw MCPAccessDisabledError() }
         switch tool {
         case "list_recordings": return try listRecordings(arguments)
         case "get_transcript": return try getTranscript(arguments)
@@ -160,7 +175,6 @@ public struct MilaMCPToolHandlers {
     // MARK: - Tools
 
     private func listRecordings(_ args: [String: Any]) throws -> String {
-        let reader = MilaStoreReader(root: root)
         let filter = MilaStoreReader.Filter(
             query: args["query"] as? String,
             speaker: args["speaker"] as? String,
@@ -174,7 +188,7 @@ public struct MilaMCPToolHandlers {
         let limit = min(args["limit"] as? Int ?? 20, 100)
         let recordings: [StoredRecording]
         do {
-            recordings = try reader.listRecordings(filter: filter, sort: sort,
+            recordings = try source.listRecordings(filter: filter, sort: sort,
                                                    order: order, limit: limit)
         } catch {
             throw ToolError.storeUnavailable(String(describing: error))
@@ -186,19 +200,18 @@ public struct MilaMCPToolHandlers {
     }
 
     private func getTranscript(_ args: [String: Any]) throws -> String {
-        let reader = MilaStoreReader(root: root)
         let recording: StoredRecording
         do {
             if let idString = args["id"] as? String {
                 guard let id = UUID(uuidString: idString) else {
                     throw ToolError.invalidArguments("id must be a UUID, got \"\(idString)\"")
                 }
-                guard let found = try reader.recording(id: id) else {
+                guard let found = try source.recording(id: id) else {
                     throw ToolError.notFound("No recording with id \(id.uuidString)")
                 }
                 recording = found
             } else {
-                guard let latest = try reader.latestCompletedRecording() else {
+                guard let latest = try source.latestCompletedRecording() else {
                     throw ToolError.notFound("No completed recordings exist yet")
                 }
                 recording = latest
@@ -209,7 +222,7 @@ public struct MilaMCPToolHandlers {
             throw ToolError.storeUnavailable(String(describing: error))
         }
 
-        var transcript = reader.namedTranscript(for: recording)
+        var transcript = source.namedTranscript(for: recording)
         var truncated = false
         if let maxChars = args["max_chars"] as? Int, maxChars > 0, transcript.count > maxChars {
             transcript = String(transcript.prefix(maxChars))
@@ -243,13 +256,12 @@ public struct MilaMCPToolHandlers {
         guard let query = args["query"] as? String, !query.isEmpty else {
             throw ToolError.invalidArguments("query is required")
         }
-        let reader = MilaStoreReader(root: root)
         let sort = try enumArg(args, "sort", MilaStoreReader.SearchSortKey.self) ?? .relevance
         let order = try enumArg(args, "order", MilaStoreReader.SortOrder.self) ?? .desc
         let limit = min(args["limit"] as? Int ?? 10, 100)
         let hits: [MilaStoreReader.SearchHit]
         do {
-            hits = try reader.searchTranscripts(query: query,
+            hits = try source.searchTranscripts(query: query,
                                                 speaker: args["speaker"] as? String,
                                                 sort: sort, order: order, limit: limit)
         } catch {
@@ -267,7 +279,7 @@ public struct MilaMCPToolHandlers {
     }
 
     private func getLiveTranscript(_ args: [String: Any]) throws -> String {
-        guard let snapshot = LiveTranscriptSnapshot.read(root: root) else {
+        guard let snapshot = source.liveSnapshot() else {
             return try json(["status": "not_recording"])
         }
 

@@ -126,14 +126,13 @@ public struct MilaStoreReader {
             return true
         }
         results.sort { a, b in
-            let ascending: Bool
+            let comparison: ComparisonResult
             switch sort {
-            case .createdAt: ascending = a.createdAt < b.createdAt
-            case .duration: ascending = a.duration < b.duration
-            case .title:
-                ascending = a.title.localizedCaseInsensitiveCompare(b.title) == .orderedAscending
+            case .createdAt: comparison = compare(a.createdAt, b.createdAt)
+            case .duration: comparison = compare(a.duration, b.duration)
+            case .title: comparison = a.title.localizedCaseInsensitiveCompare(b.title)
             }
-            return order == .asc ? ascending : !ascending
+            return isOrdered(comparison, order)
         }
         return Array(results.prefix(max(0, limit)))
     }
@@ -191,20 +190,44 @@ public struct MilaStoreReader {
             hits.append(SearchHit(recording: rec, matchCount: total, snippets: snippets))
         }
         hits.sort { a, b in
-            let ascending: Bool
+            let comparison: ComparisonResult
             switch sort {
             case .relevance:
                 if a.matchCount != b.matchCount {
-                    ascending = a.matchCount < b.matchCount
+                    comparison = compare(a.matchCount, b.matchCount)
                 } else {
-                    ascending = a.recording.createdAt < b.recording.createdAt
+                    comparison = compare(a.recording.createdAt, b.recording.createdAt)
                 }
             case .createdAt:
-                ascending = a.recording.createdAt < b.recording.createdAt
+                comparison = compare(a.recording.createdAt, b.recording.createdAt)
             }
-            return order == .asc ? ascending : !ascending
+            return isOrdered(comparison, order)
         }
         return Array(hits.prefix(max(0, limit)))
+    }
+
+    /// Three-way comparison for any `Comparable`.
+    private func compare<T: Comparable>(_ a: T, _ b: T) -> ComparisonResult {
+        if a < b { return .orderedAscending }
+        if b < a { return .orderedDescending }
+        return .orderedSame
+    }
+
+    /// Turns a three-way comparison into the strict-weak-ordering predicate
+    /// `sort(by:)` requires.
+    ///
+    /// The obvious `order == .asc ? ascending : !ascending` is **not** a valid
+    /// ordering: for equal elements `ascending` is `false`, so its negation
+    /// claims `a < b` *and* `b < a` are both true. Swift's sort is documented
+    /// as requiring a strict weak ordering and gives unspecified results
+    /// otherwise — in practice equal elements came back silently reversed.
+    /// `.orderedSame` must map to `false` in both directions.
+    private func isOrdered(_ comparison: ComparisonResult, _ order: SortOrder) -> Bool {
+        switch comparison {
+        case .orderedSame: return false
+        case .orderedAscending: return order == .asc
+        case .orderedDescending: return order == .desc
+        }
     }
 
     private func matchCount(of needle: String, in haystack: String) -> Int {

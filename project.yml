@@ -285,9 +285,15 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper.mcp
-        # The SDK's ServiceLifecycle/NIO deps use Swift 6 features; our
-        # own sources stay on the project-wide 5.10 language mode.
+        # A command-line tool, not a bundle — nothing reads an Info.plist
+        # here, and generating one just adds an empty section.
         GENERATE_INFOPLIST_FILE: NO
+        # Note on size: the MCP SDK pulls swift-nio into this target — a
+        # Debug mila-mcp is ~18 MB and carries ~33k NIO symbols, verified
+        # with `nm`. (An earlier note here also blamed ServiceLifecycle;
+        # that one genuinely isn't linked — zero symbols.) Release builds
+        # dead-strip, so check the shipped size before drawing conclusions
+        # from the Debug number.
 
   MilaTests:
     type: bundle.unit-test

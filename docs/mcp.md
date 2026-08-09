@@ -9,6 +9,24 @@ Everything stays local: the server reads Mila's own on-disk store; no
 audio or text leaves your Mac unless you ask Claude to do something
 with it.
 
+## Turn it on first
+
+**MCP access is off by default.** Enable it in Mila under **Settings →
+Storage → "Allow MCP access to transcriptions"**. Until you do, every tool
+call is refused with a message pointing back at that toggle, and the
+setting takes effect immediately — turning it off cuts access to an
+already-running Claude session without restarting anything.
+
+The toggle is a consent control, not a security boundary, and it's worth
+being straight about the difference. `mila-mcp` runs as you, and so does
+everything else you run; anything with your user account can already read
+`~/Library/Application Support/Mila/` directly, with or without this
+setting. What the toggle prevents is the realistic accident — an MCP
+client that happens to be configured quietly reading meeting transcripts
+and sending them to a cloud model because the tools were simply there. It
+does not, and cannot, defend against a hostile program already running as
+you.
+
 ## Setup (once)
 
 Claude Code:
@@ -96,7 +114,36 @@ How the polling works under the hood:
   transcript sidecar, written during recording (throttled, atomic) and
   closed with the saved recording's id at Stop.
 
+- `~/Library/Application Support/Mila/mcp-access.json` — the consent
+  flag, written by the app whenever the setting changes and re-mirrored
+  on every launch. Missing or unreadable means **denied**.
+
 If the app has never run (no pointer file), the server falls back to
 the default layout. Changes to the `recordings.json` schema must be
 mirrored in MilaKit's `StoredRecording` — `StoredRecordingDriftTests`
 guards this.
+
+## Why it reads files instead of calling a local API
+
+The alternative considered was for Mila to serve a local API over a unix
+domain socket, with `mila-mcp` as a thin client. That decouples the
+helper from the store's on-disk format and would give a third party a
+versioned contract to build against. It was declined for now, for two
+reasons.
+
+The first is availability. Mila is an ordinary dock app — no login item,
+not a background agent — and the common question ("what did we decide on
+Tuesday?") gets asked days later with Mila closed. Reading files answers
+it either way; a socket only answers while the app is running.
+
+The second is that the socket buys no security here. A socket at `0600`
+is reachable by exactly the same principals as a file at `0600`: your own
+user. The isolation it appears to add over reading files directly is not
+real.
+
+What made the trade acceptable is that it stays reversible.
+`MilaDataSource` is the seam: `FileBackedDataSource` is the only
+implementation today, and a socket-backed one would be the whole change
+on this side — the tool handlers don't move. If a third-party consumer
+shows up, or the store format starts churning, that's the moment to
+revisit.

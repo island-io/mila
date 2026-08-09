@@ -51,6 +51,10 @@ struct StorageSettingsTab: View {
                 // section — off by default, it's a single toggle. It expands
                 // itself once enabled; see `ObsidianSettingsSection`.
                 ObsidianSettingsSection()
+                // Same reasoning as Obsidian above: an opt-in destination for
+                // transcripts, one toggle wide until enabled, parked here
+                // instead of a tab of its own.
+                MCPAccessSettingsSection()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }

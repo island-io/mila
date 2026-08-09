@@ -11,6 +11,11 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         try FileManager.default.createDirectory(
             at: root.appendingPathComponent("Recordings", isDirectory: true),
             withIntermediateDirectories: true)
+        // Every test below exercises the granted path, so open the gate the
+        // same way the app does — through the real file — rather than by
+        // injecting a stub. `test_tools_are_refused_when_access_is_disabled`
+        // covers the closed path.
+        try MCPAccessGate.set(true, root: root)
     }
 
     override func tearDownWithError() throws {
