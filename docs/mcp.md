@@ -29,13 +29,21 @@ you.
 
 ## Setup (once)
 
+The helper lives inside the app bundle, so its path depends on where
+Mila is installed. **Settings ▸ Storage shows the exact command for
+your install, with a Copy button** — use that rather than retyping the
+examples below, which assume `/Applications/Mila.app` and will not start
+the helper if Mila lives anywhere else (a dev build, `~/Applications`, a
+different volume).
+
 Claude Code:
 
 ```bash
-claude mcp add mila -- /Applications/Mila.app/Contents/MacOS/mila-mcp
+claude mcp add mila -- '/Applications/Mila.app/Contents/MacOS/mila-mcp'
 ```
 
-Claude Desktop — add to `claude_desktop_config.json`:
+Claude Desktop — add to `claude_desktop_config.json`, replacing the path
+with your own:
 
 ```json
 {

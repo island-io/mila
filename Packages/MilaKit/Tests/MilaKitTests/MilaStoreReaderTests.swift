@@ -162,6 +162,19 @@ final class MilaStoreReaderTests: XCTestCase {
         XCTAssertEqual(ascending.count, 3)
     }
 
+    /// First run: Mila has never saved a recording, so `recordings.json`
+    /// does not exist. The reader must throw rather than pretend the store
+    /// is empty — `MilaMCPToolHandlers` turns that throw into the
+    /// "Has the Mila app run at least once on this Mac?" message, which is
+    /// the only useful thing to tell someone in that state.
+    func test_missing_store_file_throws_rather_than_reporting_empty() {
+        let empty = root.appendingPathComponent("no-store", isDirectory: true)
+        let reader = MilaStoreReader(recordingsDirectory: empty,
+                                     storeFileURL: empty.appendingPathComponent("recordings.json"))
+        XCTAssertThrowsError(try reader.listRecordings(),
+                             "A missing store is not the same as a store with no recordings.")
+    }
+
     func test_limit_caps_results() throws {
         let reader = try writeStore((0..<5).map { rec("R\($0)", daysAgo: Double($0)) })
         XCTAssertEqual(try reader.listRecordings(limit: 2).count, 2)

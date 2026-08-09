@@ -14,7 +14,9 @@ Mila is the user's local macOS transcription app. The `mila` MCP server
 exposes its recordings. If its tools (`list_recordings`,
 `get_transcript`, `search_transcripts`, `get_live_transcript`) are not
 available, tell the user to register the server once:
-`claude mcp add mila -- /Applications/Mila.app/Contents/MacOS/mila-mcp`
+`claude mcp add mila -- '/Applications/Mila.app/Contents/MacOS/mila-mcp'`
+(the path is wherever Mila.app actually lives — Settings ▸ Storage shows
+the exact command with a Copy button)
 
 ## Past recordings
 
@@ -66,6 +68,9 @@ assistant:
      crash); the transcript won't grow.
    - `new_session: true`: a different recording started — confirm with
      the user before following the new one.
-5. On `status: completed`: stop polling, call
-   `get_transcript(id: final_recording_id)`, and close with a short
-   summary + action items.
+5. On `status: completed`: stop polling. Call
+   `get_transcript(id: final_recording_id)` when the reply carries one —
+   it is optional, and a recording can finish without a handoff id. If
+   it's absent, take the newest entry from `list_recordings` instead (the
+   reply's `note` says so too). Close with a short summary + action
+   items.
