@@ -111,8 +111,19 @@ public struct LiveTranscriptSnapshot: Codable {
     /// `index` — the last segment the client already has is re-sent
     /// because the live merge can rewrite the trailing segment's text as
     /// more audio context arrives; the client replaces its copy.
+    ///
+    /// `index` is unvalidated client input — it arrives as
+    /// `since_segment_index` in a tool call — and `index - 1` traps on
+    /// `Int.min` (arithmetic overflow; the subscript was never the
+    /// problem, since `segments[endIndex...]` is a legal empty slice).
+    ///
+    /// Non-positive cursors are answered before any subtraction happens,
+    /// which removes the only overflow and leaves every other cursor
+    /// computing exactly what it did before — including a cursor past the
+    /// end, which still yields `[]` rather than re-sending the tail.
     public func segments(sinceIndex index: Int) -> [Segment] {
-        let start = max(0, min(index - 1, segments.count))
+        guard index > 0 else { return segments }
+        let start = min(index - 1, segments.count)
         return Array(segments[start...])
     }
 }

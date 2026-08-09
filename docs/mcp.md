@@ -103,7 +103,9 @@ How the polling works under the hood:
   updating the snapshot — likely crashed), `recording_live_unavailable`
   (recording on hardware where live transcription is gated off — wait
   for completion), `completed` (stop polling; `final_recording_id`
-  hands off to `get_transcript`), `not_recording`.
+  hands off to `get_transcript` **when present** — a recording can
+  complete without one, and the reply says so and points at
+  `list_recordings` instead), `not_recording`.
 
 ## How it finds your data
 

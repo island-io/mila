@@ -24,11 +24,18 @@ final class StoredRecordingDriftTests: XCTestCase {
         return decoder
     }
 
-    func test_fully_populated_recording_round_trips_into_stored_recording() throws {
-        let id = UUID()
-        let created = Date(timeIntervalSince1970: 1_700_000_000)
-        let deleted = Date(timeIntervalSince1970: 1_700_000_500)
-        let recording = Recording(
+    private let fixtureID = UUID()
+    private let fixtureCreated = Date(timeIntervalSince1970: 1_700_000_000)
+    private let fixtureDeleted = Date(timeIntervalSince1970: 1_700_000_500)
+
+    /// One `Recording` with **every** persisted field set. Shared by the
+    /// field-by-field test and the key-set test so a newly added field only
+    /// has to be set here once.
+    private func fullyPopulatedRecording() -> Recording {
+        let id = fixtureID
+        let created = fixtureCreated
+        let deleted = fixtureDeleted
+        return Recording(
             id: id,
             title: "Weekly sync",
             createdAt: created,
@@ -54,6 +61,13 @@ final class StoredRecordingDriftTests: XCTestCase {
             voiceMemoFolderUUID: "VMF-1",
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"]
         )
+    }
+
+    func test_fully_populated_recording_round_trips_into_stored_recording() throws {
+        let id = fixtureID
+        let created = fixtureCreated
+        let deleted = fixtureDeleted
+        let recording = fullyPopulatedRecording()
 
         let data = try storeEncoder().encode([recording])
         let stored = try storeDecoder().decode([StoredRecording].self, from: data)
@@ -89,6 +103,54 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
         XCTAssertEqual(s.summaryFileName, "Weekly sync.summary.txt")
         XCTAssertEqual(s.speakerDisplayNames, ["Daniel", "John Doe"])
+    }
+
+    /// The per-field assertions above only check fields somebody remembered
+    /// to write an assertion for, and `JSONDecoder` ignores keys it doesn't
+    /// know — so adding a persisted field to `Recording` and forgetting to
+    /// mirror it in `StoredRecording` leaves every existing test green while
+    /// mila-mcp silently stops seeing the new data. That is exactly the
+    /// drift this file exists to catch.
+    ///
+    /// This compares the *key sets*: everything the app writes must be a key
+    /// the mirror also round-trips, unless it's listed as a deliberate
+    /// omission below.
+    func test_every_persisted_key_is_mirrored() throws {
+        // Deliberately not mirrored, with the reason. Adding to this list is
+        // a decision; leaving a key out of it is a bug.
+        let intentionallyUnmirrored: Set<String> = [
+            // The sidecar .txt owns the transcript text; the mirror reads it
+            // from disk rather than from the store.
+            "fullText",
+            // Bookkeeping for the Voice Memos importer: they tie a recording
+            // back to the entry it was imported from, so re-import can skip
+            // it. Opaque identifiers with no meaning to an MCP client, which
+            // asks about content — not about import provenance. (Found by
+            // this test when it was first written: both were already absent
+            // from the mirror while the old round-trip assertions stayed
+            // green, which is the drift this test exists to catch.)
+            "voiceMemoUniqueID",
+            "voiceMemoFolderUUID",
+        ]
+
+        let recording = fullyPopulatedRecording()
+        let appJSON = try JSONSerialization.jsonObject(
+            with: storeEncoder().encode(recording)) as? [String: Any] ?? [:]
+
+        let stored = try storeDecoder().decode(StoredRecording.self,
+                                               from: storeEncoder().encode(recording))
+        let mirrorJSON = try JSONSerialization.jsonObject(
+            with: JSONEncoder().encode(stored)) as? [String: Any] ?? [:]
+
+        let missing = Set(appJSON.keys)
+            .subtracting(mirrorJSON.keys)
+            .subtracting(intentionallyUnmirrored)
+
+        XCTAssertTrue(missing.isEmpty,
+                      "Recording persists \(missing.sorted()) but MilaKit's StoredRecording "
+                      + "does not mirror them, so mila-mcp will not see them. Add the "
+                      + "field(s) to StoredRecording, or add them to "
+                      + "`intentionallyUnmirrored` with a reason.")
     }
 
     func test_minimal_recording_decodes_with_defaults() throws {

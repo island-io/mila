@@ -73,6 +73,41 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         return snap
     }
 
+    // MARK: - Hostile cursor input
+
+    /// `since_segment_index` is unvalidated client input. The cursor used to
+    /// compute `index - 1` before clamping, which **traps on `Int.min`**
+    /// (arithmetic overflow — the subscript itself was always fine, since
+    /// `segments[endIndex...]` is a legal empty slice). A tool call must
+    /// never be able to kill the server.
+    func test_live_transcript_survives_extreme_segment_cursors() throws {
+        let session = UUID()
+        _ = try liveSnapshot(sessionID: session)
+        for cursor in [Int.min, -1, 0, 1, 3, 4, 9_999, Int.max] {
+            XCTAssertNoThrow(
+                try call("get_live_transcript",
+                         ["session_id": session.uuidString,
+                          "since_segment_index": cursor]),
+                "since_segment_index \(cursor) must be handled, not trapped")
+        }
+    }
+
+    /// Clamping must not change what a legitimate cursor returns: the
+    /// previously-seen segment is re-sent because live merges rewrite it.
+    func test_segment_cursor_still_resends_the_last_seen_segment() throws {
+        let snapshot = try liveSnapshot()
+        XCTAssertEqual(snapshot.segments(sinceIndex: 0).count, 3)
+        XCTAssertEqual(snapshot.segments(sinceIndex: 2).map(\.text), ["second", "third"],
+                       "A client holding 2 segments re-reads the 2nd, which may have been rewritten.")
+        XCTAssertEqual(snapshot.segments(sinceIndex: 3).map(\.text), ["third"])
+        XCTAssertEqual(snapshot.segments(sinceIndex: 4), [],
+                       "A cursor past the end means the client is up to date — send nothing, "
+                       + "and do not re-send the tail.")
+        XCTAssertEqual(snapshot.segments(sinceIndex: Int.max), [])
+        XCTAssertEqual(snapshot.segments(sinceIndex: Int.min).count, 3,
+                       "A nonsense cursor should read as \"from the start\", not crash.")
+    }
+
     // MARK: - list / get / search via raw JSON args
 
     func test_list_recordings_speaker_filter_and_shape() throws {

@@ -122,7 +122,7 @@ public struct MilaMCPToolHandlers {
                              "description": "relevance = match count, ties newest-first (default)."],
                     "order": ["type": "string", "enum": ["asc", "desc"],
                               "description": "Sort order (default desc)."],
-                    "limit": ["type": "integer", "description": "Max results (default 10)."],
+                    "limit": ["type": "integer", "description": "Max results (default 10, max 100)."],
                 ],
                 "required": ["query"],
             ]
@@ -136,7 +136,9 @@ public struct MilaMCPToolHandlers {
             meetings answer with a tiny {changed:false}, and changed ones return only the new \
             segments (the last previously-seen segment is re-sent because live transcription \
             may rewrite it — replace your copy). When status becomes "completed", stop \
-            polling and call get_transcript with the returned final_recording_id.
+            polling: call get_transcript with the returned final_recording_id when there is \
+            one, and otherwise take the newest entry from list_recordings (a completed \
+            recording can finish without a handoff id).
             """,
             inputSchema: [
                 "type": "object",

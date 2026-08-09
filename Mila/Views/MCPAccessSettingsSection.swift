@@ -21,8 +21,20 @@ struct MCPAccessSettingsSection: View {
         return url.path
     }
 
+    /// The command we tell the user to paste into a terminal.
+    ///
+    /// The path is single-quoted, not double-quoted: inside double quotes a
+    /// shell still expands `$(…)`, backticks and `$VAR`, so an app living
+    /// under a directory someone named `$(rm -rf ~)` would produce a command
+    /// that runs that when pasted. Single quotes suppress all expansion; the
+    /// only character needing care is `'` itself, closed and reopened around
+    /// an escaped copy in the standard POSIX way.
     private var registerCommand: String {
-        "claude mcp add mila -- \"\(helperPath)\""
+        "claude mcp add mila -- \(singleQuoted(helperPath))"
+    }
+
+    private func singleQuoted(_ path: String) -> String {
+        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     var body: some View {
