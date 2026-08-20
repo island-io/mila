@@ -1,4 +1,5 @@
 import Foundation
+import TranscriptionCore
 
 /// Translation of the diarizer's raw `SPEAKER_00` / `SPEAKER_01` /…
 /// identifiers into a label the user actually wants to see — `Speaker A`
@@ -61,5 +62,41 @@ extension String {
             return "\(letters[index])׳"
         }
         return "\(index + 1)"
+    }
+}
+
+/// Canonicalisation of raw speaker IDs, kept out of `TranscriptionService` so
+/// it is reachable from non-`@MainActor` code (`RemoteWhisperEngine`, which
+/// has to re-key the labels a server-side diarizer returns).
+enum SpeakerLabels {
+    /// Re-key every speaker ID in `segments` to a sequential `SPEAKER_NN` in
+    /// order of first appearance.
+    ///
+    /// Two reasons this exists. Pyannote's clustering can leave gaps
+    /// (`SPEAKER_00` then `SPEAKER_02` when an intermediate cluster is merged
+    /// away), which surfaces as "Speaker A" + "Speaker C" with no B. And a
+    /// remote diarization model uses a different label space altogether
+    /// (`"A"`, `"B"`, …), which `friendlySpeakerLabel(language:)` would pass
+    /// through verbatim — English-looking labels in a Hebrew transcript, and
+    /// no stable key for `Recording.speakerNames`. Both become 00, 01, 02… in
+    /// transcript order.
+    ///
+    /// Segments with no label (or an empty one) are left exactly as they are.
+    static func normalized(in segments: [TranscriptSegment]) -> [TranscriptSegment] {
+        var mapping: [String: String] = [:]
+        var nextIndex = 0
+        var output = segments
+        for i in output.indices {
+            guard let original = output[i].speaker, !original.isEmpty else { continue }
+            if let remapped = mapping[original] {
+                output[i].speaker = remapped
+            } else {
+                let remapped = String(format: "SPEAKER_%02d", nextIndex)
+                mapping[original] = remapped
+                output[i].speaker = remapped
+                nextIndex += 1
+            }
+        }
+        return output
     }
 }

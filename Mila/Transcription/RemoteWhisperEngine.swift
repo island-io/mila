@@ -22,9 +22,11 @@ protocol RemoteTranscribing: TranscribingEngine {
 /// The protocol hands us 16 kHz mono `Float` samples (the same buffer the
 /// local engine would consume), so the recording's audio never has to be
 /// re-read from disk — we encode the samples to a compact AAC/`.m4a` blob and
-/// upload that. We ask for `verbose_json` so we get per-segment timestamps,
-/// which map straight onto `TranscriptSegment` and keep diarization /
-/// SRT-export working exactly as they do for the local path.
+/// upload that. The requested `response_format` is chosen from the model
+/// (see `ResponseFormat.forModel(_:)`): `verbose_json` wherever it is
+/// available, so we get per-segment timestamps that map straight onto
+/// `TranscriptSegment` and keep diarization / SRT-export working exactly as
+/// they do for the local path.
 ///
 /// Config (endpoint, key, model) is injected via `configure(_:)` before each
 /// transcription — the protocol's `transcribe` signature is fixed by the local
@@ -66,6 +68,59 @@ actor RemoteWhisperEngine: RemoteTranscribing {
             }
             return String(trimmed.prefix(200))
         }
+    }
+
+    /// The `response_format` to ask a remote model for.
+    ///
+    /// **Not every model can produce every format**, and asking for the wrong
+    /// one is a hard 400, not a degraded transcript. `verbose_json` — the only
+    /// format that carries per-segment timestamps — is effectively a
+    /// `whisper-1` exclusive: the original Whisper decoder emits timestamp
+    /// tokens natively, which is also where `srt`/`vtt` fall out of. The
+    /// `gpt-*transcribe` family are audio-native models with no alignment
+    /// stage, so they reject *every* timestamped format (`verbose_json`, `srt`,
+    /// `vtt`) and accept only `json`/`text`:
+    ///
+    ///     response_format 'verbose_json' is not compatible with model
+    ///     'gpt-transcribe-api-ev3'. Use 'json' or 'text' instead.
+    ///
+    /// `gpt-4o-transcribe-diarize` is the exception — it emits structure
+    /// organised by *speaker turn* rather than decode window, under its own
+    /// `diarized_json` name. (Behaviour verified against the live OpenAI API;
+    /// issue #180.)
+    ///
+    /// Hardcoding `verbose_json` is what previously locked remote
+    /// transcription to `whisper-1`.
+    enum ResponseFormat: String {
+        /// Timestamped segments. `whisper-1` and self-hosted Whisper servers.
+        case verboseJSON = "verbose_json"
+        /// Text only, no timing. The `gpt-*transcribe` models.
+        case json = "json"
+        /// Speaker-turn segments with timing. `gpt-4o-transcribe-diarize`.
+        case diarizedJSON = "diarized_json"
+
+        /// The format `model` can actually produce.
+        ///
+        /// Matched on the id's last path component, lowercased, so a
+        /// vendor-prefixed mirror (`openai/gpt-4o-transcribe`) resolves the
+        /// same way as the bare id — the same tolerant substring style as
+        /// `RemoteTranscriptionSettings.isHebrewOnlyModel(_:)`. Anything that
+        /// isn't a `gpt-` model keeps requesting `verbose_json` exactly as
+        /// before, so self-hosted Whisper deployments are unaffected.
+        static func forModel(_ model: String) -> ResponseFormat {
+            let id = (model.split(separator: "/").last.map(String.init) ?? model)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard id.hasPrefix("gpt-") else { return .verboseJSON }
+            return id.contains("diarize") ? .diarizedJSON : .json
+        }
+
+        /// Whether the request must also carry a `chunking_strategy`.
+        ///
+        /// The diarization models require one explicitly for audio longer than
+        /// 30s — without it the API answers "chunking_strategy is required".
+        /// No other format takes the parameter.
+        var needsChunkingStrategy: Bool { self == .diarizedJSON }
     }
 
     private var config: RemoteTranscriptionConfig?
@@ -144,7 +199,7 @@ actor RemoteWhisperEngine: RemoteTranscribing {
 
         // Endpoint kept .private — a user-configured URL can carry private
         // hostnames or credentials/query tokens we must not leak to the log.
-        remoteLog.log("transcribe: POST \(request.url?.absoluteString ?? "?", privacy: .private) model=\(config.model, privacy: .public) lang=\(language, privacy: .public) bytes=\(body.count, privacy: .public)")
+        remoteLog.log("transcribe: POST \(request.url?.absoluteString ?? "?", privacy: .private) model=\(config.model, privacy: .public) format=\(Self.ResponseFormat.forModel(config.model).rawValue, privacy: .public) lang=\(language, privacy: .public) bytes=\(body.count, privacy: .public)")
 
         // The protocol's `isCancelled` is a polled flag (the batch Cancel
         // button), not Swift task cancellation. Bridge it: run the upload in a
@@ -203,8 +258,10 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     }
 
     /// Build a `multipart/form-data` body for the transcription request.
-    /// Fields: `file` (the m4a), `model`, `response_format=verbose_json`, and
-    /// `language` (omitted when "auto" so the server detects it).
+    /// Fields: `file` (the m4a), `model`, `response_format` (chosen from the
+    /// model — see `ResponseFormat.forModel(_:)`), `chunking_strategy` where
+    /// the format requires it, and `language` (omitted when "auto" so the
+    /// server detects it).
     static func multipartBody(boundary: String,
                               audio: Data,
                               model: String,
@@ -217,7 +274,11 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         }
 
         appendField("model", model)
-        appendField("response_format", "verbose_json")
+        let format = ResponseFormat.forModel(model)
+        appendField("response_format", format.rawValue)
+        if format.needsChunkingStrategy {
+            appendField("chunking_strategy", "auto")
+        }
         let lang = language.lowercased()
         if !lang.isEmpty && lang != "auto" {
             // OpenAI expects ISO-639-1; Mila already uses "he"/"en".
@@ -235,20 +296,29 @@ actor RemoteWhisperEngine: RemoteTranscribing {
 
     // MARK: - Parsing
 
+    /// The shape shared by every transcription response Mila asks for.
+    ///
+    /// `verbose_json` and `diarized_json` differ only in the extra keys they
+    /// add (decoder internals like `seek`/`avg_logprob` for the former, a
+    /// `speaker` per turn for the latter), and `json` simply omits `segments`.
+    /// `Decodable` ignores unknown keys, so one struct decodes all three.
     private struct VerboseResponse: Decodable {
         struct Segment: Decodable {
             let start: Double
             let end: Double
             let text: String
+            /// Present only in `diarized_json` — the server's own turn label
+            /// ("A", "B", …) from `gpt-4o-transcribe-diarize`.
+            let speaker: String?
         }
         let text: String?
         let duration: Double?
         let segments: [Segment]?
     }
 
-    /// Parse a `verbose_json` (preferred) or plain `json` transcription
-    /// response into `TranscriptSegment`s. Static + pure so it can be unit
-    /// tested without a server.
+    /// Parse a `verbose_json` / `diarized_json` (preferred) or plain `json`
+    /// transcription response into `TranscriptSegment`s. Static + pure so it
+    /// can be unit tested without a server.
     static func parseSegments(data: Data) throws -> [TranscriptSegment] {
         let decoder = JSONDecoder()
         guard let parsed = try? decoder.decode(VerboseResponse.self, from: data) else {
@@ -259,9 +329,20 @@ actor RemoteWhisperEngine: RemoteTranscribing {
             let mapped = segments.compactMap { seg -> TranscriptSegment? in
                 let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !text.isEmpty else { return nil }
-                return TranscriptSegment(start: seg.start, end: seg.end, text: seg.text)
+                return TranscriptSegment(start: seg.start, end: seg.end,
+                                         text: seg.text, speaker: seg.speaker)
             }
-            if !mapped.isEmpty { return mapped }
+            if !mapped.isEmpty {
+                // A `diarized_json` body labels turns "A", "B", … — a
+                // different label space from the one the rest of the app
+                // speaks (`SPEAKER_00`, which is what `friendlySpeakerLabel`
+                // renders as "Speaker A" / "דובר א׳", what `speakerNames` is
+                // keyed by, and what the exporters emit). Re-key at the
+                // boundary where the foreign labels enter, so server-side
+                // diarization is indistinguishable downstream from the local
+                // pyannote pass. No-op for an unlabelled response.
+                return SpeakerLabels.normalized(in: mapped)
+            }
         }
 
         // No segment array (server returned `response_format=json`, or an empty

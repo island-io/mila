@@ -1141,6 +1141,50 @@ final class TranscriptionServiceTests: XCTestCase {
         XCTAssertNil(normalized[1].speaker)
         XCTAssertEqual(normalized[2].speaker, "SPEAKER_01")
     }
+
+    // MARK: - Server-side speaker labels survive the offline pass (issue #180)
+
+    func test_hasSpeakerLabels_distinguishes_server_diarized_transcripts() {
+        // What the batch worker branches on: a `diarized_json` response
+        // already carries speakers, so the local pyannote pass must not
+        // relabel it. Everything else (local whisper, `verbose_json`, `json`)
+        // arrives unlabelled and does need the offline pass.
+        XCTAssertTrue(TranscriptionService.hasSpeakerLabels([
+            .init(start: 0, end: 1, text: "hi", speaker: "SPEAKER_00"),
+            .init(start: 1, end: 2, text: "yo", speaker: "SPEAKER_01"),
+        ]))
+        XCTAssertFalse(TranscriptionService.hasSpeakerLabels([
+            .init(start: 0, end: 1, text: "hi"),
+            .init(start: 1, end: 2, text: "yo"),
+        ]))
+        XCTAssertFalse(TranscriptionService.hasSpeakerLabels([]))
+        // A present-but-empty label is not a label — an empty string would
+        // otherwise suppress diarization and render as a blank speaker.
+        XCTAssertFalse(TranscriptionService.hasSpeakerLabels([
+            .init(start: 0, end: 1, text: "hi", speaker: ""),
+        ]))
+        // One labelled segment is enough: a diarize response can leave a
+        // stretch unattributed, and mixing the two label spaces is exactly
+        // what the guard exists to prevent.
+        XCTAssertTrue(TranscriptionService.hasSpeakerLabels([
+            .init(start: 0, end: 1, text: "hi"),
+            .init(start: 1, end: 2, text: "yo", speaker: "SPEAKER_00"),
+        ]))
+    }
+
+    func test_normalizeSpeakerLabels_rekeys_foreign_server_labels() {
+        // A remote diarizer speaks its own label space ("A", "B", …), which
+        // `friendlySpeakerLabel(language:)` would pass through verbatim.
+        let segments: [TranscriptSegment] = [
+            .init(start: 0, end: 1, text: "hi", speaker: "B"),
+            .init(start: 1, end: 2, text: "yo", speaker: "A"),
+            .init(start: 2, end: 3, text: "ya", speaker: "B"),
+        ]
+        let normalized = TranscriptionService.normalizeSpeakerLabels(in: segments)
+        XCTAssertEqual(normalized.map(\.speaker),
+                       ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00"])
+        XCTAssertEqual(normalized[0].speaker?.friendlySpeakerLabel(language: "en"), "Speaker A")
+    }
 }
 
 /// Returns 401 for any request — lets the record-start probe reach `.failed`
