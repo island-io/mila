@@ -963,6 +963,14 @@ private struct AIFeatureRow<Content: View>: View {
 
 /// A prompt editor with a "Reset to default" affordance. Used by three of the
 /// four feature rows and by Live AI.
+///
+/// "Reset to default" and the Examples list next to it each replace a
+/// hand-written prompt in one click, and used to do it irrecoverably — `⌘Z` did
+/// nothing anywhere in Settings (#176). The editor is now `UndoableTextEditor`,
+/// which gives this field a real per-editor undo stack that covers typing *and*
+/// those overwrites, however they reach the binding. `⌘Z` is what users try
+/// first; the "Undo" link is here because a recovery path you can see beats one
+/// that depends on where first responder happens to be.
 private struct AIPromptEditor: View {
     let title: String
     @Binding var text: String
@@ -972,6 +980,10 @@ private struct AIPromptEditor: View {
     var caption: String?
     var isEnabled = true
 
+    /// Survives the re-renders that recreate the editor struct, so the undo
+    /// history outlives a keystroke.
+    @StateObject private var undo = PromptUndoBridge()
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
@@ -979,19 +991,24 @@ private struct AIPromptEditor: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
+                if undo.canUndo {
+                    Button("Undo") { undo.undo() }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                        .disabled(!isEnabled)
+                        .help("Put back the previous prompt (\u{2318}Z).")
+                        .accessibilityIdentifier("ai.prompt.undo")
+                }
                 Button("Reset to default") { text = defaultText }
                     .buttonStyle(.link)
                     .font(.caption)
                     .disabled(!isEnabled)
             }
-            TextEditor(text: $text)
-                .font(.system(.callout, design: .monospaced))
-                .scrollContentBackground(.hidden)
+            UndoableTextEditor(text: $text, undo: undo, isEnabled: isEnabled)
                 .frame(minHeight: minHeight, maxHeight: minHeight + 60)
                 .padding(4)
                 .overlay(RoundedRectangle(cornerRadius: 6)
                     .strokeBorder(Color.primary.opacity(0.15), lineWidth: 1))
-                .disabled(!isEnabled)
             if let caption {
                 Text(LocalizedStringKey(caption))
                     .font(.caption)
