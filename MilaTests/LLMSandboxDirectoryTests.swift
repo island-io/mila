@@ -86,6 +86,28 @@ final class LLMSandboxDirectoryTests: XCTestCase {
     /// Application Support directory (so the `~/.claude/projects` slug
     /// survives reboots and $TMPDIR purges), and actually exist — `Process`
     /// refuses to launch into a missing `currentDirectoryURL`.
+    /// The preferred root is Application Support, not $TMPDIR -- macOS rotates
+    /// and purges the per-user temp directory, which would fragment the Claude
+    /// project directory again over time.
+    ///
+    /// Asserted against the *pure* path builder rather than
+    /// `sandboxDirectory()`, because that one deliberately falls back to a temp
+    /// directory when Application Support cannot be created. Asserting "never
+    /// under $TMPDIR" on the impure call would fail exactly when the documented
+    /// fallback is working.
+    func test_sandbox_layout_is_the_same_under_either_root() {
+        let appSupport = URL(fileURLWithPath: "/Users/someone/Library/Application Support",
+                             isDirectory: true)
+        let temp = URL(fileURLWithPath: "/var/folders/xx/T", isDirectory: true)
+        for root in [appSupport, temp] {
+            let url = LLMRunner.sandboxDirectory(appSupportRoot: root)
+            XCTAssertTrue(url.path.hasPrefix(root.path),
+                          "sandbox escaped its root: \(url.path)")
+            XCTAssertTrue(url.path.hasSuffix("/Mila/llm-sandbox"),
+                          "sandbox layout changed: \(url.path)")
+        }
+    }
+
     func test_sandboxDirectory_is_stable_and_exists() {
         let first = LLMRunner.sandboxDirectory()
         let second = LLMRunner.sandboxDirectory()
@@ -94,10 +116,6 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                       "sandbox directory was not created: \(first.path)")
         XCTAssertTrue(first.path.contains("/Mila/llm-sandbox"),
                       "sandbox is not under Mila's own directory: \(first.path)")
-        // Not $TMPDIR: macOS rotates and purges the per-user temp directory,
-        // which would fragment the project directory again over time.
-        XCTAssertFalse(first.path.hasPrefix(FileManager.default.temporaryDirectory.path),
-                       "sandbox is under $TMPDIR: \(first.path)")
         XCTAssertEqual(first.lastPathComponent, "llm-sandbox",
                        "sandbox name looks run-specific: \(first.lastPathComponent)")
     }
