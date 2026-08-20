@@ -65,6 +65,24 @@ final class WAVHeaderRepairTests: XCTestCase {
             | (UInt32(bytes[offset + 2]) << 16) | (UInt32(bytes[offset + 3]) << 24)
     }
 
+    /// Offset of the `data` chunk header in a real WAV, found by walking the
+    /// chunk table. AVAudioFile emits JUNK + fmt + FLLR before `data`, and the
+    /// FLLR padding is sized to align the audio to a block boundary — so
+    /// `data` sits at no fixed offset and must be located, not assumed.
+    private func dataChunkOffset(in bytes: [UInt8]) -> Int? {
+        guard bytes.count >= 12,
+              Array(bytes[0..<4]) == ascii("RIFF"),
+              Array(bytes[8..<12]) == ascii("WAVE") else { return nil }
+        var offset = 12
+        while offset + 8 <= bytes.count {
+            let size = u32(bytes, offset + 4)
+            if Array(bytes[offset..<offset + 4]) == ascii("data") { return offset }
+            // Chunks are word-aligned: an odd size carries a trailing pad byte.
+            offset += 8 + Int(size) + (Int(size) & 1)
+        }
+        return nil
+    }
+
     private func writeTemp(_ bytes: [UInt8]) throws -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("wavrepair-\(UUID().uuidString).wav")
@@ -177,6 +195,25 @@ final class WAVHeaderRepairTests: XCTestCase {
             .appendingPathComponent("wavrepair-live-\(UUID().uuidString).wav")
         addTeardownBlock { try? FileManager.default.removeItem(at: url) }
 
+        // `AVLinearPCMIsNonInterleaved: false` next to `interleaved: false` is
+        // not the contradiction it looks like — the two configure *different*
+        // formats and AVFoundation honours them independently:
+        //
+        //   * `settings` describes the **file format**. A WAV is interleaved by
+        //     definition; passing `AVLinearPCMIsNonInterleaved: true` only makes
+        //     CoreAudio log "Audio files cannot be non-interleaved. Ignoring
+        //     setting AVLinearPCMIsNonInterleaved YES" and write an interleaved
+        //     file anyway. `false` is the only value with any meaning here.
+        //   * `interleaved:` describes the **processing format** — the layout of
+        //     the in-memory buffers handed to `write(from:)`. That one *is*
+        //     honoured, and `false` is what gives the planar
+        //     `floatChannelData[channel][frame]` addressing used below.
+        //
+        // Making them "agree" would break the point of this test: the pairing is
+        // copied verbatim from `RecordingSession` — the recorder that produces
+        // the crashed files being simulated (and from `FileTranscriber`,
+        // `DictationController` and `TestSupport`). Change either value and the
+        // test stops reproducing the real recorder's output.
         let settings: [String: Any] = [
             AVFormatIDKey: kAudioFormatLinearPCM,
             AVSampleRateKey: 16000.0,
@@ -201,6 +238,20 @@ final class WAVHeaderRepairTests: XCTestCase {
 
         XCTAssertEqual(unclosed.count, finalized.count, "close() must not change the file length.")
         XCTAssertNotEqual(unclosed, finalized, "close() is expected to backfill the size fields.")
+
+        // Pin the exact crash signature `plan()` keys off, rather than settling
+        // for "the bytes differ somewhere": a still-open AVAudioFile must leave
+        // `data` size at the placeholder 0. If a future AVFoundation started
+        // publishing a running size mid-write, the assertions above would still
+        // pass while the repair quietly stopped firing in production.
+        let liveDataOffset = try XCTUnwrap(dataChunkOffset(in: unclosed),
+                                           "AVAudioFile must emit a `data` chunk.")
+        XCTAssertEqual(u32(unclosed, liveDataOffset + 4), 0,
+                       "A still-open AVAudioFile must leave `data` size at 0.")
+        XCTAssertEqual(u32(finalized, liveDataOffset + 4), UInt32(4 * 16_000 * 4),
+                       "close() backfills the real byte count (4 writes x 16k frames x 4 bytes).")
+        XCTAssertEqual(u32(unclosed, 4), u32(finalized, 4) - UInt32(4 * 16_000 * 4),
+                       "The unclosed RIFF size must be short by exactly the audio payload.")
 
         // Put the unfinalized bytes back and let the repair redo close()'s work.
         try Data(unclosed).write(to: url)

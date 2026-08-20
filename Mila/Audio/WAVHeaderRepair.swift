@@ -44,7 +44,10 @@ enum WAVHeaderRepair {
     ///     live in the first few KB; pass a generous prefix, e.g. 64 KB).
     ///   - fileSize: the physical file size in bytes.
     static func plan(header: [UInt8], fileSize: Int) -> Plan? {
-        // Minimum: RIFF(8) + WAVE(4) + fmt(24) + data header(8) = 44.
+        // A canonical WAV header is RIFF(8) + WAVE(4) + fmt(24) + data
+        // header(8) = 44 bytes, so 44 is the smallest a WAV can be — and such
+        // a file is *all* header, with zero audio bytes after it. There is
+        // nothing to recover at or below 44, hence the strict `>`.
         guard fileSize > 44, header.count >= 12 else { return nil }
         guard header[0] == 0x52, header[1] == 0x49, header[2] == 0x46, header[3] == 0x46, // "RIFF"
               header[8] == 0x57, header[9] == 0x41, header[10] == 0x56, header[11] == 0x45 // "WAVE"
@@ -140,6 +143,9 @@ enum WAVHeaderRepair {
     @discardableResult
     static func repairIfNeeded(at url: URL) -> Bool {
         let fileSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        // Same floor as `plan`: 44 bytes is a header with no audio behind it,
+        // so there is nothing to repair. Checked here too, to skip opening a
+        // FileHandle for a file that can't possibly need one.
         guard fileSize > 44 else { return false }
         guard let handle = try? FileHandle(forUpdating: url) else { return false }
         defer { try? handle.close() }
