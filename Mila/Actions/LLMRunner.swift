@@ -774,9 +774,25 @@ enum LLMRunner {
     /// fails outright if `currentDirectoryURL` doesn't exist.
     static func sandboxDirectory() -> URL {
         let url = sandboxDirectory(appSupportRoot: applicationSupportRoot())
-        try? FileManager.default.createDirectory(at: url,
-                                                 withIntermediateDirectories: true)
-        return url
+        do {
+            try FileManager.default.createDirectory(at: url,
+                                                    withIntermediateDirectories: true)
+            return url
+        } catch {
+            // `applicationSupportRoot()` only falls back when the *lookup*
+            // fails. If the directory resolves but can't be created -- a
+            // read-only or permission-broken Application Support -- swallowing
+            // the error and returning the path anyway breaks every subsequent
+            // CLI launch, because `Process.run()` fails outright when
+            // `currentDirectoryURL` does not exist. Degrade to a temp directory
+            // instead: the Claude project slug stops being stable, which costs
+            // resumability, but LLM calls keep working.
+            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LLMRunner").error("llm sandbox unavailable at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public) -- falling back to a temp directory")
+            let fallback = sandboxDirectory(appSupportRoot: FileManager.default.temporaryDirectory)
+            try? FileManager.default.createDirectory(at: fallback,
+                                                     withIntermediateDirectories: true)
+            return fallback
+        }
     }
 
     /// Pure path composition, split out so tests can assert the layout
