@@ -618,6 +618,138 @@ final class RemoteWhisperEngineParsingTests: XCTestCase {
         }
     }
 
+    // MARK: - response_format is chosen from the model (issue #180)
+
+    /// Read one multipart field's value back out of a built body, so these
+    /// tests assert on the *value* Mila sends rather than on a substring that
+    /// could match anywhere in the blob.
+    private func multipartField(_ name: String, in body: Data) -> String? {
+        let text = String(decoding: body, as: UTF8.self)
+        let marker = "Content-Disposition: form-data; name=\"\(name)\"\r\n\r\n"
+        guard let marked = text.range(of: marker) else { return nil }
+        let rest = text[marked.upperBound...]
+        guard let end = rest.range(of: "\r\n") else { return nil }
+        return String(rest[..<end.lowerBound])
+    }
+
+    func test_responseFormat_isVerboseJSONForWhisperAndSelfHostedModels() {
+        // The only family that can actually produce timestamped output, so the
+        // default must stay `verbose_json` — SRT export and speaker
+        // assignment depend on the segment timings it carries.
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("whisper-1"), .verboseJSON)
+        // Self-hosted (speaches / faster-whisper / ivrit) ids are unaffected.
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("ivrit-ai/whisper-large-v3-turbo-ct2"), .verboseJSON)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("Systran/faster-whisper-large-v3"), .verboseJSON)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("deepdml/faster-whisper-large-v3-turbo-ct2"), .verboseJSON)
+        // A blank model id falls back to the config default (`whisper-1`)
+        // upstream; it must not be mistaken for a gpt- model here.
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel(""), .verboseJSON)
+        // "gpt" has to be the model's own prefix, not just present somewhere.
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("my-gpt-whisper-mirror/whisper-large-v3"), .verboseJSON)
+    }
+
+    func test_responseFormat_isPlainJSONForGPTTranscribeModels() {
+        // These 400 on every timestamped format — `verbose_json`, `srt` and
+        // `vtt` alike — and accept only `json`/`text`.
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("gpt-4o-transcribe"), .json)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("gpt-4o-mini-transcribe"), .json)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("gpt-transcribe"), .json)
+        // Vendor-prefixed and shouty ids resolve the same way.
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("openai/gpt-4o-transcribe"), .json)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("GPT-4o-Transcribe"), .json)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("  gpt-transcribe  "), .json)
+    }
+
+    func test_responseFormat_isDiarizedJSONForTheDiarizeVariant() {
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("gpt-4o-transcribe-diarize"), .diarizedJSON)
+        XCTAssertEqual(RemoteWhisperEngine.ResponseFormat.forModel("openai/gpt-4o-transcribe-diarize"), .diarizedJSON)
+        // Only the diarize format takes a chunking strategy.
+        XCTAssertTrue(RemoteWhisperEngine.ResponseFormat.diarizedJSON.needsChunkingStrategy)
+        XCTAssertFalse(RemoteWhisperEngine.ResponseFormat.json.needsChunkingStrategy)
+        XCTAssertFalse(RemoteWhisperEngine.ResponseFormat.verboseJSON.needsChunkingStrategy)
+    }
+
+    func test_multipartBody_asksGPTModelsForPlainJSON() {
+        let body = RemoteWhisperEngine.multipartBody(boundary: "B",
+                                                     audio: Data([0x00]),
+                                                     model: "gpt-transcribe",
+                                                     language: "en")
+        XCTAssertEqual(multipartField("response_format", in: body), "json",
+                       "gpt-* models 400 on verbose_json — hardcoding it is what locked remote transcription to whisper-1")
+        XCTAssertNil(multipartField("chunking_strategy", in: body),
+                     "Only the diarization models take a chunking strategy")
+        XCTAssertEqual(multipartField("model", in: body), "gpt-transcribe")
+        XCTAssertEqual(multipartField("language", in: body), "en")
+    }
+
+    func test_multipartBody_asksDiarizeModelForDiarizedJSONWithChunking() {
+        let body = RemoteWhisperEngine.multipartBody(boundary: "B",
+                                                     audio: Data([0x00]),
+                                                     model: "gpt-4o-transcribe-diarize",
+                                                     language: "he")
+        XCTAssertEqual(multipartField("response_format", in: body), "diarized_json")
+        XCTAssertEqual(multipartField("chunking_strategy", in: body), "auto",
+                       "The diarize model rejects the request outright without one past 30s of audio")
+    }
+
+    func test_multipartBody_keepsVerboseJSONForSelfHostedModels() {
+        let body = RemoteWhisperEngine.multipartBody(boundary: "B",
+                                                     audio: Data([0x00]),
+                                                     model: "ivrit-ai/whisper-large-v3-turbo-ct2",
+                                                     language: "he")
+        XCTAssertEqual(multipartField("response_format", in: body), "verbose_json",
+                       "Self-hosted Whisper servers must keep getting the timestamped format")
+        XCTAssertNil(multipartField("chunking_strategy", in: body))
+    }
+
+    // MARK: - diarized_json carries speakers through (issue #180)
+
+    func test_parsesDiarizedJSONSpeakersIntoCanonicalLabels() throws {
+        // Shape of a real `gpt-4o-transcribe-diarize` body: turn-oriented
+        // segments with a `speaker`, plus keys we don't model (`type`, string
+        // `id`, `usage`) that `Decodable` must ignore.
+        let json = """
+        {
+          "task": "transcribe",
+          "duration": 6.0,
+          "text": "Morning. Morning to you. Shall we start?",
+          "segments": [
+            { "id": "seg_0", "type": "transcript.text.segment", "speaker": "A",
+              "start": 0.0, "end": 1.5, "text": "Morning." },
+            { "id": "seg_1", "type": "transcript.text.segment", "speaker": "B",
+              "start": 1.5, "end": 3.0, "text": " Morning to you." },
+            { "id": "seg_2", "type": "transcript.text.segment", "speaker": "A",
+              "start": 3.0, "end": 6.0, "text": " Shall we start?" }
+          ],
+          "usage": { "type": "duration", "seconds": 6 }
+        }
+        """.data(using: .utf8)!
+
+        let segments = try RemoteWhisperEngine.parseSegments(data: json)
+        XCTAssertEqual(segments.count, 3)
+        // Re-keyed into the label space the rest of the app speaks: the raw
+        // "A"/"B" would render verbatim ("A" instead of "Speaker A" / "דובר
+        // א׳") and give `Recording.speakerNames` a foreign key.
+        XCTAssertEqual(segments.map(\.speaker), ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00"],
+                       "Server turn labels must map to SPEAKER_NN by first appearance")
+        XCTAssertEqual(segments[1].start, 1.5, "Timestamps must survive the speaker mapping")
+        XCTAssertEqual(segments[2].text, " Shall we start?")
+    }
+
+    func test_verboseJSONSegmentsCarryNoSpeaker() throws {
+        let json = """
+        {
+          "duration": 2.0,
+          "text": "hello",
+          "segments": [ { "id": 0, "start": 0.0, "end": 2.0, "text": "hello" } ]
+        }
+        """.data(using: .utf8)!
+        let segments = try RemoteWhisperEngine.parseSegments(data: json)
+        XCTAssertEqual(segments.count, 1)
+        XCTAssertNil(segments[0].speaker,
+                     "Whisper responses have no speaker field — the local diarizer owns labelling there")
+    }
+
     func test_multipartBodyOmitsLanguageWhenAuto() {
         let body = RemoteWhisperEngine.multipartBody(boundary: "B",
                                                      audio: Data(),

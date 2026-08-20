@@ -108,6 +108,18 @@ This uses OpenAI's general-purpose Whisper model (not the ivrit.ai Hebrew
 finetune). Note OpenAI's per-request file-size limit (25 MB at time of writing);
 Mila's `.m4a` encoding keeps roughly 1.5 hours of audio under that.
 
+**Which model to put in that field.** Mila picks the `response_format` from the
+model id, so OpenAI's newer transcription models work too — with one tradeoff:
+
+| Model                       | Timestamps         | Notes                                          |
+|-----------------------------|--------------------|------------------------------------------------|
+| `whisper-1`                 | yes (per segment)  | The safe default. SRT export + local diarization both work. |
+| `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | **no** | Newer, usually more accurate text. These models can only return plain text, so the whole recording arrives as one segment: no SRT timings, and local speaker diarization has nothing to align to. Good for dictation, poor for meetings. |
+| `gpt-4o-transcribe-diarize` | yes (per speaker turn) | Returns speakers itself, so Mila keeps its labels and skips the local pyannote pass. |
+
+The timestamp column is a model limitation, not a Mila one: the `gpt-*`
+transcription models reject every timestamped response format the API offers.
+
 ---
 
 ## Notes & caveats
@@ -126,4 +138,6 @@ Mila's `.m4a` encoding keeps roughly 1.5 hours of audio under that.
   There's no auto-detect: the speaker picks the language in the toolbar, because
   the model is chosen *from* that choice.
 - **Diarization** still runs locally (it reads the on-disk audio), so speaker
-  labels work regardless of which transcription backend you choose.
+  labels work regardless of which transcription backend you choose. The one
+  exception is `gpt-4o-transcribe-diarize`, which diarizes server-side: Mila
+  keeps the speakers it returns rather than relabelling them locally.

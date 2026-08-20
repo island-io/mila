@@ -755,7 +755,19 @@ final class TranscriptionService: ObservableObject {
             }
 
             var enrichedSegments = segments
-            if !speakerTurns.isEmpty {
+            // A server-side diarizer (`gpt-4o-transcribe-diarize`, whose
+            // `diarized_json` segments already carry speakers) has done this
+            // job already, on the whole file, and its labels are the ones the
+            // transcript's own turn boundaries were cut on. The local pyannote
+            // pass ran concurrently with transcription, so we cannot know in
+            // advance whether it will be needed — but overwriting labels the
+            // transcript already has would re-cluster the same audio worse
+            // and, because the offline pass has its own segment boundaries,
+            // silently misalign the result. Server labels win. (issue #180)
+            if Self.hasSpeakerLabels(segments) {
+                let distinct = Set(segments.compactMap(\.speaker)).count
+                print("Transcribe: keeping the \(distinct) server-side speaker labels — not overwriting them with the offline pass")
+            } else if !speakerTurns.isEmpty {
                 for i in enrichedSegments.indices {
                     enrichedSegments[i].speaker = SpeakerDiarizer.assignSpeaker(
                         segmentStart: enrichedSegments[i].start,
@@ -867,6 +879,14 @@ final class TranscriptionService: ObservableObject {
         }
     }
 
+    /// Whether `segments` already carry speaker labels — i.e. whoever produced
+    /// them diarized them too. True for a `diarized_json` response from a
+    /// remote diarization model; false for every local whisper.cpp result and
+    /// for `verbose_json`/`json`, which have no speaker field at all.
+    static func hasSpeakerLabels(_ segments: [TranscriptSegment]) -> Bool {
+        segments.contains { $0.speaker?.isEmpty == false }
+    }
+
     /// Re-key speaker labels in transcript order so the SET of labels
     /// is contiguous `SPEAKER_00`, `SPEAKER_01`, … with no gaps. The
     /// diarizer can return `{SPEAKER_00, SPEAKER_02}` when an
@@ -877,21 +897,10 @@ final class TranscriptionService: ObservableObject {
     /// First-appearance order is preferred over alphabetical so the
     /// person who spoke first is always `SPEAKER_00`.
     static func normalizeSpeakerLabels(in segments: [TranscriptSegment]) -> [TranscriptSegment] {
-        var mapping: [String: String] = [:]
-        var nextIndex = 0
-        var output = segments
-        for i in output.indices {
-            guard let original = output[i].speaker, !original.isEmpty else { continue }
-            if let remapped = mapping[original] {
-                output[i].speaker = remapped
-            } else {
-                let remapped = String(format: "SPEAKER_%02d", nextIndex)
-                mapping[original] = remapped
-                output[i].speaker = remapped
-                nextIndex += 1
-            }
-        }
-        return output
+        // Implementation lives in `SpeakerLabels` so the remote engine — which
+        // has to re-key a server-side diarizer's labels and is not on the main
+        // actor — can share it instead of duplicating it.
+        SpeakerLabels.normalized(in: segments)
     }
 
     private func markFailed(_ recording: Recording) {
