@@ -210,23 +210,12 @@ enum LLMRunner {
         let handle = ProcessHandle()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                // For Live AI's session continuity to work, every tick
-                // must share a CWD so claude's per-CWD session
-                // storage stays addressable. We key the stable
-                // sandbox off the session UUID.
-                let sandboxKey: String? = {
-                    switch session {
-                    case .none: return nil
-                    case .new(let id), .resume(let id): return id.uuidString
-                    }
-                }()
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
                         let outcome = try executeProcess(executable: executable,
                                                          arguments: tool.arguments(prompt: fullPrompt, model: model, session: session) + extraArgs,
                                                          timeout: timeout,
-                                                         handle: handle,
-                                                         sandboxKey: sandboxKey)
+                                                         handle: handle)
                         // The Swift Task that drove us was cancelled mid-flight
                         // — `handle` SIGTERM'd the process, so the user-visible
                         // truth is "we cancelled it", not "the CLI crashed".
@@ -400,8 +389,7 @@ enum LLMRunner {
                         let outcome = try executeProcess(executable: executable,
                                                          arguments: args,
                                                          timeout: timeout,
-                                                         handle: handle,
-                                                         sandboxKey: nil)
+                                                         handle: handle)
                         continuation.resume(returning: LLMTestResult(
                             command: command,
                             succeeded: !outcome.timedOut && outcome.exitCode == 0,
@@ -602,8 +590,7 @@ enum LLMRunner {
     private static func executeProcess(executable: URL,
                                        arguments: [String],
                                        timeout: TimeInterval,
-                                       handle: ProcessHandle,
-                                       sandboxKey: String? = nil) throws -> ProcessOutcome {
+                                       handle: ProcessHandle) throws -> ProcessOutcome {
         let process = Process()
         process.executableURL = executable
         process.arguments = arguments
@@ -614,34 +601,20 @@ enum LLMRunner {
         // surprises users whose claude/cursor wrappers source nvm/asdf/etc.
         process.environment = childEnvironment(for: executable)
 
-        // CRITICAL: spawn in a fresh, empty temp directory. macOS attributes
-        // any file access by the child process to *our* bundle ID, so if
-        // claude / cursor-agent walks the cwd looking for project files
-        // (which both do — particularly cursor-agent in `-f` mode), the user
-        // sees scary TCC prompts saying "Mila would like to access
-        // Desktop / Downloads". Launching from an isolated, empty directory
-        // guarantees there's nothing for the LLM CLI to discover and reach
-        // for, so no permission prompts fire.
+        // CRITICAL: spawn in an empty directory Mila owns — never $HOME, `/`,
+        // or a user folder. macOS attributes any file access by the child
+        // process to *our* bundle ID, so if claude / cursor-agent walks the
+        // cwd looking for project files (which both do — particularly
+        // cursor-agent in `-f` mode), the user sees scary TCC prompts saying
+        // "Mila would like to access Desktop / Downloads". Launching from an
+        // isolated, empty directory guarantees there's nothing for the LLM
+        // CLI to discover and reach for, so no permission prompts fire.
         //
-        // When `sandboxKey` is non-nil we use a STABLE per-key sandbox
-        // instead of a fresh one. claude stores its session jsonl
-        // inside a hash of the CWD — if every tick spawns in a
-        // different sandbox, `--resume <uuid>` errors with "No
-        // conversation with ID …" because the storage lives in the
-        // previous (already-deleted) sandbox. Live AI passes the
-        // session UUID as the key so all ticks share one sandbox; the
-        // caller is responsible for cleaning it up via
-        // `cleanupStableSandbox(key:)` when the session ends.
-        let sandbox: URL
-        let ephemeral: Bool
-        if let key = sandboxKey {
-            sandbox = stableSandboxDirectory(key: key)
-            ephemeral = false
-        } else {
-            sandbox = makeSandboxDirectory()
-            ephemeral = true
-        }
-        process.currentDirectoryURL = sandbox
+        // The directory is SHARED and STABLE across every invocation — see
+        // `sandboxDirectory()` for why (issue #181: claude derives its
+        // `~/.claude/projects/<slug-of-cwd>` project directory from the cwd,
+        // so a per-run cwd leaked a per-run project directory forever).
+        process.currentDirectoryURL = sandboxDirectory()
 
         // Close stdin immediately. Some CLIs (claude) read both stdin AND
         // argv; some (cursor-agent) ignore stdin entirely. We standardised
@@ -653,15 +626,6 @@ enum LLMRunner {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-
-        // Only tear down the sandbox if it was ephemeral. Stable
-        // session sandboxes are cleaned up by the caller when the
-        // Live AI session ends.
-        defer {
-            if ephemeral {
-                try? FileManager.default.removeItem(at: sandbox)
-            }
-        }
 
         do {
             try process.run()
@@ -773,40 +737,66 @@ enum LLMRunner {
                               cancelled: handle.wasTerminated)
     }
 
-    /// Create a brand-new empty directory inside the system temp area. The
-    /// child LLM process is chdir'd here so anything it scans for context
-    /// finds nothing — no popups for Desktop, Downloads, Documents, etc.
-    private static func makeSandboxDirectory() -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("island-mila-llm-\(UUID().uuidString)",
-                                    isDirectory: true)
+    /// The ONE working directory every LLM CLI invocation is chdir'd into.
+    ///
+    /// Two requirements meet here, and a single stable directory is the only
+    /// shape that satisfies both:
+    ///
+    /// 1. **TCC isolation.** The child must start in an empty directory Mila
+    ///    owns, so a CLI that scans its cwd for project context finds nothing
+    ///    and no "Mila would like to access Desktop" prompts fire.
+    /// 2. **One Claude Code project, not one per run** (issue #181). claude
+    ///    stores its conversation transcripts in
+    ///    `~/.claude/projects/<slug-of-cwd>/<session-uuid>.jsonl` — the
+    ///    *project* comes from the cwd, the *session* from the UUID we pass in
+    ///    `--session-id` / `--resume`. The old code handed every invocation
+    ///    its own cwd (`$TMPDIR/island-mila-llm-<UUID>` for one-shots,
+    ///    `$TMPDIR/island-mila-llm-session-<UUID>` for Live AI ticks), so
+    ///    every invocation minted a new project directory under
+    ///    `~/.claude/projects/` — named after a temp path Mila then deleted,
+    ///    never cleaned up, burying the user's real projects in claude's own
+    ///    resume/project pickers. One reporter had 175 of them, 46 MB.
+    ///    A shared cwd collapses all of that into a single project holding
+    ///    one jsonl per run.
+    ///
+    /// Session isolation is unaffected: sessions are keyed by the UUID in
+    /// `--session-id` / `--resume`, not by the cwd, so Live AI's `--resume`
+    /// continuity still works — and the conversations are now actually
+    /// *resumable by hand* (`cd` here, `claude --resume <uuid>`), which the
+    /// old delete-the-cwd design made impossible.
+    ///
+    /// Application Support rather than `$TMPDIR` on purpose: the project slug
+    /// must stay stable across reboots, and macOS both rotates the per-user
+    /// temp directory and periodically purges it — either would fragment the
+    /// project directory again over time.
+    ///
+    /// The directory is created on demand and never removed: `Process.run()`
+    /// fails outright if `currentDirectoryURL` doesn't exist.
+    static func sandboxDirectory() -> URL {
+        let url = sandboxDirectory(appSupportRoot: applicationSupportRoot())
         try? FileManager.default.createDirectory(at: url,
-                                                  withIntermediateDirectories: true)
+                                                 withIntermediateDirectories: true)
         return url
     }
 
-    /// Stable sandbox directory for a Claude session keyed by `key`
-    /// (the session UUID). Reused across every tick of a Live AI
-    /// session so claude's per-CWD session storage stays put and
-    /// `--resume <uuid>` keeps finding the conversation.
-    static func stableSandboxDirectory(key: String) -> URL {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("island-mila-llm-session-\(key)",
-                                    isDirectory: true)
-        try? FileManager.default.createDirectory(at: url,
-                                                  withIntermediateDirectories: true)
-        return url
+    /// Pure path composition, split out so tests can assert the layout
+    /// without touching the real Application Support directory.
+    static func sandboxDirectory(appSupportRoot: URL) -> URL {
+        appSupportRoot
+            .appendingPathComponent("Mila", isDirectory: true)
+            .appendingPathComponent("llm-sandbox", isDirectory: true)
     }
 
-    /// Tear down a stable session sandbox. Safe to call when the
-    /// directory doesn't exist. Should be called by the Live AI
-    /// session when it cancels so /tmp doesn't accumulate stale
-    /// session dirs across recordings.
-    static func cleanupStableSandbox(key: String) {
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("island-mila-llm-session-\(key)",
-                                    isDirectory: true)
-        try? FileManager.default.removeItem(at: url)
+    /// `~/Library/Application Support`, with a temp-directory fallback so a
+    /// pathological environment degrades to "LLM calls still work" rather than
+    /// "LLM calls throw". Mila is not app-sandboxed, so this is the real
+    /// user-domain path (the same one `RecordingStore` uses).
+    private static func applicationSupportRoot() -> URL {
+        if let url = FileManager.default.urls(for: .applicationSupportDirectory,
+                                              in: .userDomainMask).first {
+            return url
+        }
+        return FileManager.default.temporaryDirectory
     }
 
     private static func resolveExecutable(tool: LLMTool,
