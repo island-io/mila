@@ -169,31 +169,44 @@ struct UndoableTextEditor: NSViewRepresentable {
                 undo.refresh()
                 return
             }
-            // Each overwrite is its own undo step. AppKit coalesces consecutive
-            // programmatic replacements into one group, which would make two
-            // Examples picks in a row unwind together on a single Cmd+Z --
-            // surprising, and it loses an intermediate state the user may have
-            // wanted back.
-            textView.breakUndoCoalescing()
-            let full = NSRange(location: 0, length: (textView.string as NSString).length)
-            isApplyingExternalChange = true
-            defer { isApplyingExternalChange = false }
-            guard textView.shouldChangeText(in: full, replacementString: newValue) else {
-                textView.string = newValue
-                undo.refresh()
-                return
+
+            // Register the inverse ourselves rather than going through
+            // `shouldChangeText` + `didChangeText`.
+            //
+            // Letting NSTextView record these was the obvious route and it does
+            // not hold up: its text undo is built for typing, so it coalesces
+            // and groups by event, and two overwrites arriving in one run-loop
+            // pass collapsed into a single step -- one Cmd+Z threw away both,
+            // losing the intermediate prompt. `breakUndoCoalescing()` did not
+            // separate them either, because the grouping is what merges them,
+            // not the coalescing.
+            //
+            // One explicit registration per call is exactly one undo step,
+            // whatever the run loop is doing. Because the undo block calls this
+            // same method, NSUndoManager records *its* registration as the redo,
+            // so redo is symmetric for free. Typing is untouched and keeps using
+            // the text view's own undo on the same manager.
+            let previous = textView.string
+            undo.undoManager.registerUndo(withTarget: self) { coordinator in
+                MainActor.assumeIsolated { coordinator.applyExternalChange(previous) }
             }
-            textView.textStorage?.replaceCharacters(in: full, with: newValue)
-            textView.didChangeText()
-            // Undo of a whole-prompt replacement reads better than the generic
-            // "Undo" the Edit menu would otherwise show.
+            // Reads better in the Edit menu than the generic "Undo".
             undo.undoManager.setActionName("Prompt Change")
+
+            isApplyingExternalChange = true
+            textView.string = newValue
+            isApplyingExternalChange = false
+
+            // The binding is the source of truth for persistence, and an undo
+            // reaching here must push the restored text back out to it.
+            if text.wrappedValue != newValue { text.wrappedValue = newValue }
+
             let end = (newValue as NSString).length
             textView.setSelectedRange(NSRange(location: end, length: 0))
             undo.refresh()
 
             // The click that caused this landed on a link-styled button, so the
-            // insertion point may no longer be here — and ⌘Z only reaches a
+            // insertion point may no longer be here -- and Cmd+Z only reaches a
             // text view that is first responder. Take focus back, but never out
             // from under someone typing in a different field.
             if let window = textView.window, window.isKeyWindow,
