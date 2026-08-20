@@ -53,7 +53,25 @@ final class PromptUndoTests: XCTestCase {
         editor.box.value = new
         editor.coordinator.applyExternalChange(new)
         settle()
+        endEventGroup(editor)
         editor.bridge.refresh()
+    }
+
+    /// Close the undo group the way AppKit would at the end of an event.
+    ///
+    /// `NSUndoManager.groupsByEvent` is true: it opens a group when an AppKit
+    /// event begins and closes it when the event ends. XCTest has no AppKit
+    /// event loop, so that group is never closed here, and every change in a
+    /// test lands in one group -- which made a single `undo()` unwind several
+    /// overwrites at once and looked exactly like an undo bug in the editor.
+    ///
+    /// In the app, each "Reset to default" or Examples click is its own event
+    /// and therefore its own group, so undo steps back one overwrite at a
+    /// time. Closing the group here is what models that; it is a property of
+    /// the harness, not a workaround in the code under test.
+    private func endEventGroup(_ editor: Editor) {
+        let manager = editor.bridge.undoManager
+        while manager.groupingLevel > 0 { manager.endUndoGrouping() }
     }
 
     // MARK: - The two destructive one-click overwrites
