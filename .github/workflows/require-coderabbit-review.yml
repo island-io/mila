@@ -350,34 +350,60 @@ jobs:
             // prefix of the head (as enforced by the pattern) is the head.
             const namesHead = (sha) => head.startsWith(sha.toLowerCase());
 
+            // Does this body carry a commit line whose SECOND sha — the revision
+            // that was read, not the diff base — is the current head?
+            //
+            // Deliberately shared with the rate-limit diagnostics below, because
+            // the notice embeds this line VERBATIM (17 of the 35 commit lines in
+            // the last 70 PRs belong to a notice, not a walkthrough). Two copies
+            // of "does this name the head" would drift, and the copy that drifted
+            // is what #172 fixed.
+            //
+            // `lastIndex` is reset because the pattern is /g: `matchAll` seeds
+            // its iterator from wherever a previous call left the index.
+            function commentNamesHead(body) {
+              REVIEWED_BETWEEN_RE.lastIndex = 0;
+              for (const m of (body ?? '').matchAll(REVIEWED_BETWEEN_RE)) {
+                if (namesHead(m[2])) return true;
+              }
+              return false;
+            }
+
             const walkthroughComment = comments.filter(byBot).find((c) => {
               const body = c.body ?? '';
               if (RATE_LIMIT_RE.test(body) || NOT_A_VERDICT_RE.test(body)) return false;
               if (!VERDICT_RE.test(body)) return false;
-              REVIEWED_BETWEEN_RE.lastIndex = 0;
-              for (const m of body.matchAll(REVIEWED_BETWEEN_RE)) {
-                if (namesHead(m[2])) return true;
-              }
-              return false;
+              return commentNamesHead(body);
             });
 
-            // ---- rate-limit notice: the OPPOSITE of a review. Surfaced so a
-            // human reading the red check knows the bot was blocked by quota
-            // rather than broken. CodeRabbit edits its summary comment in place,
-            // so prefer a notice that names the current head.
+            // ---- rate-limit notice: the OPPOSITE of a review. DIAGNOSTICS ONLY
+            // — surfaced so a human reading the red check knows the bot was
+            // blocked by quota rather than broken. Nothing below section 5 reads
+            // it; the pass/fail decision is made by the four signals above and
+            // this cannot move it either way.
+            //
+            // A notice describes the LIVE state only if its commit line names the
+            // current head, matched by exactly the rule signal (d) uses: the
+            // second sha of the range, full or abbreviated.
+            //
+            // There is deliberately NO fallback to "the newest notice on the PR".
+            // CodeRabbit edits its summary comment in place and old notices linger
+            // forever, so the fallback reported a genuinely unreviewed new head as
+            // quota-blocked and sent the reader off to wait out a countdown that
+            // had already expired (#172). A notice that names only an older
+            // revision is reported as exactly that, further down.
             const rateLimited = comments.filter(byBot).filter((c) =>
               RATE_LIMIT_RE.test(c.body ?? ''),
             );
-            const activeLimit =
-              rateLimited.find((c) => (c.body ?? '').includes(head)) ??
-              rateLimited[rateLimited.length - 1];
+            const activeLimit = rateLimited.find((c) => commentNamesHead(c.body));
 
             core.info(
               `signals — review@head:${reviewAtHead ? 'yes' : 'no'} ` +
                 `inline@head:${inlineAtHead.length} ` +
                 `verdict:${verdictComment ? 'yes' : 'no'} ` +
                 `walkthrough@head:${walkthroughComment ? 'yes' : 'no'} ` +
-                `rateLimitNotices:${rateLimited.length}`,
+                `rateLimitNotices:${rateLimited.length} ` +
+                `rateLimit@head:${activeLimit ? 'yes' : 'no'}`,
             );
 
             // ---- 5. verdict -------------------------------------------------
@@ -422,21 +448,32 @@ jobs:
 
             if (activeLimit) {
               const countdown = countdownFrom(activeLimit.body);
-              const stale = !(activeLimit.body ?? '').includes(head);
               lines.push(
                 '> [!WARNING]',
                 "> **CodeRabbit was rate-limited, not silent.** It posted a",
-                `> [\"Review limit reached\" notice](${activeLimit.html_url}): the`,
-                "> account hit its per-user PR review quota, so the review never",
-                '> started.',
+                `> [\"Review limit reached\" notice](${activeLimit.html_url}) naming`,
+                `> this very commit (\`${shortHead}\`): the account hit its per-user`,
+                '> PR review quota, so the review never started.',
                 countdown
-                  ? `> **Next review available in:** ${countdown}${
-                      stale ? ' _(from an earlier revision — may have elapsed)_' : ''
-                    }`
+                  ? `> **Next review available in:** ${countdown} _(counted from ` +
+                      'when that notice was posted)_'
                   : '> No countdown was given in the notice.',
                 '>',
                 '> Note that the separate `CodeRabbit` status check goes **green**',
                 '> in this situation. It is not a review.',
+                '',
+              );
+            } else if (rateLimited.length > 0) {
+              // Stale notices are worth naming explicitly: left unexplained, the
+              // reader finds them on the PR and concludes "rate-limited" anyway,
+              // which is the misdiagnosis this whole change exists to stop.
+              lines.push(
+                '> [!NOTE]',
+                `> This PR carries ${rateLimited.length} CodeRabbit rate-limit`,
+                `> notice(s), but none of them names \`${shortHead}\` — they were`,
+                '> left on earlier revisions, and their countdowns have very likely',
+                '> elapsed. Do not read them as the current state: as far as this',
+                '> check can tell, nothing is blocking a review of this head.',
                 '',
               );
             }

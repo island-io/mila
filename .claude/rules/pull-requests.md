@@ -65,18 +65,30 @@ review.
 ### Triaging a red "CodeRabbit reviewed head"
 
 Read the job log line `signals — review@head:… inline@head:… verdict:…
-walkthrough@head:… rateLimitNotices:…`, then:
+walkthrough@head:… rateLimitNotices:… rateLimit@head:…`, then:
 
-- `review@head:no`, `inline@head:0`, `verdict:no`, `walkthrough@head:no`, **and
-  a rate-limit notice that names the current head** → **quota stall**, not a
-  gap. The count alone is not enough: `rateLimitNotices` tallies every notice on
-  the PR, including ones left on older heads, so a stale notice can dress a real
-  review gap up as a quota problem. Check that a notice names *this* head. See
-  *The quota is per PR author* below.
-- same signals, but no rate-limit notice naming the head, and CodeRabbit has
-  plainly commented on the head → likely a **detector gap**; check the comment
-  against the four signals below before assuming the bot misbehaved.
+- all four review signals negative (`review@head:no`, `inline@head:0`,
+  `verdict:no`, `walkthrough@head:no`) **and `rateLimit@head:yes`** → **quota
+  stall**, not a gap: a "Review limit reached" notice whose commit line names
+  *this* head. The check's own comment links that notice and quotes its
+  countdown. See *The quota is per PR author* below.
+- all four negative, `rateLimit@head:no`, but `rateLimitNotices` non-zero →
+  **not** a quota stall, however much it looks like one. Those notices sit on
+  earlier revisions — CodeRabbit edits its summary comment in place, so they
+  linger on the PR forever — and their countdowns have almost certainly
+  elapsed. The check says as much in its comment; do not read an old countdown
+  as the live state.
+- all four negative, `rateLimit@head:no`, and CodeRabbit has plainly commented
+  on the head → likely a **detector gap**; check the comment against the four
+  signals below before assuming the bot misbehaved.
 - otherwise → **a real gap**: the head genuinely has no review.
+
+Only `rateLimit@head` is head-matched. `rateLimitNotices` is a raw count of
+every notice on the PR, and reading the count as the live state is what produced
+two wrong diagnoses before #172: once a stale notice was believed over a
+genuinely unreviewed head, once a real stall on a short-SHA notice looked like a
+detector gap. The head match now uses the same second-SHA, full-or-abbreviated
+rule as signal 4 below, via one shared helper so the two cannot drift.
 
 ### Do not trust the `CodeRabbit` status check
 
