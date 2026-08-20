@@ -161,6 +161,20 @@ struct UndoableTextEditor: NSViewRepresentable {
         /// into the binding through `textDidChange`.
         func applyExternalChange(_ newValue: String) {
             guard let textView else { return }
+            // A re-render that changes nothing must not push an undo step.
+            // `updateNSView` already compares before calling, but this method is
+            // the whole entry point for external edits, so it owns the invariant
+            // rather than trusting every caller to remember it.
+            guard textView.string != newValue else {
+                undo.refresh()
+                return
+            }
+            // Each overwrite is its own undo step. AppKit coalesces consecutive
+            // programmatic replacements into one group, which would make two
+            // Examples picks in a row unwind together on a single Cmd+Z --
+            // surprising, and it loses an intermediate state the user may have
+            // wanted back.
+            textView.breakUndoCoalescing()
             let full = NSRange(location: 0, length: (textView.string as NSString).length)
             isApplyingExternalChange = true
             defer { isApplyingExternalChange = false }
