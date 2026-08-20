@@ -239,7 +239,6 @@ final class LiveAISession: ObservableObject {
     /// Cancel any in-flight call and clear state. Called when the
     /// recording stops or live AI mode is toggled off mid-recording.
     func cancel() {
-        let inFlightHandle = inFlight
         inFlight?.cancel()
         inFlight = nil
         coalesced = false
@@ -260,19 +259,12 @@ final class LiveAISession: ObservableObject {
         pendingKickTask = nil
         lastKickStartedAt = nil
         isFinalizing = false
-        // Wipe the per-session stable sandbox dir LLMRunner created so
-        // /tmp doesn't accumulate one folder per recording. The child
-        // claude subprocess receives SIGTERM via the cancelled Task,
-        // but exit is async — wait for the Task's continuation to
-        // complete before removing the sandbox so we don't rip the
-        // CWD out from under the still-living process.
-        if let id = sessionID {
-            let key = id.uuidString
-            Task.detached(priority: .utility) {
-                _ = await inFlightHandle?.value
-                LLMRunner.cleanupStableSandbox(key: key)
-            }
-        }
+        // No sandbox teardown to do: every LLM invocation now shares the one
+        // stable CWD `LLMRunner.sandboxDirectory()` owns (issue #181), so
+        // there is no per-session directory to accumulate or to wipe. The
+        // conversation itself lives in claude's own store, keyed by the
+        // session UUID — deliberately left in place so a bad summary can be
+        // re-read later with `claude --resume <uuid>`.
         sessionID = nil
         sessionEstablished = false
         lastTranscriptSent = ""
@@ -390,17 +382,6 @@ final class LiveAISession: ObservableObject {
             sessionID = UUID()
             sessionEstablished = false
             lastTranscriptSent = ""
-            // The abandoned session's stable sandbox is nobody's job
-            // otherwise: `cancel()` only cleans up the CURRENT sessionID.
-            // Safe to remove now — `kick()` only runs with no call in
-            // flight, so no live child process is chdir'd into it. Off the
-            // main actor for the same reason `cancel()` defers it: a
-            // recursive directory removal is a blocking syscall and this is
-            // the tick path.
-            let staleKey = stale.uuidString
-            Task.detached(priority: .utility) {
-                LLMRunner.cleanupStableSandbox(key: staleKey)
-            }
         }
         let prompt = Self.promptWithContext(
             liveAISettings.prompt

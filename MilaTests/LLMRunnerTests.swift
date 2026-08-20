@@ -43,12 +43,17 @@ final class LLMRunnerTests: XCTestCase {
     /// directory — never the user's $HOME or `/` — because macOS attributes
     /// the child's file access to *our* bundle ID and the user would see
     /// scary prompts for any folder the LLM CLI happens to scan.
-    func test_runner_spawns_child_in_isolated_temp_directory() async throws {
-        // Script prints its cwd and lists the entries it sees there.
+    func test_runner_spawns_child_in_isolated_empty_directory() async throws {
+        // Script prints its cwd and counts the entries it sees there.
+        // Deliberately `ls` and not `ls -A`: since #181 the sandbox is shared
+        // and persistent, so an LLM CLI is free to leave its own dot-files
+        // (`.claude/`) behind. What must stay true is that the child sees no
+        // *user* content — which is what a visible-entry count proves, and it
+        // still fails loudly if the cwd ever became $HOME or a user folder.
         let script = makeScript("""
             #!/bin/sh
             printf 'cwd=%s\\n' "$PWD"
-            printf 'entries=%s\\n' "$(ls -A 2>/dev/null | wc -l | tr -d ' ')"
+            printf 'entries=%s\\n' "$(ls 2>/dev/null | wc -l | tr -d ' ')"
             """)
         defer { try? FileManager.default.removeItem(at: script) }
         let out = try await LLMRunner.run(
@@ -61,14 +66,13 @@ final class LLMRunnerTests: XCTestCase {
                        "Child spawned in $HOME: \(out)")
         XCTAssertFalse(out.contains("cwd=/\n"),
                        "Child spawned in /: \(out)")
-        // It SHOULD be empty — proving there's nothing for the LLM to scan.
+        // It SHOULD hold nothing visible — proving there's nothing for the
+        // LLM to scan and reach for.
         XCTAssertTrue(out.contains("entries=0"),
                       "Sandbox directory is not empty: \(out)")
-        // And it should be under the temp dir.
-        let tempRoot = FileManager.default.temporaryDirectory.path
-            .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        XCTAssertTrue(out.contains(tempRoot),
-                      "Child cwd is not under temporary directory: \(out)")
+        // And it must be the one directory Mila owns for this.
+        XCTAssertTrue(out.contains("cwd=\(LLMRunner.sandboxDirectory().path)\n"),
+                      "Child cwd is not the shared LLM sandbox: \(out)")
     }
 
     /// The transcript travels in argv (via `composedPrompt`), not stdin —

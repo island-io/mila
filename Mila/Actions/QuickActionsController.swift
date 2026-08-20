@@ -853,20 +853,19 @@ final class QuickActionsController: ObservableObject {
         // snapshot above, because `cancel()` clears `summary` /
         // `actionItems` and those are what we just saved.
         //
-        // Left running, the session outlives the recording in two ways:
+        // Left running, the session outlives the recording: a
+        // `pendingKickTask` sleeping out the min-interval floor wakes up
+        // after the meeting is over and spawns a full `claude --resume`
+        // subprocess whose result lands on a Recording that was already
+        // written — observed 2026-07-26: stop at 13:33:58, a tick at
+        // 13:34:49. `finalizeTail` regenerates the summary from the complete
+        // transcript anyway, so that call was never anything but waste.
         //
-        //   1. A `pendingKickTask` sleeping out the min-interval floor
-        //      wakes up after the meeting is over and spawns a full
-        //      `claude --resume` subprocess whose result lands on a
-        //      Recording that was already written — observed 2026-07-26:
-        //      stop at 13:33:58, a tick at 13:34:49. `finalizeTail`
-        //      regenerates the summary from the complete transcript
-        //      anyway, so that call was never anything but waste.
-        //   2. The session's stable sandbox
-        //      (`/tmp/island-mila-llm-session-<uuid>`, plus a
-        //      `~/.claude/projects/` dir per recording) is only removed by
-        //      `cancel()` — so it survived until the NEXT recording called
-        //      `start()`, and forever if the app quit first.
+        // (There used to be a second reason: the session's per-recording
+        // stable sandbox, and the `~/.claude/projects/` directory it minted,
+        // were only removed by `cancel()`. Issue #181 replaced both with the
+        // one shared CWD `LLMRunner.sandboxDirectory()` owns, so there is
+        // nothing per-recording left to leak.)
         //
         // Not done in `wireLiveAIPipeline`'s `.idle` handler: that fires
         // during `session.stop()` above, i.e. BEFORE the snapshot, and it
