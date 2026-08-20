@@ -57,7 +57,11 @@ final class PromptUndoTests: XCTestCase {
         editor.bridge.refresh()
     }
 
-    /// Close the undo group the way AppKit would at the end of an event.
+    /// Tidies up any group AppKit would have closed at the end of an event.
+    ///
+    /// This is housekeeping, not the fix -- an earlier commit of mine claimed
+    /// otherwise and was wrong. `applyExternalChange` now opens and closes its
+    /// own group, so undo steps are already one-per-overwrite here.
     ///
     /// `NSUndoManager.groupsByEvent` is true: it opens a group when an AppKit
     /// event begins and closes it when the event ends. XCTest has no AppKit

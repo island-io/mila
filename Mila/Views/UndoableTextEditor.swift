@@ -187,11 +187,22 @@ struct UndoableTextEditor: NSViewRepresentable {
             // so redo is symmetric for free. Typing is untouched and keeps using
             // the text view's own undo on the same manager.
             let previous = textView.string
+            // The group has to be opened explicitly. `groupsByEvent` is true,
+            // which means NSUndoManager expects an AppKit event to have opened
+            // one -- and `registerUndo` *throws*
+            // ("must begin a group before registering undo") when nothing has.
+            // In the app an event is always in flight so it happens to work;
+            // anywhere without an event loop it does not. Owning the group here
+            // also makes each overwrite exactly one undo step, which is the
+            // behaviour we actually want: two Examples picks take two presses
+            // to walk back.
+            undo.undoManager.beginUndoGrouping()
             undo.undoManager.registerUndo(withTarget: self) { coordinator in
                 MainActor.assumeIsolated { coordinator.applyExternalChange(previous) }
             }
             // Reads better in the Edit menu than the generic "Undo".
             undo.undoManager.setActionName("Prompt Change")
+            undo.undoManager.endUndoGrouping()
 
             isApplyingExternalChange = true
             textView.string = newValue
