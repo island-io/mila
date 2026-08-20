@@ -219,9 +219,23 @@ struct UndoableTextEditor: NSViewRepresentable {
             // The click that caused this landed on a link-styled button, so the
             // insertion point may no longer be here -- and Cmd+Z only reaches a
             // text view that is first responder. Take focus back, but never out
-            // from under someone typing in a different field.
-            if let window = textView.window, window.isKeyWindow,
-               !(window.firstResponder is NSTextView) {
+            // from under someone typing elsewhere.
+            //
+            // Deferred to the next main-queue turn because this method also runs
+            // from `updateNSView`: changing first responder mid-update ends
+            // editing in other AppKit views and can publish state changes inside
+            // the same SwiftUI pass.
+            //
+            // The guard tests `NSText`, not `NSTextView`. A focused NSTextField
+            // is represented by its *field editor*, which IS an NSTextView, so an
+            // NSTextView-only check reads "someone is editing a text field" as
+            // "nobody is editing" and steals their focus -- the opposite of what
+            // this is for.
+            DispatchQueue.main.async { [weak textView] in
+                guard let textView, let window = textView.window, window.isKeyWindow
+                else { return }
+                if window.firstResponder === textView { return }
+                guard !(window.firstResponder is NSText) else { return }
                 window.makeFirstResponder(textView)
             }
         }
