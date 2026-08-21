@@ -1,6 +1,45 @@
 import Foundation
 import os
 
+/// Unified-log destination for every LLM invocation. Same subsystem as the
+/// rest of the app so `log stream --predicate 'subsystem == "…"'` catches
+/// runner lines alongside the callers' own lifecycle lines
+/// (`PostRecordingCoordinator`, `RecordingSummarizer`).
+///
+/// File-level rather than a member of `LLMRunner` so `ProcessHandle` and the
+/// error types can reach it too, matching `PostRecordingCoordinator`'s
+/// `postRecordingLog`.
+private let llmRunnerLog = os.Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                     category: "LLMRunner")
+
+/// Which product surface an LLM invocation belongs to.
+///
+/// Exists purely for observability: without it every line in the log reads
+/// "some CLI ran", and the question users actually ask — "did the *title*
+/// generation fire for this recording?" — stays unanswerable. `LLMRunner`
+/// itself behaves identically for every case.
+///
+/// `rawValue`s are the log tokens, so they are deliberately short, lowercase,
+/// and stable — grep-ability is the whole point, and renaming one silently
+/// breaks anyone's saved log predicate.
+enum LLMFeature: String {
+    /// Recording title suggestion (rename sheet's "Suggest", and the
+    /// hands-off auto-title in `PostRecordingCoordinator`).
+    case name
+    /// The automatic post-transcription summary (`RecordingSummarizer`).
+    case summary
+    /// The user-triggered "Send to <tool>" post-recording action.
+    case action
+    /// Live AI's periodic in-meeting tick.
+    case liveAI = "live-ai"
+    /// Settings → AI Provider's "Test" button (the `diagnose` path).
+    case settingsTest = "settings-test"
+    /// Caller didn't say. Present so adding the parameter couldn't break any
+    /// existing call site — a line tagged this way means a caller wasn't
+    /// updated, which is itself worth seeing in the log.
+    case unspecified
+}
+
 /// Errors surfaced from the CLI invocation. The Settings UI / rename sheet
 /// renders `errorDescription` directly so users can self-diagnose path /
 /// permission issues without reading logs.
@@ -142,6 +181,11 @@ enum LLMRunner {
     ///
     /// `timeout` defaults to 5 minutes. Pass a smaller value for foreground
     /// callers that block UI (e.g. the Suggest button).
+    ///
+    /// `feature` only tags the unified-log lines this call emits — it changes
+    /// no behaviour. It is the LAST parameter (rather than the first, where it
+    /// would read better) because Swift requires arguments in declaration
+    /// order: appending it keeps every existing call site compiling untouched.
     static func run(tool: LLMTool,
                     prompt: String,
                     transcript: String,
@@ -163,8 +207,13 @@ enum LLMRunner {
                     openAIAPIKey: String? = nil,
                     jsonMode: Bool = false,
                     temperature: Double? = nil,
-                    transport: OpenAITransport? = nil) async throws -> String {
-        guard tool != .none else { throw LLMRunnerError.toolDisabled }
+                    transport: OpenAITransport? = nil,
+                    feature: LLMFeature = .unspecified) async throws -> String {
+        guard tool != .none else {
+            logSetupFailure(feature: feature, tool: tool,
+                            error: LLMRunnerError.toolDisabled)
+            throw LLMRunnerError.toolDisabled
+        }
 
         // OpenAI-compatible HTTP path — handled before any CLI resolution, so
         // `executablePathOverride` / `session` / `extraArgs` (CLI-only) are
@@ -174,7 +223,11 @@ enum LLMRunner {
         if tool == .openaiCompatible {
             guard let baseURL = openAIBaseURL,
                   !baseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            else { throw LLMRunnerError.toolDisabled }
+            else {
+                logSetupFailure(feature: feature, tool: tool,
+                                error: LLMRunnerError.toolDisabled)
+                throw LLMRunnerError.toolDisabled
+            }
             let t = transport ?? URLSessionTransport(URLSession.shared)
             return try await runOpenAICompatible(prompt: prompt,
                                                  transcript: transcript,
@@ -185,21 +238,41 @@ enum LLMRunner {
                                                  apiKey: openAIAPIKey ?? "",
                                                  jsonMode: jsonMode,
                                                  temperature: temperature,
-                                                 transport: t)
+                                                 transport: t,
+                                                 feature: feature)
         }
 
-        let executable = try resolveExecutable(tool: tool,
+        let executable: URL
+        do {
+            executable = try resolveExecutable(tool: tool,
                                                override: executablePathOverride)
+        } catch {
+            // A stale or missing executable path is the single most common
+            // real-world failure, and it never reaches `executeProcess` — so
+            // without this it produced no log line whatsoever.
+            logSetupFailure(feature: feature, tool: tool, error: error)
+            throw error
+        }
         let fullPrompt = composedPrompt(prompt, transcript: transcript, summary: summary)
-        let modelTag = (model?.isEmpty ?? true) ? "(default)" : (model ?? "")
-        let sessionTag: String = {
-            switch session {
-            case .none: return "none"
-            case .new(let id): return "new:\(id.uuidString.prefix(8))"
-            case .resume(let id): return "resume:\(id.uuidString.prefix(8))"
-            }
-        }()
-        print("LLMRunner: \(executable.lastPathComponent) model=\(modelTag) session=\(sessionTag) prompt=\(fullPrompt.count)c timeout=\(Int(timeout))s")
+        let arguments = tool.arguments(prompt: fullPrompt,
+                                       model: model,
+                                       session: session) + extraArgs
+        let command = redactedCommand(executable: executable,
+                                      arguments: arguments,
+                                      prompt: fullPrompt)
+        let started = Date()
+        logRunStart(feature: feature,
+                    tool: tool,
+                    executable: executable,
+                    model: model,
+                    session: session,
+                    extraArgsCount: extraArgs.count,
+                    promptChars: prompt.count,
+                    summaryChars: summary.count,
+                    transcriptChars: transcript.count,
+                    composedChars: fullPrompt.count,
+                    timeout: timeout,
+                    command: command)
         // ProcessHandle bridges Swift task cancellation to the underlying
         // `Process`. The continuation thread `attach`es the real Process
         // once it's spawned; if the Task was already cancelled by then
@@ -213,9 +286,21 @@ enum LLMRunner {
                 DispatchQueue.global(qos: .userInitiated).async {
                     do {
                         let outcome = try executeProcess(executable: executable,
-                                                         arguments: tool.arguments(prompt: fullPrompt, model: model, session: session) + extraArgs,
+                                                         arguments: arguments,
                                                          timeout: timeout,
                                                          handle: handle)
+                        // Log the FULL outcome — exit code, stderr tail, byte
+                        // counts — before the throw below collapses it into a
+                        // single localized sentence. This is the "route real
+                        // runs through the capture `diagnose` uses" half of
+                        // issue #175: `run`'s contract still throws, but the
+                        // exit code and stderr no longer vanish with it.
+                        logRunEnd(feature: feature,
+                                  tool: tool,
+                                  outcome: outcome,
+                                  duration: Date().timeIntervalSince(started),
+                                  timeout: timeout,
+                                  command: command)
                         // The Swift Task that drove us was cancelled mid-flight
                         // — `handle` SIGTERM'd the process, so the user-visible
                         // truth is "we cancelled it", not "the CLI crashed".
@@ -231,6 +316,13 @@ enum LLMRunner {
                             continuation.resume(returning: outcome.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
                         }
                     } catch {
+                        // Only `launchFailed` reaches here (the executable
+                        // resolved but `Process.run()` refused).
+                        logLaunchFailure(feature: feature,
+                                         tool: tool,
+                                         duration: Date().timeIntervalSince(started),
+                                         command: command,
+                                         error: error)
                         continuation.resume(throwing: error)
                     }
                 }
@@ -268,7 +360,8 @@ enum LLMRunner {
                                     apiKey: String,
                                     jsonMode: Bool,
                                     temperature: Double?,
-                                    transport: OpenAITransport) async throws -> String {
+                                    transport: OpenAITransport,
+                                    feature: LLMFeature = .unspecified) async throws -> String {
         // `makeRequest` throws `OpenAIRequestError.invalidEndpoint` for a
         // malformed base URL (issue celarent7/mila#1). It's an
         // `OpenAIRequestError`, so the typed-rethrow catch below surfaces it
@@ -282,6 +375,22 @@ enum LLMRunner {
                                                jsonMode: jsonMode,
                                                temperature: temperature)
         if timeout > 0 { request.timeoutInterval = timeout }
+        // Host only, never the full URL: a user's endpoint can carry a token
+        // in its query string, and the privacy rule is "no secrets in logged
+        // URLs". The host is enough to tell "wrong endpoint" from "endpoint
+        // rejected us".
+        let host = URL(string: baseURL)?.host ?? "(unparsed)"
+        let started = Date()
+        llmRunnerLog.notice("""
+            llm http start feature=\(feature.rawValue, privacy: .public) \
+            host=\(host, privacy: .public) \
+            model=\(modelTag(model), privacy: .public) \
+            prompt=\(prompt.count, privacy: .public)c \
+            summary=\(summary.count, privacy: .public)c \
+            transcript=\(transcript.count, privacy: .public)c \
+            jsonMode=\(jsonMode, privacy: .public) \
+            timeout=\(Int(timeout.rounded(.up)), privacy: .public)s
+            """)
 
         do {
             // Already cancelled before we even dispatch (e.g. the rename sheet
@@ -299,24 +408,48 @@ enum LLMRunner {
                 // Re-check after the (possibly slow) transport returned: a
                 // late response to a cancelled task shouldn't be delivered.
                 try Task.checkCancellation()
+                llmRunnerLog.notice("""
+                    llm http end feature=\(feature.rawValue, privacy: .public) \
+                    host=\(host, privacy: .public) \
+                    status=\(http.statusCode, privacy: .public) \
+                    duration=\(durationTag(Date().timeIntervalSince(started)), privacy: .public)s \
+                    response=\(content.count, privacy: .public)c
+                    """)
                 return content
             case .failure(let error):
                 throw error
             }
         } catch let error as OpenAIRequestError {
+            logHTTPFailure(feature: feature, host: host,
+                           duration: Date().timeIntervalSince(started), error: error)
             throw error
         } catch is CancellationError {
+            // Not a failure — the user closed the sheet / discarded the
+            // recording. Debug level so it's there when someone asks "why did
+            // my summary never appear?" without adding noise to normal runs.
+            llmRunnerLog.debug("""
+                llm http cancelled feature=\(feature.rawValue, privacy: .public) \
+                host=\(host, privacy: .public) \
+                duration=\(durationTag(Date().timeIntervalSince(started)), privacy: .public)s
+                """)
             throw LLMRunnerError.cancelled
         } catch let urlError as URLError {
             switch urlError.code {
             case .cancelled:
                 throw LLMRunnerError.cancelled
             case .timedOut:
+                logHTTPFailure(feature: feature, host: host,
+                               duration: Date().timeIntervalSince(started),
+                               error: LLMRunnerError.timedOut(seconds: Int(timeout.rounded(.up))))
                 throw LLMRunnerError.timedOut(seconds: Int(timeout.rounded(.up)))
             default:
+                logHTTPFailure(feature: feature, host: host,
+                               duration: Date().timeIntervalSince(started), error: urlError)
                 throw LLMRunnerError.launchFailed(urlError)
             }
         } catch {
+            logHTTPFailure(feature: feature, host: host,
+                           duration: Date().timeIntervalSince(started), error: error)
             throw LLMRunnerError.launchFailed(error)
         }
     }
@@ -349,8 +482,11 @@ enum LLMRunner {
                          openAIBaseURL: String? = nil,
                          openAIAPIKey: String? = nil,
                          jsonMode: Bool = false,
-                         transport: OpenAITransport? = nil) async -> LLMTestResult {
+                         transport: OpenAITransport? = nil,
+                         feature: LLMFeature = .settingsTest) async -> LLMTestResult {
         guard tool != .none else {
+            logSetupFailure(feature: feature, tool: tool,
+                            error: LLMRunnerError.toolDisabled)
             return LLMTestResult(setupError: LLMRunnerError.toolDisabled.errorDescription ?? "No LLM configured.")
         }
         // OpenAI HTTP path — handled before CLI resolution, so no
@@ -371,12 +507,32 @@ enum LLMRunner {
             executable = try resolveExecutable(tool: tool, override: executablePathOverride)
         } catch {
             let msg = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+            logSetupFailure(feature: feature, tool: tool, error: error)
             return LLMTestResult(setupError: msg)
         }
         let fullPrompt = composedPrompt(prompt, transcript: transcript, summary: summary)
         let args = tool.arguments(prompt: fullPrompt, model: model) + extraArgs
+        // The panel's copy-pasteable command keeps the real prompt — it is
+        // shown only to the user who owns the transcript, in their own UI. The
+        // *logged* command is the redacted twin below; the two must not be
+        // confused.
         let command = ([executable.path] + args).map(shellQuote).joined(separator: " ")
+        let loggedCommand = redactedCommand(executable: executable,
+                                            arguments: args,
+                                            prompt: fullPrompt)
         let start = Date()
+        logRunStart(feature: feature,
+                    tool: tool,
+                    executable: executable,
+                    model: model,
+                    session: .none,
+                    extraArgsCount: extraArgs.count,
+                    promptChars: prompt.count,
+                    summaryChars: summary.count,
+                    transcriptChars: transcript.count,
+                    composedChars: fullPrompt.count,
+                    timeout: timeout,
+                    command: loggedCommand)
         // Bridge Task cancellation to the child process, same as `run` — if
         // the test is cancelled (Settings closed, a newer run started), SIGTERM
         // the CLI instead of leaving it alive until the timeout.
@@ -390,6 +546,12 @@ enum LLMRunner {
                                                          arguments: args,
                                                          timeout: timeout,
                                                          handle: handle)
+                        logRunEnd(feature: feature,
+                                  tool: tool,
+                                  outcome: outcome,
+                                  duration: elapsed(),
+                                  timeout: timeout,
+                                  command: loggedCommand)
                         continuation.resume(returning: LLMTestResult(
                             command: command,
                             succeeded: !outcome.timedOut && outcome.exitCode == 0,
@@ -401,6 +563,11 @@ enum LLMRunner {
                     } catch {
                         // Only `launchFailed` reaches here now.
                         let msg = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+                        logLaunchFailure(feature: feature,
+                                         tool: tool,
+                                         duration: elapsed(),
+                                         command: loggedCommand,
+                                         error: error)
                         continuation.resume(returning: LLMTestResult(
                             command: command,
                             durationSeconds: elapsed(),
@@ -575,6 +742,223 @@ enum LLMRunner {
         return "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
+    // MARK: - Observability (issue #175)
+    //
+    // Everything below exists so a failed title / summary / Send leaves an
+    // artifact behind. The hard constraint is that a transcript must NEVER
+    // reach the unified log: it is meeting content, the log is world-readable
+    // to anything with the right entitlement, and it persists for days. So the
+    // rule enforced here is *shape*, not annotation discipline: the only
+    // strings that reach a `Logger` call are ones these pure helpers built out
+    // of metadata. Prompt, summary and transcript appear as `.count` and
+    // nothing else.
+    //
+    // Every interpolation is `privacy: .public` on purpose. `.private` would
+    // render as `<private>` for the very person reading their own log with
+    // `/usr/bin/log show`, which is the entire audience — so a field is either
+    // safe to be public or it is not logged at all.
+
+    /// Cap on the stderr excerpt copied into a failure log line. Generous
+    /// enough for a stack-trace-ish CLI error, small enough that a CLI which
+    /// dumps megabytes to stderr can't flood the log.
+    static let stderrLogLimit = 512
+
+    /// `model=` token. Distinguishes "the CLI picked its own default" from
+    /// "we pinned one", which matters because a wrong pinned model is a
+    /// common cause of a non-zero exit.
+    static func modelTag(_ model: String?) -> String {
+        let trimmed = model?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? "(default)" : trimmed
+    }
+
+    /// `session=` token. Only the first 8 characters of the UUID: enough to
+    /// correlate a `--resume` chain across lines (and with the jsonl filename
+    /// under `~/.claude/projects/`) without making the line unreadable.
+    static func sessionTag(_ session: LLMSession) -> String {
+        switch session {
+        case .none: return "none"
+        case .new(let id): return "new:\(id.uuidString.prefix(8))"
+        case .resume(let id): return "resume:\(id.uuidString.prefix(8))"
+        }
+    }
+
+    /// Fixed 2-decimal seconds, so durations line up when scanning a log and
+    /// a sub-second run doesn't print as `0.0009999999`.
+    static func durationTag(_ seconds: TimeInterval) -> String {
+        String(format: "%.2f", seconds)
+    }
+
+    /// The argv we launched, shell-quoted for readability, with the composed
+    /// prompt replaced by `<prompt:Nc>`.
+    ///
+    /// This is the log-safe twin of `diagnose`'s `command`. The real command
+    /// line is *mostly* metadata a user needs (which binary, which flags,
+    /// which `--session-id`, which extra args they typed) plus exactly one
+    /// argument that is the meeting transcript. Redacting that one argument
+    /// keeps the diagnostically useful 95% loggable. The result is
+    /// deliberately NOT copy-pasteable — the placeholder is unquoted so it
+    /// can't be mistaken for a runnable command.
+    static func redactedCommand(executable: URL,
+                                arguments: [String],
+                                prompt: String) -> String {
+        let redacted = arguments.map { arg -> String in
+            // Empty-prompt guard: without it an empty `prompt` would match
+            // every empty argument in argv and redact unrelated tokens.
+            if !prompt.isEmpty && arg == prompt {
+                return "<prompt:\(prompt.count)c>"
+            }
+            return shellQuote(arg)
+        }
+        return ([shellQuote(executable.path)] + redacted).joined(separator: " ")
+    }
+
+    /// One-line, bounded excerpt of a CLI's stderr for a failure log line.
+    ///
+    /// Keeps the **tail**: CLIs print the fatal error last, after any
+    /// progress/warning chatter. Newlines are folded to ` | ` because a
+    /// multi-line unified-log entry is painful to read and impossible to grep.
+    ///
+    /// Logged `.public` — a defensible line to draw, because the *same* stderr
+    /// already reaches the log in full today: `LLMRunnerError.nonZeroExit`
+    /// embeds it verbatim in `errorDescription`, and
+    /// `PostRecordingCoordinator` logs that as `.public`. A bounded excerpt is
+    /// therefore strictly less exposure than the status quo, and it is CLI
+    /// diagnostic output rather than user content.
+    static func stderrTail(_ stderr: String, limit: Int = stderrLogLimit) -> String {
+        let flattened = stderr
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " | ")
+        guard flattened.count > limit else { return flattened }
+        return "…" + String(flattened.suffix(limit))
+    }
+
+    /// "A run is starting, and here is everything about it that isn't user
+    /// content." `notice` (not `debug`) because the question this answers —
+    /// "is a title being generated right now, and with what?" — has to be
+    /// answerable from a plain `log show` without `--info --debug`. One line
+    /// per invocation, and invocations are user-paced, so the volume is fine.
+    ///
+    /// `exe=` is the fully resolved path and is public: "Mila is running a
+    /// different binary than my shell is" is one of the failures this is meant
+    /// to catch, and the path is useless when redacted. It can contain the
+    /// account's short name — the same exposure the pre-existing sandbox-path
+    /// line already accepts.
+    static func logRunStart(feature: LLMFeature,
+                            tool: LLMTool,
+                            executable: URL,
+                            model: String?,
+                            session: LLMSession,
+                            extraArgsCount: Int,
+                            promptChars: Int,
+                            summaryChars: Int,
+                            transcriptChars: Int,
+                            composedChars: Int,
+                            timeout: TimeInterval,
+                            command: String) {
+        llmRunnerLog.notice("""
+            llm run start feature=\(feature.rawValue, privacy: .public) \
+            tool=\(tool.rawValue, privacy: .public) \
+            exe=\(executable.path, privacy: .public) \
+            model=\(modelTag(model), privacy: .public) \
+            session=\(sessionTag(session), privacy: .public) \
+            extraArgs=\(extraArgsCount, privacy: .public) \
+            prompt=\(promptChars, privacy: .public)c \
+            summary=\(summaryChars, privacy: .public)c \
+            transcript=\(transcriptChars, privacy: .public)c \
+            composed=\(composedChars, privacy: .public)c \
+            timeout=\(Int(timeout.rounded(.up)), privacy: .public)s
+            """)
+        // The redacted argv is `debug`: it repeats what the start line already
+        // says for a healthy run, and duplicating it at notice level would
+        // double the log volume for no gain. The failure lines below carry it
+        // at their own level, so it is never missing when it matters.
+        llmRunnerLog.debug("llm run cmd feature=\(feature.rawValue, privacy: .public) \(command, privacy: .public)")
+    }
+
+    /// The end of a run that actually reached the process. Level is chosen by
+    /// outcome, because "invisible by default" is exactly the bug:
+    ///  - success → `notice`
+    ///  - cancelled → `debug` (deliberate; the user discarded or re-ran)
+    ///  - timeout / non-zero exit → `error`, with the redacted argv and the
+    ///    stderr tail, so a failed summary is diagnosable from the log alone.
+    static func logRunEnd(feature: LLMFeature,
+                          tool: LLMTool,
+                          outcome: ProcessOutcome,
+                          duration: TimeInterval,
+                          timeout: TimeInterval,
+                          command: String) {
+        let common = """
+            feature=\(feature.rawValue) tool=\(tool.rawValue) \
+            exit=\(outcome.exitCode) duration=\(durationTag(duration))s \
+            stdout=\(outcome.stdout.utf8.count)B stderr=\(outcome.stderr.utf8.count)B
+            """
+        if outcome.cancelled {
+            llmRunnerLog.debug("llm run cancelled \(common, privacy: .public)")
+        } else if outcome.timedOut {
+            llmRunnerLog.error("""
+                llm run timed out \(common, privacy: .public) \
+                limit=\(Int(timeout.rounded(.up)), privacy: .public)s \
+                cmd=\(command, privacy: .public) \
+                stderr-tail=\(stderrTail(outcome.stderr), privacy: .public)
+                """)
+        } else if outcome.exitCode != 0 {
+            llmRunnerLog.error("""
+                llm run failed \(common, privacy: .public) \
+                cmd=\(command, privacy: .public) \
+                stderr-tail=\(stderrTail(outcome.stderr.isEmpty ? outcome.stdout : outcome.stderr), privacy: .public)
+                """)
+        } else {
+            llmRunnerLog.notice("llm run end \(common, privacy: .public)")
+        }
+    }
+
+    /// A run that never got as far as a process: no tool configured, no
+    /// executable found, or (for the HTTP path) no base URL. `error` because
+    /// the user asked for something and got nothing, and the message is
+    /// `errorDescription` — the same sentence the UI shows, which contains
+    /// only the tool/path the user typed.
+    static func logSetupFailure(feature: LLMFeature, tool: LLMTool, error: Error) {
+        let message = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+        llmRunnerLog.error("""
+            llm run setup failed feature=\(feature.rawValue, privacy: .public) \
+            tool=\(tool.rawValue, privacy: .public): \(message, privacy: .public)
+            """)
+    }
+
+    /// `Process.run()` itself refused (bad architecture, permissions, a shim
+    /// that isn't really executable). Distinct from a setup failure because
+    /// the path resolved — knowing that changes where the user looks next.
+    static func logLaunchFailure(feature: LLMFeature,
+                                 tool: LLMTool,
+                                 duration: TimeInterval,
+                                 command: String,
+                                 error: Error) {
+        let message = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+        llmRunnerLog.error("""
+            llm run launch failed feature=\(feature.rawValue, privacy: .public) \
+            tool=\(tool.rawValue, privacy: .public) \
+            duration=\(durationTag(duration), privacy: .public)s \
+            cmd=\(command, privacy: .public): \(message, privacy: .public)
+            """)
+    }
+
+    /// Failure on the OpenAI-compatible HTTP path. `host` rather than the full
+    /// URL — see the call site for why.
+    static func logHTTPFailure(feature: LLMFeature,
+                               host: String,
+                               duration: TimeInterval,
+                               error: Error) {
+        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        llmRunnerLog.error("""
+            llm http failed feature=\(feature.rawValue, privacy: .public) \
+            host=\(host, privacy: .public) \
+            duration=\(durationTag(duration), privacy: .public)s: \
+            \(message, privacy: .public)
+            """)
+    }
+
     /// Raw result of a single CLI invocation, before any success/failure
     /// interpretation. `run` maps this onto its throwing contract; `diagnose`
     /// surfaces every field verbatim so the Settings test panel can show the
@@ -685,7 +1069,10 @@ enum LLMRunner {
                 // status is already being discarded — don't hang the caller
                 // (and its awaiting continuation) on the obituary.
                 if runningGroup.wait(timeout: .now() + 5) == .timedOut {
-                    print("LLMRunner: waitUntilExit didn't return after SIGKILL — abandoning the wait")
+                    // `error`: a child that outlives SIGKILL is a genuine
+                    // anomaly (see the comment above), and it explains a
+                    // truncated result — it must not need `--debug` to see.
+                    llmRunnerLog.error("llm reap abandoned pid=\(process.processIdentifier, privacy: .public) — waitUntilExit didn't return after SIGKILL")
                 }
             }
         }
@@ -700,7 +1087,10 @@ enum LLMRunner {
             // so after the grace we move on; the leaked reader threads
             // exit when the pipes finally close.
             if group.wait(timeout: .now() + 3) == .timedOut {
-                print("LLMRunner: pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
+                // `notice`, not `error`: on the kill path the output is being
+                // discarded anyway (the caller sees .timedOut / .cancelled),
+                // so this is expected bookkeeping rather than a fault.
+                llmRunnerLog.notice("llm pipe drain timed out after kill — an orphaned grandchild is still holding stdout/stderr; returning partial output")
             }
         } else {
             // Normal exit: bounded too, but with a GENEROUS grace. Two
@@ -719,7 +1109,11 @@ enum LLMRunner {
             // returning the (fully buffered by then) output if a
             // pipe-holding helper never lets EOF arrive.
             if group.wait(timeout: .now() + 30) == .timedOut {
-                print("LLMRunner: pipe drain timed out after normal exit — a helper process is still holding stdout/stderr; returning buffered output")
+                // `error`: unlike the kill path, this output IS returned to
+                // the caller and may be truncated mid-stream — a silently
+                // short summary is exactly the kind of thing that needs a
+                // default-visible breadcrumb.
+                llmRunnerLog.error("llm pipe drain timed out after normal exit — a helper process is still holding stdout/stderr; returning buffered output")
             }
         }
 
@@ -787,10 +1181,14 @@ enum LLMRunner {
             // `currentDirectoryURL` does not exist. Degrade to a temp directory
             // instead: the Claude project slug stops being stable, which costs
             // resumability, but LLM calls keep working.
-            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "LLMRunner").error("llm sandbox unavailable at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public) -- falling back to a temp directory")
+            llmRunnerLog.error("llm sandbox unavailable at \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public) -- falling back to a temp directory")
             let fallback = sandboxDirectory(appSupportRoot: FileManager.default.temporaryDirectory)
             try? FileManager.default.createDirectory(at: fallback,
                                                      withIntermediateDirectories: true)
+            // Say where we landed as well as what broke: the fallback costs
+            // Claude Code project-slug stability (#187), so "why did my
+            // resumable conversations scatter?" is answerable from the log.
+            llmRunnerLog.notice("llm sandbox fallback in use at \(fallback.path, privacy: .public) — claude project slugs will not be stable across reboots")
             return fallback
         }
     }

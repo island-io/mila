@@ -135,7 +135,10 @@ final class RecordingSummarizer: ObservableObject {
                  openAIBaseURL: openAIBaseURL,
                  openAIAPIKey: openAIAPIKey,
                  jsonMode: jsonMode,
-                 transport: transport
+                 transport: transport,
+                 // The summarizer has exactly one purpose, so the label is
+                 // fixed here rather than threaded through the `RunLLM` seam.
+                 feature: .summary
              )
          }) {
         self.store = store

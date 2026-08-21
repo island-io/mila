@@ -272,7 +272,7 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         var callCount = 0
         let openAICoordinator = PostRecordingCoordinator(
             store: store, transcription: service, llm: llm,
-            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _ in
+            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _, _ in
                 capturedModel = model
                 callCount += 1
                 return "OPENAI ANSWER"
@@ -304,7 +304,7 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         var callCount = 0
         let cliCoordinator = PostRecordingCoordinator(
             store: store, transcription: service, llm: llm,
-            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _ in
+            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _, _ in
                 capturedModel = model
                 callCount += 1
                 return "CLI ANSWER"

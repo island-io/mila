@@ -90,7 +90,8 @@ final class LiveAISession: ObservableObject {
             openAIAPIKey: call.openAIAPIKey,
             jsonMode: call.jsonMode,
             temperature: call.temperature,
-            transport: call.transport
+            transport: call.transport,
+            feature: .liveAI
         )
     }
 

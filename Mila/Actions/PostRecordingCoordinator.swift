@@ -48,7 +48,11 @@ final class PostRecordingCoordinator: ObservableObject {
         _ openAIBaseURL: String?,
         _ openAIAPIKey: String?,
         _ jsonMode: Bool,
-        _ transport: OpenAITransport?
+        _ transport: OpenAITransport?,
+        // Which surface this call is for — the auto-title path and the Send
+        // path share this one seam, so the label has to come from the call
+        // site or the log can't tell them apart (issue #175).
+        _ feature: LLMFeature
     ) async throws -> String
     private let runLLM: RunLLM
 
@@ -83,7 +87,7 @@ final class PostRecordingCoordinator: ObservableObject {
     init(store: RecordingStore,
          transcription: TranscriptionService,
          llm: LLMSettings,
-         runLLM: @escaping RunLLM = { tool, prompt, transcript, summary, executablePathOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport in
+         runLLM: @escaping RunLLM = { tool, prompt, transcript, summary, executablePathOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport, feature in
         try await LLMRunner.run(
             tool: tool,
             prompt: prompt,
@@ -96,7 +100,8 @@ final class PostRecordingCoordinator: ObservableObject {
             openAIBaseURL: openAIBaseURL,
             openAIAPIKey: openAIAPIKey,
             jsonMode: jsonMode,
-            transport: transport)
+            transport: transport,
+            feature: feature)
     }) {
         self.store = store
         self.transcription = transcription
@@ -188,7 +193,8 @@ final class PostRecordingCoordinator: ObservableObject {
                     openAIBaseURL,
                     openAIAPIKey,
                     false,
-                    nil)
+                    nil,
+                    .name)
                 if Task.isCancelled { return }
                 let title = Self.cleanedTitle(from: suggestion)
                 guard !title.isEmpty else { return }
@@ -352,7 +358,8 @@ final class PostRecordingCoordinator: ObservableObject {
                     openAIBaseURL,
                     openAIAPIKey,
                     false,
-                    nil)
+                    nil,
+                    .action)
                 let preview = output
                     .replacingOccurrences(of: "\n", with: " ")
                     .prefix(80)
