@@ -81,16 +81,87 @@ final class LLMRunnerObservabilityTests: XCTestCase {
         XCTAssertEqual(command, "'/Users/x/My Tools/claude' --model 'claude sonnet'")
     }
 
-    /// Extra args the user typed in Settings are metadata, not content, so
-    /// they are kept verbatim — a wrong flag is a thing people need to see.
-    func test_redacted_command_keeps_user_extra_args() {
+    /// Extra args are free text from Settings and people put credentials in
+    /// them. Flag *names* survive (a wrong flag is a thing people need to
+    /// see); every value is reduced to a length.
+    func test_redacted_command_redacts_extra_argument_values() {
+        let prompt = "p"
+        let extraArgs = ["--debug", "--api-key", "sk-ant-secret", "--permission-mode", "plan"]
+        let command = LLMRunner.redactedCommand(
+            executable: URL(fileURLWithPath: "/bin/claude"),
+            arguments: LLMTool.claude.arguments(prompt: prompt) + extraArgs,
+            prompt: prompt,
+            extraArgsCount: extraArgs.count)
+
+        XCTAssertEqual(command,
+                       "/bin/claude -p <prompt:1c> --debug --api-key <value:13c> "
+                       + "--permission-mode <value:4c>")
+        XCTAssertFalse(command.contains("sk-ant-secret"),
+                       "a credential in extra args leaked into the log: \(command)")
+    }
+
+    /// The glued `--flag=value` form must split, or the `hasPrefix("-")`
+    /// check would wave the whole token through with its payload attached.
+    func test_redacted_command_splits_glued_flag_values() {
+        let extraArgs = ["--api-key=sk-abc", "--url=https://x.example/v1?token=t"]
+        let command = LLMRunner.redactedCommand(
+            executable: URL(fileURLWithPath: "/bin/gemini"),
+            arguments: extraArgs,
+            prompt: "unused",
+            extraArgsCount: extraArgs.count)
+
+        XCTAssertEqual(command,
+                       "/bin/gemini --api-key=<value:6c> --url=<value:28c>")
+        XCTAssertFalse(command.contains("sk-abc"))
+        XCTAssertFalse(command.contains("token=t"))
+    }
+
+    /// Only the trailing `extraArgsCount` tokens are user input. Mila's own
+    /// generated arguments are values Mila chose, and they stay readable —
+    /// a wrong `--model` is a common cause of a non-zero exit.
+    func test_redacted_command_keeps_mila_generated_arguments_visible() {
+        let prompt = "p"
+        let session = UUID()
+        let extraArgs = ["secret-positional"]
+        let command = LLMRunner.redactedCommand(
+            executable: URL(fileURLWithPath: "/bin/claude"),
+            arguments: LLMTool.claude.arguments(prompt: prompt,
+                                                model: "haiku",
+                                                session: .new(session)) + extraArgs,
+            prompt: prompt,
+            extraArgsCount: extraArgs.count)
+
+        XCTAssertEqual(command,
+                       "/bin/claude -p <prompt:1c> --model haiku "
+                       + "--session-id \(session.uuidString) <value:17c>")
+    }
+
+    /// Default `extraArgsCount` of 0 must not redact the tail of a
+    /// tool-generated argv — callers that pass no extra args get the full,
+    /// readable command.
+    func test_redacted_command_with_no_extra_args_redacts_nothing_but_the_prompt() {
         let prompt = "p"
         let command = LLMRunner.redactedCommand(
             executable: URL(fileURLWithPath: "/bin/claude"),
-            arguments: LLMTool.claude.arguments(prompt: prompt) + ["--debug", "--permission-mode", "plan"],
+            arguments: LLMTool.claude.arguments(prompt: prompt, model: "sonnet"),
             prompt: prompt)
 
-        XCTAssertEqual(command, "/bin/claude -p <prompt:1c> --debug --permission-mode plan")
+        XCTAssertEqual(command, "/bin/claude -p <prompt:1c> --model sonnet")
+    }
+
+    // MARK: - redactedExtraArg
+
+    func test_redacted_extra_arg_keeps_bare_flags_and_redacts_values() {
+        XCTAssertEqual(LLMRunner.redactedExtraArg("--verbose"), "--verbose")
+        XCTAssertEqual(LLMRunner.redactedExtraArg("-v"), "-v")
+        XCTAssertEqual(LLMRunner.redactedExtraArg("sk-abc"), "<value:6c>")
+        XCTAssertEqual(LLMRunner.redactedExtraArg(""), "<value:0c>")
+    }
+
+    /// A value containing `=` must not be split more than once, or part of
+    /// the payload would survive as a "flag name".
+    func test_redacted_extra_arg_splits_on_the_first_equals_only() {
+        XCTAssertEqual(LLMRunner.redactedExtraArg("--data=a=b=c"), "--data=<value:5c>")
     }
 
     // MARK: - stderrTail

@@ -259,7 +259,8 @@ enum LLMRunner {
                                        session: session) + extraArgs
         let command = redactedCommand(executable: executable,
                                       arguments: arguments,
-                                      prompt: fullPrompt)
+                                      prompt: fullPrompt,
+                                      extraArgsCount: extraArgs.count)
         let started = Date()
         logRunStart(feature: feature,
                     tool: tool,
@@ -362,19 +363,12 @@ enum LLMRunner {
                                     temperature: Double?,
                                     transport: OpenAITransport,
                                     feature: LLMFeature = .unspecified) async throws -> String {
-        // `makeRequest` throws `OpenAIRequestError.invalidEndpoint` for a
-        // malformed base URL (issue celarent7/mila#1). It's an
-        // `OpenAIRequestError`, so the typed-rethrow catch below surfaces it
-        // to the caller as a readable LocalizedError — not a crash.
-        var request = try OpenAIClient.makeRequest(baseURL: baseURL,
-                                               model: model ?? "",
-                                               prompt: prompt,
-                                               transcript: transcript,
-                                               summary: summary,
-                                               apiKey: apiKey,
-                                               jsonMode: jsonMode,
-                                               temperature: temperature)
-        if timeout > 0 { request.timeoutInterval = timeout }
+        // Log metadata FIRST, before anything that can throw. Request
+        // construction itself fails on a malformed base URL, and computing
+        // `host`/`started` afterwards meant that failure had neither a start
+        // line nor a failure line — invisible, which is the exact defect #175
+        // is about.
+        //
         // Host only, never the full URL: a user's endpoint can carry a token
         // in its query string, and the privacy rule is "no secrets in logged
         // URLs". The host is enough to tell "wrong endpoint" from "endpoint
@@ -391,6 +385,28 @@ enum LLMRunner {
             jsonMode=\(jsonMode, privacy: .public) \
             timeout=\(Int(timeout.rounded(.up)), privacy: .public)s
             """)
+
+        // `makeRequest` throws `OpenAIRequestError.invalidEndpoint` for a
+        // malformed base URL (issue celarent7/mila#1). It's an
+        // `OpenAIRequestError`, so the rethrow surfaces it to the caller as a
+        // readable LocalizedError — not a crash — and it is now recorded on
+        // the way past instead of vanishing.
+        var request: URLRequest
+        do {
+            request = try OpenAIClient.makeRequest(baseURL: baseURL,
+                                                   model: model ?? "",
+                                                   prompt: prompt,
+                                                   transcript: transcript,
+                                                   summary: summary,
+                                                   apiKey: apiKey,
+                                                   jsonMode: jsonMode,
+                                                   temperature: temperature)
+        } catch {
+            logHTTPFailure(feature: feature, host: host,
+                           duration: Date().timeIntervalSince(started), error: error)
+            throw error
+        }
+        if timeout > 0 { request.timeoutInterval = timeout }
 
         do {
             // Already cancelled before we even dispatch (e.g. the rename sheet
@@ -424,18 +440,18 @@ enum LLMRunner {
                            duration: Date().timeIntervalSince(started), error: error)
             throw error
         } catch is CancellationError {
-            // Not a failure — the user closed the sheet / discarded the
-            // recording. Debug level so it's there when someone asks "why did
-            // my summary never appear?" without adding noise to normal runs.
-            llmRunnerLog.debug("""
-                llm http cancelled feature=\(feature.rawValue, privacy: .public) \
-                host=\(host, privacy: .public) \
-                duration=\(durationTag(Date().timeIntervalSince(started)), privacy: .public)s
-                """)
+            logHTTPCancelled(feature: feature, host: host,
+                             duration: Date().timeIntervalSince(started))
             throw LLMRunnerError.cancelled
         } catch let urlError as URLError {
             switch urlError.code {
             case .cancelled:
+                // Same event as `CancellationError` above, just delivered by
+                // URLSession instead of the task. It went unlogged, so a
+                // cancel was recorded on the process path but silently
+                // dropped here.
+                logHTTPCancelled(feature: feature, host: host,
+                                 duration: Date().timeIntervalSince(started))
                 throw LLMRunnerError.cancelled
             case .timedOut:
                 logHTTPFailure(feature: feature, host: host,
@@ -519,7 +535,8 @@ enum LLMRunner {
         let command = ([executable.path] + args).map(shellQuote).joined(separator: " ")
         let loggedCommand = redactedCommand(executable: executable,
                                             arguments: args,
-                                            prompt: fullPrompt)
+                                            prompt: fullPrompt,
+                                            extraArgsCount: extraArgs.count)
         let start = Date()
         logRunStart(feature: feature,
                     tool: tool,
@@ -788,28 +805,68 @@ enum LLMRunner {
         String(format: "%.2f", seconds)
     }
 
-    /// The argv we launched, shell-quoted for readability, with the composed
-    /// prompt replaced by `<prompt:Nc>`.
+    /// The argv we launched, shell-quoted for readability, with everything
+    /// that could carry a secret or meeting content replaced by a
+    /// `<kind:Nc>` placeholder.
     ///
-    /// This is the log-safe twin of `diagnose`'s `command`. The real command
-    /// line is *mostly* metadata a user needs (which binary, which flags,
-    /// which `--session-id`, which extra args they typed) plus exactly one
-    /// argument that is the meeting transcript. Redacting that one argument
-    /// keeps the diagnostically useful 95% loggable. The result is
-    /// deliberately NOT copy-pasteable — the placeholder is unquoted so it
-    /// can't be mistaken for a runnable command.
+    /// This is the log-safe twin of `diagnose`'s `command`. A command line is
+    /// *mostly* metadata a user needs — which binary, which flags, which
+    /// `--session-id` — so redacting the few positions that can hold a
+    /// payload keeps the shape diagnosable without publishing the payload.
+    /// Two things get redacted:
+    ///
+    /// 1. **The composed prompt**, which is the meeting transcript.
+    /// 2. **The values of the user's own "Extra args"** (the trailing
+    ///    `extraArgsCount` tokens). These are free text from Settings → AI
+    ///    Provider and people do put credentials in them — `--api-key sk-…`,
+    ///    a bearer token, an `--append-system-prompt` blob. Mila cannot know
+    ///    which of a third-party CLI's flags take a secret, so the only safe
+    ///    default is that no extra-argument *value* is ever logged.
+    ///
+    /// Flag *names* survive, including the `--flag=value` form (name kept,
+    /// value redacted), because "which flags did it run with" is the
+    /// diagnostic question and a flag name is not a secret. Mila's own
+    /// generated arguments (`--model`, `--session-id`, `--resume`, `-f`,
+    /// `--skip-trust`) stay visible: those values are ones Mila chose, not
+    /// user input, and a wrong model name is a common cause of a non-zero
+    /// exit.
+    ///
+    /// The result is deliberately NOT copy-pasteable — placeholders are
+    /// unquoted so it can't be mistaken for a runnable command.
     static func redactedCommand(executable: URL,
                                 arguments: [String],
-                                prompt: String) -> String {
-        let redacted = arguments.map { arg -> String in
+                                prompt: String,
+                                extraArgsCount: Int = 0) -> String {
+        // argv is always `tool.arguments(...) + extraArgs`, so the
+        // user-supplied tokens are exactly the trailing slice. Position beats
+        // value-matching here: an extra arg that happened to equal one of
+        // Mila's own values would otherwise be treated as trusted.
+        let firstExtraArg = arguments.count - max(0, extraArgsCount)
+        let redacted = arguments.enumerated().map { index, arg -> String in
             // Empty-prompt guard: without it an empty `prompt` would match
             // every empty argument in argv and redact unrelated tokens.
             if !prompt.isEmpty && arg == prompt {
                 return "<prompt:\(prompt.count)c>"
             }
-            return shellQuote(arg)
+            guard index >= firstExtraArg else { return shellQuote(arg) }
+            return redactedExtraArg(arg)
         }
         return ([shellQuote(executable.path)] + redacted).joined(separator: " ")
+    }
+
+    /// One token of the user's "Extra args", reduced to what is safe to log.
+    ///
+    ///     --verbose          -> --verbose            (a flag name, not a secret)
+    ///     --api-key=sk-abc   -> --api-key=<value:6c> (glued form still splits)
+    ///     sk-abc             -> <value:6c>           (bare value — could be anything)
+    static func redactedExtraArg(_ arg: String) -> String {
+        guard arg.hasPrefix("-") else { return "<value:\(arg.count)c>" }
+        // `--flag=value`: keep the name, redact the payload. Split on the
+        // FIRST `=` only — a value may legitimately contain more of them.
+        guard let eq = arg.firstIndex(of: "=") else { return shellQuote(arg) }
+        let name = String(arg[arg.startIndex..<eq])
+        let value = String(arg[arg.index(after: eq)...])
+        return "\(shellQuote(name))=<value:\(value.count)c>"
     }
 
     /// One-line, bounded excerpt of a CLI's stderr for a failure log line.
@@ -818,12 +875,28 @@ enum LLMRunner {
     /// progress/warning chatter. Newlines are folded to ` | ` because a
     /// multi-line unified-log entry is painful to read and impossible to grep.
     ///
-    /// Logged `.public` — a defensible line to draw, because the *same* stderr
-    /// already reaches the log in full today: `LLMRunnerError.nonZeroExit`
-    /// embeds it verbatim in `errorDescription`, and
-    /// `PostRecordingCoordinator` logs that as `.public`. A bounded excerpt is
-    /// therefore strictly less exposure than the status quo, and it is CLI
-    /// diagnostic output rather than user content.
+    /// Logged **`privacy: .private`**, unlike every other field here.
+    ///
+    /// A CLI run verbosely can echo the prompt — i.e. the transcript — back
+    /// on stderr, and the non-zero-exit path falls back to stdout, which is
+    /// the model's answer *about* the meeting. Neither is CLI chatter; both
+    /// are the content this file reduces to character counts everywhere else.
+    /// Mila's whole premise is that recordings stay on the machine, and the
+    /// unified log is a plaintext store other processes can read, so a
+    /// structured always-on excerpt of that content is not something to
+    /// enable by default.
+    ///
+    /// The precedent that `LLMRunnerError.nonZeroExit` already embeds stderr
+    /// verbatim in `errorDescription` — which `PostRecordingCoordinator` logs
+    /// `.public` — argues that the *existing* line is too loose, not that a
+    /// new and broader one is fine. (Worth tightening separately.)
+    ///
+    /// What stays `.public` is the part that answers the question at a
+    /// glance: exit code, stderr/stdout byte counts, duration, and the
+    /// redacted command. "exit 1, 4 KB of stderr" is the triage signal; the
+    /// bytes themselves are available to the user who asks for them, via
+    /// Settings → AI Provider's test panel (which shows full stderr in the
+    /// UI, at the user's request) or by enabling private-data logging.
     static func stderrTail(_ stderr: String, limit: Int = stderrLogLimit) -> String {
         let flattened = stderr
             .components(separatedBy: .newlines)
@@ -883,6 +956,12 @@ enum LLMRunner {
     ///  - cancelled → `debug` (deliberate; the user discarded or re-ran)
     ///  - timeout / non-zero exit → `error`, with the redacted argv and the
     ///    stderr tail, so a failed summary is diagnosable from the log alone.
+    ///
+    /// Every field is `.public` except `stderr-tail`, which is `.private`
+    /// because it can echo transcript or answer text — see `stderrTail`. The
+    /// triage signal (exit code, byte counts, duration, redacted argv) is
+    /// public, so a failure is still legible without private-data logging;
+    /// only the payload is held back.
     static func logRunEnd(feature: LLMFeature,
                           tool: LLMTool,
                           outcome: ProcessOutcome,
@@ -901,13 +980,13 @@ enum LLMRunner {
                 llm run timed out \(common, privacy: .public) \
                 limit=\(Int(timeout.rounded(.up)), privacy: .public)s \
                 cmd=\(command, privacy: .public) \
-                stderr-tail=\(stderrTail(outcome.stderr), privacy: .public)
+                stderr-tail=\(stderrTail(outcome.stderr), privacy: .private)
                 """)
         } else if outcome.exitCode != 0 {
             llmRunnerLog.error("""
                 llm run failed \(common, privacy: .public) \
                 cmd=\(command, privacy: .public) \
-                stderr-tail=\(stderrTail(outcome.stderr.isEmpty ? outcome.stdout : outcome.stderr), privacy: .public)
+                stderr-tail=\(stderrTail(outcome.stderr.isEmpty ? outcome.stdout : outcome.stderr), privacy: .private)
                 """)
         } else {
             llmRunnerLog.notice("llm run end \(common, privacy: .public)")
@@ -941,6 +1020,20 @@ enum LLMRunner {
             tool=\(tool.rawValue, privacy: .public) \
             duration=\(durationTag(duration), privacy: .public)s \
             cmd=\(command, privacy: .public): \(message, privacy: .public)
+            """)
+    }
+
+    /// A cancelled HTTP call. Not a failure — the user closed the sheet or
+    /// discarded the recording — so `debug`, matching how the process path
+    /// records `outcome.cancelled`. Both delivery shapes (`CancellationError`
+    /// and `URLError.cancelled`) route here so neither can go unrecorded.
+    static func logHTTPCancelled(feature: LLMFeature,
+                                 host: String,
+                                 duration: TimeInterval) {
+        llmRunnerLog.debug("""
+            llm http cancelled feature=\(feature.rawValue, privacy: .public) \
+            host=\(host, privacy: .public) \
+            duration=\(durationTag(duration), privacy: .public)s
             """)
     }
 
