@@ -162,6 +162,50 @@ final class RemoteTranscriptionSettings: ObservableObject {
         modelID.lowercased().contains("ivrit")
     }
 
+    // MARK: - Known-good presets
+
+    /// The catalogue entry the current `model` names, or `nil` for a model id
+    /// Mila has no entry for (the picker's *Custom…*).
+    ///
+    /// **Derived, not stored.** A persisted "selected preset" would be a second
+    /// copy of a fact `model` already carries, and the two have several ways to
+    /// disagree — a `.milaconfig` import writes `model` directly
+    /// (`MilaConfigImporter`), as does anything editing the raw field. Deriving
+    /// it means an imported configuration shows up correctly identified in the
+    /// picker with no import-side change at all.
+    var selectedPreset: RemoteModelPreset? { RemoteModelPreset.matching(model) }
+
+    /// Adopt a preset: its model id, and its endpoint when the one configured
+    /// isn't the user's own.
+    ///
+    /// The endpoint rule is deliberately conservative. Switching from the
+    /// OpenAI group to a self-hosted model has to move the endpoint or the
+    /// choice is incoherent, but a URL the user typed — a private gateway, a
+    /// reverse proxy — can serve any of these ids, so overwriting it would
+    /// break a working setup on an unrelated edit. Preset endpoints are
+    /// therefore only ever replaced by other preset endpoints (or filled in
+    /// when the current value can't be parsed at all).
+    ///
+    /// `englishModel` is *not* touched here: `model`'s own `didSet` already
+    /// reconciles it for a Hebrew-only primary, so picking the ivrit preset
+    /// gets the English prefill — and picking anything else gets the matching
+    /// withdrawal — through the one code path that owns that rule.
+    func apply(_ preset: RemoteModelPreset) {
+        if shouldAdoptEndpoint(of: preset) {
+            endpoint = preset.endpoint
+        }
+        model = preset.id
+    }
+
+    /// Whether `apply(_:)` may replace the configured endpoint. True when the
+    /// current value is one the presets own, or isn't a usable URL.
+    private func shouldAdoptEndpoint(of preset: RemoteModelPreset) -> Bool {
+        guard endpointURL != nil else { return true }
+        let current = RemoteModelPreset.normalizeEndpoint(endpoint)
+        guard RemoteModelPreset.canonicalEndpoints.contains(current) else { return false }
+        return current != RemoteModelPreset.normalizeEndpoint(preset.endpoint)
+    }
+
     private let defaults: UserDefaults
     private let urlSession: URLSession
     /// Keychain item the API token is stored under. Injectable so tests /

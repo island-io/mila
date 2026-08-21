@@ -626,10 +626,32 @@ private struct ModelsSettingsTab: View {
 /// Endpoint / model / API-key configuration for the remote transcription
 /// backend, plus a connectivity test and the mandatory "audio leaves your
 /// device" warning.
+///
+/// The **Model** row is a picker over `RemoteModelPreset.all`, not free text.
+/// It used to be a `TextField` whose only guidance was a `whisper-1`
+/// placeholder, which invited model ids that fail with an opaque HTTP 400 —
+/// and, before PR #189, that was *most* of OpenAI's transcription line-up
+/// (issue #178). Free text still exists, behind **Advanced**, for a
+/// self-hosted id no catalogue could enumerate.
 private struct RemoteBackendSection: View {
     @ObservedObject var remote: RemoteTranscriptionSettings
 
     private static let setupGuideURL = URL(string: "https://github.com/island-io/mila/blob/main/docs/REMOTE_TRANSCRIPTION_SERVER.md")!
+
+    /// Picker tag for "a model id Mila has no entry for". A `nil` selection
+    /// can't be a `Picker` tag, so `Custom…` gets its own sentinel.
+    private static let customTag = "__mila.remote.model.custom__"
+
+    /// Opens itself when the configured model isn't one of the presets — a
+    /// custom id (typed, or arriving via a `.milaconfig` import) must not be
+    /// invisible just because it doesn't fit the picker.
+    @State private var showAdvanced: Bool
+
+    @MainActor
+    init(remote: RemoteTranscriptionSettings) {
+        self.remote = remote
+        _showAdvanced = State(initialValue: remote.selectedPreset == nil)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -641,26 +663,12 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                 }
-                Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Defaults to OpenAI; point it at your own server for ivrit.ai or other models.")
+                Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Picking a model below fills this in; edit it to point at your own server.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                fieldRow(label: "Model") {
-                    TextField(RemoteTranscriptionSettings.defaultModel, text: $remote.model)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                }
-
-                fieldRow(label: "English model") {
-                    TextField("Same as above", text: $remote.englishModel)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                }
-                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                modelPickerRow
 
                 fieldRow(label: "API key") {
                     SecureField("Stored in your Keychain", text: $remote.apiKey)
@@ -671,6 +679,8 @@ private struct RemoteBackendSection: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            advancedDisclosure
 
             HStack(spacing: 10) {
                 Button {
@@ -695,6 +705,115 @@ private struct RemoteBackendSection: View {
                     .font(.callout)
             }
         }
+    }
+
+    // MARK: - Model
+
+    /// The picker, plus one caption describing the selection and — when the
+    /// model can't return timings — the warning that says so *before* the user
+    /// records an hour-long meeting with it.
+    @ViewBuilder
+    private var modelPickerRow: some View {
+        fieldRow(label: "Model") {
+            Picker("Model", selection: modelSelection) {
+                ForEach(RemoteModelPreset.Group.allCases, id: \.self) { group in
+                    Section(group.displayName) {
+                        ForEach(RemoteModelPreset.presets(in: group)) { preset in
+                            Text(preset.displayName).tag(preset.id)
+                        }
+                    }
+                }
+                Text("Custom…").tag(Self.customTag)
+            }
+            .labelsHidden()
+            .accessibilityIdentifier("remote.model.picker")
+        }
+
+        if let preset = remote.selectedPreset {
+            Text(preset.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if preset.timestamps.isUntimed { noTimestampsWarning }
+        } else {
+            Text("Custom model id — set it under **Advanced** below. Mila can't vouch for a model it doesn't know; use **Test connection** to confirm the server accepts it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// Bridges the picker's `String` tag to the settings' model id.
+    ///
+    /// Reads as `customTag` whenever the configured id isn't a preset, so a
+    /// hand-typed model shows as *Custom…* rather than snapping the display to
+    /// some unrelated row. Selecting `Custom…` deliberately leaves `model`
+    /// alone — it opens the free-text field rather than clearing the value the
+    /// user is about to edit.
+    private var modelSelection: Binding<String> {
+        Binding(
+            get: { remote.selectedPreset?.id ?? Self.customTag },
+            set: { tag in
+                guard let preset = RemoteModelPreset.matching(tag) else {
+                    showAdvanced = true
+                    return
+                }
+                remote.apply(preset)
+            }
+        )
+    }
+
+    /// Losing per-segment timings is not a cosmetic downgrade — it costs SRT
+    /// timings *and* speaker labels, because local diarization has nothing to
+    /// align its speaker turns to. Say so at the point of choice; silently
+    /// degrading transcripts is what this picker exists to stop.
+    private var noTimestampsWarning: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "clock.badge.exclamationmark")
+                .foregroundStyle(.orange)
+            Text("No timestamps. This model can only return plain text, so the recording arrives as one segment: SRT export has no timings and speaker labels can't be aligned. Fine for dictation, poor for meetings.")
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+        .accessibilityIdentifier("remote.model.noTimestamps")
+    }
+
+    // MARK: - Advanced
+
+    /// The raw ids. Free text is still fully supported — a self-hosted server
+    /// can serve any model id — it just stops being the first thing the user
+    /// sees, the same treatment #144 gave "technical, set once" configuration.
+    private var advancedDisclosure: some View {
+        DisclosureGroup("Advanced", isExpanded: $showAdvanced) {
+            VStack(alignment: .leading, spacing: 8) {
+                fieldRow(label: "Model id") {
+                    TextField(RemoteTranscriptionSettings.defaultModel, text: $remote.model)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("remote.model.custom")
+                }
+                Text("Any model id your server accepts. Mila picks the response format from the id, so an unknown id is sent as a Whisper-style request (`verbose_json`).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                fieldRow(label: "English model") {
+                    TextField("Same as above", text: $remote.englishModel)
+                        .textFieldStyle(.roundedBorder)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("remote.model.english")
+                }
+                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.top, 6)
+        }
+        .font(.callout)
     }
 
     private var privacyWarning: some View {
