@@ -734,12 +734,19 @@ private struct RemoteBackendSection: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            if preset.timestamps.isUntimed { noTimestampsWarning }
         } else {
             Text("Custom model id — set it under **Advanced** below. Mila can't vouch for a model it doesn't know; use **Test connection** to confirm the server accepts it.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+        // Asked of the engine, not of the preset. `forModel(_:)` sends ANY
+        // `gpt-*` id as `json`, preset or not, so a hand-typed
+        // `gpt-4o-transcribe-something` loses timestamps just as surely as a
+        // listed one -- and gating the warning on a preset match is exactly
+        // how it would lose them silently.
+        if RemoteWhisperEngine.ResponseFormat.forModel(remote.model).timestamps.isUntimed {
+            noTimestampsWarning
         }
     }
 
@@ -795,7 +802,7 @@ private struct RemoteBackendSection: View {
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("remote.model.custom")
                 }
-                Text("Any model id your server accepts. Mila picks the response format from the id, so an unknown id is sent as a Whisper-style request (`verbose_json`).")
+                Text("Any model id your server accepts. Mila derives the response format from the id — `gpt-*` ids are sent without timestamps, anything else as a Whisper-style request (`verbose_json`).")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

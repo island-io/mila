@@ -87,6 +87,11 @@ final class RemoteTranscriptionSettings: ObservableObject {
             // again when the primary stops being Hebrew-only, because it
             // belongs to that primary and breaks the next one.
             reconcileEnglishModelForCurrentPrimary()
+            // The probe is model-specific -- it uploads a clip and asks this
+            // model to transcribe it -- so a green tick earned by the previous
+            // model says nothing about the new one. Same reset that `endpoint`
+            // and `apiKey` already do.
+            testStatus = .idle
         }
     }
 
@@ -484,11 +489,15 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
         do {
             let (data, response) = try await urlSession.upload(for: request, from: body)
-            // Drop the result if the user edited the endpoint/key while the
-            // request was in flight — `didSet` already reset status to .idle,
-            // and a stale result for the previous values would be misleading.
+            // Drop the result if the user changed the endpoint, key or model
+            // while the request was in flight — `didSet` already reset status
+            // to .idle, and a stale result for the previous values would be
+            // misleading. The model matters as much as the other two: the probe
+            // asks one specific model to transcribe, so applying its verdict
+            // after a switch would show a pass earned by a different model.
             guard endpointURL == url,
-                  apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
+                  apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key,
+                  (currentConfig()?.model ?? Self.defaultModel) == model else { return }
             guard let http = response as? HTTPURLResponse else {
                 testStatus = .failed("No HTTP response.")
                 return
@@ -496,7 +505,8 @@ final class RemoteTranscriptionSettings: ObservableObject {
             testStatus = Self.evaluateProbe(statusCode: http.statusCode, data: data)
         } catch {
             guard endpointURL == url,
-                  apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
+                  apiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key,
+                  (currentConfig()?.model ?? Self.defaultModel) == model else { return }
             testStatus = .failed(error.localizedDescription)
         }
     }
