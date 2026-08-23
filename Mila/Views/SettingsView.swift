@@ -1377,6 +1377,7 @@ private struct AIFeaturesSettingsTab: View {
                         ExamplesView(title: "Examples", items: LLMSettings.actionExamples) {
                             settings.postActionPrompt = $0
                         }
+                        transcriptByPathToggle
                     }
                 }
                 Divider()
@@ -1403,6 +1404,48 @@ private struct AIFeaturesSettingsTab: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.vertical, 4)
         }
+    }
+
+    /// Transcript delivery for the Send-to-LLM action (issue #179): paste the
+    /// transcript into the prompt, or name the recording's files and let the CLI
+    /// read them.
+    ///
+    /// Lives inside the action row rather than next to the provider picker
+    /// because it governs that one feature — title generation and the automatic
+    /// summary stay inlined on purpose (see
+    /// `LLMSettings.actionTranscriptByPath`).
+    ///
+    /// Greyed rather than hidden for a provider that can't read files, matching
+    /// how the Live AI row treats its own gates: a control that vanishes reads
+    /// as "this app can't do that", and the caption says which gate is closed.
+    private var transcriptByPathToggle: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Toggle("Send the transcript as a file path",
+                   isOn: $settings.actionTranscriptByPath)
+                .font(.callout)
+                .toggleStyle(.switch)
+                .disabled(!settings.postActionEnabled || !settings.tool.readsLocalFiles)
+                .accessibilityIdentifier("llm.action.transcriptByPath.toggle")
+            Text(transcriptByPathCaption)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+        }
+        .help("Instead of pasting the transcript into the prompt, Mila names the "
+              + "recording's subtitle (.srt), transcript (.txt) and audio files and "
+              + "asks the tool to read them. The .srt keeps the timestamps the pasted "
+              + "text drops, and the tool can re-read or seek within the file instead "
+              + "of getting one pass over a blob. Needs a tool that reads local files.")
+    }
+
+    /// Say which gate is closed rather than leaving a dead switch unexplained —
+    /// same principle as `liveAICaption`.
+    private var transcriptByPathCaption: String {
+        if !settings.tool.readsLocalFiles {
+            return "Needs a local CLI — the OpenAI-compatible endpoint can't read your files."
+        }
+        return "Point the tool at the recording's .srt / .txt / audio instead of pasting the text. Keeps timestamps."
     }
 
     /// Live AI has two independent gates on top of the user's own switch, and

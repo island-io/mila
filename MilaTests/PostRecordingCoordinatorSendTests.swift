@@ -272,7 +272,7 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         var callCount = 0
         let openAICoordinator = PostRecordingCoordinator(
             store: store, transcription: service, llm: llm,
-            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _, _ in
+            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _, _, _ in
                 capturedModel = model
                 callCount += 1
                 return "OPENAI ANSWER"
@@ -304,7 +304,7 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         var callCount = 0
         let cliCoordinator = PostRecordingCoordinator(
             store: store, transcription: service, llm: llm,
-            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _, _ in
+            runLLM: { _, _, _, _, _, model, _, _, _, _, _, _, _, _ in
                 capturedModel = model
                 callCount += 1
                 return "CLI ANSWER"
@@ -320,6 +320,143 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         try await waitFor(callCount > 0)
         XCTAssertNil(capturedModel,
                      "The CLI path must leave model nil (the CLI chooses its own)")
+    }
+
+    // MARK: - Transcript delivery (issue #179)
+
+    /// With the setting on, the send must hand the runner the recording's own
+    /// sidecars rather than the transcript body. The paths have to come from the
+    /// store — the sheets that call `sendToLLM` only ever pass text, so if the
+    /// coordinator didn't derive them nothing would.
+    func test_sendToLLM_references_the_recordings_sidecars_when_enabled() async throws {
+        let suite = UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.byPath.\(#function)")!
+        suite.removePersistentDomain(forName: "PostRecordingCoordinatorSendTests.byPath.\(#function)")
+        let llm = LLMSettings(defaults: suite,
+                              apiKeyKeychainKey: "PostRecordingCoordinatorSendTests.byPath.\(#function)")
+        llm.tool = .claude
+        llm.actionTranscriptByPath = true
+
+        var captured: TranscriptDelivery?
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, delivery in
+                captured = delivery
+                callCount += 1
+                return "ANSWER"
+            })
+
+        let rec = addCompletedRecording(text: "the transcript text")
+        // `store.add` writes the `.txt`; the `.srt` is written by the
+        // transcription pass, which the stub engine never runs here.
+        let srt = store.subtitleURL(for: rec)
+        try "1\n00:00:01,000 --> 00:00:04,000\nSPEAKER_00: hello\n\n"
+            .write(to: srt, atomically: true, encoding: .utf8)
+
+        coordinator.sendToLLM(recordingID: rec.id,
+                              tool: .claude,
+                              prompt: "File this",
+                              transcript: "the transcript text",
+                              summary: "",
+                              executableOverride: nil)
+        try await waitFor(callCount > 0)
+
+        guard case .reference(let files) = captured else {
+            return XCTFail("expected a reference delivery, got \(String(describing: captured))")
+        }
+        XCTAssertEqual(files.subtitles, srt)
+        XCTAssertEqual(files.plainText, store.transcriptURL(for: rec))
+        XCTAssertEqual(files.audio, store.audioURL(for: rec))
+    }
+
+    /// Off by default (#179's first constraint), so an untouched install keeps
+    /// inlining exactly as it did before.
+    func test_sendToLLM_inlines_by_default() async throws {
+        var captured: TranscriptDelivery?
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service,
+            llm: LLMSettings(defaults: UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.inline.\(#function)")!,
+                             apiKeyKeychainKey: "PostRecordingCoordinatorSendTests.inline.\(#function)"),
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, delivery in
+                captured = delivery
+                callCount += 1
+                return "ANSWER"
+            })
+
+        let rec = addCompletedRecording(text: "the transcript text")
+        coordinator.sendToLLM(recordingID: rec.id,
+                              tool: .claude,
+                              prompt: "Summarize",
+                              transcript: "the transcript text",
+                              summary: "",
+                              executableOverride: nil)
+        try await waitFor(callCount > 0)
+
+        XCTAssertEqual(captured, .inline)
+    }
+
+    /// The recording was discarded while the send was waiting for its
+    /// transcript, so there is nothing left to reference. Inline is the safe
+    /// answer — it is what the runner would fall back to anyway.
+    func test_sendToLLM_inlines_when_the_recording_is_gone() async throws {
+        let suite = UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.gone.\(#function)")!
+        suite.removePersistentDomain(forName: "PostRecordingCoordinatorSendTests.gone.\(#function)")
+        let llm = LLMSettings(defaults: suite,
+                              apiKeyKeychainKey: "PostRecordingCoordinatorSendTests.gone.\(#function)")
+        llm.tool = .claude
+        llm.actionTranscriptByPath = true
+
+        var captured: TranscriptDelivery?
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, delivery in
+                captured = delivery
+                callCount += 1
+                return "ANSWER"
+            })
+
+        coordinator.sendToLLM(recordingID: UUID(),
+                              tool: .claude,
+                              prompt: "Summarize",
+                              // Non-empty, so the send doesn't stall in
+                              // `awaitTranscript` looking for a recording that
+                              // was never in the store.
+                              transcript: "the transcript text",
+                              summary: "",
+                              executableOverride: nil)
+        try await waitFor(callCount > 0)
+
+        XCTAssertEqual(captured, .inline)
+    }
+
+    /// The title path is deliberately excluded from path delivery: it runs
+    /// unattended on every recording, so a CLI that skipped the read would
+    /// quietly title everything from a prompt with no transcript in it.
+    func test_auto_title_always_inlines() async throws {
+        let suite = UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.title.\(#function)")!
+        suite.removePersistentDomain(forName: "PostRecordingCoordinatorSendTests.title.\(#function)")
+        let llm = LLMSettings(defaults: suite,
+                              apiKeyKeychainKey: "PostRecordingCoordinatorSendTests.title.\(#function)")
+        llm.tool = .claude
+        llm.nameGenerationEnabled = true
+        llm.actionTranscriptByPath = true
+
+        var captured: TranscriptDelivery?
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, delivery in
+                captured = delivery
+                callCount += 1
+                return "A Tidy Title"
+            })
+
+        coordinator.present(addCompletedRecording(text: "the transcript text"))
+        try await waitFor(callCount > 0)
+
+        XCTAssertEqual(captured, .inline)
     }
 
     // MARK: - Helpers

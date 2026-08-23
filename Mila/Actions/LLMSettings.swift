@@ -89,6 +89,28 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         }
     }
 
+    /// Whether this tool runs on the user's machine and can therefore open a
+    /// file we name in the prompt. Gates `TranscriptDelivery.reference`
+    /// (issue #179).
+    ///
+    /// True for all three CLIs: each is an agentic coding tool whose whole
+    /// premise is reading the local filesystem, and each is launched with
+    /// workspace trust already granted (`cursor-agent -f`, `gemini
+    /// --skip-trust`) so a read in the sandbox cwd's world doesn't stall on a
+    /// prompt Mila would never see.
+    ///
+    /// False for `.openaiCompatible` — a remote HTTP endpoint has no filesystem
+    /// — and for `.none`, which runs nothing. This is the "must never apply to
+    /// the OpenAI-compatible provider" constraint from #179, expressed once
+    /// here so the Settings UI and `LLMRunner.effectiveDelivery` cannot drift
+    /// apart on it.
+    var readsLocalFiles: Bool {
+        switch self {
+        case .claude, .cursor, .gemini: return true
+        case .none, .openaiCompatible:  return false
+        }
+    }
+
     /// Default executable name (looked up via the user's `$PATH`). Empty for
     /// `.openaiCompatible` — the HTTP branch in `LLMRunner.run` returns before
     /// `resolveExecutable` is ever reached for this case.
@@ -226,6 +248,44 @@ final class LLMSettings: ObservableObject {
 
     @Published var postActionPrompt: String {
         didSet { defaults.set(postActionPrompt, forKey: Keys.actionPrompt) }
+    }
+
+    /// Send-to-LLM action only: hand the CLI the recording's sidecar **paths**
+    /// instead of pasting the transcript into the prompt (issue #179).
+    ///
+    /// Off by default, deliberately. Inlining is the shape that works
+    /// everywhere, and reference delivery trades that for fidelity: the `.srt`
+    /// it points at is the only artifact carrying timestamps, and the CLI can
+    /// re-read and seek within a file it opened itself. The cost is a
+    /// dependency on the CLI actually performing the read — which is why this
+    /// governs the *action* and not title generation or the automatic summary.
+    /// Those two run unattended on every recording, so a tool that declines to
+    /// read the file would degrade them silently and permanently; the action is
+    /// user-triggered and its result is shown in a banner, where "it didn't
+    /// read the transcript" is immediately visible.
+    ///
+    /// Scoped per-feature rather than global for the same reason. See
+    /// `actionDeliversTranscriptByPath` for the readiness gate that pairs with
+    /// this switch (`.claude/rules/feature-gates.md`).
+    @Published var actionTranscriptByPath: Bool {
+        didSet {
+            guard actionTranscriptByPath != oldValue else { return }
+            defaults.set(actionTranscriptByPath, forKey: Keys.actionTranscriptByPath)
+        }
+    }
+
+    /// "Enabled AND usable": the user asked for path delivery *and* the
+    /// selected tool can actually read a local file. Per
+    /// `.claude/rules/feature-gates.md` the persisted switch on its own is not
+    /// a readiness signal — a user who turns this on and later switches to the
+    /// OpenAI-compatible endpoint must not start shipping paths to a remote
+    /// endpoint that cannot open them. Callers ask this, never
+    /// `actionTranscriptByPath`.
+    ///
+    /// The stored preference is left untouched by the gate so switching back to
+    /// a CLI restores the user's choice rather than silently losing it.
+    var actionDeliversTranscriptByPath: Bool {
+        actionTranscriptByPath && tool.readsLocalFiles
     }
 
     /// Value `cliTimeout` falls back to when nothing is persisted, and the
@@ -506,6 +566,10 @@ final class LLMSettings: ObservableObject {
         self.namePrompt = defaults.string(forKey: Keys.namePrompt) ?? Self.defaultNamePrompt
         self.postActionEnabled = defaults.bool(forKey: Keys.actionEnabled)
         self.postActionPrompt = defaults.string(forKey: Keys.actionPrompt) ?? Self.defaultActionPrompt
+        // Default-OFF, so a plain `bool` read is the right one here (unlike
+        // `summaryEnabled` below): "key absent" and "user said no" mean the
+        // same thing, and inlining must stay the behaviour nobody opted into.
+        self.actionTranscriptByPath = defaults.bool(forKey: Keys.actionTranscriptByPath)
         // Default-on: a bare `defaults.bool` would read false for users who
         // have never seen this key, silently disabling summaries for
         // everyone on upgrade. Treat "key absent" as true.
@@ -571,6 +635,7 @@ final class LLMSettings: ObservableObject {
         static let namePrompt = "llm.name.prompt"
         static let actionEnabled = "llm.action.enabled"
         static let actionPrompt = "llm.action.prompt"
+        static let actionTranscriptByPath = "llm.action.transcriptByPath"
         static let summaryEnabled = "llm.summary.enabled"
         static let cliTimeout = "llm.cli.timeout"
         static let extraArgs = "llm.extraArgs"

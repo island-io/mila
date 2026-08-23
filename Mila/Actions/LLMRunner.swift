@@ -114,6 +114,111 @@ struct LLMTestResult: Equatable {
     var didLaunch: Bool { exitCode != nil || httpStatus != nil }
 }
 
+/// The on-disk artifacts a recording already has, for the *reference*
+/// transcript delivery (issue #179). Nothing here is produced for the LLM's
+/// benefit: these are the `.srt` / `.txt` / audio files `TranscriptionService`
+/// and `RecordingStore` write next to every completed recording anyway, so
+/// referencing them puts no new copy of the user's content on disk.
+///
+/// Every field is optional because none of them is guaranteed to exist at the
+/// moment a run starts: the `.srt` is written after the transcription pass and
+/// is skipped entirely for a recording with no segments, and the `.txt` is
+/// removed when the transcript comes up empty. Use `existing(...)` rather than
+/// the memberwise init so a path that is not actually on disk can never reach a
+/// prompt — a reference the CLI can't open is worse than no reference at all,
+/// because the model then answers from the prompt's framing instead of from
+/// anything that was said.
+struct TranscriptFiles: Equatable {
+    /// The `.srt` sidecar: SubRip cues carrying `00:00:07,000 --> 00:00:14,000`
+    /// timings and, when diarization ran, a `SPEAKER_00: ` prefix per cue. The
+    /// only artifact Mila writes that has timestamps at all.
+    var subtitles: URL?
+    /// The `.txt` sidecar. This is `Recording.fullText` — the plain join, with
+    /// **no** speaker labels (unlike the inlined body, which goes through
+    /// `TranscriptFormatter.plainText`). Offered as the easy-to-read whole-file
+    /// option, and it is the only reference available for a recording that has
+    /// no segments; `subtitles` is the richer one whenever it exists.
+    var plainText: URL?
+    /// The recording's audio. Referenced, never suggested for reading — an LLM
+    /// CLI can't decode it, but an agentic action ("file this recording in
+    /// $SYSTEM") needs to know where it is.
+    var audio: URL?
+
+    /// True when there is nothing to point the model at, which is the signal
+    /// for `LLMRunner.effectiveDelivery` to fall back to inlining.
+    var isEmpty: Bool { subtitles == nil && plainText == nil && audio == nil }
+
+    /// Which references survived, as a stable `+`-joined log token
+    /// (`srt+txt+audio`). Extensions only — a *filename* is derived from the
+    /// recording's title, which Mila generates from the meeting, so it is
+    /// content and does not belong in the unified log. See `redactedCommand`.
+    var logToken: String {
+        var parts: [String] = []
+        if subtitles != nil { parts.append("srt") }
+        if plainText != nil { parts.append("txt") }
+        if audio != nil { parts.append("audio") }
+        return parts.isEmpty ? "none" : parts.joined(separator: "+")
+    }
+
+    /// Keep only the paths that exist on disk *and* have bytes in them. The
+    /// zero-length check matters: `RecordingStore` deletes an emptied sidecar,
+    /// but an interrupted atomic write can still leave a 0-byte file behind,
+    /// and "read this empty file" reads to a model as "nothing was said".
+    static func existing(subtitles: URL? = nil,
+                         plainText: URL? = nil,
+                         audio: URL? = nil,
+                         fileManager: FileManager = .default) -> TranscriptFiles {
+        func usable(_ url: URL?) -> URL? {
+            guard let url else { return nil }
+            guard let size = (try? fileManager.attributesOfItem(atPath: url.path))?[.size] as? NSNumber,
+                  size.int64Value > 0 else { return nil }
+            return url
+        }
+        return TranscriptFiles(subtitles: usable(subtitles),
+                               plainText: usable(plainText),
+                               audio: usable(audio))
+    }
+}
+
+/// How the transcript reaches the model (issue #179).
+///
+/// `inline` is the historical behaviour and stays the default everywhere: the
+/// transcript body is pasted into the prompt argument. It is the only shape
+/// that works for a provider with no filesystem — notably the
+/// OpenAI-compatible HTTP endpoint.
+///
+/// `reference` swaps the body for the paths of files Mila already wrote. It
+/// exists because inlining is lossy in a way that is invisible from inside the
+/// prompt: `TranscriptFormatter.plainText` keeps speaker labels but drops every
+/// timestamp, while the `.srt` sitting next to the audio has both. It also
+/// turns a one-shot paste into something an agent can re-read, seek within and
+/// quote exact times out of — which is the point of the Send-to-LLM action.
+///
+/// A caller only ever *requests* a delivery; what actually happens is decided
+/// by `LLMRunner.effectiveDelivery(_:tool:)`, which downgrades to `inline` for
+/// a tool that cannot read files and for an empty reference set.
+enum TranscriptDelivery: Equatable {
+    case inline
+    case reference(TranscriptFiles)
+
+    /// `delivery=` log token.
+    var logToken: String {
+        switch self {
+        case .inline:    return "inline"
+        case .reference: return "reference"
+        }
+    }
+
+    /// `refs=` log token. `none` for inline, so the pair always reads
+    /// consistently.
+    var refsToken: String {
+        switch self {
+        case .inline:               return "none"
+        case .reference(let files): return files.logToken
+        }
+    }
+}
+
 /// Spawns the configured `claude` or `cursor-agent` binary with the user's
 /// prompt + transcript and returns whatever the CLI prints to stdout.
 ///
@@ -122,6 +227,8 @@ struct LLMTestResult: Equatable {
 /// `cursor-agent -p` only looks at argv and silently asks "what transcript?"
 /// when stdin is closed. Putting the transcript in the prompt is the
 /// portable shape that works for both CLIs without the user having to know.
+/// (`TranscriptDelivery.reference` narrows *what* travels in that argument —
+/// paths instead of the body — but not the mechanism: it is still argv.)
 ///
 /// We deliberately don't try to manage authentication, model selection, or
 /// streaming — both CLIs handle that themselves. Our job is "give the user's
@@ -146,12 +253,33 @@ enum LLMRunner {
     /// transcript. Empty / whitespace-only `summary` is omitted entirely
     /// (we don't want "Summary: (empty)" confusing the model when Live AI
     /// wasn't configured for this recording).
+    ///
+    /// `delivery` selects between pasting the transcript body in (the default,
+    /// unchanged) and naming the on-disk sidecars instead (issue #179). Pass the
+    /// value `effectiveDelivery(_:tool:)` returned, not the caller's raw request
+    /// — this function trusts that the paths it is handed exist and that the
+    /// tool can open them. It stays the ONE place either wire format is built,
+    /// so the format tests cover both modes.
     static func composedPrompt(_ userPrompt: String,
                                transcript: String,
-                               summary: String = "") -> String {
+                               summary: String = "",
+                               delivery: TranscriptDelivery = .inline) -> String {
         let prompt = userPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let body = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         let gist = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if case .reference(let files) = delivery, !files.isEmpty {
+            // Reference mode: the body is deliberately dropped. The summary is
+            // NOT — it is a few hundred characters, it is the gist the model
+            // should read before deciding which file to open, and it may exist
+            // for a recording whose sidecars don't (a Send fired mid-meeting).
+            // Same envelope as inline mode — one `---` under the user's prompt,
+            // blank-line-separated sections after it — so a user who switches
+            // modes doesn't have to re-tune a prompt that says "below".
+            var sections: [String] = []
+            if !gist.isEmpty { sections.append("Summary:\n\(gist)") }
+            sections.append(referenceBlock(files))
+            return "\(prompt)\n\n---\n" + sections.joined(separator: "\n\n")
+        }
+        let body = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.isEmpty && gist.isEmpty { return prompt }
         if gist.isEmpty {
             return "\(prompt)\n\n---\nTranscript:\n\(body)"
@@ -160,6 +288,59 @@ enum LLMRunner {
             return "\(prompt)\n\n---\nSummary:\n\(gist)"
         }
         return "\(prompt)\n\n---\nSummary:\n\(gist)\n\nFull transcript:\n\(body)"
+    }
+
+    /// The path-list half of the reference wire format.
+    ///
+    /// Labels describe the **format**, not the content: "with timestamps" is
+    /// true of every `.srt` Mila writes, whereas "diarized" would be a lie for
+    /// a recording transcribed with diarization off, and the URL alone can't
+    /// tell us which happened. `.srt` is listed first because it is a superset
+    /// of the `.txt` whenever both exist.
+    ///
+    /// The read instruction covers only the transcripts. The audio line sits
+    /// below it, unmentioned, so an agent doesn't spend a tool call trying to
+    /// read an `.m4a` it cannot decode — but an action that has to attach or
+    /// move the recording still knows where it is.
+    static func referenceBlock(_ files: TranscriptFiles) -> String {
+        var lines: [String] = []
+        if let srt = files.subtitles {
+            lines.append("Transcript (SubRip subtitles, with timestamps): \(srt.path)")
+        }
+        if let txt = files.plainText {
+            lines.append("Transcript (plain text): \(txt.path)")
+        }
+        if !lines.isEmpty {
+            lines.append("Read the transcript file(s) above before answering.")
+        }
+        if let audio = files.audio {
+            lines.append("Audio: \(audio.path)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    /// What `delivery` will actually do for `tool`, applied once in `run` so
+    /// the prompt builder and the log line can never disagree about it.
+    ///
+    /// Two downgrades to `inline`, both of them "the reference would be a lie":
+    ///
+    /// 1. **A tool with no filesystem.** `.openaiCompatible` is a remote HTTP
+    ///    endpoint; handing it `/Users/…/Foo.srt` sends a path it cannot open
+    ///    and gets back an answer about a meeting it never saw. The Settings UI
+    ///    doesn't offer the mode for that provider — this is the defence in
+    ///    depth behind it, exactly like `run`'s own re-check of the base URL.
+    /// 2. **No usable references.** `TranscriptFiles.existing` filtered every
+    ///    candidate out (transcription hasn't finished, or produced no
+    ///    segments and no text). Inlining whatever body we do have beats
+    ///    sending a prompt that points nowhere.
+    ///
+    /// Both degrade rather than throw: a Send that silently loses timestamps is
+    /// a worse answer, but a Send that fails outright is a lost one.
+    static func effectiveDelivery(_ delivery: TranscriptDelivery,
+                                 tool: LLMTool) -> TranscriptDelivery {
+        guard case .reference(let files) = delivery else { return .inline }
+        guard tool.readsLocalFiles, !files.isEmpty else { return .inline }
+        return delivery
     }
 
     /// Run `tool` with `prompt` + `transcript`. Returns stdout, trimmed.
@@ -173,6 +354,13 @@ enum LLMRunner {
     /// Pass empty string when there is no summary (e.g. Live AI not
     /// configured) — the wire format collapses to the old transcript-only
     /// shape in that case.
+    ///
+    /// `delivery` chooses whether the transcript body is inlined into the
+    /// prompt argument (the default, and the historical behaviour) or replaced
+    /// by the paths of the recording's own sidecars (issue #179). Always pass
+    /// the transcript text as well, even in `.reference` mode: it is what
+    /// `effectiveDelivery`'s fallback inlines when the tool can't read files or
+    /// no sidecar turned out to exist.
     ///
     /// `extraArgs` are appended verbatim after the tool's standard arguments
     /// — the user's persisted "Extra args" from Settings → AI Provider (e.g.
@@ -190,6 +378,7 @@ enum LLMRunner {
                     prompt: String,
                     transcript: String,
                     summary: String = "",
+                    delivery: TranscriptDelivery = .inline,
                     executablePathOverride: String?,
                     model: String? = nil,
                     session: LLMSession = .none,
@@ -217,7 +406,11 @@ enum LLMRunner {
 
         // OpenAI-compatible HTTP path — handled before any CLI resolution, so
         // `executablePathOverride` / `session` / `extraArgs` (CLI-only) are
-        // irrelevant here. Defense in depth: `run` has no `LLMSettings`, so it
+        // irrelevant here. `delivery` is deliberately NOT forwarded either: a
+        // remote endpoint cannot open `/Users/…/Foo.srt`, so this path always
+        // sends the transcript inline (issue #179). `effectiveDelivery` encodes
+        // the same rule for anyone composing a prompt without going through
+        // here. Defense in depth: `run` has no `LLMSettings`, so it
         // re-checks the base-URL readiness gate the Settings UI also enforces
         // via `isConfigured` — a nil/empty base URL can't send anything.
         if tool == .openaiCompatible {
@@ -253,7 +446,14 @@ enum LLMRunner {
             logSetupFailure(feature: feature, tool: tool, error: error)
             throw error
         }
-        let fullPrompt = composedPrompt(prompt, transcript: transcript, summary: summary)
+        // Resolve the delivery ONCE, here: the prompt below and the log line
+        // after it must describe the same run, and the downgrade rules live in
+        // `effectiveDelivery` rather than being re-derived at each use.
+        let resolvedDelivery = effectiveDelivery(delivery, tool: tool)
+        let fullPrompt = composedPrompt(prompt,
+                                        transcript: transcript,
+                                        summary: summary,
+                                        delivery: resolvedDelivery)
         let arguments = tool.arguments(prompt: fullPrompt,
                                        model: model,
                                        session: session) + extraArgs
@@ -272,6 +472,7 @@ enum LLMRunner {
                     summaryChars: summary.count,
                     transcriptChars: transcript.count,
                     composedChars: fullPrompt.count,
+                    delivery: resolvedDelivery,
                     timeout: timeout,
                     command: command)
         // ProcessHandle bridges Swift task cancellation to the underlying
@@ -548,6 +749,11 @@ enum LLMRunner {
                     summaryChars: summary.count,
                     transcriptChars: transcript.count,
                     composedChars: fullPrompt.count,
+                    // The Settings test panel runs against its own editable
+                    // sample transcript, not a recording, so there are no
+                    // sidecars to reference — this path is inline by
+                    // construction rather than by choice.
+                    delivery: .inline,
                     timeout: timeout,
                     command: loggedCommand)
         // Bridge Task cancellation to the child process, same as `run` — if
@@ -815,7 +1021,18 @@ enum LLMRunner {
     /// payload keeps the shape diagnosable without publishing the payload.
     /// Two things get redacted:
     ///
-    /// 1. **The composed prompt**, which is the meeting transcript.
+    /// 1. **The composed prompt.** Under the default `inline` delivery this is
+    ///    the meeting transcript, verbatim. Under `reference` delivery (issue
+    ///    #179) the body is gone — but the argument is *not* thereby neutral,
+    ///    which is the trap: it still carries the Live-AI summary, and it
+    ///    carries the sidecar paths, whose filenames Mila derives from the
+    ///    recording's title, which the LLM generated from the meeting. A run
+    ///    log full of `…/Q3 layoffs — legal review.srt` leaks the same thing
+    ///    the transcript would, one line at a time. So the placeholder holds in
+    ///    both modes, and the thing the reference mode actually made
+    ///    un-diagnosable — "did it send paths or the body, and which files?" —
+    ///    is answered by the `delivery=` / `refs=` tokens on the start line,
+    ///    which name extensions and never filenames.
     /// 2. **The values of the user's own "Extra args"** (the trailing
     ///    `extraArgsCount` tokens). These are free text from Settings → AI
     ///    Provider and people do put credentials in them — `--api-key sk-…`,
@@ -918,6 +1135,15 @@ enum LLMRunner {
     /// to catch, and the path is useless when redacted. It can contain the
     /// account's short name — the same exposure the pre-existing sandbox-path
     /// line already accepts.
+    ///
+    /// `delivery=` / `refs=` are the counterpart for issue #179. The
+    /// transcript's *path* can't be logged (it embeds the recording title — see
+    /// `redactedCommand`), so these say the shape instead: `delivery=reference
+    /// refs=srt+txt+audio` versus `delivery=inline refs=none`. That is enough
+    /// to tell the two failures apart — "the mode is on but silently fell back
+    /// to inlining because the `.srt` wasn't written yet" reads as
+    /// `delivery=inline` with a non-zero `transcript=`, while a genuine
+    /// reference run shows `transcript=` bytes that never left the machine.
     static func logRunStart(feature: LLMFeature,
                             tool: LLMTool,
                             executable: URL,
@@ -928,6 +1154,7 @@ enum LLMRunner {
                             summaryChars: Int,
                             transcriptChars: Int,
                             composedChars: Int,
+                            delivery: TranscriptDelivery,
                             timeout: TimeInterval,
                             command: String) {
         llmRunnerLog.notice("""
@@ -941,6 +1168,8 @@ enum LLMRunner {
             summary=\(summaryChars, privacy: .public)c \
             transcript=\(transcriptChars, privacy: .public)c \
             composed=\(composedChars, privacy: .public)c \
+            delivery=\(delivery.logToken, privacy: .public) \
+            refs=\(delivery.refsToken, privacy: .public) \
             timeout=\(Int(timeout.rounded(.up)), privacy: .public)s
             """)
         // The redacted argv is `debug`: it repeats what the start line already
