@@ -2,85 +2,183 @@ import SwiftUI
 import AppKit
 import Carbon.HIToolbox
 
-enum SettingsTab: Int, Hashable {
+/// One destination in Settings.
+///
+/// Still called `SettingsTab` even though Settings is no longer a `TabView`
+/// (#177 replaced the strip with a sidebar). The name is deliberately kept:
+/// it is the key of the deep-link contract (`SettingsNavigation.pendingTab`),
+/// its raw values are pinned by `AISettingsKeyCompatibilityTests`, and the
+/// per-destination views are all still named `…SettingsTab`. Renaming the
+/// type would churn all three for no behavioural gain.
+///
+/// `allCases` order IS the sidebar order, top to bottom. Adding a case adds a
+/// row; it costs vertical space in a scrollable list, so — unlike the old tab
+/// strip — there is no width budget to re-measure. See `SettingsView.body`.
+enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
     /// `aiProvider` + `aiFeatures` replace the former separate `llm` and
     /// `liveAI` tabs. The split is by *how often you touch it*: the provider
     /// is technical and set once (often via a `.milaconfig` import), while the
     /// feature switches are what people come back for. Keeping them on one
     /// screen forced every feature below the fold behind a disclosure arrow.
-    ///
-    /// Net tab count is unchanged from before the AI work (two AI tabs
-    /// replacing two AI tabs), which matters: the strip has to stay inside
-    /// the run measured in `SettingsView.body` below.
     case general, audio, models, aiProvider, aiFeatures, speakers, meetings, voiceMemos, storage
+
+    var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .audio: return "Audio"
+        case .models: return "Models"
+        case .aiProvider: return "AI Provider"
+        case .aiFeatures: return "AI Features"
+        case .speakers: return "Speakers"
+        case .meetings: return "Meetings"
+        case .voiceMemos: return "Voice Memos"
+        case .storage: return "Storage"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .general: return "gearshape"
+        case .audio: return "mic"
+        case .models: return "cube.box"
+        case .aiProvider: return "sparkles"
+        case .aiFeatures: return "wand.and.stars"
+        case .speakers: return "person.2"
+        case .meetings: return "video.fill"
+        case .voiceMemos: return "waveform"
+        case .storage: return "externaldrive"
+        }
+    }
+
+    /// Stable per-row accessibility identifier, so GUI tests can select a
+    /// destination without matching on the (localisable) visible label.
+    var accessibilityID: String {
+        switch self {
+        case .general: return "settings.section.general"
+        case .audio: return "settings.section.audio"
+        case .models: return "settings.section.models"
+        case .aiProvider: return "settings.section.aiProvider"
+        case .aiFeatures: return "settings.section.aiFeatures"
+        case .speakers: return "settings.section.speakers"
+        case .meetings: return "settings.section.meetings"
+        case .voiceMemos: return "settings.section.voiceMemos"
+        case .storage: return "settings.section.storage"
+        }
+    }
 }
 
 @Observable
 final class SettingsNavigation {
     @MainActor static let shared = SettingsNavigation()
+
+    /// Set this to jump Settings to a destination. Consumed (reset to nil) by
+    /// `SettingsView` as soon as it applies. Cross-references inside Settings
+    /// use it to become real navigation instead of prose — see
+    /// `AIFeaturesSettingsTab.notConfiguredBanner`.
     var pendingTab: SettingsTab?
 }
 
-/// Standard `Settings` scene. Opened via `Cmd+,` from the menu bar.
+/// Standard `Settings` scene. Opened via `Cmd+,` from the menu bar, and via
+/// `SettingsLink` in the sidebar footer.
+///
+/// ## Why a sidebar and not a tab strip (#177)
+///
+/// This used to be a `TabView`, and the window width was load-bearing because
+/// of it: AppKit's `NSTabView` collapses whatever does not fit into a `>>`
+/// overflow menu, which reads as a stray "expand button" and makes the
+/// collapsed tabs look disabled. That was reported as #131 and fixed in #137
+/// by pinning the window to 700×560 (740 pt of strip room) to hold the
+/// measured 599 pt run of nine tab items. #144 then concluded the obvious:
+/// nine fits, "with no room for a tenth". Every remaining move — widen again,
+/// or merge tabs — was spent, so new settings were being parked inside the
+/// Storage tab for want of a slot.
+///
+/// A sidebar list removes the ceiling instead of raising it. Destinations cost
+/// vertical space, which scrolls, rather than horizontal strip width, which
+/// does not. There is no `NSTabView`, so the `>>` chevron of #131 cannot come
+/// back at any count, and the window no longer needs a hardcoded size — it is
+/// resizable, which also settles the "dense tab can't be given more room"
+/// complaint in #177.
+///
+/// Settings stays its own `Settings` scene rather than becoming a page inside
+/// the main window: that keeps `Cmd+,`, `SettingsLink` and the App-menu item
+/// working for free (no hand-rolled `.appSettings` command, no "reopen the
+/// main window first" path when it is closed), keeps the macOS-native
+/// idiom, and — being a real window — can actually be put side by side with
+/// the main window, which an in-app page that takes over the content area
+/// cannot.
 struct SettingsView: View {
     @State private var selectedTab: SettingsTab = .general
 
     var body: some View {
-        TabView(selection: $selectedTab) {
-            GeneralSettingsTab()
-                .tabItem { Label("General", systemImage: "gearshape") }
-                .tag(SettingsTab.general)
-            AudioSettingsTab()
-                .tabItem { Label("Audio", systemImage: "mic") }
-                .tag(SettingsTab.audio)
-            ModelsSettingsTab()
-                .tabItem { Label("Models", systemImage: "cube.box") }
-                .tag(SettingsTab.models)
-            AIProviderSettingsTab()
-                .tabItem { Label("AI Provider", systemImage: "sparkles") }
-                .tag(SettingsTab.aiProvider)
-            AIFeaturesSettingsTab()
-                .tabItem { Label("AI Features", systemImage: "wand.and.stars") }
-                .tag(SettingsTab.aiFeatures)
-            DiarizationSettingsTab()
-                .tabItem { Label("Speakers", systemImage: "person.2") }
-                .tag(SettingsTab.speakers)
-            MeetingsSettingsTab()
-                .tabItem { Label("Meetings", systemImage: "video.fill") }
-                .tag(SettingsTab.meetings)
-            VoiceMemosSettingsTab()
-                .tabItem { Label("Voice Memos", systemImage: "waveform") }
-                .tag(SettingsTab.voiceMemos)
-            StorageSettingsTab()
-                .tabItem { Label("Storage", systemImage: "externaldrive") }
-                .tag(SettingsTab.storage)
+        NavigationSplitView {
+            List(SettingsTab.allCases, selection: sidebarSelection) { tab in
+                Label(tab.title, systemImage: tab.systemImage)
+                    .accessibilityIdentifier(tab.accessibilityID)
+                    .tag(tab)
+            }
+            .listStyle(.sidebar)
+            .navigationSplitViewColumnWidth(min: 168, ideal: 184, max: 240)
+            // Every destination lives in this list, so collapsing it would
+            // hide all navigation — the sidebar-toggle button a
+            // NavigationSplitView adds by default is exactly the kind of
+            // stray chrome #131 complained about.
+            .toolbar(removing: .sidebarToggle)
+        } detail: {
+            detail
+                // The old `TabView` was wrapped in `.padding(20)`, so every
+                // destination's content was written assuming an outer inset.
+                // Keep it, here, so the per-destination layouts are untouched.
+                .padding(20)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                // Puts the destination name in the window title, which is
+                // what the tab strip used to do.
+                .navigationTitle(selectedTab.title)
         }
-        // The width is load-bearing: it has to hold the whole tab strip.
-        // AppKit's NSTabView collapses whatever doesn't fit into a `>>`
-        // overflow menu, which reads as a stray "expand button" and makes
-        // the collapsed tabs look disabled (reported in #131, fixed here
-        // per #137).
+        .navigationSplitViewStyle(.balanced)
+        // No fixed size any more — the window is resizable, which is half the
+        // point of #177. The ideal is the old 740 pt content width plus the
+        // sidebar, so first launch looks like it always did.
         //
-        // Measured on macOS 26 at the default system font: the ten tab
-        // items occupy a 599 pt run (widest single item — "Voice Memos" —
-        // is 82 pt).
-        //
-        // The strip is NOT laid out inside this 700 pt frame. `.padding(20)`
-        // below sizes the Settings window to 740 pt, and AppKit draws the
-        // tab strip edge-to-edge across the whole window, so the run has the
-        // full 740 pt to sit in — measured item origins are 70 pt from the
-        // left window edge and 71 pt from the right. That is why 560 failed:
-        // it gave the strip 600 pt for a 599 pt run.
-        //
-        // If you add a tab, re-check Settings for the `>>` chevron rather
-        // than assuming it still fits.
-        .frame(width: 700, height: 560)
-        .padding(20)
+        // The floor is a judgement call, not a measurement: every destination
+        // lays out flexibly (`maxWidth:`), and the widest RIGID element in any
+        // of them is a 160 pt label, so ~500 pt of detail column is
+        // comfortable. It exists only to stop the two columns being dragged
+        // into nonsense.
+        .frame(minWidth: 700, idealWidth: 920,
+               minHeight: 440, idealHeight: 620)
         .onChange(of: SettingsNavigation.shared.pendingTab, initial: true) { _, newTab in
             if let tab = newTab {
                 selectedTab = tab
                 SettingsNavigation.shared.pendingTab = nil
             }
+        }
+    }
+
+    /// `List`'s selection binding is `Optional` — Escape or a click on empty
+    /// sidebar space clears it, which would blank the detail pane. Swallowing
+    /// the nil keeps a destination always selected.
+    private var sidebarSelection: Binding<SettingsTab?> {
+        Binding(
+            get: { selectedTab },
+            set: { if let new = $0 { selectedTab = new } }
+        )
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch selectedTab {
+        case .general: GeneralSettingsTab()
+        case .audio: AudioSettingsTab()
+        case .models: ModelsSettingsTab()
+        case .aiProvider: AIProviderSettingsTab()
+        case .aiFeatures: AIFeaturesSettingsTab()
+        case .speakers: DiarizationSettingsTab()
+        case .meetings: MeetingsSettingsTab()
+        case .voiceMemos: VoiceMemosSettingsTab()
+        case .storage: StorageSettingsTab()
         }
     }
 }
@@ -232,6 +330,10 @@ private struct AudioSettingsTab: View {
 /// didn't justify a tenth tab — and the tab strip had already overflowed into
 /// AppKit's ">>" overflow chevron at that width, which is what made the
 /// Updates tab look "disabled" (see PR discussion).
+///
+/// The strip is gone as of #177, so the width argument no longer applies;
+/// the "a toggle and a version string don't deserve their own destination"
+/// one still does, which is why this stays folded in.
 private struct GeneralSettingsTab: View {
     @EnvironmentObject private var hotkeys: HotkeySettings
 
@@ -1424,14 +1526,26 @@ private struct AIFeaturesSettingsTab: View {
 
     /// Shown once, at the top, instead of repeating "no provider" inside every
     /// feature that needs one.
+    ///
+    /// The pointer at the AI Provider destination is a button rather than
+    /// prose: with the sidebar (#177) a cross-reference inside Settings can
+    /// actually navigate, so it does.
     private var notConfiguredBanner: some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
-            Text("No AI provider yet — set one up in Settings → AI Provider.")
+            VStack(alignment: .leading, spacing: 2) {
+                Text("No AI provider yet.")
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Set one up in AI Provider") {
+                    SettingsNavigation.shared.pendingTab = .aiProvider
+                }
+                .buttonStyle(.link)
                 .font(.caption)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+                .accessibilityIdentifier("ai.features.notConfigured.link")
+            }
+            .frame(maxWidth: aiCaptionWidth, alignment: .leading)
         }
         .padding(8)
         .frame(maxWidth: .infinity, alignment: .leading)

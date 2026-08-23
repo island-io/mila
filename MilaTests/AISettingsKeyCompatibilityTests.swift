@@ -187,9 +187,10 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         // is in-memory only, which is why this PR could renumber freely), so
         // this is a tripwire for whoever first writes one to disk or a URL.
         //
-        // The list is also the authoritative tab inventory: nine tabs, which
-        // is what the measured tab-strip run in `SettingsView` assumes. Adding
-        // a tenth needs that measurement redone, not just a line here.
+        // The list is also the authoritative destination inventory. Since
+        // #177 it is no longer capped: destinations are sidebar rows, so a
+        // tenth costs scrollable vertical space rather than a re-measured tab
+        // strip. Adding one here plus a case is the whole job.
         XCTAssertEqual(SettingsTab.general.rawValue, 0)
         XCTAssertEqual(SettingsTab.audio.rawValue, 1)
         XCTAssertEqual(SettingsTab.models.rawValue, 2)
@@ -199,6 +200,44 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         XCTAssertEqual(SettingsTab.meetings.rawValue, 6)
         XCTAssertEqual(SettingsTab.voiceMemos.rawValue, 7)
         XCTAssertEqual(SettingsTab.storage.rawValue, 8)
+    }
+
+    // MARK: - Sidebar destination inventory (#177)
+
+    func test_every_settings_destination_is_reachable_from_the_sidebar() {
+        // `SettingsView` builds the sidebar from `allCases` and switches the
+        // detail pane on the same enum, so a case with no `switch` arm is a
+        // compile error and a case missing from `allCases` is impossible.
+        // What CAN silently break is the presentation: a destination with a
+        // blank title is an unclickable-looking empty row, and a duplicate
+        // title or identifier makes deep links and GUI tests ambiguous.
+        let all = SettingsTab.allCases
+        XCTAssertEqual(all.count, 9, "Destination count changed — intended?")
+
+        for tab in all {
+            XCTAssertFalse(tab.title.isEmpty, "\(tab) has no sidebar title")
+            XCTAssertFalse(tab.systemImage.isEmpty, "\(tab) has no sidebar icon")
+            XCTAssertTrue(tab.accessibilityID.hasPrefix("settings.section."),
+                          "\(tab) identifier must stay namespaced — GUI tests match on it")
+        }
+
+        XCTAssertEqual(Set(all.map(\.title)).count, all.count,
+                       "Two destinations share a sidebar title")
+        XCTAssertEqual(Set(all.map(\.accessibilityID)).count, all.count,
+                       "Two destinations share an accessibility identifier")
+        XCTAssertEqual(Set(all.map(\.id)).count, all.count,
+                       "Two destinations share a List identity")
+
+        // `SpeakerSelfHealUITests` hardcodes this string — the UI-test target
+        // cannot import the app's types, so this is the only thing keeping
+        // the two in sync.
+        XCTAssertEqual(SettingsTab.speakers.accessibilityID,
+                       "settings.section.speakers")
+
+        // Sidebar order is `allCases` order, which is the declaration order,
+        // which is the raw-value order. The old left-to-right tab order is
+        // preserved top-to-bottom.
+        XCTAssertEqual(all.map(\.rawValue), Array(0..<all.count))
     }
 
     // MARK: - Controls the two-tab split moved between screens
