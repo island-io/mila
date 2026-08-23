@@ -1100,7 +1100,7 @@ private struct AIProviderSettingsTab: View {
     private var cliFields: some View {
         VStack(alignment: .leading, spacing: 6) {
             fieldRow("Executable",
-                     help: "Set this when `claude` / `cursor-agent` / `gemini` lives somewhere a GUI app won't see by default — ~/.local/bin, an asdf shim, a Homebrew prefix that isn't on the system PATH.") {
+                     help: "Only needed when Mila can't find the CLI itself — it already searches $PATH, Homebrew, ~/.local/bin, your configured npm prefix and the node version managers (nvm, Volta, asdf).") {
                 TextField("(use $PATH)", text: $settings.executablePath)
                     .textFieldStyle(.roundedBorder)
                     .autocorrectionDisabled()

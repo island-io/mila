@@ -1364,10 +1364,11 @@ enum LLMRunner {
     }
 
     /// Ordered candidate directories for `lookupOnPath`: the inherited `$PATH`
-    /// first, then well-known shell/version-manager `bin` dirs. Node-based CLIs
-    /// (claude, cursor-agent, gemini) are commonly installed as global npm
-    /// packages under a version manager, so those roots are enumerated too.
-    /// Exposed (internal) so the version-manager enumeration is unit-testable.
+    /// first, then the `bin` of whatever prefix npm is *configured* with, then
+    /// well-known shell/version-manager `bin` dirs. Node-based CLIs (claude,
+    /// cursor-agent, gemini) are commonly installed as global npm packages
+    /// under a version manager, so those roots are enumerated too.
+    /// Exposed (internal) so the enumeration is unit-testable.
     static func searchDirectories(
         home: String = NSHomeDirectory(),
         pathEnv: String? = ProcessInfo.processInfo.environment["PATH"],
@@ -1377,14 +1378,21 @@ enum LLMRunner {
         if let pathEnv {
             dirs += pathEnv.split(separator: ":").map(String.init)
         }
-        dirs += [
+        // Everything past the PATH entries is a *guess* at where a global npm
+        // install landed — except the configured prefix, which comes from the
+        // user's own npm config, so it leads the fallbacks.
+        var fallbacks: [String] = []
+        if let prefixBin = npmPrefixBin(home: home, fileManager: fileManager) {
+            fallbacks.append(prefixBin)
+        }
+        fallbacks += [
             "\(home)/.local/bin",
             "\(home)/bin",
             "\(home)/.cargo/bin",
             "\(home)/.bun/bin",
             "\(home)/.volta/bin",        // Volta
             "\(home)/.asdf/shims",       // asdf
-            "\(home)/.npm-global/bin",   // custom npm prefix
+            "\(home)/.npm-global/bin",   // the ~/.npm-global convention
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "/usr/bin",
@@ -1396,11 +1404,109 @@ enum LLMRunner {
         // install time, so search every installed version, newest first.
         let nvmRoot = "\(home)/.nvm/versions/node"
         if let versions = try? fileManager.contentsOfDirectory(atPath: nvmRoot) {
-            dirs += versions
+            fallbacks += versions
                 .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
                 .map { "\(nvmRoot)/\($0)/bin" }
         }
+        // De-dupe, order kept: npm's *default* prefix on a node that isn't
+        // Homebrew's is /usr/local, so a configured value routinely collides
+        // with an entry already in the list (or already on PATH), and probing
+        // the same directory twice per lookup buys nothing.
+        var seen = Set(dirs)
+        dirs += fallbacks.filter { seen.insert($0).inserted }
         return dirs
+    }
+
+    /// `bin` directory of the npm prefix the user actually configured, or
+    /// `nil` when `~/.npmrc` has no usable `prefix` value.
+    ///
+    /// Parsing the file rather than shelling out to `npm config get prefix` is
+    /// deliberate: that needs `npm` on `PATH`, which is exactly what a
+    /// launchd-launched Mila does not have, and it would cost a process spawn
+    /// on every executable lookup.
+    ///
+    /// **Only the user config is read.** npm's other prefix sources cannot
+    /// help in the situation this exists for:
+    /// - `NPM_CONFIG_PREFIX` / `npm_config_prefix` and `NPM_CONFIG_USERCONFIG`
+    ///   live in the environment. A Finder- or launchd-launched Mila does not
+    ///   get the user's exported shell variables — the same stripping that
+    ///   loses `PATH` — and when Mila *is* started from a shell, that prefix's
+    ///   `bin` is already on the inherited `PATH` searched first. Honouring
+    ///   them would be dead code in the broken case and redundant in the
+    ///   working one.
+    /// - the global `$PREFIX/etc/npmrc` can only be located once the prefix is
+    ///   known, which is circular; the two prefixes it realistically names on
+    ///   macOS (`/opt/homebrew`, `/usr/local`) are in the list above already.
+    /// - a project-level `./.npmrc` is meaningless for a GUI app whose working
+    ///   directory the user never chose.
+    static func npmPrefixBin(home: String = NSHomeDirectory(),
+                             fileManager: FileManager = .default) -> String? {
+        let npmrc = (home as NSString).appendingPathComponent(".npmrc")
+        guard let data = fileManager.contents(atPath: npmrc),
+              let text = String(data: data, encoding: .utf8),
+              let value = npmrcPrefixValue(in: text) else { return nil }
+        let expanded = expandingHome(value, home: home)
+        // Blank, relative, commented-out or otherwise unusable values degrade
+        // to "no extra directory" rather than a nonsense path to probe.
+        guard expanded.hasPrefix("/") else {
+            if !expanded.isEmpty {
+                llmRunnerLog.debug("""
+                    llm npm prefix ignored (not an absolute path) \
+                    npmrc=\(npmrc, privacy: .public)
+                    """)
+            }
+            return nil
+        }
+        return (expanded as NSString).appendingPathComponent("bin")
+    }
+
+    /// The effective `prefix` value in an npmrc body, following the `ini`
+    /// parser npm itself uses: `;` and `#` start a comment, a quoted value is
+    /// taken verbatim, an unquoted one ends at an inline comment, and a later
+    /// assignment overwrites an earlier one. `nil` when the key is absent —
+    /// an empty string when it is present but blank, which the caller rejects
+    /// along with every other unusable value.
+    private static func npmrcPrefixValue(in text: String) -> String? {
+        var found: String?
+        // `isNewline` rather than splitting on "\n": Swift treats CRLF as a
+        // single Character, so a file saved with Windows line endings would
+        // otherwise parse as one giant line.
+        for rawLine in text.split(whereSeparator: { $0.isNewline }) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix(";") || line.hasPrefix("#") { continue }
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let key = line[line.startIndex..<equals]
+                .trimmingCharacters(in: .whitespaces)
+                .lowercased()
+            guard key == "prefix" else { continue }
+            var value = line[line.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces)
+            if value.count >= 2,
+               let quote = value.first, quote == "\"" || quote == "'",
+               value.last == quote {
+                value = String(value.dropFirst().dropLast())
+            } else if let comment = value.firstIndex(where: { $0 == ";" || $0 == "#" }) {
+                value = String(value[value.startIndex..<comment])
+                    .trimmingCharacters(in: .whitespaces)
+            }
+            found = value
+        }
+        return found
+    }
+
+    /// Expands a leading `~`, `$HOME` or `${HOME}` against the given home.
+    /// Anything else (`~someoneelse`, `$OTHER`) is returned untouched so it
+    /// fails `npmPrefixBin`'s absolute-path check instead of being
+    /// half-expanded into a directory that cannot exist.
+    private static func expandingHome(_ value: String, home: String) -> String {
+        for token in ["${HOME}", "$HOME", "~"] {
+            if value == token { return home }
+            if value.hasPrefix(token + "/") {
+                let rest = String(value.dropFirst(token.count + 1))
+                return (home as NSString).appendingPathComponent(rest)
+            }
+        }
+        return value
     }
 }
 
