@@ -500,7 +500,8 @@ struct RenameRecordingSheet: View {
                 timeout: llm.cliTimeout,
                 openAIBaseURL: llm.openAIBaseURL,
                 openAIAPIKey: llm.openAIAPIKey,
-                jsonMode: false
+                jsonMode: false,
+                feature: .name
             )
             let cleaned = PostRecordingCoordinator.cleanedTitle(from: suggestion)
             if cleaned.isEmpty {
