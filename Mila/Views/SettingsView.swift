@@ -821,6 +821,15 @@ private struct RemoteBackendSection: View {
             .padding(.top, 6)
         }
         .font(.callout)
+        // `showAdvanced` is @State, so its initial value is used once and never
+        // recomputed. If `model` changes to a custom id while this section is on
+        // screen -- a `.milaconfig` import is the realistic way -- the picker
+        // flips to "Custom..." while the Model id field stays collapsed, leaving
+        // the value visible nowhere and un-editable. Open the disclosure when
+        // the configured id stops being one of the presets.
+        .onChange(of: remote.model) { _, _ in
+            if remote.selectedPreset == nil { showAdvanced = true }
+        }
     }
 
     private var privacyWarning: some View {
