@@ -361,6 +361,7 @@ struct MilaApp: App {
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
     @StateObject private var updater = UpdaterViewModel()
+    @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
@@ -570,6 +571,21 @@ struct MilaApp: App {
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
+        // Save voice profile when a speaker is named — if the live
+        // diarizer has a centroid for that speaker, persist it.
+        let profileStoreRef = SpeakerProfileStore()
+        _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
+        let diarizerRef = liveDiar
+        store.onSpeakerNamed = { _, rawID, name in
+            if let entry = diarizerRef.currentProfiles().first(where: { $0.id == rawID }) {
+                profileStoreRef.updateProfile(
+                    name: name,
+                    embedding: entry.centroid,
+                    sampleCount: entry.sampleCount
+                )
+            }
+        }
+
         // Auto-drop accidental short+empty captures (issue #61). A recording
         // that finishes transcription with no text AND under the user's
         // minimum-duration threshold (Settings ▸ Storage, default 5s, 0 = keep
@@ -691,11 +707,20 @@ struct MilaApp: App {
                 .task { await runFinalizeRegressionIfRequested() }
                 .task { recordingSummarizer.backfillIfNeeded() }
                 .task { voiceMemosImporter.start() }
+                .onChange(of: actions.isRecording) { wasRecording, isRecording in
+                    if wasRecording, !isRecording {
+                        // Recording just stopped — auto-assign names from
+                        // recognised voice profiles for seeded pool entries
+                        // that actually matched utterances.
+                        autoAssignRecognisedSpeakers()
+                    }
+                }
                 .environmentObject(recordingSummarizer)
                 .environmentObject(meetingDetectionSettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 .sheet(item: Binding(
                     get: { configImporter.pending },
@@ -774,6 +799,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 // Settings ▸ General shows the Sparkle-backed
                 // "Automatically check for updates" toggle, so the Settings
@@ -831,6 +857,29 @@ struct MilaApp: App {
     /// user's enabled toggle. Called once from the main `WindowGroup`
     /// `.task` so the work is tied to the app's lifetime rather than
     /// to any single view.
+    /// After recording stops, check the live diarizer pool for speakers
+    /// that were seeded from voice profiles and actually matched real
+    /// utterances. Auto-assign their names to the most recent recording
+    /// and update their voice profiles with fresh centroid data.
+    private func autoAssignRecognisedSpeakers() {
+        guard let rec = store.recordings.first else { return }
+        let poolEntries = liveSpeakerDiarizer.currentProfiles()
+        // Only assign names for pool entries that were seeded AND
+        // actually matched utterances (sampleCount > the seed cap of 3).
+        for entry in poolEntries {
+            guard let profileName = entry.profileName else { continue }
+            // Check this speaker actually spoke (has intervals).
+            let spoke = liveSpeakerDiarizer.intervals.contains { $0.speaker == entry.id }
+            guard spoke else { continue }
+            store.setSpeakerName(profileName, forSpeaker: entry.id, recordingID: rec.id)
+            speakerProfileStore.updateProfile(
+                name: profileName,
+                embedding: entry.centroid,
+                sampleCount: entry.sampleCount
+            )
+        }
+    }
+
     private func startMeetingDetectionIfNeeded() {
         meetingPrompt.start()
         meetingPrompt.bindEnabledChanges()
@@ -1373,6 +1422,7 @@ struct MilaApp: App {
                 // By the time this runs, the session has already been freshly
                 // started for this recording.
                 diarizer.reset()
+                diarizer.seedPool(with: speakerProfileStore.seedEntries())
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.
