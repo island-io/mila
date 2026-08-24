@@ -732,42 +732,47 @@ private struct TranscriptLineView: View {
         // calls — a single English aside inside a Hebrew conversation
         // should still display LTR within its own line).
         let lineRTL = segment.text.isPredominantlyHebrew || language == "he"
+        // Outer HStack stays LTR so the trash control is always the
+        // physical trailing child. Inner stack owns lineRTL for speaker
+        // + text; putting the button inside that stack would mirror it
+        // onto the leading edge. The button stays in layout (opacity
+        // only) so rows don't jump, but is removed from hit-testing and
+        // VoiceOver until hover.
         HStack(alignment: .top, spacing: 8) {
-            if let sp = segment.speaker {
-                SpeakerLabelButton(
-                    rawID: sp,
-                    names: speakerNames,
-                    language: language,
-                    color: useSpeakerColor ? sp.speakerColor(names: speakerNames) : Color.accentColor,
-                    font: .caption.weight(.semibold),
-                    onAssign: { name in onAssignName(sp, name) }
-                )
-                .frame(minWidth: 96, alignment: .leading)
-            } else {
-                Color.clear.frame(width: 96, height: 1)
+            HStack(alignment: .top, spacing: 8) {
+                if let sp = segment.speaker {
+                    SpeakerLabelButton(
+                        rawID: sp,
+                        names: speakerNames,
+                        language: language,
+                        color: useSpeakerColor ? sp.speakerColor(names: speakerNames) : Color.accentColor,
+                        font: .caption.weight(.semibold),
+                        onAssign: { name in onAssignName(sp, name) }
+                    )
+                    .frame(minWidth: 96, alignment: .leading)
+                } else {
+                    Color.clear.frame(width: 96, height: 1)
+                }
+                Text(segment.text)
+                    .font(.callout)
+                    .foregroundStyle(segment.stable ? .primary : .secondary)
+                    .italic(!segment.stable)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(.leading)
+                    // Put the identifier on the leaf Text so XCUITest's
+                    // `.staticTexts.matching(identifier:)` finds it. The
+                    // outer wrapper-level identifier was a no-op (SwiftUI
+                    // didn't materialize an a11y node there).
+                    .accessibilityIdentifier("liveTranscript.segment")
             }
-            Text(segment.text)
-                .font(.callout)
-                .foregroundStyle(segment.stable ? .primary : .secondary)
-                .italic(!segment.stable)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .multilineTextAlignment(.leading)
-                // Put the identifier on the leaf Text so XCUITest's
-                // `.staticTexts.matching(identifier:)` finds it. The
-                // outer wrapper-level identifier was a no-op (SwiftUI
-                // didn't materialize an a11y node there).
-                .accessibilityIdentifier("liveTranscript.segment")
-            // Hover-revealed delete button. Kept out of the layout-direction
-            // flip (its own LTR) so the trash icon sits on the trailing edge
-            // regardless of the line's script. Always present but near-
-            // invisible until hover so rows don't jump when the button
-            // appears.
+            .environment(\.layoutDirection, lineRTL ? .rightToLeft : .leftToRight)
             deleteButton
                 .opacity(hovering ? 1 : 0)
-                .environment(\.layoutDirection, .leftToRight)
+                .allowsHitTesting(hovering)
+                .accessibilityHidden(!hovering)
         }
-        .environment(\.layoutDirection, lineRTL ? .rightToLeft : .leftToRight)
+        .environment(\.layoutDirection, .leftToRight)
         .contentShape(Rectangle())
         .onHover { hovering = $0 }
         // Right-click / control-click also offers delete, for when the
