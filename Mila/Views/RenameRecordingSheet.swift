@@ -208,6 +208,13 @@ struct RenameRecordingSheet: View {
         // bind ESC to Discard — the whole point of this change is that
         // dismissing the sheet must never throw audio away.
         .onExitCommand { save() }
+        // SwiftUI can reuse this sheet's @State for a later recording.
+        // Drop the previous pick so applyFolder() cannot file the new
+        // recording under the last one.
+        .onChange(of: initialRecording.id) { _, _ in
+            userEditedFolder = false
+            selectedFolder = liveRecording.folder
+        }
         // Catch any suggestion that landed in the store between this view's
         // init (which snapshotted `initialRecording.title`) and `onChange`
         // being installed — otherwise a Save could write the stale default
