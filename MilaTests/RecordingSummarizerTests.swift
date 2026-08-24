@@ -506,6 +506,197 @@ final class RecordingSummarizerTests: XCTestCase {
                        "The OpenAI summary path must send openAIModelName, not the Live AI model")
     }
 
+    // MARK: - JSON envelope (summary + action items)
+
+    /// The one-shot summarizer now asks for a JSON envelope so it can
+    /// populate BOTH the summary and the action-items list from the full
+    /// transcript — restoring the pair the pre-#87 inline final Live-AI
+    /// tick used to produce. A well-formed envelope must land both halves.
+    func test_summarize_parses_envelope_and_stores_summary_and_action_items() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            #"{"summary": "We agreed to ship next week.", "items": [{"id": "ship", "text": "Ship the beta", "speaker": null, "timestamp_seconds": 0, "source": "inferred"}, {"id": "deck", "text": "Dana sends the deck", "speaker": null, "timestamp_seconds": 0, "source": "inferred"}]}"#
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Envelope")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Envelope",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "we discussed the roadmap and agreed to ship next week"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "We agreed to ship next week.")
+        let items = try XCTUnwrap(updated.actionItems)
+        XCTAssertEqual(items.map(\.text), ["Ship the beta", "Dana sends the deck"])
+    }
+
+    /// Back-compat: a model that ignores the JSON instruction and returns
+    /// plain prose must still have its whole output stored as the summary,
+    /// with no action items — exactly the pre-change behaviour.
+    func test_summarize_plain_text_output_still_stored_as_summary_without_items() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "Just a plain prose summary." }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Prose")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Prose",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "transcript text"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "Just a plain prose summary.")
+        XCTAssertNil(updated.actionItems,
+                     "plain-text output must not fabricate an action-items list")
+    }
+
+    /// `regenerate` (the Live-AI finalize path + manual affordance) must
+    /// REPLACE stale action items with the fresh full-transcript set, the
+    /// same way it already replaces the summary.
+    func test_regenerate_replaces_action_items_from_full_transcript() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            #"{"summary": "Fresh summary.", "items": [{"id": "new", "text": "New follow-up", "speaker": null, "timestamp_seconds": 0, "source": "inferred"}]}"#
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "RegenItems")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "RegenItems",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        rec.summary = "stale summary"
+        rec.actionItems = [ActionItem(id: "old", text: "Stale item", speaker: nil,
+                                      timestampSeconds: 0, source: .llmInferred,
+                                      addedAt: Date())]
+        store.add(rec)
+
+        summarizer.regenerate(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "Fresh summary.")
+        XCTAssertEqual(updated.actionItems?.map(\.text), ["New follow-up"],
+                       "regenerate must replace the stale action items")
+    }
+
+    /// An empty (or absent) items list must NOT wipe action items the
+    /// recording already has — e.g. a Live-AI recording's rolling snapshot.
+    /// A glitchy prose response shouldn't cost the user their items.
+    func test_regenerate_empty_items_preserves_existing_action_items() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in "Only a prose summary, no JSON." }
+
+        let audioURL = store.freshAudioURL(suggestedName: "KeepItems")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "KeepItems",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        rec.summary = "stale summary"
+        rec.actionItems = [ActionItem(id: "keep", text: "Keep me", speaker: nil,
+                                      timestampSeconds: 0, source: .llmInferred,
+                                      addedAt: Date())]
+        store.add(rec)
+
+        summarizer.regenerate(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "Only a prose summary, no JSON.")
+        XCTAssertEqual(updated.actionItems?.map(\.text), ["Keep me"],
+                       "an empty items response must not wipe existing action items")
+    }
+
+    /// The prompt's preferred shape: a plain-text summary, the sentinel on
+    /// its own line, then a JSON array. The summary stays plain text (no JSON
+    /// wrapping) and the items are parsed from the trailing array.
+    func test_summarize_parses_sentinel_format() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            """
+            We agreed to ship next week and Dana owns the deck.
+            \(RecordingSummarizer.actionItemsSentinel)
+            [{"id": "ship", "text": "Ship the beta", "source": "inferred"}, {"id": "deck", "text": "Dana sends the deck", "source": "inferred"}]
+            """
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Sentinel")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Sentinel",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "we discussed the roadmap"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "We agreed to ship next week and Dana owns the deck.")
+        XCTAssertFalse(updated.summary?.contains(RecordingSummarizer.actionItemsSentinel) ?? true,
+                       "the sentinel marker must not leak into the summary")
+        XCTAssertEqual(updated.actionItems?.map(\.text), ["Ship the beta", "Dana sends the deck"])
+    }
+
+    /// Regression for the reported bug: the model returned a JSON envelope
+    /// whose summary value had UNESCAPED quotes and newlines (Hebrew review),
+    /// so the object decode failed. The summarizer must NOT dump the raw
+    /// `{...}` blob into the summary — it salvages the summary text and still
+    /// recovers the (independently valid) items array.
+    func test_summarize_salvages_summary_from_malformed_json_envelope() async throws {
+        llm.tool = .claude
+        // Note the unescaped inner quotes around על חלל and the literal \n —
+        // exactly what broke JSONDecoder in production.
+        let malformed = #"{"summary": "השיחה עסקה בניהול צוות.\n\n• בייליס מתנהג כאילו הוא "על חלל" ואינו לוקח אחריות.", "items": [{"id": "a", "text": "להחזיר לבייליס ביקורת ישירה", "source": "inferred"}, {"id": "b", "text": "לנטרל את גוליאן משיחות פרודקט", "source": "inferred"}]}"#
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in malformed }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Malformed")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Malformed",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        let summary = try XCTUnwrap(updated.summary)
+        XCTAssertFalse(summary.hasPrefix("{"),
+                       "a raw JSON blob must never be shown as the summary")
+        XCTAssertFalse(summary.contains("\"items\""),
+                       "the items scaffolding must not leak into the summary")
+        XCTAssertTrue(summary.contains("השיחה עסקה בניהול צוות"),
+                      "the real summary text must be salvaged")
+        XCTAssertTrue(summary.contains("\n"),
+                      "escaped newlines must be restored so it renders as lines")
+        XCTAssertEqual(updated.actionItems?.count, 2,
+                       "the valid items array must still be recovered")
+    }
+
     // MARK: - Helpers
 
     /// Rebuild `summarizer` with a deterministic `runLLM` stub so the
