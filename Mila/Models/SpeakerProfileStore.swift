@@ -75,7 +75,7 @@ final class SpeakerProfileStore: ObservableObject {
     func updateProfile(name: String, embedding: [Float], sampleCount: Int) {
         guard enabled else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !embedding.isEmpty else { return }
+        guard !trimmed.isEmpty, !embedding.isEmpty, sampleCount > 0 else { return }
 
         if let idx = profiles.firstIndex(where: { $0.name == trimmed }) {
             let existing = profiles[idx]
@@ -138,6 +138,11 @@ final class SpeakerProfileStore: ObservableObject {
     func renameProfile(from oldName: String, to newName: String) {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != oldName else { return }
+        // Reject if the target name is already taken by another profile.
+        guard !profiles.contains(where: { $0.name == trimmed }) else {
+            profileLog.log("renameProfile: target name already exists: \(trimmed, privacy: .private)")
+            return
+        }
         if let idx = profiles.firstIndex(where: { $0.name == oldName }) {
             profiles[idx].name = trimmed
             save()
@@ -153,7 +158,11 @@ final class SpeakerProfileStore: ObservableObject {
 
         let keep = profiles[keepIdx]
         let absorb = profiles[absorbIdx]
-        let dim = min(keep.embedding.count, absorb.embedding.count)
+        guard keep.embedding.count == absorb.embedding.count else {
+            profileLog.log("mergeProfiles: dimension mismatch (\(keep.embedding.count) vs \(absorb.embedding.count))")
+            return nil
+        }
+        let dim = keep.embedding.count
         guard dim > 0 else { return nil }
         let totalCount = keep.sampleCount + absorb.sampleCount
         var merged = [Float](repeating: 0, count: dim)
@@ -199,6 +208,11 @@ final class SpeakerProfileStore: ObservableObject {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
+            // Ensure the parent directory exists (first launch on a clean install).
+            let dir = storeURL.deletingLastPathComponent()
+            if !fileManager.fileExists(atPath: dir.path) {
+                try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
+            }
             let data = try encoder.encode(profiles)
             try data.write(to: storeURL, options: .atomic)
         } catch {

@@ -8,9 +8,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
             .appendingPathComponent("SpeakerProfileStoreTests-\(UUID().uuidString)")
     }
 
-    func test_updateProfile_creates_new_profile() {
+    func test_updateProfile_creates_new_profile() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -22,9 +22,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].sampleCount, 1)
     }
 
-    func test_updateProfile_merges_centroids() {
+    func test_updateProfile_merges_centroids() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -38,9 +38,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].embedding[1], 0.5, accuracy: 0.001)
     }
 
-    func test_updateProfile_rejects_dimension_mismatch() {
+    func test_updateProfile_rejects_dimension_mismatch() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -52,9 +52,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].embedding.count, 3)
     }
 
-    func test_deleteProfile_by_name() {
+    func test_deleteProfile_by_name() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -67,9 +67,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].name, "Bob")
     }
 
-    func test_renameProfile() {
+    func test_renameProfile() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -81,9 +81,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertTrue(store.profileExists(name: "Alicia"))
     }
 
-    func test_match_returns_best_above_threshold() {
+    func test_match_returns_best_above_threshold() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -99,9 +99,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertNil(noMatch)
     }
 
-    func test_mergeProfiles() {
+    func test_mergeProfiles() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
@@ -118,9 +118,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(merged?.embedding[0] ?? 0, 0.5, accuracy: 0.001)
     }
 
-    func test_persistence_round_trip() {
+    func test_persistence_round_trip() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
 
         do {
@@ -135,9 +135,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.profiles[0].sampleCount, 5)
     }
 
-    func test_seedEntries_returns_all_profiles() {
+    func test_seedEntries_returns_all_profiles() throws {
         let dir = tempDir()
-        try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = SpeakerProfileStore(directory: dir)
 
