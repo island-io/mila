@@ -2308,6 +2308,7 @@ private struct VoiceRecognitionSection: View {
             }
             .toggleStyle(.switch)
             .controlSize(.regular)
+            .accessibilityIdentifier("speakers.voiceRecognition.toggle")
 
             if profileStore.enabled {
                 HStack(spacing: 8) {
