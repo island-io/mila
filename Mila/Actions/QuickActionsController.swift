@@ -648,6 +648,11 @@ final class QuickActionsController: ObservableObject {
         // below once the recording is built so it doesn't carry over.
         let finalTitle = Self.resolvedRecordingTitle(userProvided: nextRecordingTitle,
                                                      defaultTitle: title)
+        // Same one-shot rule as the title: capture, apply, then clear so
+        // the next recording in this launch does not inherit the folder.
+        let chosenFolder = nextRecordingFolder
+        nextRecordingTitle = ""
+        nextRecordingFolder = nil
 
         // A mic-only recording that captured zero frames produces an empty
         // WAV → empty transcript → silent ".failed". Tell the user why
@@ -709,7 +714,7 @@ final class QuickActionsController: ObservableObject {
             language: languageSettings.current.rawValue,
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
-            folder: nextRecordingFolder,
+            folder: chosenFolder,
             appName: appName,
             appBundleID: appBundleID,
             summary: initialSummary.isEmpty ? nil : initialSummary,
@@ -734,14 +739,11 @@ final class QuickActionsController: ObservableObject {
         // drain, after `store.update`. Every exit from the drain below must
         // finish it: with the id when the row was updated, with `nil` when
         // the row is gone and there is nothing to hand off.
-        // Clear the one-shot meeting name so the next recording starts with
-        // a fresh, auto-generated title unless the user names it again.
-        nextRecordingTitle = ""
-        // Register the chosen folder in the store's folder list (and dedup
-        // case-insensitively) so the recording isn't orphaned out of both
-        // "All Transcriptions" and the folder.
-        if nextRecordingFolder != nil {
-            store.assign(recording, toFolder: nextRecordingFolder)
+        // `add` already persisted the folder field. `assign` is only needed
+        // when the name is not already in `store.folders` (brand-new folder
+        // or a case-insensitive match that needs normalizing).
+        if let chosenFolder, !store.folders.contains(chosenFolder) {
+            store.assign(recording, toFolder: chosenFolder)
         }
         activeJob = .none
         if sleepReason != nil {

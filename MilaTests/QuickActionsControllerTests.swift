@@ -134,8 +134,6 @@ final class QuickActionsControllerTests: XCTestCase {
     }
 
     func test_nextRecordingFolder_defaults_to_all_transcriptions() {
-        UserDefaults.standard.set("Stale Folder", forKey: "quickActions.nextRecordingFolder")
-        defer { UserDefaults.standard.removeObject(forKey: "quickActions.nextRecordingFolder") }
         let fresh = QuickActionsController(
             session: RecordingSession(),
             store: store,
@@ -147,6 +145,48 @@ final class QuickActionsControllerTests: XCTestCase {
                 llm: LLMSettings(defaults: UserDefaults(suiteName: "QuickActionsControllerTests.llm2")!)))
         XCTAssertNil(fresh.nextRecordingFolder,
                      "next-recording folder must default to All Transcriptions, not a persisted folder")
+    }
+
+    /// A folder chosen for one recording is one-shot: stop must not leave
+    /// it selected for the next recording in the same launch.
+    func test_stopRecording_clears_nextRecordingFolder() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "FolderClear")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        store.createFolder("Work")
+        controller.nextRecordingFolder = "Work"
+        controller.nextRecordingTitle = "Weekly Sync"
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        XCTAssertNil(controller.nextRecordingFolder,
+                     "nextRecordingFolder must reset after save")
+        XCTAssertEqual(controller.nextRecordingTitle, "",
+                       "nextRecordingTitle must reset after save")
+        let stored = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        XCTAssertEqual(stored.folder, "Work")
+        XCTAssertEqual(stored.title, "Weekly Sync")
+    }
+
+    /// A folder name that isn't already in the store list still gets
+    /// registered via assign (new folder / case-insensitive match).
+    func test_stopRecording_registers_a_brand_new_folder() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "NewFolder")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.nextRecordingFolder = "Brand New"
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        XCTAssertTrue(store.folders.contains("Brand New"))
+        let stored = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        XCTAssertEqual(stored.folder, "Brand New")
     }
 
     // MARK: - Resolved recording title (meeting name override)
