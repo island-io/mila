@@ -441,7 +441,10 @@ final class LiveTranscriber: ObservableObject {
             guard !text.isEmpty else { continue }
             guard s.start < originalDuration else { continue }
             let absStart = startSec + s.start
-            let absEnd = startSec + s.end
+            // Whisper can extend a last segment into the silence we padded
+            // onto short utterances. Clamp to the real audio so a delete
+            // cannot mark later utterances as suppressed.
+            let absEnd = min(startSec + s.end, startSec + originalDuration)
             // Skip anything the user deleted from this time span.
             guard !isSuppressed(start: absStart, end: absEnd) else { continue }
             segments.append(LiveSegment(

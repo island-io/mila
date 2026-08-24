@@ -167,7 +167,7 @@ final class LiveTranscriberTests: XCTestCase {
 
     // MARK: - Delete a live line
 
-    func test_removeSegment_removes_line_and_recomputes_fullText() async {
+    func test_removeSegment_removes_line_and_recomputes_fullText() async throws {
         await stub.setDefaultCanned([
             TranscriptSegment(start: 0, end: 1, text: "keep"),
             TranscriptSegment(start: 2, end: 3, text: "remove me")
@@ -178,7 +178,7 @@ final class LiveTranscriberTests: XCTestCase {
         await transcriber.transcribeNow()
         XCTAssertEqual(transcriber.segments.map(\.text), ["keep", "remove me"])
 
-        let victim = try! XCTUnwrap(transcriber.segments.first { $0.text == "remove me" })
+        let victim = try XCTUnwrap(transcriber.segments.first { $0.text == "remove me" })
         transcriber.removeSegment(id: victim.id)
 
         XCTAssertEqual(transcriber.segments.map(\.text), ["keep"])
@@ -189,7 +189,7 @@ final class LiveTranscriberTests: XCTestCase {
     /// A deleted line must not reappear when the fixed-window path
     /// re-transcribes its rolling buffer on the next tick — the deleted
     /// time range is suppressed.
-    func test_deleted_line_does_not_reappear_on_next_chunk_tick() async {
+    func test_deleted_line_does_not_reappear_on_next_chunk_tick() async throws {
         // Both ticks emit the same two segments; after deleting "beta" it
         // must stay gone even though tick 2 re-emits it.
         await stub.setCannedQueue([
@@ -208,7 +208,7 @@ final class LiveTranscriberTests: XCTestCase {
         await transcriber.transcribeNow()
         XCTAssertEqual(transcriber.segments.map(\.text), ["alpha", "beta"])
 
-        let beta = try! XCTUnwrap(transcriber.segments.first { $0.text == "beta" })
+        let beta = try XCTUnwrap(transcriber.segments.first { $0.text == "beta" })
         transcriber.removeSegment(id: beta.id)
         XCTAssertEqual(transcriber.segments.map(\.text), ["alpha"])
 
@@ -230,6 +230,52 @@ final class LiveTranscriberTests: XCTestCase {
         transcriber.removeSegment(id: UUID())
         XCTAssertEqual(transcriber.segments.map(\.text), ["only"])
         _ = transcriber.stop()
+    }
+
+    /// Whisper often extends a VAD segment into the trailing silence pad.
+    /// Deleting that line must not suppress the next real utterance — the
+    /// stored range is clamped to the unpadded audio.
+    ///
+    /// Do not call `transcribeNow()` between utterances: that `flush()`es
+    /// the detector and zeroes its clock, which would make the next
+    /// utterance start at 0 and overlap the deleted range for a different
+    /// reason than the padding bug.
+    func test_vad_padded_segment_delete_does_not_suppress_next_utterance() async throws {
+        await stub.setCannedQueue([
+            [TranscriptSegment(start: 0, end: 4.5, text: "first")],
+            [TranscriptSegment(start: 0, end: 1, text: "second")]
+        ])
+        transcriber.useVAD = true
+        transcriber.start(language: "en")
+
+        let speech = Array(repeating: Float(0.05), count: 16_000 * 12 / 10)
+        let silence = Array(repeating: Float(0.0), count: 16_000)
+        transcriber.ingest(ArraySlice(speech + silence))
+        try await waitUntilSegments(count: 1)
+
+        let first = try XCTUnwrap(transcriber.segments.first { $0.text == "first" })
+        XCTAssertLessThan(first.endSeconds, 2.5,
+                          "padded whisper end (4.5s) must be clamped to the ~1.7s utterance")
+        transcriber.removeSegment(id: first.id)
+        XCTAssertTrue(transcriber.segments.isEmpty)
+
+        transcriber.ingest(ArraySlice(speech + silence))
+        try await waitUntilSegments(count: 1)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["second"],
+                       "deleting a pad-extended VAD line suppressed the next utterance")
+        _ = transcriber.stop()
+    }
+
+    /// Poll until `transcriber.segments.count` reaches `count`. The VAD
+    /// path transcribes on a chained Task, so tests cannot `await
+    /// transcribeNow()` without flushing the detector.
+    private func waitUntilSegments(count: Int) async throws {
+        let deadline = Date().addingTimeInterval(2)
+        while transcriber.segments.count < count, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(transcriber.segments.count, count,
+                       "timed out waiting for \(count) live segment(s)")
     }
 
     func test_formattedTranscript_uses_timestamps_one_line_per_segment() async {
