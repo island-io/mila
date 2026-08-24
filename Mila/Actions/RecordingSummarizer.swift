@@ -373,8 +373,15 @@ final class RecordingSummarizer: ObservableObject {
                 return "Hebrew"
             }
         }()
-        let prompt = liveAISettings.summaryPrompt
+        let basePrompt = liveAISettings.summaryPrompt
             .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
+        // Wrap the user's plain-text summary prompt so the one-shot call
+        // also returns action items. Restores the summary + action-items
+        // pair the pre-#87 inline final Live-AI tick used to produce. See
+        // `promptWithActionItems`: the summary stays PLAIN TEXT and only a
+        // compact item array is JSON, so a long multi-line Hebrew summary
+        // full of quotes can't corrupt the parse.
+        let prompt = Self.promptWithActionItems(base: basePrompt)
         let transcript = recording.fullText
         let timeout = timeoutSeconds
         // OpenAI-compatible config captured up front so the detached call
@@ -425,8 +432,15 @@ final class RecordingSummarizer: ObservableObject {
                     false,
                     nil
                 )
-                let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cleaned.isEmpty else {
+                // Split the CLI output into the plain-text summary and the
+                // action-items list. `parseSummaryAndItems` handles the
+                // sentinel format the prompt asks for, tolerates a model
+                // that returned a JSON envelope instead, and — crucially —
+                // never surfaces a raw `{...}` blob as the summary when the
+                // model emits malformed JSON (unescaped quotes / newlines in
+                // a long summary value, which broke the object decode).
+                let (summaryText, parsedItems) = Self.parseSummaryAndItems(from: raw)
+                guard !summaryText.isEmpty else {
                     summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): empty CLI output")
                     // No summary landed — let a pending export fall back to
                     // the transcript rather than waiting forever. Skip the
@@ -454,10 +468,18 @@ final class RecordingSummarizer: ObservableObject {
                     self.onSummaryFinished?(current)
                     return
                 }
-                current.summary = cleaned
+                current.summary = summaryText
+                // Replace the recording's action items with the fresh
+                // full-transcript set whenever the model returned any. An
+                // empty list is treated as "keep what's there" so a glitchy
+                // empty response can't wipe the rolling live snapshot a
+                // Live-AI recording already captured at stop.
+                if !parsedItems.isEmpty {
+                    current.actionItems = parsedItems
+                }
                 self.store.update(current)
                 let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-                summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) length=\(cleaned.count, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
+                summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) length=\(summaryText.count, privacy: .public) items=\(parsedItems.count, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
                 self.onSummaryFinished?(current)
             } catch {
                 summarizerLog.error("failed \(self?.shortID(id) ?? "?", privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -502,6 +524,106 @@ final class RecordingSummarizer: ObservableObject {
 
     private func shortID(_ id: UUID) -> String {
         String(id.uuidString.prefix(8))
+    }
+
+    /// Marker the one-shot prompt asks the model to place between the
+    /// plain-text summary and the JSON action-items array. Keeping the
+    /// summary OUTSIDE any JSON is deliberate: LLMs routinely emit long,
+    /// multi-line summaries with unescaped quotes/newlines, which makes an
+    /// enclosing JSON object un-decodable. Only the compact item array — far
+    /// less prone to stray quotes — needs to be valid JSON.
+    static let actionItemsSentinel = "###ACTION_ITEMS###"
+
+    /// Wrap the user's plain-text summary prompt so the one-shot call also
+    /// returns action items, WITHOUT embedding the summary in JSON. The
+    /// user's `summaryPrompt` still drives the summary's content and style
+    /// (including its `{{LANGUAGE}}` directive); this only appends the
+    /// output-format + action-item contract. Building the request here rather
+    /// than baking it into the persisted `summaryPrompt` means a user's
+    /// customised prompt keeps working and no persisted-default migration is
+    /// needed.
+    static func promptWithActionItems(base: String) -> String {
+        """
+        \(base)
+
+        After the summary, list the action items. Format your ENTIRE response \
+        exactly like this — the plain-text summary first, then the marker on \
+        its own line, then a JSON array:
+
+        <the summary as plain text>
+        \(actionItemsSentinel)
+        [{"id": "stable-slug", "text": "...", "source": "inferred"}]
+
+        Write the summary as plain text — do NOT wrap it in JSON or quotes. \
+        Output the marker \(actionItemsSentinel) verbatim on its own line, then \
+        ONLY the JSON array and nothing after it. An action item is a concrete \
+        task someone committed to do (with or without a deadline) or an \
+        explicit follow-up or request. If there are none, output an empty \
+        array: []
+        """
+    }
+
+    /// Split raw CLI output into `(summary, items)`.
+    ///
+    /// Resolution order, most-trusted first:
+    ///   1. Sentinel format (what `promptWithActionItems` asks for): plain
+    ///      summary before `actionItemsSentinel`, JSON array after it.
+    ///   2. A JSON envelope `{"summary":...,"items":[...]}` the model may have
+    ///      returned out of habit — decoded via `LiveAISession.parseEnvelope`.
+    ///   3. Malformed JSON that LOOKS like an envelope (the failure the user
+    ///      hit: unescaped quotes broke the object decode). Salvage the
+    ///      summary text so a raw `{...}` blob is never shown, and keep any
+    ///      items the lenient array parse recovered.
+    ///   4. Plain prose — the whole output is the summary, no items.
+    static func parseSummaryAndItems(from raw: String) -> (summary: String, items: [ActionItem]) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let sentinel = trimmed.range(of: actionItemsSentinel) {
+            let summary = String(trimmed[..<sentinel.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let items = LiveAISession.parseActionItems(from: String(trimmed[sentinel.upperBound...]))
+            return (summary, items)
+        }
+        // No sentinel — the model returned a JSON envelope (or prose).
+        let parsed = LiveAISession.parseEnvelope(from: trimmed)
+        if !parsed.summary.isEmpty {
+            return (parsed.summary, parsed.items)
+        }
+        // Object decode produced no summary. If it still looks like an
+        // envelope, salvage the summary value rather than surfacing the blob.
+        if trimmed.hasPrefix("{"), trimmed.range(of: "\"summary\"") != nil {
+            return (Self.salvageSummaryValue(from: trimmed), parsed.items)
+        }
+        return (trimmed, [])
+    }
+
+    /// Best-effort extraction of the `"summary"` value from a JSON string the
+    /// decoder rejected (typically because the value itself contains
+    /// unescaped `"`). Anchors on the structural `"items"` key that follows
+    /// the summary value, so quotes INSIDE the summary don't cut it short,
+    /// then un-escapes the common JSON escapes so `\n` renders as newlines.
+    static func salvageSummaryValue(from json: String) -> String {
+        guard let keyRange = json.range(of: "\"summary\"") else { return "" }
+        let afterKey = json[keyRange.upperBound...]
+        guard let colon = afterKey.firstIndex(of: ":") else { return "" }
+        let afterColon = afterKey[afterKey.index(after: colon)...]
+        guard let openQuote = afterColon.firstIndex(of: "\"") else { return "" }
+        let valueStart = afterColon.index(after: openQuote)
+        let rest = afterColon[valueStart...]
+        let endIdx: Substring.Index
+        if let itemsAnchor = rest.range(of: "\", \"items\"")
+            ?? rest.range(of: "\",\"items\"") {
+            endIdx = itemsAnchor.lowerBound
+        } else if let lastQuote = rest.lastIndex(of: "\"") {
+            endIdx = lastQuote
+        } else {
+            endIdx = rest.endIndex
+        }
+        let value = String(rest[..<endIdx])
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\t", with: "\t")
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\/", with: "/")
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// The freshest copy of a recording from the store, or `fallback` when
