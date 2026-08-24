@@ -32,10 +32,20 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
 final class SpeakerProfileStore: ObservableObject {
     @Published private(set) var profiles: [VoiceProfile] = []
 
+    /// Master opt-in for voice recognition. When off, no voice profiles
+    /// are created or matched — speaker naming still works (via
+    /// SpeakerDirectory) but without cross-recording auto-identification.
+    /// Off by default: the user must consciously opt in to storing voice
+    /// biometric data.
+    @Published var enabled: Bool {
+        didSet { UserDefaults.standard.set(enabled, forKey: "voiceRecognition.enabled") }
+    }
+
     private let fileManager = FileManager.default
     private let storeURL: URL
 
     init() {
+        self.enabled = UserDefaults.standard.bool(forKey: "voiceRecognition.enabled")
         let appSupport = try! fileManager.url(
             for: .applicationSupportDirectory,
             in: .userDomainMask,
@@ -50,6 +60,7 @@ final class SpeakerProfileStore: ObservableObject {
 
     /// Injectable init for tests.
     init(directory: URL) {
+        self.enabled = true
         self.storeURL = directory.appendingPathComponent("speaker-profiles.json")
         load()
     }
@@ -62,6 +73,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// exists, merge the new embedding into its centroid via weighted
     /// average. Otherwise create a new profile.
     func updateProfile(name: String, embedding: [Float], sampleCount: Int) {
+        guard enabled else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !embedding.isEmpty else { return }
 
@@ -104,6 +116,13 @@ final class SpeakerProfileStore: ObservableObject {
 
     func deleteProfile(name: String) {
         profiles.removeAll { $0.name == name }
+        save()
+    }
+
+    /// Remove all stored voice profiles. Used by the "Wipe All Voice
+    /// Data" button in Settings.
+    func deleteAllProfiles() {
+        profiles.removeAll()
         save()
     }
 
@@ -154,6 +173,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// Match an embedding against all stored profiles. Returns the best
     /// match above the threshold, or nil.
     func match(embedding: [Float], threshold: Double = 0.55) -> VoiceProfile? {
+        guard enabled else { return nil }
         var best: (profile: VoiceProfile, sim: Double)?
         for profile in profiles {
             let sim = cosineSimilarity(embedding, profile.embedding)
@@ -166,7 +186,8 @@ final class SpeakerProfileStore: ObservableObject {
 
     /// Entries suitable for seeding the live diarizer pool.
     func seedEntries() -> [(id: String, name: String, centroid: [Float], sampleCount: Int)] {
-        profiles.map { p in
+        guard enabled else { return [] }
+        return profiles.map { p in
             (id: p.name, name: p.name, centroid: p.embedding, sampleCount: p.sampleCount)
         }
     }
