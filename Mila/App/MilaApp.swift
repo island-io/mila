@@ -547,7 +547,7 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak store, weak diarSettings] rec, wasRetranscription in
             // Obsidian export is driven off the summarizer's completion hook.
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
