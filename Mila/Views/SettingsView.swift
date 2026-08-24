@@ -2020,6 +2020,10 @@ private struct DiarizationSettingsTabContent: View {
 
             KnownSpeakersSection()
 
+            Divider()
+
+            VoiceRecognitionSection()
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -2213,6 +2217,67 @@ private struct KnownSpeakersSection: View {
     private func addName() {
         if directory.add(newName) != nil {
             newName = ""
+        }
+    }
+}
+
+/// Voice recognition opt-in toggle + profile management. Shown in the
+/// Speakers settings section below the known-speakers list.
+private struct VoiceRecognitionSection: View {
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
+    @State private var showWipeConfirmation = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Voice recognition")
+                .font(.callout.weight(.semibold))
+
+            Toggle(isOn: $profileStore.enabled) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Learn speaker voices across recordings")
+                        .font(.body)
+                    Text("When enabled, Mila stores a voice fingerprint (256-dimensional embedding) for each speaker you name. This data is used to auto-identify returning speakers in future recordings. Voice data is stored locally and never sent to any server.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.regular)
+
+            if profileStore.enabled {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                    Text("Voice fingerprints are biometric data. Other participants in your meetings may not know their voice is being stored. Use responsibly.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(8)
+                .background(.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
+            }
+
+            if !profileStore.profiles.isEmpty {
+                HStack {
+                    Text("\(profileStore.profiles.count) voice profile\(profileStore.profiles.count == 1 ? "" : "s") stored")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Delete All Voice Data", role: .destructive) {
+                        showWipeConfirmation = true
+                    }
+                    .font(.caption)
+                }
+                .alert("Delete all voice profiles?", isPresented: $showWipeConfirmation) {
+                    Button("Delete All", role: .destructive) {
+                        profileStore.deleteAllProfiles()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("This permanently removes all stored voice fingerprints. Speakers will no longer be auto-recognized in new recordings. This cannot be undone.")
+                }
+            }
         }
     }
 }
