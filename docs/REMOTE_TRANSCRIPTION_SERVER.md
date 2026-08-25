@@ -126,8 +126,11 @@ picker also states inline:
 | `gpt-transcribe`, `gpt-4o-transcribe`, `gpt-4o-mini-transcribe` | **no** | Newer, usually more accurate text. These models can only return plain text, so the whole recording arrives as one segment: no SRT timings, and local speaker diarization has nothing to align to. Good for dictation, poor for meetings. |
 | `gpt-4o-transcribe-diarize` | yes (per speaker turn) | Returns speakers itself, so Mila keeps its labels and skips the local pyannote pass. |
 
-The timestamp column is a model limitation, not a Mila one: the `gpt-*`
-transcription models reject every timestamped response format the API offers.
+The timestamp column is a model limitation, not a Mila one: the *non-diarizing*
+`gpt-*` transcription models reject every timestamped response format the API
+offers. `gpt-4o-transcribe-diarize` is the exception — it accepts
+`diarized_json` and returns timed speaker segments, which is why it is the one
+`gpt-*` entry above that keeps its timings.
 Mila warns next to the picker when the selected model is one of them, rather
 than letting the missing timings turn up in the transcript.
 

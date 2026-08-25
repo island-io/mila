@@ -178,7 +178,11 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// (`MilaConfigImporter`), as does anything editing the raw field. Deriving
     /// it means an imported configuration shows up correctly identified in the
     /// picker with no import-side change at all.
-    var selectedPreset: RemoteModelPreset? { RemoteModelPreset.matching(model) }
+    /// Matched against the **effective** model, not the raw field. `resolve`
+    /// turns a blank or whitespace-only value into `defaultModel`, so an empty
+    /// field transcribes as `whisper-1` — matching the raw text would show
+    /// "Custom..." for a configuration that is in fact the default preset.
+    var selectedPreset: RemoteModelPreset? { RemoteModelPreset.matching(Self.resolve(model)) }
 
     /// Adopt a preset: its model id, and its endpoint when the one configured
     /// isn't the user's own.
