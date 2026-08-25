@@ -37,6 +37,11 @@ final class LLMRunnerObservabilityTests: XCTestCase {
 
     /// The privacy invariant stated directly, so a future refactor that stops
     /// redacting fails here rather than in a user's log.
+    ///
+    /// This is the *inline* delivery — the transcript is literally inside the
+    /// prompt argument. See
+    /// `test_redacted_command_never_contains_referenced_sidecar_paths` for why
+    /// the redaction still has to hold once #179 takes the body back out.
     func test_redacted_command_never_contains_transcript_text() {
         let secret = "Acme is acquiring Globex for $4.2M"
         let prompt = LLMRunner.composedPrompt("Name this call.", transcript: secret)
@@ -56,6 +61,59 @@ final class LLMRunnerObservabilityTests: XCTestCase {
         // …while the diagnostically useful parts are all still there.
         XCTAssertTrue(command.contains("--resume \(session.uuidString)"))
         XCTAssertTrue(command.contains("/usr/local/bin/claude"))
+    }
+
+    /// Issue #179 moves the transcript body out of argv and puts sidecar
+    /// **paths** there instead. The tempting conclusion is that the prompt
+    /// argument no longer needs redacting; it is wrong, and this test is the
+    /// statement of why.
+    ///
+    /// A recording's filename is derived from its title, and Mila generates
+    /// that title from the meeting with an LLM. So `…/Q3 layoffs — legal
+    /// review.srt` in a log line leaks the same class of thing the transcript
+    /// would, one line at a time, into a store that persists for days and is
+    /// readable by anything with the right entitlement. The prompt argument
+    /// also still carries the Live-AI summary in this mode.
+    ///
+    /// What replaces the lost detail is the `delivery=` / `refs=` pair on the
+    /// start line, which names extensions and never filenames.
+    func test_redacted_command_never_contains_referenced_sidecar_paths() {
+        let title = "Q3 layoffs — legal review"
+        let dir = "/Users/someone/Recordings"
+        let files = TranscriptFiles(subtitles: URL(fileURLWithPath: "\(dir)/\(title).srt"),
+                                    plainText: URL(fileURLWithPath: "\(dir)/\(title).txt"),
+                                    audio: URL(fileURLWithPath: "\(dir)/\(title).m4a"))
+        let prompt = LLMRunner.composedPrompt("File this.",
+                                              transcript: "the body",
+                                              summary: "We agreed to ship on Friday.",
+                                              delivery: .reference(files))
+        let args = LLMTool.claude.arguments(prompt: prompt)
+        let command = LLMRunner.redactedCommand(
+            executable: URL(fileURLWithPath: "/usr/local/bin/claude"),
+            arguments: args,
+            prompt: prompt)
+
+        XCTAssertEqual(command, "/usr/local/bin/claude -p <prompt:\(prompt.count)c>")
+        XCTAssertFalse(command.contains(title),
+                       "a recording title leaked into the logged command via its path: \(command)")
+        XCTAssertFalse(command.contains(".srt"),
+                       "a referenced sidecar path leaked into the logged command: \(command)")
+        XCTAssertFalse(command.contains("ship on Friday"),
+                       "the summary leaked into the logged command: \(command)")
+    }
+
+    /// The tokens that replace what reference delivery took away. Pinned as
+    /// literals because they are grep targets in the unified log, exactly like
+    /// the `feature=` tokens below.
+    func test_delivery_log_tokens_are_stable() {
+        XCTAssertEqual(TranscriptDelivery.inline.logToken, "inline")
+        XCTAssertEqual(TranscriptDelivery.inline.refsToken, "none")
+
+        let files = TranscriptFiles(subtitles: URL(fileURLWithPath: "/r/a.srt"),
+                                    plainText: URL(fileURLWithPath: "/r/a.txt"),
+                                    audio: URL(fileURLWithPath: "/r/a.m4a"))
+        XCTAssertEqual(TranscriptDelivery.reference(files).logToken, "reference")
+        XCTAssertEqual(TranscriptDelivery.reference(files).refsToken, "srt+txt+audio")
     }
 
     /// An empty prompt must not turn into a wildcard that redacts every empty

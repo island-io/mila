@@ -52,7 +52,11 @@ final class PostRecordingCoordinator: ObservableObject {
         // Which surface this call is for — the auto-title path and the Send
         // path share this one seam, so the label has to come from the call
         // site or the log can't tell them apart (issue #175).
-        _ feature: LLMFeature
+        _ feature: LLMFeature,
+        // Inline the transcript body, or name the recording's sidecars and let
+        // the CLI read them (issue #179). Only the Send path ever asks for
+        // `.reference`; the auto-title path passes `.inline`.
+        _ delivery: TranscriptDelivery
     ) async throws -> String
     private let runLLM: RunLLM
 
@@ -87,12 +91,13 @@ final class PostRecordingCoordinator: ObservableObject {
     init(store: RecordingStore,
          transcription: TranscriptionService,
          llm: LLMSettings,
-         runLLM: @escaping RunLLM = { tool, prompt, transcript, summary, executablePathOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport, feature in
+         runLLM: @escaping RunLLM = { tool, prompt, transcript, summary, executablePathOverride, model, extraArgs, timeout, openAIBaseURL, openAIAPIKey, jsonMode, transport, feature, delivery in
         try await LLMRunner.run(
             tool: tool,
             prompt: prompt,
             transcript: transcript,
             summary: summary,
+            delivery: delivery,
             executablePathOverride: executablePathOverride,
             model: model,
             extraArgs: extraArgs,
@@ -194,7 +199,13 @@ final class PostRecordingCoordinator: ObservableObject {
                     openAIAPIKey,
                     false,
                     nil,
-                    .name)
+                    .name,
+                    // Titles stay inlined. Path delivery is scoped to the
+                    // Send action (issue #179): this path runs unattended on
+                    // every recording, so a CLI that skipped the read would
+                    // quietly title everything from a prompt with no
+                    // transcript in it, and nobody would notice.
+                    .inline)
                 if Task.isCancelled { return }
                 let title = Self.cleanedTitle(from: suggestion)
                 guard !title.isEmpty else { return }
@@ -289,6 +300,12 @@ final class PostRecordingCoordinator: ObservableObject {
     /// Idempotent per id: a second send for the same recording cancels and
     /// replaces the first (no use case for two competing CLI calls writing
     /// the same banner). The task clears its own handle on completion.
+    ///
+    /// When `LLMSettings.actionDeliversTranscriptByPath` is on, the composed
+    /// prompt names the recording's `.srt` / `.txt` / audio files instead of
+    /// carrying the transcript body (issue #179). `transcript` is still
+    /// resolved and passed either way — it is the fallback when no sidecar
+    /// exists yet.
     func sendToLLM(recordingID: UUID,
                    tool: LLMTool,
                    prompt: String,
@@ -314,6 +331,13 @@ final class PostRecordingCoordinator: ObservableObject {
         let openAIBaseURL = llm.openAIBaseURL
         let openAIAPIKey = llm.openAIAPIKey
         let openAIModelName = llm.openAIModelName
+        // Whether to reference the transcript by path (issue #179) is a
+        // click-time snapshot for the same reason the endpoint fields are: the
+        // Task below can sit in `awaitTranscript` for minutes, and a Settings
+        // edit landing in that window must not repaint this send. The *paths*
+        // are resolved later, inside the Task — they only exist once
+        // transcription has written them.
+        let byPath = llm.actionDeliversTranscriptByPath
         let task = Task { @MainActor [weak self] in
             defer {
                 // Only relinquish the slot if we finished on our own. If we
@@ -359,7 +383,12 @@ final class PostRecordingCoordinator: ObservableObject {
                     openAIAPIKey,
                     false,
                     nil,
-                    .action)
+                    .action,
+                    // Resolved here, after the transcript wait: the `.srt` is
+                    // written at the end of the transcription pass, so asking
+                    // any earlier would find nothing and fall back to inline
+                    // for every send fired mid-recording.
+                    byPath ? self.transcriptReferences(for: recordingID) : .inline)
                 let preview = output
                     .replacingOccurrences(of: "\n", with: " ")
                     .prefix(80)
@@ -376,6 +405,29 @@ final class PostRecordingCoordinator: ObservableObject {
             }
         }
         sendTasks[recordingID] = task
+    }
+
+    /// The recording's own sidecars, as a `.reference` delivery (issue #179).
+    ///
+    /// Nothing is written here: `.srt`, `.txt` and the audio are files
+    /// `TranscriptionService` / `RecordingStore` already maintain next to each
+    /// other in the recordings directory, and `TranscriptFiles.existing` drops
+    /// any of them that isn't on disk with bytes in it. So the mode adds no new
+    /// copy of the user's transcript anywhere — in particular not into the
+    /// shared `llm-sandbox` cwd (#187), which every later invocation is also
+    /// chdir'd into and would therefore be able to read (the concern open in
+    /// #190).
+    ///
+    /// Returns `.reference` with an empty set when nothing exists yet;
+    /// `LLMRunner.effectiveDelivery` turns that back into `.inline`, so the
+    /// worst case is today's behaviour rather than a prompt pointing nowhere.
+    private func transcriptReferences(for recordingID: UUID) -> TranscriptDelivery {
+        guard let rec = store.recordings.first(where: { $0.id == recordingID }) else {
+            return .inline
+        }
+        return .reference(.existing(subtitles: store.subtitleURL(for: rec),
+                                    plainText: store.transcriptURL(for: rec),
+                                    audio: store.audioURL(for: rec)))
     }
 
     /// Poll the store until `recordingID` has a non-empty transcript and
