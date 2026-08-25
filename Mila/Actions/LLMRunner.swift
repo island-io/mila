@@ -1496,13 +1496,43 @@ enum LLMRunner {
             if value.count >= 2,
                let quote = value.first, quote == "\"" || quote == "'",
                value.last == quote {
-                value = String(value.dropFirst().dropLast())
+                let inner = String(value.dropFirst().dropLast())
+                // npm decodes escapes inside DOUBLE quotes only -- it runs the
+                // value through a JSON-style unescape -- so
+                // `prefix="/opt/npm\\\\tools"` resolves to `/opt/npm\\tools`.
+                // Single-quoted values are literal.
+                value = quote == "\"" ? decodingDoubleQuotedEscapes(inner) : inner
             } else {
                 value = truncatingAtUnescapedComment(value)
             }
             found = value
         }
         return found
+    }
+
+    /// Undoes the escaping npm applies inside a double-quoted `.npmrc` value:
+    /// `\\\\` is a literal backslash and `\\"` a literal quote. Anything else is
+    /// left as written -- npm's own reader is JSON-ish here, but inventing
+    /// further escapes would corrupt paths that merely contain a backslash.
+    private static func decodingDoubleQuotedEscapes(_ value: String) -> String {
+        var out = ""
+        var pending = false
+        for character in value {
+            if pending {
+                if character == "\\" || character == "\"" {
+                    out.append(character)
+                } else {
+                    out.append("\\")
+                    out.append(character)
+                }
+                pending = false
+                continue
+            }
+            if character == "\\" { pending = true; continue }
+            out.append(character)
+        }
+        if pending { out.append("\\") }
+        return out
     }
 
     /// Cuts an unquoted value at its first *unescaped* `;` or `#`.

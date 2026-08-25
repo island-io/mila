@@ -827,6 +827,23 @@ final class LLMRunnerTests: XCTestCase {
                        "a repeated PATH entry was probed twice: \(dirs)")
     }
 
+    /// npm decodes escapes inside a DOUBLE-quoted value, so
+    /// `prefix="/opt/npm\\\\tools"` resolves to `/opt/npm\\tools`. Stripping the
+    /// quotes without decoding left both backslashes and probed a path that
+    /// cannot exist. Verified against `npm config get prefix --userconfig`.
+    func test_npmPrefixBin_decodes_escapes_in_a_double_quoted_value() throws {
+        let home = try makeHome(npmrc: "prefix=\"/opt/npm\\\\tools\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
+    }
+
+    /// Single quotes are literal in npm -- no decoding there.
+    func test_npmPrefixBin_leaves_single_quoted_values_literal() throws {
+        let home = try makeHome(npmrc: "prefix='/opt/npm\\\\tools'\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\\\tools/bin")
+    }
+
     func test_npmPrefixBin_is_nil_without_an_npmrc() throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
