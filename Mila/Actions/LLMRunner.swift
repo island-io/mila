@@ -1485,13 +1485,43 @@ enum LLMRunner {
                let quote = value.first, quote == "\"" || quote == "'",
                value.last == quote {
                 value = String(value.dropFirst().dropLast())
-            } else if let comment = value.firstIndex(where: { $0 == ";" || $0 == "#" }) {
-                value = String(value[value.startIndex..<comment])
-                    .trimmingCharacters(in: .whitespaces)
+            } else {
+                value = truncatingAtUnescapedComment(value)
             }
             found = value
         }
         return found
+    }
+
+    /// Cuts an unquoted value at its first *unescaped* `;` or `#`.
+    ///
+    /// npm keeps `\\#` and `\\;` as literal characters in an unquoted value, so
+    /// a naive scan for the bare delimiter turns `prefix=/opt/npm\\#tools` into
+    /// `/opt/npm\\` and probes a directory that does not exist. Verified
+    /// against `npm config get prefix --userconfig`.
+    ///
+    /// The backslash is dropped as it is consumed, which is what npm does with
+    /// it -- it is an escape, not part of the path.
+    private static func truncatingAtUnescapedComment(_ value: String) -> String {
+        var out = ""
+        var escaped = false
+        for character in value {
+            if escaped {
+                out.append(character)
+                escaped = false
+                continue
+            }
+            if character == "\\" {
+                escaped = true
+                continue
+            }
+            if character == ";" || character == "#" { break }
+            out.append(character)
+        }
+        // A trailing lone backslash was an escape with nothing after it; npm
+        // treats it as a literal, so keep it rather than silently dropping it.
+        if escaped { out.append("\\") }
+        return out.trimmingCharacters(in: .whitespaces)
     }
 
     /// Expands a leading `~`, `$HOME` or `${HOME}` against the given home.

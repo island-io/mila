@@ -759,6 +759,32 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/crlf/bin")
     }
 
+    /// npm keeps an escaped `\\#` / `\\;` as a literal character in an unquoted
+    /// value, so scanning for the bare delimiter cut `/opt/npm\\#tools` down to
+    /// `/opt/npm\\` and probed a directory that does not exist. Verified against
+    /// `npm config get prefix --userconfig` when this was found.
+    func test_npmPrefixBin_preserves_escaped_comment_characters() throws {
+        let hash = try makeHome(npmrc: "prefix=/opt/npm\\#tools\n")
+        defer { try? FileManager.default.removeItem(at: hash) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: hash.path), "/opt/npm#tools/bin")
+
+        let semi = try makeHome(npmrc: "prefix=/opt/npm\\;tools\n")
+        defer { try? FileManager.default.removeItem(at: semi) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: semi.path), "/opt/npm;tools/bin")
+    }
+
+    /// The escape handling must not stop a genuine inline comment being cut.
+    func test_npmPrefixBin_still_strips_a_real_inline_comment() throws {
+        let hash = try makeHome(npmrc: "prefix=/opt/plain #a trailing note\n")
+        defer { try? FileManager.default.removeItem(at: hash) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: hash.path), "/opt/plain/bin")
+
+        // Escaped first, then a real one: keep the literal, drop the comment.
+        let both = try makeHome(npmrc: "prefix=/opt/a\\#b #note\n")
+        defer { try? FileManager.default.removeItem(at: both) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: both.path), "/opt/a#b/bin")
+    }
+
     func test_npmPrefixBin_is_nil_without_an_npmrc() throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
