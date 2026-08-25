@@ -1412,7 +1412,10 @@ enum LLMRunner {
         // Homebrew's is /usr/local, so a configured value routinely collides
         // with an entry already in the list (or already on PATH), and probing
         // the same directory twice per lookup buys nothing.
-        var seen = Set(dirs)
+        // De-dupe the inherited PATH too, not just the fallbacks: a PATH with
+        // the same directory twice would otherwise be probed twice.
+        var seen = Set<String>()
+        dirs = dirs.filter { seen.insert($0).inserted }
         dirs += fallbacks.filter { seen.insert($0).inserted }
         return dirs
     }
@@ -1468,12 +1471,21 @@ enum LLMRunner {
     /// along with every other unusable value.
     private static func npmrcPrefixValue(in text: String) -> String? {
         var found: String?
+        var inSection = false
         // `isNewline` rather than splitting on "\n": Swift treats CRLF as a
         // single Character, so a file saved with Windows line endings would
         // otherwise parse as one giant line.
         for rawLine in text.split(whereSeparator: { $0.isNewline }) {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
             if line.isEmpty || line.hasPrefix(";") || line.hasPrefix("#") { continue }
+            // `[section]` scopes everything under it. npm does not use a
+            // section-scoped `prefix` as the global prefix, so neither may we --
+            // probing its `bin` would add a directory npm never installs into.
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                inSection = true
+                continue
+            }
+            guard !inSection else { continue }
             guard let equals = line.firstIndex(of: "=") else { continue }
             let key = line[line.startIndex..<equals]
                 .trimmingCharacters(in: .whitespaces)
@@ -1504,23 +1516,31 @@ enum LLMRunner {
     /// it -- it is an escape, not part of the path.
     private static func truncatingAtUnescapedComment(_ value: String) -> String {
         var out = ""
-        var escaped = false
+        var pendingBackslash = false
         for character in value {
-            if escaped {
-                out.append(character)
-                escaped = false
+            if pendingBackslash {
+                // npm escapes only these three. Before anything else the
+                // backslash is an ordinary character and both survive --
+                // `prefix=/opt/npm\\tools` is a path with a backslash in it, not
+                // `/opt/npmtools`.
+                if character == "\\" || character == ";" || character == "#" {
+                    out.append(character)
+                } else {
+                    out.append("\\")
+                    out.append(character)
+                }
+                pendingBackslash = false
                 continue
             }
             if character == "\\" {
-                escaped = true
+                pendingBackslash = true
                 continue
             }
             if character == ";" || character == "#" { break }
             out.append(character)
         }
-        // A trailing lone backslash was an escape with nothing after it; npm
-        // treats it as a literal, so keep it rather than silently dropping it.
-        if escaped { out.append("\\") }
+        // A trailing lone backslash escaped nothing; npm keeps it as a literal.
+        if pendingBackslash { out.append("\\") }
         return out.trimmingCharacters(in: .whitespaces)
     }
 

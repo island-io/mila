@@ -785,6 +785,48 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(LLMRunner.npmPrefixBin(home: both.path), "/opt/a#b/bin")
     }
 
+    /// npm treats a backslash as an escape only before `\\`, `;` or `#`. Before an
+    /// ordinary character both survive, so `prefix=/opt/npm\\tools` is a path
+    /// containing a backslash -- an earlier fix for escaped comment markers
+    /// stripped every backslash and turned it into `/opt/npmtools`.
+    func test_npmPrefixBin_keeps_a_backslash_before_an_ordinary_character() throws {
+        let home = try makeHome(npmrc: "prefix=/opt/npm\\tools\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
+    }
+
+    /// An escaped backslash collapses to one, as npm does.
+    func test_npmPrefixBin_collapses_an_escaped_backslash() throws {
+        let home = try makeHome(npmrc: "prefix=/opt/npm\\\\tools\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
+    }
+
+    /// `[section]` scopes what follows it. npm does not use a section-scoped
+    /// `prefix` as the global prefix, so probing its `bin` would add a
+    /// directory npm never installs into.
+    func test_npmPrefixBin_ignores_a_section_scoped_prefix() throws {
+        let scoped = try makeHome(npmrc: "[tool]\nprefix=/tmp/tool\n")
+        defer { try? FileManager.default.removeItem(at: scoped) }
+        XCTAssertNil(LLMRunner.npmPrefixBin(home: scoped.path))
+
+        // A top-level value before a section still counts.
+        let mixed = try makeHome(npmrc: "prefix=/opt/real\n[tool]\nprefix=/tmp/tool\n")
+        defer { try? FileManager.default.removeItem(at: mixed) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: mixed.path), "/opt/real/bin")
+    }
+
+    /// The search list must not probe the same directory twice, including when
+    /// the inherited PATH itself repeats one.
+    func test_searchDirectories_deduplicates_repeated_path_entries() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dirs = LLMRunner.searchDirectories(home: home.path,
+                                               pathEnv: "/usr/local/bin:/usr/local/bin")
+        XCTAssertEqual(dirs.filter { $0 == "/usr/local/bin" }.count, 1,
+                       "a repeated PATH entry was probed twice: \(dirs)")
+    }
+
     func test_npmPrefixBin_is_nil_without_an_npmrc() throws {
         let home = try makeHome()
         defer { try? FileManager.default.removeItem(at: home) }
