@@ -115,6 +115,29 @@ actor RemoteWhisperEngine: RemoteTranscribing {
             return id.contains("diarize") ? .diarizedJSON : .json
         }
 
+        /// What timing information a response in this format carries.
+        ///
+        /// A property of the *format*, so the UI can describe the tradeoff of
+        /// a model without re-deriving it from the model id — the mapping from
+        /// id to format lives in `forModel(_:)` and nowhere else.
+        enum TimestampSupport {
+            /// Per-decode-window segments (`verbose_json`). SRT export and the
+            /// local pyannote pass both have something to align to.
+            case perSegment
+            /// Per-speaker-turn segments (`diarized_json`), already labelled.
+            case perSpeakerTurn
+            /// None: the whole recording arrives as one untimed segment.
+            case none
+        }
+
+        var timestamps: TimestampSupport {
+            switch self {
+            case .verboseJSON:  return .perSegment
+            case .diarizedJSON: return .perSpeakerTurn
+            case .json:         return .none
+            }
+        }
+
         /// Whether the request must also carry a `chunking_strategy`.
         ///
         /// The diarization models require one explicitly for audio longer than
