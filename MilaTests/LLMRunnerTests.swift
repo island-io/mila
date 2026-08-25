@@ -837,6 +837,24 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
     }
 
+    /// `npm/ini` JSON-parses a double-quoted value, so every JSON escape
+    /// applies -- `prefix="/opt/\\u006eode"` is `/opt/node` to npm. Decoding only
+    /// `\\\\` and `\\"` by hand missed this, which is why the implementation now
+    /// delegates to `JSONDecoder` rather than approximating the escape set.
+    func test_npmPrefixBin_decodes_a_unicode_escape_in_a_double_quoted_value() throws {
+        let home = try makeHome(npmrc: "prefix=\"/opt/\\u006eode\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/node/bin")
+    }
+
+    /// An invalid escape makes the value un-decodable; keep it raw so the
+    /// absolute-path check rejects it rather than inventing a path.
+    func test_npmPrefixBin_keeps_an_undecodable_quoted_value_raw() throws {
+        let home = try makeHome(npmrc: "prefix=\"/opt/bad\\q\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/bad\\q/bin")
+    }
+
     /// Single quotes are literal in npm -- no decoding there.
     func test_npmPrefixBin_leaves_single_quoted_values_literal() throws {
         let home = try makeHome(npmrc: "prefix='/opt/npm\\\\tools'\n")
