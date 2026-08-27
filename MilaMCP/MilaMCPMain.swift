@@ -13,11 +13,7 @@ import MilaKit
 struct MilaMCPMain {
 
     static func main() async throws {
-        // MILA_ROOT overrides the app-support root — for tests and
-        // debugging against a fixture store; unset in normal use.
-        let root = ProcessInfo.processInfo.environment["MILA_ROOT"]
-            .map { URL(fileURLWithPath: $0, isDirectory: true) }
-            ?? StoreLocationPointer.defaultRoot()
+        let root = storeRoot()
         let handlers = MilaMCPToolHandlers(root: root)
 
         let tools: [Tool] = try MilaMCPToolHandlers.toolSpecs.map { spec in
@@ -49,6 +45,52 @@ struct MilaMCPMain {
 
         try await server.start(transport: StdioTransport())
         await server.waitUntilCompleted()
+    }
+
+    /// The app-support root every cross-process contract is resolved from.
+    ///
+    /// ## Why the env override is not in release builds
+    ///
+    /// `root` is not just "where the recordings are" — **all three** contracts
+    /// hang off it, and two of them are trust decisions:
+    ///
+    ///   * `<root>/mcp-access.json` — the consent gate. `handle(tool:)` asks
+    ///     `MCPAccessGate.isEnabled(root:)` with this exact root.
+    ///   * `<root>/store-location.json` — the store pointer, whose
+    ///     `recordingsDirectory` / `storeFile` are ABSOLUTE paths that may
+    ///     name any directory at all.
+    ///   * `<root>/live/current.json` — the live transcript sidecar.
+    ///
+    /// So an attacker who can set one environment variable for this process
+    /// — and an MCP client config is exactly that, whether via
+    /// `claude mcp add … -e` or an edited config file — could point `root` at
+    /// a directory they control, drop in their own `mcp-access.json` saying
+    /// `enabled: true`, and a `store-location.json` aimed at Mila's real
+    /// recordings. The gate would then read the attacker's consent file,
+    /// answer yes, and the reader would serve the user's real transcripts.
+    /// Consent granted by the party being consented to is not consent, and
+    /// the opt-in gate is the entire security basis of this feature — so the
+    /// override must not exist in a shipped binary. (CodeRabbit on #183,
+    /// CWE-284.)
+    ///
+    /// Debug builds keep it for driving the helper against a fixture store by
+    /// hand. `-DDEBUG` is present on this target's Debug compile and absent
+    /// in Release, so the shipped helper has no branch here at all: it is
+    /// unconditionally the default app-support root.
+    ///
+    /// No test depends on this: `MILA_ROOT` appears nowhere else in the
+    /// repository, and MilaKit's tests inject a fixture root straight into
+    /// `MilaMCPToolHandlers(root:)` rather than going through the executable.
+    /// Gating it therefore cannot silently redirect a test at the real store.
+    private static func storeRoot() -> URL {
+        #if DEBUG
+        if let override = ProcessInfo.processInfo.environment["MILA_ROOT"] {
+            FileHandle.standardError.write(Data(
+                "mila-mcp: DEBUG build honouring MILA_ROOT=\(override)\n".utf8))
+            return URL(fileURLWithPath: override, isDirectory: true)
+        }
+        #endif
+        return StoreLocationPointer.defaultRoot()
     }
 
     /// Bridge the SDK's `Value` arguments into the Foundation JSON tree

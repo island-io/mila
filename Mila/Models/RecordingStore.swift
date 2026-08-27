@@ -299,7 +299,8 @@ final class RecordingStore: ObservableObject {
         do {
             try await AudioCompressor.compress(wavURL: src, toM4A: dst)
         } catch {
-            recStoreLog.error("compressRecordingAudio failed for \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            // The error string names the audio file, which is title-derived.
+            recStoreLog.error("compressRecordingAudio failed for \(id, privacy: .public): \(error.localizedDescription, privacy: .private)")
             try? FileManager.default.removeItem(at: dst)  // don't leave a partial m4a
             return
         }
@@ -326,7 +327,7 @@ final class RecordingStore: ObservableObject {
         recordings[idx].audioFileName = dstName
         persist()
         try? FileManager.default.removeItem(at: src)
-        recStoreLog.log("compressed recording \(id, privacy: .public) → \(dstName, privacy: .public)")
+        recStoreLog.log("compressed recording \(id, privacy: .public) → \(dstName, privacy: .private)")
     }
 
     /// Number of finished recordings still stored as WAV (i.e. compressible).
@@ -531,7 +532,21 @@ final class RecordingStore: ObservableObject {
             }
             return true
         } catch {
-            recStoreLog.error("failed to write transcript \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            // The recording id is the safe correlation key; the FILENAME is
+            // not. `FileTranscriber` derives `audioFileName` from the
+            // recording title (`freshAudioURL(suggestedName: safeStem)`), so
+            // a public interpolation of it puts the user's meeting title into
+            // the unified log, readable by anything that can read logs.
+            // `error.localizedDescription` needs the same care: Cocoa file
+            // errors quote the offending filename ("The file \u{201C}Q3
+            // board call.txt\u{201D} doesn't exist."), so redacting only the
+            // URL would leak the title through the error string instead.
+            // (CodeRabbit on #183, CWE-532.)
+            recStoreLog.error("""
+                failed to write transcript for \(recording.id, privacy: .public) \
+                (\(url.lastPathComponent, privacy: .private)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return false
         }
     }
@@ -556,7 +571,15 @@ final class RecordingStore: ObservableObject {
                 try text.write(to: url, atomically: true, encoding: .utf8)
             }
         } catch {
-            print("RecordingStore: failed to write summary \(url.lastPathComponent): \(error)")
+            // Same leak as `writeTranscript` above, and `print` is worse
+            // than a redacted logger: it carries no privacy annotation at
+            // all and stdio is captured into the unified log for an app
+            // launched by launchd.
+            recStoreLog.error("""
+                failed to write summary for \(recording.id, privacy: .public) \
+                (\(url.lastPathComponent, privacy: .private)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
         }
     }
 
@@ -875,7 +898,12 @@ final class RecordingStore: ObservableObject {
             recordings.insert(recovered, at: 0)
             added.append(recovered)
             pendingRecoveryIDs.append(recovered.id)
-            print("RecordingStore: recovered orphan recording \(name) (\(size) bytes)")
+            // `name` came off disk and is title-derived for anything that
+            // arrived through the import path.
+            recStoreLog.log("""
+                recovered orphan recording \(recovered.id, privacy: .public) \
+                (\(name, privacy: .private), \(size, privacy: .public) bytes)
+                """)
         }
         if !added.isEmpty {
             recordings.sort { $0.createdAt > $1.createdAt }
