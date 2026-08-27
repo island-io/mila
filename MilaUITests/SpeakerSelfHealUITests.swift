@@ -63,22 +63,13 @@ final class SpeakerSelfHealUITests: XCTestCase {
         let settingsApp = XCUIApplication()
         settingsApp.typeKey(",", modifierFlags: .command)
 
-        // SettingsView is a NavigationSplitView (#177): destinations are rows
-        // in the sidebar list, each carrying a stable identifier. Fall back to
-        // the visible label for older builds / if the identifier is dropped by
-        // the AX tree.
-        var speakersTab = app.descendants(matching: .any)
-            // Mirrors `SettingsTab.speakers.accessibilityID`; the UI-test
-            // target can't import the app's types.
-            .matching(identifier: "settings.section.speakers")
+        // The SettingsView is a TabView. macOS exposes each tab as a
+        // toolbar button; "Speakers" is the label.
+        let speakersTab = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "label == 'Speakers'"))
             .firstMatch
-        if !speakersTab.waitForExistence(timeout: 10) {
-            speakersTab = app.descendants(matching: .any)
-                .matching(NSPredicate(format: "label == 'Speakers'"))
-                .firstMatch
-        }
         XCTAssertTrue(speakersTab.waitForExistence(timeout: 10),
-                      "Speakers settings destination not found")
+                      "Speakers settings tab not found")
         speakersTab.click()
 
         // Toggle "Enable speaker diarization" on.

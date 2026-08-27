@@ -46,17 +46,10 @@ struct StorageSettingsTab: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 // Obsidian vault destination lives under Storage rather than
-                // in a top-level tab (originally to keep the tab bar from
-                // overflowing), and renders as one more card in this stack
-                // rather than a titled section — off by default, it's a
-                // single toggle. It expands itself once enabled; see
-                // `ObsidianSettingsSection`.
-                //
-                // #177 removed the overflow constraint, so the original
-                // reason for parking it here is gone and promoting it to its
-                // own sidebar destination is now possible. Deliberately NOT
-                // done in #177 (container change only) — it is a separate,
-                // reviewable UX call.
+                // in a top-level tab (keeps the tab bar from overflowing), and
+                // renders as one more card in this stack rather than a titled
+                // section — off by default, it's a single toggle. It expands
+                // itself once enabled; see `ObsidianSettingsSection`.
                 ObsidianSettingsSection()
             }
             .frame(maxWidth: .infinity, alignment: .leading)
