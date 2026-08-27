@@ -24,8 +24,13 @@ updates:
       # Swiftly-based installer fails GPG verification on the Ubuntu runner
       # ("gpg: Can't check signature: No public key"), which reds the
       # e2e-transcription job. Stay on v2.x until a stable v3 ships.
+      #
+      # Written as a major-version block, not `versions: ["3.x"]`: that
+      # pattern does NOT match the bare `v3` tag Dependabot actually resolves,
+      # so the rule silently did nothing and #195 bumped straight past it into
+      # the failure described above. See #203.
       - dependency-name: "swift-actions/setup-swift"
-        versions: ["3.x"]
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "docker"
     directory: "/docker/speaches-hebrew"
