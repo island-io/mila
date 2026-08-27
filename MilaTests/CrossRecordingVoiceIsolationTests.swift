@@ -233,48 +233,11 @@ final class CrossRecordingVoiceIsolationTests: XCTestCase {
         XCTAssertEqual(entry?.profileName, "Alice", "still a seeded entry")
     }
 
-    /// The gate itself, over real diarizer state: a seeded speaker with only
-    /// a borderline attachment must not be auto-named, even though it has a
-    /// `profileName` and would have produced an interval.
-    ///
-    /// The three-part guard is replicated from `autoAssignRecognisedSpeakers`
-    /// (a private method); `spoke` is forced true to isolate the count check,
-    /// which is exactly the condition the intervals-only gate lacked.
-    func test_a_borderline_only_speaker_is_not_auto_named() {
-        let settings = makeSettings()
-        let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
-        profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 40)
-        let recordings = RecordingStore(rootDirectory: tempRoot)
-        let rec = addRecording("Borderline", to: recordings)
-
-        let diarizer = makeDiarizer()
-        diarizer.reset()
-        diarizer.seedPool(with: profiles.seedEntries())
-        _ = diarizer.assign(embedding: [0.6, 0.8, 0, 0])
-
-        // Stand-in for `liveSpeakerDiarizer.intervals`, which is
-        // `private(set)` and only fills via the daemon. Deliberately
-        // *contains* the speaker, so the count check is the only thing that
-        // can refuse — which is precisely what the old gate lacked.
-        let speakersWithIntervals: Set<String> = ["SPEAKER_00"]
-
-        var namedCount = 0
-        for entry in diarizer.currentProfiles() {
-            guard let profileName = entry.profileName else { continue }
-            guard entry.observedCount > 0 else { continue }   // the added gate
-            guard speakersWithIntervals.contains(entry.id) else { continue }
-            recordings.setSpeakerName(profileName, forSpeaker: entry.id, recordingID: rec.id)
-            namedCount += 1
-        }
-
-        XCTAssertEqual(namedCount, 0, "a borderline-only speaker must not be auto-named")
-        XCTAssertNil(recordings.recordings.first(where: { $0.id == rec.id })?
-                        .speakerNames["SPEAKER_00"])
-    }
-
     /// Negative control for the gate: with the intervals-only condition the
-    /// old code used, the same borderline-only speaker *is* named — so the
-    /// assertion above is discriminating.
+    /// old code used, the same borderline-only speaker *is* named — which is
+    /// what makes `RecognisedSpeakerAssignerTests`'
+    /// `test_a_borderline_only_speaker_is_not_auto_named` discriminating.
+    /// Necessarily a replica: the condition it reproduces no longer exists.
     func test_the_intervals_only_gate_would_have_named_a_borderline_speaker() {
         let settings = makeSettings()
         let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
