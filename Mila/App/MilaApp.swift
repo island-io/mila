@@ -1888,6 +1888,43 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         applyChrome(to: window)
     }
 
+    /// Whether `applyChrome` must leave a window alone.
+    ///
+    /// Pure and `static` so the decision is unit-testable without an
+    /// `NSWindow` — see `WindowChromeExemptionTests`. The two exemptions
+    /// are deliberately different shapes, because identifiers turn out
+    /// to be a usable discriminator for only one of them:
+    ///
+    /// - **Settings** is matched on its identifier, lowercased. SwiftUI
+    ///   names that window `com_apple_SwiftUI_Settings_window` — capital
+    ///   `S`. The original guard tested `id.contains("settings")`, which
+    ///   is case-sensitive and therefore never matched, so the early
+    ///   return never fired and this whole method ran on the Settings
+    ///   window on every `didBecomeKeyNotification` (#207). Lowercasing
+    ///   once and comparing is what actually honours the intent.
+    ///
+    /// - **Panels** are matched on their *class*, not their identifier,
+    ///   and this replaces the old `id.contains("alert")` arm rather
+    ///   than merely case-correcting it. That arm could never have
+    ///   worked: an `NSAlert`'s window is an `_NSAlertPanel` whose
+    ///   identifier is an opaque AppKit nib id — `_NS:87` when probed on
+    ///   macOS 26 — containing no recognisable substring in any case,
+    ///   and not something to depend on across OS versions. A bare
+    ///   `NSPanel` and an `NSOpenPanel` report no identifier at all, so
+    ///   `if let id = window.identifier` fell through for them too and
+    ///   they were also being restyled. Alerts, open/save panels, and
+    ///   the dictation overlay are all `NSPanel`s, and none of them
+    ///   wants a toolbar-separator tweak; the main window is a plain
+    ///   `NSWindow`, so it is unaffected.
+    /// `nonisolated` because it is pure — it touches no delegate state and
+    /// needs no main-actor context, which is also what lets the unit tests
+    /// call it synchronously.
+    nonisolated static func isChromeExempt(identifier: String?, isPanel: Bool) -> Bool {
+        if isPanel { return true }
+        guard let identifier else { return false }
+        return identifier.lowercased().contains("settings")
+    }
+
     /// Apply Mila's window chrome tweaks to a single NSWindow. Strips
     /// the hairline separator that renders below the toolbar in the
     /// detail pane but stops at the sidebar splitter — looks like a
@@ -1899,8 +1936,8 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// macOS version + SwiftUI version, either or both can produce the
     /// line. Setting both is harmless and covers everything.
     private func applyChrome(to window: NSWindow) {
-        if let id = window.identifier?.rawValue,
-           id.contains("settings") || id.contains("alert") {
+        if Self.isChromeExempt(identifier: window.identifier?.rawValue,
+                               isPanel: window is NSPanel) {
             return
         }
         // Belt and suspenders: queue the property change behind any
