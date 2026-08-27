@@ -216,7 +216,16 @@ final class DetailLayoutUITests: XCTestCase {
         let probe = element(app, section.probe)
         if !probe.waitForExistence(timeout: 8) {
             let cell = app.cells.containing(.any, identifier: section.row).firstMatch
-            if cell.exists { cell.click() }
+            if cell.exists {
+                cell.click()
+                // Wait again, exactly as the primary path does. Returning
+                // straight after the fallback click would have the caller
+                // evaluate `probe.exists` before the destination has had a
+                // chance to render — turning a recoverable click miss into a
+                // flaky failure, which is worse than no assertion because it
+                // teaches people to rerun instead of read.
+                _ = probe.waitForExistence(timeout: 8)
+            }
         }
         return probe
     }
