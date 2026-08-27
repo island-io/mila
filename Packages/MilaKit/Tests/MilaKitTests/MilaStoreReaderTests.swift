@@ -238,6 +238,35 @@ final class MilaStoreReaderTests: XCTestCase {
         XCTAssertEqual(reader.transcriptText(for: recording), "hello team goodbye")
     }
 
+    // MARK: - Trashed recordings are not reachable by id
+
+    /// REGRESSION (CodeRabbit on #183, CWE-200): `recording(id:)` had no
+    /// `isTrashed` filter, so a client holding a UUID cached from an earlier
+    /// `list_recordings` could still fetch the transcript of a recording the
+    /// user had since moved to the trash — the same store answering "no" to a
+    /// listing and "yes" to a direct lookup for the same row.
+    func test_direct_id_lookup_excludes_trashed_recordings() throws {
+        let live = rec("Live", daysAgo: 1)
+        let trashed = rec("Trashed", daysAgo: 0, deleted: true)
+        let reader = try writeStore([live, trashed])
+
+        XCTAssertEqual(try reader.listRecordings().map(\.title), ["Live"],
+                       "precondition: listing already hides it")
+        XCTAssertNotNil(try reader.recording(id: live.id))
+        XCTAssertNil(try reader.recording(id: trashed.id),
+                     "a retained id must not be a way back into a trashed transcript")
+    }
+
+    /// A trashed id and a nonexistent id must be indistinguishable —
+    /// answering "trashed" would confirm the recording exists, which is the
+    /// same disclosure in a smaller package.
+    func test_trashed_and_unknown_ids_are_indistinguishable() throws {
+        let trashed = rec("Trashed", daysAgo: 0, deleted: true)
+        let reader = try writeStore([trashed])
+        XCTAssertNil(try reader.recording(id: trashed.id))
+        XCTAssertNil(try reader.recording(id: UUID()))
+    }
+
     func test_named_transcript_resolves_speaker_names() throws {
         let recording = rec("Named", daysAgo: 0, segments: johnSegments(),
                             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"])

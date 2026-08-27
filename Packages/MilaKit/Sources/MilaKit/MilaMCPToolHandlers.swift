@@ -397,6 +397,8 @@ public struct MilaMCPToolHandlers: Sendable {
         ]
         if let folder = recording.folder { obj["folder"] = folder }
         if let appName = recording.appName { obj["app_name"] = appName }
+        // The stable companion to the localized `app_name`.
+        if let bundleID = recording.appBundleID { obj["app_bundle_id"] = bundleID }
         return obj
     }
 

@@ -77,4 +77,69 @@ final class MCPAccessGateTests: XCTestCase {
         XCTAssertThrowsError(try handlers.handle(tool: "list_recordings", arguments: [:]),
                              "The same handler instance must start refusing once revoked.")
     }
+
+    // MARK: - Revocation must fail closed
+
+    /// REGRESSION (CodeRabbit on #183, CWE-359): revoking used to be a plain
+    /// atomic write, and a failed write just propagated. The previous
+    /// `enabled: true` file SURVIVED — so the toggle read off in the UI while
+    /// a configured MCP client kept reading transcripts, indefinitely and
+    /// invisibly. Revocation now judges the END STATE: it escalates to
+    /// deleting the file (absence denies) and only throws if access is still
+    /// granted afterwards.
+    ///
+    /// This is the case that separates the new behaviour from the old. The
+    /// write is made to fail for a reason removal can fix — a stale
+    /// *directory* sitting at the gate's path, which `Data.write` cannot
+    /// replace but `removeItem` can clear. Old code: threw, directory intact.
+    /// New code: no throw, and the stale entry is gone.
+    ///
+    /// It stands in for the realistic version of the same shape, a full disk:
+    /// the write fails, the removal succeeds, and denial is reached. That one
+    /// isn't simulable at unit level.
+    func test_revocation_that_cannot_be_written_is_reached_by_removal() throws {
+        let gate = MCPAccessGate.url(root: root)
+        try FileManager.default.createDirectory(at: gate, withIntermediateDirectories: true)
+
+        XCTAssertNoThrow(try MCPAccessGate.set(false, root: root),
+                         "denial was achievable, so revocation must report success")
+        XCTAssertFalse(MCPAccessGate.isEnabled(root: root))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: gate.path),
+                       "the unwritable entry must have been removed — that is the escalation")
+    }
+
+    /// And when denial genuinely cannot be reached — here a read-only root
+    /// defeats both the atomic write and the removal — `set(false)` must
+    /// THROW while access is still granted. That throw is the whole signal
+    /// `MCPAccessSettings` relies on to keep the toggle showing ON rather
+    /// than claiming an off state it never achieved.
+    func test_unachievable_revocation_throws_and_says_so() throws {
+        try MCPAccessGate.set(true, root: root)
+        XCTAssertTrue(MCPAccessGate.isEnabled(root: root))
+
+        setRootWritable(false)
+        defer { setRootWritable(true) }
+
+        XCTAssertThrowsError(try MCPAccessGate.set(false, root: root),
+                             "returning normally here would be the silent fail-open")
+        XCTAssertTrue(MCPAccessGate.isEnabled(root: root),
+                      "precondition: this is the state the caller must be warned about")
+    }
+
+    /// The asymmetry is deliberate: failing to publish `enabled: true` leaves
+    /// the gate denying, which is safe, so it must NOT be escalated into
+    /// deleting a file or reported as a revocation problem.
+    func test_failing_to_grant_leaves_the_gate_denying() throws {
+        setRootWritable(false)
+        defer { setRootWritable(true) }
+
+        XCTAssertThrowsError(try MCPAccessGate.set(true, root: root))
+        XCTAssertFalse(MCPAccessGate.isEnabled(root: root),
+                       "a grant that couldn't be written must not grant")
+    }
+
+    private func setRootWritable(_ writable: Bool) {
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: writable ? 0o755 : 0o500], ofItemAtPath: root.path)
+    }
 }

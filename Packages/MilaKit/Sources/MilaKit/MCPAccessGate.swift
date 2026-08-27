@@ -51,9 +51,39 @@ public struct MCPAccessGate: Codable, Equatable, Sendable {
     }
 
     /// Called by the app when the user flips the setting.
+    ///
+    /// ## Revoking has to fail closed
+    ///
+    /// The two directions are not symmetric, and treating them as one write
+    /// is what made revocation fail OPEN (CodeRabbit on #183, CWE-359):
+    ///
+    ///   * Failing to publish **enabled** is safe. The file keeps whatever it
+    ///     had, and every "anything I don't positively understand" case —
+    ///     absent, unreadable, malformed — already denies. The worst outcome
+    ///     is access the user asked for not arriving.
+    ///   * Failing to publish **disabled** is not. The previous
+    ///     `enabled: true` file survives the failed atomic write, so the
+    ///     toggle reads off in the UI while a configured MCP client keeps
+    ///     reading transcripts — indefinitely, and invisibly.
+    ///
+    /// So a failed revocation escalates to deleting the file, which denies by
+    /// absence. `set(false, …)` throws only when access is *still* granted
+    /// afterwards, which lets the caller keep the UI honest instead of
+    /// showing an off switch that isn't.
     public static func set(_ enabled: Bool,
                            now: Date = Date(),
                            root: URL = StoreLocationPointer.defaultRoot()) throws {
+        do {
+            try publish(enabled: enabled, now: now, root: root)
+        } catch {
+            guard !enabled else { throw error }
+            // Denial by absence is as good as denial by content.
+            try? FileManager.default.removeItem(at: url(root: root))
+            if isEnabled(root: root) { throw error }
+        }
+    }
+
+    private static func publish(enabled: Bool, now: Date, root: URL) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]

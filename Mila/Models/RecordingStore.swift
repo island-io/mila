@@ -176,6 +176,34 @@ final class RecordingStore: ObservableObject {
         writeStoreLocationPointer()
     }
 
+    /// Whether `store-location.json` currently describes the store this
+    /// instance is actually reading and writing — i.e. whether mila-mcp
+    /// would land on the SAME store.
+    ///
+    /// `false` means the pointer is stale, and stale is dangerous rather
+    /// than merely unhelpful: `relocateRecordings` switches the live paths
+    /// before the pointer is written and deliberately leaves the old store
+    /// on disk, so a pointer that failed to update still resolves — to a
+    /// store the app has stopped writing to. The helper would answer from
+    /// recordings that stopped updating at the moment of relocation, with
+    /// nothing to tell anyone it happened. Answering nothing is strictly
+    /// better than answering confidently wrong, so `MCPAccessSettings`
+    /// treats this as "MCP access unavailable" and closes the on-disk gate
+    /// until a verified pointer exists.
+    ///
+    /// Not a permission or a preference: it is a readiness fact, recomputed
+    /// on every pointer write, and it converges on its own — `init` rewrites
+    /// the pointer on every launch, so a transient failure clears itself.
+    private(set) var storeLocationIsDiscoverable: Bool = true
+
+    /// Late-bound by `MilaApp` to `MCPAccessSettings.refreshMirror()`. Fires
+    /// only when `storeLocationIsDiscoverable` actually flips, so a normal
+    /// relocation — the overwhelmingly common case — never rewrites the gate
+    /// file. Not a `@Published` + Combine pair because `MilaApp.init` has no
+    /// cancellable bag to keep a subscription alive, and the one consumer
+    /// wants a callback rather than a value.
+    var onStoreLocationDiscoverabilityChanged: (() -> Void)?
+
     /// Mirror the resolved store paths into `store-location.json` at the
     /// original root so external tools (mila-mcp) can find the store even
     /// when the user relocated the recordings directory — the relocation
@@ -183,6 +211,11 @@ final class RecordingStore: ObservableObject {
     /// resolve. Always written at the ORIGINAL root: on the default path
     /// that's Application Support/Mila, and test instances (temp roots)
     /// stay isolated automatically.
+    ///
+    /// The write is VERIFIED by reading back what an external reader would
+    /// now resolve, not by trusting `write()` to have thrown on failure.
+    /// The end state is what matters — see
+    /// `MilaStoreReader.resolvesActiveStore`.
     private func writeStoreLocationPointer() {
         let pointer = StoreLocationPointer(recordingsDirectory: recordingsDirectory.path,
                                            storeFile: storeURL.path,
@@ -191,6 +224,24 @@ final class RecordingStore: ObservableObject {
             try pointer.write(to: originalRootDirectory)
         } catch {
             recStoreLog.error("failed to write store-location pointer: \(error.localizedDescription, privacy: .public)")
+        }
+        let discoverable = MilaStoreReader.resolvesActiveStore(
+            root: originalRootDirectory,
+            recordingsDirectory: recordingsDirectory,
+            storeFile: storeURL)
+        if !discoverable {
+            // Deliberately an error even though the app itself is fine: this
+            // is the only trace of a divergence that is otherwise invisible
+            // from inside Mila.
+            recStoreLog.error("""
+                store-location pointer does not describe the active store \
+                (external readers would resolve elsewhere) — MCP access \
+                stays closed until it can be written
+                """)
+        }
+        if storeLocationIsDiscoverable != discoverable {
+            storeLocationIsDiscoverable = discoverable
+            onStoreLocationDiscoverabilityChanged?()
         }
     }
 
@@ -338,12 +389,31 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
-    func update(_ recording: Recording) {
-        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+    /// Returns whether the record a SEPARATE PROCESS would now read matches
+    /// what was just written — i.e. both the `.txt` transcript sidecar and
+    /// `recordings.json` landed on disk.
+    ///
+    /// Callers that merely mutate in-memory state can keep ignoring the
+    /// result (hence `@discardableResult`). The one caller that must not is
+    /// `QuickActionsController.stopRecording`, which publishes the live
+    /// sidecar's `completed` + `final_recording_id` handoff: that pair
+    /// promises an external reader that following the id yields the final
+    /// transcript, and `MilaStoreReader.transcriptText` reads the `.txt`
+    /// sidecar FIRST. A suppressed write error there means the handoff points
+    /// at a stale sidecar. Both writes used to fail silently — `print` and
+    /// carry on. (CodeRabbit on #183.)
+    ///
+    /// `writeSummary` is deliberately not part of the verdict: the summary
+    /// also lives in `recordings.json`, so its sidecar is an extra surface
+    /// rather than the source of truth.
+    @discardableResult
+    func update(_ recording: Recording) -> Bool {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
         recordings[idx] = recording
-        writeTranscript(for: recording)
+        let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        persist()
+        let persisted = persist()
+        return transcriptWritten && persisted
     }
 
     /// Replace several stored records in one pass with a SINGLE persist, vs.
@@ -443,7 +513,12 @@ final class RecordingStore: ObservableObject {
     /// Persist (or clear) the `.txt` sidecar for a recording. Empty text
     /// removes the file so we never leave a stale transcript around after a
     /// re-transcription that came up silent.
-    private func writeTranscript(for recording: Recording) {
+    /// Returns whether the sidecar on disk now reflects `recording` —
+    /// written, or removed for an empty transcript. `false` means an external
+    /// reader would see the PREVIOUS text (or none), which is why the result
+    /// is propagated out through `update` rather than only logged.
+    @discardableResult
+    private func writeTranscript(for recording: Recording) -> Bool {
         let url = transcriptURL(for: recording)
         let text = recording.fullText
         do {
@@ -454,8 +529,10 @@ final class RecordingStore: ObservableObject {
             } else {
                 try text.write(to: url, atomically: true, encoding: .utf8)
             }
+            return true
         } catch {
-            print("RecordingStore: failed to write transcript \(url.lastPathComponent): \(error)")
+            recStoreLog.error("failed to write transcript \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 
@@ -813,15 +890,21 @@ final class RecordingStore: ObservableObject {
         return "Recovered recording · \(f.string(from: date))"
     }
 
-    private func persist() {
+    /// Returns whether `recordings.json` on disk now reflects the in-memory
+    /// store. `false` means a separate process still reads the previous
+    /// contents — see `update(_:)` for why that has to be reportable.
+    @discardableResult
+    private func persist() -> Bool {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
             let data = try encoder.encode(recordings)
             try data.write(to: storeURL, options: .atomic)
+            return true
         } catch {
-            print("RecordingStore persist error: \(error)")
+            recStoreLog.error("persist failed: \(error.localizedDescription, privacy: .public)")
+            return false
         }
     }
 

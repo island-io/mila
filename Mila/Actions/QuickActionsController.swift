@@ -866,11 +866,28 @@ final class QuickActionsController: ObservableObject {
         updated.summary = finalSummary.isEmpty ? nil : finalSummary
         updated.actionItems = finalItems.isEmpty ? nil : finalItems
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
-        store.update(updated)
-        // NOW the handoff is honest: the stored row carries the final
-        // transcript, so `completed` + `final_recording_id` can be
-        // published. Ordering matters — see the note at `store.add` above.
-        liveSidecarWriter?.finish(recordingID: updated.id)
+        // `update` reports whether the `.txt` sidecar AND recordings.json
+        // actually landed on disk. Both used to fail silently, so the handoff
+        // could name an id whose transcript a separate process still reads as
+        // the PREVIOUS text — `MilaStoreReader.transcriptText` prefers the
+        // sidecar, so a suppressed write error there is indistinguishable
+        // from a successful save on this side. (CodeRabbit on #183.)
+        let persisted = store.update(updated)
+        // NOW the handoff can be published, and only if it is honest.
+        // Ordering matters — see the note at `store.add` above. So does
+        // WHETHER: on a failed write we still close the sidecar (the
+        // recording is over; leaving it `recording` would strand a poller on
+        // a heartbeat that never ticks again) but publish NO id, which is the
+        // already-documented "check list_recordings for the newest entry"
+        // shape. Sending the client to a listing built from what is really on
+        // disk beats sending it to an id that resolves to a stale transcript.
+        if !persisted {
+            quickActionsLog.error("""
+                transcript persistence failed for \(updated.id, privacy: .public) — \
+                closing the live sidecar without a handoff id
+                """)
+        }
+        liveSidecarWriter?.finish(recordingID: persisted ? updated.id : nil)
 
         // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
         //

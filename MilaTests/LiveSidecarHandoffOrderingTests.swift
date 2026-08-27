@@ -93,6 +93,8 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
 
     override func tearDown() async throws {
         cancellables.removeAll()
+        // Always restore write permission, or the temp tree can't be removed.
+        setRecordingsDirWritable(true)
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
         if let savedSelection {
             UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
@@ -107,6 +109,16 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
 
     private func snapshot() -> LiveTranscriptSnapshot? {
         LiveTranscriptSnapshot.read(root: sidecarRoot)
+    }
+
+    /// The `.txt` transcript sidecar lives in the recordings directory, so
+    /// revoking write permission there is what makes `writeTranscript` fail
+    /// while leaving `recordings.json` (at the root) writable — isolating the
+    /// transcript-persistence failure from everything else.
+    private func setRecordingsDirWritable(_ writable: Bool) {
+        guard let dir = store?.recordingsDirectory else { return }
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: writable ? 0o755 : 0o500], ofItemAtPath: dir.path)
     }
 
     /// Start a fake capture with a real (short) WAV on disk, and open the
@@ -187,5 +199,58 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
                        "the removal path must still close the sidecar — a poller cannot wait forever on a row that is gone")
         XCTAssertNil(final.finalRecordingID,
                      "handing out the id of a deleted recording gives get_transcript nothing but a 404")
+    }
+
+    /// REGRESSION (CodeRabbit on #183, Major — "do not publish the handoff
+    /// when transcript persistence fails"):
+    ///
+    /// The ordering fix above governs WHEN the handoff is published. This is
+    /// WHETHER. `RecordingStore.update` writes the `.txt` sidecar, and
+    /// `writeTranscript` used to swallow its write errors (a `print` and carry
+    /// on), so `finish(recordingID:)` published `completed` + the id even when
+    /// the transcript never reached disk. `MilaStoreReader.transcriptText`
+    /// reads that sidecar FIRST, so the client following the id got the
+    /// PREVIOUS text — indistinguishable, from its side, from a real answer.
+    ///
+    /// Here the final transcript is empty (no live segments), so `update`
+    /// clears the sidecar — and the stale one can't be removed because the
+    /// recordings directory is read-only. A reader would keep serving the old
+    /// text, so no id may be published.
+    func test_no_handoff_id_when_the_transcript_sidecar_cannot_be_written() async throws {
+        let url = try await startFakeRecording()
+        let sidecarTxt = url.deletingPathExtension().appendingPathExtension("txt")
+        try "stale transcript from a previous run".write(to: sidecarTxt,
+                                                        atomically: true, encoding: .utf8)
+        setRecordingsDirWritable(false)
+
+        await controller.stopRecording()
+
+        let final = try XCTUnwrap(snapshot())
+        XCTAssertEqual(final.state, .completed, "the recording is over either way")
+        XCTAssertNil(final.finalRecordingID,
+                     "an id whose transcript is stale on disk must not be handed out")
+        XCTAssertEqual(try String(contentsOf: sidecarTxt, encoding: .utf8),
+                       "stale transcript from a previous run",
+                       "precondition: the stale sidecar really did survive, which is the hazard")
+    }
+
+    /// The same path when everything works: a successful write still publishes
+    /// the id, so the failure check can't have broken the normal handoff.
+    func test_handoff_id_is_published_when_persistence_succeeds() async throws {
+        let url = try await startFakeRecording()
+        let sidecarTxt = url.deletingPathExtension().appendingPathExtension("txt")
+        try "stale transcript from a previous run".write(to: sidecarTxt,
+                                                        atomically: true, encoding: .utf8)
+
+        await controller.stopRecording()
+
+        // Only the sidecar snapshot is asserted here. The `.txt` on disk is
+        // deliberately left alone: `finalizeTail` runs detached after
+        // `stopRecording` returns and may legitimately rewrite it from the
+        // batch pass, so asserting its contents would be a race.
+        let final = try XCTUnwrap(snapshot())
+        XCTAssertEqual(final.state, .completed)
+        XCTAssertNotNil(final.finalRecordingID,
+                        "a clean save must still hand off — this is the common path")
     }
 }

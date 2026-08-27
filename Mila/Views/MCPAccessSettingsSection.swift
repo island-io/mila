@@ -43,8 +43,28 @@ struct MCPAccessSettingsSection: View {
             if settings.enabled {
                 registrationCard
             }
-            if let error = settings.mirrorError {
+            // Turning access OFF didn't take. The toggle has been put back to
+            // on, because it is still on in fact — saying so is the only
+            // honest option, and it tells the user to act rather than
+            // assuming they're covered.
+            if settings.revocationFailed {
+                Text("Mila couldn't turn MCP access off — the permission file can't be written or removed, so the helper still has access. Check that \(settings.gateFilePath) is writable, then try again.")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if let error = settings.mirrorError {
                 Text("Mila couldn't save this preference (\(error)). The MCP helper will keep refusing access until it can be written.")
+                    .font(.callout)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            // Access is on, saved fine, and still refused — because
+            // `store-location.json` doesn't describe the store Mila is
+            // using, so the helper would read a stale one. Without this line
+            // the refusal is invisible from inside the app and the toggle
+            // looks like it's working.
+            if settings.storeUnreachable {
+                Text("MCP access is paused: Mila couldn't record where your recordings live, so the helper would read an out-of-date copy. Reopening Mila usually fixes it; if it persists, set the storage location again in Storage above.")
                     .font(.callout)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)

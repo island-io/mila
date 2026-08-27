@@ -123,6 +123,47 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertEqual(first["has_summary"] as? Bool, false)
     }
 
+    /// `appBundleID` is mirrored and exposed alongside `app_name` — the stable
+    /// key next to the localized display string. It was previously absent from
+    /// the mirror entirely, which the drift guard couldn't see because its
+    /// fixture never set the field (CodeRabbit on #183).
+    func test_app_bundle_id_is_exposed_next_to_app_name() throws {
+        var recording = meeting("Zoom call", daysAgo: 0)
+        recording.appName = "zoom.us"
+        recording.appBundleID = "us.zoom.xos"
+        try seedStore([recording])
+
+        let first = try XCTUnwrap((try call("list_recordings")["recordings"]
+            as? [[String: Any]])?.first)
+        XCTAssertEqual(first["app_name"] as? String, "zoom.us")
+        XCTAssertEqual(first["app_bundle_id"] as? String, "us.zoom.xos")
+    }
+
+    /// Absent stays absent — the key must not appear as null for the mic
+    /// recordings that have no app.
+    func test_app_bundle_id_is_omitted_when_unknown() throws {
+        try seedStore([meeting("Mic memo", daysAgo: 0)])
+        let first = try XCTUnwrap((try call("list_recordings")["recordings"]
+            as? [[String: Any]])?.first)
+        XCTAssertNil(first["app_bundle_id"])
+    }
+
+    /// The tool-layer half of the trashed-recording leak: a client holding a
+    /// retained UUID must get a not-found, not the transcript.
+    /// (CodeRabbit on #183, CWE-200.)
+    func test_get_transcript_refuses_a_trashed_recording_by_id() throws {
+        var trashed = meeting("Deleted meeting", daysAgo: 0)
+        trashed.deletedAt = Date(timeIntervalSince1970: 1_700_000_100)
+        try seedStore([trashed])
+
+        XCTAssertThrowsError(try call("get_transcript", ["id": trashed.id.uuidString])) { error in
+            XCTAssertTrue(String(describing: error).contains("No recording with id"),
+                          String(describing: error))
+        }
+        XCTAssertEqual(try call("list_recordings")["count"] as? Int, 0,
+                       "and the listing agrees — one store, one answer")
+    }
+
     func test_list_recordings_rejects_bad_sort_and_date() throws {
         try seedStore([meeting("A", daysAgo: 0)])
         XCTAssertThrowsError(try call("list_recordings", ["sort": "bogus"]))

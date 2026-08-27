@@ -53,6 +53,7 @@ final class StoredRecordingDriftTests: XCTestCase {
             deletedAt: deleted,
             folder: "Work",
             appName: "zoom.us",
+            appBundleID: "us.zoom.xos",
             summary: "A summary.",
             actionItems: [ActionItem(id: "a1", text: "Ship it", speaker: "SPEAKER_00",
                                      timestampSeconds: 3, source: .llmInferred,
@@ -92,6 +93,7 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertTrue(s.isTrashed)
         XCTAssertEqual(s.folder, "Work")
         XCTAssertEqual(s.appName, "zoom.us")
+        XCTAssertEqual(s.appBundleID, "us.zoom.xos")
         XCTAssertEqual(s.summary, "A summary.")
         XCTAssertEqual(s.actionItems?.count, 1)
         XCTAssertEqual(s.actionItems?.first?.text, "Ship it")

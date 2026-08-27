@@ -16,19 +16,77 @@ public struct MilaStoreReader: Sendable {
         self.storeFileURL = storeFileURL
     }
 
+    /// The store paths an external reader ends up on.
+    public struct ResolvedLocation: Equatable, Sendable {
+        public let recordingsDirectory: URL
+        public let storeFileURL: URL
+        /// True when no pointer existed and the default layout was assumed.
+        public let usedFallback: Bool
+    }
+
+    /// Where an external reader lands, given what is on disk at `root`
+    /// right now: the pointer file if there is one, otherwise the
+    /// historical default layout (`<root>/recordings.json` +
+    /// `<root>/Recordings/`).
+    ///
+    /// Factored out of `init(root:)` so the APP can ask the same question
+    /// the helper answers — "what store would mila-mcp read?" — and compare
+    /// it against the store it is actually writing to. Two copies of this
+    /// rule would be free to drift, and a drift here is silent: the helper
+    /// would serve a different store than the app without either side
+    /// noticing. See `resolvesActiveStore(root:recordingsDirectory:storeFile:)`.
+    public static func resolvedLocation(root: URL = StoreLocationPointer.defaultRoot())
+        -> ResolvedLocation {
+        if let pointer = StoreLocationPointer.read(from: root) {
+            return ResolvedLocation(
+                recordingsDirectory: URL(fileURLWithPath: pointer.recordingsDirectory,
+                                         isDirectory: true),
+                storeFileURL: URL(fileURLWithPath: pointer.storeFile),
+                usedFallback: false)
+        }
+        return ResolvedLocation(
+            recordingsDirectory: root.appendingPathComponent("Recordings", isDirectory: true),
+            storeFileURL: root.appendingPathComponent("recordings.json"),
+            usedFallback: true)
+    }
+
+    /// Whether what an external reader resolves from `root` is the store the
+    /// app is actually using.
+    ///
+    /// The app calls this straight after writing `store-location.json`, and
+    /// treats `false` as "mila-mcp must not answer". The check is a read-back
+    /// rather than a "did `write()` throw?", because the failure that matters
+    /// is not the throw — it is the END STATE. `relocateRecordings` switches
+    /// the live store paths BEFORE the pointer is written and deliberately
+    /// leaves the old store on disk, so a pointer write that fails (or half
+    /// succeeds, or is clobbered) leaves a perfectly readable pointer naming
+    /// a store the app has stopped writing to. The helper would then answer
+    /// questions from stale recordings — confidently wrong, with nothing to
+    /// tell the user it happened. Comparing the resolved end state catches
+    /// every route into that shape, including a `write()` that returned
+    /// without error.
+    ///
+    /// Paths are compared with symlinks resolved and standardized on both
+    /// sides: the pointer stores strings, the app holds `URL`s, and macOS
+    /// temp roots live behind the `/var` → `/private/var` symlink.
+    public static func resolvesActiveStore(root: URL,
+                                           recordingsDirectory: URL,
+                                           storeFile: URL) -> Bool {
+        func key(_ url: URL) -> String {
+            url.resolvingSymlinksInPath().standardizedFileURL.path
+        }
+        let resolved = resolvedLocation(root: root)
+        return key(resolved.recordingsDirectory) == key(recordingsDirectory)
+            && key(resolved.storeFileURL) == key(storeFile)
+    }
+
     /// Resolve from the pointer file at `root`, or fall back to the
     /// historical default layout (`<root>/recordings.json` +
     /// `<root>/Recordings/`).
     public init(root: URL = StoreLocationPointer.defaultRoot()) {
-        if let pointer = StoreLocationPointer.read(from: root) {
-            self.init(recordingsDirectory: URL(fileURLWithPath: pointer.recordingsDirectory,
-                                               isDirectory: true),
-                      storeFileURL: URL(fileURLWithPath: pointer.storeFile))
-        } else {
-            self.init(recordingsDirectory: root.appendingPathComponent("Recordings",
-                                                                       isDirectory: true),
-                      storeFileURL: root.appendingPathComponent("recordings.json"))
-        }
+        let resolved = Self.resolvedLocation(root: root)
+        self.init(recordingsDirectory: resolved.recordingsDirectory,
+                  storeFileURL: resolved.storeFileURL)
     }
 
     // MARK: - Loading
@@ -143,8 +201,26 @@ public struct MilaStoreReader: Sendable {
         try listRecordings(limit: Int.max).first { $0.status == "completed" }
     }
 
+    /// One non-trashed recording by id.
+    ///
+    /// Trashed rows are excluded HERE rather than in the tool handler so the
+    /// invariant — "this reader never surfaces a recording the user moved to
+    /// the trash" — lives in exactly one place, alongside the identical
+    /// filter in `listRecordings`. Enforcing it in the handler instead would
+    /// leave the reader's own API a trap: `recording(id:)` looked like a
+    /// safe lookup and quietly wasn't.
+    ///
+    /// It used to have no filter at all, so a client that had cached a UUID
+    /// from an earlier `list_recordings` could still fetch the transcript of
+    /// a recording the user had since deleted — a store that answers "no" to
+    /// a listing and "yes" to a direct lookup for the same row.
+    /// (CodeRabbit on #183, CWE-200.)
+    ///
+    /// A trashed id is reported as simply not found. Distinguishing "trashed"
+    /// from "never existed" would confirm the recording exists, which is the
+    /// same disclosure in a smaller package.
     public func recording(id: UUID) throws -> StoredRecording? {
-        try loadRecordings().first { $0.id == id }
+        try loadRecordings().first { $0.id == id && !$0.isTrashed }
     }
 
     // MARK: - Search

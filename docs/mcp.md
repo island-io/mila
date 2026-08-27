@@ -68,7 +68,7 @@ cp -R skills/mila-meetings ~/.claude/skills/
 | Tool | What it does |
 |---|---|
 | `list_recordings` | List/filter recordings — by speaker display name, title/app/folder text, source, date range; sortable by date/duration/title. |
-| `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. |
+| `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. Trashed recordings are not reachable, by id or otherwise. |
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
 
@@ -133,6 +133,17 @@ How the polling works under the hood:
 - `~/Library/Application Support/Mila/mcp-access.json` — the consent
   flag, written by the app whenever the setting changes and re-mirrored
   on every launch. Missing or unreadable means **denied**.
+
+  Two things have to be true for it to say yes: you turned the toggle on,
+  **and** Mila could confirm that `store-location.json` names the store it
+  is really using. If a relocation left that pointer stale, the helper
+  would answer from the store Mila stopped writing to — so access is
+  paused instead, and Settings says so. It comes back by itself once the
+  pointer is written again (every launch rewrites it).
+
+  Turning access off also fails closed: if the file can't be rewritten,
+  Mila deletes it, and if it can't do that either the toggle stays ON
+  rather than showing an off state it never achieved.
 
 If the app has never run (no pointer file), the server falls back to
 the default layout. Changes to the `recordings.json` schema must be

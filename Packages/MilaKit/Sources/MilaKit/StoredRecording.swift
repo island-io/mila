@@ -74,6 +74,12 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var deletedAt: Date?
     public var folder: String?
     public var appName: String?
+    /// The captured app's bundle identifier (`us.zoom.xxx`), recorded
+    /// alongside `appName`. Mirrored because it is the AUTHORITATIVE app
+    /// signal: `appName` is a localized display string, this one is stable
+    /// and machine-matchable. Exposing only the display name would give an
+    /// MCP client the fuzzy half and withhold the exact half.
+    public var appBundleID: String?
     public var summary: String?
     public var actionItems: [ActionItem]?
     /// Raw diarizer ID (`SPEAKER_00`) → user-assigned display name.
@@ -109,7 +115,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, speakerNames
+             summary, actionItems, speakerNames, appBundleID
         case legacyFullText = "fullText"
     }
 
@@ -128,6 +134,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         deletedAt = try c.decodeIfPresent(Date.self, forKey: .deletedAt)
         folder = try c.decodeIfPresent(String.self, forKey: .folder)
         appName = try c.decodeIfPresent(String.self, forKey: .appName)
+        appBundleID = try c.decodeIfPresent(String.self, forKey: .appBundleID)
         summary = try c.decodeIfPresent(String.self, forKey: .summary)
         actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
@@ -138,6 +145,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 source: String = "microphone", audioFileName: String, status: String = "completed",
                 language: String = "en", modelName: String? = nil, segments: [Segment] = [],
                 deletedAt: Date? = nil, folder: String? = nil, appName: String? = nil,
+                appBundleID: String? = nil,
                 summary: String? = nil, actionItems: [ActionItem]? = nil,
                 speakerNames: [String: String] = [:], legacyFullText: String? = nil) {
         self.id = id
@@ -153,6 +161,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.deletedAt = deletedAt
         self.folder = folder
         self.appName = appName
+        self.appBundleID = appBundleID
         self.summary = summary
         self.actionItems = actionItems
         self.speakerNames = speakerNames

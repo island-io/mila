@@ -536,7 +536,30 @@ struct MilaApp: App {
         // Opt-in gate for the bundled mila-mcp helper. Constructing it
         // mirrors the persisted flag back out to `mcp-access.json`, so the
         // helper's view of consent re-converges on every launch.
-        let mcpAccess = MCPAccessSettings()
+        //
+        // The readiness half is bound to the store: consent alone isn't
+        // enough, because a `store-location.json` write that failed after a
+        // relocation would leave the helper reading the OLD store and
+        // answering from it. `storeIsDiscoverable` is a closure, not a
+        // snapshot, so it is re-consulted on every mirror — the store is
+        // already constructed above, and the launch-time relocation on line
+        // ~379 has already run, so the first mirror sees the real verdict.
+        //
+        // `store` is captured STRONGLY on purpose. A weak capture that went
+        // nil would fall back to the `?? true` default and quietly re-open
+        // the gate — a fail-open in the one place that must not have one.
+        // There is no cycle: the store's callback below holds `mcpAccess`
+        // weakly, and both objects are `@StateObject`-lived anyway.
+        let mcpAccess = MCPAccessSettings(storeIsDiscoverable: {
+            store.storeLocationIsDiscoverable
+        })
+        // A mid-session relocation can flip discoverability either way, and
+        // the helper's gate must follow immediately rather than at the next
+        // launch. The store only calls this when the verdict actually
+        // changes, so a normal relocation doesn't rewrite the gate file.
+        store.onStoreLocationDiscoverabilityChanged = { [weak mcpAccess] in
+            mcpAccess?.refreshMirror()
+        }
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
