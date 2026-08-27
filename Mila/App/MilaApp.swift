@@ -783,6 +783,13 @@ struct MilaApp: App {
                 .environmentObject(obsidianVaultSettings)
                 .environmentObject(obsidianExporter)
         }
+        // Settings used to be pinned to 700×560 by a rigid `.frame` inside
+        // `SettingsView`; since #177 it is a resizable sidebar window whose
+        // content declares min/ideal/max instead. `.contentSize` is what
+        // turns those declarations into the window's own resize limits —
+        // without it the window would not honour the minimum and could be
+        // dragged narrower than the destinations can lay out in.
+        .windowResizability(.contentSize)
     }
 
     /// Build a diagnostic zip and let the user pick where to save it.

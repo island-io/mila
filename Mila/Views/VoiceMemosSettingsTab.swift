@@ -67,6 +67,9 @@ struct VoiceMemosSettingsTab: View {
             // control left to turn the integration back off.
             Toggle("Sync recordings from iPhone Voice Memos", isOn: $settings.isEnabled)
                 .toggleStyle(.switch)
+                // Voice Memos' per-section probe for `DetailLayoutUITests`
+                // — unconditional, per the comment above.
+                .accessibilityIdentifier("voiceMemos.enable.toggle")
 
             if settings.isEnabled {
                 switch library.availability {

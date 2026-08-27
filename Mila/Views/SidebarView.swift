@@ -448,6 +448,11 @@ private struct SidebarFooter: View {
                 .padding(.horizontal, 6)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // GUI tests open Settings through this row rather than through
+            // `Cmd+,`: a synthesised menu-key event needs the app to be
+            // frontmost and is unreliable on the hosted macOS runners, a
+            // click on a real element is not.
+            .accessibilityIdentifier("sidebar.settings.link")
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
 

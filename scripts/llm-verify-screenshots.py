@@ -26,6 +26,12 @@ For LIST shots (filename contains "transcriptions" or "list"):
   * Sidebar list visible.
   * Main pane shows a list header + at least one recording row.
 
+For SETTINGS shots (filename contains "settings"):
+  * Left sidebar lists the nine section rows (General … Storage), one
+    selected.
+  * Right pane shows that section's real controls, not a blank card.
+  * No tab strip and no ">>" overflow chevron.
+
 The script exits non-zero if Claude reports ANY of: sidebar items
 missing, main pane visibly empty, content overflowing or cut off,
 extreme misalignment that suggests a layout bug.
@@ -73,6 +79,11 @@ def classify(name: str) -> str:
     if bracket_end >= 0:
         suffix = name[bracket_end + 2:]
     lower = suffix.lower()
+    # Checked first: a Settings shot is a different window with a different
+    # expected layout, and without its own profile it would fall through to
+    # "home" and be failed for missing a Record button.
+    if "settings" in lower:
+        return "settings"
     if "detail" in lower:
         return "detail"
     if "transcription" in lower or "list" in lower:
@@ -101,6 +112,25 @@ EXPECTATIONS = {
         "least one recording row beneath it. The main pane should NOT be "
         "empty when there is a seeded recording.\n"
         "  - Layout should not be overflowing or misaligned."
+    ),
+    "settings": (
+        "This should be Mila's SETTINGS window (a separate, smaller window "
+        "from the main one). Expected layout:\n"
+        "  - LEFT SIDEBAR is a list of section rows, each an icon plus a "
+        "label, reading top to bottom: General, Audio, Models, AI Provider, "
+        "AI Features, Speakers, Meetings, Voice Memos, Storage. One row is "
+        "highlighted as selected. The sidebar MUST NOT be empty — an empty "
+        "sidebar is the exact regression this check exists for.\n"
+        "  - RIGHT PANE shows the selected section's controls: a heading and "
+        "real controls (checkboxes, switches, pop-up menus, segmented "
+        "controls, text fields, buttons). It MUST NOT be blank or show only "
+        "empty boxes. A short section — a heading, a line of description and "
+        "a single switch, with empty space below — is normal and correct; "
+        "only a pane with NO heading and NO controls is a defect.\n"
+        "  - The window's title bar names the selected section.\n"
+        "  - Nothing should be pushed off-screen or cut off at an edge.\n"
+        "  - There must be NO tab strip along the top and no '>>' overflow "
+        "chevron — Settings is a sidebar, not tabs."
     ),
     "detail": (
         "This should be Mila's RECORDING DETAIL view. Expected layout:\n"

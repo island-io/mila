@@ -108,6 +108,14 @@ jobs:
               - 'scripts/fixtures/**'
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
+              # DetailLayoutUITests screenshots the main window AND the
+              # Settings window, so a change to either container has to be
+              # able to trigger this job. #194 shipped an empty Settings
+              # window past a green CI precisely because nothing here looked
+              # at Settings; leaving the view out of the filter would put the
+              # new coverage back out of reach.
+              - 'Mila/Views/SettingsView.swift'
+              - 'Mila/Views/ContentView.swift'
               - 'MilaUITests/DetailLayoutUITests.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
       - name: Install xcodegen
