@@ -61,8 +61,28 @@ final class LiveSpeakerDiarizer: ObservableObject {
 
     struct SpeakerProfile {
         var id: String
+        /// Matching centroid: a running mean over the seeded weight (if any)
+        /// plus every embedding that matched this entry during the recording.
+        /// A seeded entry starts at the persisted centroid so the first
+        /// utterance can't blow it away.
         var centroid: [Float]
+        /// The weight behind `centroid`. Seeded entries start at a capped
+        /// share of the persisted count — see `seedPool`.
         var sampleCount: Int
+        /// Running mean over **only** the embeddings observed in *this*
+        /// recording, and how many there were. Empty / zero for a seeded
+        /// entry until it first matches.
+        ///
+        /// This pair exists because `centroid` / `sampleCount` cannot be
+        /// persisted: both already contain the seeded profile's own weight,
+        /// which is *already on disk*. Folding them back into the stored
+        /// profile counts that weight twice — a seeded entry with three
+        /// carried samples and one live match persisted as four new samples,
+        /// so the stored count grew ~4x per recording and the centroid froze.
+        /// `currentProfiles()` therefore reports this delta, never the
+        /// matching pair.
+        var observedCentroid: [Float]
+        var observedCount: Int
         /// Name from a stored voice profile if this pool entry was seeded.
         var profileName: String?
     }
@@ -218,6 +238,13 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// recording start. Each entry gets a fresh `SPEAKER_NN` ID and a
     /// capped `sampleCount` so the centroid can adapt to current-session
     /// acoustics on the first few matches.
+    ///
+    /// The seeded weight goes into `sampleCount` only — the matching side.
+    /// `observedCount` starts at zero because nothing has been observed in
+    /// *this* recording yet, and that is the number the persistence path
+    /// reads. A seeded entry that never speaks therefore contributes
+    /// nothing to its stored profile, and one that speaks once contributes
+    /// exactly one sample.
     func seedPool(with entries: [(id: String, name: String, centroid: [Float], sampleCount: Int)]) {
         for entry in entries {
             let id = String(format: "SPEAKER_%02d", pool.count)
@@ -225,16 +252,29 @@ final class LiveSpeakerDiarizer: ObservableObject {
                 id: id,
                 centroid: entry.centroid,
                 sampleCount: min(entry.sampleCount, 3),
+                observedCentroid: [],
+                observedCount: 0,
                 profileName: entry.name
             ))
         }
     }
 
-    /// Snapshot the current pool for persistence. Returns entries for
-    /// each speaker with their final centroid, sample count, and the
-    /// voice-profile name they were seeded from (if any).
-    func currentProfiles() -> [(id: String, centroid: [Float], sampleCount: Int, profileName: String?)] {
-        pool.map { ($0.id, $0.centroid, $0.sampleCount, $0.profileName) }
+    /// Snapshot the pool for **persistence**: for each speaker, the mean of
+    /// what was observed in this recording, how many observations that was,
+    /// and the voice-profile name it was seeded from (if any).
+    ///
+    /// Deliberately reports `observedCentroid` / `observedCount` rather than
+    /// the matching `centroid` / `sampleCount`. For a seeded entry the
+    /// matching pair carries weight that is already stored on disk, and
+    /// folding it back in counts it twice — see `SpeakerProfile`. For a
+    /// speaker minted during this recording the two pairs are identical, so
+    /// nothing changes for the common case.
+    ///
+    /// A seeded speaker who never matched reports `observedCount == 0`;
+    /// `SpeakerProfileStore.updateProfile` refuses a zero count, so it can
+    /// never write a spurious update.
+    func currentProfiles() -> [(id: String, observedCentroid: [Float], observedCount: Int, profileName: String?)] {
+        pool.map { ($0.id, $0.observedCentroid, $0.observedCount, $0.profileName) }
     }
 
     /// Fire-and-track variant of `process(...)`. Chains the call onto
@@ -335,7 +375,11 @@ final class LiveSpeakerDiarizer: ObservableObject {
         let longEnoughForNewSpeaker = utteranceDuration >= 1.0
         diarLog.log("assign: poolSize=\(self.pool.count, privacy: .public) bestMatch=\(bestId, privacy: .public) bestSim=\(bestSim, privacy: .public) threshold=\(self.similarityThreshold, privacy: .public) createThreshold=\(createThreshold, privacy: .public) dur=\(utteranceDuration, privacy: .public)")
         if let chosen = best, chosen.sim >= similarityThreshold {
-            // Confident match → fold into the centroid (running mean).
+            // Confident match → fold into the matching centroid (running
+            // mean). `centroid.count` is safe to index `embedding` with:
+            // `cosineSimilarity` returns 0 on a dimension mismatch, so a
+            // seeded profile from a different embedding model can never be
+            // `best` above the threshold and never reaches this fold.
             let n = pool[chosen.idx].sampleCount
             var centroid = pool[chosen.idx].centroid
             for i in 0..<centroid.count {
@@ -343,6 +387,23 @@ final class LiveSpeakerDiarizer: ObservableObject {
             }
             pool[chosen.idx].centroid = centroid
             pool[chosen.idx].sampleCount = n + 1
+            // The same fold over this recording's observations alone — the
+            // pair that gets persisted. A seeded entry starts empty, so its
+            // first match takes the embedding directly rather than averaging
+            // into nothing.
+            let observedSoFar = pool[chosen.idx].observedCount
+            if observedSoFar == 0 {
+                pool[chosen.idx].observedCentroid = embedding
+                pool[chosen.idx].observedCount = 1
+            } else {
+                var observed = pool[chosen.idx].observedCentroid
+                for i in 0..<observed.count {
+                    observed[i] = (observed[i] * Float(observedSoFar) + embedding[i])
+                        / Float(observedSoFar + 1)
+                }
+                pool[chosen.idx].observedCentroid = observed
+                pool[chosen.idx].observedCount = observedSoFar + 1
+            }
             return pool[chosen.idx].id
         }
         // Borderline, or too short to trust as a new voice → attach to the
@@ -350,8 +411,15 @@ final class LiveSpeakerDiarizer: ObservableObject {
         if let chosen = best, chosen.sim >= createThreshold || !longEnoughForNewSpeaker {
             return pool[chosen.idx].id
         }
+        // A speaker minted during this recording has no seeded weight, so
+        // the matching pair and the persisted pair are the same thing.
         let nextID = String(format: "SPEAKER_%02d", pool.count)
-        pool.append(SpeakerProfile(id: nextID, centroid: embedding, sampleCount: 1, profileName: nil))
+        pool.append(SpeakerProfile(id: nextID,
+                                   centroid: embedding,
+                                   sampleCount: 1,
+                                   observedCentroid: embedding,
+                                   observedCount: 1,
+                                   profileName: nil))
         return nextID
     }
 

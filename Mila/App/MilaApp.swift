@@ -589,17 +589,23 @@ struct MilaApp: App {
         let profileStoreRef = SpeakerProfileStore(settings: voiceSettings)
         _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
         // Save a voice profile when a speaker is named — if the live
-        // diarizer has a centroid for that speaker, persist it. The store
-        // refuses writes while the feature is off; the guard here means an
-        // opted-out user's centroid isn't so much as read out of the pool.
+        // diarizer observed that speaker, persist it. The store refuses
+        // writes while the feature is off; the guard here means an opted-out
+        // user's voice isn't so much as read out of the pool.
+        //
+        // `currentProfiles()` reports what was observed in *this* recording,
+        // not the pool's matching centroid — for a seeded speaker the latter
+        // carries weight that is already stored on disk, and folding it back
+        // in counts it twice. This is the only place voice profiles are
+        // written, so a recognised speaker merges exactly once per recording.
         let diarizerRef = liveDiar
         store.onSpeakerNamed = { _, rawID, name in
             guard voiceSettings.isConfigured else { return }
             if let entry = diarizerRef.currentProfiles().first(where: { $0.id == rawID }) {
                 profileStoreRef.updateProfile(
                     name: name,
-                    embedding: entry.centroid,
-                    sampleCount: entry.sampleCount
+                    embedding: entry.observedCentroid,
+                    sampleCount: entry.observedCount
                 )
             }
         }
@@ -903,11 +909,18 @@ struct MilaApp: App {
         guard voiceRecognitionSettings.isConfigured else { return }
         guard let rec = store.recordings.first else { return }
         let poolEntries = liveSpeakerDiarizer.currentProfiles()
-        // Only assign names for pool entries that were seeded AND
-        // actually matched utterances (sampleCount > the seed cap of 3).
+        // Only assign names for pool entries that were seeded (they carry a
+        // profileName) AND actually spoke. Both halves matter: a seeded
+        // speaker who never said anything must not be labelled onto the
+        // recording just because their voice was in the pool.
         for entry in poolEntries {
             guard let profileName = entry.profileName else { continue }
-            // Check this speaker actually spoke (has intervals).
+            // Check this speaker actually spoke (has intervals). Now that
+            // seeded weight is kept out of the persisted delta,
+            // `entry.observedCount > 0` says much the same thing — but
+            // `intervals` is the stronger signal, since it means the speaker
+            // reached the transcript rather than merely matching an
+            // embedding.
             let spoke = liveSpeakerDiarizer.intervals.contains { $0.speaker == entry.id }
             guard spoke else { continue }
             store.setSpeakerName(profileName, forSpeaker: entry.id, recordingID: rec.id)
