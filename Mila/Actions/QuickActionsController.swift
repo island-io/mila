@@ -887,7 +887,17 @@ final class QuickActionsController: ObservableObject {
                 closing the live sidecar without a handoff id
                 """)
         }
-        liveSidecarWriter?.finish(recordingID: persisted ? updated.id : nil)
+        // The third condition on the handoff, after WHEN and WHETHER: whether
+        // the transcript is FINAL. `liveTranscriptIsAuthoritative` is exactly
+        // that — it is what decided `.completed` vs `.pending` above. Chunk
+        // mode, the hardware-gated path and empty-live recordings all still
+        // need the batch worker, so they close without an id and the handoff is
+        // published later from the batch-completion hook. Publishing it here
+        // pointed clients at a `.pending` row holding either unlabeled or
+        // entirely empty text, while the live tool's note called it
+        // authoritative. (CodeRabbit on #183.)
+        liveSidecarWriter?.finish(recordingID: persisted ? updated.id : nil,
+                                  transcriptIsFinal: liveTranscriptIsAuthoritative)
 
         // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
         //

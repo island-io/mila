@@ -28,6 +28,16 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
     private var trailingWriteTask: Task<Void, Never>?
     private var heartbeatTask: Task<Void, Never>?
 
+    /// Set when `finish` closed a snapshot whose transcript was NOT yet final
+    /// (chunk mode, hardware-gated, or no live segments): the recording is
+    /// saved but the batch worker still has to produce its transcript, so no
+    /// handoff id could be published. `attachHandoff(forRecording:)` uses this
+    /// to complete the handoff once that batch pass lands.
+    ///
+    /// Holds the session id too, so a late completion can prove it is talking
+    /// about the snapshot still on disk rather than a newer recording's.
+    private var awaitingBatchHandoff: (session: UUID, recordingID: UUID)?
+
     /// `root` is the directory holding the `live/` subdirectory — the
     /// default app-support root in production, a temp dir in tests.
     init(root: URL = StoreLocationPointer.defaultRoot(),
@@ -62,6 +72,9 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
     /// instead of a silent, forever-empty transcript.
     func begin(title: String?, source: String?, liveAvailable: Bool) {
         cancelTimers()
+        // A new meeting supersedes any pending handoff: the old snapshot is
+        // about to be overwritten, so there is nothing left to attach to.
+        awaitingBatchHandoff = nil
         let now = Date()
         snapshot = LiveTranscriptSnapshot(liveTranscriptAvailable: liveAvailable,
                                           recordingStartedAt: now,
@@ -95,15 +108,73 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
     /// normal Stop path (poller handoff to `get_transcript`); nil when
     /// there's nothing to hand off (failed stop, sleep/lock teardown).
     /// The completed snapshot stays on disk until the next `begin`.
-    func finish(recordingID: UUID?) {
+    ///
+    /// `transcriptIsFinal: false` means the row is saved but its transcript
+    /// isn't done — chunk mode awaiting batch diarization, the hardware-gated
+    /// path, or a recording with no live segments at all. Those close WITHOUT
+    /// an id, because `final_recording_id` is read as "this id resolves to the
+    /// authoritative transcript" and at that moment it does not: the batch
+    /// worker hasn't run. Publishing it anyway pointed clients at a `.pending`
+    /// row whose text was stale or empty. (CodeRabbit on #183.) The id is
+    /// remembered so `attachHandoff(forRecording:)` can publish the handoff
+    /// when the batch pass completes.
+    func finish(recordingID: UUID?, transcriptIsFinal: Bool = true) {
         cancelTimers()
         guard var current = snapshot, current.state == .recording else { return }
         current.state = .completed
-        current.finalRecordingID = recordingID
+        if let recordingID, !transcriptIsFinal {
+            current.finalRecordingID = nil
+            awaitingBatchHandoff = (session: current.sessionID, recordingID: recordingID)
+        } else {
+            current.finalRecordingID = recordingID
+            awaitingBatchHandoff = nil
+        }
         current.revision += 1
         snapshot = current
         writeNow()
         snapshot = nil
+    }
+
+    /// Publish the handoff for a recording whose transcript has now been
+    /// produced by the batch worker, completing a `finish(…,
+    /// transcriptIsFinal: false)`.
+    ///
+    /// Every guard here fails SAFE — a no-op leaves the `completed`-without-id
+    /// snapshot exactly as it was, which is already correct and already tells a
+    /// poller to check `list_recordings`. So the worst case for this whole
+    /// mechanism is that the convenience handoff doesn't appear, never a wrong
+    /// or clobbered snapshot:
+    ///
+    ///   * `awaitingBatchHandoff` must name THIS recording — the completion
+    ///     hook it is called from is global and also fires for user-initiated
+    ///     re-transcribes of old rows;
+    ///   * `snapshot == nil` — a live recording is in progress, so the file on
+    ///     disk belongs to it and must not be touched;
+    ///   * the on-disk `sessionID` must still be the session we closed, which
+    ///     is what stops a *later* meeting's snapshot being stamped with an
+    ///     earlier recording's id;
+    ///   * it must still be `completed` with no id, so we never overwrite a
+    ///     handoff already published.
+    func attachHandoff(forRecording recordingID: UUID) {
+        guard let awaited = awaitingBatchHandoff,
+              awaited.recordingID == recordingID,
+              snapshot == nil,
+              var onDisk = LiveTranscriptSnapshot.read(root: root),
+              onDisk.sessionID == awaited.session,
+              onDisk.state == .completed,
+              onDisk.finalRecordingID == nil else { return }
+        onDisk.finalRecordingID = recordingID
+        onDisk.revision += 1
+        onDisk.updatedAt = Date()
+        do {
+            try onDisk.write(root: root)
+            awaitingBatchHandoff = nil
+            sidecarLog.log("attached late handoff for \(recordingID, privacy: .public)")
+        } catch {
+            // Left pending on purpose: a later completion for the same
+            // recording can retry, and until then the id-less snapshot stands.
+            sidecarLog.error("late handoff write failed: \(error.localizedDescription, privacy: .public)")
+        }
     }
 
     // MARK: - Write scheduling

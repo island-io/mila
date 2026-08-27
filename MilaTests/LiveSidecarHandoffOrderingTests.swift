@@ -160,13 +160,17 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
         XCTAssertEqual(idAtPresent, .some(nil),
                        "no handoff id may be published before the final store update")
 
-        // And by the time stopRecording returns, the handoff IS published,
-        // naming the row the drain just wrote.
+        // And by the time stopRecording returns, the sidecar is closed against
+        // the row the drain just wrote.
         let savedID = try XCTUnwrap(presentedID)
         XCTAssertNotNil(store.recordings.first { $0.id == savedID })
         let final = try XCTUnwrap(snapshot())
         XCTAssertEqual(final.state, .completed)
-        XCTAssertEqual(final.finalRecordingID, savedID)
+        // No id here, and that is a separate rule from the ordering this test
+        // is about: this fixture has no live segments, so the row is `.pending`
+        // and its transcript is owed by the batch worker. See
+        // `test_no_handoff_id_while_the_transcript_is_still_pending`.
+        XCTAssertNil(final.finalRecordingID)
     }
 
     /// The recording can vanish mid-finalize — the user cancels the rename
@@ -234,23 +238,97 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
                        "precondition: the stale sidecar really did survive, which is the hazard")
     }
 
-    /// The same path when everything works: a successful write still publishes
-    /// the id, so the failure check can't have broken the normal handoff.
-    func test_handoff_id_is_published_when_persistence_succeeds() async throws {
-        let url = try await startFakeRecording()
-        let sidecarTxt = url.deletingPathExtension().appendingPathExtension("txt")
-        try "stale transcript from a previous run".write(to: sidecarTxt,
-                                                        atomically: true, encoding: .utf8)
+    /// REGRESSION (CodeRabbit on #183, Major — "do not publish a final handoff
+    /// for a pending transcript"):
+    ///
+    /// **This test previously encoded the bug.** It drove a recording with no
+    /// live segments — so `liveTranscriptIsAuthoritative` is false and the row
+    /// is saved `.pending` with EMPTY `fullText` — and then asserted that a
+    /// handoff id *was* published, calling that "the common path". It was not a
+    /// correct path at all: `get_live_transcript` describes
+    /// `final_recording_id` as resolving to "the authoritative transcript", and
+    /// here it resolved to a row the batch worker had not transcribed yet.
+    ///
+    /// The assertion is now inverted, which is the actual contract: no
+    /// transcript, no handoff. The client is sent to `list_recordings` instead,
+    /// and the id arrives later from the batch-completion hook (covered by
+    /// `test_late_handoff_is_published_after_batch_completion` below and by
+    /// `LiveTranscriptSidecarWriterTests`).
+    func test_no_handoff_id_while_the_transcript_is_still_pending() async throws {
+        _ = try await startFakeRecording()
 
         await controller.stopRecording()
 
-        // Only the sidecar snapshot is asserted here. The `.txt` on disk is
-        // deliberately left alone: `finalizeTail` runs detached after
-        // `stopRecording` returns and may legitimately rewrite it from the
-        // batch pass, so asserting its contents would be a race.
+        let saved = try XCTUnwrap(store.recordings.first)
+        XCTAssertEqual(saved.status, .pending,
+                       "precondition: no live segments means the batch worker still owes us a transcript")
+
+        let final = try XCTUnwrap(snapshot())
+        XCTAssertEqual(final.state, .completed, "the recording itself is over")
+        XCTAssertNil(final.finalRecordingID,
+                     "a `.pending` row must not be advertised as the authoritative transcript")
+        let note = try XCTUnwrap(finalNoteForClient())
+        XCTAssertTrue(note.contains("list_recordings"), note)
+    }
+
+    /// The deferred half of the same contract: once the batch pass completes,
+    /// the handoff IS published, against the same snapshot, without a new
+    /// recording having started.
+    func test_late_handoff_is_published_after_batch_completion() async throws {
+        _ = try await startFakeRecording()
+        await controller.stopRecording()
+
+        let saved = try XCTUnwrap(store.recordings.first)
+        XCTAssertNil(try XCTUnwrap(snapshot()).finalRecordingID, "precondition")
+
+        // What `TranscriptionService.onTranscriptionCompleted` does for this
+        // recording once its batch transcript lands.
+        sidecar.attachHandoff(forRecording: saved.id)
+
         let final = try XCTUnwrap(snapshot())
         XCTAssertEqual(final.state, .completed)
-        XCTAssertNotNil(final.finalRecordingID,
-                        "a clean save must still hand off — this is the common path")
+        XCTAssertEqual(final.finalRecordingID, saved.id,
+                       "the handoff must arrive once there is a real transcript to hand off")
+    }
+
+    /// A completion for some OTHER recording — a user re-transcribing an old
+    /// row, which fires the same global hook — must not stamp this snapshot.
+    func test_late_handoff_ignores_an_unrelated_completion() async throws {
+        _ = try await startFakeRecording()
+        await controller.stopRecording()
+
+        sidecar.attachHandoff(forRecording: UUID())
+
+        XCTAssertNil(try XCTUnwrap(snapshot()).finalRecordingID,
+                     "the completion hook is global; only the awaited recording may claim the handoff")
+    }
+
+    /// And a late completion must never touch a NEWER meeting's snapshot.
+    func test_late_handoff_does_not_clobber_a_new_recording() async throws {
+        _ = try await startFakeRecording()
+        await controller.stopRecording()
+        let saved = try XCTUnwrap(store.recordings.first)
+
+        // A second meeting starts before the first one's batch pass lands.
+        sidecar.begin(title: "Next meeting", source: "microphone", liveAvailable: true)
+        let liveSession = try XCTUnwrap(snapshot()).sessionID
+
+        sidecar.attachHandoff(forRecording: saved.id)
+
+        let current = try XCTUnwrap(snapshot())
+        XCTAssertEqual(current.state, .recording, "the live meeting's snapshot must survive intact")
+        XCTAssertEqual(current.sessionID, liveSession)
+        XCTAssertNil(current.finalRecordingID)
+    }
+
+    /// The `note` an MCP client would receive for the current snapshot, taken
+    /// from the same handler the helper runs.
+    private func finalNoteForClient() throws -> String? {
+        try MCPAccessGate.set(true, root: sidecarRoot)
+        let raw = try MilaMCPToolHandlers(root: sidecarRoot)
+            .handle(tool: "get_live_transcript", arguments: [:])
+        let json = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+        return json["note"] as? String
     }
 }

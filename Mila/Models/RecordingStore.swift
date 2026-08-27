@@ -223,6 +223,15 @@ final class RecordingStore: ObservableObject {
         do {
             try pointer.write(to: originalRootDirectory)
         } catch {
+            // Deliberately still `.public`, and the only file-write path left
+            // that is. This writes to `originalRootDirectory`, a `let` set from
+            // `init(rootDirectory:)` that is NEVER the user's chosen storage
+            // folder: `relocateRecordings` moves `recordingsDirectory` /
+            // `storeURL` / `foldersURL` and leaves this untouched, and
+            // production always constructs `RecordingStore()`, i.e. the fixed
+            // app-support root. So the quoted path can only ever be
+            // “store-location.json” in the folder “Mila” — no user content, and
+            // a readable message is worth more here than a blanket redaction.
             recStoreLog.error("failed to write store-location pointer: \(error.localizedDescription, privacy: .public)")
         }
         let discoverable = MilaStoreReader.resolvesActiveStore(
@@ -931,7 +940,28 @@ final class RecordingStore: ObservableObject {
             try data.write(to: storeURL, options: .atomic)
             return true
         } catch {
-            recStoreLog.error("persist failed: \(error.localizedDescription, privacy: .public)")
+            // `.private` on the description — and this one really did need it,
+            // contrary to the exception I claimed last round. `storeURL`
+            // follows the user's chosen storage directory (see
+            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER in
+            // the message: "You don't have permission to save the file
+            // “recordings.json” in the folder “Acme Corp”." That is the same
+            // mechanism that leaked recording titles, and a folder the user
+            // picked can name a client, an employer or a project. Reasoning
+            // about the fixed FILENAME and stopping there was the mistake.
+            // (CodeRabbit on #183, CWE-532.)
+            //
+            // Domain + code stay public so a real failure is still diagnosable
+            // without the path: they are what separates "no permission"
+            // (NSCocoaErrorDomain 513) from a full disk or a missing
+            // directory. The filename is a literal, so naming WHICH write
+            // failed reveals nothing.
+            let ns = error as NSError
+            recStoreLog.error("""
+                persist failed for recordings.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return false
         }
     }

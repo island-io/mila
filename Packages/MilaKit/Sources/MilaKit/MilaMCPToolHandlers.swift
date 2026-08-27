@@ -327,7 +327,14 @@ public struct MilaMCPToolHandlers: Sendable {
                 result["final_recording_id"] = finalID.uuidString
                 result["note"] = "The recording ended. Call get_transcript with final_recording_id for the authoritative transcript (speaker labels may improve after the post-stop pass)."
             } else {
-                result["note"] = "The recording ended without a saved transcript handoff; check list_recordings for the newest entry."
+                // No id covers several cases the snapshot can't tell apart, and
+                // since the app stopped publishing an id for a not-yet-final
+                // transcript this is the ORDINARY outcome for chunk-mode,
+                // hardware-gated and empty-live recordings — not a failure. The
+                // wording has to be accurate for all of them, so it names the
+                // action and warns the row may still be transcribing rather
+                // than implying something went wrong.
+                result["note"] = "The recording ended without a transcript handoff; check list_recordings for the newest entry. Its transcript may still be processing — get_transcript reports status \"pending\" until it is done."
             }
             return try json(result)
         }

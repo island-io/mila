@@ -578,7 +578,23 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
+        // Live-transcript sidecar for external tools (mila-mcp). Anchored
+        // to the store's original root so tests / UI-test temp stores stay
+        // isolated from the user's real app-support directory.
+        //
+        // Constructed HERE, above `onTranscriptionCompleted`, because that hook
+        // captures it to publish the deferred batch handoff. It only needs
+        // `store`; the `actions` wiring stays further down with the rest.
+        let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
+        sidecarWriter.cleanupAtLaunch()
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
+            // A recording whose live transcript wasn't final closed its live
+            // sidecar WITHOUT a handoff id, because at Stop the batch worker
+            // hadn't produced the transcript yet. It just did — so publish the
+            // handoff now, completing what `finish(…, transcriptIsFinal:
+            // false)` deferred. A no-op unless this is that exact recording
+            // and its snapshot is still the one on disk; see `attachHandoff`.
+            sidecarWriter?.attachHandoff(forRecording: rec.id)
             // Obsidian export is driven off the summarizer's completion hook.
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
@@ -623,11 +639,6 @@ struct MilaApp: App {
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings
         actions.obsidianExporter = obsidian
-        // Live-transcript sidecar for external tools (mila-mcp). Anchored
-        // to the store's original root so tests / UI-test temp stores stay
-        // isolated from the user's real app-support directory.
-        let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
-        sidecarWriter.cleanupAtLaunch()
         actions.liveSidecarWriter = sidecarWriter
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
