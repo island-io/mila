@@ -17,7 +17,7 @@ import Foundation
 /// If that trade ever changes — a third-party consumer appears, or the store
 /// format starts churning — a socket-backed implementation of this protocol
 /// is the whole change on this side. The handler bodies don't move.
-public protocol MilaDataSource {
+public protocol MilaDataSource: Sendable {
     func listRecordings(filter: MilaStoreReader.Filter,
                         sort: MilaStoreReader.SortKey,
                         order: MilaStoreReader.SortOrder,

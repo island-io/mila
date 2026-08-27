@@ -4,7 +4,7 @@ import Foundation
 /// layer with no MCP-SDK types — the executable's transport wiring stays
 /// a thin shell (and swappable for a hand-rolled JSON-RPC loop if the SDK
 /// ever misbehaves), and everything here is unit-testable in-process.
-public struct MilaMCPToolHandlers {
+public struct MilaMCPToolHandlers: Sendable {
 
     public enum ToolError: Error, CustomStringConvertible {
         case unknownTool(String)
@@ -24,6 +24,11 @@ public struct MilaMCPToolHandlers {
         }
     }
 
+    /// One tool's transport-agnostic declaration. Deliberately NOT
+    /// `Sendable`: `inputSchema` is a `[String: Any]` JSON tree, which
+    /// cannot be. Specs are built on demand by `toolSpecs` and consumed
+    /// synchronously by the caller that asked for them, so no value of
+    /// this type ever crosses an isolation boundary.
     public struct ToolSpec {
         public let name: String
         public let description: String
@@ -36,16 +41,23 @@ public struct MilaMCPToolHandlers {
     /// live — the default Mila app-support directory in production, a
     /// temp fixture in tests.
     private let root: URL
-    private let now: () -> Date
-    private let source: MilaDataSource
+    private let now: @Sendable () -> Date
+    private let source: any MilaDataSource
     /// Injectable so tests can drive both sides of the gate without writing
     /// to the real app-support directory.
-    private let isAccessEnabled: (URL) -> Bool
+    private let isAccessEnabled: @Sendable (URL) -> Bool
 
+    /// The two defaults are written as closure literals rather than the
+    /// tidier unapplied references (`Date.init`,
+    /// `MCPAccessGate.isEnabled(root:)`): an unapplied function reference is
+    /// not inferred `@Sendable`, so those forms warn under strict
+    /// concurrency even though both targets are trivially concurrency-safe.
     public init(root: URL = StoreLocationPointer.defaultRoot(),
-                now: @escaping () -> Date = Date.init,
-                source: MilaDataSource? = nil,
-                isAccessEnabled: @escaping (URL) -> Bool = MCPAccessGate.isEnabled(root:)) {
+                now: @escaping @Sendable () -> Date = { Date() },
+                source: (any MilaDataSource)? = nil,
+                isAccessEnabled: @escaping @Sendable (URL) -> Bool = {
+                    MCPAccessGate.isEnabled(root: $0)
+                }) {
         self.root = root
         self.now = now
         self.source = source ?? FileBackedDataSource(root: root)
@@ -54,7 +66,11 @@ public struct MilaMCPToolHandlers {
 
     // MARK: - Tool definitions
 
-    public static let toolSpecs: [ToolSpec] = [
+    /// Computed, not a `static let`: a stored global would have to be
+    /// `Sendable`, and `ToolSpec.inputSchema` is a `[String: Any]` JSON
+    /// tree that never can be. Built once per read, and the only reader is
+    /// the transport shell's `tools/list` wiring at startup.
+    public static var toolSpecs: [ToolSpec] { [
         ToolSpec(
             name: "list_recordings",
             description: """
@@ -152,7 +168,7 @@ public struct MilaMCPToolHandlers {
                 ],
             ]
         ),
-    ]
+    ] }
 
     // MARK: - Dispatch
 
@@ -359,9 +375,7 @@ public struct MilaMCPToolHandlers {
             result["new_segments"] = snapshot.segments.map(segmentObject(for:))
             result["transcript"] = TranscriptFormatter.plainText(
                 segments: snapshot.segments,
-                fallback: snapshot.segments.map(\.text)
-                    .joined(separator: " ")
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                fallback: TranscriptFormatter.joinedFullText(segments: snapshot.segments),
                 names: snapshot.speakerNames
             )
         }
@@ -402,17 +416,38 @@ public struct MilaMCPToolHandlers {
         return String(decoding: data, as: UTF8.self)
     }
 
+    /// `Date.ISO8601FormatStyle`, not `ISO8601DateFormatter`.
+    ///
+    /// The formatter is a class and is NOT thread-safe (unlike
+    /// `DateFormatter`, it never got internal locking, and it is not
+    /// `Sendable`), so it can be neither hoisted into a shared `static let`
+    /// nor held as a stored property of this `Sendable` struct. Allocating
+    /// one per call is safe but wasteful — `iso(_:)` runs once per
+    /// recording in every `list_recordings` / `search_transcripts`
+    /// response, up to 100 per call.
+    ///
+    /// The format style is a value type and `Sendable`, so one shared
+    /// instance is both correct and allocation-free. Output is byte-identical
+    /// to the old formatter's default (`.withInternetDateTime` in GMT →
+    /// `2026-07-15T12:34:56Z`), and parsing accepts the same shapes plus
+    /// one the old code got WRONG: a fractional-seconds timestamp
+    /// (`…T22:13:20.500Z`) failed the internet-date-time attempt, fell
+    /// through to the date-only attempt, and silently parsed as midnight —
+    /// a 22-hour error in the caller's `after` / `before` filter.
+    private static let internetDateTime = Date.ISO8601FormatStyle()
+    private static let fullDate = Date.ISO8601FormatStyle(dateSeparator: .dash,
+                                                          timeZone: .gmt)
+        .year().month().day()
+
     private func iso(_ date: Date) -> String {
-        ISO8601DateFormatter().string(from: date)
+        date.formatted(Self.internetDateTime)
     }
 
     private func date(_ args: [String: Any], _ key: String) throws -> Date? {
         guard let raw = args[key] as? String else { return nil }
-        let formatter = ISO8601DateFormatter()
-        if let parsed = formatter.date(from: raw) { return parsed }
+        if let parsed = try? Self.internetDateTime.parse(raw) { return parsed }
         // Accept plain dates too ("2026-07-15").
-        formatter.formatOptions = [.withFullDate]
-        if let parsed = formatter.date(from: raw) { return parsed }
+        if let parsed = try? Self.fullDate.parse(raw) { return parsed }
         throw ToolError.invalidArguments("\(key) must be an ISO 8601 date, got \"\(raw)\"")
     }
 

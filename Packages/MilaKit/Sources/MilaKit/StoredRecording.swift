@@ -10,8 +10,8 @@ import Foundation
 /// populated app `Recording` and asserts this type round-trips it.
 /// Decoding is deliberately lenient (`decodeIfPresent` + defaults) so an
 /// older helper never chokes on a newer app's additions.
-public struct StoredRecording: Codable, Identifiable {
-    public struct Segment: Codable, Equatable, SpeakerTextSegment {
+public struct StoredRecording: Codable, Identifiable, Sendable {
+    public struct Segment: Codable, Equatable, Sendable, SpeakerTextSegment {
         public var start: Double
         public var end: Double
         public var text: String
@@ -35,7 +35,7 @@ public struct StoredRecording: Codable, Identifiable {
         }
     }
 
-    public struct ActionItem: Codable {
+    public struct ActionItem: Codable, Sendable {
         public var text: String
         public var speaker: String?
         public var timestampSeconds: Double?

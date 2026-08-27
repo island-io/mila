@@ -199,11 +199,43 @@ final class MilaStoreReaderTests: XCTestCase {
         XCTAssertEqual(reader.transcriptText(for: recording), "sidecar text")
     }
 
+    /// REGRESSION (CodeRabbit on #183): the segment fallback used to be a
+    /// separator-free `joined()`, which glued the last word of one segment
+    /// to the first word of the next for any recording whose segments came
+    /// from the LIVE path — `LiveTranscriber` trims each segment on
+    /// construction, so there is no leading space to stand in for the
+    /// separator. It read `"hello teamhi, thanks for joining"`.
     func test_transcript_falls_back_to_segments_join() throws {
         let recording = rec("NoSidecar", daysAgo: 0, segments: johnSegments())
         let reader = try writeStore([recording])
         XCTAssertEqual(reader.transcriptText(for: recording),
-                       "hello teamhi, thanks for joining")
+                       "hello team hi, thanks for joining")
+    }
+
+    /// The other half of the same fallback, and the reason a plain
+    /// `joined(separator: " ")` is not the fix: whisper's BATCH segments
+    /// arrive with a LEADING space, which a space separator would turn into
+    /// a double space on every gap.
+    func test_transcript_fallback_does_not_double_space_whisper_segments() throws {
+        let recording = rec("Whisper", daysAgo: 0, segments: [
+            .init(start: 0, end: 2, text: " Hello team", speaker: "SPEAKER_00"),
+            .init(start: 2, end: 5, text: " hi, thanks for joining", speaker: "SPEAKER_01"),
+        ])
+        let reader = try writeStore([recording])
+        XCTAssertEqual(reader.transcriptText(for: recording),
+                       "Hello team hi, thanks for joining")
+    }
+
+    /// Whitespace-only segments (whisper emits them across silence) must
+    /// not leave a double space behind either.
+    func test_transcript_fallback_drops_whitespace_only_segments() throws {
+        let recording = rec("Blanks", daysAgo: 0, segments: [
+            .init(start: 0, end: 2, text: "hello team", speaker: "SPEAKER_00"),
+            .init(start: 2, end: 3, text: "   ", speaker: "SPEAKER_00"),
+            .init(start: 3, end: 5, text: "goodbye", speaker: "SPEAKER_00"),
+        ])
+        let reader = try writeStore([recording])
+        XCTAssertEqual(reader.transcriptText(for: recording), "hello team goodbye")
     }
 
     func test_named_transcript_resolves_speaker_names() throws {

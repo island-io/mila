@@ -735,8 +735,11 @@ final class RecordingStore: ObservableObject {
                 // happen — segments + empty fullText only existed on the
                 // brief window where status was running and we hadn't
                 // flushed the final text yet).
-                let joined = decoded[i].segments.map(\.text).joined()
-                decoded[i].fullText = joined
+                // Shared with mila-mcp's `MilaStoreReader.transcriptText`
+                // so both readers reconstruct identical text — see
+                // `TranscriptFormatter.joinedFullText`.
+                decoded[i].fullText = TranscriptFormatter
+                    .joinedFullText(segments: decoded[i].segments)
             }
         }
         self.recordings = decoded.sorted { $0.createdAt > $1.createdAt }

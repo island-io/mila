@@ -249,4 +249,104 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertEqual(result["status"] as? String, "not_recording")
         XCTAssertEqual(result["last_session"] as? String, "interrupted")
     }
+
+    // MARK: - The completed → get_transcript handoff
+
+    /// The client-side half of the ordering fix in
+    /// `QuickActionsController.stopRecording` (CodeRabbit on #183): the
+    /// contract a poller relies on is that the *instant* it sees
+    /// `completed`, following `final_recording_id` yields the FINAL
+    /// transcript. This walks that handoff the way a client does — poll,
+    /// read the id, fetch it — and asserts the fetched text is the final
+    /// one, not the pre-drain snapshot the app wrote when it first added
+    /// the row.
+    ///
+    /// The app-side ordering that makes this true (finish the sidecar only
+    /// after `store.update`) is pinned separately by
+    /// `QuickActionsControllerTests`, which needs the app target.
+    func test_completed_handoff_id_resolves_to_the_final_transcript() throws {
+        let finalID = UUID()
+        var saved = meeting("Handoff", daysAgo: 0)
+        saved.id = finalID
+        // What the drain wrote LAST: the final segments, not the initial
+        // ones the row was created with.
+        saved.segments = [
+            .init(start: 0, end: 3, text: "shalom everyone", speaker: "SPEAKER_00"),
+            .init(start: 3, end: 6, text: "let's begin", speaker: "SPEAKER_01"),
+            .init(start: 6, end: 9, text: "and the tail of the meeting", speaker: "SPEAKER_00"),
+        ]
+        try seedStore([saved])
+        _ = try liveSnapshot(state: .completed, finalRecordingID: finalID)
+
+        let poll = try call("get_live_transcript")
+        XCTAssertEqual(poll["status"] as? String, "completed")
+        let handoff = try XCTUnwrap(poll["final_recording_id"] as? String)
+
+        let fetched = try call("get_transcript", ["id": handoff])
+        let transcript = try XCTUnwrap(fetched["transcript"] as? String)
+        XCTAssertTrue(transcript.contains("and the tail of the meeting"),
+                      "the handoff id must resolve to the FINAL transcript: \(transcript)")
+    }
+
+    /// A recording removed during finalization (the user cancels the rename
+    /// sheet) closes the sidecar with `completed` and NO id. The refusal
+    /// must be the documented "check list_recordings" hint, never an id that
+    /// `get_transcript` can only 404 on.
+    func test_completed_without_handoff_id_points_at_list_recordings() throws {
+        _ = try liveSnapshot(state: .completed, finalRecordingID: nil)
+        let result = try call("get_live_transcript")
+        XCTAssertEqual(result["status"] as? String, "completed")
+        XCTAssertNil(result["final_recording_id"])
+        let note = try XCTUnwrap(result["note"] as? String)
+        XCTAssertTrue(note.contains("list_recordings"), note)
+    }
+
+    // MARK: - ISO 8601 dates
+
+    /// `iso(_:)` moved off `ISO8601DateFormatter` (a non-thread-safe class
+    /// that cannot be shared, and cannot be a stored property of a
+    /// `Sendable` struct) onto `Date.ISO8601FormatStyle`. The output format
+    /// is part of every tool response, so pin that it did not drift.
+    func test_created_at_is_rendered_as_internet_date_time_in_utc() throws {
+        try seedStore([meeting("Stamped", daysAgo: 0)])
+        let result = try call("list_recordings")
+        let first = try XCTUnwrap((result["recordings"] as? [[String: Any]])?.first)
+        // 1_700_000_000 == 2023-11-14T22:13:20Z
+        XCTAssertEqual(first["created_at"] as? String, "2023-11-14T22:13:20Z")
+    }
+
+    /// Both input shapes the old formatter accepted still parse: a full
+    /// internet date-time, and a bare `yyyy-MM-dd`.
+    func test_date_filters_accept_full_timestamps_and_bare_dates() throws {
+        try seedStore([meeting("Older", daysAgo: 10), meeting("Newer", daysAgo: 0)])
+
+        let byTimestamp = try call("list_recordings", ["after": "2023-11-10T00:00:00Z"])
+        XCTAssertEqual((byTimestamp["recordings"] as? [[String: Any]])?
+            .compactMap { $0["title"] as? String }, ["Newer"])
+
+        let byBareDate = try call("list_recordings", ["after": "2023-11-10"])
+        XCTAssertEqual((byBareDate["recordings"] as? [[String: Any]])?
+            .compactMap { $0["title"] as? String }, ["Newer"])
+    }
+
+    /// A fractional-seconds timestamp used to fail the internet-date-time
+    /// attempt, fall through to the date-only attempt, and parse as
+    /// MIDNIGHT — quietly widening the caller's window by up to a day.
+    /// `2023-11-14T22:13:20.500Z` is after the `daysAgo: 0` fixture
+    /// (22:13:20Z), so a correct parse excludes it and the old midnight
+    /// parse would have let it through.
+    func test_fractional_seconds_no_longer_parse_as_midnight() throws {
+        try seedStore([meeting("Exactly", daysAgo: 0)])
+        let result = try call("list_recordings", ["after": "2023-11-14T22:13:20.500Z"])
+        XCTAssertEqual(result["count"] as? Int, 0,
+                       "a sub-second-later cursor must exclude the fixture, not fall back to midnight")
+    }
+
+    func test_unparseable_date_is_rejected_with_the_offending_value() throws {
+        try seedStore([meeting("Any", daysAgo: 0)])
+        XCTAssertThrowsError(try call("list_recordings", ["after": "last tuesday"])) { error in
+            XCTAssertTrue(String(describing: error).contains("last tuesday"),
+                          String(describing: error))
+        }
+    }
 }

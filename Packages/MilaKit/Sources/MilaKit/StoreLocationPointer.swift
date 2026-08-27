@@ -6,7 +6,7 @@ import Foundation
 /// which a separate process can't resolve — so RecordingStore mirrors the
 /// resolved paths into this small JSON file at the DEFAULT app-support root
 /// on every launch and relocation.
-public struct StoreLocationPointer: Codable, Equatable {
+public struct StoreLocationPointer: Codable, Equatable, Sendable {
     public var version: Int
     /// Directory holding the audio files + sidecars (`.txt`/`.srt`/…).
     public var recordingsDirectory: String

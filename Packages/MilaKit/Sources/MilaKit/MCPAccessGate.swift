@@ -20,7 +20,7 @@ import Foundation
 /// reading meeting transcripts and shipping them to a cloud model because
 /// the tools happened to be there. That is an *accident* prevented by an
 /// explicit opt-in, not an attack prevented by a permission check.
-public struct MCPAccessGate: Codable, Equatable {
+public struct MCPAccessGate: Codable, Equatable, Sendable {
 
     public var enabled: Bool
     public var updatedAt: Date

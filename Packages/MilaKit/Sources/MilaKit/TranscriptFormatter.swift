@@ -62,6 +62,34 @@ public enum TranscriptFormatter {
         return lines.joined(separator: "\n")
     }
 
+    /// The one way to rebuild a recording's full text from its segments.
+    ///
+    /// Used wherever the `.txt` sidecar and the legacy inline `fullText`
+    /// are both unavailable: `MilaStoreReader.transcriptText`, the app's
+    /// `RecordingStore` load fallback, and the live poll's `transcript`
+    /// field. Those three used to disagree — the first two joined with NO
+    /// separator, the third with `" "` plus a trim — and the disagreement
+    /// was not cosmetic, because the two segment-producing paths store
+    /// text differently:
+    ///
+    ///   * whisper's batch segments arrive with a LEADING space
+    ///     (`" Hello team"`), so a separator-free join is already correctly
+    ///     spaced and adding `" "` would double every gap;
+    ///   * `LiveTranscriber` trims each segment on construction, so a
+    ///     separator-free join glues words together — the exact
+    ///     `"hello teamhi, thanks for joining"` CodeRabbit flagged on #183.
+    ///
+    /// Segments in `recordings.json` can come from EITHER path, so neither
+    /// join is right on its own. Trimming each piece and re-joining with a
+    /// single space is right for both, and dropping now-empty pieces keeps
+    /// whitespace-only segments from leaving double spaces behind.
+    public static func joinedFullText<S: SpeakerTextSegment>(segments: [S]) -> String {
+        segments
+            .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
     private static func format(speaker: String?, text: String) -> String {
         guard let speaker else { return text }
         return "\(speaker): \(text)"

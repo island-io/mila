@@ -127,7 +127,8 @@ final class QuickActionsController: ObservableObject {
     /// Set after init by MilaApp. `stopRecording` closes the on-disk
     /// live-transcript sidecar with the saved recording's id so external
     /// pollers (mila-mcp) can hand off from the live feed to the stored
-    /// transcript.
+    /// transcript — but only once that stored transcript is final. See the
+    /// ordering note in `stopRecording` at `store.add`.
     var liveSidecarWriter: LiveTranscriptSidecarWriter?
 
     /// True only while `stopRecording` is running its inline LIVE-PIPELINE
@@ -680,11 +681,23 @@ final class QuickActionsController: ObservableObject {
             speakerNames: liveTranscriber?.speakerNames ?? [:]
         )
         store.add(recording)
-        // The recording is persisted — close the live sidecar with its id
-        // so an external poller's next get_live_transcript sees
-        // `completed` + the handoff id (the inline drain below keeps
-        // updating the STORED recording, which is what the handoff reads).
-        liveSidecarWriter?.finish(recordingID: recording.id)
+        // The live sidecar is deliberately NOT closed here. `finish()`
+        // publishes `completed` + `final_recording_id`, and that pair is a
+        // promise to an external poller that the id it just got resolves to
+        // the FINAL transcript. At this point it doesn't: `recording` holds
+        // only the pre-drain snapshot, and the inline drain below is what
+        // replaces its segments/fullText.
+        //
+        // Nothing stops a poller acting on `completed` the instant it lands,
+        // so an mcp client that sees it here and immediately calls
+        // get_transcript(final_recording_id) gets the INITIAL transcript and
+        // stops polling — the handoff silently loses the tail of the meeting.
+        // (CodeRabbit on #183.) The sidecar therefore stays in `recording`
+        // — heartbeat still ticking, so a poller reads "live, nothing new"
+        // rather than anything stale — and is finished at the end of the
+        // drain, after `store.update`. Every exit from the drain below must
+        // finish it: with the id when the row was updated, with `nil` when
+        // the row is gone and there is nothing to hand off.
         activeJob = .none
         if sleepReason != nil {
             sleepInterruption = SleepInterruption(
@@ -825,6 +838,12 @@ final class QuickActionsController: ObservableObject {
             // The row this snapshot belonged to is gone, so there is
             // nothing left to read `summary` / `actionItems` for.
             liveAISession?.cancel()
+            // Close the sidecar with NO handoff id: the recording the
+            // poller would have been sent to no longer exists, so naming
+            // it would hand out an id `get_transcript` can only 404 on.
+            // `completed` + no id is the documented "check
+            // list_recordings for the newest entry" case.
+            liveSidecarWriter?.finish(recordingID: nil)
             // Third exit from a finished recording, and it needs the same
             // clear as the other two — otherwise cancelling the rename
             // sheet is enough to carry this meeting's notes into the next
@@ -848,6 +867,10 @@ final class QuickActionsController: ObservableObject {
         updated.actionItems = finalItems.isEmpty ? nil : finalItems
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         store.update(updated)
+        // NOW the handoff is honest: the stored row carries the final
+        // transcript, so `completed` + `final_recording_id` can be
+        // published. Ordering matters — see the note at `store.add` above.
+        liveSidecarWriter?.finish(recordingID: updated.id)
 
         // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
         //

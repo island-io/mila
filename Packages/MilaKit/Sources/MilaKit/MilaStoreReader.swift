@@ -6,7 +6,7 @@ import Foundation
 /// (the app hasn't run since the pointer feature shipped). Every call
 /// re-reads from disk — the store is small, the app's writes are atomic,
 /// and freshness beats caching for a live assistant.
-public struct MilaStoreReader {
+public struct MilaStoreReader: Sendable {
 
     public let recordingsDirectory: URL
     public let storeFileURL: URL
@@ -41,14 +41,15 @@ public struct MilaStoreReader {
     }
 
     /// Plain transcript text: sidecar `.txt` → legacy inline text →
-    /// joined segments (same fallback chain as the app's load path).
+    /// joined segments (same fallback chain, and now the same join, as the
+    /// app's load path — see `TranscriptFormatter.joinedFullText`).
     public func transcriptText(for recording: StoredRecording) -> String {
         let url = recordingsDirectory.appendingPathComponent(recording.transcriptFileName)
         if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
             return text
         }
         if let legacy = recording.legacyFullText, !legacy.isEmpty { return legacy }
-        return recording.segments.map(\.text).joined()
+        return TranscriptFormatter.joinedFullText(segments: recording.segments)
     }
 
     /// Speaker-named transcript — the app's canonical rendering
@@ -65,7 +66,7 @@ public struct MilaStoreReader {
 
     // MARK: - Listing
 
-    public struct Filter {
+    public struct Filter: Sendable {
         /// Substring over title, appName, and folder.
         public var query: String?
         /// Substring over resolved speaker display names.
@@ -87,13 +88,13 @@ public struct MilaStoreReader {
         }
     }
 
-    public enum SortKey: String {
+    public enum SortKey: String, Sendable {
         case createdAt = "created_at"
         case duration
         case title
     }
 
-    public enum SortOrder: String {
+    public enum SortOrder: String, Sendable {
         case asc, desc
     }
 
@@ -148,7 +149,7 @@ public struct MilaStoreReader {
 
     // MARK: - Search
 
-    public struct SearchHit {
+    public struct SearchHit: Sendable {
         public let recording: StoredRecording
         /// Total case-insensitive matches across title + transcript.
         public let matchCount: Int
@@ -156,7 +157,7 @@ public struct MilaStoreReader {
         public let snippets: [String]
     }
 
-    public enum SearchSortKey: String {
+    public enum SearchSortKey: String, Sendable {
         case relevance
         case createdAt = "created_at"
     }

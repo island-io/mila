@@ -13,9 +13,9 @@ import Foundation
 /// means the app crashed or hung mid-meeting. `sessionID` is minted fresh
 /// per recording so a poller can tell "same meeting, nothing new" apart
 /// from "a different meeting whose counters happen to line up".
-public struct LiveTranscriptSnapshot: Codable {
+public struct LiveTranscriptSnapshot: Codable, Sendable {
 
-    public enum State: String, Codable {
+    public enum State: String, Codable, Sendable {
         /// A recording is in progress; segments may still grow.
         case recording
         /// The recording ended normally; `finalRecordingID` points at the

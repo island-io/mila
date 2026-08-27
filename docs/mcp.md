@@ -122,7 +122,13 @@ How the polling works under the hood:
   folder (Settings ▸ Storage), so the server follows the move.
 - `~/Library/Application Support/Mila/live/current.json` — the live
   transcript sidecar, written during recording (throttled, atomic) and
-  closed with the saved recording's id at Stop.
+  closed with the saved recording's id at Stop. It is closed only after
+  the saved recording's transcript is final, never before: `completed` +
+  `final_recording_id` is a promise that following the id yields the
+  authoritative text, and a poller is free to act on it the instant it
+  lands. Stop therefore keeps the snapshot in `recording` (heartbeat
+  still ticking) for the second or two the post-stop drain takes, and
+  publishes the handoff last.
 
 - `~/Library/Application Support/Mila/mcp-access.json` — the consent
   flag, written by the app whenever the setting changes and re-mirrored
