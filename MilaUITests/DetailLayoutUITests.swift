@@ -136,6 +136,255 @@ final class DetailLayoutUITests: XCTestCase {
         )
     }
 
+    // MARK: - Settings window (#177)
+
+    /// The nine Settings destinations, in sidebar order: row identifier,
+    /// window title, and one control that is present *unconditionally* on
+    /// that destination.
+    ///
+    /// Mirrors `SettingsTab` — the UI-test target cannot import the app's
+    /// types, so `AISettingsKeyCompatibilityTests` pins the row identifiers
+    /// on the app side to keep the two in sync.
+    ///
+    /// The probe controls are the point of this table. The first attempt at
+    /// the sidebar (#194, reverted in `6b64e8b`) rendered an empty window —
+    /// the split view laid out 6115 pt tall inside a 472 pt window, so every
+    /// row and every control sat thousands of points off-screen — and passed
+    /// this workflow green, because nothing here looked at whether Settings
+    /// contained anything. Asserting a real control per destination, inside
+    /// the window's bounds, is what makes that failure loud.
+    private static let settingsSections: [(row: String, title: String, probe: String)] = [
+        ("settings.section.general",    "General",     "updates.autoCheck.toggle"),
+        ("settings.section.audio",      "Audio",       "audio.input.picker"),
+        ("settings.section.models",     "Models",      "models.backend.picker"),
+        ("settings.section.aiProvider", "AI Provider", "ai.provider.tool"),
+        ("settings.section.aiFeatures", "AI Features", "ai.features.outputLanguage"),
+        ("settings.section.speakers",   "Speakers",    "speakers.enable.toggle"),
+        ("settings.section.meetings",   "Meetings",    "meetings.enable.toggle"),
+        ("settings.section.voiceMemos", "Voice Memos", "voiceMemos.enable.toggle"),
+        ("settings.section.storage",    "Storage",     "storage.chooseFolder.button"),
+    ]
+
+    private func element(_ app: XCUIApplication, _ identifier: String) -> XCUIElement {
+        app.descendants(matching: .any).matching(identifier: identifier).firstMatch
+    }
+
+    /// Attach + write a screenshot of one specific element (a window, here)
+    /// rather than `app.windows.firstMatch`, which is the *main* window once
+    /// Settings is open.
+    ///
+    /// `forVisionCheck: false` attaches the shot to the test result but keeps
+    /// it out of `$MILA_UI_SCREENSHOTS_DIR`, i.e. out of
+    /// `scripts/llm-verify-screenshots.py`'s input. Used for shots taken in a
+    /// deliberately unusual state (a window dragged to its size floor) that a
+    /// "does this look right?" judge would reasonably flag.
+    private func attachScreenshot(of element: XCUIElement,
+                                  name: String,
+                                  forVisionCheck: Bool = true) {
+        let shot = element.screenshot()
+        let att = XCTAttachment(screenshot: shot)
+        att.name = name
+        att.lifetime = .keepAlways
+        add(att)
+
+        guard forVisionCheck else { return }
+        let dir = ProcessInfo.processInfo.environment["MILA_UI_SCREENSHOTS_DIR"]
+            ?? "/tmp/mila-ui-screenshots"
+        try? FileManager.default.createDirectory(
+            atPath: dir, withIntermediateDirectories: true)
+        let safe = name.replacingOccurrences(of: "/", with: "_")
+        let url = URL(fileURLWithPath: "\(dir)/\(self.name)-\(safe).png")
+        try? shot.pngRepresentation.write(to: url)
+    }
+
+    /// Click a sidebar row and return that destination's probe control.
+    ///
+    /// The identifier lands on the row's `Label`, which macOS exposes as a
+    /// `StaticText` inside the list's cell. Clicking the label normally
+    /// selects the row; if the probe doesn't turn up, retry on the enclosing
+    /// cell before giving up, so a routing quirk reads as a click that needs
+    /// retrying rather than as a destination that rendered nothing.
+    private func selectSection(
+        _ app: XCUIApplication,
+        _ section: (row: String, title: String, probe: String)
+    ) -> XCUIElement {
+        let row = element(app, section.row)
+        XCTAssertTrue(row.waitForExistence(timeout: 5),
+                      "Sidebar row \(section.row) (\(section.title)) is missing from Settings")
+        row.click()
+
+        let probe = element(app, section.probe)
+        if !probe.waitForExistence(timeout: 8) {
+            let cell = app.cells.containing(.any, identifier: section.row).firstMatch
+            if cell.exists {
+                cell.click()
+                // Wait again, exactly as the primary path does. Returning
+                // straight after the fallback click would have the caller
+                // evaluate `probe.exists` before the destination has had a
+                // chance to render — turning a recoverable click miss into a
+                // flaky failure, which is worse than no assertion because it
+                // teaches people to rerun instead of read.
+                _ = probe.waitForExistence(timeout: 8)
+            }
+        }
+        return probe
+    }
+
+    /// Poll the window title. `SettingsWindowTitle` applies it one runloop
+    /// turn after the selection changes, so a bare read can lose the race.
+    /// Returns the last value seen, for the failure message.
+    private func waitForWindowTitle(_ window: XCUIElement,
+                                    _ expected: String,
+                                    timeout: TimeInterval = 5) -> String {
+        let deadline = Date().addingTimeInterval(timeout)
+        var seen = window.title
+        while Date() < deadline {
+            seen = window.title
+            if seen == expected { return seen }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return seen
+    }
+
+    /// Open Settings by clicking the sidebar footer's `SettingsLink` and
+    /// return the Settings window element.
+    ///
+    /// Clicked rather than `Cmd+,`'d on purpose: a synthesised menu-key event
+    /// needs the app frontmost and is unreliable on the hosted runners.
+    private func openSettings(_ app: XCUIApplication) -> XCUIElement {
+        let link = element(app, "sidebar.settings.link")
+        XCTAssertTrue(link.waitForExistence(timeout: 15),
+                      "Sidebar's Settings row (sidebar.settings.link) not found — cannot open Settings")
+        link.click()
+
+        // Wait on a sidebar row rather than on the window: the window exists
+        // the moment it is ordered in, whether or not anything rendered
+        // inside it, which is exactly the state #194 shipped.
+        let firstRow = element(app, Self.settingsSections[0].row)
+        XCTAssertTrue(
+            firstRow.waitForExistence(timeout: 20),
+            "Settings opened but no section row ever appeared in the accessibility tree — the sidebar list did not render.")
+
+        let window = app.windows
+            .containing(.any, identifier: Self.settingsSections[0].row)
+            .firstMatch
+        XCTAssertTrue(window.waitForExistence(timeout: 5),
+                      "Could not identify the Settings window from its section rows")
+        return window
+    }
+
+    /// The section list is populated: all nine rows exist, are hittable, and
+    /// sit inside the window's bounds.
+    ///
+    /// The bounds assertion is the one that matters. `exists` was true for all
+    /// nine rows in the broken build too — they were just at y ≈ -2600, above
+    /// the top of a window whose own frame started at y = 134.
+    func test_settings_sidebar_lists_every_section() {
+        let app = launchApp()
+        let window = openSettings(app)
+        attachScreenshot(of: window, name: "settings-general")
+
+        let windowFrame = window.frame
+        XCTAssertGreaterThan(windowFrame.width, 0, "Settings window has no width")
+
+        for section in Self.settingsSections {
+            let row = element(app, section.row)
+            XCTAssertTrue(row.waitForExistence(timeout: 5),
+                          "Sidebar row \(section.row) (\(section.title)) is missing from Settings")
+            XCTAssertTrue(
+                windowFrame.contains(row.frame),
+                "Sidebar row \(section.row) is at \(row.frame), OUTSIDE the Settings window \(windowFrame). This is the #194 regression: the content was laid out far taller than the window and centred, pushing every row off-screen."
+            )
+            XCTAssertTrue(row.isHittable,
+                          "Sidebar row \(section.row) exists and is inside the window but is not hittable — something is covering it.")
+        }
+    }
+
+    /// Selecting a section shows that section's content, and the window title
+    /// follows the selection.
+    ///
+    /// Also covers the destination-teardown contract `AudioSettingsTab`'s VU
+    /// meter depends on: with the old `TabView`, `.task` / `.onDisappear`
+    /// fired on tab change; they now have to fire on *selection* change. The
+    /// previous section's probe having disappeared by the time the next one
+    /// appears is what proves the old destination was torn down rather than
+    /// left alive (and, for Audio, that the monitor was stopped).
+    func test_settings_each_section_renders_its_content_and_retitles_the_window() {
+        let app = launchApp()
+        let window = openSettings(app)
+
+        var previous: (title: String, probe: XCUIElement)?
+        for section in Self.settingsSections {
+            let probe = selectSection(app, section)
+            XCTAssertTrue(
+                probe.exists,
+                "Selected \(section.title) but its \(section.probe) control never appeared — the destination rendered nothing."
+            )
+            XCTAssertTrue(
+                window.frame.contains(probe.frame),
+                "\(section.title)'s \(section.probe) is at \(probe.frame), OUTSIDE the Settings window \(window.frame) — the destination is overflowing or clipped."
+            )
+
+            let title = waitForWindowTitle(window, section.title)
+            XCTAssertEqual(
+                title, section.title,
+                "Settings window title is '\(title)' after selecting \(section.title) — the title is not tracking the selected section."
+            )
+
+            if let stale = previous {
+                XCTAssertFalse(
+                    stale.probe.exists,
+                    "\(stale.title)'s control is still in the tree after switching to \(section.title) — the destination was not torn down, so `.onDisappear` (e.g. Audio's VU-meter stop) never fired."
+                )
+            }
+            previous = (section.title, probe)
+
+            let shortName = section.row
+                .replacingOccurrences(of: "settings.section.", with: "")
+            attachScreenshot(of: window, name: "settings-\(shortName)")
+        }
+    }
+
+    /// Requirement from the #194 post-mortem: shrinking the window to its
+    /// floor must not clip a destination. Models and AI Provider are the
+    /// widest, so check those two.
+    ///
+    /// Resizing is done by dragging the bottom-right corner well past the
+    /// declared minimum; `windowResizability(.contentSize)` clamps it there.
+    /// If the runner does not land the corner drag the window frame is
+    /// unchanged, which says nothing about clipping — skip rather than fail
+    /// in that case, since the default-size bounds checks in the two tests
+    /// above still run on every build.
+    func test_settings_content_is_not_clipped_at_the_window_floor() throws {
+        let app = launchApp()
+        let window = openSettings(app)
+
+        let before = window.frame
+        let corner = window.coordinate(withNormalizedOffset: CGVector(dx: 0.999, dy: 0.999))
+        let target = window.coordinate(withNormalizedOffset: CGVector(dx: -0.6, dy: -0.6))
+        corner.press(forDuration: 0.3, thenDragTo: target)
+
+        let after = window.frame
+        try XCTSkipIf(
+            abs(after.width - before.width) < 2 && abs(after.height - before.height) < 2,
+            "Corner drag did not resize the Settings window (\(before) -> \(after)) — cannot exercise the floor on this runner."
+        )
+
+        for section in Self.settingsSections where section.title == "Models" || section.title == "AI Provider" {
+            let probe = selectSection(app, section)
+            XCTAssertTrue(probe.exists,
+                          "\(section.title) rendered nothing at the window floor \(after)")
+            XCTAssertTrue(
+                window.frame.contains(probe.frame),
+                "At the window floor \(window.frame), \(section.title)'s \(section.probe) is at \(probe.frame) — clipped."
+            )
+            let shortName = section.title.replacingOccurrences(of: " ", with: "")
+            attachScreenshot(of: window,
+                             name: "settings-floor-\(shortName)",
+                             forVisionCheck: false)
+        }
+    }
+
     /// Regression test for the Hebrew live-transcript alignment bug
     /// where, with the sidebar open, the live transcript text was
     /// shifted away from the right edge of the pane by a gap equal

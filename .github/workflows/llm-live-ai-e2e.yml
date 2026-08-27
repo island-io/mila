@@ -108,6 +108,30 @@ jobs:
               - 'scripts/fixtures/**'
               - 'Mila/Models/LiveAISettings.swift'
               - 'Mila/Actions/LiveAISession.swift'
+              # DetailLayoutUITests screenshots the main window AND the
+              # Settings window, so a change to any view this job renders —
+              # or to any accessibility identifier or launch seam it queries
+              # — has to be able to trigger it.
+              #
+              # A glob rather than a hand-kept list of files, deliberately.
+              # #194 shipped an empty Settings window past a green CI
+              # precisely because nothing here looked at Settings, and an
+              # incomplete filter reproduces that failure exactly: the job
+              # never runs, so the coverage exists on paper only. Enumerating
+              # files re-opens that hole every time a view moves, gets split,
+              # or a new destination lands in a new file — three ways for
+              # this list to rot silently. Naming the whole directory cannot
+              # rot. The identifiers these tests match on are spread across
+              # SidebarView (sidebar.settings.link, sidebar.folder.default,
+              # sidebar.recording.*), RecordingDetailView
+              # (detail.title.label), SettingsView (settings.section.* plus
+              # most destination probes), StorageSettingsTab and
+              # VoiceMemosSettingsTab (their probes) — all under Mila/Views.
+              - 'Mila/Views/**'
+              # The --ui-test-clean-store / --ui-test-seed-recording launch
+              # seams and the Settings scene's windowResizability live here,
+              # and the tests' launch-state contract depends on both.
+              - 'Mila/App/MilaApp.swift'
               - 'MilaUITests/DetailLayoutUITests.swift'
               - '.github/workflows/llm-live-ai-e2e.yml'
       - name: Install xcodegen
