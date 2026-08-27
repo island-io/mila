@@ -24,45 +24,86 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
 }
 
 /// Manages persistent speaker voice profiles for cross-recording
-/// recognition. Profiles are created when a user names a speaker
-/// that has an embedding available (from the live diarizer pool or
-/// batch extraction). Builds on top of the existing SpeakerDirectory
-/// (which manages the name list) by adding voice embeddings.
+/// recognition, in `speaker-profiles.json` at the Application Support/Mila
+/// root. Profiles are created when a user names a speaker that has an
+/// embedding available (from the live diarizer pool). Builds on top of the
+/// existing `SpeakerDirectory` (which manages the name list) by adding
+/// voice embeddings.
+///
+/// **Entirely gated on `VoiceRecognitionSettings.isConfigured`, which is
+/// off by default.** With the feature off this object is inert: the JSON
+/// file is never parsed, `profiles` stays empty, no embedding is written,
+/// and `seedEntries()` hands the diarizer nothing. A user who never opts in
+/// has no voice data stored — the guarantee is "never written", not
+/// "written and ignored".
+///
+/// The one thing that still works while off is deletion
+/// (`deleteAllProfiles`), because off is precisely when somebody wants
+/// their voice data gone. Opting out is otherwise non-destructive: profiles
+/// stay on disk so re-enabling restores them, and Settings keeps an
+/// explicit delete button visible for as long as the file exists.
 @MainActor
 final class SpeakerProfileStore: ObservableObject {
+    /// Profiles held in memory. **Empty whenever the feature is off** — the
+    /// file is not even parsed until the user opts in, so an opted-out
+    /// process holds no voice data at all, not merely unused voice data.
     @Published private(set) var profiles: [VoiceProfile] = []
 
-    /// Master opt-in for voice recognition. When off, no voice profiles
-    /// are created or matched — speaker naming still works (via
-    /// SpeakerDirectory) but without cross-recording auto-identification.
-    /// Off by default: the user must consciously opt in to storing voice
-    /// biometric data.
-    @Published var enabled: Bool {
-        didSet { UserDefaults.standard.set(enabled, forKey: "voiceRecognition.enabled") }
-    }
+    /// True when `speaker-profiles.json` exists on disk, whether or not it
+    /// has been parsed. Lets Settings tell an opted-out user that voice
+    /// profiles from an earlier opt-in are still stored, and offer to
+    /// delete them, without reading a single embedding back into memory.
+    @Published private(set) var hasStoredProfilesOnDisk: Bool = false
+
+    /// The opt-in gate. Every persist / seed / match path below is guarded
+    /// on `settings.isConfigured` (enabled **and** the diarization pipeline
+    /// able to produce embeddings), never on `settings.isEnabled` alone.
+    let settings: VoiceRecognitionSettings
 
     private let fileManager = FileManager.default
     private let storeURL: URL
 
-    init() {
-        self.enabled = UserDefaults.standard.bool(forKey: "voiceRecognition.enabled")
-        let appSupport = try! fileManager.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        self.storeURL = appSupport
-            .appendingPathComponent("Mila", isDirectory: true)
-            .appendingPathComponent("speaker-profiles.json")
-        load()
+    /// `directory` is the folder that holds `speaker-profiles.json`.
+    /// Injectable so tests can point at a temp directory.
+    init(directory: URL, settings: VoiceRecognitionSettings) {
+        self.settings = settings
+        self.storeURL = directory.appendingPathComponent("speaker-profiles.json")
+        self.hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        // Only read the file when the user has opted in. Off means off: no
+        // embedding reaches memory, so nothing can be seeded or matched
+        // even by a caller that forgot its own guard.
+        if settings.isEnabled { load() }
+        // Toggling mid-session has to take effect without a relaunch:
+        // opting in loads what was stored, opting out drops it again.
+        settings.onEnabledChange = { [weak self] nowEnabled in
+            guard let self else { return }
+            if nowEnabled {
+                self.load()
+            } else {
+                self.profiles.removeAll()
+            }
+        }
     }
 
-    /// Injectable init for tests.
-    init(directory: URL) {
-        self.enabled = true
-        self.storeURL = directory.appendingPathComponent("speaker-profiles.json")
-        load()
+    /// Production init: the same Application Support/Mila root
+    /// `RecordingStore` and `SpeakerDirectory` resolve.
+    convenience init(settings: VoiceRecognitionSettings) {
+        // Mirror SpeakerDirectory: UI tests must never read or write the
+        // user's real voice profiles.
+        if CommandLine.arguments.contains("--ui-test-clean-store") {
+            let tmp = FileManager.default.temporaryDirectory
+                .appendingPathComponent("Mila-UITest-VoiceProfiles-\(UUID())", isDirectory: true)
+            self.init(directory: tmp, settings: settings)
+            return
+        }
+        // Non-throwing lookup + temp-dir fallback, matching SpeakerDirectory:
+        // a missing Application Support directory must not crash the app at
+        // launch (the previous `try!` here would have).
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                  in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        self.init(directory: appSupport.appendingPathComponent("Mila", isDirectory: true),
+                  settings: settings)
     }
 
     deinit {}
@@ -73,7 +114,10 @@ final class SpeakerProfileStore: ObservableObject {
     /// exists, merge the new embedding into its centroid via weighted
     /// average. Otherwise create a new profile.
     func updateProfile(name: String, embedding: [Float], sampleCount: Int) {
-        guard enabled else { return }
+        // The write gate. Callers guard too (so an opted-out user's centroid
+        // is never even read out of the diarizer pool), but the refusal that
+        // actually matters is here: nothing reaches `save()` while off.
+        guard settings.isConfigured else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !embedding.isEmpty, sampleCount > 0 else { return }
 
@@ -119,11 +163,24 @@ final class SpeakerProfileStore: ObservableObject {
         save()
     }
 
-    /// Remove all stored voice profiles. Used by the "Wipe All Voice
-    /// Data" button in Settings.
+    /// Remove every stored voice profile — the "Delete voice profiles"
+    /// button in Settings.
+    ///
+    /// Deliberately **not** gated: deletion has to work when the feature is
+    /// off, because off is exactly when a user wants their voice data gone.
+    /// It deletes the file rather than writing an empty array over it, so
+    /// after opting out and deleting there is no `speaker-profiles.json`
+    /// left behind at all.
     func deleteAllProfiles() {
         profiles.removeAll()
-        save()
+        do {
+            if fileManager.fileExists(atPath: storeURL.path) {
+                try fileManager.removeItem(at: storeURL)
+            }
+        } catch {
+            profileLog.log("deleteAll error: \(error.localizedDescription, privacy: .public)")
+        }
+        hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
     }
 
     func profileExists(name: String) -> Bool {
@@ -182,7 +239,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// Match an embedding against all stored profiles. Returns the best
     /// match above the threshold, or nil.
     func match(embedding: [Float], threshold: Double = 0.55) -> VoiceProfile? {
-        guard enabled else { return nil }
+        guard settings.isConfigured else { return nil }
         var best: (profile: VoiceProfile, sim: Double)?
         for profile in profiles {
             let sim = cosineSimilarity(embedding, profile.embedding)
@@ -194,8 +251,11 @@ final class SpeakerProfileStore: ObservableObject {
     }
 
     /// Entries suitable for seeding the live diarizer pool.
+    ///
+    /// The seed gate. Returns nothing while the feature is off — and while
+    /// off `profiles` is empty anyway, since the file was never parsed.
     func seedEntries() -> [(id: String, name: String, centroid: [Float], sampleCount: Int)] {
-        guard enabled else { return [] }
+        guard settings.isConfigured else { return [] }
         return profiles.map { p in
             (id: p.name, name: p.name, centroid: p.embedding, sampleCount: p.sampleCount)
         }
@@ -203,7 +263,27 @@ final class SpeakerProfileStore: ObservableObject {
 
     // MARK: - Persistence
 
+    /// Writes `profiles` to disk.
+    ///
+    /// **Refuses while the feature is off**, and that refusal does double
+    /// duty. It is the last line of the "nothing is written unless the user
+    /// opted in" guarantee, and it stops the opposite failure too: while off
+    /// `profiles` is empty, so a stray `save()` would overwrite a
+    /// previously-stored file with `[]` and destroy voice profiles the user
+    /// is entitled to get back by re-enabling.
+    ///
+    /// This one guard reads `isEnabled` rather than `isConfigured` on
+    /// purpose. `isConfigured` gates everything that *creates* voice data
+    /// (`updateProfile`) or *uses* it (`seedEntries`, `match`), so no new
+    /// embedding can reach here without it; what's left is the user's own
+    /// housekeeping — a rename or a single delete from Settings — and that
+    /// must still persist when the diarization pipeline happens to be
+    /// unverified, or their edit would silently revert on relaunch.
     private func save() {
+        guard settings.isEnabled else {
+            profileLog.log("save skipped — voice recognition is off")
+            return
+        }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -215,12 +295,18 @@ final class SpeakerProfileStore: ObservableObject {
             }
             let data = try encoder.encode(profiles)
             try data.write(to: storeURL, options: .atomic)
+            hasStoredProfilesOnDisk = true
         } catch {
             profileLog.log("save error: \(error.localizedDescription, privacy: .public)")
         }
     }
 
+    /// Parses `speaker-profiles.json` into memory. Called from `init` only
+    /// when the user has already opted in, and from the opt-in transition —
+    /// the guard is belt and braces so a future caller can't read voice data
+    /// back in behind an opted-out user's back.
     private func load() {
+        guard settings.isEnabled else { return }
         guard fileManager.fileExists(atPath: storeURL.path) else { return }
         do {
             let data = try Data(contentsOf: storeURL)

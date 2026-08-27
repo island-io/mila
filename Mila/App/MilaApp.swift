@@ -361,6 +361,10 @@ struct MilaApp: App {
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
     @StateObject private var updater = UpdaterViewModel()
+    /// Opt-in switch for cross-recording voice recognition (off by default).
+    @StateObject private var voiceRecognitionSettings: VoiceRecognitionSettings
+    /// Persisted voice fingerprints behind that feature. Inert — nothing
+    /// read, nothing written — until the setting above is turned on.
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
@@ -547,7 +551,7 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak store, weak diarSettings] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
             // Obsidian export is driven off the summarizer's completion hook.
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
@@ -571,12 +575,26 @@ struct MilaApp: App {
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
-        // Save voice profile when a speaker is named — if the live
-        // diarizer has a centroid for that speaker, persist it.
-        let profileStoreRef = SpeakerProfileStore()
+        // Cross-recording voice recognition. Opt-in and off by default:
+        // `voiceSettings.isConfigured` is the single gate, and it means
+        // "the user turned it on AND diarization can actually produce
+        // embeddings" — see `.claude/rules/feature-gates.md`. Readiness is
+        // injected as a closure so the settings object can read the
+        // diarization gate without being able to mutate it.
+        let voiceSettings = VoiceRecognitionSettings()
+        voiceSettings.diarizationReady = { [weak diarSettings] in
+            diarSettings?.isConfigured ?? false
+        }
+        _voiceRecognitionSettings = StateObject(wrappedValue: voiceSettings)
+        let profileStoreRef = SpeakerProfileStore(settings: voiceSettings)
         _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
+        // Save a voice profile when a speaker is named — if the live
+        // diarizer has a centroid for that speaker, persist it. The store
+        // refuses writes while the feature is off; the guard here means an
+        // opted-out user's centroid isn't so much as read out of the pool.
         let diarizerRef = liveDiar
         store.onSpeakerNamed = { _, rawID, name in
+            guard voiceSettings.isConfigured else { return }
             if let entry = diarizerRef.currentProfiles().first(where: { $0.id == rawID }) {
                 profileStoreRef.updateProfile(
                     name: name,
@@ -720,6 +738,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 .sheet(item: Binding(
@@ -799,6 +818,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 // Settings ▸ General shows the Sparkle-backed
@@ -861,7 +881,12 @@ struct MilaApp: App {
     /// that were seeded from voice profiles and actually matched real
     /// utterances. Auto-assign their names to the most recent recording
     /// and update their voice profiles with fresh centroid data.
+    ///
+    /// No-ops entirely while voice recognition is off. The pool would carry
+    /// no `profileName` anyway (nothing was seeded), but an explicit gate
+    /// keeps the guarantee readable rather than emergent.
     private func autoAssignRecognisedSpeakers() {
+        guard voiceRecognitionSettings.isConfigured else { return }
         guard let rec = store.recordings.first else { return }
         let poolEntries = liveSpeakerDiarizer.currentProfiles()
         // Only assign names for pool entries that were seeded AND
@@ -1422,7 +1447,14 @@ struct MilaApp: App {
                 // By the time this runs, the session has already been freshly
                 // started for this recording.
                 diarizer.reset()
-                diarizer.seedPool(with: speakerProfileStore.seedEntries())
+                // Seed the embedding pool with known voices only when the
+                // user opted in. `seedEntries()` refuses on its own too, and
+                // while off it has nothing to hand over regardless (the
+                // profiles file is never parsed) — three independent reasons
+                // an opted-out recording starts from a blank pool.
+                if voiceRecognitionSettings.isConfigured {
+                    diarizer.seedPool(with: speakerProfileStore.seedEntries())
+                }
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.

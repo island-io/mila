@@ -3,16 +3,52 @@ import XCTest
 
 @MainActor
 final class SpeakerProfileStoreTests: XCTestCase {
+
+    private var suiteNames: [String] = []
+
+    override func tearDown() async throws {
+        // Every settings object below gets its own UserDefaults suite so the
+        // opt-in flag never touches `.standard` (and never leaks between
+        // tests). Tear them all down.
+        for name in suiteNames {
+            UserDefaults().removePersistentDomain(forName: name)
+        }
+        suiteNames.removeAll()
+        try await super.tearDown()
+    }
+
     private func tempDir() -> URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent("SpeakerProfileStoreTests-\(UUID().uuidString)")
+        TestSupport.makeTempRoot(label: "SpeakerProfileStoreTests")
+    }
+
+    /// A `VoiceRecognitionSettings` on its own throwaway suite, never
+    /// `.standard`. The setting itself is off out of the box — the point of
+    /// the feature — so `enabled` is explicit here: these tests exercise the
+    /// storage mechanics with the feature on, and
+    /// `VoiceRecognitionGateTests` covers the off state.
+    private func makeSettings(enabled: Bool, diarizationReady: Bool = true) -> VoiceRecognitionSettings {
+        let name = "SpeakerProfileStoreTests.\(UUID())"
+        suiteNames.append(name)
+        let settings = VoiceRecognitionSettings(defaults: UserDefaults(suiteName: name)!)
+        settings.diarizationReady = { diarizationReady }
+        settings.isEnabled = enabled
+        return settings
+    }
+
+    /// An opted-in store rooted at `dir`. Keeps the settings object alive for
+    /// the store's lifetime by handing it back to the caller via the store's
+    /// own `settings` property.
+    private func makeStore(in dir: URL, enabled: Bool = true, diarizationReady: Bool = true) -> SpeakerProfileStore {
+        SpeakerProfileStore(directory: dir,
+                            settings: makeSettings(enabled: enabled,
+                                                   diarizationReady: diarizationReady))
     }
 
     func test_updateProfile_creates_new_profile() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
 
@@ -26,7 +62,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1, 0], sampleCount: 1)
         store.updateProfile(name: "Alice", embedding: [0, 1], sampleCount: 1)
@@ -42,7 +78,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
         store.updateProfile(name: "Alice", embedding: [1, 0], sampleCount: 1)
@@ -56,7 +92,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
         store.updateProfile(name: "Bob", embedding: [2], sampleCount: 1)
@@ -71,7 +107,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
         store.renameProfile(from: "Alice", to: "Alicia")
@@ -85,7 +121,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
         store.updateProfile(name: "Bob", embedding: [0, 1, 0], sampleCount: 1)
@@ -103,7 +139,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1, 0], sampleCount: 2)
         store.updateProfile(name: "Bob", embedding: [0, 1], sampleCount: 2)
@@ -124,11 +160,11 @@ final class SpeakerProfileStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
 
         do {
-            let store = SpeakerProfileStore(directory: dir)
+            let store = makeStore(in: dir)
             store.updateProfile(name: "Alice", embedding: [1, 2, 3], sampleCount: 5)
         }
 
-        let reloaded = SpeakerProfileStore(directory: dir)
+        let reloaded = makeStore(in: dir)
         XCTAssertEqual(reloaded.profiles.count, 1)
         XCTAssertEqual(reloaded.profiles[0].name, "Alice")
         XCTAssertEqual(reloaded.profiles[0].embedding, [1, 2, 3])
@@ -139,7 +175,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
-        let store = SpeakerProfileStore(directory: dir)
+        let store = makeStore(in: dir)
 
         store.updateProfile(name: "Alice", embedding: [1], sampleCount: 3)
         store.updateProfile(name: "Bob", embedding: [2], sampleCount: 5)

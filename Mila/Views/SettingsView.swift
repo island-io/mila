@@ -2086,7 +2086,7 @@ private struct DiarizationSettingsTabContent: View {
 
             Divider()
 
-            VoiceRecognitionSection()
+            VoiceRecognitionSection(diarization: diarization)
 
             Spacer()
         }
@@ -2285,65 +2285,91 @@ private struct KnownSpeakersSection: View {
     }
 }
 
-/// Voice recognition opt-in toggle + profile management. Shown in the
-/// Speakers settings section below the known-speakers list.
+/// Settings → Speakers → voice recognition: the opt-in switch for
+/// cross-recording recognition, plus the delete path for whatever it has
+/// already stored. Sits below the known-speakers list.
+///
+/// The off-state footprint is deliberately one toggle and one caption — the
+/// shape `ObsidianSettingsSection.enableCard` uses, in the flat,
+/// divider-separated style the rest of this tab uses rather than a card —
+/// with one addition that only appears when it has to. While profiles from
+/// an earlier opt-in are still on disk, the delete button stays visible
+/// *even with the feature off*: opting out stops all reading and writing but
+/// does not destroy the user's work, so deleting is a separate, explicit
+/// decision, and it would be dishonest for the opt-out to be the only hint
+/// that voice data is still at rest.
+///
+/// The caption is the full disclosure in both states rather than a teaser
+/// that expands once you've already switched it on. What gets stored, where
+/// it goes, and the fact that it never leaves the Mac are things you need
+/// *before* deciding, not after.
 private struct VoiceRecognitionSection: View {
+    /// The diarization settings this tab is already showing. Voice
+    /// recognition rides on the diarizer's embedding pool, so the section
+    /// observes it to explain why an enabled toggle might not be doing
+    /// anything yet.
+    @ObservedObject var diarization: DiarizationSettings
+    @EnvironmentObject private var settings: VoiceRecognitionSettings
     @EnvironmentObject private var profileStore: SpeakerProfileStore
-    @State private var showWipeConfirmation = false
+    @State private var showDeleteConfirmation = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Voice recognition")
                 .font(.callout.weight(.semibold))
 
-            Toggle(isOn: $profileStore.enabled) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Learn speaker voices across recordings")
-                        .font(.body)
-                    Text("When enabled, Mila stores a voice fingerprint (256-dimensional embedding) for each speaker you name. This data is used to auto-identify returning speakers in future recordings. Voice data is stored locally and never sent to any server.")
+            Toggle("Recognise returning speakers by voice", isOn: $settings.isEnabled)
+                .accessibilityIdentifier("speakers.voiceRecognition.toggle")
+
+            Text("Naming a speaker also saves a voice fingerprint for them: 256 numbers describing how the voice sounds, written to speaker-profiles.json in Mila's Application Support folder. The audio is not part of it and a fingerprint can't be played back — but it is enough to pick the same person out of a later recording, which is the point of it. Nothing is uploaded: the fingerprints stay on this Mac and are left out of diagnostic reports. They describe everyone whose name you fill in, not only you, so turn this on only where that is yours to decide.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // An enabled toggle does nothing until the diarizer can hand it
+            // embeddings, so say so rather than letting it look broken.
+            if settings.isEnabled, !diarization.isConfigured {
+                Text("Waiting on speaker diarization above — until that reports Ready there are no voices to learn from, and nothing is stored.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("speakers.voiceRecognition.waiting")
+            }
+
+            if profileStore.hasStoredProfilesOnDisk {
+                Divider()
+                HStack(alignment: .firstTextBaseline) {
+                    Text(storedProfilesLabel)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .toggleStyle(.switch)
-            .controlSize(.regular)
-            .accessibilityIdentifier("speakers.voiceRecognition.toggle")
-
-            if profileStore.enabled {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
-                    Text("Voice fingerprints are biometric data. Other participants in your meetings may not know their voice is being stored. Use responsibly.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(8)
-                .background(.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 6))
-            }
-
-            if !profileStore.profiles.isEmpty {
-                HStack {
-                    Text("\(profileStore.profiles.count) voice profile\(profileStore.profiles.count == 1 ? "" : "s") stored")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    Button("Delete All Voice Data", role: .destructive) {
-                        showWipeConfirmation = true
+                    Spacer(minLength: 12)
+                    Button("Delete Voice Profiles", role: .destructive) {
+                        showDeleteConfirmation = true
                     }
                     .font(.caption)
+                    .accessibilityIdentifier("speakers.voiceRecognition.delete")
                 }
-                .alert("Delete all voice profiles?", isPresented: $showWipeConfirmation) {
-                    Button("Delete All", role: .destructive) {
+                .alert("Delete stored voice profiles?", isPresented: $showDeleteConfirmation) {
+                    Button("Delete", role: .destructive) {
                         profileStore.deleteAllProfiles()
                     }
                     Button("Cancel", role: .cancel) {}
                 } message: {
-                    Text("This permanently removes all stored voice fingerprints. Speakers will no longer be auto-recognized in new recordings. This cannot be undone.")
+                    Text("This deletes speaker-profiles.json and every voice fingerprint in it. Speaker names already on your recordings are untouched, but nobody will be recognised in new ones. This can't be undone.")
                 }
             }
         }
+    }
+
+    /// While the feature is off the profiles file is deliberately never
+    /// parsed, so there is no count to show — only the fact that it exists.
+    private var storedProfilesLabel: String {
+        guard settings.isEnabled else {
+            return "Voice profiles from an earlier session are still stored on this Mac. Turning the switch back on picks up where you left off; they are only removed if you remove them."
+        }
+        let n = profileStore.profiles.count
+        return n == 1 ? "1 voice profile stored." : "\(n) voice profiles stored."
     }
 }
 
