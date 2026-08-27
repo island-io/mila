@@ -879,12 +879,26 @@ struct MilaApp: App {
     /// to any single view.
     /// After recording stops, check the live diarizer pool for speakers
     /// that were seeded from voice profiles and actually matched real
-    /// utterances. Auto-assign their names to the most recent recording
-    /// and update their voice profiles with fresh centroid data.
+    /// utterances. Auto-assign their names to the most recent recording.
     ///
     /// No-ops entirely while voice recognition is off. The pool would carry
     /// no `profileName` anyway (nothing was seeded), but an explicit gate
     /// keeps the guarantee readable rather than emergent.
+    ///
+    /// **Persistence is `setSpeakerName`'s job, not this loop's — one
+    /// recognition must fold into the stored centroid exactly once.**
+    /// `setSpeakerName` synchronously fires `store.onSpeakerNamed`, which
+    /// `MilaApp.init` wires to `SpeakerProfileStore.updateProfile`; this used
+    /// to *also* call `updateProfile` directly with the same entry, so every
+    /// recognised speaker was merged twice per recording. The centroid value
+    /// survives that (a weighted average of x with x is x) but `sampleCount`
+    /// doubles, and since the merge weights by sample count the profile goes
+    /// progressively rigid and quietly stops adapting — recognition decays
+    /// with no visible failure. Do not re-add a second persistence call
+    /// here: the single call below is deliberately the only one, and it is
+    /// what makes re-running this for the same recording idempotent (the
+    /// name already matches, so `setSpeakerName` returns without firing the
+    /// hook).
     private func autoAssignRecognisedSpeakers() {
         guard voiceRecognitionSettings.isConfigured else { return }
         guard let rec = store.recordings.first else { return }
@@ -897,11 +911,6 @@ struct MilaApp: App {
             let spoke = liveSpeakerDiarizer.intervals.contains { $0.speaker == entry.id }
             guard spoke else { continue }
             store.setSpeakerName(profileName, forSpeaker: entry.id, recordingID: rec.id)
-            speakerProfileStore.updateProfile(
-                name: profileName,
-                embedding: entry.centroid,
-                sampleCount: entry.sampleCount
-            )
         }
     }
 
