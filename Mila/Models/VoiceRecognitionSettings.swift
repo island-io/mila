@@ -35,20 +35,30 @@ final class VoiceRecognitionSettings: ObservableObject {
             guard isEnabled != oldValue else { return }
             defaults.set(isEnabled, forKey: Keys.enabled)
             // Synchronous, on the main actor, and after the property has
-            // been written — so the observer (SpeakerProfileStore) sees the
-            // new value. This is the repo's existing callback idiom
-            // (`RecordingStore.onSpeakerNamed`, `svc.onTranscriptionCompleted`)
-            // rather than a Combine sink, because `@Published` delivers on
-            // *willSet*: a sink would fire while `isEnabled` still read the
-            // old value, and the store's own guards read it.
-            onEnabledChange?(isEnabled)
+            // been written — so observers see the new value. This is the
+            // repo's existing callback idiom (`RecordingStore.onSpeakerNamed`,
+            // `svc.onTranscriptionCompleted`) rather than a Combine sink,
+            // because `@Published` delivers on *willSet*: a sink would fire
+            // while `isEnabled` still read the old value, and the observers'
+            // own guards read it.
+            for observer in enabledObservers { observer(isEnabled) }
         }
     }
 
-    /// Called on every actual change to `isEnabled`, with the new value.
-    /// `SpeakerProfileStore` installs this to load stored profiles on
-    /// opt-in and to drop them out of memory again on opt-out.
-    var onEnabledChange: ((Bool) -> Void)?
+    private var enabledObservers: [(Bool) -> Void] = []
+
+    /// Register a handler for actual changes to `isEnabled`, called
+    /// synchronously with the new value.
+    ///
+    /// `SpeakerProfileStore` uses it to load stored profiles on opt-in and
+    /// drop them from memory on opt-out; `ObservedVoiceSnapshots` uses it to
+    /// discard the observations it is holding. A list rather than one
+    /// assignable slot on purpose: with a single slot the second registrant
+    /// silently unhooked the first, so whichever object was constructed last
+    /// would have been the only one to ever hear about an opt-out.
+    func addEnabledObserver(_ observer: @escaping (Bool) -> Void) {
+        enabledObservers.append(observer)
+    }
 
     /// Answers "can the embedding pipeline this feature rides on actually
     /// produce embeddings right now?". Injected by `MilaApp` as a read of

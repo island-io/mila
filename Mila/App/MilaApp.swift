@@ -366,6 +366,11 @@ struct MilaApp: App {
     /// Persisted voice fingerprints behind that feature. Inert — nothing
     /// read, nothing written — until the setting above is turned on.
     @StateObject private var speakerProfileStore: SpeakerProfileStore
+    /// Per-recording snapshots of the diarizer pool, so naming a speaker
+    /// persists that recording's voice rather than the live pool's. Not
+    /// observable by any view, hence a plain reference rather than a
+    /// `@StateObject`.
+    private let observedVoices: ObservedVoiceSnapshots
 
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
@@ -588,26 +593,36 @@ struct MilaApp: App {
         _voiceRecognitionSettings = StateObject(wrappedValue: voiceSettings)
         let profileStoreRef = SpeakerProfileStore(settings: voiceSettings)
         _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
+        let voiceSnapshots = ObservedVoiceSnapshots()
+        voiceSnapshots.clearOnOptOut(of: voiceSettings)
+        observedVoices = voiceSnapshots
         // Save a voice profile when a speaker is named — if the live
-        // diarizer observed that speaker, persist it. The store refuses
-        // writes while the feature is off; the guard here means an opted-out
-        // user's voice isn't so much as read out of the pool.
+        // diarizer observed that speaker *in that recording*, persist it.
+        // The store refuses writes while the feature is off; the guard here
+        // means an opted-out user's voice isn't so much as looked up.
         //
-        // `currentProfiles()` reports what was observed in *this* recording,
-        // not the pool's matching centroid — for a seeded speaker the latter
-        // carries weight that is already stored on disk, and folding it back
-        // in counts it twice. This is the only place voice profiles are
-        // written, so a recognised speaker merges exactly once per recording.
-        let diarizerRef = liveDiar
-        store.onSpeakerNamed = { _, rawID, name in
+        // Resolved through `observedVoices` keyed on `recordingID`, never
+        // against the live pool. `SPEAKER_00` restarts from zero on every
+        // `reset()`, so a live-pool lookup silently returned the *current*
+        // recording's speaker for a name applied to an older one — writing a
+        // stranger's voice into the named profile. A recording with no
+        // snapshot resolves to nil and persists nothing, which is the honest
+        // answer: its pool is gone.
+        //
+        // The snapshot holds what was observed in that recording, not the
+        // pool's matching centroid — for a seeded speaker the latter carries
+        // weight already stored on disk, and folding it back counts it twice.
+        // This is the only place voice profiles are written, so a recognised
+        // speaker merges exactly once per recording.
+        store.onSpeakerNamed = { recordingID, rawID, name in
             guard voiceSettings.isConfigured else { return }
-            if let entry = diarizerRef.currentProfiles().first(where: { $0.id == rawID }) {
-                profileStoreRef.updateProfile(
-                    name: name,
-                    embedding: entry.observedCentroid,
-                    sampleCount: entry.observedCount
-                )
-            }
+            guard let observed = voiceSnapshots.observation(forSpeaker: rawID,
+                                                           in: recordingID) else { return }
+            profileStoreRef.updateProfile(
+                name: name,
+                embedding: observed.observedCentroid,
+                sampleCount: observed.observedCount
+            )
         }
 
         // Auto-drop accidental short+empty captures (issue #61). A recording
@@ -909,18 +924,31 @@ struct MilaApp: App {
         guard voiceRecognitionSettings.isConfigured else { return }
         guard let rec = store.recordings.first else { return }
         let poolEntries = liveSpeakerDiarizer.currentProfiles()
-        // Only assign names for pool entries that were seeded (they carry a
-        // profileName) AND actually spoke. Both halves matter: a seeded
-        // speaker who never said anything must not be labelled onto the
-        // recording just because their voice was in the pool.
+        // Snapshot the pool against this recording's id BEFORE naming
+        // anything: `setSpeakerName` fires `onSpeakerNamed` synchronously,
+        // and that hook resolves the voice through this snapshot. Every pool
+        // entry is kept, not just the seeded ones, because a speaker the user
+        // names by hand later needs the same lookup.
+        observedVoices.record(poolEntries, for: rec.id)
+        // Assign a name only where all three hold.
         for entry in poolEntries {
+            // 1. Seeded from a stored profile — there is a name to assign.
             guard let profileName = entry.profileName else { continue }
-            // Check this speaker actually spoke (has intervals). Now that
-            // seeded weight is kept out of the persisted delta,
-            // `entry.observedCount > 0` says much the same thing — but
-            // `intervals` is the stronger signal, since it means the speaker
-            // reached the transcript rather than merely matching an
-            // embedding.
+            // 2. Confidently matched this recording. `assign` deliberately
+            //    attaches *borderline* utterances (and anything under a
+            //    second) to the nearest existing speaker without folding
+            //    them into the centroid — so such an utterance produces an
+            //    interval while leaving `observedCount` at zero. Gating on
+            //    intervals alone therefore stamped a stored profile's name
+            //    onto a speaker that never confidently matched it: a
+            //    misattributed transcript, and the wrong person's name shown
+            //    against their words. `observedCount` is precisely the
+            //    "confidently observed this recording" signal.
+            guard entry.observedCount > 0 else { continue }
+            // 3. Reached the transcript. Kept alongside the count check
+            //    rather than replaced by it: intervals prove the speaker
+            //    actually surfaced in the saved transcript, which is a
+            //    stronger claim than having matched an embedding.
             let spoke = liveSpeakerDiarizer.intervals.contains { $0.speaker == entry.id }
             guard spoke else { continue }
             store.setSpeakerName(profileName, forSpeaker: entry.id, recordingID: rec.id)

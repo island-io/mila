@@ -75,7 +75,7 @@ final class SpeakerProfileStore: ObservableObject {
         if settings.isEnabled { load() }
         // Toggling mid-session has to take effect without a relaunch:
         // opting in loads what was stored, opting out drops it again.
-        settings.onEnabledChange = { [weak self] nowEnabled in
+        settings.addEnabledObserver { [weak self] nowEnabled in
             guard let self else { return }
             if nowEnabled {
                 self.load()
