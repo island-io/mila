@@ -1500,11 +1500,18 @@ enum LLMRunner {
                 // npm's ini reader JSON-parses a double-quoted value, so every
                 // JSON escape applies -- not just `\\\\` and `\\"` but `\\u006e` too.
                 // Hand-rolling that decoding got it wrong twice on this branch,
-                // so delegate to a real JSON parser and keep the raw value when
-                // it isn't valid JSON (the absolute-path check then rejects it).
-                // Single-quoted values are literal in npm; no decoding there.
+                // so delegate to a real JSON parser rather than enumerating the
+                // escapes. Single-quoted values are literal in npm; no decoding.
+                //
+                // A double-quoted value that isn't valid JSON is **discarded**,
+                // not salvaged by dropping the quotes: npm cannot read it
+                // either, so it has no prefix from this file, and stripping the
+                // quotes off `"/opt/bad\\q"` yields `/opt/bad\\q`, which is
+                // absolute and would be probed -- a directory npm would never
+                // install into. Better to have no candidate than a wrong one.
                 if quote == "\"" {
-                    value = jsonDecodedString(String(value)) ?? inner
+                    guard let decoded = jsonDecodedString(String(value)) else { continue }
+                    value = decoded
                 } else {
                     value = inner
                 }

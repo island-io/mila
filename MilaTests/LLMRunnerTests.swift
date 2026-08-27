@@ -847,12 +847,23 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/node/bin")
     }
 
-    /// An invalid escape makes the value un-decodable; keep it raw so the
-    /// absolute-path check rejects it rather than inventing a path.
-    func test_npmPrefixBin_keeps_an_undecodable_quoted_value_raw() throws {
+    /// A double-quoted value npm itself cannot parse yields **no** prefix.
+    ///
+    /// Stripping the quotes instead would leave `/opt/bad\\q` -- absolute, so
+    /// it passes the path check and gets probed, even though npm has no prefix
+    /// from that file at all. A missing candidate is better than a wrong one.
+    func test_npmPrefixBin_discards_an_undecodable_quoted_value() throws {
         let home = try makeHome(npmrc: "prefix=\"/opt/bad\\q\"\n")
         defer { try? FileManager.default.removeItem(at: home) }
-        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/bad\\q/bin")
+        XCTAssertNil(LLMRunner.npmPrefixBin(home: home.path))
+    }
+
+    /// ...but an earlier valid top-level `prefix` still wins, since a later
+    /// unparseable line must not erase a good value.
+    func test_npmPrefixBin_keeps_an_earlier_valid_prefix_when_a_later_one_is_undecodable() throws {
+        let home = try makeHome(npmrc: "prefix=/opt/good\nprefix=\"/opt/bad\\q\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/good/bin")
     }
 
     /// Single quotes are literal in npm -- no decoding there.
