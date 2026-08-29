@@ -166,15 +166,21 @@ final class RecognisedSpeakerAssignerTests: XCTestCase {
         let memo = add("Memo", createdAt: Date().addingTimeInterval(60),
                        source: .voiceMemo, to: w.store)
 
-        // The removed inference.
-        let inferred = w.store.recordings.first?.id
+        // The removed inference. Bound rather than force-unwrapped below:
+        // `XCTAssertEqual` records a failure and carries on, so a nil here
+        // would crash the runner on the next line and bury which of the two
+        // fixture preconditions actually broke.
+        guard let inferred = w.store.recordings.first?.id else {
+            XCTFail("precondition: the store must have a recording to infer from")
+            return
+        }
         XCTAssertEqual(inferred, memo.id)
         XCTAssertNotEqual(inferred, meeting.id,
                           "inferring from store order picks the memo, not the meeting")
 
         // Its consequence: the meeting never gets a snapshot, so naming it
         // later learns nothing.
-        w.snapshots.record(w.diarizer.currentProfiles(), for: inferred!)
+        w.snapshots.record(w.diarizer.currentProfiles(), for: inferred)
         XCTAssertNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: meeting.id))
         w.store.setSpeakerName("Alice", forSpeaker: "SPEAKER_00", recordingID: meeting.id)
         XCTAssertEqual(alice(w)?.sampleCount, 40,

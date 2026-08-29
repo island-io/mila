@@ -21,6 +21,69 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: VoiceProfile, rhs: VoiceProfile) -> Bool { lhs.id == rhs.id }
+
+    /// Ceiling on `sampleCount`. Not a capacity limit in any meaningful sense
+    /// — it is roughly 4.6 × 10¹⁸ utterances — but a guarantee that **any two
+    /// valid counts can be added without trapping**, which both
+    /// `updateProfile` and `mergeProfiles` do. Those two also clamp their sums
+    /// to it, so the store can never produce a value its own validator would
+    /// later reject.
+    static let maxSampleCount = Int.max / 2
+
+    /// Why this profile cannot be used, or nil when it is sound.
+    ///
+    /// `speaker-profiles.json` is a plain file in Application Support that
+    /// anything can edit, and a syntactically valid one can still hold values
+    /// no code path here tolerates. These are exactly the invariants
+    /// `SpeakerProfileStore.updateProfile` enforces on the way *in*, so the
+    /// same check on the way back out means the store cannot read something
+    /// it would have refused to write. Each clause is load-bearing:
+    ///
+    /// * **`sampleCount <= 0`** — `seedPool` carries the stored count into
+    ///   the live pool (`min(count, 3)`, which leaves a negative one
+    ///   negative), and the confident-match fold in `LiveSpeakerDiarizer.assign`
+    ///   computes `(centroid[i] * Float(n) + embedding[i]) / Float(n + 1)`.
+    ///   At `n == -1` that divides by zero. It is `Float` division, not
+    ///   `Int`: **nothing traps**. The centroid silently becomes ±inf/NaN,
+    ///   every later fold keeps it NaN, and `cosineSimilarity` then returns
+    ///   NaN for that entry forever. Worse, `assign` picks its best match
+    ///   with `sim > best.sim`, which is *false* for NaN — so a poisoned
+    ///   entry ahead of the real ones captures `best`, clears no threshold,
+    ///   and every utterance mints a fresh speaker instead of matching. The
+    ///   symptom is silent misrecognition, not a crash. The weighted folds in
+    ///   `updateProfile` and `mergeProfiles` land on the same `Float(0)`
+    ///   divisor when a stored `-1` meets a single new sample, and there the
+    ///   NaN is worse still: `JSONEncoder` refuses to encode it, so `save()`
+    ///   throws and the store quietly stops persisting anything at all.
+    /// * **`sampleCount > maxSampleCount`** — the one variant that *is*
+    ///   fatal: `updateProfile` evaluates `existing.sampleCount +
+    ///   sampleCount`, and Swift traps on `Int` overflow, so a stored
+    ///   `Int.max` crashes the app the moment that speaker is named again.
+    /// * **a non-finite component** — the same NaN poisoning, with no fold
+    ///   needed to trigger it. Belt and braces rather than a live hole:
+    ///   `JSONDecoder` cannot hand one back today, because JSON has no NaN or
+    ///   Infinity literal and a number too large for `Float` (`1e39` upwards)
+    ///   makes the *whole file* fail to parse. The clause states the
+    ///   invariant the arithmetic actually rests on, so it survives a change
+    ///   of encoding or of where embeddings come from.
+    /// * **an empty name or embedding** — nothing to label with, nothing to
+    ///   match against.
+    ///
+    /// Deliberately *not* checked: the embedding's width. Nothing here
+    /// assumes it — `updateProfile`, `mergeProfiles` and `assign` each carry
+    /// an explicit dimension-mismatch guard, so a profile written by some
+    /// other embedding model is inert rather than dangerous. Pinning it to
+    /// 256 here and nowhere else would also make the store refuse to read
+    /// back exactly what `updateProfile` accepts, and quietly drop a user's
+    /// profiles on any future model change.
+    var unusableReason: String? {
+        if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "empty name" }
+        if embedding.isEmpty { return "empty embedding" }
+        if embedding.contains(where: { !$0.isFinite }) { return "non-finite embedding value" }
+        if sampleCount <= 0 { return "non-positive sampleCount (\(sampleCount))" }
+        if sampleCount > Self.maxSampleCount { return "sampleCount out of range (\(sampleCount))" }
+        return nil
+    }
 }
 
 /// Manages persistent speaker voice profiles for cross-recording
@@ -119,7 +182,17 @@ final class SpeakerProfileStore: ObservableObject {
         // actually matters is here: nothing reaches `save()` while off.
         guard settings.isConfigured else { return }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !embedding.isEmpty, sampleCount > 0 else { return }
+        // The same invariants `VoiceProfile.unusableReason` re-checks on the
+        // way back off disk — kept identical on purpose, so the store never
+        // accepts something it would later refuse to load, or vice versa. The
+        // finiteness and upper-bound clauses matter here too: a NaN reaching
+        // the centroid poisons it permanently, and an unbounded count makes
+        // the addition below trap.
+        guard !trimmed.isEmpty,
+              !embedding.isEmpty,
+              embedding.allSatisfy({ $0.isFinite }),
+              sampleCount > 0,
+              sampleCount <= VoiceProfile.maxSampleCount else { return }
 
         if let idx = profiles.firstIndex(where: { $0.name == trimmed }) {
             let existing = profiles[idx]
@@ -127,7 +200,14 @@ final class SpeakerProfileStore: ObservableObject {
                 profileLog.log("updateProfile: dimension mismatch (\(existing.embedding.count) vs \(embedding.count)) for \(trimmed, privacy: .private)")
                 return
             }
-            let totalCount = existing.sampleCount + sampleCount
+            // Safe to add: both operands are at most `maxSampleCount` — the
+            // incoming one by the guard above, the stored one because every
+            // route into `profiles` (this method, or `load`'s validation)
+            // enforces it. Swift traps on `Int` overflow, and a decoded
+            // `Int.max` here would otherwise crash the app outright. The
+            // clamp keeps the result inside the same bound, so what is
+            // written back is always something `load` will accept.
+            let totalCount = min(existing.sampleCount + sampleCount, VoiceProfile.maxSampleCount)
             var merged = [Float](repeating: 0, count: embedding.count)
             for i in 0..<merged.count {
                 merged[i] = (existing.embedding[i] * Float(existing.sampleCount)
@@ -221,7 +301,8 @@ final class SpeakerProfileStore: ObservableObject {
         }
         let dim = keep.embedding.count
         guard dim > 0 else { return nil }
-        let totalCount = keep.sampleCount + absorb.sampleCount
+        // Bounded and clamped for the same reason as `updateProfile`'s sum.
+        let totalCount = min(keep.sampleCount + absorb.sampleCount, VoiceProfile.maxSampleCount)
         var merged = [Float](repeating: 0, count: dim)
         for i in 0..<dim {
             merged[i] = (keep.embedding[i] * Float(keep.sampleCount)
@@ -305,6 +386,24 @@ final class SpeakerProfileStore: ObservableObject {
     /// when the user has already opted in, and from the opt-in transition —
     /// the guard is belt and braces so a future caller can't read voice data
     /// back in behind an opted-out user's back.
+    ///
+    /// Decoding is only half the job: a file that parses can still describe a
+    /// profile no arithmetic here survives, so each decoded entry is checked
+    /// against `VoiceProfile.unusableReason` before it is installed.
+    ///
+    /// **An unusable entry is dropped individually and logged**, rather than
+    /// the whole file being rejected. One hand-edited or truncated profile
+    /// must not cost the user every other voice they have trained, and the
+    /// entry is unusable by definition — there is nothing to salvage, and
+    /// leaving it in memory is what does the damage. The drop is in-memory;
+    /// the file is not rewritten here, so the bad entry survives on disk
+    /// until the next legitimate `save()` and can still be repaired by hand
+    /// until then.
+    ///
+    /// Per-entry granularity is only available for *semantic* invalidity.
+    /// Malformed JSON, or a number too large for its Swift type, fails inside
+    /// `decode` before any entry exists, so those stay all-or-nothing — the
+    /// catch below leaves `profiles` as it was and logs.
     private func load() {
         guard settings.isEnabled else { return }
         guard fileManager.fileExists(atPath: storeURL.path) else { return }
@@ -312,8 +411,18 @@ final class SpeakerProfileStore: ObservableObject {
             let data = try Data(contentsOf: storeURL)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
-            profiles = try decoder.decode([VoiceProfile].self, from: data)
-            profileLog.log("loaded \(self.profiles.count) voice profiles")
+            let decoded = try decoder.decode([VoiceProfile].self, from: data)
+            var accepted: [VoiceProfile] = []
+            accepted.reserveCapacity(decoded.count)
+            for profile in decoded {
+                if let reason = profile.unusableReason {
+                    profileLog.log("load: dropped \(profile.name, privacy: .private) — \(reason, privacy: .public)")
+                    continue
+                }
+                accepted.append(profile)
+            }
+            profiles = accepted
+            profileLog.log("loaded \(accepted.count) of \(decoded.count) voice profiles")
         } catch {
             profileLog.log("load error: \(error.localizedDescription, privacy: .public)")
         }
