@@ -1464,9 +1464,11 @@ enum LLMRunner {
     }
 
     /// The effective `prefix` value in an npmrc body, following the `ini`
-    /// parser npm itself uses: `;` and `#` start a comment, a quoted value is
-    /// taken verbatim, an unquoted one ends at an inline comment, and a later
-    /// assignment overwrites an earlier one. `nil` when the key is absent —
+    /// parser npm itself uses: `;` and `#` start a comment, a double-quoted
+    /// value is JSON-decoded and a single-quoted one is literal, an unquoted
+    /// one ends at an inline comment, and a later assignment overwrites an
+    /// earlier one — *including* a later one npm cannot parse, which lands as
+    /// its own raw text and so leaves no usable prefix. `nil` when the key is absent —
     /// an empty string when it is present but blank, which the caller rejects
     /// along with every other unusable value.
     private static func npmrcPrefixValue(in text: String) -> String? {
@@ -1503,15 +1505,24 @@ enum LLMRunner {
                 // so delegate to a real JSON parser rather than enumerating the
                 // escapes. Single-quoted values are literal in npm; no decoding.
                 //
-                // A double-quoted value that isn't valid JSON is **discarded**,
-                // not salvaged by dropping the quotes: npm cannot read it
-                // either, so it has no prefix from this file, and stripping the
-                // quotes off `"/opt/bad\\q"` yields `/opt/bad\\q`, which is
-                // absolute and would be probed -- a directory npm would never
-                // install into. Better to have no candidate than a wrong one.
+                // A double-quoted value that isn't valid JSON is kept **raw,
+                // quotes and all** -- which is precisely what `npm/ini` does:
+                // its `JSON.parse` sits inside a `try/catch` whose handler
+                // leaves the value untouched, and the parse loop then assigns
+                // it like any other. That buys two things at once. The leading
+                // `"` fails `npmPrefixBin`'s absolute-path check, so a value
+                // npm cannot read still yields no directory to probe -- unlike
+                // dropping the quotes, which would turn `"/opt/bad\\q"` into
+                // the absolute-looking `/opt/bad\\q` and probe a directory npm
+                // would never install into. And because the line is *assigned*
+                // rather than skipped, it overwrites an earlier `prefix`,
+                // keeping last-assignment-wins true even when the last
+                // assignment is malformed. Skipping it would leave a stale
+                // earlier value in force and send Mila hunting for a CLI in a
+                // directory npm no longer points at -- a wrong answer where
+                // npm gives none.
                 if quote == "\"" {
-                    guard let decoded = jsonDecodedString(String(value)) else { continue }
-                    value = decoded
+                    value = jsonDecodedString(value) ?? value
                 } else {
                     value = inner
                 }

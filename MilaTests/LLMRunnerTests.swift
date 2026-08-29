@@ -858,12 +858,33 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertNil(LLMRunner.npmPrefixBin(home: home.path))
     }
 
-    /// ...but an earlier valid top-level `prefix` still wins, since a later
-    /// unparseable line must not erase a good value.
-    func test_npmPrefixBin_keeps_an_earlier_valid_prefix_when_a_later_one_is_undecodable() throws {
-        let home = try makeHome(npmrc: "prefix=/opt/good\nprefix=\"/opt/bad\\q\"\n")
-        defer { try? FileManager.default.removeItem(at: home) }
-        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/good/bin")
+    /// ...and it erases an earlier good one, because last-assignment-wins
+    /// holds even when the last assignment is malformed.
+    ///
+    /// `npm/ini` does not skip the unparseable line: its `JSON.parse` sits in
+    /// a `try/catch` whose handler leaves the raw quoted text in place, and
+    /// the parse loop assigns that like any other value. npm's effective
+    /// `prefix` here is therefore the literal `"/opt/bad\\q"` -- quotes
+    /// included, so not an absolute path, so no prefix at all. Retaining
+    /// `/opt/good` instead would have Mila probe a directory the user's npm
+    /// config no longer names and launch a CLI npm does not install into,
+    /// where npm itself simply finds nothing.
+    func test_npmPrefixBin_drops_an_earlier_prefix_when_a_later_one_is_undecodable() throws {
+        // Control: the same first line on its own really does resolve, so the
+        // nil below is the override taking effect -- not a fixture that failed
+        // to write or a parser that choked on the whole file. Without this the
+        // assertion would pass just as happily against a `makeHome` that wrote
+        // nothing at all.
+        let good = try makeHome(npmrc: "prefix=/opt/good\n")
+        defer { try? FileManager.default.removeItem(at: good) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: good.path), "/opt/good/bin")
+
+        let overridden = try makeHome(npmrc: "prefix=/opt/good\nprefix=\"/opt/bad\\q\"\n")
+        defer { try? FileManager.default.removeItem(at: overridden) }
+        let resolved = LLMRunner.npmPrefixBin(home: overridden.path)
+        XCTAssertNotEqual(resolved, "/opt/good/bin",
+                          "the superseded prefix survived a malformed override")
+        XCTAssertNil(resolved)
     }
 
     /// Single quotes are literal in npm -- no decoding there.
