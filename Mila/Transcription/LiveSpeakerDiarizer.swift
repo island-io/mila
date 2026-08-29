@@ -374,12 +374,26 @@ final class LiveSpeakerDiarizer: ObservableObject {
         // speaker when we already have a pool to attach to.
         let longEnoughForNewSpeaker = utteranceDuration >= 1.0
         diarLog.log("assign: poolSize=\(self.pool.count, privacy: .public) bestMatch=\(bestId, privacy: .public) bestSim=\(bestSim, privacy: .public) threshold=\(self.similarityThreshold, privacy: .public) createThreshold=\(createThreshold, privacy: .public) dur=\(utteranceDuration, privacy: .public)")
-        if let chosen = best, chosen.sim >= similarityThreshold {
+        // A confident match must agree in *dimension* as well as in angle.
+        // `cosineSimilarity` returns 0 on a count mismatch, so while the
+        // threshold is positive a differently-sized centroid can never clear
+        // it — but `similarityThreshold` is a plain `var` with no invariant
+        // of its own (Settings clamps its slider to 0.5...0.95; nothing binds
+        // a direct caller), and at a non-positive threshold that 0 would pass
+        // and the fold below would index `embedding` out of bounds. The
+        // mismatch itself is real, not hypothetical: `seedPool` takes
+        // centroids straight off disk, so a profile written by a different
+        // embedding model arrives at whatever length it was stored at.
+        // Checking here keeps the fold's memory safety local instead of
+        // resting on a distant clamp, and enforces exactly the outcome the
+        // threshold was assumed to produce — such an entry is not a
+        // confident match, so it falls through to attach-or-mint below.
+        if let chosen = best,
+           chosen.sim >= similarityThreshold,
+           pool[chosen.idx].centroid.count == embedding.count {
             // Confident match → fold into the matching centroid (running
-            // mean). `centroid.count` is safe to index `embedding` with:
-            // `cosineSimilarity` returns 0 on a dimension mismatch, so a
-            // seeded profile from a different embedding model can never be
-            // `best` above the threshold and never reaches this fold.
+            // mean). The guard above makes `centroid.count` safe to index
+            // `embedding` with.
             let n = pool[chosen.idx].sampleCount
             var centroid = pool[chosen.idx].centroid
             for i in 0..<centroid.count {
@@ -390,7 +404,9 @@ final class LiveSpeakerDiarizer: ObservableObject {
             // The same fold over this recording's observations alone — the
             // pair that gets persisted. A seeded entry starts empty, so its
             // first match takes the embedding directly rather than averaging
-            // into nothing.
+            // into nothing. A non-empty `observedCentroid` was itself built
+            // from embeddings that passed the dimension check above, so it is
+            // the same length as `embedding` and safe to index in step.
             let observedSoFar = pool[chosen.idx].observedCount
             if observedSoFar == 0 {
                 pool[chosen.idx].observedCentroid = embedding

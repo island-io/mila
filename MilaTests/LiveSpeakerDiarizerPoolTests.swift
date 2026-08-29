@@ -188,6 +188,61 @@ final class LiveSpeakerDiarizerPoolTests: XCTestCase {
             "A same-speaker similarity dip into the [0.40,0.55) band must attach, not fork")
     }
 
+    /// The confident-match fold walks `centroid.count` and indexes
+    /// `embedding` in step, so an entry whose centroid has a *different*
+    /// dimension must never reach it. `cosineSimilarity` returns 0 on a count
+    /// mismatch, which keeps such an entry out only while the threshold is
+    /// positive — and `similarityThreshold` is a plain `var` (Settings clamps
+    /// its slider to 0.5...0.95, but nothing binds a direct caller). At a
+    /// non-positive threshold that 0 clears the bar, and without the explicit
+    /// dimension check in `assign` the fold would read off the end of the
+    /// shorter vector. The mismatch has a real source: `seedPool` takes
+    /// centroids straight off disk, so a profile written by a different
+    /// embedding model arrives at whatever length it was stored at.
+    func test_non_positive_threshold_cannot_fold_a_mismatched_dimension_profile() {
+        for threshold in [0.0, -1.0] {
+            let d = LiveSpeakerDiarizer()
+            d.similarityThreshold = threshold
+            // Seeded from disk with an 8-dim centroid; this "daemon" emits
+            // 4-dim embeddings.
+            d.seedPool(with: [(id: "Ada", name: "Ada",
+                               centroid: [Float](repeating: 1, count: 8),
+                               sampleCount: 3)])
+
+            // Long enough to mint: the mismatched entry is not a confident
+            // match, so it forks instead of folding.
+            let minted = d.assign(embedding: [1, 0, 0, 0], utteranceDuration: 2.0)
+            XCTAssertEqual(minted, "SPEAKER_01",
+                "A dimension-mismatched entry must not count as a confident match (threshold \(threshold))")
+
+            // Too short to mint: attaches to the closest entry — which is the
+            // mismatched one — still without folding into it.
+            let attached = d.assign(embedding: [0, 1, 0, 0], utteranceDuration: 0.5)
+            XCTAssertEqual(attached, "SPEAKER_00",
+                "A short utterance attaches to the closest entry (threshold \(threshold))")
+
+            let seeded = d.currentProfiles().first { $0.profileName == "Ada" }
+            XCTAssertEqual(seeded?.observedCount, 0,
+                "The mismatched seeded profile must record no observations (threshold \(threshold))")
+            XCTAssertEqual(seeded?.observedCentroid.count, 0,
+                "The mismatched seeded profile must not take on this recording's embeddings")
+        }
+    }
+
+    /// Positive control for the dimension check: it rejects mismatched entries
+    /// only. At the same non-positive threshold a same-dimension entry still
+    /// folds exactly as before.
+    func test_non_positive_threshold_still_folds_matching_dimensions() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.0
+        XCTAssertEqual(d.assign(embedding: [1, 0, 0, 0]), "SPEAKER_00")
+        XCTAssertEqual(d.assign(embedding: [0, 1, 0, 0]), "SPEAKER_00",
+            "sim 0 clears a 0 threshold, so a same-dimension entry is still a confident match")
+        let profile = d.currentProfiles().first
+        XCTAssertEqual(profile?.observedCount, 2, "Both embeddings must have folded in")
+        XCTAssertEqual(profile?.observedCentroid.count, 4)
+    }
+
     func test_higher_threshold_makes_pool_more_conservative() {
         let d = LiveSpeakerDiarizer()
         d.similarityThreshold = 0.99
