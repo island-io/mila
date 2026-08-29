@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import OSLog
+import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
 
@@ -113,8 +114,11 @@ final class RecordingStore: ObservableObject {
     /// `relocateRecordings(to: nil)` can revert to the original
     /// default-path layout (json files sit alongside the `Recordings/`
     /// subdir, matching the historical shape that pre-v1.7 builds
-    /// shipped).
-    private let originalRootDirectory: URL
+    /// shipped). Exposed (read-only) so app-state siblings that must NOT
+    /// travel with a relocated recordings folder — the store-location
+    /// pointer, the live-transcript sidecar — anchor to the same root,
+    /// keeping test instances (temp roots) isolated automatically.
+    let originalRootDirectory: URL
 
     init(rootDirectory: URL) {
         self.originalRootDirectory = rootDirectory
@@ -131,6 +135,7 @@ final class RecordingStore: ObservableObject {
         load()
         loadFolders()
         loadTombstones()
+        writeStoreLocationPointer()
     }
 
     /// Switch the recordings directory to `newDirectory`. Clears the
@@ -168,6 +173,85 @@ final class RecordingStore: ObservableObject {
         self.pendingRecoveryIDs = []
         load()
         loadFolders()
+        writeStoreLocationPointer()
+    }
+
+    /// Whether `store-location.json` currently describes the store this
+    /// instance is actually reading and writing — i.e. whether mila-mcp
+    /// would land on the SAME store.
+    ///
+    /// `false` means the pointer is stale, and stale is dangerous rather
+    /// than merely unhelpful: `relocateRecordings` switches the live paths
+    /// before the pointer is written and deliberately leaves the old store
+    /// on disk, so a pointer that failed to update still resolves — to a
+    /// store the app has stopped writing to. The helper would answer from
+    /// recordings that stopped updating at the moment of relocation, with
+    /// nothing to tell anyone it happened. Answering nothing is strictly
+    /// better than answering confidently wrong, so `MCPAccessSettings`
+    /// treats this as "MCP access unavailable" and closes the on-disk gate
+    /// until a verified pointer exists.
+    ///
+    /// Not a permission or a preference: it is a readiness fact, recomputed
+    /// on every pointer write, and it converges on its own — `init` rewrites
+    /// the pointer on every launch, so a transient failure clears itself.
+    private(set) var storeLocationIsDiscoverable: Bool = true
+
+    /// Late-bound by `MilaApp` to `MCPAccessSettings.refreshMirror()`. Fires
+    /// only when `storeLocationIsDiscoverable` actually flips, so a normal
+    /// relocation — the overwhelmingly common case — never rewrites the gate
+    /// file. Not a `@Published` + Combine pair because `MilaApp.init` has no
+    /// cancellable bag to keep a subscription alive, and the one consumer
+    /// wants a callback rather than a value.
+    var onStoreLocationDiscoverabilityChanged: (() -> Void)?
+
+    /// Mirror the resolved store paths into `store-location.json` at the
+    /// original root so external tools (mila-mcp) can find the store even
+    /// when the user relocated the recordings directory — the relocation
+    /// itself lives in a security-scoped bookmark another process can't
+    /// resolve. Always written at the ORIGINAL root: on the default path
+    /// that's Application Support/Mila, and test instances (temp roots)
+    /// stay isolated automatically.
+    ///
+    /// The write is VERIFIED by reading back what an external reader would
+    /// now resolve, not by trusting `write()` to have thrown on failure.
+    /// The end state is what matters — see
+    /// `MilaStoreReader.resolvesActiveStore`.
+    private func writeStoreLocationPointer() {
+        let pointer = StoreLocationPointer(recordingsDirectory: recordingsDirectory.path,
+                                           storeFile: storeURL.path,
+                                           updatedAt: Date())
+        do {
+            try pointer.write(to: originalRootDirectory)
+        } catch {
+            // Deliberately still `.public`, and the only file-write path left
+            // that is. This writes to `originalRootDirectory`, a `let` set from
+            // `init(rootDirectory:)` that is NEVER the user's chosen storage
+            // folder: `relocateRecordings` moves `recordingsDirectory` /
+            // `storeURL` / `foldersURL` and leaves this untouched, and
+            // production always constructs `RecordingStore()`, i.e. the fixed
+            // app-support root. So the quoted path can only ever be
+            // “store-location.json” in the folder “Mila” — no user content, and
+            // a readable message is worth more here than a blanket redaction.
+            recStoreLog.error("failed to write store-location pointer: \(error.localizedDescription, privacy: .public)")
+        }
+        let discoverable = MilaStoreReader.resolvesActiveStore(
+            root: originalRootDirectory,
+            recordingsDirectory: recordingsDirectory,
+            storeFile: storeURL)
+        if !discoverable {
+            // Deliberately an error even though the app itself is fine: this
+            // is the only trace of a divergence that is otherwise invisible
+            // from inside Mila.
+            recStoreLog.error("""
+                store-location pointer does not describe the active store \
+                (external readers would resolve elsewhere) — MCP access \
+                stays closed until it can be written
+                """)
+        }
+        if storeLocationIsDiscoverable != discoverable {
+            storeLocationIsDiscoverable = discoverable
+            onStoreLocationDiscoverabilityChanged?()
+        }
     }
 
     func audioURL(for recording: Recording) -> URL {
@@ -224,7 +308,8 @@ final class RecordingStore: ObservableObject {
         do {
             try await AudioCompressor.compress(wavURL: src, toM4A: dst)
         } catch {
-            recStoreLog.error("compressRecordingAudio failed for \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            // The error string names the audio file, which is title-derived.
+            recStoreLog.error("compressRecordingAudio failed for \(id, privacy: .public): \(error.localizedDescription, privacy: .private)")
             try? FileManager.default.removeItem(at: dst)  // don't leave a partial m4a
             return
         }
@@ -251,7 +336,7 @@ final class RecordingStore: ObservableObject {
         recordings[idx].audioFileName = dstName
         persist()
         try? FileManager.default.removeItem(at: src)
-        recStoreLog.log("compressed recording \(id, privacy: .public) → \(dstName, privacy: .public)")
+        recStoreLog.log("compressed recording \(id, privacy: .public) → \(dstName, privacy: .private)")
     }
 
     /// Number of finished recordings still stored as WAV (i.e. compressible).
@@ -314,12 +399,31 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
-    func update(_ recording: Recording) {
-        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
+    /// Returns whether the record a SEPARATE PROCESS would now read matches
+    /// what was just written — i.e. both the `.txt` transcript sidecar and
+    /// `recordings.json` landed on disk.
+    ///
+    /// Callers that merely mutate in-memory state can keep ignoring the
+    /// result (hence `@discardableResult`). The one caller that must not is
+    /// `QuickActionsController.stopRecording`, which publishes the live
+    /// sidecar's `completed` + `final_recording_id` handoff: that pair
+    /// promises an external reader that following the id yields the final
+    /// transcript, and `MilaStoreReader.transcriptText` reads the `.txt`
+    /// sidecar FIRST. A suppressed write error there means the handoff points
+    /// at a stale sidecar. Both writes used to fail silently — `print` and
+    /// carry on. (CodeRabbit on #183.)
+    ///
+    /// `writeSummary` is deliberately not part of the verdict: the summary
+    /// also lives in `recordings.json`, so its sidecar is an extra surface
+    /// rather than the source of truth.
+    @discardableResult
+    func update(_ recording: Recording) -> Bool {
+        guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return false }
         recordings[idx] = recording
-        writeTranscript(for: recording)
+        let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        persist()
+        let persisted = persist()
+        return transcriptWritten && persisted
     }
 
     /// Replace several stored records in one pass with a SINGLE persist, vs.
@@ -419,7 +523,12 @@ final class RecordingStore: ObservableObject {
     /// Persist (or clear) the `.txt` sidecar for a recording. Empty text
     /// removes the file so we never leave a stale transcript around after a
     /// re-transcription that came up silent.
-    private func writeTranscript(for recording: Recording) {
+    /// Returns whether the sidecar on disk now reflects `recording` —
+    /// written, or removed for an empty transcript. `false` means an external
+    /// reader would see the PREVIOUS text (or none), which is why the result
+    /// is propagated out through `update` rather than only logged.
+    @discardableResult
+    private func writeTranscript(for recording: Recording) -> Bool {
         let url = transcriptURL(for: recording)
         let text = recording.fullText
         do {
@@ -430,8 +539,24 @@ final class RecordingStore: ObservableObject {
             } else {
                 try text.write(to: url, atomically: true, encoding: .utf8)
             }
+            return true
         } catch {
-            print("RecordingStore: failed to write transcript \(url.lastPathComponent): \(error)")
+            // The recording id is the safe correlation key; the FILENAME is
+            // not. `FileTranscriber` derives `audioFileName` from the
+            // recording title (`freshAudioURL(suggestedName: safeStem)`), so
+            // a public interpolation of it puts the user's meeting title into
+            // the unified log, readable by anything that can read logs.
+            // `error.localizedDescription` needs the same care: Cocoa file
+            // errors quote the offending filename ("The file \u{201C}Q3
+            // board call.txt\u{201D} doesn't exist."), so redacting only the
+            // URL would leak the title through the error string instead.
+            // (CodeRabbit on #183, CWE-532.)
+            recStoreLog.error("""
+                failed to write transcript for \(recording.id, privacy: .public) \
+                (\(url.lastPathComponent, privacy: .private)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+            return false
         }
     }
 
@@ -455,7 +580,15 @@ final class RecordingStore: ObservableObject {
                 try text.write(to: url, atomically: true, encoding: .utf8)
             }
         } catch {
-            print("RecordingStore: failed to write summary \(url.lastPathComponent): \(error)")
+            // Same leak as `writeTranscript` above, and `print` is worse
+            // than a redacted logger: it carries no privacy annotation at
+            // all and stdio is captured into the unified log for an app
+            // launched by launchd.
+            recStoreLog.error("""
+                failed to write summary for \(recording.id, privacy: .public) \
+                (\(url.lastPathComponent, privacy: .private)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
         }
     }
 
@@ -711,8 +844,11 @@ final class RecordingStore: ObservableObject {
                 // happen — segments + empty fullText only existed on the
                 // brief window where status was running and we hadn't
                 // flushed the final text yet).
-                let joined = decoded[i].segments.map(\.text).joined()
-                decoded[i].fullText = joined
+                // Shared with mila-mcp's `MilaStoreReader.transcriptText`
+                // so both readers reconstruct identical text — see
+                // `TranscriptFormatter.joinedFullText`.
+                decoded[i].fullText = TranscriptFormatter
+                    .joinedFullText(segments: decoded[i].segments)
             }
         }
         self.recordings = decoded.sorted { $0.createdAt > $1.createdAt }
@@ -771,7 +907,12 @@ final class RecordingStore: ObservableObject {
             recordings.insert(recovered, at: 0)
             added.append(recovered)
             pendingRecoveryIDs.append(recovered.id)
-            print("RecordingStore: recovered orphan recording \(name) (\(size) bytes)")
+            // `name` came off disk and is title-derived for anything that
+            // arrived through the import path.
+            recStoreLog.log("""
+                recovered orphan recording \(recovered.id, privacy: .public) \
+                (\(name, privacy: .private), \(size, privacy: .public) bytes)
+                """)
         }
         if !added.isEmpty {
             recordings.sort { $0.createdAt > $1.createdAt }
@@ -786,15 +927,42 @@ final class RecordingStore: ObservableObject {
         return "Recovered recording · \(f.string(from: date))"
     }
 
-    private func persist() {
+    /// Returns whether `recordings.json` on disk now reflects the in-memory
+    /// store. `false` means a separate process still reads the previous
+    /// contents — see `update(_:)` for why that has to be reportable.
+    @discardableResult
+    private func persist() -> Bool {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
             let data = try encoder.encode(recordings)
             try data.write(to: storeURL, options: .atomic)
+            return true
         } catch {
-            print("RecordingStore persist error: \(error)")
+            // `.private` on the description — and this one really did need it,
+            // contrary to the exception I claimed last round. `storeURL`
+            // follows the user's chosen storage directory (see
+            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER in
+            // the message: "You don't have permission to save the file
+            // “recordings.json” in the folder “Acme Corp”." That is the same
+            // mechanism that leaked recording titles, and a folder the user
+            // picked can name a client, an employer or a project. Reasoning
+            // about the fixed FILENAME and stopping there was the mistake.
+            // (CodeRabbit on #183, CWE-532.)
+            //
+            // Domain + code stay public so a real failure is still diagnosable
+            // without the path: they are what separates "no permission"
+            // (NSCocoaErrorDomain 513) from a full disk or a missing
+            // directory. The filename is a literal, so naming WHICH write
+            // failed reveals nothing.
+            let ns = error as NSError
+            recStoreLog.error("""
+                persist failed for recordings.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+            return false
         }
     }
 
@@ -848,7 +1016,30 @@ final class RecordingStore: ObservableObject {
             let data = try encoder.encode(folders)
             try data.write(to: foldersURL, options: .atomic)
         } catch {
-            print("RecordingStore persistFolders error: \(error)")
+            // Same treatment as `persist()` above, and for the same reason:
+            // `foldersURL` follows the user's chosen storage directory (see
+            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER
+            // in the message — "You don't have permission to save the file
+            // “folders.json” in the folder “Acme Corp”." A folder the user
+            // picked can name a client, an employer or a project, so the
+            // description is `.private`.
+            //
+            // Domain + code stay public: they are what separates "no
+            // permission" (NSCocoaErrorDomain 513) from a full disk or a
+            // missing directory, and they name no path. The filename in the
+            // message is a literal.
+            //
+            // The sibling `persistTombstones` / store-location writes keep a
+            // plain message because their URLs are anchored to
+            // `originalRootDirectory`, which `relocateRecordings` never
+            // moves — the containing folder there can only ever be `Mila`.
+            // (CodeRabbit on #183, CWE-532.)
+            let ns = error as NSError
+            recStoreLog.error("""
+                persistFolders failed for folders.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
         }
     }
 }

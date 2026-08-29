@@ -352,6 +352,7 @@ struct MilaApp: App {
     /// StateObject purely so it stays alive — the completion hooks capture it
     /// weakly.
     @StateObject private var obsidianVaultSettings: ObsidianVaultSettings
+    @StateObject private var mcpAccessSettings: MCPAccessSettings
     @StateObject private var obsidianExporter: ObsidianExporter
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
@@ -360,6 +361,10 @@ struct MilaApp: App {
     @StateObject private var speakerDirectory: SpeakerDirectory
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
+    /// Mirrors the live transcript to `live/current.json` for external
+    /// tools (mila-mcp). Not observed by any view; held as a StateObject
+    /// purely so it survives SwiftUI re-inits like the other singletons.
+    @StateObject private var liveSidecarWriter: LiveTranscriptSidecarWriter
     @StateObject private var updater = UpdaterViewModel()
 
     init() {
@@ -528,6 +533,33 @@ struct MilaApp: App {
         // transcript fallback) once its summary is ready, then optionally
         // committed + pushed to git. Off by default.
         let obsidianSettings = ObsidianVaultSettings()
+        // Opt-in gate for the bundled mila-mcp helper. Constructing it
+        // mirrors the persisted flag back out to `mcp-access.json`, so the
+        // helper's view of consent re-converges on every launch.
+        //
+        // The readiness half is bound to the store: consent alone isn't
+        // enough, because a `store-location.json` write that failed after a
+        // relocation would leave the helper reading the OLD store and
+        // answering from it. `storeIsDiscoverable` is a closure, not a
+        // snapshot, so it is re-consulted on every mirror — the store is
+        // already constructed above, and the launch-time relocation on line
+        // ~379 has already run, so the first mirror sees the real verdict.
+        //
+        // `store` is captured STRONGLY on purpose. A weak capture that went
+        // nil would fall back to the `?? true` default and quietly re-open
+        // the gate — a fail-open in the one place that must not have one.
+        // There is no cycle: the store's callback below holds `mcpAccess`
+        // weakly, and both objects are `@StateObject`-lived anyway.
+        let mcpAccess = MCPAccessSettings(storeIsDiscoverable: {
+            store.storeLocationIsDiscoverable
+        })
+        // A mid-session relocation can flip discoverability either way, and
+        // the helper's gate must follow immediately rather than at the next
+        // launch. The store only calls this when the verdict actually
+        // changes, so a normal relocation doesn't rewrite the gate file.
+        store.onStoreLocationDiscoverabilityChanged = { [weak mcpAccess] in
+            mcpAccess?.refreshMirror()
+        }
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
@@ -546,7 +578,23 @@ struct MilaApp: App {
         // summary referring to the previous transcript; we force-
         // regenerate so the user doesn't end up with a stale summary
         // that disagrees with what the segments now say.
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian] rec, wasRetranscription in
+        // Live-transcript sidecar for external tools (mila-mcp). Anchored
+        // to the store's original root so tests / UI-test temp stores stay
+        // isolated from the user's real app-support directory.
+        //
+        // Constructed HERE, above `onTranscriptionCompleted`, because that hook
+        // captures it to publish the deferred batch handoff. It only needs
+        // `store`; the `actions` wiring stays further down with the rest.
+        let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
+        sidecarWriter.cleanupAtLaunch()
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
+            // A recording whose live transcript wasn't final closed its live
+            // sidecar WITHOUT a handoff id, because at Stop the batch worker
+            // hadn't produced the transcript yet. It just did — so publish the
+            // handoff now, completing what `finish(…, transcriptIsFinal:
+            // false)` deferred. A no-op unless this is that exact recording
+            // and its snapshot is still the one on disk; see `attachHandoff`.
+            sidecarWriter?.attachHandoff(forRecording: rec.id)
             // Obsidian export is driven off the summarizer's completion hook.
             // Mark this fresh completion pending so the hook knows to write it
             // (backfilled recordings are never marked, hence never re-filed).
@@ -591,6 +639,7 @@ struct MilaApp: App {
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings
         actions.obsidianExporter = obsidian
+        actions.liveSidecarWriter = sidecarWriter
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -630,6 +679,7 @@ struct MilaApp: App {
         _liveAISession = StateObject(wrappedValue: liveSession)
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
         _obsidianVaultSettings = StateObject(wrappedValue: obsidianSettings)
+        _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
@@ -644,6 +694,7 @@ struct MilaApp: App {
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
         _configImporter = StateObject(wrappedValue: configImporter)
+        _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
@@ -719,6 +770,7 @@ struct MilaApp: App {
                     Text(configImporter.errorMessage ?? "")
                 }
                 .environmentObject(obsidianVaultSettings)
+                .environmentObject(mcpAccessSettings)
                 .environmentObject(obsidianExporter)
         }
         .commands {
@@ -781,6 +833,7 @@ struct MilaApp: App {
                 // and the menu command use — never a second one.
                 .environmentObject(updater)
                 .environmentObject(obsidianVaultSettings)
+                .environmentObject(mcpAccessSettings)
                 .environmentObject(obsidianExporter)
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
@@ -1246,6 +1299,7 @@ struct MilaApp: App {
         // drain belongs here (sleep/lock/quit path) or to
         // `stopRecording` (Stop-button path).
         let actionsRef: QuickActionsController? = actions
+        let sidecarWriter = liveSidecarWriter
 
         var feedTask: Task<Void, Never>?
         var aiEnabledCancellable: AnyCancellable?
@@ -1320,10 +1374,19 @@ struct MilaApp: App {
                     // to a recording that never ran the LLM loop.
                     // Cursor flagged on c95d2bb.
                     aiSession.cancel()
+                    // Still surface the recording to external pollers
+                    // (mila-mcp): they get an honest "recording, but no
+                    // live text on this hardware" status instead of
+                    // silence.
+                    sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
                         .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
+                // Open the live-transcript sidecar for this recording so
+                // external tools (mila-mcp) can follow the meeting; the
+                // feed loop below streams content into it.
+                sidecarWriter.begin(title: nil, source: nil, liveAvailable: true)
                 // Live transcription runs on every recording — it's how
                 // the recording UI shows the live transcript pane even
                 // when AI mode is off. Apply the user's tick-interval
@@ -1412,7 +1475,7 @@ struct MilaApp: App {
                     }
 
                 feedTask?.cancel()
-                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, aiSettings, llmSettingsRef] in
+                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
                     var lastFed = ""
                     guard let transcriber else { return }
                     for await _ in transcriber.$segments.values {
@@ -1433,6 +1496,14 @@ struct MilaApp: App {
                         if let diarizer {
                             transcriber.applySpeakerLabels(diarizer.intervals)
                         }
+                        // Mirror the tick to the on-disk live sidecar
+                        // (throttled + deduped inside the writer).
+                        let liveSegments = transcriber.segments.map {
+                            TranscriptSegment(start: $0.startSeconds, end: $0.endSeconds,
+                                              text: $0.text, speaker: $0.speaker)
+                        }
+                        sidecarWriter?.update(segments: liveSegments,
+                                              speakerNames: transcriber.speakerNames)
                         if aiActive {
                             let text = transcriber.formattedTranscript
                             if text != lastFed, !text.isEmpty {
@@ -1522,6 +1593,11 @@ struct MilaApp: App {
                     // `stopRecording`, which owns finalize and cancels the
                     // session itself once its snapshot is stored.
                     aiSession.cancel()
+                    // Close the live sidecar with no handoff id — this
+                    // teardown path (sleep/lock/quit/cancelAll) has no
+                    // saved Recording yet; the Stop-button path closes
+                    // it from stopRecording with the real id instead.
+                    sidecarWriter.finish(recordingID: nil)
                 }
                 // Note: no aiSession.cancel() out here, outside the branch
                 // above — this handler fires during `session.stop()`,

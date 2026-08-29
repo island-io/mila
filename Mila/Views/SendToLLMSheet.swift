@@ -1,4 +1,5 @@
 import SwiftUI
+import MilaKit
 
 /// Sheet shown when the user right-clicks a recording and picks
 /// "Send to <LLM>…". Surfaces the prompt that will be sent (editable for

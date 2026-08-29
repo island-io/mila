@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import MilaKit
 
 /// Shown the moment a recording is added — i.e. as soon as recording stops,
 /// in parallel with transcription. The user can type a title and Save at any

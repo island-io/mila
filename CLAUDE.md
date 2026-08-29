@@ -15,6 +15,8 @@ A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optio
   - `Mila/Resources/DiarizationModels/` — bundled pyannote speaker diarization model weights (~31 MB)
   - `MilaTests/` — unit tests
   - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp bindings), WAVReader, WER calculator, and E2E transcription test fixtures
+  - `Packages/MilaKit/` — zero-dependency Swift package shared by the app and the `mila-mcp` helper: TranscriptFormatter, the read-only `StoredRecording` mirror of recordings.json, `MilaStoreReader`, the live-transcript snapshot schema, and the MCP tool handlers
+  - `MilaMCP/` — the `mila-mcp` executable (MCP stdio server over Mila's transcriptions), embedded at `Mila.app/Contents/MacOS/mila-mcp`; see `docs/mcp.md`
   - `scripts/` — release/build scripts (make-dmg.sh, etc.)
 
 ## Conventions
@@ -46,9 +48,23 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - For verification/setup state that should survive app restarts, persist a `verified` flag alongside the verified parameter values (path). On launch, restore only if current values match the persisted ones.
 - Computed `status` properties must check `verificationStatus` before `lastVerifyResult` -- the persisted verified state should take precedence over nil in-memory verify results on launch.
 
+### MCP server (mila-mcp) and MilaKit
+
+- The app persists two cross-process contracts for the embedded MCP helper: `store-location.json` (written by `RecordingStore` on init + relocate — where recordings.json currently lives) and `live/current.json` (the live-transcript sidecar written during recording by `LiveTranscriptSidecarWriter`). Both live at the DEFAULT app-support root and deliberately do not travel with a relocated recordings folder.
+- **Any change to what `Recording.encode(to:)` writes into recordings.json must be mirrored in MilaKit's `StoredRecording`** — `StoredRecordingDriftTests` in MilaTests is the tripwire. That includes the NESTED element types (`TranscriptSegment`, `ActionItem`): they encode as objects, so a top-level key-set check sees `segments`/`actionItems` present on both sides however far the elements have drifted, which is how `ActionItem.source` stayed unmirrored. The test compares nested key sets too, each with its own allowlist. Keep `StoredRecording` decoding lenient (`decodeIfPresent` + defaults) so an older helper survives a newer app's schema.
+- MilaKit must stay dependency-free (in particular: no TranscriptionCore) — it links into `mila-mcp`, which must not drag in the whisper xcframework. Tool logic lives in `MilaMCPToolHandlers` (pure JSON), not in the executable.
+- **The helper is off by default and must stay that way.** A third contract, `mcp-access.json`, carries the user's consent; `MCPAccessGate` fails closed on a missing, unreadable, or malformed file, and `handle(tool:)` re-reads it on *every* call so revoking access bites a server that is already running. `MCPAccessSettings` owns the UserDefaults key (`mcp.enabled`) and mirrors it to that file on change and on every launch. Do not add a cache in front of the gate, and do not let a new tool path skip `handle(tool:)`.
+- **Both directions of the gate must fail closed, and they are not symmetric.** Failing to publish `enabled` is safe (the gate keeps denying); failing to publish `disabled` is not, because the previous `enabled: true` file survives a failed atomic write and keeps granting. `MCPAccessGate.set(false, …)` therefore escalates to deleting the file and throws only when access is *still* granted, and `MCPAccessSettings` forces the toggle back ON in that case — never show an off switch that didn't turn anything off.
+- **Consent is necessary but not sufficient.** What gets mirrored is `enabled && storeLocationIsDiscoverable`. `RecordingStore` verifies every `store-location.json` write by reading back what an external reader would resolve (`MilaStoreReader.resolvesActiveStore`) — because `relocateRecordings` switches the live paths *before* writing the pointer and leaves the old store on disk, so a failed write leaves the helper reading a store the app has stopped writing to. Relocation is deliberately NOT rolled back (the preference is persisted upstream, so a rollback wouldn't converge); access is paused instead and returns on its own once the pointer verifies.
+- Anything the MCP surface exposes must agree with `listRecordings`' trashed filter — `recording(id:)` excludes trashed rows too, so a retained UUID is not a way back into a deleted transcript. Keep that invariant in `MilaStoreReader`, not in the handler.
+- `stopRecording` publishes the live sidecar's `completed` + `final_recording_id` handoff only *after* the final `store.update` and only if that update reported success (`update(_:)` returns whether the `.txt` sidecar and recordings.json both landed). Both the ordering and the success check exist because `MilaStoreReader.transcriptText` reads the sidecar first, so a premature or unverified handoff points a client at a stale transcript.
+- The gate is a **consent** control, not a privilege boundary — `mila-mcp` runs as the user and could read the store regardless. Describe it that way in UI and docs; claiming it contains a hostile process would be false.
+- `MilaDataSource` is the seam that keeps the architecture reversible: `FileBackedDataSource` is the only implementation, and swapping in a socket-backed one (Mila serving a local API) should not require touching the handler bodies. Reading files directly is a deliberate choice — it keeps transcripts readable while Mila is closed. See `docs/mcp.md` for the full reasoning.
+
 ### Tests
+
 - `TranscriptionService` now requires a `diarizationSettings:` parameter. In tests, always pass `DiarizationSettings(defaults: .init(suiteName: "TestClassName.diarization")!)` to isolate from user defaults.
-- Run tests with `make test` or via Xcode.
+- Run tests with `make test` or via Xcode. Package tests: `make package-test` (TranscriptionCore + MilaKit).
 
 ## Release Process
 - **Release notes are REQUIRED, first.** Every release must add

@@ -135,9 +135,16 @@ settings:
 packages:
   TranscriptionCore:
     path: Packages/TranscriptionCore
+  MilaKit:
+    path: Packages/MilaKit
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
+  # MCP Swift SDK for the mila-mcp helper (stdio server exposing
+  # transcriptions to Claude). Pinned exactly, like Sparkle.
+  MCP:
+    url: https://github.com/modelcontextprotocol/swift-sdk
+    exactVersion: 0.12.1
     
 targets:
   Mila:
@@ -238,11 +245,55 @@ targets:
     dependencies:
       - package: TranscriptionCore
         product: TranscriptionCore
+      - package: MilaKit
+        product: MilaKit
       - package: Sparkle
         product: Sparkle
+      # Build-order only: the post-build script below copies the helper
+      # into Contents/MacOS. Not linked (it's an executable, not a lib).
+      - target: mila-mcp
+        link: false
+        embed: false
     settings:
       base:
         OTHER_LDFLAGS: "$(inherited) -framework Accelerate -framework Metal -framework MetalKit"
+    postBuildScripts:
+      # Ship the MCP helper inside the app bundle so users can register it
+      # with `claude mcp add mila -- /Applications/Mila.app/Contents/MacOS/mila-mcp`.
+      # Runs before the app's code-sign step, so the copy is covered by the
+      # bundle seal; the helper binary carries its own signature from its
+      # target build (and make-dmg.sh's --deep re-sign covers DMGs).
+      - name: Embed mila-mcp helper
+        script: |
+          cp -f "$BUILT_PRODUCTS_DIR/mila-mcp" "$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/mila-mcp"
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/mila-mcp
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(EXECUTABLE_FOLDER_PATH)/mila-mcp
+
+  mila-mcp:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: MilaMCP
+    dependencies:
+      - package: MilaKit
+        product: MilaKit
+      - package: MCP
+        product: MCP
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.island.whisper.IslandWhisper.mcp
+        # A command-line tool, not a bundle — nothing reads an Info.plist
+        # here, and generating one just adds an empty section.
+        GENERATE_INFOPLIST_FILE: NO
+        # Note on size: the MCP SDK pulls swift-nio into this target — a
+        # Debug mila-mcp is ~18 MB and carries ~33k NIO symbols, verified
+        # with `nm`. (An earlier note here also blamed ServiceLifecycle;
+        # that one genuinely isn't linked — zero symbols.) Release builds
+        # dead-strip, so check the shipped size before drawing conclusions
+        # from the Debug number.
 
   MilaTests:
     type: bundle.unit-test
@@ -254,6 +305,8 @@ targets:
       - target: Mila
       - package: TranscriptionCore
         product: TranscriptionCore
+      - package: MilaKit
+        product: MilaKit
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"

@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import OSLog
+import MilaKit
 
 private let postRecordingLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                       category: "PostRecordingCoordinator")
