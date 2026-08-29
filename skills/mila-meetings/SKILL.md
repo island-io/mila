@@ -32,6 +32,10 @@ the exact command with a Copy button)
   returns a stored `summary` when one exists — read it before deciding
   to re-summarize from the raw transcript. Transcripts may be in any
   language (often Hebrew); answer in the user's language.
+- Action items from `get_transcript` carry a `source`. `voice_command`
+  means the speaker dictated the item out loud; `inferred` means Live AI
+  derived it from the conversation. Do not report an inferred item as
+  something someone said — say it was picked up from the discussion.
 
 ## Live meeting assistant
 

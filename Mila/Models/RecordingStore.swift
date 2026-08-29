@@ -1016,7 +1016,30 @@ final class RecordingStore: ObservableObject {
             let data = try encoder.encode(folders)
             try data.write(to: foldersURL, options: .atomic)
         } catch {
-            print("RecordingStore persistFolders error: \(error)")
+            // Same treatment as `persist()` above, and for the same reason:
+            // `foldersURL` follows the user's chosen storage directory (see
+            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER
+            // in the message — "You don't have permission to save the file
+            // “folders.json” in the folder “Acme Corp”." A folder the user
+            // picked can name a client, an employer or a project, so the
+            // description is `.private`.
+            //
+            // Domain + code stay public: they are what separates "no
+            // permission" (NSCocoaErrorDomain 513) from a full disk or a
+            // missing directory, and they name no path. The filename in the
+            // message is a literal.
+            //
+            // The sibling `persistTombstones` / store-location writes keep a
+            // plain message because their URLs are anchored to
+            // `originalRootDirectory`, which `relocateRecordings` never
+            // moves — the containing folder there can only ever be `Mila`.
+            // (CodeRabbit on #183, CWE-532.)
+            let ns = error as NSError
+            recStoreLog.error("""
+                persistFolders failed for folders.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
         }
     }
 }

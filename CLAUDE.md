@@ -49,8 +49,9 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - Computed `status` properties must check `verificationStatus` before `lastVerifyResult` -- the persisted verified state should take precedence over nil in-memory verify results on launch.
 
 ### MCP server (mila-mcp) and MilaKit
+
 - The app persists two cross-process contracts for the embedded MCP helper: `store-location.json` (written by `RecordingStore` on init + relocate — where recordings.json currently lives) and `live/current.json` (the live-transcript sidecar written during recording by `LiveTranscriptSidecarWriter`). Both live at the DEFAULT app-support root and deliberately do not travel with a relocated recordings folder.
-- **Any change to what `Recording.encode(to:)` writes into recordings.json must be mirrored in MilaKit's `StoredRecording`** — `StoredRecordingDriftTests` in MilaTests is the tripwire. Keep `StoredRecording` decoding lenient (`decodeIfPresent` + defaults) so an older helper survives a newer app's schema.
+- **Any change to what `Recording.encode(to:)` writes into recordings.json must be mirrored in MilaKit's `StoredRecording`** — `StoredRecordingDriftTests` in MilaTests is the tripwire. That includes the NESTED element types (`TranscriptSegment`, `ActionItem`): they encode as objects, so a top-level key-set check sees `segments`/`actionItems` present on both sides however far the elements have drifted, which is how `ActionItem.source` stayed unmirrored. The test compares nested key sets too, each with its own allowlist. Keep `StoredRecording` decoding lenient (`decodeIfPresent` + defaults) so an older helper survives a newer app's schema.
 - MilaKit must stay dependency-free (in particular: no TranscriptionCore) — it links into `mila-mcp`, which must not drag in the whisper xcframework. Tool logic lives in `MilaMCPToolHandlers` (pure JSON), not in the executable.
 - **The helper is off by default and must stay that way.** A third contract, `mcp-access.json`, carries the user's consent; `MCPAccessGate` fails closed on a missing, unreadable, or malformed file, and `handle(tool:)` re-reads it on *every* call so revoking access bites a server that is already running. `MCPAccessSettings` owns the UserDefaults key (`mcp.enabled`) and mirrors it to that file on change and on every launch. Do not add a cache in front of the gate, and do not let a new tool path skip `handle(tool:)`.
 - **Both directions of the gate must fail closed, and they are not symmetric.** Failing to publish `enabled` is safe (the gate keeps denying); failing to publish `disabled` is not, because the previous `enabled: true` file survives a failed atomic write and keeps granting. `MCPAccessGate.set(false, …)` therefore escalates to deleting the file and throws only when access is *still* granted, and `MCPAccessSettings` forces the toggle back ON in that case — never show an off switch that didn't turn anything off.
@@ -61,6 +62,7 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - `MilaDataSource` is the seam that keeps the architecture reversible: `FileBackedDataSource` is the only implementation, and swapping in a socket-backed one (Mila serving a local API) should not require touching the handler bodies. Reading files directly is a deliberate choice — it keeps transcripts readable while Mila is closed. See `docs/mcp.md` for the full reasoning.
 
 ### Tests
+
 - `TranscriptionService` now requires a `diarizationSettings:` parameter. In tests, always pass `DiarizationSettings(defaults: .init(suiteName: "TestClassName.diarization")!)` to isolate from user defaults.
 - Run tests with `make test` or via Xcode. Package tests: `make package-test` (TranscriptionCore + MilaKit).
 

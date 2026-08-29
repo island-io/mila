@@ -7,10 +7,19 @@ import Foundation
 /// mila-mcp helper can decode the store without linking app code. Every
 /// field the app encodes must decode here — guarded by
 /// `StoredRecordingDriftTests` in MilaTests, which encodes a fully
-/// populated app `Recording` and asserts this type round-trips it.
-/// Decoding is deliberately lenient (`decodeIfPresent` + defaults) so an
-/// older helper never chokes on a newer app's additions.
+/// populated app `Recording` and asserts this type round-trips it —
+/// **including the nested `segments` and `actionItems` element types**,
+/// which encode as objects and so are invisible to a top-level key-set
+/// comparison. Decoding is deliberately lenient (`decodeIfPresent` +
+/// defaults) so an older helper never chokes on a newer app's additions.
 public struct StoredRecording: Codable, Identifiable, Sendable {
+    /// The app's `TranscriptSegment` also persists an `id` UUID. It is
+    /// deliberately NOT mirrored: it is minted by `TranscriptSegment`'s
+    /// default initializer purely to give SwiftUI lists a stable identity,
+    /// it is regenerated wholesale by a re-transcription, and no MCP tool
+    /// accepts a segment id. Mirroring it would advertise an addressability
+    /// the app does not offer. Recorded in `StoredRecordingDriftTests`'
+    /// nested allowlist so the tripwire stays armed for every OTHER field.
     public struct Segment: Codable, Equatable, Sendable, SpeakerTextSegment {
         public var start: Double
         public var end: Double
@@ -36,23 +45,54 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     }
 
     public struct ActionItem: Codable, Sendable {
+        /// The app's `ActionItem.id` — chosen by the LLM and stable across
+        /// Live-AI ticks so the app can dedupe. Mirrored because the app
+        /// persists it, **not** as a client-facing handle: it is unique
+        /// only within one recording's list (the model happily emits "1",
+        /// "2"), so no tool takes it as an argument.
+        public var id: String
         public var text: String
         public var speaker: String?
         public var timestampSeconds: Double?
+        /// Raw value of the app's `ActionItem.Source`: `voice_command` when
+        /// the speaker dictated the item out loud, `inferred` when the model
+        /// derived it from the conversation. Kept as a string so a future
+        /// case added by the app doesn't fail the decode.
+        ///
+        /// This is the field whose absence actually cost something: without
+        /// it every item read over MCP looked equally authoritative, and a
+        /// client answering "what did I commit to?" could not tell a
+        /// spoken commitment from a model's guess.
+        public var source: String
+        /// When the item first appeared in the app's Live-AI list. Wall
+        /// clock, not an offset into the recording — `timestampSeconds` is
+        /// the in-recording position. Mirrored for completeness; the tool
+        /// surface exposes the offset, which is what a client can act on.
+        public var addedAt: Date?
 
-        public init(text: String, speaker: String? = nil, timestampSeconds: Double? = nil) {
+        public init(id: String = "", text: String, speaker: String? = nil,
+                    timestampSeconds: Double? = nil, source: String = "",
+                    addedAt: Date? = nil) {
+            self.id = id
             self.text = text
             self.speaker = speaker
             self.timestampSeconds = timestampSeconds
+            self.source = source
+            self.addedAt = addedAt
         }
 
-        private enum CodingKeys: String, CodingKey { case text, speaker, timestampSeconds }
+        private enum CodingKeys: String, CodingKey {
+            case id, text, speaker, timestampSeconds, source, addedAt
+        }
 
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
+            id = try c.decodeIfPresent(String.self, forKey: .id) ?? ""
             text = try c.decodeIfPresent(String.self, forKey: .text) ?? ""
             speaker = try c.decodeIfPresent(String.self, forKey: .speaker)
             timestampSeconds = try c.decodeIfPresent(Double.self, forKey: .timestampSeconds)
+            source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
+            addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt)
         }
     }
 

@@ -155,6 +155,127 @@ final class StoredRecordingDriftTests: XCTestCase {
                       + "`intentionallyUnmirrored` with a reason.")
     }
 
+    /// The key-set check above stops at depth 1, and that is not enough.
+    ///
+    /// `segments` and `actionItems` encode as arrays of OBJECTS, so at the
+    /// top level they are one key each: `"segments"` is present on both
+    /// sides no matter how far the element types have drifted. That
+    /// recreated, one level down, the exact blind spot the file exists to
+    /// close — and it was not hypothetical. When this test was written it
+    /// immediately found live drift: the app's `ActionItem` persists `id`,
+    /// `source` and `addedAt`, and the mirror carried none of them, so
+    /// mila-mcp could not tell a `voice_command` item (the speaker dictated
+    /// it) from an `inferred` one (the model guessed). Every existing test
+    /// stayed green throughout, because `JSONDecoder` ignores keys it does
+    /// not know. (CodeRabbit on #183.)
+    ///
+    /// Each container gets its own allowlist for the same reason the
+    /// top-level one has one: an omission has to be a decision somebody
+    /// wrote down, not a field nobody noticed.
+    func test_every_persisted_nested_key_is_mirrored() throws {
+        // Keyed by the containing property so a reason is attached to the
+        // container it belongs to. Same rule as `intentionallyUnmirrored`:
+        // adding to this is a decision, leaving a key out of it is a bug.
+        let intentionallyUnmirrored: [String: Set<String>] = [
+            // `TranscriptSegment.id` is a UUID minted by the type's default
+            // initializer purely to give SwiftUI lists a stable identity. A
+            // re-transcription regenerates every one of them, and no MCP
+            // tool accepts a segment id — segments are addressed by order
+            // and by time. Mirroring it would advertise an addressability
+            // the app does not offer.
+            "segments": ["id"],
+            // Nothing. `ActionItem` is mirrored in full — see the note above
+            // for what the gap here used to cost.
+            "actionItems": [],
+        ]
+
+        let recording = fullyPopulatedRecording()
+        let appJSON = try JSONSerialization.jsonObject(
+            with: storeEncoder().encode(recording)) as? [String: Any] ?? [:]
+        let stored = try storeDecoder().decode(StoredRecording.self,
+                                               from: storeEncoder().encode(recording))
+        let mirrorJSON = try JSONSerialization.jsonObject(
+            with: storeEncoder().encode(stored)) as? [String: Any] ?? [:]
+
+        // Union across elements, not just `.first`: `encodeIfPresent` drops
+        // a nil optional, so one element that happens to leave a field unset
+        // would hide that field from the comparison.
+        func keyUnion(_ elements: [[String: Any]]) -> Set<String> {
+            elements.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
+        }
+
+        // Derive the containers from what the app actually encoded — every
+        // top-level key whose value is a non-empty array of objects. Driving
+        // the loop off `intentionallyUnmirrored` instead would leave this
+        // test with the same hole it exists to close: a NEW nested container
+        // nobody listed would simply not be checked.
+        let containers = appJSON.compactMap { key, value -> String? in
+            guard let elements = value as? [[String: Any]], !elements.isEmpty else { return nil }
+            return key
+        }.sorted()
+        XCTAssertEqual(containers, ["actionItems", "segments"],
+                       "Recording gained (or lost) a nested container. Populate it in "
+                       + "fullyPopulatedRecording(), mirror its element type in "
+                       + "StoredRecording, and pin its shape in "
+                       + "test_nested_fixtures_populate_every_persisted_element_key.")
+        XCTAssertTrue(Set(intentionallyUnmirrored.keys).subtracting(containers).isEmpty,
+                      "stale entries in the nested allowlist: "
+                      + "\(Set(intentionallyUnmirrored.keys).subtracting(containers).sorted())")
+
+        for container in containers {
+            let allowlist = intentionallyUnmirrored[container] ?? []
+            let appElements = try XCTUnwrap(appJSON[container] as? [[String: Any]])
+            let mirrorElements = try XCTUnwrap(mirrorJSON[container] as? [[String: Any]],
+                                               "\(container) is missing (or not an array of "
+                                               + "objects) in the mirror's JSON — the whole "
+                                               + "container is unmirrored")
+            XCTAssertFalse(mirrorElements.isEmpty,
+                           "\(container) round-tripped as an EMPTY array — the mirror "
+                           + "dropped every element")
+
+            let missing = keyUnion(appElements)
+                .subtracting(keyUnion(mirrorElements))
+                .subtracting(allowlist)
+
+            XCTAssertTrue(missing.isEmpty,
+                          "Recording persists \(container)[].\(missing.sorted()) but MilaKit's "
+                          + "StoredRecording.\(container) element does not mirror them, so "
+                          + "mila-mcp will not see them. Add the field(s) to the mirror's "
+                          + "element type, or add them to this test's allowlist with a reason.")
+        }
+    }
+
+    /// The nested check above is only as good as the fixture feeding it:
+    /// `encodeIfPresent` drops a nil optional, so a nested field left unset
+    /// in `fullyPopulatedRecording()` never appears in the app's JSON and
+    /// silently cannot be compared. Pin the element key sets literally, so
+    /// a new nested field forces someone to look here.
+    func test_nested_fixtures_populate_every_persisted_element_key() throws {
+        let appJSON = try JSONSerialization.jsonObject(
+            with: storeEncoder().encode(fullyPopulatedRecording())) as? [String: Any] ?? [:]
+
+        let segment = try XCTUnwrap((appJSON["segments"] as? [[String: Any]])?.first)
+        XCTAssertEqual(Set(segment.keys), ["id", "start", "end", "text", "speaker"],
+                       "TranscriptSegment's persisted shape changed — update the fixture "
+                       + "and decide whether the new key belongs in StoredRecording.Segment")
+
+        let item = try XCTUnwrap((appJSON["actionItems"] as? [[String: Any]])?.first)
+        XCTAssertEqual(Set(item.keys),
+                       ["id", "text", "speaker", "timestampSeconds", "source", "addedAt"],
+                       "ActionItem's persisted shape changed — update the fixture and decide "
+                       + "whether the new key belongs in StoredRecording.ActionItem")
+    }
+
+    /// The recovered fields must actually arrive, not merely have a key.
+    func test_action_item_provenance_survives_the_round_trip() throws {
+        let data = try storeEncoder().encode([fullyPopulatedRecording()])
+        let s = try XCTUnwrap(storeDecoder().decode([StoredRecording].self, from: data).first)
+        let item = try XCTUnwrap(s.actionItems?.first)
+        XCTAssertEqual(item.id, "a1")
+        XCTAssertEqual(item.source, ActionItem.Source.llmInferred.rawValue)
+        XCTAssertEqual(item.addedAt, fixtureCreated)
+    }
+
     func test_minimal_recording_decodes_with_defaults() throws {
         let recording = Recording(title: "Bare", source: .microphone,
                                   audioFileName: "bare.wav")

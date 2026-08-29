@@ -342,6 +342,71 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertTrue(note.contains("list_recordings"), note)
     }
 
+    // MARK: - Action items
+
+    /// `ActionItem.source` distinguishes an item the speaker DICTATED
+    /// (`voice_command`) from one the model INFERRED. The app has always
+    /// persisted it; the mirror did not carry it and the handler did not
+    /// emit it, so over MCP the two were indistinguishable and a client
+    /// answering "what did I commit to?" had to treat a guess as a
+    /// commitment. Mirrored + exposed after `StoredRecordingDriftTests`
+    /// grew a nested key-set check that finally saw the gap.
+    func test_action_items_expose_source_and_timestamp() throws {
+        try seedStore([
+            StoredRecording(
+                title: "Planning", createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+                duration: 60, source: "meeting", audioFileName: "Planning.wav",
+                status: "completed",
+                segments: [.init(start: 0, end: 2, text: "hello", speaker: "SPEAKER_00")],
+                summary: "A summary.",
+                actionItems: [
+                    .init(id: "a1", text: "Ship it", speaker: "SPEAKER_00",
+                          timestampSeconds: 12.5, source: "voice_command",
+                          addedAt: Date(timeIntervalSince1970: 1_700_000_100)),
+                    .init(id: "a2", text: "Maybe refactor", timestampSeconds: 30,
+                          source: "inferred"),
+                ],
+                speakerNames: ["SPEAKER_00": "Dana"]),
+        ])
+
+        let result = try call("get_transcript")
+        let items = try XCTUnwrap(result["action_items"] as? [[String: Any]])
+        XCTAssertEqual(items.count, 2)
+
+        XCTAssertEqual(items[0]["text"] as? String, "Ship it")
+        // Raw diarizer IDs never leave the handler — resolved to the display name.
+        XCTAssertEqual(items[0]["speaker"] as? String, "Dana")
+        XCTAssertEqual(items[0]["source"] as? String, "voice_command")
+        XCTAssertEqual(items[0]["timestamp_seconds"] as? Double, 12.5)
+
+        XCTAssertEqual(items[1]["source"] as? String, "inferred")
+        XCTAssertNil(items[1]["speaker"], "an unattributed item must not invent a speaker")
+
+        // The LLM-chosen id is mirrored but deliberately not published: it is
+        // unique only within one recording's list, so exposing it would
+        // suggest a handle no tool accepts.
+        XCTAssertNil(items[0]["id"])
+    }
+
+    /// An older store — written before the app persisted `source` — must
+    /// still decode, and must not emit an empty `source` that a client
+    /// would have to special-case. Absent beats blank.
+    func test_action_items_from_a_legacy_store_omit_source() throws {
+        let json = """
+        [{"id":"\(UUID().uuidString)","title":"Legacy",
+        "createdAt":"2023-11-14T22:13:20Z","duration":60,"source":"meeting",
+        "audioFileName":"Legacy.wav","status":"completed","segments":[],
+        "actionItems":[{"text":"Old item"}]}]
+        """
+        try Data(json.utf8).write(to: root.appendingPathComponent("recordings.json"))
+
+        let items = try XCTUnwrap(try call("get_transcript")["action_items"] as? [[String: Any]])
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(items[0]["text"] as? String, "Old item")
+        XCTAssertNil(items[0]["source"])
+        XCTAssertNil(items[0]["timestamp_seconds"])
+    }
+
     // MARK: - ISO 8601 dates
 
     /// `iso(_:)` moved off `ISO8601DateFormatter` (a non-thread-safe class
@@ -370,17 +435,54 @@ final class MilaMCPToolHandlersTests: XCTestCase {
             .compactMap { $0["title"] as? String }, ["Newer"])
     }
 
-    /// A fractional-seconds timestamp used to fail the internet-date-time
-    /// attempt, fall through to the date-only attempt, and parse as
-    /// MIDNIGHT — quietly widening the caller's window by up to a day.
-    /// `2023-11-14T22:13:20.500Z` is after the `daysAgo: 0` fixture
-    /// (22:13:20Z), so a correct parse excludes it and the old midnight
-    /// parse would have let it through.
-    func test_fractional_seconds_no_longer_parse_as_midnight() throws {
+    /// A fractional-seconds timestamp must not fall through to the date-only
+    /// attempt and parse as MIDNIGHT — that quietly widens the caller's
+    /// window by up to a day. It is the shape any client built on JS gets
+    /// for free: `Date.toISOString()` always emits `.mmm`.
+    ///
+    /// The failure is silent rather than loud because `fullDate.parse`
+    /// matches a PREFIX — handed the whole timestamp it succeeds at
+    /// midnight instead of throwing — so nothing but an assertion catches
+    /// it. Both directions are pinned: `2023-11-14T22:13:20.500Z` is half a
+    /// second AFTER the `daysAgo: 0` fixture (22:13:20Z), so as an `after`
+    /// bound it must exclude the fixture (midnight would include it) and as
+    /// a `before` bound it must include it (midnight would exclude it).
+    /// One assertion alone is satisfiable by a broken parse.
+    func test_fractional_seconds_do_not_parse_as_midnight() throws {
         try seedStore([meeting("Exactly", daysAgo: 0)])
-        let result = try call("list_recordings", ["after": "2023-11-14T22:13:20.500Z"])
-        XCTAssertEqual(result["count"] as? Int, 0,
-                       "a sub-second-later cursor must exclude the fixture, not fall back to midnight")
+
+        let after = try call("list_recordings", ["after": "2023-11-14T22:13:20.500Z"])
+        XCTAssertEqual(after["count"] as? Int, 0,
+                       "a sub-second-later `after` cursor must exclude the fixture, "
+                       + "not fall back to midnight")
+
+        let before = try call("list_recordings", ["before": "2023-11-14T22:13:20.500Z"])
+        XCTAssertEqual(before["count"] as? Int, 1,
+                       "a sub-second-later `before` cursor must include the fixture; "
+                       + "a midnight fallback would have excluded it")
+    }
+
+    /// Fractional seconds combined with a numeric UTC offset — the other
+    /// half of the shape a non-Z client sends. `2023-11-15T00:13:20.500+02:00`
+    /// is the same instant as `2023-11-14T22:13:20.500Z`, so it must behave
+    /// identically to the test above. A date-only fallback would read the
+    /// *local* calendar date (the 15th) and be a day out on top of being
+    /// midnight.
+    func test_fractional_seconds_with_utc_offset_parse_as_the_same_instant() throws {
+        try seedStore([meeting("Exactly", daysAgo: 0)])
+        let result = try call("list_recordings", ["after": "2023-11-15T00:13:20.500+02:00"])
+        XCTAssertEqual(result["count"] as? Int, 0)
+    }
+
+    /// A whole-second timestamp must keep working after the fractional
+    /// attempt was inserted — the new style is field-exact in the other
+    /// direction, so it must not be the only one tried.
+    func test_whole_second_timestamps_still_parse_after_the_fractional_attempt() throws {
+        try seedStore([meeting("Exactly", daysAgo: 0)])
+        XCTAssertEqual(try call("list_recordings",
+                                ["after": "2023-11-14T22:13:20Z"])["count"] as? Int, 1)
+        XCTAssertEqual(try call("list_recordings",
+                                ["after": "2023-11-14T22:13:21Z"])["count"] as? Int, 0)
     }
 
     func test_unparseable_date_is_rejected_with_the_offending_value() throws {

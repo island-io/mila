@@ -108,6 +108,9 @@ public struct MilaMCPToolHandlers: Sendable {
             Fetch one recording's full transcript with speaker names resolved (e.g. "John \
             Doe: …"), plus its summary and action items when available. Pass the id from \
             list_recordings/search_transcripts; omit it for the latest completed recording.
+            Each action item carries "source": "voice_command" when the speaker dictated it \
+            out loud, "inferred" when the model derived it from the conversation — do not \
+            present an inferred item as something the speaker said.
             """,
             inputSchema: [
                 "type": "object",
@@ -262,6 +265,14 @@ public struct MilaMCPToolHandlers: Sendable {
                     var obj: [String: Any] = ["text": item.text]
                     if let speaker = item.speaker {
                         obj["speaker"] = recording.speakerNames[speaker] ?? speaker
+                    }
+                    // `voice_command` (the speaker dictated the item) vs
+                    // `inferred` (the model derived it). Without this the
+                    // two are indistinguishable and every item reads as
+                    // equally authoritative — see StoredRecording.ActionItem.
+                    if !item.source.isEmpty { obj["source"] = item.source }
+                    if let seconds = item.timestampSeconds {
+                        obj["timestamp_seconds"] = seconds
                     }
                     return obj
                 }
@@ -438,12 +449,19 @@ public struct MilaMCPToolHandlers: Sendable {
     /// The format style is a value type and `Sendable`, so one shared
     /// instance is both correct and allocation-free. Output is byte-identical
     /// to the old formatter's default (`.withInternetDateTime` in GMT →
-    /// `2026-07-15T12:34:56Z`), and parsing accepts the same shapes plus
-    /// one the old code got WRONG: a fractional-seconds timestamp
-    /// (`…T22:13:20.500Z`) failed the internet-date-time attempt, fell
-    /// through to the date-only attempt, and silently parsed as midnight —
-    /// a 22-hour error in the caller's `after` / `before` filter.
+    /// `2026-07-15T12:34:56Z`).
     private static let internetDateTime = Date.ISO8601FormatStyle()
+    /// The same style with `includingFractionalSeconds`, tried second.
+    ///
+    /// Whether `internetDateTime` tolerates a fractional-seconds input is
+    /// **runtime-dependent**: current Foundation parses `…T22:13:20.500Z`
+    /// with the plain style, but the styles are field-exact on the older
+    /// Foundation shipped with this package's deployment floor (macOS 14),
+    /// where the plain style rejects it. Relying on the newer behaviour
+    /// would make `after` / `before` correct on the dev machine and wrong
+    /// on a supported OS — the worst shape of bug. (CodeRabbit on #183.)
+    private static let fractionalDateTime =
+        Date.ISO8601FormatStyle(includingFractionalSeconds: true)
     private static let fullDate = Date.ISO8601FormatStyle(dateSeparator: .dash,
                                                           timeZone: .gmt)
         .year().month().day()
@@ -455,6 +473,16 @@ public struct MilaMCPToolHandlers: Sendable {
     private func date(_ args: [String: Any], _ key: String) throws -> Date? {
         guard let raw = args[key] as? String else { return nil }
         if let parsed = try? Self.internetDateTime.parse(raw) { return parsed }
+        // Fractional seconds — a real shape for an MCP client that built the
+        // string from a JS `Date.toISOString()` (which always emits `.mmm`).
+        //
+        // Ordering is load-bearing, not cosmetic. `fullDate.parse` matches a
+        // PREFIX: handed the whole `2023-11-14T22:13:20.500Z` it succeeds and
+        // returns MIDNIGHT rather than throwing. So on a runtime where the
+        // plain style rejects fractional seconds, putting this attempt after
+        // the date-only fallback would not surface an error — it would
+        // silently widen the caller's window by up to 24 hours.
+        if let parsed = try? Self.fractionalDateTime.parse(raw) { return parsed }
         // Accept plain dates too ("2026-07-15").
         if let parsed = try? Self.fullDate.parse(raw) { return parsed }
         throw ToolError.invalidArguments("\(key) must be an ISO 8601 date, got \"\(raw)\"")
