@@ -74,6 +74,81 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].embedding[1], 0.5, accuracy: 0.001)
     }
 
+    /// The clamp that keeps `sampleCount` inside `maxSampleCount` must apply
+    /// to the **stored count only**, never to the divisor of the weighted
+    /// mean. Both folds weight their numerator by the true counts, so a
+    /// clamped divisor stops producing a mean and starts scaling the whole
+    /// centroid by `rawTotal / maxSampleCount`.
+    ///
+    /// Two ceiling-count profiles is the worst case — `rawTotal` is very
+    /// nearly `Int.max`, i.e. twice the clamp — so the wrong shape yields
+    /// `[1, 1]` where the mean is `[0.5, 0.5]`. The `accuracy: 0.001`
+    /// assertions below are therefore discriminating rather than decorative:
+    /// dividing by the clamped total fails them by 0.5.
+    func test_updateProfile_divides_by_true_total_when_stored_count_saturates() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+
+        let ceiling = VoiceProfile.maxSampleCount
+        store.updateProfile(name: "Alice", embedding: [1, 0], sampleCount: ceiling)
+        store.updateProfile(name: "Alice", embedding: [0, 1], sampleCount: ceiling)
+
+        XCTAssertEqual(store.profiles.count, 1)
+        // (1*c + 0*c) / 2c = 0.5 — NOT (1*c + 0*c) / c = 1.0.
+        XCTAssertEqual(store.profiles[0].embedding[0], 0.5, accuracy: 0.001)
+        XCTAssertEqual(store.profiles[0].embedding[1], 0.5, accuracy: 0.001)
+        // The stored count saturates rather than overflowing…
+        XCTAssertEqual(store.profiles[0].sampleCount, ceiling)
+        // …and stays something `load` will hand back, which is the whole
+        // point of having a ceiling.
+        XCTAssertNil(store.profiles[0].unusableReason)
+    }
+
+    /// The control for the case above: a sum that lands exactly *on* the
+    /// ceiling is not clamped at all, so the two divisors coincide and the
+    /// mean is unaffected. Fixing the fold must not disturb this.
+    func test_updateProfile_sum_exactly_at_ceiling_is_not_clamped() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+
+        let ceiling = VoiceProfile.maxSampleCount
+        store.updateProfile(name: "Alice", embedding: [1, 0], sampleCount: ceiling - 1)
+        store.updateProfile(name: "Alice", embedding: [0, 1], sampleCount: 1)
+
+        XCTAssertEqual(store.profiles[0].sampleCount, ceiling)
+        // The lone new sample is a ~10⁻¹⁹ share, so the centroid barely moves.
+        XCTAssertEqual(store.profiles[0].embedding[0], 1.0, accuracy: 0.001)
+        XCTAssertEqual(store.profiles[0].embedding[1], 0.0, accuracy: 0.001)
+        XCTAssertNil(store.profiles[0].unusableReason)
+    }
+
+    /// Same invariant on the other fold. `mergeProfiles` had the identical
+    /// clamped-divisor shape, so it needs its own guard — a fix applied to
+    /// one call site and not the other is exactly the failure mode here.
+    func test_mergeProfiles_divides_by_true_total_when_stored_count_saturates() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+
+        let ceiling = VoiceProfile.maxSampleCount
+        store.updateProfile(name: "Alice", embedding: [1, 0], sampleCount: ceiling)
+        store.updateProfile(name: "Bob", embedding: [0, 1], sampleCount: ceiling)
+
+        let merged = store.mergeProfiles(keep: "Alice", absorb: "Bob")
+
+        XCTAssertEqual(store.profiles.count, 1)
+        // Same discrimination as above: the clamped divisor gives [1, 1].
+        XCTAssertEqual(merged?.embedding[0] ?? 0, 0.5, accuracy: 0.001)
+        XCTAssertEqual(merged?.embedding[1] ?? 0, 0.5, accuracy: 0.001)
+        XCTAssertEqual(merged?.sampleCount, ceiling)
+        XCTAssertNil(merged?.unusableReason)
+    }
+
     func test_updateProfile_rejects_dimension_mismatch() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

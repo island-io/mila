@@ -27,7 +27,29 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
     /// valid counts can be added without trapping**, which both
     /// `updateProfile` and `mergeProfiles` do. Those two also clamp their sums
     /// to it, so the store can never produce a value its own validator would
-    /// later reject.
+    /// later reject. `Int.max / 2 + Int.max / 2 == Int.max - 1`: exactly one
+    /// unit of headroom, which is all that is needed.
+    ///
+    /// **The clamp applies to the stored count only, never to the divisor of
+    /// the weighted mean.** Both folds weight their numerator by the *true*
+    /// counts, so dividing by the clamped total would not produce a mean at
+    /// all — it would scale the whole centroid by `rawTotal / maxSampleCount`,
+    /// up to 2× at the ceiling. Verified: folding two ceiling-count profiles
+    /// `[1, 0]` and `[0, 1]` that way yields `[1, 1]` where the mean is
+    /// `[0.5, 0.5]`.
+    ///
+    /// The count therefore **saturates** while the centroid stays exact, and
+    /// the two disagree from that point on: a profile that has really seen
+    /// `rawTotal` samples reports `maxSampleCount`, so the *next* fold
+    /// under-weights it and lets the incoming sample pull the centroid
+    /// harder than it should — by at most 2×, since no single valid count
+    /// exceeds the ceiling either. That is a deliberate trade. The
+    /// alternatives are worse: storing `rawTotal` unclamped re-arms the
+    /// overflow trap this ceiling exists to prevent, and refusing the fold
+    /// would silently stop a speaker from ever being updated again. It is
+    /// also unreachable in practice — at one utterance per second, reaching
+    /// the ceiling takes on the order of 10¹¹ years — so the residual
+    /// imprecision is bounded, documented and never paid.
     static let maxSampleCount = Int.max / 2
 
     /// Why this profile cannot be used, or nil when it is sound.
@@ -204,19 +226,23 @@ final class SpeakerProfileStore: ObservableObject {
             // incoming one by the guard above, the stored one because every
             // route into `profiles` (this method, or `load`'s validation)
             // enforces it. Swift traps on `Int` overflow, and a decoded
-            // `Int.max` here would otherwise crash the app outright. The
-            // clamp keeps the result inside the same bound, so what is
-            // written back is always something `load` will accept.
-            let totalCount = min(existing.sampleCount + sampleCount, VoiceProfile.maxSampleCount)
+            // `Int.max` here would otherwise crash the app outright.
+            let rawTotal = existing.sampleCount + sampleCount
+            // Clamped so what is written back is always something `load` will
+            // accept. **Only the stored count is clamped** — the fold below
+            // divides by `rawTotal`, because its numerator is weighted by the
+            // true counts and a clamped divisor would scale the centroid
+            // instead of averaging it. See `VoiceProfile.maxSampleCount`.
+            let storedCount = min(rawTotal, VoiceProfile.maxSampleCount)
             var merged = [Float](repeating: 0, count: embedding.count)
             for i in 0..<merged.count {
                 merged[i] = (existing.embedding[i] * Float(existing.sampleCount)
-                           + embedding[i] * Float(sampleCount)) / Float(totalCount)
+                           + embedding[i] * Float(sampleCount)) / Float(rawTotal)
             }
             profiles[idx].embedding = merged
-            profiles[idx].sampleCount = totalCount
+            profiles[idx].sampleCount = storedCount
             profiles[idx].lastSeenAt = Date()
-            profileLog.log("updateProfile: merged into \(trimmed, privacy: .private) (now \(totalCount) samples)")
+            profileLog.log("updateProfile: merged into \(trimmed, privacy: .private) (now \(storedCount) samples)")
             save()
         } else {
             let profile = VoiceProfile(
@@ -301,15 +327,19 @@ final class SpeakerProfileStore: ObservableObject {
         }
         let dim = keep.embedding.count
         guard dim > 0 else { return nil }
-        // Bounded and clamped for the same reason as `updateProfile`'s sum.
-        let totalCount = min(keep.sampleCount + absorb.sampleCount, VoiceProfile.maxSampleCount)
+        // Bounded and clamped exactly as in `updateProfile`, and for the same
+        // reasons: the sum cannot trap because both stored counts are at most
+        // `maxSampleCount`, and only the *stored* count is clamped — the fold
+        // divides by the true `rawTotal` so it stays a weighted mean.
+        let rawTotal = keep.sampleCount + absorb.sampleCount
+        let storedCount = min(rawTotal, VoiceProfile.maxSampleCount)
         var merged = [Float](repeating: 0, count: dim)
         for i in 0..<dim {
             merged[i] = (keep.embedding[i] * Float(keep.sampleCount)
-                       + absorb.embedding[i] * Float(absorb.sampleCount)) / Float(totalCount)
+                       + absorb.embedding[i] * Float(absorb.sampleCount)) / Float(rawTotal)
         }
         profiles[keepIdx].embedding = merged
-        profiles[keepIdx].sampleCount = totalCount
+        profiles[keepIdx].sampleCount = storedCount
         profiles[keepIdx].lastSeenAt = max(keep.lastSeenAt, absorb.lastSeenAt)
         profiles.removeAll { $0.id == absorb.id }
         profileLog.log("mergeProfiles: merged \(absorbName, privacy: .private) into \(keepName, privacy: .private)")
