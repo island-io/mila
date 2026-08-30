@@ -76,17 +76,21 @@ final class WindowChromeExemptionTests: XCTestCase {
         )
     }
 
-    /// Negative control for the other half: the old `contains("alert")` arm
-    /// could never have matched a real alert, whatever the casing, because the
-    /// identifier carries no such substring.
-    func test_the_old_alert_check_could_never_have_matched_a_real_alert() {
-        let alert = NSAlert()
-        alert.messageText = "probe"
-        let id = alert.window.identifier?.rawValue ?? ""
-
-        XCTAssertFalse(id.lowercased().contains("alert"),
-                       "Alert identifiers carry no 'alert' substring (observed: '\(id)'), so case was never the only problem here.")
-    }
+    // Why there is no test asserting that an alert's identifier lacks an
+    // "alert" substring, even though that is what killed the old
+    // `id.contains("alert")` arm:
+    //
+    // When this was written, `NSAlert().window.identifier` was `_NS:87` — an
+    // opaque AppKit nib id with no recognisable substring in any casing. That
+    // observation is why the guard now matches on the panel *class* instead of
+    // the identifier. But asserting it in CI would pin an AppKit implementation
+    // detail we neither control nor rely on: a macOS update could start
+    // including "alert" in that identifier and turn the suite red while
+    // `isChromeExempt(identifier:isPanel:)` remained perfectly correct.
+    //
+    // `test_a_real_alert_window_is_exempt_by_being_a_panel` covers the contract
+    // that actually matters — an alert is exempt because it is an `NSPanel` —
+    // and it keeps holding whatever AppKit does to the identifier.
 
     func test_open_and_save_panels_are_exempt() {
         // Typed as NSWindow deliberately: `NSOpenPanel is NSPanel` is
