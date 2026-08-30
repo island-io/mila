@@ -246,6 +246,99 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.profiles[0].sampleCount, 5)
     }
 
+    // MARK: - Deletion observers
+
+    /// Deleting is a privacy action, and the store is not the only place the
+    /// data lives: `LiveSpeakerDiarizer` was seeded with these centroids at
+    /// record-start and keeps its own copy. The notification is what lets a
+    /// recording already in flight drop them — without it the deletion is
+    /// undone at stop. `RecognisedSpeakerAssignerTests` drives the whole
+    /// chain; these pin the store's half of it.
+    func test_deleteAllProfiles_notifies_observers() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        store.deleteAllProfiles()
+
+        XCTAssertEqual(seen, [.all])
+    }
+
+    /// The case that most needs it. With the feature off the file is never
+    /// parsed, so `profiles` is empty and the store cannot say *what* it
+    /// deleted — `.all` is both the honest answer and the safe one. Firing
+    /// only when something was in memory would skip exactly the user who
+    /// switched the feature off and then deleted.
+    func test_deleteAllProfiles_notifies_even_with_nothing_in_memory() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir, enabled: false)
+        XCTAssertTrue(store.profiles.isEmpty, "precondition: nothing parsed while off")
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        store.deleteAllProfiles()
+
+        XCTAssertEqual(seen, [.all])
+    }
+
+    func test_deleteProfile_notifies_with_the_deleted_name() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [2], sampleCount: 1)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        store.deleteProfile(name: "Alice")
+        let bobID = try XCTUnwrap(store.profile(named: "Bob")?.id)
+        store.deleteProfile(id: bobID)
+
+        XCTAssertEqual(seen, [.named(["Alice"]), .named(["Bob"])])
+    }
+
+    /// A delete that removed nothing must not disturb an in-flight
+    /// recording's pool.
+    func test_a_delete_that_matches_nothing_does_not_notify() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        store.deleteProfile(name: "Nobody")
+        store.deleteProfile(id: UUID())
+
+        XCTAssertTrue(seen.isEmpty)
+        XCTAssertEqual(store.profiles.count, 1)
+    }
+
+    /// Two registrants, both heard — the mistake `addEnabledObserver`'s
+    /// single-slot version made.
+    func test_every_deletion_observer_is_called() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+
+        var first = 0, second = 0
+        store.addDeletionObserver { _ in first += 1 }
+        store.addDeletionObserver { _ in second += 1 }
+        store.deleteAllProfiles()
+
+        XCTAssertEqual(first, 1)
+        XCTAssertEqual(second, 1)
+    }
+
     func test_seedEntries_returns_all_profiles() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

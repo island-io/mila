@@ -598,7 +598,23 @@ struct MilaApp: App {
         let assigner = RecognisedSpeakerAssigner(store: store,
                                                 diarizer: liveDiar,
                                                 snapshots: voiceSnapshots,
-                                                settings: voiceSettings)
+                                                settings: voiceSettings,
+                                                profileStillStored: { name in
+                                                    profileStoreRef.profileExists(name: name)
+                                                })
+        // Deleting voice profiles has to reach the recording that is already
+        // running, not just memory and the file. The pool was seeded from
+        // these profiles at record-start and keeps its own copy of every
+        // centroid, so without this the rest of the recording goes on
+        // matching the erased voice and `assigner.finish` writes it back at
+        // stop — the deleted file reappears, holding the same person's
+        // fingerprint. Same immediacy as the opt-out path above.
+        profileStoreRef.addDeletionObserver { [weak liveDiar] deletion in
+            switch deletion {
+            case .all: liveDiar?.forgetSeededProfiles()
+            case .named(let names): liveDiar?.forgetSeededProfiles(named: names)
+            }
+        }
         actions.onRecordingFinalized = { [assigner] recordingID in
             assigner.finish(recording: recordingID)
         }

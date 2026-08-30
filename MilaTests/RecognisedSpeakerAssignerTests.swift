@@ -71,7 +71,15 @@ final class RecognisedSpeakerAssignerTests: XCTestCase {
 
     /// Alice on disk and a seeded pool — everything the assigner needs.
     /// Deliberately creates no `Recording`: each test controls store contents.
-    private func makeWorld(enabled: Bool = true) -> World {
+    ///
+    /// `deletionObserver` and `storedProfileGate` are the two locks that stop
+    /// a mid-recording deletion being undone at stop. Both default to on —
+    /// the shipping wiring — and the deletion tests below switch them off
+    /// individually to show each one works alone, and off together to
+    /// reconstruct the pre-fix shape as a negative control.
+    private func makeWorld(enabled: Bool = true,
+                           deletionObserver: Bool = true,
+                           storedProfileGate: Bool = true) -> World {
         let settings = makeSettings(enabled: enabled)
         let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
         profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 40)
@@ -91,15 +99,39 @@ final class RecognisedSpeakerAssignerTests: XCTestCase {
 
         let diarizer = LiveSpeakerDiarizer()
         diarizer.similarityThreshold = 0.7
+        // Same wiring MilaApp.init installs: a deletion has to reach the
+        // pool of a recording that is already running.
+        if deletionObserver {
+            profiles.addDeletionObserver { [weak diarizer] deletion in
+                switch deletion {
+                case .all: diarizer?.forgetSeededProfiles()
+                case .named(let names): diarizer?.forgetSeededProfiles(named: names)
+                }
+            }
+        }
         diarizer.reset()
         diarizer.seedPool(with: profiles.seedEntries())
 
-        let assigner = RecognisedSpeakerAssigner(store: store,
-                                                 diarizer: diarizer,
-                                                 snapshots: snapshots,
-                                                 settings: settings)
+        let assigner = RecognisedSpeakerAssigner(
+            store: store,
+            diarizer: diarizer,
+            snapshots: snapshots,
+            settings: settings,
+            // The `false` branch is the pre-gate shape, not a shortcut: the
+            // tests that pass `storedProfileGate: false` need exactly it.
+            profileStillStored: { name in
+                storedProfileGate ? profiles.profileExists(name: name) : true
+            })
         return World(store: store, profiles: profiles, snapshots: snapshots,
                      diarizer: diarizer, assigner: assigner, settings: settings)
+    }
+
+    /// Where `SpeakerProfileStore` keeps its file, so the tests can assert
+    /// that a deleted one is not silently recreated.
+    private var profilesFile: URL { tempRoot.appendingPathComponent("speaker-profiles.json") }
+
+    private var profilesFileExists: Bool {
+        FileManager.default.fileExists(atPath: profilesFile.path)
     }
 
     /// Alice speaks once, confidently.
@@ -265,6 +297,165 @@ final class RecognisedSpeakerAssignerTests: XCTestCase {
         w.assigner.finish(recording: meeting.id)
 
         XCTAssertEqual(w.snapshots.heldRecordingCount, 0, "no embeddings held while off")
+        XCTAssertNil(recording(meeting.id, in: w.store)?.speakerNames["SPEAKER_00"])
+    }
+
+    // MARK: - Deleting voice profiles while a recording is in flight
+
+    /// **The privacy invariant: deleting voice profiles during a recording
+    /// must not be undone when that recording stops.**
+    ///
+    /// The pool was seeded from the profiles at record-start and holds its
+    /// own copy of every centroid, so deleting the file and the in-memory
+    /// list leaves the deletion two thirds done. Left alone, `finish` names
+    /// the still-seeded speaker, `setSpeakerName` fires `onSpeakerNamed`, and
+    /// `updateProfile` — which *creates* when the name is absent, because
+    /// that is how hand-naming makes a profile — writes the deleted person
+    /// straight back, recreating `speaker-profiles.json` in the process. See
+    /// `test_without_either_lock_the_profile_comes_straight_back` for the
+    /// measured before-state: the user is told their voice data is gone
+    /// while it quietly returns.
+    func test_deleting_profiles_mid_recording_does_not_bring_them_back() {
+        let w = makeWorld()
+        aliceSpeaksConfidently(w)
+        let meeting = add("Meeting", createdAt: Date(), to: w.store)
+
+        // Mid-recording: Settings ▸ Delete Voice Profiles.
+        w.profiles.deleteAllProfiles()
+        XCTAssertFalse(profilesFileExists, "precondition: the file is gone")
+
+        // ...and now the recording stops.
+        w.assigner.finish(recording: meeting.id)
+
+        XCTAssertTrue(w.profiles.profiles.isEmpty, "nothing may be back in memory")
+        XCTAssertNil(alice(w))
+        XCTAssertFalse(profilesFileExists, "speaker-profiles.json must not be recreated")
+        XCTAssertFalse(w.profiles.hasStoredProfilesOnDisk,
+                       "and Settings must not start offering to delete it again")
+        XCTAssertNil(recording(meeting.id, in: w.store)?.speakerNames["SPEAKER_00"],
+                     "the deleted name must not be stamped on the transcript either")
+    }
+
+    /// Negative control — the pre-fix wiring, reconstructed from the same
+    /// real objects: no deletion observer, and the assigner's stored-profile
+    /// gate answering `true` unconditionally. It proves the assertions above
+    /// discriminate, and records exactly what the resurrection looked like.
+    ///
+    /// Note *what* comes back. Not the profile that was deleted: a fresh
+    /// `id`, a fresh `createdAt`, and `sampleCount` counting only this
+    /// recording. But the name returns, the file returns, and the embedding —
+    /// this recording's own centroid for the same person — sits at better
+    /// than 0.999 cosine to the deleted one, so it recognises them just as
+    /// well in every future recording. Partial by the numbers, complete in
+    /// effect.
+    func test_without_either_lock_the_profile_comes_straight_back() {
+        let w = makeWorld(deletionObserver: false, storedProfileGate: false)
+        aliceSpeaksConfidently(w)
+        let meeting = add("Meeting", createdAt: Date(), to: w.store)
+        let originalID = alice(w)?.id
+
+        w.profiles.deleteAllProfiles()
+        XCTAssertFalse(profilesFileExists, "precondition: the file is gone")
+
+        w.assigner.finish(recording: meeting.id)
+
+        guard let back = alice(w) else {
+            return XCTFail("precondition for the tests above: unguarded, Alice returns")
+        }
+        XCTAssertNotEqual(back.id, originalID, "a new profile, not the deleted one")
+        XCTAssertEqual(back.sampleCount, 1, "carrying only this recording's observation")
+        XCTAssertGreaterThan(cosineSimilarity(back.embedding, aliceStored), 0.99,
+                             "but the same voice, to within rounding")
+        XCTAssertTrue(profilesFileExists, "and the deleted file is recreated")
+    }
+
+    /// Lock 1 alone — the store's deletion observer strips the seeded name
+    /// out of the live pool, so `finish` has nothing to auto-name.
+    func test_the_deletion_observer_alone_prevents_the_resurrection() {
+        let w = makeWorld(deletionObserver: true, storedProfileGate: false)
+        aliceSpeaksConfidently(w)
+        let meeting = add("Meeting", createdAt: Date(), to: w.store)
+
+        w.profiles.deleteAllProfiles()
+        XCTAssertNil(w.diarizer.currentProfiles().first?.profileName,
+                     "the pool entry stops carrying the deleted name")
+        w.assigner.finish(recording: meeting.id)
+
+        XCTAssertNil(alice(w))
+        XCTAssertFalse(profilesFileExists)
+    }
+
+    /// Lock 2 alone — `finish` refuses to auto-apply the name of a profile
+    /// that is no longer stored, even with the pool still carrying it. This
+    /// is the lock that does not depend on a caller having wired the
+    /// observer up.
+    func test_the_stored_profile_gate_alone_prevents_the_resurrection() {
+        let w = makeWorld(deletionObserver: false, storedProfileGate: true)
+        aliceSpeaksConfidently(w)
+        let meeting = add("Meeting", createdAt: Date(), to: w.store)
+
+        w.profiles.deleteAllProfiles()
+        XCTAssertEqual(w.diarizer.currentProfiles().first?.profileName, "Alice",
+                       "precondition: with no observer the pool still carries it")
+        w.assigner.finish(recording: meeting.id)
+
+        XCTAssertNil(alice(w))
+        XCTAssertFalse(profilesFileExists)
+        XCTAssertNil(recording(meeting.id, in: w.store)?.speakerNames["SPEAKER_00"])
+    }
+
+    /// Deletion must stop *recognition* too, not merely persistence: a
+    /// speaker whose profile the user has just erased is not recognised for
+    /// the rest of the recording. The neutralised entry stays in the pool
+    /// (ids are positional — removing it would collide the next mint), so
+    /// the new speaker is `SPEAKER_01`, nameless.
+    func test_after_deletion_the_erased_voice_is_no_longer_recognised() {
+        let w = makeWorld()
+        // Alice has not spoken yet, so the seeded entry holds nothing but
+        // the profile that is about to be deleted.
+        w.profiles.deleteAllProfiles()
+
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_01",
+                       "a fresh speaker — the erased centroid must not match her")
+        let entries = w.diarizer.currentProfiles()
+        XCTAssertEqual(entries.count, 2, "the emptied entry stays, so ids cannot collide")
+        XCTAssertTrue(entries.allSatisfy { $0.profileName == nil })
+    }
+
+    /// Deleting one profile by name reaches the pool the same way, and
+    /// leaves the others seeded. (Only Alice is stored in this fixture; the
+    /// selective half is pinned in `LiveSpeakerDiarizerPoolTests`.)
+    func test_deleting_a_single_profile_mid_recording_also_reaches_the_pool() {
+        let w = makeWorld()
+        aliceSpeaksConfidently(w)
+        let meeting = add("Meeting", createdAt: Date(), to: w.store)
+
+        w.profiles.deleteProfile(name: "Alice")
+        w.assigner.finish(recording: meeting.id)
+
+        XCTAssertNil(alice(w), "one deleted profile must not come back either")
+        XCTAssertNil(recording(meeting.id, in: w.store)?.speakerNames["SPEAKER_00"])
+    }
+
+    /// The same hole through a different door: a profile can also stop
+    /// existing under its seeded name because the user *renamed* it
+    /// mid-recording. Rename does not notify the pool, so this is lock 2's
+    /// work alone — and it is why the gate is worth having as well as the
+    /// observer. Not auto-naming is the conservative outcome: the recording
+    /// is left unlabelled rather than labelled with a name that is no longer
+    /// anybody's, and above all the old name is not recreated on disk.
+    func test_a_renamed_profile_is_not_recreated_under_its_old_name() {
+        let w = makeWorld()
+        aliceSpeaksConfidently(w)
+        let meeting = add("Meeting", createdAt: Date(), to: w.store)
+
+        w.profiles.renameProfile(from: "Alice", to: "Alice Smith")
+        w.assigner.finish(recording: meeting.id)
+
+        XCTAssertNil(alice(w), "the old name must not reappear as a second profile")
+        XCTAssertEqual(w.profiles.profiles.count, 1)
+        XCTAssertEqual(w.profiles.profiles.first?.name, "Alice Smith")
+        XCTAssertEqual(w.profiles.profiles.first?.sampleCount, 40, "and it learned nothing")
         XCTAssertNil(recording(meeting.id, in: w.store)?.speakerNames["SPEAKER_00"])
     }
 

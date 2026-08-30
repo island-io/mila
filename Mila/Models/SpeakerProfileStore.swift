@@ -148,6 +148,45 @@ final class SpeakerProfileStore: ObservableObject {
     private let fileManager = FileManager.default
     private let storeURL: URL
 
+    /// What a deletion removed, handed to the observers below.
+    enum Deletion: Equatable {
+        /// Every profile — `deleteAllProfiles`. Carries no names on purpose:
+        /// while the feature is off `profiles` is empty (the file is never
+        /// parsed), so the store genuinely does not know what it just
+        /// deleted. "All" is the honest answer and the safe one.
+        case all
+        /// One profile, by name.
+        case named(Set<String>)
+    }
+
+    private var deletionObservers: [(Deletion) -> Void] = []
+
+    /// Register a handler for profile deletions, called synchronously after
+    /// the profiles are gone.
+    ///
+    /// **This is what stops a recording that is already in flight from
+    /// putting a deleted profile back.** Deleting is a privacy action, but
+    /// it only reaches this object and the file: `LiveSpeakerDiarizer`'s pool
+    /// was seeded with those centroids at record-start and keeps its own
+    /// copy, so without this the rest of the recording goes on matching
+    /// against the erased voice, and `RecognisedSpeakerAssigner.finish`
+    /// writes it straight back at stop — under a new id, with this
+    /// recording's centroid, which is the same person's fingerprint to
+    /// within rounding. `MilaApp` wires this to
+    /// `LiveSpeakerDiarizer.forgetSeededProfiles`, so the deletion takes
+    /// effect immediately and everywhere, exactly as opting out does through
+    /// `VoiceRecognitionSettings.addEnabledObserver`.
+    ///
+    /// A list rather than one slot, for the same reason `addEnabledObserver`
+    /// is: a second registrant must not silently unhook the first.
+    func addDeletionObserver(_ observer: @escaping (Deletion) -> Void) {
+        deletionObservers.append(observer)
+    }
+
+    private func notifyDeleted(_ deletion: Deletion) {
+        for observer in deletionObservers { observer(deletion) }
+    }
+
     /// `directory` is the folder that holds `speaker-profiles.json`.
     /// Injectable so tests can point at a temp directory.
     init(directory: URL, settings: VoiceRecognitionSettings) {
@@ -260,13 +299,21 @@ final class SpeakerProfileStore: ObservableObject {
     }
 
     func deleteProfile(id: UUID) {
+        let removed = Set(profiles.filter { $0.id == id }.map(\.name))
         profiles.removeAll { $0.id == id }
         save()
+        // Same reason as `deleteAllProfiles`: a live diarizer seeded with
+        // this profile would otherwise keep matching it and write it back at
+        // stop. Skipped when nothing matched the id, so a no-op delete does
+        // not disturb an in-flight recording.
+        if !removed.isEmpty { notifyDeleted(.named(removed)) }
     }
 
     func deleteProfile(name: String) {
+        let removed = Set(profiles.filter { $0.name == name }.map(\.name))
         profiles.removeAll { $0.name == name }
         save()
+        if !removed.isEmpty { notifyDeleted(.named(removed)) }
     }
 
     /// Remove every stored voice profile — the "Delete voice profiles"
@@ -277,6 +324,16 @@ final class SpeakerProfileStore: ObservableObject {
     /// It deletes the file rather than writing an empty array over it, so
     /// after opting out and deleting there is no `speaker-profiles.json`
     /// left behind at all.
+    ///
+    /// **Deleting in memory and on disk is not the whole job.** A recording
+    /// in flight was seeded from these profiles at record-start and holds
+    /// its own copy of every centroid in `LiveSpeakerDiarizer`'s pool, so
+    /// until the observers below are told, the deletion is only two thirds
+    /// done: the rest of the recording keeps matching the erased voice, and
+    /// `RecognisedSpeakerAssigner` writes the profile back at stop — the
+    /// file the user deleted reappears, holding a fingerprint that matches
+    /// the deleted one to better than 0.999 cosine. That is CWE-459, and the
+    /// notification is what completes the cleanup.
     func deleteAllProfiles() {
         profiles.removeAll()
         do {
@@ -287,6 +344,12 @@ final class SpeakerProfileStore: ObservableObject {
             profileLog.log("deleteAll error: \(error.localizedDescription, privacy: .public)")
         }
         hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        // Unconditional, and after the file is gone: this must fire even
+        // when `profiles` was already empty in memory (the feature is off,
+        // so the file was never parsed) — that is precisely the case where
+        // the store cannot name what it deleted but a seeded pool may still
+        // be holding it.
+        notifyDeleted(.all)
     }
 
     func profileExists(name: String) -> Bool {

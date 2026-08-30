@@ -243,6 +243,107 @@ final class LiveSpeakerDiarizerPoolTests: XCTestCase {
         XCTAssertEqual(profile?.observedCentroid.count, 4)
     }
 
+    // MARK: - forgetSeededProfiles (deleting voice profiles mid-recording)
+
+    /// A seeded entry that has not been heard yet holds nothing but the
+    /// deleted profile, so after `forgetSeededProfiles` its owner is a
+    /// stranger: she mints a fresh, nameless speaker instead of being
+    /// recognised. The emptied entry is kept rather than removed — ids are
+    /// minted positionally from `pool.count`, so removing it would collide
+    /// the next mint with an id already in `intervals`.
+    func test_forgetSeededProfiles_stops_an_unheard_voice_being_recognised() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.7
+        d.seedPool(with: [(id: "Alice", name: "Alice", centroid: [1, 0, 0, 0], sampleCount: 40)])
+
+        d.forgetSeededProfiles()
+
+        XCTAssertEqual(d.assign(embedding: [0.99, 0.01, 0, 0]), "SPEAKER_01",
+                       "the erased centroid must not match her any more")
+        let pool = d.currentProfiles()
+        XCTAssertEqual(pool.count, 2, "the emptied entry stays so ids cannot collide")
+        XCTAssertEqual(pool.map(\.id), ["SPEAKER_00", "SPEAKER_01"])
+        XCTAssertTrue(pool.allSatisfy { $0.profileName == nil }, "and carries no name")
+    }
+
+    /// Control for the same fixture without the deletion: she *is*
+    /// recognised, on her seeded entry, under her name.
+    func test_an_unforgotten_seeded_voice_is_still_recognised() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.7
+        d.seedPool(with: [(id: "Alice", name: "Alice", centroid: [1, 0, 0, 0], sampleCount: 40)])
+
+        XCTAssertEqual(d.assign(embedding: [0.99, 0.01, 0, 0]), "SPEAKER_00")
+        XCTAssertEqual(d.currentProfiles().first?.profileName, "Alice")
+    }
+
+    /// An emptied entry must not collect utterances through the *attach*
+    /// branch either. `cosineSimilarity` scores it 0, which keeps it out of
+    /// the confident-match branch — but the borderline / too-short-to-mint
+    /// branch takes the best entry whatever its score, so without the
+    /// empty-centroid skip in `assign` a short utterance would land on a
+    /// speaker whose voice the user just deleted.
+    func test_a_short_utterance_does_not_attach_to_a_forgotten_entry() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.7
+        d.seedPool(with: [(id: "Alice", name: "Alice", centroid: [1, 0, 0, 0], sampleCount: 40)])
+        d.forgetSeededProfiles()
+
+        XCTAssertEqual(d.assign(embedding: [0, 0, 1, 0], utteranceDuration: 0.4), "SPEAKER_01",
+                       "too short to mint, but there is no longer anything to attach to")
+    }
+
+    /// What a heard-from entry keeps is exactly what *this recording*
+    /// produced: the seeded weight is dropped and the matching centroid falls
+    /// back to the observed one, so the deleted numbers stop steering
+    /// matching while the speaker stays coherent for the rest of the
+    /// recording.
+    ///
+    /// Discriminating by construction. `U` folds into the seeded entry
+    /// (cos 0.75 to the stored centroid), leaving a matching centroid of
+    /// `[0.9375, 0.165, 0, 0]` — three parts stored, one part heard. The
+    /// probe `P` sits at cos 0.37 to that blend but cos 0.80 to `U` alone,
+    /// so it mints a new speaker while the seeded weight is there and
+    /// matches `SPEAKER_00` once it is gone.
+    func test_forgetSeededProfiles_drops_the_seeded_weight_and_keeps_the_heard_one() {
+        let stored: [Float] = [1, 0, 0, 0]
+        let U: [Float] = [0.75, 0.66, 0, 0]
+        let P: [Float] = [0.2, 0.98, 0, 0]
+
+        let control = LiveSpeakerDiarizer()
+        control.similarityThreshold = 0.7
+        control.seedPool(with: [(id: "Alice", name: "Alice", centroid: stored, sampleCount: 40)])
+        XCTAssertEqual(control.assign(embedding: U), "SPEAKER_00")
+        XCTAssertEqual(control.assign(embedding: P), "SPEAKER_01",
+                       "with the seeded weight in place, P is a different speaker")
+
+        let forgotten = LiveSpeakerDiarizer()
+        forgotten.similarityThreshold = 0.7
+        forgotten.seedPool(with: [(id: "Alice", name: "Alice", centroid: stored, sampleCount: 40)])
+        XCTAssertEqual(forgotten.assign(embedding: U), "SPEAKER_00")
+        forgotten.forgetSeededProfiles()
+        XCTAssertEqual(forgotten.assign(embedding: P), "SPEAKER_00",
+                       "matching now runs off what this recording heard, not off disk")
+        let entry = forgotten.currentProfiles().first
+        XCTAssertNil(entry?.profileName)
+        XCTAssertEqual(entry?.observedCount, 2, "the recording's own observations are kept")
+    }
+
+    /// Deleting one profile leaves the others seeded and recognisable.
+    func test_forgetSeededProfiles_by_name_leaves_the_others_alone() {
+        let d = LiveSpeakerDiarizer()
+        d.similarityThreshold = 0.7
+        d.seedPool(with: [(id: "Alice", name: "Alice", centroid: [1, 0, 0, 0], sampleCount: 40),
+                          (id: "Bob", name: "Bob", centroid: [0, 1, 0, 0], sampleCount: 40)])
+
+        d.forgetSeededProfiles(named: ["Alice"])
+
+        XCTAssertEqual(d.assign(embedding: [0.02, 0.99, 0, 0]), "SPEAKER_01", "Bob is untouched")
+        XCTAssertEqual(d.currentProfiles().first { $0.id == "SPEAKER_01" }?.profileName, "Bob")
+        XCTAssertEqual(d.assign(embedding: [0.99, 0.01, 0, 0]), "SPEAKER_02", "Alice is a stranger")
+        XCTAssertNil(d.currentProfiles().first { $0.id == "SPEAKER_00" }?.profileName)
+    }
+
     func test_higher_threshold_makes_pool_more_conservative() {
         let d = LiveSpeakerDiarizer()
         d.similarityThreshold = 0.99

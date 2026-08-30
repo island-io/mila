@@ -38,15 +38,25 @@ final class RecognisedSpeakerAssigner {
     private let diarizer: LiveSpeakerDiarizer
     private let snapshots: ObservedVoiceSnapshots
     private let settings: VoiceRecognitionSettings
+    private let profileStillStored: (String) -> Bool
 
+    /// `profileStillStored` answers "is there still a stored profile under
+    /// this name?", read at stop rather than at record-start. A closure
+    /// rather than a `SpeakerProfileStore` reference, following
+    /// `VoiceRecognitionSettings.diarizationReady`: this object has no
+    /// business mutating the store, and the gate is trivially testable. It
+    /// has no default — a defaulted `{ true }` would fail open, which is the
+    /// bug it exists to prevent.
     init(store: RecordingStore,
          diarizer: LiveSpeakerDiarizer,
          snapshots: ObservedVoiceSnapshots,
-         settings: VoiceRecognitionSettings) {
+         settings: VoiceRecognitionSettings,
+         profileStillStored: @escaping (String) -> Bool) {
         self.store = store
         self.diarizer = diarizer
         self.snapshots = snapshots
         self.settings = settings
+        self.profileStillStored = profileStillStored
     }
 
     /// Call once per finished recording, with that recording's id.
@@ -110,6 +120,29 @@ final class RecognisedSpeakerAssigner {
             //    against their words. `observedCount` is precisely the
             //    "confidently observed this recording" signal.
             guard entry.observedCount > 0 else { continue }
+            // 3. The profile is still stored. The pool was seeded at
+            //    record-start and holds its own copy of the centroid, so a
+            //    profile can disappear underneath it while the recording
+            //    runs — the user deleting their voice profiles from Settings
+            //    is the case that matters, and merging or renaming one has
+            //    the same shape. Naming a speaker here fires
+            //    `RecordingStore.onSpeakerNamed`, which persists; and
+            //    `updateProfile` *creates* when the name is absent, because
+            //    that is how a hand-named speaker gets a profile at all. So
+            //    an ungated auto-name recreates exactly what the user just
+            //    erased, file and all, with this recording's centroid — a
+            //    fingerprint that matches the deleted one to better than
+            //    0.999 cosine.
+            //
+            //    `SpeakerProfileStore`'s deletion observer already strips
+            //    `profileName` out of the pool, so deletion normally never
+            //    reaches this line. This is the second lock: it keeps the
+            //    guarantee local to the write path, covers the routes that
+            //    do not notify (a rename, or the absorbed half of a merge),
+            //    and does not depend on a caller having wired the observer
+            //    up. Note it can only *suppress* an auto-name — naming a
+            //    speaker by hand still creates a profile, as it must.
+            guard profileStillStored(profileName) else { continue }
             store.setSpeakerName(profileName, forSpeaker: entry.id, recordingID: recordingID)
         }
     }

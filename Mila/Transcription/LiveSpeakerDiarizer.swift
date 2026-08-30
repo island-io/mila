@@ -259,6 +259,50 @@ final class LiveSpeakerDiarizer: ObservableObject {
         }
     }
 
+    /// Drop everything the pool holds that came off disk, for the profiles
+    /// the user has just deleted (`names`), or for every seeded entry when
+    /// `names` is nil.
+    ///
+    /// Deleting voice profiles is a privacy action, and `seedPool` gave this
+    /// object its own copy of the centroids at record-start. Deleting the
+    /// file therefore does not, by itself, delete the voice from a recording
+    /// that is already running: the pool goes on matching against the erased
+    /// centroid for the rest of it, and `RecognisedSpeakerAssigner.finish`
+    /// then names the speaker and writes the profile straight back at stop —
+    /// under a fresh id and this recording's own centroid, which is the same
+    /// person's fingerprint to within rounding. The user is told their voice
+    /// data is gone while it quietly returns. `SpeakerProfileStore`'s
+    /// deletion observer calls this so the deletion lands everywhere at
+    /// once, the way opting out already does.
+    ///
+    /// Entries are neutralised, never removed: ids are minted positionally
+    /// (`SPEAKER_%02d` from `pool.count`), so removing one would make the
+    /// next minted speaker collide with an existing id, and any interval
+    /// already labelled with the removed id would dangle. What each entry
+    /// keeps is exactly what *this recording* heard:
+    ///
+    ///   * `profileName` is cleared, so nothing downstream can auto-apply
+    ///     the deleted name or persist under it;
+    ///   * the matching pair falls back to the observed pair, dropping the
+    ///     seeded weight — the deleted centroid stops steering the match
+    ///     while the speaker stays coherent for the rest of the recording
+    ///     from utterances the recording itself produced.
+    ///
+    /// A seeded entry that never matched has no observations, so it is left
+    /// with an empty centroid: inert, and skipped by `assign`'s scan.
+    /// In-recording diarization is not what was deleted — the stored profile
+    /// is — so this deliberately keeps the former and destroys only the
+    /// latter.
+    func forgetSeededProfiles(named names: Set<String>? = nil) {
+        for idx in pool.indices {
+            guard let name = pool[idx].profileName else { continue }
+            if let names, !names.contains(name) { continue }
+            pool[idx].profileName = nil
+            pool[idx].centroid = pool[idx].observedCentroid
+            pool[idx].sampleCount = pool[idx].observedCount
+        }
+    }
+
     /// Snapshot the pool for **persistence**: for each speaker, the mean of
     /// what was observed in this recording, how many observations that was,
     /// and the voice-profile name it was seeded from (if any).
@@ -359,6 +403,17 @@ final class LiveSpeakerDiarizer: ObservableObject {
     func assign(embedding: [Float], utteranceDuration: Double = 2.0) -> String {
         var best: (idx: Int, sim: Double)?
         for (idx, profile) in pool.enumerated() {
+            // An entry with no centroid has nothing to compare against, so
+            // it cannot be anyone's best match. `cosineSimilarity` already
+            // returns 0 for it, which keeps it out of the confident-match
+            // branch — but not out of the borderline/short-utterance
+            // *attach* branch below, which takes the best entry whatever its
+            // similarity. Without this skip, a seeded entry emptied by
+            // `forgetSeededProfiles` could still capture utterances into a
+            // speaker whose voice the user just deleted. Unreachable
+            // otherwise: `process` refuses an empty embedding, so nothing
+            // else ever puts an empty centroid in the pool.
+            guard !profile.centroid.isEmpty else { continue }
             let sim = cosineSimilarity(embedding, profile.centroid)
             if best == nil || sim > best!.sim {
                 best = (idx, sim)
