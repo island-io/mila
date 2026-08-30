@@ -187,4 +187,37 @@ final class MeetingStopPromptTests: XCTestCase {
         XCTAssertEqual(ended.count, 2,
                        "Re-joining and ending a second meeting should fire meetingEnded again")
     }
+
+    // MARK: - Browser (title-only) detection
+
+    /// Apps with empty `captureBundlePrefixes` (browsers running Google
+    /// Meet) are detected by window title only. Verify they exist in
+    /// `supportedApps` and that the state machine handles them the same
+    /// way as mic-capture apps.
+    func test_browser_apps_have_title_hints_and_empty_capture_prefixes() {
+        let browsers = MeetingDetector.supportedApps.filter {
+            $0.captureBundlePrefixes.isEmpty
+        }
+        XCTAssertFalse(browsers.isEmpty,
+                       "At least one browser should be in supportedApps for Google Meet")
+        for app in browsers {
+            XCTAssertFalse(app.meetingTitleHints.isEmpty,
+                           "\(app.displayName) has empty prefixes but also empty title hints — it can never be detected")
+        }
+    }
+
+    func test_browser_app_triggers_meeting_started_via_state_machine() throws {
+        let detector = MeetingDetector(endConfirmationPolls: 2)
+        var started: [MeetingDetector.App] = []
+        let cancellable = detector.meetingStarted.sink { started.append($0) }
+        defer { cancellable.cancel() }
+
+        let meet = try XCTUnwrap(MeetingDetector.supportedApps.first {
+            $0.bundleID == "meet.google.com"
+        })
+        detector.simulatePollForTesting(activeBundleIDs: [meet.bundleID])
+
+        XCTAssertEqual(started.map(\.bundleID), [meet.bundleID],
+                       "A browser app should trigger meetingStarted the same as any other app")
+    }
 }

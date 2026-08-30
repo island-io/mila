@@ -8,15 +8,19 @@ import XCTest
 @MainActor
 final class MeetingDetectorAppsTests: XCTestCase {
 
-    func test_every_supported_app_declares_a_capture_prefix() {
+    func test_every_supported_app_has_a_detection_path() {
         for app in MeetingDetector.supportedApps {
-            XCTAssertFalse(
-                app.captureBundlePrefixes.isEmpty,
+            // Native apps (Zoom, Teams) use captureBundlePrefixes.
+            // Browser apps use their own bundleID for mic-capture
+            // matching (case-insensitive prefix against helper
+            // processes) plus title hints as a fallback on older macOS.
+            let hasCapturePrefixes = !app.captureBundlePrefixes.isEmpty
+            let hasTitleFallback = !app.meetingTitleHints.isEmpty
+            XCTAssertTrue(
+                hasCapturePrefixes || hasTitleFallback,
                 """
-                \(app.displayName) has no captureBundlePrefixes, so the \
-                primary signal (Core Audio per-process mic capture) can \
-                never fire for it. Window titles are a fallback, never the \
-                main detection path.
+                \(app.displayName) has neither captureBundlePrefixes nor \
+                meetingTitleHints — it can never be detected by any path.
                 """
             )
         }
@@ -45,6 +49,9 @@ final class MeetingDetectorAppsTests: XCTestCase {
 
     func test_canonical_bundle_id_is_covered_by_its_own_capture_prefixes() {
         for app in MeetingDetector.supportedApps {
+            // Browser apps have empty captureBundlePrefixes — they use
+            // their bundleID directly for case-insensitive mic matching.
+            guard !app.captureBundlePrefixes.isEmpty else { continue }
             XCTAssertTrue(
                 app.captureBundlePrefixes.contains { app.bundleID.hasPrefix($0) },
                 """
