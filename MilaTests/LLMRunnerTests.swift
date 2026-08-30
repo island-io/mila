@@ -653,6 +653,263 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertFalse(dirs.contains { $0.contains("/.nvm/versions/node/") })
     }
 
+    // MARK: - Configured npm prefix (~/.npmrc)
+
+    /// A throwaway home directory, optionally carrying an `.npmrc`. Local to
+    /// these tests — nothing else needs a fake home.
+    private func makeHome(npmrc: String? = nil) throws -> URL {
+        let home = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-npmrc-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: home,
+                                                withIntermediateDirectories: true)
+        if let npmrc {
+            try npmrc.write(to: home.appendingPathComponent(".npmrc"),
+                            atomically: true, encoding: .utf8)
+        }
+        return home
+    }
+
+    func test_searchDirectories_honours_a_configured_npm_prefix() throws {
+        // The whole point of the feature: a prefix that is *not* the
+        // ~/.npm-global convention still gets searched.
+        let home = try makeHome(npmrc: """
+            registry=https://registry.npmjs.org/
+            prefix=/opt/npm-elsewhere
+            """)
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let dirs = LLMRunner.searchDirectories(home: home.path, pathEnv: nil)
+        XCTAssertTrue(dirs.contains("/opt/npm-elsewhere/bin"), "\(dirs)")
+        // Configured beats guessed: it must be probed before the conventions.
+        let configured = try XCTUnwrap(dirs.firstIndex(of: "/opt/npm-elsewhere/bin"))
+        let convention = try XCTUnwrap(dirs.firstIndex(of: "\(home.path)/.npm-global/bin"))
+        XCTAssertLessThan(configured, convention, "\(dirs)")
+    }
+
+    func test_searchDirectories_expands_home_in_a_configured_npm_prefix() throws {
+        // npmrc files are written by hand, so all three spellings of "my home
+        // directory" show up in the wild. A literal "~" would be a directory
+        // that cannot exist.
+        for spelling in ["~/npm-here", "$HOME/npm-here", "${HOME}/npm-here"] {
+            let home = try makeHome(npmrc: "prefix=\(spelling)\n")
+            defer { try? FileManager.default.removeItem(at: home) }
+
+            let dirs = LLMRunner.searchDirectories(home: home.path, pathEnv: nil)
+            XCTAssertTrue(dirs.contains("\(home.path)/npm-here/bin"),
+                          "\(spelling) was not expanded: \(dirs)")
+        }
+    }
+
+    func test_searchDirectories_ignores_unusable_npm_prefix_values() throws {
+        // A malformed, blank, relative or commented-out value must degrade to
+        // "no extra directory" — never to a nonsense path we then probe.
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let npmrc = home.appendingPathComponent(".npmrc")
+        let baseline = LLMRunner.searchDirectories(home: home.path, pathEnv: nil)
+
+        for content in [
+            "prefix=\n",                          // blank
+            "prefix=   \n",                       // whitespace only
+            "prefix=relative/dir\n",              // not absolute
+            "; prefix=/opt/commented\n",          // ini comment
+            "#prefix=/opt/commented\n",           // the other comment marker
+            "prefix=~someoneelse/npm\n",          // another user's home
+            "prefix\n",                           // no '=' at all
+            "registry=https://example.com/\n",    // no prefix key
+            "[scope]\nnothing-here=1\n"          // no prefix key, with a section
+        ] {
+            try content.write(to: npmrc, atomically: true, encoding: .utf8)
+            XCTAssertEqual(LLMRunner.searchDirectories(home: home.path, pathEnv: nil),
+                           baseline,
+                           "unusable value must add nothing: \(content.debugDescription)")
+        }
+    }
+
+    func test_npmPrefixBin_strips_quotes_and_inline_comments() throws {
+        // npm parses npmrc with the `ini` package: a quoted value is verbatim,
+        // an unquoted one ends at the first ; or #.
+        let quoted = try makeHome(npmrc: "prefix = \"/opt/quoted npm\"\n")
+        defer { try? FileManager.default.removeItem(at: quoted) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: quoted.path),
+                       "/opt/quoted npm/bin")
+
+        let commented = try makeHome(npmrc: "prefix=/opt/trailing # set by hand\n")
+        defer { try? FileManager.default.removeItem(at: commented) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: commented.path),
+                       "/opt/trailing/bin")
+    }
+
+    func test_npmPrefixBin_takes_the_last_assignment_and_normalises_slashes() throws {
+        // Later wins, matching ini semantics; a trailing slash must not
+        // produce "/opt/second//bin".
+        let home = try makeHome(npmrc: """
+            prefix=/opt/first
+            prefix=/opt/second/
+            """)
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/second/bin")
+    }
+
+    func test_npmPrefixBin_handles_windows_line_endings() throws {
+        // Swift treats CRLF as a single Character, so splitting on "\n" would
+        // swallow the whole file into one line and the prefix would be lost.
+        let home = try makeHome(npmrc: "registry=https://example.com/\r\nprefix=/opt/crlf\r\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/crlf/bin")
+    }
+
+    /// npm keeps an escaped `\\#` / `\\;` as a literal character in an unquoted
+    /// value, so scanning for the bare delimiter cut `/opt/npm\\#tools` down to
+    /// `/opt/npm\\` and probed a directory that does not exist. Verified against
+    /// `npm config get prefix --userconfig` when this was found.
+    func test_npmPrefixBin_preserves_escaped_comment_characters() throws {
+        let hash = try makeHome(npmrc: "prefix=/opt/npm\\#tools\n")
+        defer { try? FileManager.default.removeItem(at: hash) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: hash.path), "/opt/npm#tools/bin")
+
+        let semi = try makeHome(npmrc: "prefix=/opt/npm\\;tools\n")
+        defer { try? FileManager.default.removeItem(at: semi) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: semi.path), "/opt/npm;tools/bin")
+    }
+
+    /// The escape handling must not stop a genuine inline comment being cut.
+    func test_npmPrefixBin_still_strips_a_real_inline_comment() throws {
+        let hash = try makeHome(npmrc: "prefix=/opt/plain #a trailing note\n")
+        defer { try? FileManager.default.removeItem(at: hash) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: hash.path), "/opt/plain/bin")
+
+        // Escaped first, then a real one: keep the literal, drop the comment.
+        let both = try makeHome(npmrc: "prefix=/opt/a\\#b #note\n")
+        defer { try? FileManager.default.removeItem(at: both) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: both.path), "/opt/a#b/bin")
+    }
+
+    /// npm treats a backslash as an escape only before `\\`, `;` or `#`. Before an
+    /// ordinary character both survive, so `prefix=/opt/npm\\tools` is a path
+    /// containing a backslash -- an earlier fix for escaped comment markers
+    /// stripped every backslash and turned it into `/opt/npmtools`.
+    func test_npmPrefixBin_keeps_a_backslash_before_an_ordinary_character() throws {
+        let home = try makeHome(npmrc: "prefix=/opt/npm\\tools\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
+    }
+
+    /// An escaped backslash collapses to one, as npm does.
+    func test_npmPrefixBin_collapses_an_escaped_backslash() throws {
+        let home = try makeHome(npmrc: "prefix=/opt/npm\\\\tools\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
+    }
+
+    /// `[section]` scopes what follows it. npm does not use a section-scoped
+    /// `prefix` as the global prefix, so probing its `bin` would add a
+    /// directory npm never installs into.
+    func test_npmPrefixBin_ignores_a_section_scoped_prefix() throws {
+        let scoped = try makeHome(npmrc: "[tool]\nprefix=/tmp/tool\n")
+        defer { try? FileManager.default.removeItem(at: scoped) }
+        XCTAssertNil(LLMRunner.npmPrefixBin(home: scoped.path))
+
+        // A top-level value before a section still counts.
+        let mixed = try makeHome(npmrc: "prefix=/opt/real\n[tool]\nprefix=/tmp/tool\n")
+        defer { try? FileManager.default.removeItem(at: mixed) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: mixed.path), "/opt/real/bin")
+    }
+
+    /// The search list must not probe the same directory twice, including when
+    /// the inherited PATH itself repeats one.
+    func test_searchDirectories_deduplicates_repeated_path_entries() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        let dirs = LLMRunner.searchDirectories(home: home.path,
+                                               pathEnv: "/usr/local/bin:/usr/local/bin")
+        XCTAssertEqual(dirs.filter { $0 == "/usr/local/bin" }.count, 1,
+                       "a repeated PATH entry was probed twice: \(dirs)")
+    }
+
+    /// npm decodes escapes inside a DOUBLE-quoted value, so
+    /// `prefix="/opt/npm\\\\tools"` resolves to `/opt/npm\\tools`. Stripping the
+    /// quotes without decoding left both backslashes and probed a path that
+    /// cannot exist. Verified against `npm config get prefix --userconfig`.
+    func test_npmPrefixBin_decodes_escapes_in_a_double_quoted_value() throws {
+        let home = try makeHome(npmrc: "prefix=\"/opt/npm\\\\tools\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\tools/bin")
+    }
+
+    /// `npm/ini` JSON-parses a double-quoted value, so every JSON escape
+    /// applies -- `prefix="/opt/\\u006eode"` is `/opt/node` to npm. Decoding only
+    /// `\\\\` and `\\"` by hand missed this, which is why the implementation now
+    /// delegates to `JSONDecoder` rather than approximating the escape set.
+    func test_npmPrefixBin_decodes_a_unicode_escape_in_a_double_quoted_value() throws {
+        let home = try makeHome(npmrc: "prefix=\"/opt/\\u006eode\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/node/bin")
+    }
+
+    /// A double-quoted value npm itself cannot parse yields **no** prefix.
+    ///
+    /// Stripping the quotes instead would leave `/opt/bad\\q` -- absolute, so
+    /// it passes the path check and gets probed, even though npm has no prefix
+    /// from that file at all. A missing candidate is better than a wrong one.
+    func test_npmPrefixBin_discards_an_undecodable_quoted_value() throws {
+        let home = try makeHome(npmrc: "prefix=\"/opt/bad\\q\"\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertNil(LLMRunner.npmPrefixBin(home: home.path))
+    }
+
+    /// ...and it erases an earlier good one, because last-assignment-wins
+    /// holds even when the last assignment is malformed.
+    ///
+    /// `npm/ini` does not skip the unparseable line: its `JSON.parse` sits in
+    /// a `try/catch` whose handler leaves the raw quoted text in place, and
+    /// the parse loop assigns that like any other value. npm's effective
+    /// `prefix` here is therefore the literal `"/opt/bad\\q"` -- quotes
+    /// included, so not an absolute path, so no prefix at all. Retaining
+    /// `/opt/good` instead would have Mila probe a directory the user's npm
+    /// config no longer names and launch a CLI npm does not install into,
+    /// where npm itself simply finds nothing.
+    func test_npmPrefixBin_drops_an_earlier_prefix_when_a_later_one_is_undecodable() throws {
+        // Control: the same first line on its own really does resolve, so the
+        // nil below is the override taking effect -- not a fixture that failed
+        // to write or a parser that choked on the whole file. Without this the
+        // assertion would pass just as happily against a `makeHome` that wrote
+        // nothing at all.
+        let good = try makeHome(npmrc: "prefix=/opt/good\n")
+        defer { try? FileManager.default.removeItem(at: good) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: good.path), "/opt/good/bin")
+
+        let overridden = try makeHome(npmrc: "prefix=/opt/good\nprefix=\"/opt/bad\\q\"\n")
+        defer { try? FileManager.default.removeItem(at: overridden) }
+        let resolved = LLMRunner.npmPrefixBin(home: overridden.path)
+        XCTAssertNotEqual(resolved, "/opt/good/bin",
+                          "the superseded prefix survived a malformed override")
+        XCTAssertNil(resolved)
+    }
+
+    /// Single quotes are literal in npm -- no decoding there.
+    func test_npmPrefixBin_leaves_single_quoted_values_literal() throws {
+        let home = try makeHome(npmrc: "prefix='/opt/npm\\\\tools'\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertEqual(LLMRunner.npmPrefixBin(home: home.path), "/opt/npm\\\\tools/bin")
+    }
+
+    func test_npmPrefixBin_is_nil_without_an_npmrc() throws {
+        let home = try makeHome()
+        defer { try? FileManager.default.removeItem(at: home) }
+        XCTAssertNil(LLMRunner.npmPrefixBin(home: home.path))
+    }
+
+    func test_searchDirectories_does_not_duplicate_a_default_npm_prefix() throws {
+        // /usr/local is npm's own default prefix, so the configured value
+        // routinely collides with an entry that is already in the list.
+        let home = try makeHome(npmrc: "prefix=/usr/local\n")
+        defer { try? FileManager.default.removeItem(at: home) }
+
+        let dirs = LLMRunner.searchDirectories(home: home.path, pathEnv: "/usr/local/bin")
+        XCTAssertEqual(dirs.filter { $0 == "/usr/local/bin" }.count, 1, "\(dirs)")
+    }
+
     func test_gemini_cli_returns_a_title_for_a_sample_transcript() async throws {
         guard let geminiPath = resolve("gemini") else {
             throw XCTSkip("gemini CLI not installed on this machine")

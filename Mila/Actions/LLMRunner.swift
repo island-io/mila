@@ -1593,10 +1593,11 @@ enum LLMRunner {
     }
 
     /// Ordered candidate directories for `lookupOnPath`: the inherited `$PATH`
-    /// first, then well-known shell/version-manager `bin` dirs. Node-based CLIs
-    /// (claude, cursor-agent, gemini) are commonly installed as global npm
-    /// packages under a version manager, so those roots are enumerated too.
-    /// Exposed (internal) so the version-manager enumeration is unit-testable.
+    /// first, then the `bin` of whatever prefix npm is *configured* with, then
+    /// well-known shell/version-manager `bin` dirs. Node-based CLIs (claude,
+    /// cursor-agent, gemini) are commonly installed as global npm packages
+    /// under a version manager, so those roots are enumerated too.
+    /// Exposed (internal) so the enumeration is unit-testable.
     static func searchDirectories(
         home: String = NSHomeDirectory(),
         pathEnv: String? = ProcessInfo.processInfo.environment["PATH"],
@@ -1606,14 +1607,21 @@ enum LLMRunner {
         if let pathEnv {
             dirs += pathEnv.split(separator: ":").map(String.init)
         }
-        dirs += [
+        // Everything past the PATH entries is a *guess* at where a global npm
+        // install landed — except the configured prefix, which comes from the
+        // user's own npm config, so it leads the fallbacks.
+        var fallbacks: [String] = []
+        if let prefixBin = npmPrefixBin(home: home, fileManager: fileManager) {
+            fallbacks.append(prefixBin)
+        }
+        fallbacks += [
             "\(home)/.local/bin",
             "\(home)/bin",
             "\(home)/.cargo/bin",
             "\(home)/.bun/bin",
             "\(home)/.volta/bin",        // Volta
             "\(home)/.asdf/shims",       // asdf
-            "\(home)/.npm-global/bin",   // custom npm prefix
+            "\(home)/.npm-global/bin",   // the ~/.npm-global convention
             "/opt/homebrew/bin",
             "/usr/local/bin",
             "/usr/bin",
@@ -1625,11 +1633,197 @@ enum LLMRunner {
         // install time, so search every installed version, newest first.
         let nvmRoot = "\(home)/.nvm/versions/node"
         if let versions = try? fileManager.contentsOfDirectory(atPath: nvmRoot) {
-            dirs += versions
+            fallbacks += versions
                 .sorted { $0.compare($1, options: .numeric) == .orderedDescending }
                 .map { "\(nvmRoot)/\($0)/bin" }
         }
+        // De-dupe, order kept: npm's *default* prefix on a node that isn't
+        // Homebrew's is /usr/local, so a configured value routinely collides
+        // with an entry already in the list (or already on PATH), and probing
+        // the same directory twice per lookup buys nothing.
+        // De-dupe the inherited PATH too, not just the fallbacks: a PATH with
+        // the same directory twice would otherwise be probed twice.
+        var seen = Set<String>()
+        dirs = dirs.filter { seen.insert($0).inserted }
+        dirs += fallbacks.filter { seen.insert($0).inserted }
         return dirs
+    }
+
+    /// `bin` directory of the npm prefix the user actually configured, or
+    /// `nil` when `~/.npmrc` has no usable `prefix` value.
+    ///
+    /// Parsing the file rather than shelling out to `npm config get prefix` is
+    /// deliberate: that needs `npm` on `PATH`, which is exactly what a
+    /// launchd-launched Mila does not have, and it would cost a process spawn
+    /// on every executable lookup.
+    ///
+    /// **Only the user config is read.** npm's other prefix sources cannot
+    /// help in the situation this exists for:
+    /// - `NPM_CONFIG_PREFIX` / `npm_config_prefix` and `NPM_CONFIG_USERCONFIG`
+    ///   live in the environment. A Finder- or launchd-launched Mila does not
+    ///   get the user's exported shell variables — the same stripping that
+    ///   loses `PATH` — and when Mila *is* started from a shell, that prefix's
+    ///   `bin` is already on the inherited `PATH` searched first. Honouring
+    ///   them would be dead code in the broken case and redundant in the
+    ///   working one.
+    /// - the global `$PREFIX/etc/npmrc` can only be located once the prefix is
+    ///   known, which is circular; the two prefixes it realistically names on
+    ///   macOS (`/opt/homebrew`, `/usr/local`) are in the list above already.
+    /// - a project-level `./.npmrc` is meaningless for a GUI app whose working
+    ///   directory the user never chose.
+    static func npmPrefixBin(home: String = NSHomeDirectory(),
+                             fileManager: FileManager = .default) -> String? {
+        let npmrc = (home as NSString).appendingPathComponent(".npmrc")
+        guard let data = fileManager.contents(atPath: npmrc),
+              let text = String(data: data, encoding: .utf8),
+              let value = npmrcPrefixValue(in: text) else { return nil }
+        let expanded = expandingHome(value, home: home)
+        // Blank, relative, commented-out or otherwise unusable values degrade
+        // to "no extra directory" rather than a nonsense path to probe.
+        guard expanded.hasPrefix("/") else {
+            if !expanded.isEmpty {
+                llmRunnerLog.debug("""
+                    llm npm prefix ignored (not an absolute path) \
+                    npmrc=\(npmrc, privacy: .public)
+                    """)
+            }
+            return nil
+        }
+        return (expanded as NSString).appendingPathComponent("bin")
+    }
+
+    /// The effective `prefix` value in an npmrc body, following the `ini`
+    /// parser npm itself uses: `;` and `#` start a comment, a double-quoted
+    /// value is JSON-decoded and a single-quoted one is literal, an unquoted
+    /// one ends at an inline comment, and a later assignment overwrites an
+    /// earlier one — *including* a later one npm cannot parse, which lands as
+    /// its own raw text and so leaves no usable prefix. `nil` when the key is absent —
+    /// an empty string when it is present but blank, which the caller rejects
+    /// along with every other unusable value.
+    private static func npmrcPrefixValue(in text: String) -> String? {
+        var found: String?
+        var inSection = false
+        // `isNewline` rather than splitting on "\n": Swift treats CRLF as a
+        // single Character, so a file saved with Windows line endings would
+        // otherwise parse as one giant line.
+        for rawLine in text.split(whereSeparator: { $0.isNewline }) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix(";") || line.hasPrefix("#") { continue }
+            // `[section]` scopes everything under it. npm does not use a
+            // section-scoped `prefix` as the global prefix, so neither may we --
+            // probing its `bin` would add a directory npm never installs into.
+            if line.hasPrefix("[") && line.hasSuffix("]") {
+                inSection = true
+                continue
+            }
+            guard !inSection else { continue }
+            guard let equals = line.firstIndex(of: "=") else { continue }
+            let key = line[line.startIndex..<equals]
+                .trimmingCharacters(in: .whitespaces)
+                .lowercased()
+            guard key == "prefix" else { continue }
+            var value = line[line.index(after: equals)...]
+                .trimmingCharacters(in: .whitespaces)
+            if value.count >= 2,
+               let quote = value.first, quote == "\"" || quote == "'",
+               value.last == quote {
+                let inner = String(value.dropFirst().dropLast())
+                // npm's ini reader JSON-parses a double-quoted value, so every
+                // JSON escape applies -- not just `\\\\` and `\\"` but `\\u006e` too.
+                // Hand-rolling that decoding got it wrong twice on this branch,
+                // so delegate to a real JSON parser rather than enumerating the
+                // escapes. Single-quoted values are literal in npm; no decoding.
+                //
+                // A double-quoted value that isn't valid JSON is kept **raw,
+                // quotes and all** -- which is precisely what `npm/ini` does:
+                // its `JSON.parse` sits inside a `try/catch` whose handler
+                // leaves the value untouched, and the parse loop then assigns
+                // it like any other. That buys two things at once. The leading
+                // `"` fails `npmPrefixBin`'s absolute-path check, so a value
+                // npm cannot read still yields no directory to probe -- unlike
+                // dropping the quotes, which would turn `"/opt/bad\\q"` into
+                // the absolute-looking `/opt/bad\\q` and probe a directory npm
+                // would never install into. And because the line is *assigned*
+                // rather than skipped, it overwrites an earlier `prefix`,
+                // keeping last-assignment-wins true even when the last
+                // assignment is malformed. Skipping it would leave a stale
+                // earlier value in force and send Mila hunting for a CLI in a
+                // directory npm no longer points at -- a wrong answer where
+                // npm gives none.
+                if quote == "\"" {
+                    value = jsonDecodedString(value) ?? value
+                } else {
+                    value = inner
+                }
+            } else {
+                value = truncatingAtUnescapedComment(value)
+            }
+            found = value
+        }
+        return found
+    }
+
+    /// Decodes a JSON string literal (quotes included), or nil when the text
+    /// isn't valid JSON. `npm/ini` uses JSON parsing for double-quoted values,
+    /// so this matches it exactly instead of approximating a subset of the
+    /// escapes by hand.
+    private static func jsonDecodedString(_ quoted: String) -> String? {
+        guard let data = quoted.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(String.self, from: data)
+    }
+
+    /// Cuts an unquoted value at its first *unescaped* `;` or `#`.
+    ///
+    /// npm keeps `\\#` and `\\;` as literal characters in an unquoted value, so
+    /// a naive scan for the bare delimiter turns `prefix=/opt/npm\\#tools` into
+    /// `/opt/npm\\` and probes a directory that does not exist. Verified
+    /// against `npm config get prefix --userconfig`.
+    ///
+    /// The backslash is dropped as it is consumed, which is what npm does with
+    /// it -- it is an escape, not part of the path.
+    private static func truncatingAtUnescapedComment(_ value: String) -> String {
+        var out = ""
+        var pendingBackslash = false
+        for character in value {
+            if pendingBackslash {
+                // npm escapes only these three. Before anything else the
+                // backslash is an ordinary character and both survive --
+                // `prefix=/opt/npm\\tools` is a path with a backslash in it, not
+                // `/opt/npmtools`.
+                if character == "\\" || character == ";" || character == "#" {
+                    out.append(character)
+                } else {
+                    out.append("\\")
+                    out.append(character)
+                }
+                pendingBackslash = false
+                continue
+            }
+            if character == "\\" {
+                pendingBackslash = true
+                continue
+            }
+            if character == ";" || character == "#" { break }
+            out.append(character)
+        }
+        // A trailing lone backslash escaped nothing; npm keeps it as a literal.
+        if pendingBackslash { out.append("\\") }
+        return out.trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Expands a leading `~`, `$HOME` or `${HOME}` against the given home.
+    /// Anything else (`~someoneelse`, `$OTHER`) is returned untouched so it
+    /// fails `npmPrefixBin`'s absolute-path check instead of being
+    /// half-expanded into a directory that cannot exist.
+    private static func expandingHome(_ value: String, home: String) -> String {
+        for token in ["${HOME}", "$HOME", "~"] {
+            if value == token { return home }
+            if value.hasPrefix(token + "/") {
+                let rest = String(value.dropFirst(token.count + 1))
+                return (home as NSString).appendingPathComponent(rest)
+            }
+        }
+        return value
     }
 }
 
