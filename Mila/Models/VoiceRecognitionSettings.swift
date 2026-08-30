@@ -50,12 +50,21 @@ final class VoiceRecognitionSettings: ObservableObject {
     /// Register a handler for actual changes to `isEnabled`, called
     /// synchronously with the new value.
     ///
-    /// `SpeakerProfileStore` uses it to load stored profiles on opt-in and
-    /// drop them from memory on opt-out; `ObservedVoiceSnapshots` uses it to
-    /// discard the observations it is holding. A list rather than one
-    /// assignable slot on purpose: with a single slot the second registrant
-    /// silently unhooked the first, so whichever object was constructed last
-    /// would have been the only one to ever hear about an opt-out.
+    /// Three registrants, one per place a copied embedding can be sitting
+    /// when the user flips the switch: `SpeakerProfileStore` loads stored
+    /// profiles on opt-in and drops them from memory on opt-out;
+    /// `ObservedVoiceSnapshots` discards the observations it is holding; and
+    /// `MilaApp` calls `LiveSpeakerDiarizer.forgetSeededProfiles()` so the
+    /// pool of a recording that is *already running* stops matching against
+    /// centroids `seedPool` copied out of the store at record-start. Miss
+    /// that last one and opting out stops the writes but not the reads —
+    /// the transcript goes on being auto-labelled from stored voices until
+    /// the recording ends.
+    ///
+    /// A list rather than one assignable slot on purpose: with a single slot
+    /// the second registrant silently unhooked the first, so whichever
+    /// object was constructed last would have been the only one to ever hear
+    /// about an opt-out.
     func addEnabledObserver(_ observer: @escaping (Bool) -> Void) {
         enabledObservers.append(observer)
     }

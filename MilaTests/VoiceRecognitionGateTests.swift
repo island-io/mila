@@ -273,6 +273,157 @@ final class VoiceRecognitionGateTests: XCTestCase {
                        "an off-state mutation must not rewrite speaker-profiles.json")
     }
 
+    // MARK: - Opting out *during* a recording
+
+    /// Alice, as stored on disk.
+    private var aliceStored: [Float] { [1, 0, 0, 0] }
+    /// Close enough to Alice to be a confident match at threshold 0.7.
+    private var aliceSpeaking: [Float] { [0.99, 0.01, 0, 0] }
+
+    /// A recording already under way with Alice's stored profile seeded into
+    /// the pool, exactly as `MilaApp` sets one up.
+    ///
+    /// `poolObserver` is the fix under test. It defaults to on — the
+    /// shipping wiring — and the negative control below switches it off to
+    /// reconstruct the pre-fix shape, so the assertions are provably
+    /// discriminating rather than vacuously true.
+    private func startedRecordingWithAliceSeeded(
+        poolObserver: Bool = true
+    ) -> (settings: VoiceRecognitionSettings,
+          profiles: SpeakerProfileStore,
+          snapshots: ObservedVoiceSnapshots,
+          diarizer: LiveSpeakerDiarizer) {
+        let settings = makeSettings()
+        settings.isEnabled = true
+        let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
+        profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 40)
+
+        let diarizer = LiveSpeakerDiarizer()
+        diarizer.similarityThreshold = 0.7
+
+        // Same wiring MilaApp.init installs, in the same order.
+        let snapshots = ObservedVoiceSnapshots()
+        snapshots.clearOnOptOut(of: settings)
+        if poolObserver {
+            settings.addEnabledObserver { [weak diarizer] nowEnabled in
+                guard !nowEnabled else { return }
+                diarizer?.forgetSeededProfiles()
+            }
+        }
+
+        // Record-start: reset, then seed behind the gate.
+        diarizer.reset()
+        XCTAssertTrue(settings.isConfigured)
+        diarizer.seedPool(with: profiles.seedEntries())
+        XCTAssertEqual(diarizer.currentProfiles().first?.profileName, "Alice",
+                       "precondition: the pool holds a copy of Alice's centroid")
+        return (settings, profiles, snapshots, diarizer)
+    }
+
+    /// **The invariant.** Opting out mid-recording has to stop the *reads*,
+    /// not just the writes.
+    ///
+    /// `seedPool` gave the diarizer its own copy of every stored centroid at
+    /// record-start, so unloading `SpeakerProfileStore.profiles` and
+    /// dropping the snapshots — the two things opting out used to do —
+    /// leaves `assign` matching against stored voices for the rest of the
+    /// recording. The persistence gates mean nothing is written back, but
+    /// the user still watches their transcript fill with names produced by a
+    /// feature they just switched off. Same shape as deleting a profile
+    /// mid-recording, and it gets the same remedy.
+    func test_opting_out_mid_recording_stops_the_pool_matching_a_stored_voice() {
+        let w = startedRecordingWithAliceSeeded()
+
+        w.settings.isEnabled = false
+
+        // Alice speaks after the opt-out. Her seeded entry was never heard
+        // in this recording, so it has nothing of its own to fall back to:
+        // it is inert, `assign` skips it, and she is simply somebody new.
+        XCTAssertNotEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                          "a stored voice must not be recognised after opting out")
+        XCTAssertTrue(w.diarizer.currentProfiles().allSatisfy { $0.profileName == nil },
+                      "no pool entry may still carry a stored profile name")
+    }
+
+    /// Negative control: the same scenario with the observer unwired, which
+    /// is what shipped before this fix. Alice is still recognised, under her
+    /// stored name. If this ever starts failing, the test above has stopped
+    /// proving anything.
+    func test_control_without_the_observer_a_stored_voice_survives_the_opt_out() {
+        let w = startedRecordingWithAliceSeeded(poolObserver: false)
+
+        w.settings.isEnabled = false
+
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                       "pre-fix shape: the pool goes on matching the stored centroid")
+        XCTAssertEqual(w.diarizer.currentProfiles().first?.profileName, "Alice",
+                       "pre-fix shape: and it still knows her name")
+    }
+
+    /// The other half of the opt-out, and the reason this neutralises rather
+    /// than removes: a speaker who *was* heard before the switch flipped
+    /// keeps their id for the rest of the recording, from what this
+    /// recording itself observed. Diarization is not what was switched off —
+    /// cross-recording recognition is — so the transcript stays coherent
+    /// while the stored identity is gone.
+    ///
+    /// Do not "fix" this into minting a new id: it would fork one person
+    /// across two speakers mid-transcript, and it is the name, not the
+    /// separation, that opting out revokes.
+    func test_opting_out_keeps_an_already_heard_speaker_coherent_but_nameless() {
+        let w = startedRecordingWithAliceSeeded()
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                       "precondition: Alice matched while the feature was on")
+
+        w.settings.isEnabled = false
+
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                       "in-recording continuity is deliberate")
+        XCTAssertNil(w.diarizer.currentProfiles().first?.profileName,
+                     "…but the stored name is gone, so nothing can auto-apply it")
+        XCTAssertTrue(w.profiles.profiles.isEmpty)
+        XCTAssertTrue(w.snapshots.heldRecordingCount == 0)
+    }
+
+    /// Ordering: a recording that stops *immediately* after the opt-out.
+    ///
+    /// `RecognisedSpeakerAssigner.finish` is gated on `isConfigured`, so it
+    /// returns before naming anything or taking a snapshot — the opt-out
+    /// wins whichever way the two land, and the three opt-out observers are
+    /// independent removals from three different holders, so their order
+    /// does not matter either.
+    ///
+    /// This one already held before the pool observer above existed, and it
+    /// is pinned here precisely because it is what makes that observer's job
+    /// small: stop is already safe, so the observer only has to cover the
+    /// *rest of the recording*. If this ever regresses, the opt-out stops
+    /// being fail-closed at both ends rather than one.
+    func test_stopping_right_after_an_opt_out_names_nothing_and_stores_nothing() {
+        let w = startedRecordingWithAliceSeeded()
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00")
+
+        let recordings = RecordingStore(rootDirectory: tempRoot)
+        let recording = Recording(title: "Standup",
+                                  duration: 30,
+                                  source: .microphone,
+                                  audioFileName: "standup.wav")
+        recordings.add(recording)
+        let assigner = RecognisedSpeakerAssigner(
+            store: recordings,
+            diarizer: w.diarizer,
+            snapshots: w.snapshots,
+            settings: w.settings,
+            profileStillStored: { w.profiles.profileExists(name: $0) })
+
+        w.settings.isEnabled = false
+        assigner.finish(recording: recording.id)
+
+        XCTAssertTrue(recordings.recordings.first?.speakerNames.isEmpty ?? false,
+                      "no speaker may be auto-named from a feature just switched off")
+        XCTAssertEqual(w.snapshots.heldRecordingCount, 0,
+                       "and no embeddings may be retained for the stopped recording")
+    }
+
     // MARK: - The explicit delete path
 
     /// Deletion is the one operation that must work *while off* — that's

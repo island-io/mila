@@ -263,6 +263,16 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// the user has just deleted (`names`), or for every seeded entry when
     /// `names` is nil.
     ///
+    /// Two callers, both wired in `MilaApp.init`, both answering the same
+    /// question — "the user just revoked something; does the recording that
+    /// is already running honour it?":
+    ///
+    ///   * `SpeakerProfileStore`'s deletion observer, passing the deleted
+    ///     `names` (or nil for "delete everything");
+    ///   * `VoiceRecognitionSettings`' enabled observer on opt-out, passing
+    ///     nil — switching the feature off revokes every seeded voice at
+    ///     once, not a named subset.
+    ///
     /// Deleting voice profiles is a privacy action, and `seedPool` gave this
     /// object its own copy of the centroids at record-start. Deleting the
     /// file therefore does not, by itself, delete the voice from a recording

@@ -590,6 +590,24 @@ struct MilaApp: App {
         _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
         let voiceSnapshots = ObservedVoiceSnapshots()
         voiceSnapshots.clearOnOptOut(of: voiceSettings)
+        // …and the third holder of copied voice data: the live pool. The two
+        // lines above unload the profiles (`SpeakerProfileStore`'s own
+        // observer) and drop the snapshots, but `seedPool` handed the
+        // diarizer its own copy of every centroid at record-start, so an
+        // opt-out mid-recording otherwise leaves `assign` matching against
+        // stored voices for the rest of it. The write gates stop the result
+        // being persisted; they do not stop it being *read*, and the user
+        // still watches their transcript auto-fill with names from a feature
+        // they just switched off.
+        //
+        // Exactly the deletion path's problem, so it gets the deletion
+        // path's remedy — see `addDeletionObserver` below. Opt-out is the
+        // broader of the two, so it forgets every seeded entry rather than
+        // named ones.
+        voiceSettings.addEnabledObserver { [weak liveDiar] nowEnabled in
+            guard !nowEnabled else { return }
+            liveDiar?.forgetSeededProfiles()
+        }
         // Auto-naming + the per-recording snapshot, driven by the finalize
         // drain rather than by observing `isRecording`. The drain hands over
         // the id of the recording that actually finished, and calls
