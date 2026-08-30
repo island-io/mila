@@ -299,7 +299,21 @@ final class VoiceMemosImporter: ObservableObject {
                 summary.imported += 1
             } catch {
                 summary.failedImport += 1
-                log.error("VoiceMemos import failed for \(memo.fileURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                // A Voice Memo's filename is its user-visible name — the title
+                // the user (or iOS's location naming) gave the memo — and the
+                // import writes into the recordings directory, so the error
+                // text names both that file and the folder the user chose.
+                // Domain + code stay public: they separate "no permission"
+                // from a full disk from an unreadable source file, which is
+                // what a failed import needs answered. The memo's own id keeps
+                // the line correlatable. (Issue #213, CWE-532.)
+                let ns = error as NSError
+                log.error("""
+                    VoiceMemos import failed for \(memo.uniqueID, privacy: .public) \
+                    (\(memo.fileURL.lastPathComponent, privacy: .private)) \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                    \(error.localizedDescription, privacy: .private)
+                    """)
             }
         }
 

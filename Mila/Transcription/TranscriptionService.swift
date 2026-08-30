@@ -5,6 +5,37 @@ import TranscriptionCore
 
 private let serviceLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "TranscriptionService")
 
+// MARK: - Logging privacy in this file
+//
+// Every line the transcription pass emits used to be a `print`, and a `print`
+// is public by construction — it has no privacy annotation, and an app
+// launched by launchd has its stdio captured into the unified log regardless.
+// The pass is also the highest-volume producer of these lines: one set per
+// recording, forever.
+//
+// `recording.title` is a meeting name — "Q3 board call", a client, a
+// candidate's name — and it was interpolated into roughly fourteen of them.
+// So the rule here, the one PR #183 settled for `RecordingStore`:
+//
+//   * the recording's UUID is the PUBLIC correlation key. It carries no
+//     content, and it is what lets you follow one recording across the queue,
+//     the run and the failure.
+//   * the title, and any filename derived from it, are `.private`. Audio,
+//     transcript, summary and subtitle names all come from the title via
+//     `RecordingStore.freshAudioURL(suggestedName:)` / `FileTranscriber`'s
+//     `safeStem`, so logging a filename logs a title.
+//   * an `error`'s message is `.private` wherever the failure touched one of
+//     those files, because Cocoa quotes the offending file — and its
+//     containing folder — inside `localizedDescription`. `NSError.domain` and
+//     `code` stay public: they are what separates "no permission" from a full
+//     disk, and they name nothing.
+//   * everything that is model/engine/queue state — model names, sample
+//     counts, segment counts, speaker counts, durations — stays `.public`.
+//     Redacting those would make a real failure undiagnosable and protect
+//     nothing.
+//
+// (Issue #213, CWE-532.)
+
 /// Coordinates batch transcription of recordings + one-shot transcription
 /// for dictation.
 ///
@@ -180,7 +211,7 @@ final class TranscriptionService: ObservableObject {
     func prewarm(language: String) {
         guard let model = modelManager.model(for: language),
               modelManager.isInstalled(model) else {
-            print("TranscriptionService.prewarm: skipping — no installed model for lang=\(language)")
+            serviceLog.log("prewarm: skipping — no installed model for lang=\(language, privacy: .public)")
             return
         }
         let modelURL = modelManager.url(for: model)
@@ -189,7 +220,7 @@ final class TranscriptionService: ObservableObject {
         // unwrapped on the property but force-imports here would
         // re-promote it to Optional inside the closure.
         let observerTask: Task<Void, Never> = observerSetupTask
-        print("TranscriptionService.prewarm: kicking off load for \(displayName)")
+        serviceLog.log("prewarm: kicking off load for \(displayName, privacy: .public)")
         Task.detached(priority: .userInitiated) { [engine] in
             // Bugbot #3: ensure the preparation observer is registered
             // BEFORE the first CoreML compile starts — otherwise the
@@ -202,11 +233,16 @@ final class TranscriptionService: ObservableObject {
             await observerTask.value
             do {
                 try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
-                print("TranscriptionService.prewarm: completed for \(displayName)")
+                serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")
             } catch {
                 // Silent — the real transcription call will retry and
                 // can surface any error through its own path.
-                print("TranscriptionService.prewarm: failed for \(displayName) (will retry on first use): \(error)")
+                // The model name and the whisper error are app/model state,
+                // not user content — no recording is involved in a prewarm.
+                serviceLog.error("""
+                    prewarm: failed for \(displayName, privacy: .public) \
+                    (will retry on first use): \(error.localizedDescription, privacy: .public)
+                    """)
             }
         }
     }
@@ -232,7 +268,11 @@ final class TranscriptionService: ObservableObject {
         queue.append(recording)
         publishPending()
         startWorkerIfNeeded()
-        print("Transcribe queue: enqueued \(recording.title) [\(recording.id.uuidString.prefix(8))], queue depth: \(queue.count)")
+        serviceLog.log("""
+            queue: enqueued \(recording.id.uuidString.prefix(8), privacy: .public) \
+            (\(recording.title, privacy: .private)), \
+            queue depth: \(self.queue.count, privacy: .public)
+            """)
     }
 
     /// Wait until the worker has fully drained the queue and gone idle.
@@ -439,7 +479,13 @@ final class TranscriptionService: ObservableObject {
             serviceLog.log("rediarizeSegments: offline pass labeled \(normalized.count, privacy: .public) segments with \(distinct, privacy: .public) speakers (was \(Set(segments.compactMap(\.speaker)).count, privacy: .public) live)")
             return normalized
         } catch {
-            serviceLog.log("rediarizeSegments: failed (keeping live speakers): \(error.localizedDescription, privacy: .public)")
+            // Same subprocess-output leak as the batch diarization path:
+            // `SpeakerDiarizer.Error.diarizationFailed` carries the Python
+            // stderr, which prints the title-derived WAV path. (Issue #213.)
+            serviceLog.log("""
+                rediarizeSegments: failed (keeping live speakers): \
+                \(SpeakerDiarizer.Error.logMessage(for: error), privacy: .public)
+                """)
             return nil
         }
     }
@@ -498,7 +544,10 @@ final class TranscriptionService: ObservableObject {
         // The user may have hit Cancel between enqueue and now. Don't spin up
         // the model just to throw the result away.
         if cancellation.contains(recording.id) {
-            print("Transcribe skipped: \(recording.title) was cancelled before processing")
+            serviceLog.log("""
+                skipped \(recording.id.uuidString.prefix(8), privacy: .public) \
+                (\(recording.title, privacy: .private)): cancelled before processing
+                """)
             cancellation.remove(recording.id)
             return
         }
@@ -531,7 +580,10 @@ final class TranscriptionService: ObservableObject {
         let isFirstTranscription = !wasRetranscribeEnqueue
             && working.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         if working.isTrashed {
-            print("Transcribe skipped: \(working.title) was deleted before processing")
+            serviceLog.log("""
+                skipped \(working.id.uuidString.prefix(8), privacy: .public) \
+                (\(working.title, privacy: .private)): deleted before processing
+                """)
             return
         }
 
@@ -565,7 +617,7 @@ final class TranscriptionService: ObservableObject {
             }
             guard modelManager.isInstalled(model) else {
                 lastError = "Whisper model is still downloading. Try again once it's ready."
-                print("Transcribe skipped: model \(model.name) not installed yet")
+                serviceLog.log("skipped: model \(model.name, privacy: .public) not installed yet")
                 markFailed(recording)
                 return
             }
@@ -611,7 +663,10 @@ final class TranscriptionService: ObservableObject {
             }
         }
 
-        print("Transcribe begin: \(working.title) [\(recordingID.uuidString.prefix(8))]")
+        serviceLog.log("""
+            begin \(recordingID.uuidString.prefix(8), privacy: .public) \
+            (\(working.title, privacy: .private))
+            """)
 
         // Bugbot #3: make sure the preparation observer is installed
         // before `loadIfNeeded` — see `init` for the race.
@@ -639,8 +694,16 @@ final class TranscriptionService: ObservableObject {
             let samples = try AudioConvert.loadAsWhisperSamples(url: audioURL)
             let durationSeconds = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
             let peak = samples.map { abs($0) }.max() ?? 0
-            print(String(format: "Transcribe: loaded %d samples (%.2fs, peak=%.4f) from %@",
-                         samples.count, durationSeconds, peak, audioURL.lastPathComponent))
+            // The audio FILENAME is title-derived (`freshAudioURL`), so it is
+            // `.private`; the sample count, duration and peak are the numbers
+            // that make a silent-capture report diagnosable and stay public.
+            serviceLog.log("""
+                loaded \(samples.count, privacy: .public) samples \
+                (\(String(format: "%.2f", durationSeconds), privacy: .public)s, \
+                peak=\(String(format: "%.4f", peak), privacy: .public)) \
+                for \(recordingID.uuidString.prefix(8), privacy: .public) \
+                from \(audioURL.lastPathComponent, privacy: .private)
+                """)
 
             // Reject essentially-silent / extremely-short audio BEFORE handing
             // it to Whisper. Otherwise the auto-gain step would amplify mic
@@ -656,7 +719,11 @@ final class TranscriptionService: ObservableObject {
                 // status in the list is enough self-serve signal; the
                 // detail view shows "No transcript yet" + a Transcribe
                 // button if the user wants to retry on a noisier mic.
-                print("Transcribe: rejecting \(working.title) — too short or too quiet to be real speech")
+                serviceLog.log("""
+                    rejecting \(recordingID.uuidString.prefix(8), privacy: .public) \
+                    (\(working.title, privacy: .private)) — too short or too quiet \
+                    to be real speech
+                    """)
                 working.status = .failed
                 working.fullText = ""
                 working.segments = []
@@ -686,17 +753,28 @@ final class TranscriptionService: ObservableObject {
 
             async let diarizeTask: [SpeakerTurn] = {
                 guard shouldDiarize else { return [] }
-                print("Transcribe: running speaker diarization...")
+                serviceLog.log("running speaker diarization…")
                 do {
                     let turns = try await SpeakerDiarizer.diarize(
                         wavURL: audioURL,
                         pythonPath: diarPythonPath
                     )
                     let speakerCount = Set(turns.map(\.speaker)).count
-                    print("Transcribe: diarization found \(speakerCount) speakers across \(turns.count) turns")
+                    serviceLog.log("""
+                        diarization found \(speakerCount, privacy: .public) speakers \
+                        across \(turns.count, privacy: .public) turns
+                        """)
                     return turns
                 } catch {
-                    print("Transcribe: diarization failed (continuing without speakers): \(error)")
+                    // `SpeakerDiarizer.Error.diarizationFailed` wraps the
+                    // Python subprocess's stderr verbatim, and that stderr
+                    // prints the WAV path it was handed — a title-derived
+                    // filename. `logMessage(for:)` keeps the failure and drops
+                    // the bytes. (Issue #213.)
+                    serviceLog.error("""
+                        diarization failed (continuing without speakers): \
+                        \(SpeakerDiarizer.Error.logMessage(for: error), privacy: .public)
+                        """)
                     return []
                 }
             }()
@@ -749,7 +827,10 @@ final class TranscriptionService: ObservableObject {
             // coordinator is about to delete the recording. Don't write a
             // `.completed` row to a recording that's already gone.
             if cancellation.contains(recordingID) {
-                print("Transcribe cancelled post-run: \(working.title)")
+                serviceLog.log("""
+                    cancelled post-run \(recordingID.uuidString.prefix(8), privacy: .public) \
+                    (\(working.title, privacy: .private))
+                    """)
                 cancellation.remove(recordingID)
                 return
             }
@@ -766,7 +847,10 @@ final class TranscriptionService: ObservableObject {
             // silently misalign the result. Server labels win. (issue #180)
             if Self.hasSpeakerLabels(segments) {
                 let distinct = Set(segments.compactMap(\.speaker)).count
-                print("Transcribe: keeping the \(distinct) server-side speaker labels — not overwriting them with the offline pass")
+                serviceLog.log("""
+                    keeping the \(distinct, privacy: .public) server-side speaker labels \
+                    — not overwriting them with the offline pass
+                    """)
             } else if !speakerTurns.isEmpty {
                 for i in enrichedSegments.indices {
                     enrichedSegments[i].speaker = SpeakerDiarizer.assignSpeaker(
@@ -784,15 +868,29 @@ final class TranscriptionService: ObservableObject {
                 enrichedSegments = Self.normalizeSpeakerLabels(in: enrichedSegments)
                 let labeled = enrichedSegments.compactMap(\.speaker).count
                 let distinct = Set(enrichedSegments.compactMap(\.speaker)).count
-                print("Transcribe: applied speaker labels — \(labeled)/\(enrichedSegments.count) segments labeled, \(distinct) distinct speakers")
+                serviceLog.log("""
+                    applied speaker labels — \(labeled, privacy: .public)/\
+                    \(enrichedSegments.count, privacy: .public) segments labeled, \
+                    \(distinct, privacy: .public) distinct speakers
+                    """)
             } else {
-                print("Transcribe: NO speaker labels — shouldDiarize=\(shouldDiarize), speakerTurns.count=0. Either diarization is not configured, returned no turns, or the pyannote subprocess failed (check stderr above).")
+                serviceLog.log("""
+                    NO speaker labels — shouldDiarize=\(shouldDiarize, privacy: .public), \
+                    speakerTurns.count=0. Either diarization is not configured, returned \
+                    no turns, or the pyannote subprocess failed (see the diarization \
+                    failure line above).
+                    """)
             }
 
             let text = enrichedSegments.map(\.text)
                 .joined()
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            print("Transcribe done: \(working.title) -> \(enrichedSegments.count) segments, \(text.count) chars")
+            serviceLog.log("""
+                done \(recordingID.uuidString.prefix(8), privacy: .public) \
+                (\(working.title, privacy: .private)) -> \
+                \(enrichedSegments.count, privacy: .public) segments, \
+                \(text.count, privacy: .public) chars
+                """)
 
             working.segments = enrichedSegments
             // The batch pass minted fresh speaker IDs (new clustering, new
@@ -834,7 +932,11 @@ final class TranscriptionService: ObservableObject {
                     $0.speakerNames = working.speakerNames
                 }
             }) else {
-                print("Transcribe: \(working.title) vanished from the store mid-pass — result discarded, row not recreated")
+                serviceLog.log("""
+                    \(recordingID.uuidString.prefix(8), privacy: .public) \
+                    (\(working.title, privacy: .private)) vanished from the store \
+                    mid-pass — result discarded, row not recreated
+                    """)
                 return
             }
             if persisted.status == .completed {
@@ -844,7 +946,11 @@ final class TranscriptionService: ObservableObject {
                     // the *user-facing* completion work: no stray `.srt` sidecar
                     // on disk, and no summarizer/LLM spend on something the user
                     // just threw away.
-                    print("Transcribe: \(persisted.title) was moved to Recently Deleted mid-pass — transcript saved, skipping SRT + summary")
+                    serviceLog.log("""
+                        \(persisted.id.uuidString.prefix(8), privacy: .public) \
+                        (\(persisted.title, privacy: .private)) was moved to Recently \
+                        Deleted mid-pass — transcript saved, skipping SRT + summary
+                        """)
                 } else {
                     TranscriptExporter.writeSRT(for: persisted, in: store.recordingsDirectory)
                     onTranscriptionCompleted?(persisted, hadSummaryBeforeRun)
@@ -865,10 +971,25 @@ final class TranscriptionService: ObservableObject {
             // also going to hard-delete the recording from the store — don't
             // race with that by writing a `.failed` status, and don't surface
             // a scary error banner for what was a user-initiated action.
-            print("Transcribe cancelled mid-run: \(working.title)")
+            serviceLog.log("""
+                cancelled mid-run \(recordingID.uuidString.prefix(8), privacy: .public) \
+                (\(working.title, privacy: .private))
+                """)
             cancellation.remove(recording.id)
         } catch {
-            print("Transcribe error for \(working.title): \(error)")
+            // The pass reads the recording's own audio and writes its
+            // transcript, both under the (possibly user-chosen) recordings
+            // directory with title-derived names — so a Cocoa error here
+            // quotes a title, or the folder holding it. Domain + code stay
+            // public: they separate "file missing" from "no permission" from
+            // a decode failure, and name nothing.
+            let ns = error as NSError
+            serviceLog.error("""
+                error for \(recordingID.uuidString.prefix(8), privacy: .public) \
+                (\(working.title, privacy: .private)) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             // A failed pass produced no transcript, so `status` is the ONLY
             // field it owns here — in particular it must not overwrite
             // `speakerNames`/`segments`, which it never re-keyed. Merging onto
@@ -987,7 +1108,12 @@ final class TranscriptionService: ObservableObject {
         // which can be stale (crash-recovered rows are seeded with 0) and
         // would let a long-but-silent clip slip under the threshold.
         guard shouldAutoDropShortEmpty?(duration, transcript) == true else { return false }
-        print("Transcribe: auto-dropping \(recording.title) [\(recording.id.uuidString.prefix(8))] — \(duration)s + empty transcript (issue #61)")
+        serviceLog.log("""
+            auto-dropping \(recording.id.uuidString.prefix(8), privacy: .public) \
+            (\(recording.title, privacy: .private)) — \
+            \(String(format: "%.2f", duration), privacy: .public)s + empty transcript \
+            (issue #61)
+            """)
         store.permanentlyDelete(recording)
         return true
     }

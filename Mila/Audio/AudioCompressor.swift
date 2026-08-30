@@ -47,7 +47,16 @@ enum AudioCompressor {
                 if buffer.frameLength == 0 { break }
                 try output.write(from: buffer)
             }
-            compressorLog.log("compressed \(wavURL.lastPathComponent, privacy: .public) → \(destURL.lastPathComponent, privacy: .public)")
+            // Both names are title-derived — the caller
+            // (`RecordingStore.compressRecordingAudio`) already redacts its own
+            // copy of the destination name for this reason; this line is the
+            // one it wraps and needs the same treatment. The compressor has no
+            // recording id to correlate on, but `RecordingStore` logs the id
+            // either side of this call. (Issue #213, CWE-532.)
+            compressorLog.log("""
+                compressed \(wavURL.lastPathComponent, privacy: .private) → \
+                \(destURL.lastPathComponent, privacy: .private)
+                """)
         }.value
     }
 

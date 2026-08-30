@@ -181,7 +181,13 @@ enum WAVHeaderRepair {
             wavRepairLog.error("WAV header fsync failed: \(error.localizedDescription, privacy: .public)")
             return false
         }
-        wavRepairLog.log("repaired unfinalized WAV header for \(url.lastPathComponent, privacy: .public) (data size -> \(plan.newDataSize))")
+        // The WAV's name is title-derived (`freshAudioURL(suggestedName:)`), so
+        // it is `.private`; the repaired size is the diagnostic and stays
+        // public. (Issue #213.)
+        wavRepairLog.log("""
+            repaired unfinalized WAV header for \(url.lastPathComponent, privacy: .private) \
+            (data size -> \(plan.newDataSize, privacy: .public))
+            """)
         return true
     }
 

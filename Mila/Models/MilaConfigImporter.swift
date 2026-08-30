@@ -78,7 +78,15 @@ final class MilaConfigImporter: ObservableObject {
             pending = PendingImport(config: config,
                                     changes: plannedChanges(for: config),
                                     sourceName: url.lastPathComponent)
-            log.log("staged \(url.lastPathComponent, privacy: .public) for import (\(self.pending?.changes.count ?? 0) change(s))")
+            // The FILENAME is user-chosen — a `.milaconfig` handed round a
+            // team is commonly named for the org or the server it configures
+            // ("acme-asr.milaconfig"), which is the same "names an employer or
+            // a customer" exposure as the storage folder. The change count is
+            // the diagnostic and stays public. (Issue #213.)
+            log.log("""
+                staged \(url.lastPathComponent, privacy: .private) for import \
+                (\(self.pending?.changes.count ?? 0, privacy: .public) change(s))
+                """)
         } catch {
             errorMessage = (error as? MilaConfig.LoadError)?.errorDescription
                 ?? error.localizedDescription
