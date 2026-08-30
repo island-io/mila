@@ -145,7 +145,15 @@ final class CrossRecordingVoiceIsolationTests: XCTestCase {
         XCTAssertEqual(alice(w.profiles)?.sampleCount, 41, "40 stored + A's 1 observation")
         // Alice's centroid must still point at Alice. The stranger is
         // [0, 1, 0, 0], so a leak shows up as component 1 moving off zero.
-        let embedding = alice(w.profiles)?.embedding ?? []
+        //
+        // Unwrapped rather than defaulted to `[]`: if the write path ever
+        // regresses and nothing is stored, an empty fallback would trap on the
+        // subscript below and abort the whole runner, hiding *which* invariant
+        // broke. Failing here names it instead.
+        guard let embedding = alice(w.profiles)?.embedding, embedding.count >= 2 else {
+            XCTFail("Alice was never written, or her embedding is too short to check for a leak")
+            return
+        }
         XCTAssertGreaterThan(embedding[0], 0.98, "still Alice")
         XCTAssertLessThan(embedding[1], 0.02, "the stranger's voice must not have leaked in")
         XCTAssertGreaterThan(cosineSimilarity(embedding, aliceStored), 0.99)
@@ -164,7 +172,13 @@ final class CrossRecordingVoiceIsolationTests: XCTestCase {
                                  embedding: leaked?.observedCentroid ?? [],
                                  sampleCount: leaked?.observedCount ?? 0)
 
-        let embedding = alice(w.profiles)?.embedding ?? []
+        // Same unwrap-don't-default reasoning as above: this control is only
+        // meaningful if Alice was actually written, so say so rather than
+        // trapping on an empty array.
+        guard let embedding = alice(w.profiles)?.embedding, embedding.count >= 2 else {
+            XCTFail("the control did not write Alice at all, so it cannot demonstrate the leak")
+            return
+        }
         XCTAssertGreaterThan(embedding[1], 0.02,
                              "the old lookup leaks the stranger — this is what the fix prevents")
     }
