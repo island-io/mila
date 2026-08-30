@@ -23,6 +23,11 @@ final class RecordingStore: ObservableObject {
     /// up in the sidebar and survives moving its last recording elsewhere.
     @Published private(set) var folders: [String] = []
 
+    /// Called when a speaker name is assigned (via setSpeakerName).
+    /// Provides the recording ID, raw speaker ID, and the name.
+    /// Used by voice recognition to save voice profiles.
+    var onSpeakerNamed: ((_ recordingID: UUID, _ rawID: String, _ name: String) -> Void)?
+
     private let fileManager = FileManager.default
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
@@ -489,6 +494,7 @@ final class RecordingStore: ObservableObject {
         if let trimmed, !trimmed.isEmpty {
             guard recordings[idx].speakerNames[rawID] != trimmed else { return }
             recordings[idx].speakerNames[rawID] = trimmed
+            onSpeakerNamed?(recordingID, rawID, trimmed)
         } else {
             guard recordings[idx].speakerNames[rawID] != nil else { return }
             recordings[idx].speakerNames.removeValue(forKey: rawID)

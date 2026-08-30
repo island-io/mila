@@ -366,6 +366,11 @@ struct MilaApp: App {
     /// purely so it survives SwiftUI re-inits like the other singletons.
     @StateObject private var liveSidecarWriter: LiveTranscriptSidecarWriter
     @StateObject private var updater = UpdaterViewModel()
+    /// Opt-in switch for cross-recording voice recognition (off by default).
+    @StateObject private var voiceRecognitionSettings: VoiceRecognitionSettings
+    /// Persisted voice fingerprints behind that feature. Inert — nothing
+    /// read, nothing written — until the setting above is turned on.
+    @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
@@ -618,6 +623,96 @@ struct MilaApp: App {
                 summarizer?.summarizeIfNeeded(rec)
             }
         }
+        // Cross-recording voice recognition. Opt-in and off by default:
+        // `voiceSettings.isConfigured` is the single gate, and it means
+        // "the user turned it on AND diarization can actually produce
+        // embeddings" — see `.claude/rules/feature-gates.md`. Readiness is
+        // injected as a closure so the settings object can read the
+        // diarization gate without being able to mutate it.
+        let voiceSettings = VoiceRecognitionSettings()
+        voiceSettings.diarizationReady = { [weak diarSettings] in
+            diarSettings?.isConfigured ?? false
+        }
+        _voiceRecognitionSettings = StateObject(wrappedValue: voiceSettings)
+        let profileStoreRef = SpeakerProfileStore(settings: voiceSettings)
+        _speakerProfileStore = StateObject(wrappedValue: profileStoreRef)
+        let voiceSnapshots = ObservedVoiceSnapshots()
+        voiceSnapshots.clearOnOptOut(of: voiceSettings)
+        // …and the third holder of copied voice data: the live pool. The two
+        // lines above unload the profiles (`SpeakerProfileStore`'s own
+        // observer) and drop the snapshots, but `seedPool` handed the
+        // diarizer its own copy of every centroid at record-start, so an
+        // opt-out mid-recording otherwise leaves `assign` matching against
+        // stored voices for the rest of it. The write gates stop the result
+        // being persisted; they do not stop it being *read*, and the user
+        // still watches their transcript auto-fill with names from a feature
+        // they just switched off.
+        //
+        // Exactly the deletion path's problem, so it gets the deletion
+        // path's remedy — see `addDeletionObserver` below. Opt-out is the
+        // broader of the two, so it forgets every seeded entry rather than
+        // named ones.
+        voiceSettings.addEnabledObserver { [weak liveDiar] nowEnabled in
+            guard !nowEnabled else { return }
+            liveDiar?.forgetSeededProfiles()
+        }
+        // Auto-naming + the per-recording snapshot, driven by the finalize
+        // drain rather than by observing `isRecording`. The drain hands over
+        // the id of the recording that actually finished, and calls
+        // synchronously inside the window where the diarizer pool still
+        // belongs to it — see `RecognisedSpeakerAssigner`.
+        let assigner = RecognisedSpeakerAssigner(store: store,
+                                                diarizer: liveDiar,
+                                                snapshots: voiceSnapshots,
+                                                settings: voiceSettings,
+                                                profileStillStored: { name in
+                                                    profileStoreRef.profileExists(name: name)
+                                                })
+        // Deleting voice profiles has to reach the recording that is already
+        // running, not just memory and the file. The pool was seeded from
+        // these profiles at record-start and keeps its own copy of every
+        // centroid, so without this the rest of the recording goes on
+        // matching the erased voice and `assigner.finish` writes it back at
+        // stop — the deleted file reappears, holding the same person's
+        // fingerprint. Same immediacy as the opt-out path above.
+        profileStoreRef.addDeletionObserver { [weak liveDiar] deletion in
+            switch deletion {
+            case .all: liveDiar?.forgetSeededProfiles()
+            case .named(let names): liveDiar?.forgetSeededProfiles(named: names)
+            }
+        }
+        actions.onRecordingFinalized = { [assigner] recordingID in
+            assigner.finish(recording: recordingID)
+        }
+        // Save a voice profile when a speaker is named — if the live
+        // diarizer observed that speaker *in that recording*, persist it.
+        // The store refuses writes while the feature is off; the guard here
+        // means an opted-out user's voice isn't so much as looked up.
+        //
+        // Resolved through the per-recording snapshot keyed on
+        // `recordingID`, never against the live pool. `SPEAKER_00` restarts from zero on every
+        // `reset()`, so a live-pool lookup silently returned the *current*
+        // recording's speaker for a name applied to an older one — writing a
+        // stranger's voice into the named profile. A recording with no
+        // snapshot resolves to nil and persists nothing, which is the honest
+        // answer: its pool is gone.
+        //
+        // The snapshot holds what was observed in that recording, not the
+        // pool's matching centroid — for a seeded speaker the latter carries
+        // weight already stored on disk, and folding it back counts it twice.
+        // This is the only place voice profiles are written, so a recognised
+        // speaker merges exactly once per recording.
+        store.onSpeakerNamed = { recordingID, rawID, name in
+            guard voiceSettings.isConfigured else { return }
+            guard let observed = voiceSnapshots.observation(forSpeaker: rawID,
+                                                           in: recordingID) else { return }
+            profileStoreRef.updateProfile(
+                name: name,
+                embedding: observed.observedCentroid,
+                sampleCount: observed.observedCount
+            )
+        }
+
         // Auto-drop accidental short+empty captures (issue #61). A recording
         // that finishes transcription with no text AND under the user's
         // minimum-duration threshold (Settings ▸ Storage, default 5s, 0 = keep
@@ -747,6 +842,8 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(voiceRecognitionSettings)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 .sheet(item: Binding(
                     get: { configImporter.pending },
@@ -826,6 +923,8 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(voiceRecognitionSettings)
+                .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
                 // Settings ▸ General shows the Sparkle-backed
                 // "Automatically check for updates" toggle, so the Settings
@@ -1443,6 +1542,14 @@ struct MilaApp: App {
                 // By the time this runs, the session has already been freshly
                 // started for this recording.
                 diarizer.reset()
+                // Seed the embedding pool with known voices only when the
+                // user opted in. `seedEntries()` refuses on its own too, and
+                // while off it has nothing to hand over regardless (the
+                // profiles file is never parsed) — three independent reasons
+                // an opted-out recording starts from a blank pool.
+                if voiceRecognitionSettings.isConfigured {
+                    diarizer.seedPool(with: speakerProfileStore.seedEntries())
+                }
                 diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
                 // Detach the diarizer start so a quick stop-after-start
                 // doesn't block the state observer on pyannote cold-init.

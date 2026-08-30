@@ -154,6 +154,20 @@ final class QuickActionsController: ObservableObject {
     /// `stopRecording`.
     @Published var isFinalizingRecording: Bool = false
 
+    /// Late-bound by MilaApp. Called once per finished recording, **with
+    /// that recording's id**, from inside the finalize drain: after
+    /// `liveDiarizer.awaitPending()` (so `intervals` are final), after the
+    /// recording's final state is written to the store, and before
+    /// `liveDiarizer.stop()` — i.e. inside the window where the live
+    /// diarizer's pool is still guaranteed to belong to this recording.
+    ///
+    /// Cross-recording voice recognition hangs off this. It has to be told
+    /// the id: observing `isRecording` flipping false carries none, and
+    /// recovering one from `store.recordings.first` is unreliable because
+    /// `add` inserts at index 0 with no re-sort, so any recording added in
+    /// between (a Voice Memos import, say) becomes `first`.
+    var onRecordingFinalized: ((UUID) -> Void)?
+
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
     /// VAD path already produced segments), TranscriptionService's
@@ -898,6 +912,22 @@ final class QuickActionsController: ObservableObject {
         // authoritative. (CodeRabbit on #183.)
         liveSidecarWriter?.finish(recordingID: persisted ? updated.id : nil,
                                   transcriptIsFinal: liveTranscriptIsAuthoritative)
+
+        // Cross-recording voice recognition gets its one shot here, with the
+        // id of the recording that actually just finished. This is the only
+        // point where reading the live diarizer for *this* recording is
+        // sound: `awaitPending()` above means `intervals` are final, the
+        // `isFinalizingRecording` window below hasn't closed so no new
+        // recording can have `reset()` the pool, and `updated` is already
+        // written so the speaker names it assigns won't be clobbered by the
+        // snapshot above.
+        //
+        // Deliberately a callback with the id rather than something MilaApp
+        // observes: it used to run off `.onChange(of: actions.isRecording)`,
+        // which carries no id and had to guess with `store.recordings.first`
+        // — and `add` inserts at index 0, so a Voice Memos import landing in
+        // between made the memo "the recording that just stopped".
+        onRecordingFinalized?(recording.id)
 
         // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
         //
