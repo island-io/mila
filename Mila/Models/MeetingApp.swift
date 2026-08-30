@@ -9,6 +9,7 @@ import SwiftUI
 enum MeetingApp: String, CaseIterable {
     case zoom
     case teams
+    case googleMeet
 
     struct Info {
         let displayName: String
@@ -44,6 +45,17 @@ enum MeetingApp: String, CaseIterable {
                 badgeColor: Color(red: 0.384, green: 0.388, blue: 0.651), // #6264A7
                 bundleIDPrefixes: ["com.microsoft.teams"],
                 matchSubstring: "microsoft teams"
+            )
+        case .googleMeet:
+            return Info(
+                displayName: "Google Meet",
+                badgeColor: Color(red: 0.0, green: 0.682, blue: 0.478), // #00AE7A
+                bundleIDPrefixes: [
+                    "meet.google.com",
+                    "com.google.chrome", "com.apple.safari",
+                    "company.thebrowser", "io.island"
+                ],
+                matchSubstring: "meet.google.com"
             )
         }
     }
