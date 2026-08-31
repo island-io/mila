@@ -32,12 +32,36 @@ The user seeing their own content, on a surface they asked for, on their own
 screen, is not a leak — prefer splitting the loggable message from the displayed
 one over weakening the UI.
 
+## Redaction is per branch, not per function
+
+The most common way this reappears is **half-fixed**: the success log in a
+function is redacted and the error / `catch` / fallback branch a few lines below
+still interpolates the same value — or the `localizedDescription` that quotes it
+— as `.public`. It reads as done, and the failure branch is the worse of the two
+to leak from, because Cocoa's message names the *containing folder* as well as
+the file.
+
+Bugbot caught exactly this on PR #218 in `WAVHeaderRepair.repairIfNeeded`: the
+success line marked the title-derived WAV name `.private`, while the write-failure
+and `fsync`-failure lines above it still published `error.localizedDescription`.
+The same sweep found it again in `MilaConfigImporter.handleOpen`, whose success
+line redacts the user-chosen `.milaconfig` filename and whose `catch` logged
+`String(describing: error)` — the same filename, plus its folder.
+
+So: check **every** branch that logs, not the one the diff draws attention to.
+A `catch` is not exempt for being an error path.
+
 ## What to flag
 
 - `print(` carrying a title, path, transcript or subprocess output.
 - Public `Logger` interpolation of anything the user can relocate or name.
 - `error.localizedDescription` logged publicly where the error came from a file
   operation on a user-chosen path.
-- An `errorDescription` that embeds stdout/stderr from a child process.
+- A function whose success log redacts a title or path while its error, `catch`
+  or fallback branch still logs that value — or an error message that quotes it
+  — `.public`.
+- An `errorDescription` that embeds stdout/stderr from a child process, **or a
+  response body from a remote endpoint**. Both are output Mila did not write, and
+  a 401 body commonly quotes a fragment of the user's API key.
 - Redaction of a value that is purely diagnostic (domain, code, counts,
   durations, exit codes) — flag that as over-redaction.

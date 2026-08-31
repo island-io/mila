@@ -78,10 +78,11 @@ jobs:
 
       - name: Install Swift
         if: steps.changes.outputs.relevant == 'true'
-        # HELD at v2.4.0 on purpose: setup-swift's only v3 tag is the
-        # 3.0.0-beta.1 pre-release, whose Swiftly-based installer fails GPG
-        # verification on the Ubuntu runner ("gpg: Can't check signature: No
-        # public key") and kills this job. Dependabot is told to skip 3.x in
+        # HELD at v2.4.0 on purpose: setup-swift has no stable v3 — its `v3`
+        # tag and its `v3.0.0-beta.1` tag are the same commit, and that build's
+        # Swiftly-based installer fails GPG verification on the Ubuntu runner
+        # ("gpg: Can't check signature: No public key"), which kills this job
+        # every run (not a flake). Dependabot is told to skip 3.x in
         # .github/dependabot.yml — revisit when a stable v3 ships.
         uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:

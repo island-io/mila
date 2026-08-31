@@ -185,6 +185,16 @@ final class LiveAISession: ObservableObject {
         self.liveAISettings = liveAISettings
     }
 
+    /// Inject rolling AI output without invoking an LLM. Same idiom (and same
+    /// justification) as `LiveTranscriber.seedForTesting`: `summary` and
+    /// `actionItems` are `private(set)`, so a test asserting on what Stop
+    /// snapshots out of them has no other way in. Production paths must not
+    /// call this.
+    func seedForTesting(summary: String, actionItems: [ActionItem] = []) {
+        self.summary = summary
+        self.actionItems = actionItems
+    }
+
     /// Begin a session — clears any previous state. Generates a fresh
     /// session id when the user's LLM tool supports session continuity
     /// (Claude does; Cursor doesn't), so each recording gets its own
@@ -537,7 +547,21 @@ TRANSCRIPT SO FAR:
                 }
             } catch {
                 let elapsed = Date().timeIntervalSince(llmStart)
-                print(String(format: "LiveAI[%@]: FAILED after %.1fs: %@", kickTag, elapsed, error.localizedDescription))
+                // Was a `print`, which is the worst version of this: no
+                // privacy annotation exists on it at all, and an app launched
+                // by launchd has its stdio captured into the unified log
+                // anyway. Live AI's prompt is the in-progress meeting
+                // transcript, so a CLI that echoes its input on stderr put the
+                // live transcript here on every failed tick — and ticks repeat
+                // for the whole meeting. `logMessage(for:)` keeps the exit
+                // status and a byte count. (Issue #193.) `lastError` below
+                // still carries the full text: that one is the in-app banner
+                // the user is watching.
+                liveAILog.error("""
+                    tick \(kickTag, privacy: .public): FAILED after \
+                    \(String(format: "%.1f", elapsed), privacy: .public)s: \
+                    \(LLMRunnerError.logMessage(for: error), privacy: .public)
+                    """)
                 // Same drop-the-stale-tick check as the success path.
                 guard let self, self.sessionID == kickSessionID else {
                     return

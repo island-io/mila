@@ -26,10 +26,20 @@ public enum TranscriptFormatter {
     ///
     /// Matches the SRT exporter's prefix format so the clipboard text and
     /// the on-disk `.srt` use the same speaker labels.
+    ///
+    /// `fallback` is an `@autoclosure`, and that is load-bearing rather than
+    /// a micro-optimisation. It is consulted on exactly one path — no segment
+    /// carries a speaker — so for a diarized recording producing it is work
+    /// with no observable effect. `MilaStoreReader.namedTranscript` passes an
+    /// expression that READS A FILE, and it used to be evaluated eagerly for
+    /// every recording a search touched: the "N synchronous file reads per
+    /// `search_transcripts` call" of #201. Every call site passes a pure
+    /// expression, so nothing reads differently at the call sites; deferring
+    /// it is the whole point, so do not hoist one into a `let`.
     public static func plainText<S: SpeakerTextSegment>(
-        segments: [S], fallback: String, names: [String: String] = [:]
+        segments: [S], fallback: @autoclosure () -> String, names: [String: String] = [:]
     ) -> String {
-        guard segments.contains(where: { $0.speaker != nil }) else { return fallback }
+        guard segments.contains(where: { $0.speaker != nil }) else { return fallback() }
 
         var lines: [String] = []
         var currentSpeaker: String?? = .none

@@ -174,8 +174,9 @@ final class SpeakerProfileStore: ObservableObject {
     /// recording's centroid, which is the same person's fingerprint to
     /// within rounding. `MilaApp` wires this to
     /// `LiveSpeakerDiarizer.forgetSeededProfiles`, so the deletion takes
-    /// effect immediately and everywhere, exactly as opting out does through
-    /// `VoiceRecognitionSettings.addEnabledObserver`.
+    /// effect immediately and everywhere, exactly as the feature ceasing to
+    /// be configured does through
+    /// `VoiceRecognitionSettings.addConfiguredObserver`.
     ///
     /// A list rather than one slot, for the same reason `addEnabledObserver`
     /// is: a second registrant must not silently unhook the first.
@@ -189,6 +190,15 @@ final class SpeakerProfileStore: ObservableObject {
 
     /// `directory` is the folder that holds `speaker-profiles.json`.
     /// Injectable so tests can point at a temp directory.
+    ///
+    /// In production it is the fixed `Application Support/Mila` root (see the
+    /// convenience init), NOT the user's chosen recordings folder — voice
+    /// profiles are app state and deliberately do not travel with a relocated
+    /// store, exactly like `speaker-names.json` and the voice-memo tombstones.
+    /// That is why the load/save/delete failures below keep
+    /// `error.localizedDescription` `.public`: the folder Cocoa quotes in the
+    /// message can only ever be “Mila”. The profile NAMES are user content and
+    /// are already `.private` at the one site that logs one. (Issue #213.)
     init(directory: URL, settings: VoiceRecognitionSettings) {
         self.settings = settings
         self.storeURL = directory.appendingPathComponent("speaker-profiles.json")

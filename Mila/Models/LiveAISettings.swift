@@ -273,7 +273,18 @@ final class LiveAISettings: ObservableObject {
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
         let langRaw = defaults.string(forKey: Keys.outputLanguage) ?? OutputLanguage.auto.rawValue
         self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto
-        self.summaryPrompt = defaults.string(forKey: Keys.summaryPrompt) ?? Self.defaultSummaryPrompt
+        // Migrate users still on the pre-1.8.x concise default up to the
+        // richer `defaultSummaryPrompt`. A nil value (never set) or an exact
+        // match of the old default both adopt the new default; any other
+        // value is a user customisation and is preserved as-is. Idempotent:
+        // the migration is a pure read (we don't write the default back), so
+        // a later prompt revision can migrate the same way.
+        let storedSummaryPrompt = defaults.string(forKey: Keys.summaryPrompt)
+        if let stored = storedSummaryPrompt, stored != Self.legacySummaryPromptV1 {
+            self.summaryPrompt = stored
+        } else {
+            self.summaryPrompt = Self.defaultSummaryPrompt
+        }
     }
 
     /// Default model. Currently `claude-sonnet-4-6` — better
@@ -326,13 +337,40 @@ If the call has just started and there is no transcript yet, output \
 {"summary": "", "items": []}.
 """
 
-    /// Default one-shot summary prompt. Plain-text, meeting-style — no
-    /// JSON envelope, no action items, no "you've been called repeatedly"
-    /// framing. This runs ONCE against the full transcript after a
-    /// recording finishes, so the prompt can assume the model has the
-    /// complete picture and just needs to produce a concise human-readable
-    /// summary. `{{LANGUAGE}}` is substituted at send time.
+    /// Default one-shot summary prompt. Plain-text, meeting-style — this
+    /// runs ONCE against the full transcript after a recording finishes, so
+    /// the prompt can assume the model has the complete picture. The one-shot
+    /// caller (`RecordingSummarizer`) appends the action-items contract at
+    /// send time, so this prompt only governs the SUMMARY content/style.
+    /// `{{LANGUAGE}}` is substituted at send time.
+    ///
+    /// Depth deliberately matches the pre-#87 live summary: an overview, the
+    /// main topics with their key points, decisions made, and — when the
+    /// conversation centres on specific people / projects / items — a
+    /// per-item breakdown so each one's situation and next steps are clear.
     static let defaultSummaryPrompt = """
+You are summarizing a meeting transcript. Output everything in {{LANGUAGE}}.
+
+Write a thorough summary for someone who did not attend. Cover:
+  • A short overview of what the meeting was about.
+  • The main topics discussed, with the key points for each.
+  • Any decisions that were made.
+  • When the conversation centres on specific people, projects, or items,
+    break the summary down per person / topic so each one's situation and
+    the next steps for it are clear.
+
+Use short paragraphs or bullet points, and **bold** the key names and
+topics so the summary is easy to skim. Be comprehensive but do not repeat
+yourself. Do NOT include a preamble like "Here is the summary"; start
+directly with the content.
+"""
+
+    /// The pre-1.8.x concise default. Kept verbatim so `init` can migrate a
+    /// user still on the old default up to `defaultSummaryPrompt` without
+    /// clobbering a genuinely customised prompt. Do not edit — changing it
+    /// would break the migration match. (Retire once enough releases have
+    /// passed that no one is on the old default.)
+    static let legacySummaryPromptV1 = """
 You are summarizing a meeting transcript. Output everything in {{LANGUAGE}}.
 
 Read the transcript below and produce a concise summary suitable for

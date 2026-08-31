@@ -181,7 +181,20 @@ final class QuickActionsController: ObservableObject {
     /// recovering one from `store.recordings.first` is unreliable because
     /// `add` inserts at index 0 with no re-sort, so any recording added in
     /// between (a Voice Memos import, say) becomes `first`.
-    var onRecordingFinalized: ((UUID) -> Void)?
+    ///
+    /// The second argument is the speaker names the user assigned from the
+    /// LIVE transcript pane while the recording ran (`LiveTranscriber.
+    /// speakerNames`). They travel through this hook rather than being copied
+    /// onto the row here because that copy was the bug in island-io/mila#209:
+    /// a name already on the row makes `RecordingStore.setSpeakerName`
+    /// no-change-guard out before it can fire `onSpeakerNamed`, the one hook
+    /// that persists a voice profile — so a mid-recording label stuck to the
+    /// transcript and taught the recogniser nothing, silently. There is no
+    /// row to name while the recording runs (`store.add` happens in
+    /// `stopRecording`), so deferring to here is what makes that single
+    /// persistence trigger reachable at all. See `RecognisedSpeakerAssigner.
+    /// finish(recording:liveSpeakerNames:)`.
+    var onRecordingFinalized: ((_ recordingID: UUID, _ liveSpeakerNames: [String: String]) -> Void)?
 
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
@@ -714,6 +727,20 @@ final class QuickActionsController: ObservableObject {
         // and chunk modes produce live segments we want to preserve,
         // so the initial-status gate is segment-presence, not mode.
         let initialStatus: TranscriptionStatus = initialSegments.isEmpty ? .pending : .running
+        // `speakerNames` is deliberately NOT seeded from `liveTranscriber`
+        // below, and neither is it copied onto `updated` in the drain. Both
+        // copies used to exist, and between them they made mid-recording
+        // speaker naming teach the recogniser nothing at all
+        // (island-io/mila#209): the name was already on the row by the time
+        // `onRecordingFinalized` fired, so `setSpeakerName`'s no-change guard
+        // returned before firing `onSpeakerNamed` — the only hook that writes
+        // a voice profile. The live map now travels through that hook instead,
+        // which applies it via `setSpeakerName` and so keeps ONE persistence
+        // trigger (a parallel write is what caused the double-merge fixed in
+        // #204). Nothing reads the row's names in the meantime: the
+        // post-record sheet renders the transcript only once the row leaves
+        // `.pending`/`.running`, and the live MCP sidecar carries its own copy
+        // of the map.
         let recording = Recording(
             title: finalTitle,
             duration: duration,
@@ -727,8 +754,7 @@ final class QuickActionsController: ObservableObject {
             appName: appName,
             appBundleID: appBundleID,
             summary: initialSummary.isEmpty ? nil : initialSummary,
-            actionItems: initialItems.isEmpty ? nil : initialItems,
-            speakerNames: liveTranscriber?.speakerNames ?? [:]
+            actionItems: initialItems.isEmpty ? nil : initialItems
         )
         store.add(recording)
         // The live sidecar is deliberately NOT closed here. `finish()`
@@ -852,6 +878,11 @@ final class QuickActionsController: ObservableObject {
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
         let finalLiveSegments = liveTranscriber?.segments ?? []
+        // Snapshotted here for the same reason as the segments themselves —
+        // before `liveTranscriber?.stop()` below — because it is what tells an
+        // emptied live transcript apart from one that never existed. See
+        // `liveTranscriptIsAuthoritative`.
+        let userDeletedLiveLines = liveTranscriber?.hasUserDeletedSegments ?? false
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = liveAISession?.actionItems ?? []
@@ -898,7 +929,21 @@ final class QuickActionsController: ObservableObject {
         // `vadActive` here is whatever was passed in by the caller —
         // typically `liveAISettings.useVAD && liveAISettings.enabled`.
         let hasLiveSegments = !finalLiveSegments.isEmpty
-        let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive
+        // A live transcript the user EMPTIED by deleting every line is not the
+        // same thing as one that was never produced, and `hasLiveSegments`
+        // cannot tell them apart on its own. It exists for the second case: no
+        // live text means the live path gave us nothing, so fall back to the
+        // batch pass. Run that fallback after a hand-emptied transcript and the
+        // batch pass re-transcribes the WAV and writes every deleted line back
+        // into recordings.json, the `.txt` sidecar and the `.srt` — the
+        // resurrection `bugbot-rules/deleted-data-stays-deleted.md` describes,
+        // reached by the one route the UI-side gate cannot cover, because
+        // emptying `segments` is itself what flips this gate. Deleting every
+        // line is the strongest statement a user can make that this must not be
+        // recorded, so a deliberate emptying stays authoritative and saves
+        // empty. (Cursor Bugbot on #229.)
+        let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
+        let liveTranscriptIsAuthoritative = (hasLiveSegments || userEmptiedLiveTranscript) && vadActive
         let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
             TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
                               text: ls.text, speaker: ls.speaker)
@@ -930,11 +975,15 @@ final class QuickActionsController: ObservableObject {
             return
         }
         updated.segments = finalTranscriptSegments
-        // Mid-recording speaker renames from the live pane. Snapshotted
-        // here (before `liveTranscriber?.stop()` below) alongside the
-        // segments they label; `finalizeTail` remaps them if the offline
-        // re-diarize pass re-keys the speaker IDs.
-        updated.speakerNames = liveTranscriber?.speakerNames ?? [:]
+        // Mid-recording speaker renames from the live pane are NOT copied
+        // onto the row here — see the note at `store.add` above. They are
+        // handed to `onRecordingFinalized` below (still before
+        // `liveTranscriber?.stop()`, so the map is intact) and applied with
+        // `store.setSpeakerName`, which is what lets them persist a voice
+        // profile. `finalizeTail` still remaps whatever the row ends up
+        // holding if the offline re-diarize pass re-keys the speaker IDs — it
+        // re-reads the row rather than using this snapshot, precisely so a
+        // name assigned after this line is not lost.
         // Always preserve fullText when we have live segments — the
         // sheet should show what the user just saw on screen, even
         // for chunk mode while the batch diarization pass is still
@@ -942,6 +991,27 @@ final class QuickActionsController: ObservableObject {
         updated.fullText = hasLiveSegments ? finalFullText : ""
         updated.summary = finalSummary.isEmpty ? nil : finalSummary
         updated.actionItems = finalItems.isEmpty ? nil : finalItems
+        if userEmptiedLiveTranscript {
+            // Emptying the live transcript is a DISCARD of the transcript, so
+            // the artifacts DERIVED from it go with it. Both were produced by
+            // the Live AI loop from text that no longer exists, and nothing
+            // downstream would replace them: `RecordingSummarizer.regenerate`
+            // bails on an empty `fullText` (and only ever writes `summary`,
+            // never `actionItems`), and an authoritative row owes no batch
+            // pass, so there is no completion hook either. Keeping them would
+            // leave the transcript reading clean while the deleted words sit
+            // in the `summary` field of `recordings.json` and in everything
+            // that reads the row — MCP `get_transcript` included, which serves
+            // summary + action items by default. (Cursor Bugbot on #229.)
+            //
+            // Scoped to a FULL emptying on purpose. A partial delete leaves a
+            // non-empty transcript, and dropping a meeting's whole summary
+            // because one line was removed would be its own data loss; that
+            // case is discussed on the PR (the summary is regenerated from the
+            // clean text, but `actionItems` are not).
+            updated.summary = nil
+            updated.actionItems = nil
+        }
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         // `update` reports whether the `.txt` sidecar AND recordings.json
         // actually landed on disk. Both used to fail silently, so the handoff
@@ -990,7 +1060,21 @@ final class QuickActionsController: ObservableObject {
         // which carries no id and had to guess with `store.recordings.first`
         // — and `add` inserts at index 0, so a Voice Memos import landing in
         // between made the memo "the recording that just stopped".
-        onRecordingFinalized?(recording.id)
+        //
+        // It also carries the live pane's speaker names, which is what makes
+        // naming a speaker mid-recording learn a voice profile at all
+        // (island-io/mila#209). Read from `liveTranscriber` here — before the
+        // teardown below — and applied on the far side through
+        // `store.setSpeakerName`, the single persistence trigger.
+        onRecordingFinalized?(recording.id, liveTranscriber?.speakerNames ?? [:])
+        // Those names are written into the STORED row by `setSpeakerName`, not
+        // into this local copy, so re-read it. Without this the tail below
+        // carries a `speakerNames`-less snapshot and its
+        // `TranscriptExporter.writeSRT(for: updated, …)` would overwrite the
+        // named `.srt` that `setSpeakerName` just wrote with an unnamed one.
+        if let named = store.recordings.first(where: { $0.id == recording.id }) {
+            updated = named
+        }
 
         // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
         //

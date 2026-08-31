@@ -2,7 +2,11 @@ import Foundation
 import AppKit
 import Combine
 import AVFoundation
+import OSLog
 import TranscriptionCore
+
+private let dictationLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                  category: "DictationController")
 
 /// Press the bound hotkey to start a dictation in that language. Press the same
 /// hotkey again to stop, transcribe, and paste at the cursor.
@@ -280,7 +284,21 @@ final class DictationController: ObservableObject {
                 try file.write(from: buffer)
             }
         } catch {
-            print("Dictation save error: \(error)")
+            // `url` is `store.freshAudioURL(...)` — inside the recordings
+            // directory, which is the folder the user chose in Settings →
+            // Storage. Cocoa quotes the file AND its containing folder in
+            // `localizedDescription` ("…in the folder “Acme Corp Client X”"),
+            // so the message leaks that choice even though the filename
+            // itself is the fixed "Dictation" stem. Domain + code stay public:
+            // "no permission" (NSCocoaErrorDomain 513) versus a full disk
+            // versus a missing directory is the entire diagnostic, and neither
+            // names a path. (Issue #213, CWE-532.)
+            let ns = error as NSError
+            dictationLog.error("""
+                dictation save failed \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return
         }
         let title = "Dictation · \(Self.titleFormatter.string(from: Date()))"

@@ -19,6 +19,17 @@ private let sidecarLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 @MainActor
 final class LiveTranscriptSidecarWriter: ObservableObject {
 
+    /// Every file this type writes lives at `<root>/live/`, and `root` is
+    /// `RecordingStore.originalRootDirectory` in production (see `MilaApp`) —
+    /// the fixed app-support root, which `relocateRecordings` never moves. So
+    /// the three write-failure lines below keep `error.localizedDescription`
+    /// `.public` on purpose: the folder Cocoa quotes in the message can only
+    /// ever be “Mila”, no title or user-chosen path can reach them, and a
+    /// readable message is what makes a broken MCP handoff diagnosable. Same
+    /// established exception as `store-location.json` and `persistTombstones`
+    /// in `RecordingStore`; contrast `persist()` / `persistFolders()` there,
+    /// which follow the user's chosen directory and therefore redact.
+    /// (Issue #213.)
     private let root: URL
     private let minWriteInterval: TimeInterval
     private let heartbeatInterval: TimeInterval
@@ -90,6 +101,14 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
     /// on every reassignment, changed or not), and coalesces bursts down
     /// to one write per `minWriteInterval` with a guaranteed trailing
     /// write so the last tick of a burst always lands.
+    ///
+    /// A tick that REMOVED a line — the user deleted it from the live pane —
+    /// also stamps `segmentsRemovedAtRevision`, because the incremental poll
+    /// cursor cannot express a removal on its own: it is a count plus a
+    /// "re-read the last entry" rule, so a poller holding the deleted line
+    /// would keep it (and mis-stitch everything after it). See
+    /// `LiveTranscriptSnapshot.segmentsWereRemoved(from:to:)` for what counts
+    /// — trailing rewrites and late speaker labels deliberately do not.
     func update(segments: [TranscriptSegment], speakerNames: [String: String]) {
         guard var current = snapshot, current.state == .recording else { return }
         let mapped = segments.map {
@@ -97,9 +116,21 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
                                            text: $0.text, speaker: $0.speaker)
         }
         guard mapped != current.segments || speakerNames != current.speakerNames else { return }
+        let removed = LiveTranscriptSnapshot.segmentsWereRemoved(from: current.segments, to: mapped)
         current.segments = mapped
         current.speakerNames = speakerNames
         current.revision += 1
+        if removed {
+            // Stamped with the revision that carries the removal, so a poller
+            // whose cursor predates it gets the full set and every later
+            // poller keeps its cheap delta.
+            current.segmentsRemovedAtRevision = current.revision
+            sidecarLog.log("""
+                live transcript line removed at revision \(current.revision, privacy: .public) \
+                (\(current.segments.count, privacy: .public) remain) — pollers older than that \
+                revision get a full resend
+                """)
+        }
         snapshot = current
         scheduleWrite()
     }

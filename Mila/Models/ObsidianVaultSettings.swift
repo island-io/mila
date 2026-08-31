@@ -1,5 +1,9 @@
 import Foundation
 import Combine
+import OSLog
+
+private let vaultSettingsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                      category: "ObsidianVaultSettings")
 
 /// Filesystem-name safety for everything Mila writes into the vault.
 ///
@@ -321,7 +325,17 @@ final class ObsidianVaultSettings: ObservableObject {
                 bookmarkDataIsStale: &isStale
             )
         } catch {
-            print("ObsidianVaultSettings: failed to resolve bookmark: \(error)")
+            // Same shape as `RecordingStorageSettings`: the bookmark points at
+            // a folder the user chose, and Cocoa quotes it (or its parent) in
+            // the error text. An Obsidian vault path is if anything more
+            // revealing than the recordings folder — it is someone's personal
+            // notes tree. Domain + code stay public. (Issue #213.)
+            let ns = error as NSError
+            vaultSettingsLog.error("""
+                failed to resolve bookmark \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             defaults.removeObject(forKey: Self.bookmarkKey)
             return
         }
@@ -366,7 +380,12 @@ final class ObsidianVaultSettings: ObservableObject {
             resolveAndStartAccessing()
             return vaultURL != nil
         } catch {
-            print("ObsidianVaultSettings: failed to mint bookmark for \(url.path): \(error)")
+            let ns = error as NSError
+            vaultSettingsLog.error("""
+                failed to mint bookmark for \(url.path, privacy: .private) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return false
         }
     }

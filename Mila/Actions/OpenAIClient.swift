@@ -31,6 +31,54 @@ enum OpenAIRequestError: LocalizedError, Equatable {
             return "“\(baseURL)” is not a valid endpoint URL. Check the Base URL in Settings → AI Provider (it must look like https://api.openai.com/v1)."
         }
     }
+
+    /// The log-safe twin of `errorDescription`, matching
+    /// `LLMRunnerError.logDescription` and
+    /// `SpeakerDiarizer.Error.logDescription`.
+    ///
+    /// This is the HTTP half of the same defect those two closed on the
+    /// subprocess side: the content is inside the string before any `Logger`
+    /// sees it, so annotating the call sites cannot help. `LLMRunner.run`
+    /// rethrows this type unchanged from `runOpenAICompatible`, and every LLM
+    /// log site funnels through `LLMRunnerError.logMessage(for:)` — so
+    /// whatever `errorDescription` says lands in a `.public` field.
+    ///
+    ///   * `.auth` / `.notFound` / `.server` carry `message`, which is the
+    ///     remote endpoint's own response body (`OpenAIClient.parse` pulls
+    ///     `error.message`). It is third-party output of unbounded shape: a
+    ///     real OpenAI 401 reads "Incorrect API key provided: sk-…XYZ", so the
+    ///     log field gets a fragment of the user's credential, once per failed
+    ///     call.
+    ///   * `.invalidEndpoint` carries the configured Base URL verbatim.
+    ///     `runOpenAICompatible` deliberately logs `host=` and *never* the
+    ///     full URL, because "a user's endpoint can carry a token in its query
+    ///     string" — and then this case handed the whole URL back through the
+    ///     failure field, defeating that on the one path where the URL is
+    ///     malformed enough that `URL(string:)` produced no host to log.
+    ///
+    /// What survives is what triages: which failure, and the HTTP status. A
+    /// 401 versus a 404 versus a 500 is the entire first question, and none of
+    /// those numbers names anything. `.emptyOutput` carries nothing and passes
+    /// through unchanged.
+    ///
+    /// `errorDescription` is untouched on purpose — the Settings → AI Provider
+    /// test panel and the post-recording banner are surfaces the user opened
+    /// themselves, and there the server's own words are the whole value.
+    /// (CodeRabbit; issues #193 / #213, CWE-532.)
+    var logDescription: String {
+        switch self {
+        case .auth:
+            return "Authentication failed (401) — server message withheld (it can quote your API key)"
+        case .notFound:
+            return "Model or endpoint not found (404) — server message withheld"
+        case .server(let status, _):
+            return "Server returned HTTP \(status) — server message withheld"
+        case .emptyOutput:
+            return errorDescription ?? "\(self)"
+        case .invalidEndpoint:
+            return "Configured Base URL is not a valid endpoint URL (URL withheld — it can carry a token); check Settings → AI Provider"
+        }
+    }
 }
 
 /// Host-locality classification for an OpenAI-compatible base URL, used by

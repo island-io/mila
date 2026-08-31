@@ -100,4 +100,36 @@ final class LiveAISettingsMigrationTests: XCTestCase {
         let settings = LiveAISettings(defaults: defaults)
         XCTAssertEqual(settings.speakerSimilarityThreshold, 0.55, accuracy: 0.0001)
     }
+
+    // MARK: - summaryPrompt
+
+    func test_summaryPrompt_unset_uses_new_default() {
+        let settings = LiveAISettings(defaults: defaults)
+        XCTAssertEqual(settings.summaryPrompt, LiveAISettings.defaultSummaryPrompt)
+    }
+
+    /// A user still carrying the pre-1.8.x concise default must be migrated
+    /// up to the richer default so the summary regains its pre-#87 depth.
+    func test_summaryPrompt_legacy_default_migrates_to_new_default() {
+        defaults.set(LiveAISettings.legacySummaryPromptV1, forKey: "liveAI.summaryPrompt")
+        let settings = LiveAISettings(defaults: defaults)
+        XCTAssertEqual(settings.summaryPrompt, LiveAISettings.defaultSummaryPrompt,
+                       "The legacy concise default must be migrated to the richer default")
+    }
+
+    /// A genuinely customised prompt must never be clobbered by the migration.
+    func test_summaryPrompt_custom_value_is_preserved() {
+        let custom = "Summarise in exactly three bullet points."
+        defaults.set(custom, forKey: "liveAI.summaryPrompt")
+        let settings = LiveAISettings(defaults: defaults)
+        XCTAssertEqual(settings.summaryPrompt, custom,
+                       "A user's customised summary prompt must survive the migration")
+    }
+
+    /// A user already on the new default keeps it (no spurious reset).
+    func test_summaryPrompt_new_default_is_preserved() {
+        defaults.set(LiveAISettings.defaultSummaryPrompt, forKey: "liveAI.summaryPrompt")
+        let settings = LiveAISettings(defaults: defaults)
+        XCTAssertEqual(settings.summaryPrompt, LiveAISettings.defaultSummaryPrompt)
+    }
 }

@@ -6,14 +6,50 @@ import Foundation
 /// (the app hasn't run since the pointer feature shipped). Every call
 /// re-reads from disk — the store is small, the app's writes are atomic,
 /// and freshness beats caching for a live assistant.
+///
+/// That statelessness is deliberate and stays: nothing here remembers
+/// anything between calls, so the only way to make a call cheaper is to make
+/// it do less work, not to reuse work from an earlier one. `searchTranscripts`
+/// is where that matters — see its own note for what one call costs, what
+/// `limit` bounds, and what it deliberately does not (#201).
 public struct MilaStoreReader: Sendable {
 
     public let recordingsDirectory: URL
     public let storeFileURL: URL
 
+    /// How a recording's `.txt` sidecar is read.
+    ///
+    /// Internal and injectable for exactly one reason: tests need to COUNT
+    /// the sidecar reads a single call performs. A read whose result is
+    /// discarded leaves no trace in the output — which is precisely the waste
+    /// #201 was about — so no assertion over results can see it, and the
+    /// bound `searchTranscripts` promises would be unpinnable. Production
+    /// always gets `readSidecarFromDisk`. (`MilaMCPToolHandlers` takes an
+    /// injectable `isAccessEnabled` for the same kind of reason.)
+    typealias SidecarReader = @Sendable (URL) -> String?
+
+    /// Written as a closure literal rather than the tidier unapplied
+    /// `String.init(contentsOf:encoding:)`: an unapplied function reference
+    /// is not inferred `@Sendable`, which this package's strict-concurrency
+    /// checking rejects.
+    static let readSidecarFromDisk: SidecarReader = {
+        try? String(contentsOf: $0, encoding: .utf8)
+    }
+
+    private let readSidecar: SidecarReader
+
     public init(recordingsDirectory: URL, storeFileURL: URL) {
+        self.init(recordingsDirectory: recordingsDirectory,
+                  storeFileURL: storeFileURL,
+                  readSidecar: Self.readSidecarFromDisk)
+    }
+
+    /// Test seam — see `SidecarReader`.
+    init(recordingsDirectory: URL, storeFileURL: URL,
+         readSidecar: @escaping SidecarReader) {
         self.recordingsDirectory = recordingsDirectory
         self.storeFileURL = storeFileURL
+        self.readSidecar = readSidecar
     }
 
     /// The store paths an external reader ends up on.
@@ -103,7 +139,7 @@ public struct MilaStoreReader: Sendable {
     /// app's load path — see `TranscriptFormatter.joinedFullText`).
     public func transcriptText(for recording: StoredRecording) -> String {
         let url = recordingsDirectory.appendingPathComponent(recording.transcriptFileName)
-        if let text = try? String(contentsOf: url, encoding: .utf8), !text.isEmpty {
+        if let text = readSidecar(url), !text.isEmpty {
             return text
         }
         if let legacy = recording.legacyFullText, !legacy.isEmpty { return legacy }
@@ -113,6 +149,14 @@ public struct MilaStoreReader: Sendable {
     /// Speaker-named transcript — the app's canonical rendering
     /// (`SPEAKER_00:` prefixes resolved through `speakerNames`, same-speaker
     /// turns collapsed).
+    ///
+    /// The `fallback:` argument is an `@autoclosure`, so `transcriptText`
+    /// (a file read) runs only for a recording whose segments carry no
+    /// speaker labels — the one case where the sidecar is what the rendering
+    /// is made of. A diarized recording renders from segments that are
+    /// already decoded, and reading its sidecar to throw the text away was
+    /// one wasted file read per recording per search (#201). Keep the read
+    /// inside the argument; hoisting it into a `let` puts them all back.
     public func namedTranscript(for recording: StoredRecording) -> String {
         TranscriptFormatter.plainText(
             segments: recording.segments,
@@ -240,19 +284,112 @@ public struct MilaStoreReader: Sendable {
 
     /// Case/diacritic-insensitive full-text search over titles and
     /// transcript text of non-trashed recordings.
+    ///
+    /// **What one call costs.** There is no cache (see the type's own note),
+    /// so the cost is whatever this call does:
+    ///
+    ///   * one `recordings.json` decode, which is also where the trashed
+    ///     filter is applied — candidates come from `listRecordings`, so
+    ///     nothing below can reach a row the listing hides;
+    ///   * per candidate, the rendered transcript: free for a diarized
+    ///     recording (its segments are already decoded and its sidecar is
+    ///     never part of the rendering), one file read for a recording with
+    ///     no speaker labels, whose sidecar IS its transcript;
+    ///   * per candidate whose transcript contains the query at all, a
+    ///     second per-line pass to count matches and build snippets. A
+    ///     non-matching recording — the common case for a specific query —
+    ///     never pays for the line split or the per-line scans.
+    ///
+    /// **What `limit` bounds.** `sort: .createdAt` is bounded by it: date
+    /// order is the traversal order, so the scan stops at the `limit`-th hit
+    /// and opens no transcript past it. What it bounds is that per-recording
+    /// transcript work; `recordings.json` is still decoded, filtered and
+    /// sorted whole by `listRecordings`, because that metadata is where the
+    /// traversal order the early stop depends on comes from.
+    ///
+    /// `sort: .relevance` (the default) is NOT, and cannot be: ranking by
+    /// match count has to score every candidate before it knows which few
+    /// are the top ones. Capping the candidate set instead — title matches
+    /// first, then a few transcripts — would drop the best hit in a large
+    /// store silently, which is a worse answer rather than a cheaper one.
+    /// So the ceiling on the default path stays linear in the store: one
+    /// transcript render per non-trashed recording, plus one sidecar read
+    /// per undiarized one. #201 reduced the constant (it used to be one read
+    /// per recording unconditionally, diarized or not); it did not remove
+    /// the linear term, and a store in the tens of thousands would want the
+    /// on-disk index that issue also weighs.
     public func searchTranscripts(query: String,
                                   speaker: String? = nil,
                                   sort: SearchSortKey = .relevance,
                                   order: SortOrder = .desc,
                                   limit: Int = 10) throws -> [SearchHit] {
-        let recordings = try listRecordings(filter: Filter(speaker: speaker), limit: Int.max)
+        // Date order is the one ranking whose output order is knowable
+        // before the whole store has been scored, so it is the one that can
+        // stop early. Relevance re-sorts by match count afterwards, so the
+        // order candidates arrive in is only its tie-break input — kept at
+        // `.desc` (newest first), which is what it was when the hits were
+        // always collected in that order.
+        let sortedByRecency: Bool
+        switch sort {
+        case .createdAt: sortedByRecency = true
+        case .relevance: sortedByRecency = false
+        }
+        let cap = max(0, limit)
+        // A caller asking for nothing gets nothing without the store being
+        // touched. The trailing `prefix(cap)` already returned empty, but only
+        // after paying for it: the relevance path scores every candidate, and
+        // even the date path renders transcripts until the *first* hit, because
+        // the early stop below is checked after a hit is appended. Same answer,
+        // zero reads. `limit` is `min`-clamped upstream in the handler but has
+        // no lower bound there, so `limit: 0` is reachable from a client.
+        guard cap > 0 else { return [] }
+        let candidates = try listRecordings(filter: Filter(speaker: speaker),
+                                            sort: .createdAt,
+                                            order: sortedByRecency ? order : .desc,
+                                            limit: Int.max)
         var hits: [SearchHit] = []
-        for rec in recordings {
-            let transcript = namedTranscript(for: rec)
-            let titleMatches = matchCount(of: query, in: rec.title)
+        for rec in candidates {
+            guard let hit = searchHit(for: rec, query: query) else { continue }
+            hits.append(hit)
+            // Already in output order, so the first `cap` hits ARE the
+            // answer: everything after this point in the store can only be
+            // older (or newer, ascending) than results that are already in.
+            if sortedByRecency, hits.count >= cap { break }
+        }
+        if !sortedByRecency {
+            hits.sort { a, b in
+                let comparison: ComparisonResult
+                if a.matchCount != b.matchCount {
+                    comparison = compare(a.matchCount, b.matchCount)
+                } else {
+                    comparison = compare(a.recording.createdAt, b.recording.createdAt)
+                }
+                return isOrdered(comparison, order)
+            }
+        }
+        return Array(hits.prefix(cap))
+    }
+
+    /// One recording's hit, or nil when it does not match.
+    ///
+    /// Ordered cheapest-first: the title is already in memory, the
+    /// transcript may cost a file read, and the per-line pass allocates a
+    /// string per line and re-scans each one.
+    private func searchHit(for recording: StoredRecording, query: String) -> SearchHit? {
+        let titleMatches = matchCount(of: query, in: recording.title)
+        let transcript = namedTranscript(for: recording)
+        var textMatches = 0
+        var snippets: [String] = []
+        // Every line is a contiguous substring of the transcript, so if the
+        // whole transcript does not contain the query, no line can either —
+        // one scan rules out the per-line pass for a non-matching recording.
+        //
+        // This is a gate, not a replacement: counting over the whole string
+        // would NOT be equivalent, because a query containing a newline
+        // matches the joined transcript while matching no single line. The
+        // counts a caller sees stay per-line; only the work is skipped.
+        if contains(query, in: transcript) {
             let lines = transcript.components(separatedBy: .newlines)
-            var textMatches = 0
-            var snippets: [String] = []
             for (i, line) in lines.enumerated() {
                 let n = matchCount(of: query, in: line)
                 guard n > 0 else { continue }
@@ -262,25 +399,10 @@ public struct MilaStoreReader: Sendable {
                     snippets.append(context.joined(separator: "\n"))
                 }
             }
-            let total = titleMatches + textMatches
-            guard total > 0 else { continue }
-            hits.append(SearchHit(recording: rec, matchCount: total, snippets: snippets))
         }
-        hits.sort { a, b in
-            let comparison: ComparisonResult
-            switch sort {
-            case .relevance:
-                if a.matchCount != b.matchCount {
-                    comparison = compare(a.matchCount, b.matchCount)
-                } else {
-                    comparison = compare(a.recording.createdAt, b.recording.createdAt)
-                }
-            case .createdAt:
-                comparison = compare(a.recording.createdAt, b.recording.createdAt)
-            }
-            return isOrdered(comparison, order)
-        }
-        return Array(hits.prefix(max(0, limit)))
+        let total = titleMatches + textMatches
+        guard total > 0 else { return nil }
+        return SearchHit(recording: recording, matchCount: total, snippets: snippets)
     }
 
     /// Three-way comparison for any `Comparable`.
@@ -305,6 +427,14 @@ public struct MilaStoreReader: Sendable {
         case .orderedAscending: return order == .asc
         case .orderedDescending: return order == .desc
         }
+    }
+
+    /// Whether `haystack` contains `needle` at all, under the same matching
+    /// options `matchCount` uses — one scan that stops at the first hit.
+    private func contains(_ needle: String, in haystack: String) -> Bool {
+        guard !needle.isEmpty else { return false }
+        return haystack.range(of: needle,
+                              options: [.caseInsensitive, .diacriticInsensitive]) != nil
     }
 
     private func matchCount(of needle: String, in haystack: String) -> Int {

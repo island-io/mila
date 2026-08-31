@@ -20,12 +20,35 @@ updates:
       actions:
         patterns: ["*"]
     ignore:
-      # setup-swift's only v3 tag is the 3.0.0-beta.1 pre-release. Its
-      # Swiftly-based installer fails GPG verification on the Ubuntu runner
-      # ("gpg: Can't check signature: No public key"), which reds the
-      # e2e-transcription job. Stay on v2.x until a stable v3 ships.
+      # HOLD swift-actions/setup-swift at v2.x. Upstream has no stable v3: its
+      # `v3` tag and its `v3.0.0-beta.1` tag point at the SAME commit
+      # (364295d9c23900ce04d4e5cc708387921b4e50f9). That build's Swiftly-based
+      # installer fails GPG verification on the Ubuntu runner ("gpg: Can't
+      # check signature: No public key") and fails the e2e-transcription job.
+      # It is not a flake — reruns do not clear it.
+      #
+      # Do NOT "tidy" this back to `versions: ["3.x"]`. Dependabot parses these
+      # strings as RubyGems requirements, and `3.x` is itself a valid RubyGems
+      # *version literal*, so `["3.x"]` compiles to the equality requirement
+      # `= 3.x` and matches nothing whatsoever — neither `3` (what the moving
+      # `v3` tag resolves to) nor `3.0.0-beta.1`. The rule looked right and was
+      # silently inert, which is how PRs #195 and #212 proposed the bump
+      # anyway. Wildcards are not supported here; only comparison operators.
+      #
+      # `>= 3.a, < 4` is ONE comma-ANDed requirement: `3.a` is Dependabot's own
+      # lower bound for "any 3.x, pre-releases included" (it is what
+      # `version-update:semver-major` expands to from 2.4.0), and `< 4` stops
+      # this from silently swallowing a future *stable* v4. Note the asymmetry,
+      # which is RubyGems semantics rather than an oversight: `< 4` admits
+      # `4.0.0` but still excludes `4.0.0-beta.1`, because a pre-release of 4
+      # sorts below 4. So a v4 beta stays ignored until v4 goes stable — which
+      # is the behaviour we want here, given a v3 pre-release is exactly what
+      # caused this. 2.x updates still flow.
+      #
+      # Revisit when a stable v3 ships: bump the pin in
+      # .github/workflows/e2e-transcription.yml and drop this entry.
       - dependency-name: "swift-actions/setup-swift"
-        versions: ["3.x"]
+        versions: [">= 3.a, < 4"]
 
   - package-ecosystem: "docker"
     directory: "/docker/speaches-hebrew"

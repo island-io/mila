@@ -30,6 +30,19 @@ jobs:
           swift --version
           sw_vers
 
+      # MilaKit is the whole cross-process surface mila-mcp runs against, and
+      # until now NO workflow ran its tests: the app links the library (so its
+      # sources are compiled by the build below) but `Packages/MilaKit`'s test
+      # target is in no Xcode scheme, and the E2E job's `swift test` runs in
+      # TranscriptionCore. `make package-test` was therefore the only thing
+      # executing them — locally, if someone remembered. That left assertions
+      # like `MilaStoreReaderTests`' read-count bounds (#201) unverified on
+      # every PR. The package has no dependencies and no fixtures to download,
+      # so this costs seconds and runs before the heavy steps.
+      - name: Run MilaKit package tests
+        working-directory: Packages/MilaKit
+        run: swift test
+
       - name: Install xcodegen
         run: brew install xcodegen
 

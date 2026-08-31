@@ -1,5 +1,83 @@
 import XCTest
+import Combine
 @testable import Mila
+
+/// Alice, as stored on disk.
+private let aliceStored: [Float] = [1, 0, 0, 0]
+/// Close enough to Alice to be a confident match at threshold 0.7.
+private let aliceSpeaking: [Float] = [0.99, 0.01, 0, 0]
+
+/// Which generation of the revocation wiring to install, so every test in the
+/// mid-recording section says out loud which shape it is exercising.
+private enum PoolWiring {
+    /// Pre-#204: nothing tells the live pool that access was revoked.
+    case none
+    /// #204: forget on the `isEnabled` toggle only. The shape #215 fixes —
+    /// it covers opting out and nothing else.
+    case toggleOnly
+    /// Shipping: forget whenever the **gate** closes, whichever half did it.
+    case gate
+}
+
+/// A recording already under way with Alice's stored profile seeded into the
+/// pool, wired exactly as `MilaApp.init` wires it — including a stand-in for
+/// `DiarizationSettings`, so a test can close either half of the gate.
+@MainActor
+private final class SeededRecording {
+    let settings: VoiceRecognitionSettings
+    let profiles: SpeakerProfileStore
+    let snapshots = ObservedVoiceSnapshots()
+    let diarizer = LiveSpeakerDiarizer()
+
+    /// The `DiarizationSettings` stand-in. `ready` is what the injected
+    /// `diarizationReady` closure reads; `changes` is the `objectWillChange`
+    /// publisher `MilaApp` hands to `trackDiarizationReadiness` — the same
+    /// `ObservableObjectPublisher` type, driven the same way.
+    private var ready = true
+    private let changes = ObservableObjectPublisher()
+
+    init(defaults: UserDefaults, directory: URL, wiring: PoolWiring) {
+        settings = VoiceRecognitionSettings(defaults: defaults)
+        profiles = SpeakerProfileStore(directory: directory, settings: settings)
+        settings.diarizationReady = { [weak self] in self?.ready ?? false }
+        settings.isEnabled = true
+        profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 40)
+
+        diarizer.similarityThreshold = 0.7
+        snapshots.clearOnOptOut(of: settings)
+        switch wiring {
+        case .none:
+            break
+        case .toggleOnly:
+            settings.addEnabledObserver { [weak diarizer] nowEnabled in
+                guard !nowEnabled else { return }
+                diarizer?.forgetSeededProfiles()
+            }
+        case .gate:
+            settings.addConfiguredObserver { [weak diarizer] nowConfigured in
+                guard !nowConfigured else { return }
+                diarizer?.forgetSeededProfiles()
+            }
+            settings.trackDiarizationReadiness(changes)
+        }
+
+        // Record-start: reset, then seed behind the gate.
+        diarizer.reset()
+        XCTAssertTrue(settings.isConfigured)
+        diarizer.seedPool(with: profiles.seedEntries())
+        XCTAssertEqual(diarizer.currentProfiles().first?.profileName, "Alice",
+                       "precondition: the pool holds a copy of Alice's centroid")
+    }
+
+    /// Turn diarization off (or back on) the way `DiarizationSettings` does:
+    /// `objectWillChange` is sent **before** the value settles. Reproducing
+    /// that order is the point — an implementation that read `isConfigured`
+    /// straight from the sink would see the stale `true` and forget nothing.
+    func setDiarizationReady(_ isReady: Bool) {
+        changes.send()
+        ready = isReady
+    }
+}
 
 /// Tests for the **opt-in gate** on cross-recording voice recognition —
 /// separate from `SpeakerProfileStoreTests`, which covers the storage
@@ -273,51 +351,30 @@ final class VoiceRecognitionGateTests: XCTestCase {
                        "an off-state mutation must not rewrite speaker-profiles.json")
     }
 
-    // MARK: - Opting out *during* a recording
-
-    /// Alice, as stored on disk.
-    private var aliceStored: [Float] { [1, 0, 0, 0] }
-    /// Close enough to Alice to be a confident match at threshold 0.7.
-    private var aliceSpeaking: [Float] { [0.99, 0.01, 0, 0] }
+    // MARK: - Losing the feature *during* a recording
 
     /// A recording already under way with Alice's stored profile seeded into
-    /// the pool, exactly as `MilaApp` sets one up.
-    ///
-    /// `poolObserver` is the fix under test. It defaults to on — the
-    /// shipping wiring — and the negative control below switches it off to
-    /// reconstruct the pre-fix shape, so the assertions are provably
+    /// the pool. `wiring` selects which generation of the revocation wiring
+    /// is installed: `.gate` is what ships, and the negative controls below
+    /// reconstruct the earlier shapes so the assertions are provably
     /// discriminating rather than vacuously true.
     private func startedRecordingWithAliceSeeded(
-        poolObserver: Bool = true
-    ) -> (settings: VoiceRecognitionSettings,
-          profiles: SpeakerProfileStore,
-          snapshots: ObservedVoiceSnapshots,
-          diarizer: LiveSpeakerDiarizer) {
-        let settings = makeSettings()
-        settings.isEnabled = true
-        let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
-        profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 40)
+        wiring: PoolWiring = .gate
+    ) -> SeededRecording {
+        SeededRecording(defaults: isolatedDefaults(), directory: tempRoot, wiring: wiring)
+    }
 
-        let diarizer = LiveSpeakerDiarizer()
-        diarizer.similarityThreshold = 0.7
-
-        // Same wiring MilaApp.init installs, in the same order.
-        let snapshots = ObservedVoiceSnapshots()
-        snapshots.clearOnOptOut(of: settings)
-        if poolObserver {
-            settings.addEnabledObserver { [weak diarizer] nowEnabled in
-                guard !nowEnabled else { return }
-                diarizer?.forgetSeededProfiles()
-            }
+    /// Let the main-actor task `trackDiarizationReadiness` schedules actually
+    /// run. `objectWillChange` fires on *willSet*, so the refresh is
+    /// deliberately deferred one turn — see `trackDiarizationReadiness`.
+    ///
+    /// Yields rather than sleeps: bounded, no wall-clock, and a control case
+    /// whose condition never holds costs microseconds instead of a timeout.
+    private func settle(until condition: () -> Bool = { false }) async {
+        for _ in 0..<100 {
+            if condition() { return }
+            await Task.yield()
         }
-
-        // Record-start: reset, then seed behind the gate.
-        diarizer.reset()
-        XCTAssertTrue(settings.isConfigured)
-        diarizer.seedPool(with: profiles.seedEntries())
-        XCTAssertEqual(diarizer.currentProfiles().first?.profileName, "Alice",
-                       "precondition: the pool holds a copy of Alice's centroid")
-        return (settings, profiles, snapshots, diarizer)
     }
 
     /// **The invariant.** Opting out mid-recording has to stop the *reads*,
@@ -345,12 +402,12 @@ final class VoiceRecognitionGateTests: XCTestCase {
                       "no pool entry may still carry a stored profile name")
     }
 
-    /// Negative control: the same scenario with the observer unwired, which
-    /// is what shipped before this fix. Alice is still recognised, under her
-    /// stored name. If this ever starts failing, the test above has stopped
-    /// proving anything.
+    /// Negative control: the same scenario with nothing wired to the pool,
+    /// which is what shipped before #204. Alice is still recognised, under
+    /// her stored name. If this ever starts failing, the test above has
+    /// stopped proving anything.
     func test_control_without_the_observer_a_stored_voice_survives_the_opt_out() {
-        let w = startedRecordingWithAliceSeeded(poolObserver: false)
+        let w = startedRecordingWithAliceSeeded(wiring: .none)
 
         w.settings.isEnabled = false
 
@@ -422,6 +479,114 @@ final class VoiceRecognitionGateTests: XCTestCase {
                       "no speaker may be auto-named from a feature just switched off")
         XCTAssertEqual(w.snapshots.heldRecordingCount, 0,
                        "and no embeddings may be retained for the stopped recording")
+    }
+
+    // MARK: - Turning *diarization* off during a recording (#215)
+
+    /// The same invariant as the opt-out above, reached through the other
+    /// half of the gate.
+    ///
+    /// `isConfigured` is `isEnabled && diarizationReady`, so switching
+    /// diarization off in Settings revokes voice recognition just as
+    /// completely as switching voice recognition off does — the embedding
+    /// pipeline every centroid comes out of is gone. #204 wired the toggle
+    /// and only the toggle, so this path fired nothing at all: the pool kept
+    /// the centroids `seedPool` copied at record-start and went on
+    /// auto-labelling the transcript from stored voices. The write gates
+    /// held, so nothing was persisted; the *reads* were the leak.
+    func test_turning_diarization_off_mid_recording_stops_the_pool_matching_a_stored_voice() async {
+        let w = startedRecordingWithAliceSeeded()
+
+        w.setDiarizationReady(false)
+        await settle(until: { w.diarizer.currentProfiles().first?.profileName == nil })
+
+        XCTAssertFalse(w.settings.isConfigured,
+                       "precondition: the gate is closed even though the toggle never moved")
+        XCTAssertTrue(w.settings.isEnabled,
+                      "…and it closed on the readiness half, which is the whole point")
+        // Alice speaks after diarization went away. Her seeded entry was
+        // never heard in this recording, so it has nothing of its own to fall
+        // back to: it is inert, `assign` skips it, and she is somebody new.
+        XCTAssertNotEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                          "a stored voice must not be recognised once the gate has closed")
+        XCTAssertTrue(w.diarizer.currentProfiles().allSatisfy { $0.profileName == nil },
+                      "no pool entry may still carry a stored profile name")
+    }
+
+    /// Negative control: the #204 wiring, which listens to the `isEnabled`
+    /// toggle only. Diarization going away moves no toggle, so nothing fires
+    /// and Alice is still recognised under her stored name — exactly the bug
+    /// #215 reports. If this ever starts failing, the test above has stopped
+    /// proving anything.
+    func test_control_toggle_only_wiring_keeps_matching_after_diarization_goes_off() async {
+        let w = startedRecordingWithAliceSeeded(wiring: .toggleOnly)
+
+        w.setDiarizationReady(false)
+        await settle(until: { w.diarizer.currentProfiles().first?.profileName == nil })
+
+        XCTAssertFalse(w.settings.isConfigured,
+                       "the gate really is closed — the control is not vacuous")
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                       "pre-fix shape: the pool goes on matching the stored centroid")
+        XCTAssertEqual(w.diarizer.currentProfiles().first?.profileName, "Alice",
+                       "pre-fix shape: and it still knows her name")
+    }
+
+    /// The same nuance as the opt-out: a speaker who *was* heard before the
+    /// gate closed keeps their id for the rest of the recording, falling back
+    /// to what this recording itself observed. Minting a new id here would
+    /// fork one person across two speakers mid-transcript, and in-recording
+    /// diarization is not what was revoked — the stored identity is.
+    func test_turning_diarization_off_keeps_an_already_heard_speaker_coherent_but_nameless() async {
+        let w = startedRecordingWithAliceSeeded()
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                       "precondition: Alice matched while the feature was configured")
+
+        w.setDiarizationReady(false)
+        await settle(until: { w.diarizer.currentProfiles().first?.profileName == nil })
+
+        XCTAssertEqual(w.diarizer.assign(embedding: aliceSpeaking), "SPEAKER_00",
+                       "in-recording continuity is deliberate")
+        XCTAssertNil(w.diarizer.currentProfiles().first?.profileName,
+                     "…but the stored name is gone, so nothing can auto-apply it")
+    }
+
+    /// Opting out keeps working through the gate channel — and synchronously,
+    /// with no turn of the run loop, because `isEnabled`'s `didSet` refreshes
+    /// the gate itself rather than going through the publisher. The two
+    /// triggers therefore reach `forgetSeededProfiles` by different routes
+    /// and both land; #204's behaviour is not traded away for #215's.
+    func test_the_gate_channel_still_covers_the_opt_out_synchronously() {
+        let w = startedRecordingWithAliceSeeded()
+
+        w.settings.isEnabled = false
+
+        XCTAssertTrue(w.diarizer.currentProfiles().allSatisfy { $0.profileName == nil },
+                      "opting out must forget the seeded pool without waiting for a hop")
+    }
+
+    /// `trackDiarizationReadiness` subscribes to `objectWillChange`, which
+    /// fires for *every* published change on the diarization settings, not
+    /// only ones that move the gate. Observers must therefore see
+    /// transitions, not notifications — otherwise a settings pane that
+    /// updates a progress string would re-run the revocation handler on a
+    /// loop.
+    func test_the_gate_notifies_on_transitions_not_on_every_refresh() {
+        let settings = VoiceRecognitionSettings(defaults: isolatedDefaults())
+        var ready = true
+        settings.diarizationReady = { ready }
+        var seen: [Bool] = []
+        settings.addConfiguredObserver { seen.append($0) }
+
+        settings.isEnabled = true          // false → true
+        settings.refreshConfiguredState()  // unchanged
+        settings.refreshConfiguredState()  // unchanged
+        ready = false
+        settings.refreshConfiguredState()  // true → false
+        settings.refreshConfiguredState()  // unchanged
+        settings.isEnabled = false         // gate already closed
+
+        XCTAssertEqual(seen, [true, false])
     }
 
     // MARK: - The explicit delete path

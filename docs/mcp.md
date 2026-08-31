@@ -72,6 +72,25 @@ cp -R skills/mila-meetings ~/.claude/skills/
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
 
+### What a search costs
+
+Nothing is cached — every call reads the store as it is right now, which is
+what makes the answers trustworthy while you're still recording. So the
+work a `search_transcripts` call does is worth knowing:
+
+- `sort: "created_at"` stops at the `limit`-th match: no transcript past it is
+  opened or rendered, however large the store is. The `recordings.json` index
+  is still read whole — it is one small file, and the date order the early stop
+  relies on comes from it — so what `limit` bounds here is the per-recording
+  transcript work, not the metadata read.
+- `sort: "relevance"` (the default) ranks by match count, and that means
+  scoring every recording before it can pick the top few. Its cost grows
+  with the size of your library. Recordings with speaker labels are scored
+  from `recordings.json` alone; the rest cost one transcript file read each.
+
+If you only want the most recent mentions, `sort: "created_at"` with a small
+`limit` is both cheaper and usually the better question.
+
 ## Reading past recordings
 
 Just ask, e.g.:
@@ -107,6 +126,13 @@ How the polling works under the hood:
 - A `session_id` mismatch means a new recording started between polls —
   Claude gets the new meeting's transcript from the top with
   `new_session: true`.
+- If you **delete a line** from the live transcript, the next poll whose
+  cursor predates the deletion gets the whole segment set back with
+  `segments_removed: true`, and is told to discard its previous copy
+  rather than append. The incremental cursor is a count plus a "re-read
+  the last entry" rule, so it cannot express a removal on its own — and
+  a deletion is a privacy action, so the poller must not be left holding
+  the line you removed.
 - `status` values: `recording` (keep polling), `stale` (the app stopped
   updating the snapshot — likely crashed), `recording_live_unavailable`
   (recording on hardware where live transcription is gated off — wait
