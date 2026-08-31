@@ -174,8 +174,9 @@ final class SpeakerProfileStore: ObservableObject {
     /// recording's centroid, which is the same person's fingerprint to
     /// within rounding. `MilaApp` wires this to
     /// `LiveSpeakerDiarizer.forgetSeededProfiles`, so the deletion takes
-    /// effect immediately and everywhere, exactly as opting out does through
-    /// `VoiceRecognitionSettings.addEnabledObserver`.
+    /// effect immediately and everywhere, exactly as the feature ceasing to
+    /// be configured does through
+    /// `VoiceRecognitionSettings.addConfiguredObserver`.
     ///
     /// A list rather than one slot, for the same reason `addEnabledObserver`
     /// is: a second registrant must not silently unhook the first.

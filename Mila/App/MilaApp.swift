@@ -641,21 +641,37 @@ struct MilaApp: App {
         // …and the third holder of copied voice data: the live pool. The two
         // lines above unload the profiles (`SpeakerProfileStore`'s own
         // observer) and drop the snapshots, but `seedPool` handed the
-        // diarizer its own copy of every centroid at record-start, so an
-        // opt-out mid-recording otherwise leaves `assign` matching against
-        // stored voices for the rest of it. The write gates stop the result
-        // being persisted; they do not stop it being *read*, and the user
-        // still watches their transcript auto-fill with names from a feature
-        // they just switched off.
+        // diarizer its own copy of every centroid at record-start, so the
+        // feature becoming unusable mid-recording otherwise leaves `assign`
+        // matching against stored voices for the rest of it. The write gates
+        // stop the result being persisted; they do not stop it being *read*,
+        // and the user still watches their transcript auto-fill with names
+        // from a feature that is no longer on.
         //
         // Exactly the deletion path's problem, so it gets the deletion
-        // path's remedy — see `addDeletionObserver` below. Opt-out is the
+        // path's remedy — see `addDeletionObserver` below. This one is the
         // broader of the two, so it forgets every seeded entry rather than
         // named ones.
-        voiceSettings.addEnabledObserver { [weak liveDiar] nowEnabled in
-            guard !nowEnabled else { return }
+        //
+        // Registered on the **gate**, not the toggle. `isConfigured` is
+        // `isEnabled && diarizationReady`, and either half closing revokes
+        // the feature just as completely: turning diarization off in
+        // Settings mid-recording used to fire nothing at all, so the pool
+        // went on recognising stored voices (#215). `trackDiarizationReadiness`
+        // below is what lets the settings object notice the second half.
+        voiceSettings.addConfiguredObserver { [weak liveDiar] nowConfigured in
+            guard !nowConfigured else { return }
             liveDiar?.forgetSeededProfiles()
         }
+        // The readiness half of that gate lives on `DiarizationSettings`, and
+        // `diarizationReady` above only *reads* it — nothing tells this
+        // object when the answer changes. Both publishers are needed:
+        // `isConfigured` there is `isEnabled && (hasBundledRuntime ?
+        // bootstrap.isReady : status.isGood)`, so the bootstrap's readiness
+        // is a genuinely separate source of truth (`nuclearRepair` clears it
+        // without touching the settings object at all).
+        voiceSettings.trackDiarizationReadiness(diarSettings.objectWillChange,
+                                                diarSettings.bootstrap.objectWillChange)
         // Auto-naming + the per-recording snapshot, driven by the finalize
         // drain rather than by observing `isRecording`. The drain hands over
         // the id of the recording that actually finished, and calls
