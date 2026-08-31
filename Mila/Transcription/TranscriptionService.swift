@@ -56,6 +56,30 @@ final class TranscriptionService: ObservableObject {
     /// implying the transcript is still being produced. `nil` when no
     /// re-diarize is in flight.
     @Published private(set) var diarizingRecordingID: UUID?
+
+    /// Recording ids whose SPEAKER LABELS are not final yet, because the
+    /// offline re-diarize pass for them is about to run or is running.
+    ///
+    /// Deliberately wider in time than `diarizingRecordingID`, and that is
+    /// the entire point. `diarizingRecordingID` only lights up once
+    /// `rediarizeSegments` is already executing inside
+    /// `QuickActionsController.finalizeTail`'s detached task; this set is
+    /// published SYNCHRONOUSLY by `finalizeTail` itself, in the same
+    /// main-actor run as the `store.update` that flips the row to
+    /// `.completed`. The gap between those two is the window issue #211
+    /// describes: the recording already reads as finished, its labels are
+    /// still the live diarizer's over-segmented ones, and a "Send to Claude"
+    /// fired in that gap ships them to the CLI — silently and permanently,
+    /// since nothing reconciles the CLI's answer once the good labels land.
+    ///
+    /// A set, not a single id, because the tail is id-keyed: the user can
+    /// start a new recording while a previous one is still finalizing.
+    ///
+    /// In-memory on purpose. The failure mode of losing it (app relaunch, a
+    /// crash mid-pass) is that nothing waits — today's behaviour — whereas a
+    /// persisted flag orphaned by a crash would park every future send on
+    /// that recording until the timeout.
+    @Published private(set) var speakerFinalizationPendingIDs: Set<UUID> = []
     @Published private(set) var progress: Double = 0
     @Published var lastError: String?
 
@@ -455,6 +479,41 @@ final class TranscriptionService: ObservableObject {
             serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return []
         }
+    }
+
+    // MARK: - Speaker finalization marker (issue #211)
+
+    /// Whether the offline speaker pipeline is enabled AND ready to run.
+    ///
+    /// A read-only passthrough to `DiarizationSettings.isConfigured`, which
+    /// this service already owns privately. Exposed so
+    /// `QuickActionsController.finalizeTail` can decide whether the offline
+    /// pass is going to happen *before* it spawns the tail — without the
+    /// controller growing a second reference to the same settings object,
+    /// and without anything downstream having to guess. Users with
+    /// diarization off never publish a marker, so nothing waits for them.
+    var isDiarizationConfigured: Bool { diarizationSettings.isConfigured }
+
+    /// Publish "the speaker labels for `recordingID` are not final yet".
+    ///
+    /// Called by `QuickActionsController.finalizeTail` before it spawns the
+    /// detached tail, so there is no instant in which the row reads
+    /// `.completed` with no marker while the offline pass is still to come.
+    func beginSpeakerFinalization(_ recordingID: UUID) {
+        speakerFinalizationPendingIDs.insert(recordingID)
+    }
+
+    /// Release the marker. Idempotent: the tail clears it the moment the
+    /// labels (and the `.srt` that carries them) are written, and again from
+    /// its `defer`, so a cancelled or failed tail cannot strand a send.
+    func endSpeakerFinalization(_ recordingID: UUID) {
+        speakerFinalizationPendingIDs.remove(recordingID)
+    }
+
+    /// True while `recordingID`'s speaker labels may still be re-keyed by the
+    /// offline pass. Callers that feed a transcript to an LLM wait on this.
+    func isAwaitingSpeakerFinalization(_ recordingID: UUID) -> Bool {
+        speakerFinalizationPendingIDs.contains(recordingID)
     }
 
     /// Re-run the OFFLINE speaker diarizer on an already-transcribed

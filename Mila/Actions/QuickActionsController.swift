@@ -1081,6 +1081,33 @@ final class QuickActionsController: ObservableObject {
         liveSpeakerCount > maxLiveSpeakersToSkipRediarize
     }
 
+    /// Whether `finalizeTail` is going to re-key this recording's speaker
+    /// labels — and therefore whether anything that feeds the transcript to
+    /// an LLM ("Send to Claude", the background auto-title job) must wait
+    /// before it can trust them. Issue #211.
+    ///
+    /// All three conditions matter:
+    ///  * `liveTranscriptIsAuthoritative` — the batch path diarizes inside
+    ///    the transcription pass and only then leaves `.pending`, so its
+    ///    labels are already final when the row goes terminal.
+    ///  * `diarizationConfigured` — with the feature off `rediarizeSegments`
+    ///    returns immediately and nothing re-keys anything, so a user who
+    ///    has it off must not pay a wait.
+    ///  * `shouldRediarize` — at or below `maxLiveSpeakersToSkipRediarize`
+    ///    the offline pass is skipped entirely, so a short recording pays
+    ///    no wait either.
+    ///
+    /// Pure + `static` for the same reason `shouldRediarize` is: the gate
+    /// has to be assertable without a pyannote subprocess, which CI cannot
+    /// spin up.
+    static func willFinalizeSpeakers(liveTranscriptIsAuthoritative: Bool,
+                                     liveSpeakerCount: Int,
+                                     diarizationConfigured: Bool) -> Bool {
+        liveTranscriptIsAuthoritative
+            && diarizationConfigured
+            && shouldRediarize(liveSpeakerCount: liveSpeakerCount)
+    }
+
     /// The HEAVY, live-singleton-free tail of finalization, run as a
     /// detached, id-keyed background task so the record button (freed in
     /// `stopRecording` once the live pipeline is drained) stays usable
@@ -1100,12 +1127,43 @@ final class QuickActionsController: ObservableObject {
     /// pure store + service work and is the part this PR decoupled.
     func finalizeTail(for recording: Recording, liveTranscriptIsAuthoritative: Bool) {
         let id = recording.id
+        // Bound to a local, and captured strongly by the task below (which
+        // holds `self` weakly): the `defer` there MUST be able to release the
+        // speaker-finalization marker even on the paths where `self` has gone
+        // away, or a waiting send is parked on a pass that can never finish.
+        // The service holds no reference back here, so this is not a cycle.
+        let transcription = self.transcription
+        // Whether the offline pass will re-key the speakers is decided HERE,
+        // synchronously, and published before this function returns — not
+        // inside the task below. `stopRecording` runs from the
+        // `store.update(updated)` that flips the row to `.completed` all the
+        // way to this call without a single suspension point, so no other
+        // main-actor work (a "Send to Claude" among it) can observe the row
+        // as finished while the marker is still missing. Deciding inside the
+        // task would reopen exactly the gap issue #211 describes: the row
+        // already terminal, the pass not yet started, nothing to wait on.
+        let liveSpeakerCount = Set(recording.segments.compactMap(\.speaker)).count
+        let willRediarize = Self.willFinalizeSpeakers(
+            liveTranscriptIsAuthoritative: liveTranscriptIsAuthoritative,
+            liveSpeakerCount: liveSpeakerCount,
+            diarizationConfigured: transcription.isDiarizationConfigured)
+        if willRediarize { transcription.beginSpeakerFinalization(id) }
         // Replace (and cancel) any previous tail for the same id —
         // defensive; ids are unique per recording so this shouldn't
         // collide in practice.
         finalizeTasks[id]?.cancel()
         finalizeTasks[id] = Task { @MainActor [weak self] in
-            defer { self?.finalizeTasks[id] = nil }
+            defer {
+                self?.finalizeTasks[id] = nil
+                // Belt and braces. The marker is released explicitly below,
+                // the moment the labels and the `.srt` carrying them are on
+                // disk — well before the summarizer and the transcode this
+                // task also runs. This catches the routes that never reach
+                // that line (cancellation, an early return) so a send can
+                // never be parked on a pass that will not finish. `remove`
+                // is idempotent.
+                transcription.endSpeakerFinalization(id)
+            }
             guard let self else { return }
             var updated = recording
             if liveTranscriptIsAuthoritative {
@@ -1125,8 +1183,12 @@ final class QuickActionsController: ObservableObject {
                 // ≤3 speakers is almost certainly correct, so we finalize
                 // with the live labels as-is and skip the heavy pyannote
                 // subprocess (saves seconds of post-record delay).
-                let liveSpeakerCount = Set(updated.segments.compactMap(\.speaker)).count
-                if Self.shouldRediarize(liveSpeakerCount: liveSpeakerCount) {
+                //
+                // `willRediarize` was computed (and published as the
+                // speaker-finalization marker) before this task existed, so
+                // the decision a waiting send is gated on and the work
+                // actually done here can never disagree.
+                if willRediarize {
                     // Re-fetch before writing: the user may have renamed the
                     // recording (rename sheet) while this tail was running, so
                     // we update only the segments rather than clobbering the row.
@@ -1164,6 +1226,13 @@ final class QuickActionsController: ObservableObject {
                 // enabled + configured conditions. `summarizeIfNeeded` covers
                 // the Live-AI-off case under the normal auto-summary gate.
                 TranscriptExporter.writeSRT(for: updated, in: self.store.recordingsDirectory)
+                // Speakers are settled and the `.srt` that carries them is on
+                // disk, so release anything parked on this recording's labels
+                // — a background "Send to Claude", the auto-title job — now,
+                // rather than making it also sit out the summarizer LLM call
+                // and the m4a transcode below, neither of which touches the
+                // transcript's speakers. (Issue #211.)
+                self.transcription.endSpeakerFinalization(id)
                 // Mark this fresh completion pending for Obsidian export (if
                 // enabled) BEFORE kicking the summarizer, since a skip fires
                 // the completion hook synchronously.

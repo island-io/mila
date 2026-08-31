@@ -458,6 +458,84 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertTrue(QuickActionsController.shouldRediarize(liveSpeakerCount: 7))
     }
 
+    // MARK: - Speaker-finalization gate (issue #211)
+
+    /// `willFinalizeSpeakers` is what decides whether a "Send to Claude"
+    /// fired the instant the recording stopped has to wait. It must be true
+    /// in exactly the case the offline pass actually runs — otherwise either
+    /// the send races the pass (too permissive) or every recording pays a
+    /// wait it doesn't need (too strict).
+    func test_willFinalizeSpeakers_only_when_the_offline_pass_will_run() {
+        XCTAssertTrue(QuickActionsController.willFinalizeSpeakers(
+            liveTranscriptIsAuthoritative: true,
+            liveSpeakerCount: 4,
+            diarizationConfigured: true),
+                      "Authoritative live transcript, over-segmented, diarization ready — the pass runs, so a send must wait")
+
+        XCTAssertFalse(QuickActionsController.willFinalizeSpeakers(
+            liveTranscriptIsAuthoritative: true,
+            liveSpeakerCount: 3,
+            diarizationConfigured: true),
+                       "At the skip threshold the pass never runs — a short recording must pay no wait")
+
+        XCTAssertFalse(QuickActionsController.willFinalizeSpeakers(
+            liveTranscriptIsAuthoritative: true,
+            liveSpeakerCount: 7,
+            diarizationConfigured: false),
+                       "Diarization off — nothing re-keys the labels, so nothing changes for that user")
+
+        XCTAssertFalse(QuickActionsController.willFinalizeSpeakers(
+            liveTranscriptIsAuthoritative: false,
+            liveSpeakerCount: 7,
+            diarizationConfigured: true),
+                       "The batch path diarizes inside the transcription pass, before the row leaves .pending")
+    }
+
+    /// The marker has to be published SYNCHRONOUSLY by `finalizeTail`, not
+    /// from inside its detached task: `stopRecording` flips the row to
+    /// `.completed` and calls `finalizeTail` in one uninterrupted main-actor
+    /// run, so a send can only ever observe "still transcribing" or
+    /// "finalizing speakers" — never the gap between them (issue #211).
+    ///
+    /// This test drives the gate's OFF side end-to-end, which is the side CI
+    /// can run: with diarization unconfigured no marker is published, so a
+    /// user who has the feature off waits for nothing. (The ON side needs a
+    /// pyannote subprocess; `willFinalizeSpeakers` above pins it purely.)
+    func test_finalize_tail_publishes_no_speaker_marker_when_diarization_is_off() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.recordingsDirectory.appendingPathComponent("speaker-marker.wav")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.6)
+        let recording = Recording(
+            title: "marker-recording",
+            duration: 0.6,
+            source: .microphone,
+            audioFileName: url.lastPathComponent,
+            status: .completed,
+            language: languageSettings.current.rawValue,
+            // Over-segmented enough that `shouldRediarize` alone would say yes.
+            segments: [TranscriptSegment(start: 0, end: 1, text: "a", speaker: "SPEAKER_00"),
+                       TranscriptSegment(start: 1, end: 2, text: "b", speaker: "SPEAKER_01"),
+                       TranscriptSegment(start: 2, end: 3, text: "c", speaker: "SPEAKER_02"),
+                       TranscriptSegment(start: 3, end: 4, text: "d", speaker: "SPEAKER_03")],
+            fullText: "a b c d"
+        )
+        store.add(recording)
+        XCTAssertFalse(service.isDiarizationConfigured,
+                       "Sanity: the test suite runs with diarization unconfigured")
+
+        controller.isFinalizingRecording = false
+        controller.finalizeTail(for: recording, liveTranscriptIsAuthoritative: true)
+
+        // Checked BEFORE awaiting the tail — this is the synchronous window.
+        XCTAssertFalse(service.isAwaitingSpeakerFinalization(recording.id),
+                       "Diarization is off, so nothing will re-key the labels and nothing must wait")
+
+        await controller.awaitFinalizeTails()
+        XCTAssertFalse(service.isAwaitingSpeakerFinalization(recording.id),
+                       "The marker must not be left set after the tail finishes")
+    }
+
     func test_user_bug_repro_second_recording_after_first_started_transcribing() async throws {
         let first = tempRoot.appendingPathComponent("recording-A.wav")
         let second = tempRoot.appendingPathComponent("recording-B.wav")

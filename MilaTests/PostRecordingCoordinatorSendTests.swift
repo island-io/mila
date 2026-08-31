@@ -1,5 +1,6 @@
 import XCTest
 import TranscriptionCore
+import MilaKit
 @testable import Mila
 
 /// Tests for `PostRecordingCoordinator`'s background "Send to <LLM>"
@@ -251,6 +252,197 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         XCTAssertFalse(coordinator.isSending(rec.id))
     }
 
+    // MARK: - Fired before the offline speaker pass lands (issue #211)
+
+    /// NEGATIVE CONTROL for issue #211.
+    ///
+    /// The user stops a meeting and hits Send immediately. On the live/VAD
+    /// path the row is ALREADY `.completed` at that instant — `stopRecording`
+    /// writes it before spinning off `finalizeTail` — but the labels on it are
+    /// the live diarizer's over-segmented ones: one person split across four
+    /// `SPEAKER_NN`, with the name the user typed stuck to only the first.
+    /// The offline pass that collapses them lands seconds later.
+    ///
+    /// Before the fix the send took two shortcuts that both landed on the
+    /// stale text: the click-time snapshot was used verbatim whenever it was
+    /// non-empty (always, on this path), and even falling through,
+    /// `awaitTranscript` only waited for the status to leave
+    /// `.pending`/`.running` — which it already had.
+    ///
+    /// The assertion is deliberately on the PAYLOAD, not on the plumbing:
+    /// what reaches the runner must carry the POST-remap labels. Remove the
+    /// speaker wait, or the re-read that follows it, and this fails — the
+    /// captured transcript comes back full of `SPEAKER_01`…`SPEAKER_03`.
+    func test_send_waits_for_speaker_finalization_and_sends_the_remapped_labels() async throws {
+        var captured: String?
+        var callCount = 0
+        let coordinator = makeCoordinator(label: "speakers.\(#function)") {
+            _, _, transcript, _, _, _, _, _, _, _, _, _, _, _ in
+            captured = transcript
+            callCount += 1
+            return "ANSWER"
+        }
+
+        let rec = addCompletedRecording(
+            text: "one two three four",
+            segments: [seg(0, 1, "one", "SPEAKER_00"),
+                       seg(1, 2, "two", "SPEAKER_01"),
+                       seg(2, 3, "three", "SPEAKER_02"),
+                       seg(3, 4, "four", "SPEAKER_03")],
+            speakerNames: ["SPEAKER_00": "Ada"])
+        // Exactly what the sheet would hand `sendToLLM` at click time.
+        let clickTime = TranscriptFormatter.plainText(segments: rec.segments,
+                                                      fallback: rec.fullText,
+                                                      names: rec.speakerNames)
+        XCTAssertTrue(clickTime.contains("SPEAKER_03"),
+                      "Sanity: the click-time snapshot carries the live diarizer's labels")
+
+        // `finalizeTail` has published the marker and the pyannote pass is
+        // running — the window a Send fired right after Stop lands in.
+        service.beginSpeakerFinalization(rec.id)
+
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude,
+                              prompt: "Summarize", transcript: clickTime,
+                              summary: "", executableOverride: nil)
+
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(callCount, 0,
+                       "The send must not reach the CLI while the speaker labels are still being re-keyed")
+        XCTAssertEqual(coordinator.activityStatus,
+                       PostRecordingCoordinator.waitingForSpeakersStatus,
+                       "The wait must be explained, not just felt as an unexplained delay")
+
+        // The offline pass lands: four speakers collapse to one, and
+        // `SpeakerNameRemapper` carries the name onto the surviving id.
+        var current = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        current.segments = [seg(0, 1, "one", "SPEAKER_00"),
+                            seg(1, 2, "two", "SPEAKER_00"),
+                            seg(2, 3, "three", "SPEAKER_00"),
+                            seg(3, 4, "four", "SPEAKER_00")]
+        current.speakerNames = ["SPEAKER_00": "Ada"]
+        store.update(current)
+        service.endSpeakerFinalization(rec.id)
+
+        try await waitFor(callCount > 0)
+        let sent = try XCTUnwrap(captured)
+        XCTAssertFalse(sent.contains("SPEAKER_01"),
+                       "The CLI must not receive the pre-re-diarize labels — got: \(sent)")
+        XCTAssertFalse(sent.contains("SPEAKER_02"))
+        XCTAssertFalse(sent.contains("SPEAKER_03"))
+        XCTAssertTrue(sent.contains("Ada: one two three four"),
+                      "The remapped name must cover every turn — got: \(sent)")
+    }
+
+    /// The counterpart, so the fix cannot degenerate into "always sleep".
+    ///
+    /// A recording the live pass already pinned at ≤
+    /// `maxLiveSpeakersToSkipRediarize` speakers skips the offline pass
+    /// entirely, so `finalizeTail` publishes no marker and the send must pay
+    /// NOTHING for the new wait.
+    ///
+    /// Discriminating by construction: nothing in this test ever calls
+    /// `endSpeakerFinalization`, and `transcriptWaitTimeout` is shortened to
+    /// 3s. An unconditional wait would therefore park the send for the full
+    /// timeout and blow the 1s assertion window.
+    func test_send_does_not_wait_when_the_recording_skipped_rediarization() async throws {
+        var captured: String?
+        var callCount = 0
+        let coordinator = makeCoordinator(label: "nowait.\(#function)") {
+            _, _, transcript, _, _, _, _, _, _, _, _, _, _, _ in
+            captured = transcript
+            callCount += 1
+            return "ANSWER"
+        }
+        coordinator.transcriptWaitTimeout = 3
+
+        let rec = addCompletedRecording(
+            text: "hello there",
+            segments: [seg(0, 1, "hello", "SPEAKER_00"),
+                       seg(1, 2, "there", "SPEAKER_01")],
+            speakerNames: [:])
+        XCTAssertFalse(service.isAwaitingSpeakerFinalization(rec.id),
+                       "Sanity: a recording that skipped re-diarization carries no marker")
+
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude,
+                              prompt: "Summarize", transcript: "hello there",
+                              summary: "", executableOverride: nil)
+
+        try await waitFor(callCount > 0, timeoutSeconds: 1)
+        XCTAssertNotEqual(coordinator.activityStatus,
+                          PostRecordingCoordinator.waitingForSpeakersStatus,
+                          "Nothing was pending, so no speaker wait should ever have been announced")
+        XCTAssertEqual(captured, "SPEAKER_00: hello\nSPEAKER_01: there")
+    }
+
+    /// The marker is per-recording: one recording still finalizing must not
+    /// hold up a send for a different, already-final one.
+    func test_speaker_wait_is_scoped_to_the_recording_being_sent() async throws {
+        var callCount = 0
+        let coordinator = makeCoordinator(label: "scoped.\(#function)") {
+            _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+            callCount += 1
+            return "ANSWER"
+        }
+        coordinator.transcriptWaitTimeout = 3
+
+        let other = addCompletedRecording(text: "other meeting")
+        service.beginSpeakerFinalization(other.id)
+        defer { service.endSpeakerFinalization(other.id) }
+
+        let rec = addCompletedRecording(text: "this meeting")
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude,
+                              prompt: "Summarize", transcript: "this meeting",
+                              summary: "", executableOverride: nil)
+
+        try await waitFor(callCount > 0, timeoutSeconds: 1)
+    }
+
+    /// The background auto-title job shares the wait (issue #211, point 4) —
+    /// a title built from over-segmented speakers is the same stale input.
+    /// It must NOT announce the wait, though: it runs unattended on every
+    /// recording, so a banner would be noise for something the user never
+    /// asked for.
+    func test_auto_title_waits_for_speaker_finalization_without_a_banner() async throws {
+        let suiteName = "PostRecordingCoordinatorSendTests.titleWait.\(#function)"
+        UserDefaults().removePersistentDomain(forName: suiteName)
+        let llm = LLMSettings(defaults: UserDefaults(suiteName: suiteName)!,
+                              apiKeyKeychainKey: suiteName)
+        llm.tool = .claude
+        llm.nameGenerationEnabled = true
+
+        var captured: String?
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, transcript, _, _, _, _, _, _, _, _, _, _, _ in
+                captured = transcript
+                callCount += 1
+                return "A Tidy Title"
+            })
+
+        let rec = addCompletedRecording(
+            text: "one two",
+            segments: [seg(0, 1, "one", "SPEAKER_00"),
+                       seg(1, 2, "two", "SPEAKER_01")],
+            speakerNames: [:])
+        service.beginSpeakerFinalization(rec.id)
+
+        coordinator.present(rec)
+        try await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(callCount, 0, "The auto-title job must wait for the speaker pass too")
+        XCTAssertNil(coordinator.activityStatus,
+                     "The unattended title job must not post a banner about the wait")
+
+        var current = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        current.segments = [seg(0, 1, "one", "SPEAKER_00"), seg(1, 2, "two", "SPEAKER_00")]
+        store.update(current)
+        service.endSpeakerFinalization(rec.id)
+
+        try await waitFor(callCount > 0)
+        XCTAssertEqual(captured, "SPEAKER_00: one two",
+                       "The title must be generated from the post-remap transcript")
+    }
+
     // MARK: - OpenAI-compatible model threading (issue celarent7/mila#3)
 
     /// `sendToLLM` must thread `openAIModelName` as the `model` argument for
@@ -474,16 +666,43 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
     }
 
     /// Add a `.completed` recording with the given transcript text, with a
-    /// placeholder audio file so `RecordingStore.add` is happy.
-    private func addCompletedRecording(text: String) -> Recording {
+    /// placeholder audio file so `RecordingStore.add` is happy. `segments` /
+    /// `speakerNames` let a test stage a diarized row — the shape the issue
+    /// #211 tests need.
+    private func addCompletedRecording(text: String,
+                                       segments: [TranscriptSegment] = [],
+                                       speakerNames: [String: String] = [:]) -> Recording {
         let audioURL = store.freshAudioURL(suggestedName: "Send")
         try? Data("not-audio".utf8).write(to: audioURL)
         var rec = Recording(title: "Send", source: .microphone,
                             audioFileName: audioURL.lastPathComponent,
                             fullText: text)
         rec.status = .completed
+        rec.segments = segments
+        rec.speakerNames = speakerNames
         store.add(rec)
         return rec
+    }
+
+    /// One utterance, labeled by the diarizer.
+    private func seg(_ start: Double, _ end: Double,
+                     _ text: String, _ speaker: String) -> TranscriptSegment {
+        TranscriptSegment(start: start, end: end, text: text, speaker: speaker)
+    }
+
+    /// A coordinator with an injected `runLLM` seam, so the assertions can
+    /// read exactly what the CLI would have been handed without spawning one.
+    private func makeCoordinator(
+        label: String,
+        runLLM: @escaping PostRecordingCoordinator.RunLLM
+    ) -> PostRecordingCoordinator {
+        let suiteName = "PostRecordingCoordinatorSendTests.\(label)"
+        UserDefaults().removePersistentDomain(forName: suiteName)
+        let llm = LLMSettings(defaults: UserDefaults(suiteName: suiteName)!,
+                              apiKeyKeychainKey: suiteName)
+        llm.tool = .claude
+        return PostRecordingCoordinator(store: store, transcription: service,
+                                        llm: llm, runLLM: runLLM)
     }
 
     private func waitForBanner(containing needle: String,
