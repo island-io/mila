@@ -18,6 +18,44 @@ final class RecordingStoreTests: XCTestCase {
         super.tearDown()
     }
 
+    // MARK: - Orphan recovery
+
+    /// A capture that never received a frame must not come back. `AVAudioFile`
+    /// reserves a 4 KB header block on open, so an empty WAV is 4096 bytes —
+    /// well over the old 512-byte "skip empty files" guard, which is why every
+    /// empty capture reappeared as a `Recovered recording` row that transcribed
+    /// to nothing and settled at `.failed`.
+    func test_empty_orphan_wav_is_not_recovered() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(Recording(title: "Real", source: .microphone, audioFileName: "real.wav"))
+        let empty = store.recordingsDirectory.appendingPathComponent("empty-capture.wav")
+        try Data(count: RecordingStore.emptyWAVByteCount).write(to: empty)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        XCTAssertEqual(relaunched.recordings.map(\.title), ["Real"],
+                       "an empty capture was resurrected as a phantom recording")
+        XCTAssertTrue(relaunched.consumePendingRecoveryIDs().isEmpty,
+                      "an empty capture must not be enqueued for transcription either")
+    }
+
+    /// The other half of the same guard: a crashed recording that DID capture
+    /// audio still has to be recovered. Its header is unfinalized (it claims
+    /// zero frames), so the size on disk is the only usable signal.
+    func test_orphan_wav_with_audio_is_still_recovered() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        store.add(Recording(title: "Real", source: .microphone, audioFileName: "real.wav"))
+        let crashed = store.recordingsDirectory.appendingPathComponent("crashed.wav")
+        try Data(count: RecordingStore.emptyWAVByteCount + 1).write(to: crashed)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        XCTAssertEqual(relaunched.recordings.count, 2)
+        XCTAssertEqual(relaunched.recordings.first(where: { $0.audioFileName == "crashed.wav" })?.status,
+                       .pending)
+        XCTAssertEqual(relaunched.consumePendingRecoveryIDs().count, 1)
+    }
+
     func test_store_persists_recordings_across_instances() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         XCTAssertTrue(first.recordings.isEmpty)
