@@ -430,6 +430,28 @@ struct LiveAIRecordingView: View {
                                 TranscriptLineView(segment: seg, language: language,
                                                    useSpeakerColor: hasMultipleSpeakers,
                                                    speakerNames: transcriber.speakerNames,
+                                                   // The live transcriber is the only
+                                                   // place this name can go: there is no
+                                                   // `Recording` in the store yet
+                                                   // (`store.add` happens in
+                                                   // `stopRecording`), so
+                                                   // `RecordingStore.setSpeakerName` —
+                                                   // and the `onSpeakerNamed` hook that
+                                                   // persists a voice profile — cannot
+                                                   // resolve an id to name.
+                                                   //
+                                                   // The map is handed to
+                                                   // `onRecordingFinalized` at stop and
+                                                   // applied through `setSpeakerName`
+                                                   // there, so naming a speaker here does
+                                                   // learn their voice (island-io/mila#209)
+                                                   // — with ONE persistence trigger. Do
+                                                   // not add a profile write at this site:
+                                                   // a parallel one is what caused the
+                                                   // double-merge fixed in #204, and the
+                                                   // embeddings for this recording are not
+                                                   // final until the diarizer's queue has
+                                                   // drained at stop anyway.
                                                    onAssignName: { raw, name in
                                                        if let name {
                                                            transcriber.speakerNames[raw] = name
