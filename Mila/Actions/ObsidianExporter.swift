@@ -1,5 +1,9 @@
 import Foundation
+import OSLog
 import MilaKit
+
+private let obsidianLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                 category: "ObsidianExporter")
 
 /// Writes a completed recording into the configured Obsidian vault as a
 /// Markdown note, then optionally kicks the git sync.
@@ -30,6 +34,28 @@ final class ObsidianExporter: ObservableObject {
 
     private var pending: Set<UUID> = []
 
+    /// Recordings the user threw away during this session — a tombstone, not a
+    /// cleared flag.
+    ///
+    /// `clearPending` on its own loses the race. `cancelAndDiscard` does not
+    /// cancel `QuickActionsController.finalizeTail`, which is still running
+    /// (on the VAD path it awaits the OFFLINE re-diarize, so the window is
+    /// tens of seconds, not milliseconds) and ends by calling `markPending`
+    /// for the same id. Worse, the summary that follows can be *skipped* —
+    /// summaries off, LLM unconfigured, empty transcript — and every skip path
+    /// in `RecordingSummarizer` fires `onSummaryFinished` **synchronously**
+    /// with a fallback snapshot of the recording. That hook only checks
+    /// `isPending`, so the note lands for a recording the user discarded and
+    /// that no longer exists in the store. (The success path is already safe:
+    /// `runSummary` bails on its "is the row still in the store?" lookup.)
+    ///
+    /// Session-scoped and deliberately not persisted: a discard only has to
+    /// beat work already in flight, and a fresh launch has none. The gate sits
+    /// on `markPending` and `export`, the two entry points a completion hook
+    /// can reach; `exportAll` is the "Sync existing transcripts" backfill over
+    /// `store.recordings`, which cannot contain a permanently-deleted row.
+    private var discarded: Set<UUID> = []
+
     init(settings: ObsidianVaultSettings,
          gitSyncer: ObsidianGitSyncer = ObsidianGitSyncer(),
          defaults: UserDefaults = .standard,
@@ -42,7 +68,11 @@ final class ObsidianExporter: ObservableObject {
 
     // MARK: - Pending gate
 
-    func markPending(_ id: UUID) { pending.insert(id) }
+    /// Ignores an id the user has already thrown away — see `discarded`.
+    func markPending(_ id: UUID) {
+        guard !discarded.contains(id) else { return }
+        pending.insert(id)
+    }
     func isPending(_ id: UUID) -> Bool { pending.contains(id) }
     func clearPending(_ id: UUID) { pending.remove(id) }
 
@@ -54,6 +84,9 @@ final class ObsidianExporter: ObservableObject {
     @discardableResult
     func export(_ recording: Recording) -> URL? {
         guard settings.enabled, let vault = settings.vaultURL else { return nil }
+        // Deleted stays deleted: a completion hook that fires after the user
+        // discarded this recording must not re-file it. See `discarded`.
+        guard !discarded.contains(recording.id) else { return nil }
         var index = writtenIndex()
         guard let write = writeNote(recording, vault: vault, index: &index) else { return nil }
         setWrittenIndex(index)
@@ -69,10 +102,11 @@ final class ObsidianExporter: ObservableObject {
         return write.written
     }
 
-    /// Undo the export for `recording`: drop it from the pending gate so a
-    /// summary still in flight can't file it later, and delete the note if one
-    /// was already written. Returns the removed file, or nil when there was
-    /// nothing in the vault for this recording.
+    /// Undo the export for `recording`: tombstone the id so no later hook can
+    /// file it (see `discarded` — clearing the pending flag alone loses the
+    /// race against `finalizeTail`), and delete the note if one was already
+    /// written. Returns the removed file, or nil when there was nothing in the
+    /// vault for this recording.
     ///
     /// Called when the user throws a recording away. Export is driven off the
     /// summarizer's completion hook, which can fire either side of a discard,
@@ -81,31 +115,59 @@ final class ObsidianExporter: ObservableObject {
     /// vault anyway" reads as the app ignoring the discard.
     @discardableResult
     func discardNote(for recording: Recording) -> URL? {
+        // Tombstone first, before any early return: even with no vault picked
+        // right now, a later `markPending` for this id must not re-arm.
+        discarded.insert(recording.id)
         clearPending(recording.id)
         guard let vault = settings.vaultURL else { return nil }
         var index = writtenIndex()
         let key = Self.indexKey(vault: vault, id: recording.id)
         migrateLegacyIndexEntry(&index, key: key, vault: vault, id: recording.id)
-        guard let relative = index[key] else {
-            // The migration above may have dropped a legacy entry.
-            setWrittenIndex(index)
-            return nil
-        }
-        index[key] = nil
+        // Persist the migration itself here, so it lands on every path below
+        // rather than only when the removal succeeds.
         setWrittenIndex(index)
+        guard let relative = index[key] else { return nil }
 
         let note = vault.appendingPathComponent(relative)
         // Same rule the write path follows: never resolve a stored path back
         // out of the vault. A path that no longer sits inside it is one we
         // must not delete, whatever the index says.
-        guard ObsidianPathSanitizer.isContained(note, in: vault, fileManager: fileManager),
-              fileManager.fileExists(atPath: note.path) else { return nil }
+        guard ObsidianPathSanitizer.isContained(note, in: vault, fileManager: fileManager) else {
+            return nil
+        }
+        guard fileManager.fileExists(atPath: note.path) else {
+            // Stale entry — the note is already gone from the vault. Safe to
+            // forget, and nothing was removed, so no return value and no sync.
+            index[key] = nil
+            setWrittenIndex(index)
+            return nil
+        }
         do {
             try fileManager.removeItem(at: note)
         } catch {
-            print("ObsidianExporter: failed to remove \(note.path): \(error)")
+            // KEEP the index entry. Dropping it before the removal succeeded
+            // would strand the note: the transcript the user threw away stays
+            // in the vault and no later discard can find it again, because the
+            // only record of where it lives is this entry. Leaving it means a
+            // retry still has a path to follow.
+            //
+            // Domain + code stay public (they separate "no permission" from a
+            // read-only volume); the vault path and the Cocoa message do not,
+            // because the path is user-chosen and the filename is derived from
+            // the meeting title — and `localizedDescription` quotes the path
+            // again. See `bugbot-rules/no-user-content-in-logs.md`.
+            let ns = error as NSError
+            obsidianLog.error("""
+                discardNote failed to remove the note \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+                \(note.path, privacy: .private) \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return nil
         }
+        // Only now is the entry safe to drop: the note is gone from the vault.
+        index[key] = nil
+        setWrittenIndex(index)
         if settings.gitSyncEnabled {
             let title = Self.singleLine(recording.title)
             let message = "Remove discarded transcript: \(title.isEmpty ? "Untitled recording" : title)"

@@ -232,6 +232,63 @@ final class ObsidianExportSequencingTests: XCTestCase {
         XCTAssertNil(exporter.discardNote(for: rec))
     }
 
+    /// Discard has to be a TOMBSTONE, not a cleared flag.
+    /// `PostRecordingCoordinator.cancelAndDiscard` does not cancel
+    /// `QuickActionsController.finalizeTail`, which is still running — on the
+    /// VAD path it awaits the OFFLINE re-diarize — and ends by re-`markPending`ing
+    /// the same id. A *skipped* summary (summaries off, LLM unconfigured, empty
+    /// transcript) then fires `onSummaryFinished` synchronously with a fallback
+    /// snapshot, and that hook's only gate is `isPending`. So with a cleared
+    /// flag the note lands for a recording the user threw away.
+    func test_a_late_finalize_tail_cannot_re_export_a_discarded_recording() async throws {
+        let rec = addRecording()
+        // The reachable path: no summary will be generated, so the completion
+        // hook fires synchronously rather than going through `runSummary`
+        // (whose "is the row still in the store?" lookup already covers the
+        // success path).
+        llm.summaryEnabled = false
+
+        exporter.discardNote(for: rec)
+        store.permanentlyDelete(rec)   // as `cancelAndDiscard` does
+
+        // `finalizeTail`, still in flight, re-arms and drives the summary.
+        exporter.markPending(rec.id)
+        XCTAssertFalse(exporter.isPending(rec.id),
+                       "a discarded recording must not be able to re-arm the export gate")
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expected.path),
+                       "a recording the user discarded must not be filed by a late completion hook")
+    }
+
+    /// A failed delete must not forget where the note is. The written-index
+    /// entry is the ONLY record of the path, so dropping it before `removeItem`
+    /// succeeds strands the transcript the user threw away in the vault with no
+    /// way for any later discard to find it.
+    func test_a_failed_removal_keeps_the_index_entry_for_a_retry() throws {
+        let failingExporter = ObsidianExporter(settings: settings,
+                                               defaults: obsidianDefaults,
+                                               fileManager: RemoveFailingFileManager())
+        let rec = addRecording()
+        let note = try XCTUnwrap(failingExporter.export(rec), "precondition: the note was written")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: note.path))
+
+        XCTAssertNil(failingExporter.discardNote(for: rec),
+                     "a removal that failed must not report a removed file")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: note.path),
+                      "precondition: the stubbed delete really did fail")
+
+        // A fresh exporter over the SAME index — this is the retry path, and it
+        // only exists if the entry survived the failure above.
+        let retry = ObsidianExporter(settings: settings, defaults: obsidianDefaults)
+        XCTAssertNotNil(retry.discardNote(for: rec),
+                        "the index entry must survive a failed removal so a retry can find the note")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: note.path),
+                       "the retry must actually take the note out of the vault")
+    }
+
     /// The hook fires exactly once per attempt: a second export for the same
     /// recording only happens on a second, deliberate summarize attempt.
     func test_hook_fires_once_per_attempt() async throws {
@@ -247,5 +304,16 @@ final class ObsidianExportSequencingTests: XCTestCase {
         await summarizer.awaitInFlight(rec.id)
 
         XCTAssertEqual(fired.ids, [rec.id], "one attempt in flight must yield exactly one signal")
+    }
+}
+
+/// Every operation is the real `FileManager` except `removeItem`, which always
+/// fails. Models a vault the app can read and write but not delete from — a
+/// read-only volume, a permissions change, or an offline network mount.
+private final class RemoveFailingFileManager: FileManager {
+    override func removeItem(at url: URL) throws {
+        throw NSError(domain: NSCocoaErrorDomain,
+                      code: NSFileWriteNoPermissionError,
+                      userInfo: [NSFilePathErrorKey: url.path])
     }
 }
