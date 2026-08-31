@@ -67,5 +67,37 @@ final class MeetingAppTests: XCTestCase {
     func test_zoom_and_teams_cases_exist_with_expected_display_names() {
         XCTAssertEqual(MeetingApp.zoom.info.displayName, "Zoom")
         XCTAssertEqual(MeetingApp.teams.info.displayName, "Microsoft Teams")
+        XCTAssertEqual(MeetingApp.googleMeet.info.displayName, "Google Meet")
+    }
+
+    /// Google Meet's only bundle-ID prefix is the detector's synthetic
+    /// `meet.google.com`, so a recording that came from a detected Meet call
+    /// still gets the Meet badge.
+    func test_matching_bundle_id_finds_google_meet_by_its_synthetic_id() {
+        XCTAssertEqual(MeetingApp.matching(bundleID: "meet.google.com"), .googleMeet)
+        XCTAssertEqual(MeetingApp.matching(bundleID: "MEET.GOOGLE.COM"), .googleMeet)
+    }
+
+    /// The browsers that *host* Meet must never be listed as Meet's bundle-ID
+    /// prefixes. A browser's bundle ID says the recording came from a browser,
+    /// not that it came from a Google Meet call, so listing them would badge
+    /// every Chrome or Safari system-audio capture as a Meet meeting — and
+    /// `io.island` would badge one as Meet because Mila's own bundle ID
+    /// (`io.island.whisper.IslandWhisper`) starts with it.
+    ///
+    /// `test_matching_bundle_id_rejects_lookalike_identifiers` above already
+    /// pins Safari; this covers the rest of the browsers and Mila itself.
+    func test_host_browsers_are_not_badged_as_google_meet() {
+        for bundleID in ["com.google.Chrome", "com.apple.Safari",
+                         "company.thebrowser.Browser", "io.island.Island",
+                         "io.island.whisper.IslandWhisper"] {
+            XCTAssertNil(
+                MeetingApp.matching(bundleID: bundleID),
+                """
+                \(bundleID) is a browser (or Mila itself), not evidence of a \
+                Google Meet call — it must not carry the Meet badge.
+                """
+            )
+        }
     }
 }

@@ -50,11 +50,25 @@ enum MeetingApp: String, CaseIterable {
             return Info(
                 displayName: "Google Meet",
                 badgeColor: Color(red: 0.0, green: 0.682, blue: 0.478), // #00AE7A
-                bundleIDPrefixes: [
-                    "meet.google.com",
-                    "com.google.chrome", "com.apple.safari",
-                    "company.thebrowser", "io.island"
-                ],
+                // Only the synthetic ID `MeetingDetector` uses for Meet —
+                // deliberately NOT the browsers that host it. A browser's
+                // bundle ID says the recording came from a browser, not that
+                // it came from a Google Meet call, so listing
+                // `com.apple.safari` here would badge every Safari
+                // system-audio capture — YouTube, a podcast, anything — as a
+                // Meet meeting, and `io.island` would badge one as Meet
+                // because Mila's own ID (`io.island.whisper.…`) starts with
+                // it. `MeetingAppTests` pins Safari to no meeting app for
+                // exactly this reason.
+                //
+                // The honest consequence: a browser capture the user started
+                // by hand gets the generic source icon rather than a guess.
+                // This case exists to keep the detector↔badge identity
+                // invariant (`MeetingDetectorAppsTests`) satisfiable — every
+                // detector entry must resolve to a badge — and it is no less
+                // reachable than Zoom's is from an auto-started recording,
+                // which persists no app identity at all.
+                bundleIDPrefixes: ["meet.google.com"],
                 matchSubstring: "meet.google.com"
             )
         }

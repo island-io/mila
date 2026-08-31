@@ -22,6 +22,22 @@ import OSLog
 /// on-screen window titles via `CGWindowListCopyWindowInfo` (needs Screen
 /// Recording permission for titles; silently skipped without it).
 ///
+/// **Browser-hosted meetings (Google Meet).** Meet has no app of its own —
+/// it is a tab in Chrome, Safari, Arc or Island — so the entry lists the
+/// browsers that host it (`appBundleIDs`) and the helper processes they
+/// actually capture under (`helperBundlePrefixes`). It rides the same two
+/// signals in the same order, which has one consequence worth stating
+/// plainly: **mic capture proves a browser is in a live audio session, not
+/// that the session is Google Meet.** A Slack huddle or WhatsApp Web call
+/// in a supported browser reads as a Meet meeting on the primary path. That
+/// is accepted deliberately — the prompt it produces is a 10-second
+/// auto-dismissing offer to transcribe a call the user really is in, and the
+/// alternative (title matching as the primary signal) trades it for a worse
+/// failure: a window title only ever reflects the *frontmost tab*, so
+/// switching tabs mid-call would read as the meeting having ended and offer
+/// to stop a recording that should keep running. See the notes on
+/// `helperBundlePrefixes` for the identity trap this creates.
+///
 /// Detection is a low-frequency poll (every 3 s), not an event
 /// subscription — neither the audio nor the window signal posts a "user
 /// joined a meeting" notification.
@@ -61,6 +77,16 @@ final class MeetingDetector: ObservableObject {
         /// `company.thebrowser.browser.helper`). Checked alongside
         /// `appBundleIDs` during mic-capture matching (case-insensitive).
         /// Empty for native apps that capture under their own prefix.
+        ///
+        /// **Keep every prefix here as long as the app it identifies.** A
+        /// prefix is matched against *all* mic-capturing processes on the
+        /// machine, Mila's own included: Mila is `io.island.whisper.…` and
+        /// captures the mic both while recording and while the Settings VU
+        /// meter is live, so a prefix of `io.island` (rather than
+        /// `io.island.Island` for the Island browser) makes Mila detect
+        /// *itself* as a meeting and prompt the user about a call that is
+        /// just their own audio settings pane.
+        /// `MeetingDetectorBrowserDetectionTests` pins this.
         let helperBundlePrefixes: [String]
         /// Lowercased window-title substrings. For native apps (Zoom,
         /// Teams) this is a fallback when the mic-capture API is
@@ -74,6 +100,17 @@ final class MeetingDetector: ObservableObject {
         /// the fallback never claims a meeting for it (the Core Audio
         /// signal remains, and no detection beats a false one).
         let meetingTitleHints: [String]
+
+        /// True for an entry that lives inside another app (a browser tab)
+        /// rather than owning a process of its own — it captures under a
+        /// host's bundle ID, so it declares no `captureBundlePrefixes`.
+        ///
+        /// Only the window-title path needs to know: a browser window
+        /// minimized during a call must still count, or the fallback reads a
+        /// minimized Meet tab as the meeting having ended. A native app's
+        /// meeting window is its own, so the narrower on-screen-only search
+        /// stays for those (unchanged behaviour for Zoom).
+        var isBrowserHosted: Bool { captureBundlePrefixes.isEmpty }
     }
 
     /// Supported meeting apps. Adding a new app (e.g. Google Meet) is just
@@ -106,25 +143,46 @@ final class MeetingDetector: ObservableObject {
             helperBundlePrefixes: [],
             meetingTitleHints: []
         ),
-        // Google Meet runs inside a browser. Mic capture detects
-        // which browser is actively using the microphone; helper
-        // prefixes catch the subprocess that actually captures audio.
+        // Google Meet runs inside a browser, so the entry names the browsers
+        // that host it and rides the same mic-capture signal as the native
+        // apps: whichever of them is actively capturing the microphone (in
+        // its own process or a helper) is in a call.
+        //
+        // `bundleID` is synthetic — no process has this ID. It is the
+        // silence/snooze key and the badge key, and it deliberately does not
+        // name a browser, because silencing "Google Meet" must not silence
+        // every recording made from Chrome.
         App(
             bundleID: "meet.google.com",
-            displayName: "Google Meet (Chrome, Safari, Arc, Island)",
+            displayName: "Google Meet",
             appBundleIDs: [
                 "com.google.Chrome",
                 "com.apple.Safari",
                 "company.thebrowser.Browser",
+                // The Island browser. NOT `io.island` — see the warning on
+                // `helperBundlePrefixes`; that prefix also owns Mila.
                 "io.island.Island",
             ],
             captureBundlePrefixes: [],
-            helperBundlePrefixes: [
-                "com.google.chrome",
-                "com.apple.webkit",
-                "company.thebrowser",
-                "io.island",
-            ],
+            // Just the one. Chrome, Arc and Island capture under a `.helper`
+            // subprocess (`com.google.Chrome.helper`,
+            // `company.thebrowser.browser.helper`) which their own bundle ID
+            // above already prefixes, so listing those again adds nothing —
+            // and listing them *shorter* than the browser's own ID (say
+            // `company.thebrowser`, which also owns Dia) only widens what
+            // counts as Meet. Safari is the exception that needs an entry:
+            // its capture process is `com.apple.WebKit.GPU`, which
+            // `com.apple.Safari` does not prefix. It is also the broadest
+            // prefix here — a WKWebView capturing audio inside some *other*
+            // app would read as Meet.
+            helperBundlePrefixes: ["com.apple.webkit"],
+            // `Meet - <code>` is the in-call window title; the bare URL shows
+            // while the page loads. Reached only on macOS < 14.4 (no
+            // per-process audio API), which is why `meet -` is tolerable
+            // despite also matching a page titled e.g. "Track Meet -
+            // Results": on 14.4+ this list is never consulted. Deliberately
+            // no `google meet` hint — that is the *lobby* title, where the
+            // user has not joined anything yet.
             meetingTitleHints: ["meet.google.com", "meet -"]
         ),
     ]
@@ -207,42 +265,63 @@ final class MeetingDetector: ObservableObject {
         var activeMeetings: Set<String> = []
         for app in Self.supportedApps {
             let inMeeting: Bool
-            if app.captureBundlePrefixes.isEmpty {
-                // Browser-based meetings (Google Meet, etc.): detect
-                // via mic capture — the browser (or its helper) is
-                // actively capturing the microphone during a call.
-                //
-                // Window-title matching would be more precise but macOS
-                // 26 (Tahoe) hides titles from CGWindowListCopyWindowInfo
-                // even with Screen Recording permission, making it
-                // unreliable. Mic capture is the only cross-version
-                // signal that works.
-                //
-                // Case-insensitive prefix: browser helpers use a
-                // lowercased bundle ID (e.g. Arc's mic-capture process
-                // is "company.thebrowser.browser.helper").
-                if let capturing {
-                    let allPrefixes = app.appBundleIDs.map { $0.lowercased() }
-                        + app.helperBundlePrefixes.map { $0.lowercased() }
-                    inMeeting = capturing.contains { bid in
-                        let lowered = bid.lowercased()
-                        return allPrefixes.contains { lowered.hasPrefix($0) }
-                    }
-                } else {
-                    // No mic-capture API (older macOS): fall back to
-                    // title-only detection.
-                    inMeeting = isRunning(app) && hasMeetingWindow(for: app, includeOffScreen: true)
-                }
-            } else if let capturing {
-                inMeeting = app.captureBundlePrefixes.contains { prefix in
-                    capturing.contains { $0.hasPrefix(prefix) }
-                }
+            if let capturing {
+                inMeeting = Self.micCaptureIndicatesMeeting(app, capturing: capturing)
             } else {
-                inMeeting = isRunning(app) && hasMeetingWindow(for: app)
+                // No mic-capture API (macOS < 14.4): the window title is all
+                // there is. Both guards short-circuit before
+                // `windowTitles(for:)`, so an app that isn't running — or
+                // that opted out of this path by declaring no hints, like
+                // Teams — costs no window enumeration on a 3-second poll.
+                inMeeting = isRunning(app)
+                    && !app.meetingTitleHints.isEmpty
+                    && Self.titleIndicatesMeeting(
+                        app,
+                        titles: windowTitles(for: app, includeOffScreen: app.isBrowserHosted))
             }
             if inMeeting { activeMeetings.insert(app.bundleID) }
         }
         processActiveMeetings(activeMeetings)
+    }
+
+    // MARK: - Pure matching (the two signals, without the world)
+
+    /// True iff one of the processes currently capturing mic input belongs to
+    /// `app` — its own bundle ID, its host app's, or one of the helper
+    /// subprocesses it captures through.
+    ///
+    /// Pure and `static` on purpose: this is the decision that says "you are
+    /// in a meeting", and it is the one part of the detector that can be
+    /// tested exhaustively without Core Audio, a browser, or a microphone.
+    /// Matching is prefix-based (an app may capture under a helper ID) and
+    /// case-insensitive on both sides — bundle IDs are conventionally
+    /// lowercase but nothing enforces it, the same reason
+    /// `MeetingApp.matching(bundleID:)` lowercases.
+    ///
+    /// Because a prefix match is open-ended to the right, every prefix has to
+    /// be long enough to name one app and no more; `io.island` would claim
+    /// Mila itself. `MeetingDetectorBrowserDetectionTests` holds that line.
+    static func micCaptureIndicatesMeeting(_ app: App, capturing: Set<String>) -> Bool {
+        let prefixes = (app.captureBundlePrefixes + app.appBundleIDs + app.helperBundlePrefixes)
+            .map { $0.lowercased() }
+        return capturing.contains { bundleID in
+            let lowered = bundleID.lowercased()
+            return prefixes.contains { lowered.hasPrefix($0) }
+        }
+    }
+
+    /// True iff one of `titles` looks like one of `app`'s meeting windows.
+    /// `titles` are the raw window titles as `CGWindowListCopyWindowInfo`
+    /// reports them; hints are lowercased substrings, so the comparison
+    /// lowercases the title. An app with no hints opts out entirely (Teams),
+    /// which is why an empty hint list must never be read as "match
+    /// anything".
+    static func titleIndicatesMeeting(_ app: App, titles: [String]) -> Bool {
+        guard !app.meetingTitleHints.isEmpty else { return false }
+        return titles.contains { title in
+            let lower = title.lowercased()
+            return app.meetingTitleHints.contains { lower.contains($0) }
+        }
     }
 
     /// Test seam: drive the state machine directly with a set of "in a
@@ -367,39 +446,42 @@ final class MeetingDetector: ObservableObject {
 
     // MARK: - Fallback signal: window title (older macOS)
 
-    /// True iff a window owned by an app with the given bundle ID has a
-    /// title containing one of `app.meetingTitleHints`. Without Screen
-    /// Recording permission, window titles for other processes come back
-    /// nil — in that case we conservatively return false. An app with no
-    /// hints opts out of this fallback entirely.
+    /// Titles of the windows owned by any of `app.appBundleIDs`. Without
+    /// Screen Recording permission, window titles for other processes come
+    /// back nil, so this returns an empty array and the caller detects
+    /// nothing — the same conservative outcome as before, just expressed as
+    /// "no evidence" rather than "no meeting".
+    ///
+    /// Split from the hint matching (`titleIndicatesMeeting`) so the matching
+    /// half is a pure function tests can drive with realistic titles; this
+    /// half is the part that needs a real WindowServer.
     ///
     /// `includeOffScreen` broadens the search to minimized and off-screen
-    /// windows. Used for title-only apps (browsers) where the user may
-    /// minimize the browser during a call — `.optionOnScreenOnly` would
-    /// miss the Meet tab and falsely end the meeting.
-    private func hasMeetingWindow(for app: App, includeOffScreen: Bool = false) -> Bool {
-        guard !app.meetingTitleHints.isEmpty else { return false }
-
+    /// windows, for browser-hosted meetings where the user may minimize the
+    /// browser during a call — `.optionOnScreenOnly` would miss the Meet tab
+    /// and falsely end the meeting.
+    ///
+    /// Titles are user content (a tab title names a document, a client, a
+    /// meeting) and are deliberately never logged — see
+    /// `bugbot-rules/no-user-content-in-logs.md`.
+    private func windowTitles(for app: App, includeOffScreen: Bool = false) -> [String] {
         let runningPIDs = NSWorkspace.shared.runningApplications
-            .filter { bid in app.appBundleIDs.contains(bid.bundleIdentifier ?? "") }
+            .filter { app.appBundleIDs.contains($0.bundleIdentifier ?? "") }
             .map { $0.processIdentifier }
-        guard !runningPIDs.isEmpty else { return false }
+        guard !runningPIDs.isEmpty else { return [] }
 
         let options: CGWindowListOption = includeOffScreen
             ? [.excludeDesktopElements]
             : [.optionOnScreenOnly, .excludeDesktopElements]
         guard let info = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]]
-        else { return false }
-        for window in info {
+        else { return [] }
+
+        return info.compactMap { window in
             guard let pid = window[kCGWindowOwnerPID as String] as? Int32,
-                  runningPIDs.contains(pid) else { continue }
+                  runningPIDs.contains(pid) else { return nil }
             guard let title = window[kCGWindowName as String] as? String,
-                  !title.isEmpty else { continue }
-            let lower = title.lowercased()
-            if app.meetingTitleHints.contains(where: { lower.contains($0) }) {
-                return true
-            }
+                  !title.isEmpty else { return nil }
+            return title
         }
-        return false
     }
 }

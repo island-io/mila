@@ -8,22 +8,48 @@ import XCTest
 @MainActor
 final class MeetingDetectorAppsTests: XCTestCase {
 
-    func test_every_supported_app_has_a_detection_path() {
+    /// Every app must be reachable by the PRIMARY signal (Core Audio
+    /// per-process mic capture). Window titles remain a fallback, never the
+    /// main detection path — the same invariant this test has always held,
+    /// widened only in *where* the bundle IDs may come from.
+    ///
+    /// Native apps (Zoom, Teams) declare `captureBundlePrefixes`. A
+    /// browser-hosted entry (Google Meet) declares none, because it captures
+    /// under a host browser's ID — so for it the primary signal is
+    /// `appBundleIDs` plus `helperBundlePrefixes`. An entry with all three
+    /// empty can only ever be detected on macOS < 14.4, which is not a
+    /// feature anyone would ship on purpose.
+    func test_every_supported_app_is_reachable_by_mic_capture() {
         for app in MeetingDetector.supportedApps {
-            // Native apps (Zoom, Teams) use captureBundlePrefixes.
-            // Browser apps use their own bundleID for mic-capture
-            // matching (case-insensitive prefix against helper
-            // processes) plus title hints as a fallback on older macOS.
-            let hasCapturePrefixes = !app.captureBundlePrefixes.isEmpty
-            let hasTitleFallback = !app.meetingTitleHints.isEmpty
-            XCTAssertTrue(
-                hasCapturePrefixes || hasTitleFallback,
+            let micCaptureIDs =
+                app.captureBundlePrefixes + app.appBundleIDs + app.helperBundlePrefixes
+            XCTAssertFalse(
+                micCaptureIDs.isEmpty,
                 """
-                \(app.displayName) has neither captureBundlePrefixes nor \
-                meetingTitleHints — it can never be detected by any path.
+                \(app.displayName) declares no bundle IDs for the mic-capture \
+                path, so the primary signal can never fire for it. Window \
+                titles are a fallback (macOS < 14.4), never the main \
+                detection path.
                 """
             )
         }
+    }
+
+    /// Google Meet is not an app — it is a tab. The entry has to name the
+    /// browsers that host it, or `isRunning` / the window-title fallback have
+    /// nothing to look at, and the mic-capture path has no prefix to match.
+    func test_google_meet_names_the_browsers_that_host_it() throws {
+        let meet = try XCTUnwrap(
+            MeetingDetector.supportedApps.first { $0.bundleID == "meet.google.com" },
+            "Google Meet (meet.google.com) is not a supported app"
+        )
+        for browser in ["com.google.Chrome", "com.apple.Safari",
+                        "company.thebrowser.Browser", "io.island.Island"] {
+            XCTAssertTrue(meet.appBundleIDs.contains(browser),
+                          "Google Meet does not list \(browser) as a host browser")
+        }
+        XCTAssertTrue(meet.captureBundlePrefixes.isEmpty,
+                      "A browser-hosted entry captures under its host's ID, not its own")
     }
 
     /// The live detector (Core Audio bundle IDs) and the saved-recording
