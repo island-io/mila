@@ -439,9 +439,16 @@ final class RecordingSummarizer: ObservableObject {
                 // never surfaces a raw `{...}` blob as the summary when the
                 // model emits malformed JSON (unescaped quotes / newlines in
                 // a long summary value, which broke the object decode).
-                let (summaryText, parsedItems) = Self.parseSummaryAndItems(from: raw)
+                let (summaryText, parsedItems, origin) = Self.parseSummaryAndItems(from: raw)
                 guard !summaryText.isEmpty else {
-                    summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): empty CLI output")
+                    // `origin` distinguishes "the CLI printed nothing" from
+                    // "the CLI printed a JSON object we could not read a
+                    // summary out of" — two very different diagnoses that
+                    // used to log identically. It is a fixed keyword, never
+                    // the model's text: summary output is derived from the
+                    // transcript and is user content, so it must not reach a
+                    // `.public` log field (`bugbot-rules/no-user-content-in-logs.md`).
+                    summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): no summary parsed origin=\(origin.rawValue, privacy: .public) output=\(raw.count, privacy: .public)c")
                     // No summary landed — let a pending export fall back to
                     // the transcript rather than waiting forever. Skip the
                     // signal entirely if the recording went away mid-flight.
@@ -470,16 +477,18 @@ final class RecordingSummarizer: ObservableObject {
                 }
                 current.summary = summaryText
                 // Replace the recording's action items with the fresh
-                // full-transcript set whenever the model returned any. An
-                // empty list is treated as "keep what's there" so a glitchy
-                // empty response can't wipe the rolling live snapshot a
-                // Live-AI recording already captured at stop.
+                // full-transcript set whenever the model returned any — but
+                // never at the cost of an item the user DICTATED out loud.
+                // An empty list is treated as "keep what's there" so a
+                // glitchy empty response can't wipe the rolling live snapshot
+                // a Live-AI recording already captured at stop.
                 if !parsedItems.isEmpty {
-                    current.actionItems = parsedItems
+                    current.actionItems = Self.merged(fresh: parsedItems,
+                                                      keepingDictatedFrom: current.actionItems ?? [])
                 }
                 self.store.update(current)
                 let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-                summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) length=\(summaryText.count, privacy: .public) items=\(parsedItems.count, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
+                summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) origin=\(origin.rawValue, privacy: .public) length=\(summaryText.count, privacy: .public) items=\(current.actionItems?.count ?? 0, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
                 self.onSummaryFinished?(current)
             } catch {
                 summarizerLog.error("failed \(self?.shortID(id) ?? "?", privacy: .public): \(error.localizedDescription, privacy: .public)")
@@ -563,7 +572,8 @@ final class RecordingSummarizer: ObservableObject {
         """
     }
 
-    /// Split raw CLI output into `(summary, items)`.
+    /// Split raw CLI output into `(summary, items, origin)`, where `origin`
+    /// names the branch that produced it so the tolerant paths are loggable.
     ///
     /// Resolution order, most-trusted first:
     ///   1. Sentinel format (what `promptWithActionItems` asks for): plain
@@ -575,25 +585,114 @@ final class RecordingSummarizer: ObservableObject {
     ///      summary text so a raw `{...}` blob is never shown, and keep any
     ///      items the lenient array parse recovered.
     ///   4. Plain prose — the whole output is the summary, no items.
-    static func parseSummaryAndItems(from raw: String) -> (summary: String, items: [ActionItem]) {
+    ///
+    /// A JSON object that reaches step 3 and yields nothing readable returns
+    /// an EMPTY summary rather than the blob — see `unreadableEnvelope`.
+    static func parseSummaryAndItems(
+        from raw: String
+    ) -> (summary: String, items: [ActionItem], origin: SummaryParseOrigin) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if let sentinel = trimmed.range(of: actionItemsSentinel) {
             let summary = String(trimmed[..<sentinel.lowerBound])
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             let items = LiveAISession.parseActionItems(from: String(trimmed[sentinel.upperBound...]))
-            return (summary, items)
+            return (summary, items, .sentinel)
         }
         // No sentinel — the model returned a JSON envelope (or prose).
         let parsed = LiveAISession.parseEnvelope(from: trimmed)
         if !parsed.summary.isEmpty {
-            return (parsed.summary, parsed.items)
+            return (parsed.summary, parsed.items, .envelope)
         }
         // Object decode produced no summary. If it still looks like an
         // envelope, salvage the summary value rather than surfacing the blob.
-        if trimmed.hasPrefix("{"), trimmed.range(of: "\"summary\"") != nil {
-            return (Self.salvageSummaryValue(from: trimmed), parsed.items)
+        if trimmed.hasPrefix("{") {
+            let salvaged = Self.salvageSummaryValue(from: trimmed)
+            if !salvaged.isEmpty {
+                return (salvaged, parsed.items, .salvagedEnvelope)
+            }
+            // A JSON object we cannot read a summary out of at all (no
+            // `"summary"` key, or an empty one). Storing it verbatim is the
+            // exact bug this fix exists to remove, and doing so is
+            // self-perpetuating: a stored blob satisfies `shouldSummarize`'s
+            // "already has a summary" gate, so the recording would never be
+            // retried and the blob would be what the detail view, the Obsidian
+            // note and the MCP surface all report forever. Report NO summary
+            // instead — logged with this origin at the call site, exported as
+            // the transcript fallback, and still picked up by the next
+            // `backfillIfNeeded` sweep. That is the same treatment empty CLI
+            // output has always had (`test_summarize_drops_empty_output`), so
+            // it is an established shape rather than a new one. Items the
+            // lenient array parse recovered are still returned.
+            return ("", parsed.items, .unreadableEnvelope)
         }
-        return (trimmed, [])
+        return (trimmed, [], .plain)
+    }
+
+    /// Which branch of `parseSummaryAndItems` produced the result. Logged so
+    /// the tolerant paths are VISIBLE — a model that quietly ignores the
+    /// output contract on every call should be diagnosable from Console
+    /// instead of hiding behind a summary that looks fine.
+    ///
+    /// A fixed keyword, deliberately: the model's output is derived from the
+    /// user's transcript and is user content, so it must never reach a
+    /// `.public` log field (`bugbot-rules/no-user-content-in-logs.md`). This
+    /// records WHICH SHAPE arrived, never what it said.
+    enum SummaryParseOrigin: String {
+        /// The sentinel format `promptWithActionItems` asks for.
+        case sentinel
+        /// A decodable `{"summary":…,"items":[…]}` envelope.
+        case envelope
+        /// A broken envelope whose summary value was recovered textually.
+        case salvagedEnvelope = "salvaged-envelope"
+        /// Plain prose — the whole output is the summary.
+        case plain
+        /// A JSON object with no readable summary. Yields no summary at all.
+        case unreadableEnvelope = "unreadable-envelope"
+    }
+
+    /// Fold the fresh full-transcript items into what the recording already
+    /// has, keeping every item the user DICTATED (`source == .voiceCommand`,
+    /// i.e. "Mila, action item: …") ahead of the model's inferred set.
+    ///
+    /// Why this is not a plain replace: for a Live-AI recording,
+    /// `QuickActionsController` snapshots the live list — voice-command items
+    /// included — onto the recording at stop and then immediately calls
+    /// `regenerate`. The one-shot prompt is not shown the existing list and
+    /// only ever asks for `source: "inferred"`, so a wholesale replace would
+    /// trade an item the user said out loud for the model's guess at it, or
+    /// lose it entirely. `ActionItem.source` is also mirrored all the way out
+    /// to the MCP surface precisely so a client can tell a spoken commitment
+    /// from an inferred one (see `MilaKit.StoredRecording.ActionItem.source`),
+    /// which is the answer this would have degraded.
+    ///
+    /// Fresh items are deduped by id and by normalised text — the model
+    /// re-derives a dictated task from the transcript under a new id, and it
+    /// also duplicates ids outright, which the live path already guards
+    /// against ("LLM duplicated an id; keep first" in
+    /// `LiveAISession.applyResponse`).
+    static func merged(fresh: [ActionItem],
+                       keepingDictatedFrom existing: [ActionItem]) -> [ActionItem] {
+        let dictated = existing.filter { $0.source == .voiceCommand }
+        var seenIDs = Set(dictated.map(\.id))
+        var seenTexts = Set(dictated.map { Self.dedupKey($0.text) })
+        var result = dictated
+        for item in fresh {
+            let textKey = Self.dedupKey(item.text)
+            guard !seenIDs.contains(item.id), !seenTexts.contains(textKey) else { continue }
+            seenIDs.insert(item.id)
+            seenTexts.insert(textKey)
+            result.append(item)
+        }
+        return result
+    }
+
+    /// Normalised form used only to spot "the model re-emitted this dictated
+    /// item under a different id": trimmed, case-folded, inner whitespace
+    /// collapsed. Never persisted or displayed.
+    private static func dedupKey(_ text: String) -> String {
+        text.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
     }
 
     /// Best-effort extraction of the `"summary"` value from a JSON string the
@@ -610,9 +709,17 @@ final class RecordingSummarizer: ObservableObject {
         let valueStart = afterColon.index(after: openQuote)
         let rest = afterColon[valueStart...]
         let endIdx: Substring.Index
-        if let itemsAnchor = rest.range(of: "\", \"items\"")
-            ?? rest.range(of: "\",\"items\"") {
-            endIdx = itemsAnchor.lowerBound
+        // Find the `"items"` KEY, then walk back to the last quote before it:
+        // that quote is the summary value's terminator whatever separates the
+        // two. Matching the separator literally (`", "items"` / `","items"`)
+        // only covered compact output — a pretty-printed malformed envelope
+        // (`",\n  "items"`, which is what a CLI emitting multi-line JSON
+        // produces) fell through to `lastIndex(of:)` and dragged the entire
+        // items array into the summary, i.e. exactly the scaffolding leak
+        // this function exists to prevent.
+        if let itemsKey = rest.range(of: "\"items\"") {
+            let head = rest[..<itemsKey.lowerBound]
+            endIdx = head.lastIndex(of: "\"") ?? itemsKey.lowerBound
         } else if let lastQuote = rest.lastIndex(of: "\"") {
             endIdx = lastQuote
         } else {

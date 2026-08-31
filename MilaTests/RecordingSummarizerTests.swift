@@ -697,7 +697,222 @@ final class RecordingSummarizerTests: XCTestCase {
                        "the valid items array must still be recovered")
     }
 
+    // MARK: - Parsing the one-shot output (pure, no runner)
+
+    /// `parseSummaryAndItems` must say WHICH shape it got. The tolerant
+    /// paths are the whole point of this fix, and a model that quietly
+    /// ignores the output contract on every single call should be
+    /// diagnosable from Console rather than invisible.
+    func test_parse_origin_reports_which_shape_arrived() {
+        XCTAssertEqual(RecordingSummarizer.parseSummaryAndItems(from: "Plain prose.").origin,
+                       .plain)
+        XCTAssertEqual(
+            RecordingSummarizer.parseSummaryAndItems(
+                from: "A summary.\n\(RecordingSummarizer.actionItemsSentinel)\n[]"
+            ).origin,
+            .sentinel)
+        XCTAssertEqual(
+            RecordingSummarizer.parseSummaryAndItems(
+                from: #"{"summary": "A summary.", "items": []}"#
+            ).origin,
+            .envelope)
+    }
+
+    /// A malformed envelope that is PRETTY-PRINTED. The salvage anchored on
+    /// the separator spelled exactly `", "items"` / `","items"`, so
+    /// multi-line JSON — what a CLI printing an indented object emits — fell
+    /// through to "take everything up to the last quote" and dragged the
+    /// whole items array into the summary. That is the same scaffolding leak
+    /// the fix exists to prevent, just one whitespace variation away.
+    ///
+    /// `legacySalvageSummaryValue` below reproduces the old anchor and is
+    /// asserted to leak, so the assertions here are provably discriminating
+    /// rather than vacuous.
+    func test_parse_salvages_pretty_printed_malformed_envelope_without_leaking_scaffolding() {
+        let malformed = """
+        {
+          "summary": "Team review. Baylis acts as if he is "on another planet" and takes no ownership.",
+          "items": [
+            {"id": "a", "text": "Give Baylis direct feedback", "source": "inferred"}
+          ]
+        }
+        """
+
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: malformed)
+
+        XCTAssertEqual(parsed.origin, .salvagedEnvelope)
+        XCTAssertFalse(parsed.summary.hasPrefix("{"),
+                       "a raw JSON blob must never be shown as the summary")
+        XCTAssertFalse(parsed.summary.contains("\"items\""),
+                       "the items scaffolding must not leak into the summary")
+        XCTAssertFalse(parsed.summary.contains("\"source\""),
+                       "no item field may leak into the summary")
+        XCTAssertTrue(parsed.summary.hasSuffix("takes no ownership."),
+                      "the summary must end where its value ended; got \(parsed.summary)")
+        XCTAssertTrue(parsed.summary.contains("\"on another planet\""),
+                      "the unescaped quotes that broke the decode are part of the text")
+        XCTAssertEqual(parsed.items.map(\.text), ["Give Baylis direct feedback"],
+                       "the independently valid items array must still be recovered")
+
+        // Negative control: the pre-fix anchor swallows the array.
+        XCTAssertTrue(legacySalvageSummaryValue(from: malformed).contains("\"items\""),
+                      "control: the literal-separator anchor must leak, or this test proves nothing")
+    }
+
+    /// A JSON object with no readable summary at all. Storing it verbatim is
+    /// the reported bug, and it is self-perpetuating — a stored blob passes
+    /// the "already summarized" gate, so the recording is never retried.
+    /// No summary is the honest answer; the origin makes it diagnosable.
+    func test_parse_unreadable_json_object_yields_no_summary_rather_than_the_blob() {
+        let blob = #"{"resumen": "clave equivocada", "items": []}"#
+
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: blob)
+
+        XCTAssertEqual(parsed.origin, .unreadableEnvelope)
+        XCTAssertTrue(parsed.summary.isEmpty,
+                      "an unreadable object must yield no summary; got \(parsed.summary)")
+    }
+
+    // MARK: - Dictated action items survive the one-shot pass
+
+    /// For a Live-AI recording, `QuickActionsController` snapshots the live
+    /// action items — including ones the user DICTATED ("Mila, action
+    /// item: …", `source == .voiceCommand`) — onto the recording at stop and
+    /// then immediately calls `regenerate`. The one-shot prompt is never
+    /// shown that list and only ever asks for `source: "inferred"`, so a
+    /// wholesale replace trades what the user said out loud for the model's
+    /// guess at it. Dictated items must survive.
+    func test_regenerate_preserves_action_items_the_user_dictated() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            """
+            Fresh summary.
+            \(RecordingSummarizer.actionItemsSentinel)
+            [{"id": "fresh", "text": "Ship the beta", "source": "inferred"}]
+            """
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Dictated")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "Dictated",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        rec.summary = "stale summary"
+        rec.actionItems = [ActionItem(id: "dictated", text: "Call the bank",
+                                      speaker: nil, timestampSeconds: 12,
+                                      source: .voiceCommand, addedAt: Date())]
+        store.add(rec)
+
+        summarizer.regenerate(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "Fresh summary.")
+        let items = try XCTUnwrap(updated.actionItems)
+        XCTAssertEqual(items.map(\.text), ["Call the bank", "Ship the beta"],
+                       "a dictated item must not be dropped for the inferred set")
+        XCTAssertEqual(items.first?.source, .voiceCommand,
+                       "it must stay marked as dictated — the MCP surface reports that field")
+    }
+
+    /// The model usually DOES re-derive a dictated task from the transcript,
+    /// under an id of its own. Keeping both would show the user the same
+    /// task twice, so the fresh copy is dropped and the dictated one — the
+    /// authoritative record of an explicit instruction — is kept. Matching
+    /// is case- and whitespace-insensitive, which this fixture exercises.
+    func test_regenerate_does_not_duplicate_a_dictated_item_the_model_re_derived() async throws {
+        llm.tool = .claude
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            """
+            Fresh summary.
+            \(RecordingSummarizer.actionItemsSentinel)
+            [{"id": "reinferred", "text": "call the   BANK", "source": "inferred"},
+             {"id": "other", "text": "Ship the beta", "source": "inferred"}]
+            """
+        }
+
+        let audioURL = store.freshAudioURL(suggestedName: "NoDupes")
+        try Data("x".utf8).write(to: audioURL)
+        var rec = Recording(
+            title: "NoDupes",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        rec.actionItems = [ActionItem(id: "dictated", text: "Call the bank",
+                                      speaker: nil, timestampSeconds: 12,
+                                      source: .voiceCommand, addedAt: Date())]
+        store.add(rec)
+
+        summarizer.regenerate(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        let items = try XCTUnwrap(updated.actionItems)
+        XCTAssertEqual(items.map(\.text), ["Call the bank", "Ship the beta"],
+                       "the re-derived copy of a dictated item must be folded away")
+        XCTAssertEqual(items.first?.source, .voiceCommand)
+    }
+
+    /// End-to-end negative control for the malformed-JSON path: output the
+    /// summarizer cannot read a summary out of must leave the recording
+    /// WITHOUT a summary — never with the raw `{...}` blob, which is what
+    /// shipped and what permanently blocked a retry.
+    func test_summarize_never_stores_an_unreadable_json_object_as_the_summary() async throws {
+        llm.tool = .claude
+        let blob = #"{"resumen": "clave equivocada", "items": []}"#
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in blob }
+
+        let audioURL = store.freshAudioURL(suggestedName: "Unreadable")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "Unreadable",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertNil(updated.summary,
+                     "a blob must not be stored — the recording stays eligible for a retry")
+        XCTAssertTrue(summarizer.shouldSummarize(updated),
+                      "and the retry gate must actually still be open")
+    }
+
     // MARK: - Helpers
+
+    /// The pre-fix salvage end-anchor, kept ONLY as a negative control for
+    /// `test_parse_salvages_pretty_printed_malformed_envelope_without_leaking_scaffolding`.
+    /// It matched the separator between the summary value and the `"items"`
+    /// key literally, so any other spelling of it fell through to
+    /// `lastIndex(of:)`. Do not use for anything else.
+    private func legacySalvageSummaryValue(from json: String) -> String {
+        guard let keyRange = json.range(of: "\"summary\"") else { return "" }
+        let afterKey = json[keyRange.upperBound...]
+        guard let colon = afterKey.firstIndex(of: ":") else { return "" }
+        let afterColon = afterKey[afterKey.index(after: colon)...]
+        guard let openQuote = afterColon.firstIndex(of: "\"") else { return "" }
+        let rest = afterColon[afterColon.index(after: openQuote)...]
+        let endIdx: Substring.Index
+        if let itemsAnchor = rest.range(of: "\", \"items\"")
+            ?? rest.range(of: "\",\"items\"") {
+            endIdx = itemsAnchor.lowerBound
+        } else if let lastQuote = rest.lastIndex(of: "\"") {
+            endIdx = lastQuote
+        } else {
+            endIdx = rest.endIndex
+        }
+        return String(rest[..<endIdx])
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     /// Rebuild `summarizer` with a deterministic `runLLM` stub so the
     /// end-to-end tests don't depend on a real subprocess. Call after
