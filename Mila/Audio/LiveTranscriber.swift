@@ -117,7 +117,9 @@ final class LiveTranscriber: ObservableObject {
     /// a just-deleted line can't reappear on a later tick — the fixed-window
     /// path re-transcribes a rolling buffer and would otherwise re-emit the
     /// deleted content. The VAD path emits each utterance once, so this is
-    /// mostly a safety net there. Cleared on `start()`.
+    /// mostly a safety net there. Cleared on `start()` AND on `stop()` — it is
+    /// per-recording state, and `start()` is not the only way a new recording
+    /// begins (see `stop()`).
     private var deletedRanges: [(start: Double, end: Double)] = []
     private var inFlight: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
@@ -182,6 +184,22 @@ final class LiveTranscriber: ObservableObject {
         detector = nil
         lastUtteranceTask?.cancel()
         lastUtteranceTask = nil
+        // The deletions belong to the recording that just ended, and `start()`
+        // is NOT the only way the next one begins: `wireLiveAIPipeline`'s
+        // hardware-gated branch calls `stop()` and deliberately never calls
+        // `start()` (that is also where the sibling reset of `segments` is
+        // documented). Leaving them behind there would let a previous
+        // recording's emptying make the NEW recording's genuinely-empty
+        // transcript look authoritative, so its batch pass would never be
+        // enqueued and it would save with no transcript at all — a silent
+        // total loss, and a worse failure than the one the flag prevents.
+        // (Cursor Bugbot on #229.)
+        //
+        // Suppression is unaffected: every `stop()` call site is a teardown
+        // (end of recording, failed stop, gated re-arm, dictation), and
+        // `stopRecording` snapshots `hasUserDeletedSegments` before its own
+        // `stop()` — the same ordering it already relies on for `segments`.
+        deletedRanges = []
         return fullText
     }
 

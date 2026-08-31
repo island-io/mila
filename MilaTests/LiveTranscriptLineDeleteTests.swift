@@ -298,6 +298,96 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         }
     }
 
+    /// Empty the transcript, then start the NEXT recording the way
+    /// `wireLiveAIPipeline`'s hardware-gated branch does — `transcriber.stop()`
+    /// and deliberately no `start()`. If the emptying leaked across that
+    /// boundary, this recording's genuinely-empty transcript would look
+    /// authoritative, its batch pass would never be enqueued, and it would
+    /// save with no transcript at all. (Cursor Bugbot on #229.)
+    func test_an_emptied_transcript_does_not_leak_into_the_next_recording() async throws {
+        try await recordTwoLinesAndDeleteTheSecond()
+        let survivor = try XCTUnwrap(transcriber.segments.first)
+        transcriber.removeSegment(id: survivor.id)
+        feedSidecar()
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+        XCTAssertEqual(store.recordings.count, 1, "precondition: the emptied recording saved")
+
+        // The gated path's exact moves: stop the transcriber, never start it.
+        _ = transcriber.stop()
+        let second = store.freshAudioURL(suggestedName: "SecondRecording")
+        try TestSupport.writeStereo48kSineWav(at: second, durationSeconds: 0.6)
+        await controller.startFakeRecordingForTesting(outputURL: second)
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "precondition: this recording has no live transcript of its own")
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+
+        let fresh = try XCTUnwrap(store.recordings.first {
+            $0.audioFileName == second.lastPathComponent
+        })
+        XCTAssertFalse(fresh.fullText.isEmpty,
+                       "the second recording was never transcribed — the previous recording's "
+                       + "emptying leaked and made its empty transcript look authoritative")
+        XCTAssertEqual(fresh.status, .completed)
+    }
+
+    /// Emptying the transcript has to take the artifacts DERIVED from it too.
+    /// Nothing downstream would: `RecordingSummarizer.regenerate` bails on an
+    /// empty `fullText` (and only ever writes `summary`, never `actionItems`),
+    /// and an authoritative row owes no batch pass, so there is no completion
+    /// hook either. Without the clear, the transcript reads clean while the
+    /// deleted words sit in the `summary` field of `recordings.json` and in
+    /// MCP `get_transcript`, which serves summary + action items by default.
+    /// (Cursor Bugbot on #229.)
+    func test_emptying_the_transcript_drops_the_ai_output_derived_from_it() async throws {
+        try await recordTwoLinesAndDeleteTheSecond()
+        let survivor = try XCTUnwrap(transcriber.segments.first)
+        transcriber.removeSegment(id: survivor.id)
+        feedSidecar()
+
+        // Attached after the recording is under way so nothing in the start
+        // path can clear the seeded output before Stop reads it.
+        let ai = LiveAISession(
+            llmSettings: LLMSettings(defaults: UserDefaults(suiteName: "\(suitePrefix).llm")!),
+            liveAISettings: liveAISettings)
+        ai.seedForTesting(
+            summary: "The team discussed \(Self.deletedLine) at length.",
+            actionItems: [ActionItem(id: UUID().uuidString,
+                                     text: "follow up on \(Self.deletedLine)",
+                                     speaker: nil,
+                                     timestampSeconds: 0,
+                                     source: .llmInferred,
+                                     addedAt: Date())])
+        controller.liveAISession = ai
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+
+        let saved = try XCTUnwrap(store.recordings.first)
+        XCTAssertNil(saved.summary,
+                     "the saved summary was derived from the transcript the user deleted")
+        XCTAssertNil(saved.actionItems,
+                     "the saved action items were derived from the transcript the user deleted")
+
+        let transcript = try callTool("get_transcript", ["id": saved.id.uuidString])
+        XCTAssertNotNil(transcript["transcript"] as? String,
+                        "precondition: get_transcript resolved this recording at all")
+        let served = String(describing: transcript)
+        XCTAssertFalse(served.contains(Self.deletedLine),
+                       "get_transcript still serves the deleted words via summary / action items")
+        XCTAssertFalse(served.contains(Self.keptLine))
+
+        for file in allTextOnDisk() {
+            XCTAssertFalse(file.text.contains(Self.deletedLine),
+                           "deleted transcript text survived in \(file.path)")
+        }
+    }
+
     /// The MCP read paths specifically. `search_transcripts` goes through
     /// `namedTranscript` → the `.txt` sidecar, so it can serve text the store
     /// row no longer has; a retained recording id must not be a way back in

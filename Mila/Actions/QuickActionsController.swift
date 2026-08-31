@@ -898,6 +898,27 @@ final class QuickActionsController: ObservableObject {
         updated.fullText = hasLiveSegments ? finalFullText : ""
         updated.summary = finalSummary.isEmpty ? nil : finalSummary
         updated.actionItems = finalItems.isEmpty ? nil : finalItems
+        if userEmptiedLiveTranscript {
+            // Emptying the live transcript is a DISCARD of the transcript, so
+            // the artifacts DERIVED from it go with it. Both were produced by
+            // the Live AI loop from text that no longer exists, and nothing
+            // downstream would replace them: `RecordingSummarizer.regenerate`
+            // bails on an empty `fullText` (and only ever writes `summary`,
+            // never `actionItems`), and an authoritative row owes no batch
+            // pass, so there is no completion hook either. Keeping them would
+            // leave the transcript reading clean while the deleted words sit
+            // in the `summary` field of `recordings.json` and in everything
+            // that reads the row — MCP `get_transcript` included, which serves
+            // summary + action items by default. (Cursor Bugbot on #229.)
+            //
+            // Scoped to a FULL emptying on purpose. A partial delete leaves a
+            // non-empty transcript, and dropping a meeting's whole summary
+            // because one line was removed would be its own data loss; that
+            // case is discussed on the PR (the summary is regenerated from the
+            // clean text, but `actionItems` are not).
+            updated.summary = nil
+            updated.actionItems = nil
+        }
         updated.status = liveTranscriptIsAuthoritative ? .completed : .pending
         // `update` reports whether the `.txt` sidecar AND recordings.json
         // actually landed on disk. Both used to fail silently, so the handoff
