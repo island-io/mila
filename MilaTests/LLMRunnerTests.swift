@@ -45,15 +45,21 @@ final class LLMRunnerTests: XCTestCase {
     /// scary prompts for any folder the LLM CLI happens to scan.
     func test_runner_spawns_child_in_isolated_empty_directory() async throws {
         // Script prints its cwd and counts the entries it sees there.
-        // Deliberately `ls` and not `ls -A`: since #181 the sandbox is shared
-        // and persistent, so an LLM CLI is free to leave its own dot-files
-        // (`.claude/`) behind. What must stay true is that the child sees no
-        // *user* content — which is what a visible-entry count proves, and it
-        // still fails loudly if the cwd ever became $HOME or a user folder.
+        //
+        // `ls -A`, hidden entries included (issue #190). Between #181 and #190
+        // this was a bare `ls`, on the grounds that a shared, persistent
+        // sandbox lets an LLM CLI leave its own dot-files (`.claude/`) behind
+        // — which made the count pass by luck rather than by construction, and
+        // spared exactly the directory a CLI would cache an answer about the
+        // user's meeting in. The runner now empties the sandbox on the idle
+        // transitions, so a run that starts with nothing else in flight — as
+        // this one does — must find the directory genuinely empty, dot-files
+        // and all. The cwd assertions below still fail loudly if it ever became
+        // $HOME or a user folder.
         let script = makeScript("""
             #!/bin/sh
             printf 'cwd=%s\\n' "$PWD"
-            printf 'entries=%s\\n' "$(ls 2>/dev/null | wc -l | tr -d ' ')"
+            printf 'entries=%s\\n' "$(ls -A 2>/dev/null | wc -l | tr -d ' ')"
             """)
         defer { try? FileManager.default.removeItem(at: script) }
         let out = try await LLMRunner.run(
@@ -73,6 +79,89 @@ final class LLMRunnerTests: XCTestCase {
         // And it must be the one directory Mila owns for this.
         XCTAssertTrue(out.contains("cwd=\(LLMRunner.sandboxDirectory().path)\n"),
                       "Child cwd is not the shared LLM sandbox: \(out)")
+    }
+
+    /// Issue #190. The shared cwd #181 introduced is not empty at the start of
+    /// a run: whatever the previous CLI wrote into it is still sitting there.
+    /// So an artifact derived from one recording's call — a scratch file, a
+    /// cached answer — was discoverable by an unrelated later call, including
+    /// one for a different recording.
+    ///
+    /// Deliberately probes for ONE uniquely-named marker instead of asserting
+    /// the directory is empty. Emptiness is a property of the whole directory
+    /// that a concurrent invocation is entitled to break (concurrent runs share
+    /// this cwd by design, and that is pinned by
+    /// `LLMSandboxDirectoryTests`), whereas "the file invocation A wrote is
+    /// gone before invocation B starts" is the property that actually matters
+    /// and holds no matter what else is in there.
+    ///
+    /// The writer re-checks its own marker with the same `[ -e ]` test before
+    /// exiting, so `ABSENT` from the reader cannot pass for the wrong reason —
+    /// a mis-quoted path or a write that never landed would show up as
+    /// `WROTE:ABSENT` and fail the first assertion instead of quietly making
+    /// the second one trivially true.
+    func test_artifact_from_one_invocation_is_not_visible_to_the_next() async throws {
+        let marker = "island-mila-leak-probe-\(UUID().uuidString).txt"
+        let writer = makeScript("""
+            #!/bin/sh
+            printf 'output derived from a meeting transcript' > "\(marker)"
+            if [ -e "\(marker)" ]; then printf 'WROTE:FOUND'; else printf 'WROTE:ABSENT'; fi
+            """)
+        let reader = makeScript("""
+            #!/bin/sh
+            if [ -e "\(marker)" ]; then printf 'PROBE:FOUND'; else printf 'PROBE:ABSENT'; fi
+            """)
+        defer {
+            try? FileManager.default.removeItem(at: writer)
+            try? FileManager.default.removeItem(at: reader)
+        }
+
+        let wrote = try await LLMRunner.run(tool: .claude,
+                                            prompt: "x", transcript: "y",
+                                            executablePathOverride: writer.path,
+                                            timeout: 30)
+        XCTAssertEqual(wrote, "WROTE:FOUND",
+                       "the first invocation never wrote its marker, so the "
+                       + "probe below would prove nothing: \(wrote)")
+
+        let probe = try await LLMRunner.run(tool: .claude,
+                                            prompt: "x", transcript: "y",
+                                            executablePathOverride: reader.path,
+                                            timeout: 30)
+        XCTAssertEqual(probe, "PROBE:ABSENT",
+                       "a later invocation could read a file the previous one "
+                       + "left in the shared sandbox: \(probe)")
+    }
+
+    /// Negative control for the test above, in the shape the bug actually took
+    /// on disk: a file already sitting in the shared directory when a run
+    /// starts. Planted with `FileManager` rather than by a first run, so this
+    /// asserts the *entry* sweep specifically — the one that also covers what a
+    /// crashed or force-quit session left behind, where no release ever ran.
+    ///
+    /// Uses nothing but the pre-#190 API surface (`run`, `sandboxDirectory()`),
+    /// so it compiles against the unfixed runner and fails there: that runner
+    /// swept nothing, and the child would print `PROBE:FOUND`.
+    func test_leftover_in_the_shared_sandbox_is_gone_before_the_next_child_starts() async throws {
+        let name = "island-mila-stale-leftover-\(UUID().uuidString).txt"
+        let leftover = LLMRunner.sandboxDirectory().appendingPathComponent(name)
+        try Data("left behind by an earlier invocation".utf8).write(to: leftover)
+        defer { try? FileManager.default.removeItem(at: leftover) }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: leftover.path),
+                      "test setup failed: the leftover was never planted at \(leftover.path)")
+
+        let script = makeScript("""
+            #!/bin/sh
+            if [ -e "\(name)" ]; then printf 'PROBE:FOUND'; else printf 'PROBE:ABSENT'; fi
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+        let out = try await LLMRunner.run(tool: .claude,
+                                          prompt: "x", transcript: "y",
+                                          executablePathOverride: script.path,
+                                          timeout: 30)
+        XCTAssertEqual(out, "PROBE:ABSENT",
+                       "the child could read a file an earlier run left in the "
+                       + "shared sandbox: \(out)")
     }
 
     /// The transcript travels in argv (via `composedPrompt`), not stdin —

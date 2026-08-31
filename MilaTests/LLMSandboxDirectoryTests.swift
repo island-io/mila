@@ -69,6 +69,48 @@ final class LLMSandboxDirectoryTests: XCTestCase {
         return url
     }
 
+    /// Writes `marker` into its cwd (the sandbox), signals `ready`, parks until
+    /// `barrier` appears, then reports whether its own file survived the wait.
+    /// `ready` and `barrier` both live OUTSIDE the sandbox so the handshake
+    /// itself writes nothing into the directory under test.
+    private func makeMarkerHolderScript(marker: String, ready: URL, barrier: URL) -> URL {
+        makeScript("""
+        #!/bin/sh
+        printf 'output derived from a meeting transcript' > "\(marker)"
+        : > "\(ready.path)"
+        i=0
+        while [ ! -f "\(barrier.path)" ] && [ $i -lt 1200 ]; do
+          i=$((i+1)); sleep 0.05
+        done
+        if [ -e "\(marker)" ]; then printf 'TICK:FOUND'; else printf 'TICK:ABSENT'; fi
+        """)
+    }
+
+    private func makeScript(_ body: String) -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("island-mila-sandbox-test-\(UUID().uuidString).sh")
+        try? body.write(to: url, atomically: true, encoding: .utf8)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o755],
+                                              ofItemAtPath: url.path)
+        return url
+    }
+
+    /// Poll for a handshake file. `XCTFail` rather than a `throw` on expiry so
+    /// the failure names the file that never appeared instead of surfacing as
+    /// an opaque error out of the caller.
+    private func waitForFile(_ url: URL,
+                             timeout: TimeInterval,
+                             file: StaticString = #filePath,
+                             line: UInt = #line) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if FileManager.default.fileExists(atPath: url.path) { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        XCTFail("timed out after \(Int(timeout))s waiting for \(url.lastPathComponent)",
+                file: file, line: line)
+    }
+
     /// claude derives its `~/.claude/projects/<slug-of-cwd>` project directory
     /// from the process CWD. A per-invocation CWD therefore leaked a
     /// per-invocation project directory that nothing ever cleaned up (175
@@ -242,6 +284,101 @@ final class LLMSandboxDirectoryTests: XCTestCase {
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: LLMRunner.sandboxDirectory().path),
             "shared sandbox was torn down after the run")
+    }
+
+    /// Issue #190's hard constraint: the sweep that keeps the shared directory
+    /// clean must never delete a file a CONCURRENT invocation is using. Driven
+    /// through the lease API directly rather than through two child processes
+    /// so the overlap is exact and the test carries no subprocess timing — the
+    /// end-to-end twin is `test_a_oneshot_run_does_not_sweep_a_concurrent_tick`
+    /// below.
+    ///
+    /// Reads as the life of one Live AI tick with a one-shot Send landing on
+    /// top of it: the tick writes something, the Send starts and finishes
+    /// around it, and only when the last invocation leaves does the directory
+    /// get emptied.
+    func test_sweep_waits_for_the_last_concurrent_invocation() throws {
+        let first = LLMRunner.acquireSandbox()
+        var firstReleased = false
+        defer { if !firstReleased { LLMRunner.releaseSandbox(first) } }
+
+        let marker = first.appendingPathComponent(
+            "island-mila-inflight-\(UUID().uuidString).txt")
+        try Data("a file the running invocation is using".utf8).write(to: marker)
+        // Control for the three assertions below: they are only meaningful if
+        // the file was really there to begin with.
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path),
+                      "test setup failed: nothing was written at \(marker.path)")
+
+        // A second invocation STARTING while the first is still inside must not
+        // sweep — this is the "deleted a file out from under a live child"
+        // case that rules out a naive sweep-before-each-run.
+        let second = LLMRunner.acquireSandbox()
+        var secondReleased = false
+        defer { if !secondReleased { LLMRunner.releaseSandbox(second) } }
+        XCTAssertEqual(second, first,
+                       "concurrent invocations must still share one cwd (#181)")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path),
+                      "a second invocation swept a file the first one is using")
+
+        // Nor may it sweep on the way out, while the first is still inside.
+        LLMRunner.releaseSandbox(second)
+        secondReleased = true
+        XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path),
+                      "the sweep fired while an invocation was still running")
+
+        // Last one out empties the directory.
+        LLMRunner.releaseSandbox(first)
+        firstReleased = true
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path),
+                       "the shared sandbox kept an artifact after the last "
+                       + "invocation left: \(marker.path)")
+    }
+
+    /// The same property with real children, because the lease test cannot show
+    /// that `executeProcess` actually holds its lease for the whole life of the
+    /// child rather than just across the launch.
+    ///
+    /// A long-running invocation (the shape of a Live AI tick) writes a file
+    /// into the shared cwd and parks on a barrier; a one-shot call then starts
+    /// AND finishes around it. Neither the one-shot's entry nor its exit may
+    /// take the tick's file with it.
+    func test_a_oneshot_run_does_not_sweep_a_concurrent_tick() async throws {
+        let token = UUID().uuidString
+        let temp = FileManager.default.temporaryDirectory
+        let ready = temp.appendingPathComponent("island-mila-tick-ready-\(token)")
+        let barrier = temp.appendingPathComponent("island-mila-tick-barrier-\(token)")
+        let tick = makeMarkerHolderScript(marker: "island-mila-tick-artifact-\(token).txt",
+                                          ready: ready,
+                                          barrier: barrier)
+        let oneShot = makeCWDEchoScript()
+        defer {
+            for url in [ready, barrier, tick, oneShot] {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+
+        async let live = LLMRunner.run(tool: .claude, prompt: "x", transcript: "y",
+                                       executablePathOverride: tick.path,
+                                       session: .new(UUID()), timeout: 120)
+        // Don't start the one-shot until the tick is genuinely inside with its
+        // file written — otherwise the two might not overlap at all and the
+        // test would pass without exercising anything.
+        try await waitForFile(ready, timeout: 60)
+
+        let oneShotCWD = try await LLMRunner.run(tool: .claude,
+                                                 prompt: "x", transcript: "y",
+                                                 executablePathOverride: oneShot.path,
+                                                 timeout: 60)
+        XCTAssertEqual(oneShotCWD, LLMRunner.sandboxDirectory().path,
+                       "the one-shot didn't run in the shared sandbox, so it "
+                       + "never had the chance to sweep the tick's file")
+
+        try Data().write(to: barrier)
+        let tickResult = try await live
+        XCTAssertEqual(tickResult, "TICK:FOUND",
+                       "a concurrent one-shot swept the running tick's file out "
+                       + "from under it: \(tickResult)")
     }
 
     /// `diagnose` (Settings → AI Provider "Test") is the third code path into
