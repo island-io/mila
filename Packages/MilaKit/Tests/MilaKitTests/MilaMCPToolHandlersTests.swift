@@ -57,7 +57,8 @@ final class MilaMCPToolHandlersTests: XCTestCase {
                               revision: Int = 3, liveAvailable: Bool = true,
                               updatedAt: Date = Date(),
                               segments: [LiveTranscriptSnapshot.Segment]? = nil,
-                              finalRecordingID: UUID? = nil) throws -> LiveTranscriptSnapshot {
+                              finalRecordingID: UUID? = nil,
+                              segmentsRemovedAtRevision: Int? = nil) throws -> LiveTranscriptSnapshot {
         let snap = LiveTranscriptSnapshot(
             sessionID: sessionID, state: state, liveTranscriptAvailable: liveAvailable,
             recordingStartedAt: updatedAt.addingTimeInterval(-120), updatedAt: updatedAt,
@@ -68,7 +69,8 @@ final class MilaMCPToolHandlersTests: XCTestCase {
                 .init(start: 4, end: 6, text: "third", speaker: "SPEAKER_01"),
             ],
             speakerNames: ["SPEAKER_00": "Dana"],
-            finalRecordingID: finalRecordingID)
+            finalRecordingID: finalRecordingID,
+            segmentsRemovedAtRevision: segmentsRemovedAtRevision)
         try snap.write(root: root)
         return snap
     }
@@ -248,6 +250,95 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         let texts = (result["new_segments"] as? [[String: Any]])?.compactMap { $0["text"] as? String }
         XCTAssertEqual(texts, ["second", "third"])
         XCTAssertEqual(result["next_segment_index"] as? Int, 3)
+    }
+
+    // MARK: - A deleted line must reach the poller
+
+    /// The user deleted the middle line mid-meeting. A poller holding all
+    /// three lines has a cursor the delta cannot honour: `segments(sinceIndex:
+    /// 3)` over a two-entry list is `[]`, so the reply would be "nothing was
+    /// removed, nothing is new" and the client would keep quoting the deleted
+    /// text for the rest of the call. It must be handed the complete current
+    /// set instead, flagged so it replaces rather than appends.
+    func test_live_delta_resends_everything_after_a_line_is_removed() throws {
+        let snap = try liveSnapshot(
+            revision: 5,
+            segments: [
+                .init(start: 0, end: 2, text: "first", speaker: "SPEAKER_00"),
+                .init(start: 4, end: 6, text: "third", speaker: "SPEAKER_01"),
+            ],
+            segmentsRemovedAtRevision: 5)
+        let result = try call("get_live_transcript", [
+            "session_id": snap.sessionID.uuidString,
+            "since_revision": 4,
+            "since_segment_index": 3,
+        ])
+        XCTAssertEqual(result["changed"] as? Bool, true)
+        XCTAssertEqual(result["segments_removed"] as? Bool, true)
+        let texts = (result["new_segments"] as? [[String: Any]])?.compactMap { $0["text"] as? String }
+        XCTAssertEqual(texts, ["first", "third"],
+                       "a cursor that predates the removal must get the whole set, not an empty delta")
+        XCTAssertEqual(result["next_segment_index"] as? Int, 2,
+                       "the client's cursor has to be corrected too, or every later line is mis-stitched")
+        let transcript = try XCTUnwrap(result["transcript"] as? String)
+        XCTAssertFalse(transcript.contains("second"),
+                       "the deleted line must not come back in the rendered transcript")
+        let note = try XCTUnwrap(result["note"] as? String)
+        XCTAssertTrue(note.localizedCaseInsensitiveContains("removed"), note)
+    }
+
+    /// Once the client's cursor is at or past the removal it is back on the
+    /// cheap path — a delete must not turn every remaining poll of the meeting
+    /// into a full resend.
+    func test_live_delta_stays_incremental_once_the_client_has_seen_the_removal() throws {
+        let snap = try liveSnapshot(
+            revision: 6,
+            segments: [
+                .init(start: 0, end: 2, text: "first", speaker: "SPEAKER_00"),
+                .init(start: 4, end: 6, text: "third", speaker: "SPEAKER_01"),
+                .init(start: 6, end: 8, text: "fourth", speaker: "SPEAKER_01"),
+            ],
+            segmentsRemovedAtRevision: 5)
+        let result = try call("get_live_transcript", [
+            "session_id": snap.sessionID.uuidString,
+            "since_revision": 5,
+            "since_segment_index": 2,
+        ])
+        XCTAssertNil(result["segments_removed"])
+        XCTAssertNil(result["transcript"], "a delta carries segments, not the whole rendering")
+        let texts = (result["new_segments"] as? [[String: Any]])?.compactMap { $0["text"] as? String }
+        XCTAssertEqual(texts, ["third", "fourth"])
+    }
+
+    /// A client that sends a segment cursor but no `since_revision` cannot
+    /// prove it has seen the removal, so it is served the full set. Failing
+    /// closed here costs one large reply; failing open leaves deleted text in
+    /// someone's context.
+    func test_live_poll_without_a_revision_cursor_gets_the_full_set_after_a_removal() throws {
+        let snap = try liveSnapshot(
+            revision: 5,
+            segments: [.init(start: 0, end: 2, text: "first", speaker: "SPEAKER_00")],
+            segmentsRemovedAtRevision: 5)
+        let result = try call("get_live_transcript", [
+            "session_id": snap.sessionID.uuidString,
+            "since_segment_index": 3,
+        ])
+        XCTAssertEqual(result["segments_removed"] as? Bool, true)
+        XCTAssertEqual((result["new_segments"] as? [[String: Any]])?.count, 1)
+    }
+
+    /// Nothing has ever been removed → the delta path is untouched. This is
+    /// the control for the three tests above.
+    func test_live_delta_is_unaffected_when_nothing_was_removed() throws {
+        let snap = try liveSnapshot(revision: 4)
+        let result = try call("get_live_transcript", [
+            "session_id": snap.sessionID.uuidString,
+            "since_revision": 2,
+            "since_segment_index": 3,
+        ])
+        XCTAssertNil(result["segments_removed"])
+        XCTAssertEqual((result["new_segments"] as? [[String: Any]])?.count, 1,
+                       "an ordinary cursor at the tail re-reads only the last segment")
     }
 
     func test_live_session_mismatch_returns_new_session_full_set() throws {

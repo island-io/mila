@@ -49,6 +49,28 @@ public struct LiveTranscriptSnapshot: Codable, Sendable {
     /// Set when `state == .completed` — the saved recording's UUID, for
     /// handoff to `get_transcript`.
     public var finalRecordingID: UUID?
+    /// The `revision` at which segments were last REMOVED rather than
+    /// appended-to or trailing-rewritten — i.e. the user deleted a line from
+    /// the live pane.
+    ///
+    /// The incremental poll contract (`since_segment_index`) is append-only by
+    /// construction: `next_segment_index` is a count, and a delta re-sends
+    /// only from one before that index. Nothing in it can say "the line you
+    /// already hold is gone", so without this marker a poller that had
+    /// already fetched a deleted line would keep it in its own context for
+    /// the rest of the meeting — and its cursor would be off by one, so
+    /// subsequent lines would be mis-stitched too.
+    ///
+    /// A poller whose `since_revision` predates this value is served the FULL
+    /// segment set instead of a delta. `nil` (the common case, and what an
+    /// older app's file decodes to) means nothing has ever been removed, so
+    /// deltas behave exactly as before.
+    ///
+    /// Optional deliberately: the mila-mcp helper and the app ship in the
+    /// same bundle but need not be the same build — a non-optional `Int`
+    /// would make a newer helper fail to decode an older app's snapshot
+    /// entirely and report "not recording" mid-meeting.
+    public var segmentsRemovedAtRevision: Int?
 
     public init(version: Int = 1,
                 sessionID: UUID = UUID(),
@@ -61,7 +83,8 @@ public struct LiveTranscriptSnapshot: Codable, Sendable {
                 source: String? = nil,
                 segments: [Segment] = [],
                 speakerNames: [String: String] = [:],
-                finalRecordingID: UUID? = nil) {
+                finalRecordingID: UUID? = nil,
+                segmentsRemovedAtRevision: Int? = nil) {
         self.version = version
         self.sessionID = sessionID
         self.state = state
@@ -74,6 +97,7 @@ public struct LiveTranscriptSnapshot: Codable, Sendable {
         self.segments = segments
         self.speakerNames = speakerNames
         self.finalRecordingID = finalRecordingID
+        self.segmentsRemovedAtRevision = segmentsRemovedAtRevision
     }
 
     /// Heartbeat age beyond which a `recording` snapshot is reported stale.
@@ -125,5 +149,40 @@ public struct LiveTranscriptSnapshot: Codable, Sendable {
         guard index > 0 else { return segments }
         let start = min(index - 1, segments.count)
         return Array(segments[start...])
+    }
+
+    /// Whether going from `old` to `new` REMOVED a line a poller may already
+    /// hold, as opposed to the two changes the incremental cursor already
+    /// describes correctly:
+    ///
+    ///   * **Appending** — new entries past the old count.
+    ///   * **Rewriting the trailing entry** — the live merge extends the last
+    ///     utterance as whisper gets more audio, which is exactly why
+    ///     `segments(sinceIndex:)` re-sends one before the cursor. Deleting
+    ///     the LAST line therefore needs no marker either: the client is told
+    ///     to replace that entry with whatever now occupies it (or, when
+    ///     nothing does, `next_segment_index` shrinks past it).
+    ///
+    /// `speaker` is deliberately NOT compared. Live diarization labels land
+    /// on already-published lines several seconds late; treating that as a
+    /// removal would force a full resend on most ticks of a multi-speaker
+    /// meeting. (An in-place speaker label is not delivered incrementally
+    /// today either — a separate, pre-existing gap.)
+    public static func segmentsWereRemoved(from old: [Segment], to new: [Segment]) -> Bool {
+        // Anything shorter lost a line outright. (Also the `old.count == 1`
+        // case: its only entry is the trailing one, so a shrink to 0 is the
+        // sole way it can go.)
+        if new.count < old.count { return true }
+        guard old.count > 1 else { return false }
+        // Compare the protected prefix — everything except the trailing
+        // entry the protocol already re-sends.
+        for i in 0..<(old.count - 1) {
+            if new[i].start != old[i].start
+                || new[i].end != old[i].end
+                || new[i].text != old[i].text {
+                return true
+            }
+        }
+        return false
     }
 }

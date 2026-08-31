@@ -185,6 +185,16 @@ final class LiveAISession: ObservableObject {
         self.liveAISettings = liveAISettings
     }
 
+    /// Inject rolling AI output without invoking an LLM. Same idiom (and same
+    /// justification) as `LiveTranscriber.seedForTesting`: `summary` and
+    /// `actionItems` are `private(set)`, so a test asserting on what Stop
+    /// snapshots out of them has no other way in. Production paths must not
+    /// call this.
+    func seedForTesting(summary: String, actionItems: [ActionItem] = []) {
+        self.summary = summary
+        self.actionItems = actionItems
+    }
+
     /// Begin a session — clears any previous state. Generates a fresh
     /// session id when the user's LLM tool supports session continuity
     /// (Claude does; Cursor doesn't), so each recording gets its own

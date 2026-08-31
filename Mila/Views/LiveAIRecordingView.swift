@@ -65,6 +65,27 @@ struct LiveAIRecordingView: View {
             && !llmSettings.liveAIDisabledByRemoteOpenAI
     }
 
+    /// Whether the transcript on screen is the one that gets SAVED, rather
+    /// than a provisional preview.
+    ///
+    /// This is the same predicate `QuickActionsController.stopRecording`
+    /// calls `vadActive` — deliberately the same expression and not a new
+    /// rule, because it decides `liveTranscriptIsAuthoritative` there. With
+    /// auto-segment (VAD) off, Stop enqueues the WAV for a full batch
+    /// re-transcription that overwrites `segments` + `fullText` wholesale, so
+    /// nothing the user does to the live text survives — a deleted line comes
+    /// straight back into `recordings.json`, the `.txt` sidecar and the
+    /// `.srt`. Editing affordances are hidden in that mode rather than
+    /// silently undone (`bugbot-rules/deleted-data-stays-deleted.md`: a
+    /// delete must not come back).
+    ///
+    /// It stays a pure mode check: deleting the *last* line would otherwise
+    /// empty `segments` and flip `liveTranscriptIsAuthoritative` by itself, but
+    /// that route is closed in `stopRecording` (an emptied transcript stays
+    /// authoritative) rather than by refusing the delete here. Emptying the
+    /// transcript is a legitimate thing to want.
+    private var liveTranscriptIsSaved: Bool { liveAISettings.useVAD }
+
     /// RTL for the AI pane (summary + action items). The AI output is its
     /// own language setting; for `.auto` we detect from the actual emitted
     /// text — summary + ALL item texts combined — so a short individual
@@ -477,7 +498,11 @@ struct LiveAIRecordingView: View {
                                                        } else {
                                                            transcriber.speakerNames.removeValue(forKey: raw)
                                                        }
-                                                   })
+                                                   },
+                                                   onDelete: { id in
+                                                       transcriber.removeSegment(id: id)
+                                                   },
+                                                   canDelete: liveTranscriptIsSaved)
                                     .frame(maxWidth: .infinity, alignment: textAlignment)
                                 // Identifier is applied to the inner Text
                                 // inside TranscriptLineView (where SwiftUI
@@ -752,8 +777,39 @@ private struct TranscriptLineView: View {
     /// Persists a rename picked from the label's popover mid-recording:
     /// (raw speaker ID, chosen name or nil-to-reset).
     var onAssignName: (String, String?) -> Void = { _, _ in }
+    /// Deletes this line from the live transcript. Wired to
+    /// `LiveTranscriber.removeSegment(id:)`.
+    var onDelete: (UUID) -> Void = { _ in }
+    /// Whether a deletion would actually STICK — i.e. whether the live
+    /// transcript is the one that gets saved. See `liveTranscriptIsSaved`
+    /// in `LiveAIRecordingView`: with auto-segment (VAD) off, the whole
+    /// live transcript is provisional and Stop replaces it wholesale with
+    /// a fresh batch pass over the WAV, so a deleted line would come
+    /// straight back. Offering a destructive control that silently undoes
+    /// itself is worse than not offering it.
+    var canDelete: Bool = true
+
+    @State private var hovering = false
 
     var body: some View {
+        // Right-click / control-click also offers delete, for when the
+        // hover button is easy to miss. The MODIFIER is conditional, not
+        // just its content: an empty `.contextMenu {}` still installs a
+        // menu, and a right-click that opens nothing reads as a bug.
+        if canDelete {
+            line.contextMenu {
+                Button(role: .destructive) {
+                    onDelete(segment.id)
+                } label: {
+                    Label("Delete line", systemImage: "trash")
+                }
+            }
+        } else {
+            line
+        }
+    }
+
+    private var line: some View {
         // We rely on the PARENT pane's layoutDirection. That mirrors the
         // HStack (speaker badge ends up on the right in RTL, text fills
         // the remaining space leftward) without us having to flip
@@ -762,34 +818,65 @@ private struct TranscriptLineView: View {
         // calls — a single English aside inside a Hebrew conversation
         // should still display LTR within its own line).
         let lineRTL = segment.text.isPredominantlyHebrew || language == "he"
-        HStack(alignment: .top, spacing: 8) {
-            if let sp = segment.speaker {
-                SpeakerLabelButton(
-                    rawID: sp,
-                    names: speakerNames,
-                    language: language,
-                    color: useSpeakerColor ? sp.speakerColor(names: speakerNames) : Color.accentColor,
-                    font: .caption.weight(.semibold),
-                    onAssign: { name in onAssignName(sp, name) }
-                )
-                .frame(minWidth: 96, alignment: .leading)
-            } else {
-                Color.clear.frame(width: 96, height: 1)
+        // Outer HStack stays LTR so the trash control is always the
+        // physical trailing child. Inner stack owns lineRTL for speaker
+        // + text; putting the button inside that stack would mirror it
+        // onto the leading edge. The button stays in layout (opacity
+        // only) so rows don't jump, but is removed from hit-testing and
+        // VoiceOver until hover.
+        return HStack(alignment: .top, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                if let sp = segment.speaker {
+                    SpeakerLabelButton(
+                        rawID: sp,
+                        names: speakerNames,
+                        language: language,
+                        color: useSpeakerColor ? sp.speakerColor(names: speakerNames) : Color.accentColor,
+                        font: .caption.weight(.semibold),
+                        onAssign: { name in onAssignName(sp, name) }
+                    )
+                    .frame(minWidth: 96, alignment: .leading)
+                } else {
+                    Color.clear.frame(width: 96, height: 1)
+                }
+                Text(segment.text)
+                    .font(.callout)
+                    .foregroundStyle(segment.stable ? .primary : .secondary)
+                    .italic(!segment.stable)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .multilineTextAlignment(.leading)
+                    // Put the identifier on the leaf Text so XCUITest's
+                    // `.staticTexts.matching(identifier:)` finds it. The
+                    // outer wrapper-level identifier was a no-op (SwiftUI
+                    // didn't materialize an a11y node there).
+                    .accessibilityIdentifier("liveTranscript.segment")
             }
-            Text(segment.text)
-                .font(.callout)
-                .foregroundStyle(segment.stable ? .primary : .secondary)
-                .italic(!segment.stable)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .multilineTextAlignment(.leading)
-                // Put the identifier on the leaf Text so XCUITest's
-                // `.staticTexts.matching(identifier:)` finds it. The
-                // outer wrapper-level identifier was a no-op (SwiftUI
-                // didn't materialize an a11y node there).
-                .accessibilityIdentifier("liveTranscript.segment")
+            .environment(\.layoutDirection, lineRTL ? .rightToLeft : .leftToRight)
+            if canDelete {
+                deleteButton
+                    .opacity(hovering ? 1 : 0)
+                    .allowsHitTesting(hovering)
+                    .accessibilityHidden(!hovering)
+            }
         }
-        .environment(\.layoutDirection, lineRTL ? .rightToLeft : .leftToRight)
+        .environment(\.layoutDirection, .leftToRight)
+        .contentShape(Rectangle())
+        .onHover { hovering = $0 }
+    }
+
+    private var deleteButton: some View {
+        Button {
+            onDelete(segment.id)
+        } label: {
+            Image(systemName: "trash")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.borderless)
+        .help("Delete this line from the transcript")
+        .accessibilityLabel("Delete line")
+        .accessibilityIdentifier("liveTranscript.deleteLine")
     }
 }
 
