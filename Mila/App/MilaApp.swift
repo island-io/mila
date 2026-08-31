@@ -704,8 +704,8 @@ struct MilaApp: App {
             case .named(let names): liveDiar?.forgetSeededProfiles(named: names)
             }
         }
-        actions.onRecordingFinalized = { [assigner] recordingID in
-            assigner.finish(recording: recordingID)
+        actions.onRecordingFinalized = { [assigner] recordingID, liveSpeakerNames in
+            assigner.finish(recording: recordingID, liveSpeakerNames: liveSpeakerNames)
         }
         // Save a voice profile when a speaker is named — if the live
         // diarizer observed that speaker *in that recording*, persist it.
