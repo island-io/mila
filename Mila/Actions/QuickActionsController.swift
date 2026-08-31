@@ -600,6 +600,10 @@ final class QuickActionsController: ObservableObject {
             // over either way, so its notes must not carry into the next
             // recording.
             liveAISettings?.meetingContext = ""
+            // Same one-shot rule as the successful path: a failed stop
+            // must not leave title/folder selected for the next recording.
+            nextRecordingTitle = ""
+            nextRecordingFolder = nil
             liveSidecarWriter?.finish(recordingID: nil)
             isFinalizingRecording = false
             activeJob = .none

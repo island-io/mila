@@ -171,6 +171,20 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertEqual(stored.title, "Weekly Sync")
     }
 
+    /// `session.stop()` returning nil never reaches the successful-path
+    /// clear, so title/folder would otherwise stick for the next recording.
+    func test_failed_stop_clears_nextRecording_title_and_folder() async {
+        controller.nextRecordingFolder = "Work"
+        controller.nextRecordingTitle = "Weekly Sync"
+        XCTAssertFalse(controller.isRecording)
+
+        await controller.stopRecording()
+
+        XCTAssertNil(controller.nextRecordingFolder)
+        XCTAssertEqual(controller.nextRecordingTitle, "")
+        XCTAssertTrue(store.recordings.isEmpty)
+    }
+
     /// A folder name that isn't already in the store list still gets
     /// registered via assign (new folder / case-insensitive match).
     func test_stopRecording_registers_a_brand_new_folder() async throws {
