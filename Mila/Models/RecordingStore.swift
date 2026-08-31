@@ -877,14 +877,6 @@ final class RecordingStore: ObservableObject {
         return ids
     }
 
-    /// Crash recovery: scan the recordings directory for `.wav` files that
-    /// no Recording in the store points at. Each orphan was a recording in
-    /// progress when the app died — the audio is on disk (AVAudioFile
-    /// writes WAV frames incrementally), the metadata was never persisted.
-    /// Re-attach those files with `.pending` status so the user sees them
-    /// in the list and so the launch-time recovery sweep can enqueue them
-    /// for transcription. Returns the list of newly-added recordings so
-    /// the caller can decide whether to re-persist.
     /// Size of a WAV that captured nothing. `AVAudioFile` reserves a 4 KB
     /// header block on open, so a recording that never received a frame is
     /// exactly this big — not the 44 bytes a raw WAV header would suggest.
@@ -893,6 +885,14 @@ final class RecordingStore: ObservableObject {
     /// transcribed to nothing and settled at `.failed`.
     static let emptyWAVByteCount = 4096
 
+    /// Crash recovery: scan the recordings directory for `.wav` files that
+    /// no Recording in the store points at. Each orphan was a recording in
+    /// progress when the app died — the audio is on disk (AVAudioFile
+    /// writes WAV frames incrementally), the metadata was never persisted.
+    /// Re-attach those files with `.pending` status so the user sees them
+    /// in the list and so the launch-time recovery sweep can enqueue them
+    /// for transcription. Returns the list of newly-added recordings so
+    /// the caller can decide whether to re-persist.
     @discardableResult
     private func recoverOrphanRecordings() -> [Recording] {
         let referenced = Set(recordings.map { $0.audioFileName })
