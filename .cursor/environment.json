@@ -1,0 +1,4 @@
+{
+  "name": "Mila (Linux Swift packages)",
+  "install": "bash scripts/cloud-agent-setup.sh"
+}
