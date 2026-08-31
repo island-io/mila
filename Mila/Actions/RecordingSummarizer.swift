@@ -680,9 +680,11 @@ final class RecordingSummarizer: ObservableObject {
     /// falls back to the unmodified text, never to a failed parse.
     private static func unfencedBody(in trimmed: String) -> String? {
         guard let opening = trimmed.range(of: "```") else { return nil }
-        // Only a short label may precede the fence, and nothing but
-        // whitespace may follow its closer. Otherwise the backticks are far
-        // more likely part of the content than a wrapper around it.
+        // Only a short label may precede the fence. THIS guard is load-bearing
+        // and is the one restriction worth keeping: without it, a long prose
+        // summary that happens to quote a fenced JSON object would have that
+        // object substituted for it and then be blanked — losing a good
+        // summary, which is worse than showing a blob.
         guard trimmed[..<opening.lowerBound].count <= 80 else { return nil }
         let afterOpening = trimmed[opening.upperBound...]
         // Drop the info string (`json`) up to the end of the fence line.
@@ -690,12 +692,18 @@ final class RecordingSummarizer: ObservableObject {
         if let newline = afterOpening.firstIndex(of: "\n") {
             inner = afterOpening[afterOpening.index(after: newline)...]
         }
-        guard let closing = inner.range(of: "```"),
-              inner[closing.upperBound...]
-                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return nil }
-        return inner[..<closing.lowerBound]
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Neither a MISSING closer nor content after one is a veto. This
+        // function only ever offers a candidate; `envelopeBody` re-tests the
+        // original text when the candidate is not envelope-shaped, so being
+        // generous here cannot cost anything — whereas vetoing can, and did:
+        // an unclosed fence (the model stopped early) sent a labelled
+        // envelope to `.plain` as a raw blob, because a labelled envelope has
+        // no leading `{` to fall back on and `findFirstJSONStructure` gives up
+        // on the odd unescaped quote this whole path exists for.
+        if let closing = inner.range(of: "```") {
+            inner = inner[..<closing.lowerBound]
+        }
+        return inner.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// The envelope-shaped payload in `text`, or nil when this is prose that

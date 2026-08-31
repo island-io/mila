@@ -843,6 +843,45 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(parsed.items.map(\.text), ["Ship the retry change"])
     }
 
+    /// The unwrapper must never VETO, only offer. Two shapes proved that: a
+    /// fence the model never closed (it stopped early), and a fence followed
+    /// by a chatty sign-off. Both used to abort the unwrap, and a labelled
+    /// envelope has no leading `{` of its own to fall back on.
+    ///
+    /// Each payload carries an ODD number of unescaped quotes, which leaves
+    /// `findFirstJSONStructure`'s `inString` inverted so the balanced-block
+    /// search fails outright — exactly the malformed input this salvage path
+    /// exists for. The fence candidate is therefore the ONLY route to the
+    /// leading-`{` bypass, which is what makes these assertions discriminating
+    /// rather than incidentally true.
+    func test_parse_salvages_a_wrapped_envelope_when_the_fence_is_unclosed_or_trailed() {
+        let unclosed = #"""
+        Here is the summary:
+        ```json
+        {"summary": "He said "hi" and left, "items": []}
+        """#
+
+        let trailed = #"""
+        Here is the summary:
+        ```json
+        {"summary": "He said "hi" and left, "items": []}
+        ```
+        Hope that helps!
+        """#
+
+        for (shape, raw) in [("unclosed fence", unclosed), ("trailed fence", trailed)] {
+            let parsed = RecordingSummarizer.parseSummaryAndItems(from: raw)
+            XCTAssertEqual(parsed.origin, .salvagedEnvelope,
+                           "\(shape): must still reach the salvage")
+            XCTAssertFalse(parsed.summary.hasPrefix("{"),
+                           "\(shape): a raw blob must never be shown as the summary")
+            XCTAssertFalse(parsed.summary.contains("```"),
+                           "\(shape): fence scaffolding must not reach the summary")
+            XCTAssertTrue(parsed.summary.contains("He said"),
+                          "\(shape): got \(parsed.summary)")
+        }
+    }
+
     /// The counterweight to the test above, and the reason the fix is not
     /// simply "the output contains a `{`". A real summary may quote braces or
     /// a code block; blanking a GOOD summary is a worse outcome than showing
