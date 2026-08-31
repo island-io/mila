@@ -120,7 +120,15 @@ final class PostRecordingCoordinator: ObservableObject {
     /// the sheet is already showing a different recording the new one is
     /// dropped (we don't queue — concurrent voice memos are rare and a
     /// stack of sheets is worse UX than just naming the first one).
-    func present(_ recording: Recording) {
+    ///
+    /// `titleWasUserProvided` reports that the recording was saved under a
+    /// meeting name the user typed before / during recording. The background
+    /// auto-title job can only protect a user's title by comparing against the
+    /// default it expects to replace, and here that default IS the user's
+    /// title — so the guard cannot see the difference and the CLI suggestion
+    /// would overwrite the typed name. Skip the job entirely in that case; the
+    /// Suggest button in the sheet still offers it on demand.
+    func present(_ recording: Recording, titleWasUserProvided: Bool = false) {
         // UI-TEST: the record-while-finalizing E2E drives two back-to-back
         // recordings through the real `stopRecording`; a modal rename sheet
         // after each Stop would sit over Home and block the next Record tap
@@ -130,6 +138,7 @@ final class PostRecordingCoordinator: ObservableObject {
         if CommandLine.arguments.contains("--ui-test-finalize-regression") { return }
         guard pending == nil else { return }
         pending = recording
+        guard !titleWasUserProvided else { return }
         armAutoSuggestTitle(for: recording)
     }
 
