@@ -652,48 +652,75 @@ final class RecordingSummarizer: ObservableObject {
     /// Fences are the single most likely shape for an LLM to emit, so the
     /// promise held only for the tidiest case.
     ///
-    /// Deliberately NOT "contains a `{`": a legitimate prose summary can quote
-    /// braces, and blanking a good summary is a worse outcome than showing the
-    /// blob. The object must be what the output IS, not something it mentions
-    /// — so only a short single-line label may precede it and nothing but
-    /// whitespace may follow it.
+    /// Unwrapping is an OPTIMISTIC normalisation, judged separately from the
+    /// envelope/prose decision, and it must never be able to make the parse
+    /// worse than not having attempted it. So: if a fence is confidently
+    /// identifiable and what it wraps is envelope-shaped, that is the payload;
+    /// otherwise the ORIGINAL text is judged on its own merits. An
+    /// unrecognised wrapper — an over-long prefix, content after the closer,
+    /// no closer at all, or a shape neither of us has thought of — costs
+    /// nothing beyond the failed attempt.
+    ///
+    /// The first cut of this stripped the fence *before* the shape test and
+    /// returned nil when the wrapper looked wrong, which re-broke the very
+    /// case it was added for: a malformed envelope whose summary TEXT mentions
+    /// ```` ``` ```` (a meeting that discussed code) was hijacked by the fence
+    /// branch and aborted, though its leading `{` alone should have been
+    /// enough to salvage it.
     static func envelopeBody(in trimmed: String) -> String? {
-        var body = trimmed
-        // Unwrap a ``` / ```json fenced block. Matched wherever it starts, not
-        // just at position 0, because a chatty model puts a label line ahead
-        // of the fence — the commonest shape of all.
-        if let opening = body.range(of: "```") {
-            // Only a short label may precede the fence and nothing but
-            // whitespace may follow it; otherwise this is prose that quotes a
-            // code block, not an envelope in a wrapper.
-            guard body[..<opening.lowerBound].count <= 80 else { return nil }
-            let afterOpening = body[opening.upperBound...]
-            // Drop the info string (`json`) up to the end of the fence line.
-            var inner = afterOpening
-            if let newline = afterOpening.firstIndex(of: "\n") {
-                inner = afterOpening[afterOpening.index(after: newline)...]
-            }
-            if let closing = inner.range(of: "```") {
-                guard inner[closing.upperBound...]
-                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                else { return nil }
-                inner = inner[..<closing.lowerBound]
-            }
-            body = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let unwrapped = Self.unfencedBody(in: trimmed),
+           let body = Self.objectPayload(in: unwrapped) {
+            return body
         }
-        // The object IS the payload. Accepted without a balanced-block check,
-        // because the malformed input this path exists for can defeat the
-        // depth counter (an odd number of unescaped quotes leaves `inString`
-        // inverted) while `salvageSummaryValue` still reads the summary fine.
-        if body.hasPrefix("{") { return body }
-        guard let range = LiveAISession.findFirstJSONStructure(
-            in: body, opening: "{", closing: "}"
-        ) else { return nil }
-        guard body[..<range.lowerBound].count <= 80,
-              body[range.upperBound...]
+        return Self.objectPayload(in: trimmed)
+    }
+
+    /// The contents of a ``` / ```json fenced block. Nil means only "no
+    /// wrapper I can be confident about" — NOT "not an envelope"; the caller
+    /// falls back to the unmodified text, never to a failed parse.
+    private static func unfencedBody(in trimmed: String) -> String? {
+        guard let opening = trimmed.range(of: "```") else { return nil }
+        // Only a short label may precede the fence, and nothing but
+        // whitespace may follow its closer. Otherwise the backticks are far
+        // more likely part of the content than a wrapper around it.
+        guard trimmed[..<opening.lowerBound].count <= 80 else { return nil }
+        let afterOpening = trimmed[opening.upperBound...]
+        // Drop the info string (`json`) up to the end of the fence line.
+        var inner = afterOpening
+        if let newline = afterOpening.firstIndex(of: "\n") {
+            inner = afterOpening[afterOpening.index(after: newline)...]
+        }
+        guard let closing = inner.range(of: "```"),
+              inner[closing.upperBound...]
                 .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else { return nil }
-        return String(body[range])
+        return inner[..<closing.lowerBound]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The envelope-shaped payload in `text`, or nil when this is prose that
+    /// merely MENTIONS a brace block. This nil IS the envelope/prose
+    /// discriminator `parseSummaryAndItems` needs, which is why it cannot
+    /// simply fail open: accepting everything would route every plain-prose
+    /// summary into the salvage branch and blank it.
+    ///
+    /// Deliberately not "contains a `{`": a real summary can quote braces, and
+    /// blanking a GOOD summary is a worse outcome than showing a blob. The
+    /// object must be what the text IS, not something it mentions.
+    private static func objectPayload(in text: String) -> String? {
+        // A leading `{` is accepted without the balanced-block check, because
+        // the malformed input this path exists for can defeat the depth
+        // counter (an odd number of unescaped quotes leaves `inString`
+        // inverted) while `salvageSummaryValue` reads the summary fine.
+        if text.hasPrefix("{") { return text }
+        guard let range = LiveAISession.findFirstJSONStructure(
+            in: text, opening: "{", closing: "}"
+        ) else { return nil }
+        guard text[..<range.lowerBound].count <= 80,
+              text[range.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return String(text[range])
     }
 
     /// Which branch of `parseSummaryAndItems` produced the result. Logged so

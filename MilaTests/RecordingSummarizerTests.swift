@@ -819,6 +819,30 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(labelledParse.summary, "A \"quoted\" thing.")
     }
 
+    /// The wrapper-stripper must never ABORT the salvage. A malformed
+    /// envelope whose summary text mentions ```` ``` ```` — a meeting that
+    /// discussed code — has backticks that are content, not a wrapper, and the
+    /// first cut of the fence handling let that hijack the parse: it stripped
+    /// before the shape test and bailed when the wrapper looked wrong, so this
+    /// landed in `.plain` as a raw blob even though the leading `{` alone was
+    /// always enough to salvage it. Unwrapping is optimistic; when it cannot
+    /// identify a wrapper the original text is judged on its own merits.
+    func test_parse_salvages_a_malformed_envelope_whose_summary_mentions_backticks() {
+        let malformed = #"{"summary": "The team reviewed the ```retry``` helper and called it "fine".", "items": [{"id": "a", "text": "Ship the retry change", "source": "inferred"}]}"#
+
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: malformed)
+
+        XCTAssertEqual(parsed.origin, .salvagedEnvelope,
+                       "backticks in the summary TEXT must not abort the salvage")
+        XCTAssertFalse(parsed.summary.hasPrefix("{"),
+                       "a raw JSON blob must never be shown as the summary")
+        XCTAssertTrue(parsed.summary.contains("```retry```"),
+                      "the backticks are part of the summary; got \(parsed.summary)")
+        XCTAssertFalse(parsed.summary.contains("\"items\""),
+                       "the items scaffolding must not leak into the summary")
+        XCTAssertEqual(parsed.items.map(\.text), ["Ship the retry change"])
+    }
+
     /// The counterweight to the test above, and the reason the fix is not
     /// simply "the output contains a `{`". A real summary may quote braces or
     /// a code block; blanking a GOOD summary is a worse outcome than showing
@@ -989,6 +1013,36 @@ final class RecordingSummarizerTests: XCTestCase {
         let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertNil(updated.summary,
                      "a fenced blob must not be stored; got \(updated.summary ?? "nil")")
+        XCTAssertTrue(summarizer.shouldSummarize(updated),
+                      "and the retry gate must actually still be open")
+    }
+
+    /// End-to-end proof that the CLASS is closed, not one instance of it: an
+    /// unreadable object whose text mentions ```` ``` ```` is the shape the
+    /// fence-stripper used to abort on, and aborting stored the blob and shut
+    /// the retry gate. Whatever the stripper makes of a wrapper, the pipeline
+    /// must end up no worse than if it had never tried.
+    func test_summarize_never_stores_a_blob_whose_text_mentions_backticks() async throws {
+        llm.tool = .claude
+        let blob = #"{"resumen": "hablamos del helper ```retry```", "items": []}"#
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in blob }
+
+        let audioURL = store.freshAudioURL(suggestedName: "BacktickBlob")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "BacktickBlob",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertNil(updated.summary,
+                     "a blob must not be stored; got \(updated.summary ?? "nil")")
         XCTAssertTrue(summarizer.shouldSummarize(updated),
                       "and the retry gate must actually still be open")
     }
