@@ -212,6 +212,14 @@ struct RenameRecordingSheet: View {
         // Drop the previous pick so applyFolder() cannot file the new
         // recording under the last one.
         .onChange(of: initialRecording.id) { _, _ in
+            // `title` has exactly the same exposure as the folder below, and
+            // is the worse half to get wrong: with `userEditedTitle` left true
+            // from the previous presentation, both mirrors (`onAppear` and
+            // `onChange(of: liveRecording.title)`) stay gated off, so `save()`
+            // writes the PREVIOUS recording's name onto this one. (CodeRabbit
+            // on #230.)
+            userEditedTitle = false
+            title = liveRecording.title
             userEditedFolder = false
             selectedFolder = liveRecording.folder
         }

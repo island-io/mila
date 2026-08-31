@@ -167,7 +167,7 @@ final class QuickActionsControllerTests: XCTestCase {
                      "nextRecordingFolder must reset after save")
         XCTAssertEqual(controller.nextRecordingTitle, "",
                        "nextRecordingTitle must reset after save")
-        let stored = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        let stored = try XCTUnwrap(savedRecording(for: url))
         XCTAssertEqual(stored.folder, "Work")
         XCTAssertEqual(stored.title, "Weekly Sync")
     }
@@ -200,7 +200,7 @@ final class QuickActionsControllerTests: XCTestCase {
         await controller.awaitFinalizeTails()
 
         XCTAssertTrue(store.folders.contains("Brand New"))
-        let stored = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        let stored = try XCTUnwrap(savedRecording(for: url))
         XCTAssertEqual(stored.folder, "Brand New")
     }
 
@@ -240,7 +240,7 @@ final class QuickActionsControllerTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
 
         XCTAssertEqual(callCount, 0, "the auto-title CLI must not run for a user-named recording")
-        let stored = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        let stored = try XCTUnwrap(savedRecording(for: url))
         XCTAssertEqual(stored.title, "Weekly Sync")
     }
 
