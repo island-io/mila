@@ -269,13 +269,39 @@ final class LogPrivacyRedactionTests: XCTestCase {
                        "title leaked once the concrete type was erased")
     }
 
-    /// A cancellation or a decode failure reaches the same catch blocks and
-    /// must still read normally.
-    func test_diarizer_logMessage_passes_through_other_errors() {
-        let thrown: Error = CocoaError(.fileNoSuchFile)
+    /// The decode failure that reaches the same catch blocks. `diarize` sends
+    /// every non-WAV recording through `AudioCompressor.decodeToTempWAV`, so an
+    /// unreadable `.m4a` in the user-chosen recordings folder surfaces here as
+    /// a bare Cocoa file error — and Cocoa's sentence for that names the file
+    /// and its folder. This assertion fails against the previous
+    /// `localizedDescription` fallback, which published it.
+    func test_diarizer_logMessage_withholds_a_bare_file_error() {
+        let thrown: Error = NSError(
+            domain: NSCocoaErrorDomain,
+            code: NSFileReadNoSuchFileError,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "The file “Q3 board offsite.m4a” couldn’t be opened because "
+                    + "there is no such file.",
+                NSFilePathErrorKey: "/Users/x/Audio Notes/Q3 board offsite.m4a"
+            ]
+        )
 
-        XCTAssertEqual(SpeakerDiarizer.Error.logMessage(for: thrown),
-                       thrown.localizedDescription)
+        let logged = SpeakerDiarizer.Error.logMessage(for: thrown)
+
+        XCTAssertFalse(logged.contains("Q3 board offsite"),
+                       "the recording title reached a public log field")
+        XCTAssertFalse(logged.contains("Audio Notes"),
+                       "the user-chosen recordings folder reached a public log field")
+        XCTAssertEqual(logged, "unexpected error [\(NSCocoaErrorDomain) \(NSFileReadNoSuchFileError)]",
+                       "domain + code should survive so the failure stays diagnosable")
+    }
+
+    /// Cancellation is the common non-error arrival at that same fallback, and
+    /// it must still read as itself rather than as a bare domain/code pair.
+    func test_diarizer_logMessage_names_cancellation() {
+        XCTAssertEqual(SpeakerDiarizer.Error.logMessage(for: CancellationError()),
+                       "diarization cancelled")
     }
 
     // MARK: - #213: RemoteWhisperEngine.RemoteError.http

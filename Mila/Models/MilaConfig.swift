@@ -123,8 +123,10 @@ extension MilaConfig {
         /// where the concrete type is still unknown — `MilaConfigImporter`
         /// catches `Error`.
         ///
-        /// The fallback is deliberately **not** `localizedDescription`, unlike
-        /// the LLM and diarizer helpers. `load(from:)` only ever throws
+        /// The fallback is deliberately **not** `localizedDescription`, as in
+        /// `SpeakerDiarizer.Error.logMessage(for:)` and unlike the LLM helper —
+        /// whose fallback stays a pass-through because nothing on that path
+        /// opens a file the user named. `load(from:)` only ever throws
         /// `LoadError`, so anything else arriving here came from the
         /// surrounding file-open path (the security-scope dance, a future
         /// caller) — which is exactly the shape that quotes the user's path.

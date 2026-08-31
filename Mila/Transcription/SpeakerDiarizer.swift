@@ -72,9 +72,28 @@ enum SpeakerDiarizer {
         /// The log-safe message for any error a diarization call can throw —
         /// applied where the concrete type is still unknown, since callers
         /// catch `Error` and a cancellation or a decode failure lands here too.
+        ///
+        /// The fallback is deliberately **not** `localizedDescription`, for the
+        /// same reason as `MilaConfig.LoadError.logMessage(for:)`: `diarize` is
+        /// a file-open path. Any recording that is not already a WAV goes
+        /// through `AudioCompressor.decodeToTempWAV`, so an
+        /// `AVAudioFile(forReading:)` failure on a title-derived `.m4a` in the
+        /// user-chosen recordings folder arrives here as a plain `NSError` —
+        /// the shape Cocoa fills with the file's name and its containing
+        /// folder. Passing it through undid the redaction the two
+        /// `SpeakerDiarizer.Error` cases above had just applied, at the same
+        /// two `.public` log fields. Domain + code keep it diagnosable without
+        /// guessing. (Issue #213, CWE-532.)
+        ///
+        /// Cancellation is named explicitly because it is the common non-error
+        /// arrival here and carries nothing worth withholding — a bare
+        /// `[Swift.CancellationError 1]` would be the over-redaction
+        /// `bugbot-rules/no-user-content-in-logs.md` warns about.
         static func logMessage(for error: Swift.Error) -> String {
             if let diarError = error as? SpeakerDiarizer.Error { return diarError.logDescription }
-            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            if error is CancellationError { return "diarization cancelled" }
+            let ns = error as NSError
+            return "unexpected error [\(ns.domain) \(ns.code)]"
         }
     }
 
