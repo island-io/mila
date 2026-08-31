@@ -1728,7 +1728,14 @@ private struct AIFeaturesSettingsTab: View {
                     AIPromptEditor(title: "Summary prompt",
                                    text: $liveAI.summaryPrompt,
                                    defaultText: LiveAISettings.defaultSummaryPrompt,
-                                   caption: "Sent with the full transcript. `{{LANGUAGE}}` becomes the output language above.",
+                                   // The editor governs the SUMMARY only.
+                                   // `RecordingSummarizer.promptWithActionItems`
+                                   // appends the action-items request at send
+                                   // time, so say so here rather than letting a
+                                   // user wonder where the extra list came
+                                   // from — or delete it from their own prompt
+                                   // and find it still arriving.
+                                   caption: "Sent with the full transcript. Mila also asks for the action items alongside it. `{{LANGUAGE}}` becomes the output language above.",
                                    isEnabled: settings.summaryEnabled)
                 }
                 Divider()

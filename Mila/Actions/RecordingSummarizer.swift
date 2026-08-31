@@ -373,8 +373,15 @@ final class RecordingSummarizer: ObservableObject {
                 return "Hebrew"
             }
         }()
-        let prompt = liveAISettings.summaryPrompt
+        let basePrompt = liveAISettings.summaryPrompt
             .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
+        // Wrap the user's plain-text summary prompt so the one-shot call
+        // also returns action items. Restores the summary + action-items
+        // pair the pre-#87 inline final Live-AI tick used to produce. See
+        // `promptWithActionItems`: the summary stays PLAIN TEXT and only a
+        // compact item array is JSON, so a long multi-line Hebrew summary
+        // full of quotes can't corrupt the parse.
+        let prompt = Self.promptWithActionItems(base: basePrompt)
         let transcript = recording.fullText
         let timeout = timeoutSeconds
         // OpenAI-compatible config captured up front so the detached call
@@ -425,9 +432,23 @@ final class RecordingSummarizer: ObservableObject {
                     false,
                     nil
                 )
-                let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !cleaned.isEmpty else {
-                    summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): empty CLI output")
+                // Split the CLI output into the plain-text summary and the
+                // action-items list. `parseSummaryAndItems` handles the
+                // sentinel format the prompt asks for, tolerates a model
+                // that returned a JSON envelope instead, and — crucially —
+                // never surfaces a raw `{...}` blob as the summary when the
+                // model emits malformed JSON (unescaped quotes / newlines in
+                // a long summary value, which broke the object decode).
+                let (summaryText, parsedItems, origin) = Self.parseSummaryAndItems(from: raw)
+                guard !summaryText.isEmpty else {
+                    // `origin` distinguishes "the CLI printed nothing" from
+                    // "the CLI printed a JSON object we could not read a
+                    // summary out of" — two very different diagnoses that
+                    // used to log identically. It is a fixed keyword, never
+                    // the model's text: summary output is derived from the
+                    // transcript and is user content, so it must not reach a
+                    // `.public` log field (`bugbot-rules/no-user-content-in-logs.md`).
+                    summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): no summary parsed origin=\(origin.rawValue, privacy: .public) output=\(raw.count, privacy: .public)c")
                     // No summary landed — let a pending export fall back to
                     // the transcript rather than waiting forever. Skip the
                     // signal entirely if the recording went away mid-flight.
@@ -454,10 +475,20 @@ final class RecordingSummarizer: ObservableObject {
                     self.onSummaryFinished?(current)
                     return
                 }
-                current.summary = cleaned
+                current.summary = summaryText
+                // Replace the recording's action items with the fresh
+                // full-transcript set whenever the model returned any — but
+                // never at the cost of an item the user DICTATED out loud.
+                // An empty list is treated as "keep what's there" so a
+                // glitchy empty response can't wipe the rolling live snapshot
+                // a Live-AI recording already captured at stop.
+                if !parsedItems.isEmpty {
+                    current.actionItems = Self.merged(fresh: parsedItems,
+                                                      keepingDictatedFrom: current.actionItems ?? [])
+                }
                 self.store.update(current)
                 let elapsedMs = Int(Date().timeIntervalSince(startedAt) * 1000)
-                summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) length=\(cleaned.count, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
+                summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) origin=\(origin.rawValue, privacy: .public) length=\(summaryText.count, privacy: .public) items=\(current.actionItems?.count ?? 0, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
                 self.onSummaryFinished?(current)
             } catch {
                 // `logMessage(for:)`, not `localizedDescription`: this catches
@@ -513,6 +544,339 @@ final class RecordingSummarizer: ObservableObject {
 
     private func shortID(_ id: UUID) -> String {
         String(id.uuidString.prefix(8))
+    }
+
+    /// Marker the one-shot prompt asks the model to place between the
+    /// plain-text summary and the JSON action-items array. Keeping the
+    /// summary OUTSIDE any JSON is deliberate: LLMs routinely emit long,
+    /// multi-line summaries with unescaped quotes/newlines, which makes an
+    /// enclosing JSON object un-decodable. Only the compact item array — far
+    /// less prone to stray quotes — needs to be valid JSON.
+    static let actionItemsSentinel = "###ACTION_ITEMS###"
+
+    /// Wrap the user's plain-text summary prompt so the one-shot call also
+    /// returns action items, WITHOUT embedding the summary in JSON. The
+    /// user's `summaryPrompt` still drives the summary's content and style
+    /// (including its `{{LANGUAGE}}` directive); this only appends the
+    /// output-format + action-item contract. Building the request here rather
+    /// than baking it into the persisted `summaryPrompt` means a user's
+    /// customised prompt keeps working and no persisted-default migration is
+    /// needed.
+    static func promptWithActionItems(base: String) -> String {
+        """
+        \(base)
+
+        After the summary, list the action items. Format your ENTIRE response \
+        exactly like this — the plain-text summary first, then the marker on \
+        its own line, then a JSON array:
+
+        <the summary as plain text>
+        \(actionItemsSentinel)
+        [{"id": "stable-slug", "text": "...", "source": "inferred"}]
+
+        Write the summary as plain text — do NOT wrap it in JSON or quotes. \
+        Output the marker \(actionItemsSentinel) verbatim on its own line, then \
+        ONLY the JSON array and nothing after it. An action item is a concrete \
+        task someone committed to do (with or without a deadline) or an \
+        explicit follow-up or request. If there are none, output an empty \
+        array: []
+        """
+    }
+
+    /// Split raw CLI output into `(summary, items, origin)`, where `origin`
+    /// names the branch that produced it so the tolerant paths are loggable.
+    ///
+    /// Resolution order, most-trusted first:
+    ///   1. Sentinel format (what `promptWithActionItems` asks for): plain
+    ///      summary before `actionItemsSentinel`, JSON array after it.
+    ///   2. A JSON envelope `{"summary":...,"items":[...]}` the model may have
+    ///      returned out of habit — decoded via `LiveAISession.parseEnvelope`.
+    ///   3. Malformed JSON that LOOKS like an envelope (the failure the user
+    ///      hit: unescaped quotes broke the object decode) — bare, inside
+    ///      ```` ```json ```` fences, or behind a one-line label, since
+    ///      `parseEnvelope` accepts all three. Salvage the summary text so a
+    ///      raw `{...}` blob is never shown, and keep any items the lenient
+    ///      array parse recovered.
+    ///   4. Plain prose — the whole output is the summary, no items.
+    ///
+    /// A JSON object that reaches step 3 and yields nothing readable returns
+    /// an EMPTY summary rather than the blob — see `unreadableEnvelope`.
+    static func parseSummaryAndItems(
+        from raw: String
+    ) -> (summary: String, items: [ActionItem], origin: SummaryParseOrigin) {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let sentinel = trimmed.range(of: actionItemsSentinel) {
+            let summary = String(trimmed[..<sentinel.lowerBound])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let items = LiveAISession.parseActionItems(from: String(trimmed[sentinel.upperBound...]))
+            return (summary, items, .sentinel)
+        }
+        // No sentinel — the model returned a JSON envelope (or prose).
+        let parsed = LiveAISession.parseEnvelope(from: trimmed)
+        if !parsed.summary.isEmpty {
+            return (parsed.summary, parsed.items, .envelope)
+        }
+        // Object decode produced no summary. If the output still IS an
+        // envelope — bare, fenced, or behind a label — salvage the summary
+        // value rather than surfacing the blob.
+        if let envelope = Self.envelopeBody(in: trimmed) {
+            let salvaged = Self.salvageSummaryValue(from: envelope)
+            if !salvaged.isEmpty {
+                return (salvaged, parsed.items, .salvagedEnvelope)
+            }
+            // A JSON object we cannot read a summary out of at all (no
+            // `"summary"` key, or an empty one). Storing it verbatim is the
+            // exact bug this fix exists to remove, and doing so is
+            // self-perpetuating: a stored blob satisfies `shouldSummarize`'s
+            // "already has a summary" gate, so the recording would never be
+            // retried and the blob would be what the detail view, the Obsidian
+            // note and the MCP surface all report forever. Report NO summary
+            // instead — logged with this origin at the call site, exported as
+            // the transcript fallback, and still picked up by the next
+            // `backfillIfNeeded` sweep. That is the same treatment empty CLI
+            // output has always had (`test_summarize_drops_empty_output`), so
+            // it is an established shape rather than a new one. Items the
+            // lenient array parse recovered are still returned.
+            return ("", parsed.items, .unreadableEnvelope)
+        }
+        // Genuine prose. Items stay empty: every shape from which the lenient
+        // parse can actually recover an items array is an envelope, and those
+        // now route through the branch above instead of falling to here.
+        return (trimmed, [], .plain)
+    }
+
+    /// The envelope-shaped payload inside the wrappers
+    /// `LiveAISession.parseEnvelope` accepts — a ```` ```json ```` fence, or a
+    /// one-line "Here is the JSON:" label — or nil when the output is prose
+    /// that merely CONTAINS a brace.
+    ///
+    /// Why this exists: the salvage and `unreadableEnvelope` branches were
+    /// gated on `trimmed.hasPrefix("{")`, but `parseEnvelope` does not require
+    /// its object to be at position 0 — it plucks the first balanced block out
+    /// of the string (`findFirstJSONStructure`) precisely because "the CLI
+    /// occasionally wraps output in prose or ```json fences". A fenced or
+    /// prefixed BROKEN envelope therefore failed the object decode *and* the
+    /// prefix test and landed in `.plain`, which stores the raw blob as the
+    /// summary — the exact bug this fix exists to remove, and the
+    /// self-perpetuating one, since a stored blob satisfies
+    /// `shouldSummarize`'s "already has a summary" gate and is never retried.
+    /// Fences are the single most likely shape for an LLM to emit, so the
+    /// promise held only for the tidiest case.
+    ///
+    /// Unwrapping is an OPTIMISTIC normalisation, judged separately from the
+    /// envelope/prose decision, and it must never be able to make the parse
+    /// worse than not having attempted it. So: if a fence is confidently
+    /// identifiable and what it wraps is envelope-shaped, that is the payload;
+    /// otherwise the ORIGINAL text is judged on its own merits. An
+    /// unrecognised wrapper — an over-long label, quoted material rather than
+    /// a wrapper, or a shape nobody enumerated — costs nothing beyond the
+    /// failed attempt.
+    ///
+    /// The reverse is NOT symmetric, which is the trap this went through
+    /// twice: unwrapping too eagerly is not free. A candidate that is
+    /// object-shaped but carries no `"summary"` gets BLANKED as
+    /// `unreadableEnvelope`, so substituting a quoted config snippet for a
+    /// real prose summary destroys it. Hence `unfencedBody` still refuses the
+    /// cases where the block is plainly quoted material.
+    ///
+    /// The first cut of this stripped the fence *before* the shape test and
+    /// returned nil when the wrapper looked wrong, which re-broke the very
+    /// case it was added for: a malformed envelope whose summary TEXT mentions
+    /// ```` ``` ```` (a meeting that discussed code) was hijacked by the fence
+    /// branch and aborted, though its leading `{` alone should have been
+    /// enough to salvage it.
+    static func envelopeBody(in trimmed: String) -> String? {
+        if let unwrapped = Self.unfencedBody(in: trimmed),
+           let body = Self.objectPayload(in: unwrapped) {
+            return body
+        }
+        return Self.objectPayload(in: trimmed)
+    }
+
+    /// The contents of a ``` / ```json fenced block. Nil means only "no
+    /// wrapper I can be confident about" — NOT "not an envelope"; the caller
+    /// falls back to the unmodified text, never to a failed parse.
+    private static func unfencedBody(in trimmed: String) -> String? {
+        guard let opening = Self.lineLeadingFence(in: trimmed, from: trimmed.startIndex)
+        else { return nil }
+        // Only a short label may precede the fence. Without this, a long prose
+        // summary that quotes a fenced JSON object would have that object
+        // substituted for it and then be blanked — losing a good summary,
+        // which is worse than showing a blob.
+        guard trimmed[..<opening.lowerBound].count <= 80 else { return nil }
+        let afterOpening = trimmed[opening.upperBound...]
+        // Drop the info string (`json`) up to the end of the fence line.
+        var inner = afterOpening
+        if let newline = afterOpening.firstIndex(of: "\n") {
+            inner = afterOpening[afterOpening.index(after: newline)...]
+        }
+        if let closing = Self.lineLeadingFence(in: trimmed, from: inner.startIndex) {
+            // Content after the closer means the block is material QUOTED
+            // INSIDE a larger prose summary, not a wrapper around the whole
+            // output. Taking the block would substitute a config snippet for
+            // the summary and then blank it, discarding the real prose either
+            // side. So this stays a veto, and the caller judges the original.
+            guard trimmed[closing.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            inner = trimmed[inner.startIndex..<closing.lowerBound]
+        }
+        // A MISSING closer, by contrast, is not a veto: the model simply
+        // stopped early, there is no trailing prose to lose, and what follows
+        // the opener is still the best candidate.
+        return inner.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The next ```` ``` ```` that BEGINS A LINE, at or after `from`.
+    ///
+    /// A fence delimits a block only at the start of a line. Backticks in the
+    /// middle of one are content — a summary quoting `` `code` `` — and must
+    /// neither open a block nor close one. Matching them anywhere let an inner
+    /// run masquerade as the closer, which truncated the candidate mid-value
+    /// and produced a short, plausible-looking WRONG summary: worse than the
+    /// blob, because nothing about it looks broken.
+    private static func lineLeadingFence(
+        in text: String, from start: String.Index
+    ) -> Range<String.Index>? {
+        var searchStart = start
+        while let candidate = text.range(of: "```", range: searchStart..<text.endIndex) {
+            if candidate.lowerBound == text.startIndex
+                || text[text.index(before: candidate.lowerBound)] == "\n" {
+                return candidate
+            }
+            searchStart = candidate.upperBound
+        }
+        return nil
+    }
+
+    /// The envelope-shaped payload in `text`, or nil when this is prose that
+    /// merely MENTIONS a brace block. This nil IS the envelope/prose
+    /// discriminator `parseSummaryAndItems` needs, which is why it cannot
+    /// simply fail open: accepting everything would route every plain-prose
+    /// summary into the salvage branch and blank it.
+    ///
+    /// Deliberately not "contains a `{`": a real summary can quote braces, and
+    /// blanking a GOOD summary is a worse outcome than showing a blob. The
+    /// object must be what the text IS, not something it mentions.
+    private static func objectPayload(in text: String) -> String? {
+        // A leading `{` is accepted without the balanced-block check, because
+        // the malformed input this path exists for can defeat the depth
+        // counter (an odd number of unescaped quotes leaves `inString`
+        // inverted) while `salvageSummaryValue` reads the summary fine.
+        if text.hasPrefix("{") { return text }
+        guard let range = LiveAISession.findFirstJSONStructure(
+            in: text, opening: "{", closing: "}"
+        ) else { return nil }
+        guard text[..<range.lowerBound].count <= 80,
+              text[range.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return String(text[range])
+    }
+
+    /// Which branch of `parseSummaryAndItems` produced the result. Logged so
+    /// the tolerant paths are VISIBLE — a model that quietly ignores the
+    /// output contract on every call should be diagnosable from Console
+    /// instead of hiding behind a summary that looks fine.
+    ///
+    /// A fixed keyword, deliberately: the model's output is derived from the
+    /// user's transcript and is user content, so it must never reach a
+    /// `.public` log field (`bugbot-rules/no-user-content-in-logs.md`). This
+    /// records WHICH SHAPE arrived, never what it said.
+    enum SummaryParseOrigin: String {
+        /// The sentinel format `promptWithActionItems` asks for.
+        case sentinel
+        /// A decodable `{"summary":…,"items":[…]}` envelope.
+        case envelope
+        /// A broken envelope whose summary value was recovered textually.
+        case salvagedEnvelope = "salvaged-envelope"
+        /// Plain prose — the whole output is the summary.
+        case plain
+        /// A JSON object with no readable summary. Yields no summary at all.
+        case unreadableEnvelope = "unreadable-envelope"
+    }
+
+    /// Fold the fresh full-transcript items into what the recording already
+    /// has, keeping every item the user DICTATED (`source == .voiceCommand`,
+    /// i.e. "Mila, action item: …") ahead of the model's inferred set.
+    ///
+    /// Why this is not a plain replace: for a Live-AI recording,
+    /// `QuickActionsController` snapshots the live list — voice-command items
+    /// included — onto the recording at stop and then immediately calls
+    /// `regenerate`. The one-shot prompt is not shown the existing list and
+    /// only ever asks for `source: "inferred"`, so a wholesale replace would
+    /// trade an item the user said out loud for the model's guess at it, or
+    /// lose it entirely. `ActionItem.source` is also mirrored all the way out
+    /// to the MCP surface precisely so a client can tell a spoken commitment
+    /// from an inferred one (see `MilaKit.StoredRecording.ActionItem.source`),
+    /// which is the answer this would have degraded.
+    ///
+    /// Fresh items are deduped by id and by normalised text — the model
+    /// re-derives a dictated task from the transcript under a new id, and it
+    /// also duplicates ids outright, which the live path already guards
+    /// against ("LLM duplicated an id; keep first" in
+    /// `LiveAISession.applyResponse`).
+    static func merged(fresh: [ActionItem],
+                       keepingDictatedFrom existing: [ActionItem]) -> [ActionItem] {
+        let dictated = existing.filter { $0.source == .voiceCommand }
+        var seenIDs = Set(dictated.map(\.id))
+        var seenTexts = Set(dictated.map { Self.dedupKey($0.text) })
+        var result = dictated
+        for item in fresh {
+            let textKey = Self.dedupKey(item.text)
+            guard !seenIDs.contains(item.id), !seenTexts.contains(textKey) else { continue }
+            seenIDs.insert(item.id)
+            seenTexts.insert(textKey)
+            result.append(item)
+        }
+        return result
+    }
+
+    /// Normalised form used only to spot "the model re-emitted this dictated
+    /// item under a different id": trimmed, case-folded, inner whitespace
+    /// collapsed. Never persisted or displayed.
+    private static func dedupKey(_ text: String) -> String {
+        text.lowercased()
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
+    /// Best-effort extraction of the `"summary"` value from a JSON string the
+    /// decoder rejected (typically because the value itself contains
+    /// unescaped `"`). Anchors on the structural `"items"` key that follows
+    /// the summary value, so quotes INSIDE the summary don't cut it short,
+    /// then un-escapes the common JSON escapes so `\n` renders as newlines.
+    static func salvageSummaryValue(from json: String) -> String {
+        guard let keyRange = json.range(of: "\"summary\"") else { return "" }
+        let afterKey = json[keyRange.upperBound...]
+        guard let colon = afterKey.firstIndex(of: ":") else { return "" }
+        let afterColon = afterKey[afterKey.index(after: colon)...]
+        guard let openQuote = afterColon.firstIndex(of: "\"") else { return "" }
+        let valueStart = afterColon.index(after: openQuote)
+        let rest = afterColon[valueStart...]
+        let endIdx: Substring.Index
+        // Find the `"items"` KEY, then walk back to the last quote before it:
+        // that quote is the summary value's terminator whatever separates the
+        // two. Matching the separator literally (`", "items"` / `","items"`)
+        // only covered compact output — a pretty-printed malformed envelope
+        // (`",\n  "items"`, which is what a CLI emitting multi-line JSON
+        // produces) fell through to `lastIndex(of:)` and dragged the entire
+        // items array into the summary, i.e. exactly the scaffolding leak
+        // this function exists to prevent.
+        if let itemsKey = rest.range(of: "\"items\"") {
+            let head = rest[..<itemsKey.lowerBound]
+            endIdx = head.lastIndex(of: "\"") ?? itemsKey.lowerBound
+        } else if let lastQuote = rest.lastIndex(of: "\"") {
+            endIdx = lastQuote
+        } else {
+            endIdx = rest.endIndex
+        }
+        let value = String(rest[..<endIdx])
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\t", with: "\t")
+            .replacingOccurrences(of: "\\\"", with: "\"")
+            .replacingOccurrences(of: "\\/", with: "/")
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     /// The freshest copy of a recording from the store, or `fallback` when
