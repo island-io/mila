@@ -61,6 +61,100 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// Mid-recording copy button: `clipboardText` must match the detail
+    /// view's copy format — the plain fullText join while nobody is
+    /// labelled, speaker-prefixed turns once live diarization kicks in.
+    func test_clipboardText_matches_detail_copy_format() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "hello"),
+            TranscriptSegment(start: 2, end: 3, text: "hi there")
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+
+        // No speakers yet -> plain joined text, no prefixes.
+        XCTAssertEqual(transcriber.clipboardText, "hello hi there")
+
+        transcriber.applySpeakerLabels([
+            (start: 0, end: 1, speaker: "SPEAKER_00"),
+            (start: 2, end: 3, speaker: "SPEAKER_01")
+        ])
+        XCTAssertEqual(transcriber.clipboardText,
+                       "SPEAKER_00: hello\nSPEAKER_01: hi there")
+        _ = transcriber.stop()
+    }
+
+    /// Pins the `names:` argument in `clipboardText`. Dropping it still
+    /// COMPILES — `TranscriptFormatter.plainText`'s `names` parameter
+    /// defaults to `[:]` — and the raw-ID parity test above would still
+    /// pass, because it never assigns a name. So without this assertion a
+    /// refactor could silently regress mid-recording copy to raw
+    /// `SPEAKER_00` labels while the detail view kept showing (and
+    /// copying) the user's assigned names.
+    func test_clipboardText_applies_assigned_speaker_names() async {
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "hello"),
+            TranscriptSegment(start: 2, end: 3, text: "hi there")
+        ])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        transcriber.applySpeakerLabels([
+            (start: 0, end: 1, speaker: "SPEAKER_00"),
+            (start: 2, end: 3, speaker: "SPEAKER_01")
+        ])
+
+        // Rename one speaker mid-recording, exactly as the transcript
+        // pane's speaker-label popover does.
+        transcriber.speakerNames["SPEAKER_00"] = "Alice"
+        XCTAssertEqual(transcriber.clipboardText,
+                       "Alice: hello\nSPEAKER_01: hi there",
+                       "Mid-recording copy must use assigned speaker names, not raw diarizer IDs")
+
+        transcriber.speakerNames["SPEAKER_01"] = "Bob"
+        XCTAssertEqual(transcriber.clipboardText,
+                       "Alice: hello\nBob: hi there")
+        _ = transcriber.stop()
+    }
+
+    /// Negative control for the copy button. The button is gated on
+    /// `segments.isEmpty`, so that predicate and `clipboardText` must
+    /// agree: with nothing transcribed there must be nothing to copy —
+    /// not a stale or bogus value that would land on the pasteboard if
+    /// the gate were ever weakened.
+    ///
+    /// The second half is the staleness case that actually bit users
+    /// before (see the `epoch` guard in `LiveTranscriber`: a late whisper
+    /// result from recording N appending to recording N+1). The copy
+    /// button is a NEW read of that accumulated state, so pin that
+    /// starting a fresh recording leaves it with nothing to hand over
+    /// rather than the previous conversation's transcript.
+    func test_clipboardText_is_empty_with_no_segments_and_across_recordings() async {
+        // Fresh transcriber: nothing started, nothing to copy.
+        XCTAssertTrue(transcriber.segments.isEmpty)
+        XCTAssertEqual(transcriber.clipboardText, "",
+                       "An empty live transcript must copy as nothing")
+
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "first recording")])
+        let samples = Array(repeating: Float(0.3), count: 32_000)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(samples))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.clipboardText, "first recording")
+        _ = transcriber.stop()
+
+        // Second recording, before any audio has been transcribed.
+        transcriber.start(language: "en")
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "start() must clear segments — the copy button's disabled gate reads this")
+        XCTAssertEqual(transcriber.clipboardText, "",
+                       "Copying at the start of a new recording must not yield the previous recording's transcript")
+        _ = transcriber.stop()
+    }
+
     func test_successive_ticks_dedup_overlap_by_time() async {
         // Two ticks. Each whisper call sees the window starting at the
         // same absolute time (0s in this test because the buffer is

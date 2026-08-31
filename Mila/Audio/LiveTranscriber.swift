@@ -361,6 +361,28 @@ final class LiveTranscriber: ObservableObject {
         }.joined(separator: "\n")
     }
 
+    /// The live segments as `TranscriptSegment`s — the shape the
+    /// formatter/exporter share with finished recordings, so copy and
+    /// SRT export mid-recording produce the same output the detail view
+    /// would for the same content.
+    var transcriptSegments: [TranscriptSegment] {
+        segments.map {
+            TranscriptSegment(start: $0.startSeconds, end: $0.endSeconds,
+                              text: $0.text, speaker: $0.speaker)
+        }
+    }
+
+    /// Clipboard rendering of the in-progress transcript — same format
+    /// as the detail view's "Copy transcript" (speaker-prefixed turns
+    /// once live diarization has labelled anyone, plain joined text
+    /// otherwise), so copying mid-recording and copying after the fact
+    /// produce the same text.
+    var clipboardText: String {
+        TranscriptFormatter.plainText(segments: transcriptSegments,
+                                      fallback: fullText,
+                                      names: speakerNames)
+    }
+
     /// VAD path: enqueue a transcribe for a complete utterance. New
     /// utterances chain on top of the previous task so whisper runs
     /// strictly serially (the engine actor enforces this anyway, but
