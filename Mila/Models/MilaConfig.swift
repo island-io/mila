@@ -85,6 +85,55 @@ extension MilaConfig {
                     + "Update Mila and try again."
             }
         }
+
+        /// The log-safe twin of `errorDescription`, matching
+        /// `LLMRunnerError.logDescription` and
+        /// `SpeakerDiarizer.Error.logDescription`.
+        ///
+        /// `MilaConfigImporter` logs the staged filename `.private` because a
+        /// `.milaconfig` passed round a team is commonly named for the org or
+        /// the server it configures — and then its `catch` published the same
+        /// name straight back, because these two cases are built from someone
+        /// else's message:
+        ///
+        ///   * `.unreadable` wraps `Data(contentsOf:).localizedDescription`
+        ///     for a file the user double-clicked, and Cocoa quotes both the
+        ///     filename and its containing folder in that sentence.
+        ///   * `.malformed` wraps `JSONDecoder`'s message, which quotes coding
+        ///     keys and — for a type/value mismatch — the offending value,
+        ///     e.g. the endpoint URL or model name in the config.
+        ///
+        /// `.unsupportedVersion` is the opposite case and passes through: two
+        /// integers Mila composed itself, which are the entire diagnostic
+        /// ("update Mila") and name nothing. Redacting it would be the
+        /// over-redaction `bugbot-rules/no-user-content-in-logs.md` warns
+        /// about. (Issue #213, CWE-532.)
+        var logDescription: String {
+            switch self {
+            case .unreadable:
+                return "Couldn't read the configuration file (detail withheld — it quotes the file's name and folder)"
+            case .malformed:
+                return "Not a valid Mila configuration file (detail withheld — decoder messages quote keys and values)"
+            case .unsupportedVersion:
+                return errorDescription ?? "\(self)"
+            }
+        }
+
+        /// The log-safe message for any error a config load can throw, applied
+        /// where the concrete type is still unknown — `MilaConfigImporter`
+        /// catches `Error`.
+        ///
+        /// The fallback is deliberately **not** `localizedDescription`, unlike
+        /// the LLM and diarizer helpers. `load(from:)` only ever throws
+        /// `LoadError`, so anything else arriving here came from the
+        /// surrounding file-open path (the security-scope dance, a future
+        /// caller) — which is exactly the shape that quotes the user's path.
+        /// Domain + code keep it diagnosable without guessing.
+        static func logMessage(for error: Swift.Error) -> String {
+            if let loadError = error as? LoadError { return loadError.logDescription }
+            let ns = error as NSError
+            return "unexpected error [\(ns.domain) \(ns.code)]"
+        }
     }
 
     /// Parse a `.milaconfig` file, throwing a user-facing `LoadError`.

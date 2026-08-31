@@ -13,12 +13,15 @@ import XCTest
 /// file makes no attempt to pretend otherwise.
 ///
 /// What *is* testable is the part of the fix that is a pure function, and it
-/// happens to be the part that was the actual bug: two error types whose
-/// `errorDescription` embeds a **child process's output verbatim**. Annotating
-/// their call sites would not have been enough — the content is inside the
-/// string before any `Logger` sees it — so each grew a `logDescription` twin
-/// that the log sites use instead. Those are pure, and pinning them pins the
-/// invariant rather than the formatting.
+/// happens to be the part that was the actual bug: four error types whose
+/// `errorDescription` embeds **output Mila did not write** — a child process's
+/// stderr (`LLMRunnerError.nonZeroExit`, `SpeakerDiarizer.Error`), a remote
+/// endpoint's response body (`OpenAIRequestError`,
+/// `RemoteWhisperEngine.RemoteError`), or Cocoa's own quoted-path message
+/// (`MilaConfig.LoadError`). Annotating their call sites would not have been
+/// enough — the content is inside the string before any `Logger` sees it — so
+/// each grew a `logDescription` twin that the log sites use instead. Those are
+/// pure, and pinning them pins the invariant rather than the formatting.
 ///
 /// The other half of the contract matters just as much and is pinned too:
 /// `errorDescription` must KEEP the tool's own words. It is what the Settings
@@ -113,15 +116,104 @@ final class LogPrivacyRedactionTests: XCTestCase {
         XCTAssertTrue(logged.contains("status 1"), logged)
     }
 
-    /// A non-runner error still gets its readable message — the helper is a
-    /// redaction, not a gag. An `OpenAIRequestError` is the realistic case:
-    /// the same catch blocks see it, and "Authentication failed (401)" is the
-    /// whole diagnostic.
-    func test_logMessage_passes_through_other_localized_errors() {
-        let thrown: Error = OpenAIRequestError.auth("Incorrect API key provided")
+    /// An error the helper has no special knowledge of still gets its readable
+    /// message — the helper is a redaction of the types that are known to
+    /// carry someone else's bytes, not a gag on every error. A transport
+    /// failure ("The Internet connection appears to be offline") is the whole
+    /// diagnostic and names nothing.
+    func test_logMessage_passes_through_an_unrelated_error() {
+        let thrown: Error = CocoaError(.fileNoSuchFile)
 
         XCTAssertEqual(LLMRunnerError.logMessage(for: thrown),
-                       OpenAIRequestError.auth("Incorrect API key provided").errorDescription)
+                       thrown.localizedDescription)
+    }
+
+    // MARK: - #193: OpenAIRequestError (the HTTP twin of nonZeroExit)
+    //
+    // This case previously read "a non-runner error passes through", and that
+    // assertion was itself the bug: `OpenAIRequestError` is not a bystander
+    // type, it is the second error whose `errorDescription` embeds bytes Mila
+    // did not write. `LLMRunner.run`'s `.openaiCompatible` branch rethrows it
+    // unchanged, so every log site that goes through `logMessage(for:)` —
+    // `PostRecordingCoordinator`, `RecordingSummarizer`, `LiveAISession`,
+    // `logSetupFailure`, `logLaunchFailure`, `logHTTPFailure` — published it.
+    // (Found by CodeRabbit on this PR.)
+
+    /// The endpoint's own response body reaches `errorDescription` through
+    /// `.auth`/`.notFound`/`.server`. A real OpenAI 401 quotes a fragment of
+    /// the API key, so the log field was getting a piece of a credential.
+    func test_openAIRequestError_logDescription_never_contains_the_server_message() {
+        let serverMessage = "Incorrect API key provided: sk-proj-9aBcDeF***XYZ. "
+            + "You can find your API key at https://platform.openai.com/account/api-keys."
+        let error = OpenAIRequestError.auth(serverMessage)
+
+        let logged = error.logDescription
+        XCTAssertFalse(logged.contains("sk-proj-9aBcDeF"),
+                       "API key fragment leaked into the log message: \(logged)")
+        XCTAssertFalse(logged.contains(serverMessage),
+                       "raw server message leaked into the log message: \(logged)")
+        // …and what survives is the part that triages: which status.
+        XCTAssertTrue(logged.contains("401"), logged)
+    }
+
+    /// `.server` carries an arbitrary upstream body — a proxy answering 502
+    /// with the payload it was given can put transcript text there.
+    func test_openAIRequestError_logDescription_keeps_the_status_and_drops_the_body() {
+        let error = OpenAIRequestError.server(status: 502,
+                                              message: "upstream rejected: Acme is acquiring Globex")
+
+        let logged = error.logDescription
+        XCTAssertTrue(logged.contains("502"), logged)
+        XCTAssertFalse(logged.contains("Acme is acquiring Globex"),
+                       "upstream body leaked into the log message: \(logged)")
+    }
+
+    /// `.invalidEndpoint` is the sharper half: `runOpenAICompatible`
+    /// deliberately logs `host=` and never the full URL, because a user's
+    /// endpoint can carry a token in its query string — and this case handed
+    /// the whole URL back through the failure field, on the one path where the
+    /// URL is malformed enough that there was no host to log instead.
+    func test_openAIRequestError_logDescription_never_contains_the_configured_endpoint() {
+        let baseURL = "https://llm.acme-internal.example/v1?access_token=s3cr3t"
+        let error = OpenAIRequestError.invalidEndpoint(baseURL)
+
+        let logged = error.logDescription
+        XCTAssertFalse(logged.contains("s3cr3t"),
+                       "endpoint token leaked into the log message: \(logged)")
+        XCTAssertFalse(logged.contains("acme-internal"),
+                       "configured endpoint leaked into the log message: \(logged)")
+    }
+
+    /// The other half of the contract, as for `nonZeroExit`: the Settings → AI
+    /// Provider test panel and the post-recording banner keep the server's own
+    /// words, because that is the only thing that turns "the LLM failed" into
+    /// something the user can act on.
+    func test_openAIRequestError_errorDescription_still_shows_the_user_the_server_message() {
+        XCTAssertEqual(OpenAIRequestError.auth("Incorrect API key provided").errorDescription,
+                       "Authentication failed (401). Incorrect API key provided")
+
+        let shown = OpenAIRequestError.invalidEndpoint("https://x y/v1").errorDescription ?? ""
+        XCTAssertTrue(shown.contains("https://x y/v1"),
+                      "the user must still see which URL was rejected: \(shown)")
+    }
+
+    /// `.emptyOutput` carries nothing of anyone's, so the two descriptions
+    /// must stay identical — redacting it would be pure loss.
+    func test_openAIRequestError_emptyOutput_is_not_redacted() {
+        XCTAssertEqual(OpenAIRequestError.emptyOutput.logDescription,
+                       OpenAIRequestError.emptyOutput.errorDescription)
+    }
+
+    /// The shape the catch blocks actually see: `run` rethrows the typed error
+    /// into a `catch { }` that only knows `Error`.
+    func test_logMessage_redacts_an_openAIRequestError_thrown_as_a_bare_error() {
+        let secret = "sk-proj-9aBcDeF***XYZ"
+        let thrown: Error = OpenAIRequestError.auth("Incorrect API key provided: \(secret)")
+
+        let logged = LLMRunnerError.logMessage(for: thrown)
+        XCTAssertFalse(logged.contains(secret),
+                       "credential leaked once the concrete type was erased: \(logged)")
+        XCTAssertTrue(logged.contains("401"), logged)
     }
 
     // MARK: - #213: SpeakerDiarizer.Error.diarizationFailed
@@ -152,6 +244,15 @@ final class LogPrivacyRedactionTests: XCTestCase {
     /// The interpreter path is a value the user typed into Settings, names no
     /// recording, and is the entire diagnostic for this case — so it passes
     /// through unredacted.
+    ///
+    /// CodeRabbit asked for this one to be redacted on PR #218. Deliberately
+    /// not done, and this assertion is the record of that: the value is
+    /// configuration, not content — no title, no transcript, and not the
+    /// recordings folder — and the analogous CLI path is already logged
+    /// `.public` as `exe=` by design (see `LLMRunner.logRunStart`). "Python not
+    /// found at `<private>`" is the over-redaction
+    /// `bugbot-rules/no-user-content-in-logs.md` warns about: it removes the
+    /// only fact the line exists to report.
     func test_pythonNotFound_is_not_redacted() {
         let error = SpeakerDiarizer.Error.pythonNotFound("/opt/homebrew/bin/python3")
 
@@ -175,5 +276,159 @@ final class LogPrivacyRedactionTests: XCTestCase {
 
         XCTAssertEqual(SpeakerDiarizer.Error.logMessage(for: thrown),
                        thrown.localizedDescription)
+    }
+
+    // MARK: - #213: RemoteWhisperEngine.RemoteError.http
+    //
+    // The remote transcription path is the third instance of the same shape,
+    // found by sweeping the files this PR already touched:
+    // `RemoteError.http`'s `errorDescription` runs the endpoint's response
+    // body through `shortMessage(from:)`, which falls back to a 200-character
+    // slice of the raw body. `TranscriptionService.transcribeOnceSegments`
+    // logged that `.public` — and its own comment notes the line "repeats on
+    // every utterance for the whole recording".
+
+    /// A real OpenAI 401 body quotes a fragment of the API key, and
+    /// `shortMessage` lifts exactly that field out of the JSON.
+    func test_remoteWhisperError_logDescription_never_contains_the_server_body() {
+        let body = """
+            {"error":{"message":"Incorrect API key provided: sk-proj-9aBcDeF***XYZ. \
+            You can find your API key at https://platform.openai.com/account/api-keys.",\
+            "type":"invalid_request_error"}}
+            """
+        let error = RemoteWhisperEngine.RemoteError.http(status: 401, body: body)
+
+        // Precondition: the leak is real — the user-facing description does
+        // carry the key fragment, which is why annotating the call site could
+        // never have fixed this.
+        let shown = error.errorDescription ?? ""
+        XCTAssertTrue(shown.contains("sk-proj-9aBcDeF"),
+                      "expected errorDescription to carry the server message: \(shown)")
+
+        let logged = error.logDescription
+        XCTAssertFalse(logged.contains("sk-proj-9aBcDeF"),
+                       "API key fragment leaked into the log message: \(logged)")
+        XCTAssertFalse(logged.contains("Incorrect API key provided"),
+                       "server body leaked into the log message: \(logged)")
+        // Status and volume survive: "401 with 0 bytes" and "401 with 300
+        // bytes" are different bugs.
+        XCTAssertTrue(logged.contains("401"), logged)
+        XCTAssertTrue(logged.contains("\(body.utf8.count)B"), logged)
+    }
+
+    /// A proxy that answers with the payload it was handed puts transcript
+    /// text in the body — the same exposure as a CLI echoing its prompt.
+    func test_remoteWhisperError_logDescription_drops_an_echoed_transcript() {
+        let transcript = "We agreed to let Dana go at the end of Q3."
+        let error = RemoteWhisperEngine.RemoteError.http(
+            status: 502,
+            body: "Bad gateway. Upstream request was: \(transcript)")
+
+        let logged = error.logDescription
+        XCTAssertFalse(logged.contains(transcript),
+                       "transcript leaked into the log message: \(logged)")
+        XCTAssertTrue(logged.contains("502"), logged)
+    }
+
+    /// Every other case is a sentence Mila wrote, so the two descriptions must
+    /// stay identical — redacting them would make a misconfigured endpoint
+    /// undiagnosable for no gain.
+    func test_remoteWhisperError_cases_without_a_server_body_are_not_redacted() {
+        let cases: [RemoteWhisperEngine.RemoteError] = [
+            .notConfigured, .noAudioCaptured, .badResponse, .emptyResult
+        ]
+        for error in cases {
+            XCTAssertEqual(error.logDescription, error.errorDescription,
+                           "\(error) should not be redacted — it carries no server output")
+        }
+    }
+
+    /// The shape `TranscriptionService` uses: the live path catches `Error`.
+    func test_remote_logMessage_redacts_through_a_bare_error() {
+        let thrown: Error = RemoteWhisperEngine.RemoteError.http(
+            status: 401, body: "Incorrect API key provided: sk-proj-XYZ")
+
+        let logged = RemoteWhisperEngine.RemoteError.logMessage(for: thrown)
+        XCTAssertFalse(logged.contains("sk-proj-XYZ"),
+                       "credential leaked once the concrete type was erased: \(logged)")
+        XCTAssertTrue(logged.contains("401"), logged)
+    }
+
+    /// …and a transport failure still reads normally.
+    func test_remote_logMessage_passes_through_other_errors() {
+        let thrown: Error = CocoaError(.fileNoSuchFile)
+
+        XCTAssertEqual(RemoteWhisperEngine.RemoteError.logMessage(for: thrown),
+                       thrown.localizedDescription)
+    }
+
+    // MARK: - #213: MilaConfig.LoadError
+    //
+    // The success/failure asymmetry, in the form Bugbot flagged on
+    // `WAVHeaderRepair`: `MilaConfigImporter.handleOpen` logs the staged
+    // filename `.private` — a `.milaconfig` handed round a team is commonly
+    // named for the org it configures — and then its own `catch` published
+    // that name straight back through `String(describing: error)`.
+
+    /// `LoadError.unreadable` wraps `Data(contentsOf:).localizedDescription`
+    /// verbatim, and Cocoa quotes the filename (and its folder) in there.
+    func test_configLoadError_logDescription_never_contains_the_quoted_filename() {
+        // The shape Cocoa produces for a file the user double-clicked.
+        let cocoaMessage = "The file “Acme Corp — ASR rollout.milaconfig” couldn’t be "
+            + "opened because there is no such file."
+        let error = MilaConfig.LoadError.unreadable(cocoaMessage)
+
+        let logged = error.logDescription
+        XCTAssertFalse(logged.contains("Acme Corp"),
+                       "config filename leaked into the log message: \(logged)")
+        XCTAssertFalse(logged.contains(cocoaMessage),
+                       "raw Cocoa message leaked into the log message: \(logged)")
+        XCTAssertEqual(MilaConfig.LoadError.logMessage(for: error), logged)
+    }
+
+    /// `.malformed` wraps `JSONDecoder`'s message, which quotes coding keys
+    /// and — on a type mismatch — the offending value out of the config.
+    func test_configLoadError_malformed_logDescription_never_contains_the_decoder_detail() {
+        let detail = "Expected to decode String but found a number instead, "
+            + "at CodingKeys(stringValue: \"baseURL\"): https://llm.acme-internal.example/v1"
+        let logged = MilaConfig.LoadError.malformed(detail).logDescription
+
+        XCTAssertFalse(logged.contains("acme-internal"),
+                       "decoder detail leaked into the log message: \(logged)")
+    }
+
+    /// The opposite case, kept public on purpose: two integers Mila composed
+    /// itself, which are the entire diagnostic and name nothing.
+    func test_configLoadError_unsupportedVersion_is_not_redacted() {
+        let error = MilaConfig.LoadError.unsupportedVersion(found: 4, supported: 1)
+
+        XCTAssertEqual(error.logDescription, error.errorDescription)
+        XCTAssertTrue(error.logDescription.contains("v4"), error.logDescription)
+    }
+
+    /// The user-facing half is unchanged: the confirmation sheet still tells
+    /// the user which file it couldn't read.
+    func test_configLoadError_errorDescription_still_names_the_file_for_the_user() {
+        let cocoaMessage = "The file “Acme Corp — ASR rollout.milaconfig” couldn’t be "
+            + "opened because there is no such file."
+        let shown = MilaConfig.LoadError.unreadable(cocoaMessage).errorDescription ?? ""
+
+        XCTAssertTrue(shown.contains("Acme Corp"),
+                      "the sheet must still tell the user which file failed: \(shown)")
+    }
+
+    /// Unlike the LLM and diarizer helpers, this fallback must NOT pass an
+    /// unknown error through: `load(from:)` only ever throws `LoadError`, so
+    /// anything else here came from the surrounding file-open path — which is
+    /// exactly the shape that quotes the user's path.
+    func test_configLoadError_logMessage_does_not_pass_through_an_unexpected_file_error() {
+        let thrown: Error = CocoaError(.fileNoSuchFile)
+        let logged = MilaConfig.LoadError.logMessage(for: thrown)
+
+        XCTAssertNotEqual(logged, thrown.localizedDescription,
+                          "an unexpected file error was passed through verbatim: \(logged)")
+        let ns = thrown as NSError
+        XCTAssertTrue(logged.contains(ns.domain), logged)
+        XCTAssertTrue(logged.contains("\(ns.code)"), logged)
     }
 }

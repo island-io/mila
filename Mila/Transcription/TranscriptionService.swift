@@ -402,7 +402,21 @@ final class TranscriptionService: ObservableObject {
                 // on every utterance for the whole recording and silently empties
                 // the live pane. Error level so it's visible in `log show`
                 // WITHOUT --debug and stands out from the debug firehose.
-                serviceLog.error("transcribeOnceSegments(remote): FAILED error=\(error.localizedDescription, privacy: .public)")
+                // `logMessage(for:)`, not `localizedDescription`: this is the
+                // same "someone else's bytes are already inside the string"
+                // shape as `LLMRunnerError.nonZeroExit` and
+                // `SpeakerDiarizer.Error.diarizationFailed`, just over HTTP.
+                // `RemoteWhisperEngine.RemoteError.http` embeds up to 200
+                // characters of the endpoint's raw response body, and the
+                // comment above says this line repeats on every utterance —
+                // so a 401 wrote a fragment of the user's API key into the log
+                // once per utterance, all recording long. The status code and
+                // a byte count survive; `lastError` below keeps the full text
+                // for the banner. (Issue #213, CWE-532.)
+                serviceLog.error("""
+                    transcribeOnceSegments(remote): FAILED \
+                    error=\(RemoteWhisperEngine.RemoteError.logMessage(for: error), privacy: .public)
+                    """)
                 // Surface the failure instead of returning a silently-empty
                 // result that's indistinguishable from "no speech". Set once
                 // (only when nothing is already showing) so a per-utterance

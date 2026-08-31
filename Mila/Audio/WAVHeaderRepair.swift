@@ -164,7 +164,23 @@ enum WAVHeaderRepair {
                 try handle.write(contentsOf: bytes)
                 return true
             } catch {
-                wavRepairLog.error("WAV header write failed at \(offset): \(error.localizedDescription, privacy: .public)")
+                // Same redaction as the success line below, for the same
+                // reason — the failure path had been left `.public` while the
+                // success path was fixed, which is the more dangerous half of
+                // the pair: a repair that *works* logs a name, one that fails
+                // logs the name AND the folder holding it, because Cocoa
+                // quotes both inside `localizedDescription`. `url` here is a
+                // title-derived WAV inside the user's chosen recordings
+                // directory. Domain + code stay public: a read-only volume, a
+                // full disk and a vanished file are what this line exists to
+                // tell apart, and none of them names anything.
+                // (Bugbot, issue #213, CWE-532.)
+                let ns = error as NSError
+                wavRepairLog.error("""
+                    WAV header write failed at \(offset, privacy: .public) \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                    \(error.localizedDescription, privacy: .private)
+                    """)
                 return false
             }
         }
@@ -178,7 +194,15 @@ enum WAVHeaderRepair {
         do {
             try handle.synchronize()
         } catch {
-            wavRepairLog.error("WAV header fsync failed: \(error.localizedDescription, privacy: .public)")
+            // As above. `synchronize()` fails against the same title-derived
+            // file in the same user-chosen folder, so its message quotes the
+            // same two things. (Bugbot, issue #213, CWE-532.)
+            let ns = error as NSError
+            wavRepairLog.error("""
+                WAV header fsync failed \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return false
         }
         // The WAV's name is title-derived (`freshAudioURL(suggestedName:)`), so

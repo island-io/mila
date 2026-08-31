@@ -129,8 +129,24 @@ enum LLMRunnerError: LocalizedError {
     /// can also fail with an `OpenAIRequestError`, a `CancellationError`, or
     /// something from `Foundation` — so the redaction has to be applied where
     /// the type is still unknown, or it gets skipped exactly when it matters.
+    ///
+    /// `OpenAIRequestError` needs the same treatment as `LLMRunnerError`, not
+    /// the pass-through: `run`'s `.openaiCompatible` branch rethrows it
+    /// unchanged from `runOpenAICompatible`, and its `errorDescription`
+    /// embeds the endpoint's own response body (a real 401 quotes a fragment
+    /// of the API key) or, for `.invalidEndpoint`, the configured Base URL
+    /// that this file otherwise refuses to log in full. Falling through to the
+    /// `LocalizedError` branch published both. See
+    /// `OpenAIRequestError.logDescription`. (CodeRabbit; issue #193.)
+    ///
+    /// The final fallback stays `errorDescription`/`localizedDescription` on
+    /// purpose — the helper is a redaction of the two types that are *known*
+    /// to carry someone else's bytes, not a gag on every error. A
+    /// `CancellationError` or a `URLError` reading "The Internet connection
+    /// appears to be offline" is the whole diagnostic and names nothing.
     static func logMessage(for error: Error) -> String {
         if let runnerError = error as? LLMRunnerError { return runnerError.logDescription }
+        if let openAIError = error as? OpenAIRequestError { return openAIError.logDescription }
         return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 }
