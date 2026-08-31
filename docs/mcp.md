@@ -107,6 +107,13 @@ How the polling works under the hood:
 - A `session_id` mismatch means a new recording started between polls —
   Claude gets the new meeting's transcript from the top with
   `new_session: true`.
+- If you **delete a line** from the live transcript, the next poll whose
+  cursor predates the deletion gets the whole segment set back with
+  `segments_removed: true`, and is told to discard its previous copy
+  rather than append. The incremental cursor is a count plus a "re-read
+  the last entry" rule, so it cannot express a removal on its own — and
+  a deletion is a privacy action, so the poller must not be left holding
+  the line you removed.
 - `status` values: `recording` (keep polling), `stale` (the app stopped
   updating the snapshot — likely crashed), `recording_live_unavailable`
   (recording on hardware where live transcription is gated off — wait

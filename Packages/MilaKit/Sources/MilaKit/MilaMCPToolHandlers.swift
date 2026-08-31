@@ -154,7 +154,10 @@ public struct MilaMCPToolHandlers: Sendable {
             since_revision) and next_segment_index (as since_segment_index): unchanged \
             meetings answer with a tiny {changed:false}, and changed ones return only the new \
             segments (the last previously-seen segment is re-sent because live transcription \
-            may rewrite it — replace your copy). When status becomes "completed", stop \
+            may rewrite it — replace your copy). If a reply carries segments_removed:true the \
+            user deleted lines from the transcript: new_segments is then the COMPLETE current \
+            set, so discard your previous copy of this session's segments instead of appending, \
+            and do not quote the removed text. When status becomes "completed", stop \
             polling: call get_transcript with the returned final_recording_id when there is \
             one, and otherwise take the newest entry from list_recordings (a completed \
             recording can finish without a handoff id).
@@ -385,17 +388,41 @@ public struct MilaMCPToolHandlers: Sendable {
         result["speaker_names"] = snapshot.speakerNames
         result["next_segment_index"] = snapshot.segments.count
 
-        if sameSession, let sinceIndex = args["since_segment_index"] as? Int {
+        // A delta is only honest while the client's prefix is still valid. The
+        // user can DELETE a line from the live pane, and the cursor has no way
+        // to say so: it is a count plus "re-read the entry before it", so a
+        // client that already fetched the deleted line would keep it for the
+        // rest of the meeting and mis-stitch every line after it. When the
+        // removal happened at a revision the client hasn't seen, resend
+        // everything and say why. A client that sent no `since_revision` at
+        // all can't prove it saw the removal, so it gets the same treatment.
+        let clientRevision = args["since_revision"] as? Int
+        let prefixInvalidated: Bool = {
+            guard let removedAt = snapshot.segmentsRemovedAtRevision else { return false }
+            guard let clientRevision else { return true }
+            return clientRevision < removedAt
+        }()
+
+        if sameSession, !prefixInvalidated, let sinceIndex = args["since_segment_index"] as? Int {
             result["new_segments"] = snapshot.segments(sinceIndex: sinceIndex)
                 .map(segmentObject(for:))
         } else {
-            // First poll (or a new session): full transcript + all segments.
+            // First poll, a new session, or a removal the client hasn't seen:
+            // full transcript + all segments.
             result["new_segments"] = snapshot.segments.map(segmentObject(for:))
             result["transcript"] = TranscriptFormatter.plainText(
                 segments: snapshot.segments,
                 fallback: TranscriptFormatter.joinedFullText(segments: snapshot.segments),
                 names: snapshot.speakerNames
             )
+            if sameSession, prefixInvalidated {
+                result["segments_removed"] = true
+                // Don't clobber the stale-heartbeat note, which is the more
+                // urgent thing to tell the client.
+                if !result.keys.contains("note") {
+                    result["note"] = "Lines were removed from this transcript, so new_segments is the COMPLETE current set — discard your previous copy of this session's segments rather than appending."
+                }
+            }
         }
         return try json(result)
     }
