@@ -31,6 +31,12 @@ final class PostRecordingCoordinator: ObservableObject {
     private let transcription: TranscriptionService
     private let llm: LLMSettings
 
+    /// Late-bound by `MilaApp`, like the exporter wiring on
+    /// `QuickActionsController`. Discard has to reach the vault: export runs
+    /// off the summarizer's completion hook, which can land either side of the
+    /// user throwing the recording away.
+    var obsidianExporter: ObsidianExporter?
+
     /// Injectable LLM-run seam so tests can assert what `PostRecordingCoordinator`
     /// sends to `LLMRunner` (e.g. that the OpenAI path threads `openAIModelName`
     /// — issue celarent7/mila#3) without spawning a CLI or hitting the network.
@@ -120,7 +126,15 @@ final class PostRecordingCoordinator: ObservableObject {
     /// the sheet is already showing a different recording the new one is
     /// dropped (we don't queue — concurrent voice memos are rare and a
     /// stack of sheets is worse UX than just naming the first one).
-    func present(_ recording: Recording) {
+    ///
+    /// `titleWasUserProvided` reports that the recording was saved under a
+    /// meeting name the user typed before / during recording. The background
+    /// auto-title job can only protect a user's title by comparing against the
+    /// default it expects to replace, and here that default IS the user's
+    /// title — so the guard cannot see the difference and the CLI suggestion
+    /// would overwrite the typed name. Skip the job entirely in that case; the
+    /// Suggest button in the sheet still offers it on demand.
+    func present(_ recording: Recording, titleWasUserProvided: Bool = false) {
         // UI-TEST: the record-while-finalizing E2E drives two back-to-back
         // recordings through the real `stopRecording`; a modal rename sheet
         // after each Stop would sit over Home and block the next Record tap
@@ -130,6 +144,7 @@ final class PostRecordingCoordinator: ObservableObject {
         if CommandLine.arguments.contains("--ui-test-finalize-regression") { return }
         guard pending == nil else { return }
         pending = recording
+        guard !titleWasUserProvided else { return }
         armAutoSuggestTitle(for: recording)
     }
 
@@ -489,7 +504,8 @@ final class PostRecordingCoordinator: ObservableObject {
     ///  2. trip the transcription service's abort flag so whisper.cpp
     ///     unwinds within ~100ms instead of finishing
     ///  3. permanently delete the recording + its audio file
-    ///  4. dismiss the sheet
+    ///  4. un-export it from the Obsidian vault
+    ///  5. dismiss the sheet
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
         autoSuggestingIDs.remove(recording.id)
@@ -500,9 +516,14 @@ final class PostRecordingCoordinator: ObservableObject {
             task.cancel()
         }
         transcription.cancel(recordingID: recording.id)
-        if let stored = store.recordings.first(where: { $0.id == recording.id }) {
+        let stored = store.recordings.first(where: { $0.id == recording.id })
+        if let stored {
             store.permanentlyDelete(stored)
         }
+        // After the delete, and against the STORED row when there is one: its
+        // title is what named the note on disk, and the `pending` snapshot's
+        // may predate a rename made in the sheet.
+        obsidianExporter?.discardNote(for: stored ?? recording)
         pending = nil
     }
 

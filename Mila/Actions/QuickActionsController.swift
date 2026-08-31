@@ -64,6 +64,21 @@ final class QuickActionsController: ObservableObject {
     /// new app and the user has to re-grant access.
     @Published var microphonePermissionMissing = false
 
+    /// Mila folder the *next* recording is filed into (nil = All Transcriptions).
+    /// Always defaults to All Transcriptions on launch — the choice is
+    /// per-session only and deliberately NOT persisted across launches, so a
+    /// folder picked for one session never silently becomes the default for
+    /// the next one. Set from the Home record controls; applied when the
+    /// recording is saved in `stopRecording`.
+    @Published var nextRecordingFolder: String?
+
+    /// User-entered meeting name for the *next* recording (empty = use the
+    /// auto-generated date-stamped title). Set from the Home controls and
+    /// the live recording screen; applied when the recording is saved in
+    /// `stopRecording`, then cleared so a name typed for one meeting never
+    /// silently carries into the next one.
+    @Published var nextRecordingTitle: String = ""
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -598,6 +613,10 @@ final class QuickActionsController: ObservableObject {
             // over either way, so its notes must not carry into the next
             // recording.
             liveAISettings?.meetingContext = ""
+            // Same one-shot rule as the successful path: a failed stop
+            // must not leave title/folder selected for the next recording.
+            nextRecordingTitle = ""
+            nextRecordingFolder = nil
             liveSidecarWriter?.finish(recordingID: nil)
             isFinalizingRecording = false
             activeJob = .none
@@ -640,6 +659,22 @@ final class QuickActionsController: ObservableObject {
                 return (defaultTitle(prefix: "Recording"), .microphone, nil, nil)
             }
         }()
+
+        // A user-entered meeting name (from Home or the live recording
+        // screen) overrides the auto-generated date-stamped title. Cleared
+        // below once the recording is built so it doesn't carry over.
+        let finalTitle = Self.resolvedRecordingTitle(userProvided: nextRecordingTitle,
+                                                     defaultTitle: title)
+        // Read before the clear below: the rename sheet needs to know the
+        // title came from the user, so its background auto-title job doesn't
+        // hand the name straight to the LLM and overwrite it.
+        let titleWasUserProvided = !nextRecordingTitle
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Same one-shot rule as the title: capture, apply, then clear so
+        // the next recording in this launch does not inherit the folder.
+        let chosenFolder = nextRecordingFolder
+        nextRecordingTitle = ""
+        nextRecordingFolder = nil
 
         // A mic-only recording that captured zero frames produces an empty
         // WAV → empty transcript → silent ".failed". Tell the user why
@@ -707,7 +742,7 @@ final class QuickActionsController: ObservableObject {
         // `.pending`/`.running`, and the live MCP sidecar carries its own copy
         // of the map.
         let recording = Recording(
-            title: title,
+            title: finalTitle,
             duration: duration,
             source: source,
             audioFileName: outputURL.lastPathComponent,
@@ -715,6 +750,7 @@ final class QuickActionsController: ObservableObject {
             language: languageSettings.current.rawValue,
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
+            folder: chosenFolder,
             appName: appName,
             appBundleID: appBundleID,
             summary: initialSummary.isEmpty ? nil : initialSummary,
@@ -738,6 +774,33 @@ final class QuickActionsController: ObservableObject {
         // drain, after `store.update`. Every exit from the drain below must
         // finish it: with the id when the row was updated, with `nil` when
         // the row is gone and there is nothing to hand off.
+        // `add` already persisted the folder field, so this is NOT the common
+        // path: `NextRecordingFolderPicker` only ever offers names that are
+        // already in `store.folders`, and for those this branch is skipped.
+        //
+        // It is the reconciliation for a pick that went stale between
+        // selection and Stop, which is the only way the UI can reach it: the
+        // user deleted or renamed that folder in the sidebar mid-recording, so
+        // `store.folders` no longer holds the name. (A caller setting
+        // `nextRecordingFolder` programmatically to a brand-new name, or to one
+        // differing only by case/whitespace, lands here too — `assign`
+        // auto-creates and case-normalizes.)
+        //
+        // Do NOT drop the `assign` on the grounds that `add` already wrote
+        // `folder`: it is what keeps the invariant the sidebar is built on —
+        // a recording's `folder` is always a name present in `store.folders`.
+        // Without it a folder deleted mid-recording leaves the new recording
+        // tagged with a folder that has no row to reach it from.
+        //
+        // Honouring the stale pick (rather than silently unfiling) is
+        // deliberate: "Save to <name>" was on screen right up to Stop, so
+        // filing it there is what the user was told would happen. The folder
+        // reappearing in the sidebar is the visible cost of that, and it is
+        // the honest one. `RecordingFolderMenu` in the detail view is the
+        // one-click undo.
+        if let chosenFolder, !store.folders.contains(chosenFolder) {
+            store.assign(recording, toFolder: chosenFolder)
+        }
         activeJob = .none
         if sleepReason != nil {
             sleepInterruption = SleepInterruption(
@@ -748,7 +811,7 @@ final class QuickActionsController: ObservableObject {
             )
         }
         if sleepReason == nil {
-            postRecording.present(recording)
+            postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
         }
 
         // ---- INLINE LIVE-PIPELINE DRAIN: finalize whatever was still
@@ -1391,6 +1454,15 @@ final class QuickActionsController: ObservableObject {
     var elapsed: TimeInterval { session.elapsed }
     var micLevel: Float { session.micLevel }
     var systemLevel: Float { session.systemLevel }
+
+    /// Resolve the title a recording should be saved with: the user-entered
+    /// meeting name (trimmed) when they typed one, otherwise the
+    /// auto-generated date-stamped default. Pure + `static` so it's
+    /// unit-testable without a real recording session.
+    static func resolvedRecordingTitle(userProvided: String, defaultTitle: String) -> String {
+        let trimmed = userProvided.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? defaultTitle : trimmed
+    }
 
     private func defaultTitle(prefix: String) -> String {
         let f = DateFormatter()

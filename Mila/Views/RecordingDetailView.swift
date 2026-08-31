@@ -67,6 +67,9 @@ struct RecordingDetailView: View {
                     Text(recording.createdAt, format: .dateTime)
                     Text("·")
                     Text(formatDuration(recording.duration))
+                    Text("·")
+                    RecordingFolderMenu(recordingID: recording.id,
+                                        currentFolder: recording.folder)
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)

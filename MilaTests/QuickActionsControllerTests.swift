@@ -1,5 +1,6 @@
 import XCTest
 import TranscriptionCore
+import MilaKit
 @testable import Mila
 
 /// Integration tests for the file-import + transcribe pipeline that runs when
@@ -131,6 +132,286 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
             source: .meeting, wallClock: 1200, captured: 600),
             "a 600s file against a 1200s clock IS a real short capture — the point is that a pause must not produce this shape")
+    }
+
+    func test_nextRecordingFolder_defaults_to_all_transcriptions() {
+        let fresh = QuickActionsController(
+            session: RecordingSession(),
+            store: store,
+            transcription: service,
+            languageSettings: languageSettings,
+            postRecording: PostRecordingCoordinator(
+                store: store,
+                transcription: service,
+                llm: LLMSettings(defaults: UserDefaults(suiteName: "QuickActionsControllerTests.llm2")!)))
+        XCTAssertNil(fresh.nextRecordingFolder,
+                     "next-recording folder must default to All Transcriptions, not a persisted folder")
+    }
+
+    /// A folder chosen for one recording is one-shot: stop must not leave
+    /// it selected for the next recording in the same launch.
+    func test_stopRecording_clears_nextRecordingFolder() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "FolderClear")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        store.createFolder("Work")
+        controller.nextRecordingFolder = "Work"
+        controller.nextRecordingTitle = "Weekly Sync"
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        XCTAssertNil(controller.nextRecordingFolder,
+                     "nextRecordingFolder must reset after save")
+        XCTAssertEqual(controller.nextRecordingTitle, "",
+                       "nextRecordingTitle must reset after save")
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        XCTAssertEqual(stored.folder, "Work")
+        XCTAssertEqual(stored.title, "Weekly Sync")
+    }
+
+    /// `session.stop()` returning nil never reaches the successful-path
+    /// clear, so title/folder would otherwise stick for the next recording.
+    func test_failed_stop_clears_nextRecording_title_and_folder() async {
+        controller.nextRecordingFolder = "Work"
+        controller.nextRecordingTitle = "Weekly Sync"
+        XCTAssertFalse(controller.isRecording)
+
+        await controller.stopRecording()
+
+        XCTAssertNil(controller.nextRecordingFolder)
+        XCTAssertEqual(controller.nextRecordingTitle, "")
+        XCTAssertTrue(store.recordings.isEmpty)
+    }
+
+    /// A folder name that isn't already in the store list still gets
+    /// registered via assign (new folder / case-insensitive match).
+    func test_stopRecording_registers_a_brand_new_folder() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "NewFolder")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.nextRecordingFolder = "Brand New"
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        XCTAssertTrue(store.folders.contains("Brand New"))
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        XCTAssertEqual(stored.folder, "Brand New")
+    }
+
+    /// A meeting name typed before recording survives the stop: the rename
+    /// sheet's background auto-title job must not hand it to the LLM and
+    /// write the suggestion back over it.
+    func test_stopRecording_does_not_auto_title_a_user_named_recording() async throws {
+        let suite = UserDefaults(suiteName: "QuickActionsControllerTests.autoTitle")!
+        suite.removePersistentDomain(forName: "QuickActionsControllerTests.autoTitle")
+        let llm = LLMSettings(defaults: suite,
+                              apiKeyKeychainKey: "QuickActionsControllerTests.autoTitle")
+        llm.tool = .claude
+        llm.nameGenerationEnabled = true
+
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                callCount += 1
+                return "An LLM Title"
+            })
+        let named = QuickActionsController(session: session,
+                                           store: store,
+                                           transcription: service,
+                                           languageSettings: languageSettings,
+                                           postRecording: coordinator)
+
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "UserNamed")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await named.startFakeRecordingForTesting(outputURL: url)
+        named.nextRecordingTitle = "Weekly Sync"
+
+        await named.stopRecording()
+        await named.awaitFinalizeTails()
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(callCount, 0, "the auto-title CLI must not run for a user-named recording")
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        XCTAssertEqual(stored.title, "Weekly Sync")
+    }
+
+    // MARK: - Resolved recording title (meeting name override)
+
+    /// An empty or whitespace-only meeting name falls back to the
+    /// auto-generated date-stamped default title.
+    func test_resolvedRecordingTitle_falls_back_to_default_when_empty() {
+        let def = "Recording · Jul 20, 2026"
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "", defaultTitle: def), def)
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "   \n\t", defaultTitle: def), def)
+    }
+
+    /// A non-empty meeting name wins over the default and is trimmed of
+    /// surrounding whitespace.
+    func test_resolvedRecordingTitle_prefers_trimmed_user_title() {
+        let def = "Recording · Jul 20, 2026"
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "Weekly Sync", defaultTitle: def),
+                       "Weekly Sync")
+        XCTAssertEqual(QuickActionsController.resolvedRecordingTitle(userProvided: "  Weekly Sync  ", defaultTitle: def),
+                       "Weekly Sync")
+    }
+
+    // MARK: - Negative controls for the meeting name / folder destination
+
+    /// Find the recording `stopRecording` just saved for `audioURL`.
+    ///
+    /// Matches on the file STEM, not the full name: `stopRecording`'s tail
+    /// enqueues the row for batch transcription, and completion can hand it to
+    /// `RecordingStore.compressRecordingAudio`, which rewrites
+    /// `audioFileName` from `<stem>.wav` to `<stem>.m4a`. Matching the whole
+    /// name would make these tests race that transcode.
+    private func savedRecording(for audioURL: URL) -> Recording? {
+        let stem = (audioURL.lastPathComponent as NSString).deletingPathExtension
+        return store.recordings.first {
+            ($0.audioFileName as NSString).deletingPathExtension == stem
+        }
+    }
+
+    /// NEGATIVE CONTROL — a meeting name is user-typed text, and titles are
+    /// what `RecordingStore.freshAudioURL(suggestedName:)` turns into a path
+    /// component elsewhere in the app (`FileTranscriber` sanitizes a "/" out
+    /// of an imported file's stem for exactly that reason). On this path the
+    /// audio file is created at record START, before any name exists, so the
+    /// name must never reach a filesystem path at all.
+    ///
+    /// Pinning it here because "use the meeting name for the filename" is an
+    /// obvious-looking follow-up: `freshAudioURL` appends its argument as a
+    /// path component with no sanitizing of its own, so wiring the name in
+    /// would let "../../x" write outside the recordings directory. The title
+    /// itself is deliberately kept verbatim — the user reading their own
+    /// meeting name on their own screen is not a leak, and mangling it would
+    /// be the wrong fix.
+    func test_meeting_name_with_path_separators_cannot_escape_the_recordings_directory() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "PathEscape")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.nextRecordingTitle = "../../../etc/passwd: Q3 board call"
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        XCTAssertEqual(stored.title, "../../../etc/passwd: Q3 board call",
+                       "the title is display text and must survive verbatim — sanitizing it would be the wrong fix")
+        XCTAssertEqual((stored.audioFileName as NSString).deletingPathExtension,
+                       (url.lastPathComponent as NSString).deletingPathExtension,
+                       "the audio file is named at record start; the meeting name must not rename it")
+        for name in [stored.audioFileName, stored.transcriptFileName,
+                     stored.summaryFileName, stored.subtitleFileName] {
+            XCTAssertFalse(name.contains("/"),
+                           "\(name) is used as a single path component — a separator in it escapes the recordings directory")
+            XCTAssertFalse(name.contains(".."), "\(name) can traverse out of the recordings directory")
+        }
+        // The real invariant: every sidecar the store resolves for this
+        // recording still sits DIRECTLY inside the recordings directory.
+        // `standardizedFileURL` collapses any ".." on the way, which is what
+        // would expose an escape; symlinks are deliberately not resolved, so
+        // both sides stay the same string root (`/var` vs `/private/var` for a
+        // temp dir would otherwise differ for a sidecar that isn't on disk).
+        let expectedParent = store.recordingsDirectory.standardizedFileURL.path
+        for resolved in [store.transcriptURL(for: stored),
+                         store.summaryURL(for: stored),
+                         store.subtitleURL(for: stored)] {
+            XCTAssertEqual((resolved.standardizedFileURL.path as NSString).deletingLastPathComponent,
+                           expectedParent,
+                           "\(resolved.lastPathComponent) resolved outside the recordings directory")
+        }
+    }
+
+    /// NEGATIVE CONTROL — the folder pick is one-shot state held from before
+    /// the recording started, so the user can delete that folder in the
+    /// sidebar mid-recording. The recording must still be saved (never
+    /// silently dropped), and it must not be left tagged with a folder that
+    /// has no row in `store.folders` — that combination is reachable from
+    /// `store.folders` alone, which is what the sidebar is built from.
+    ///
+    /// This is the test that justifies the `store.assign` call in
+    /// `stopRecording`: `Recording(folder:)` already persists the name, so the
+    /// `assign` looks redundant and is a tempting deletion. Remove it and this
+    /// assertion fails — the row is filed under "Work" while `store.folders`
+    /// is empty.
+    func test_folder_deleted_mid_recording_still_saves_and_stays_reachable() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "FolderVanished")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        store.createFolder("Work")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.nextRecordingFolder = "Work"
+
+        // The user deletes the folder while the recording is still running.
+        store.deleteFolder("Work")
+        XCTAssertTrue(store.folders.isEmpty)
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        let stored = try XCTUnwrap(savedRecording(for: url),
+                                   "a vanished destination folder must not cost the user the recording")
+        if let folder = stored.folder {
+            XCTAssertTrue(store.folders.contains(folder),
+                          "recording filed under \"\(folder)\" but that folder has no row in store.folders — unreachable from the sidebar")
+            XCTAssertEqual(store.recordings(inFolder: folder).map(\.id), [stored.id])
+        }
+    }
+
+    /// NEGATIVE CONTROL for the MCP contract. `Recording.folder` is a metadata
+    /// label inside `recordings.json`, NOT a directory — nothing about a folder
+    /// choice moves the audio or the `.txt` sidecar out of
+    /// `recordingsDirectory`, which is the single location
+    /// `store-location.json` points a separate process at.
+    ///
+    /// So a recording filed at record time has to stay fully resolvable
+    /// through `MilaStoreReader` — the same reader `mila-mcp` uses. If a
+    /// future change ever made the destination a real folder on disk, this
+    /// fails: the reader would resolve `recordingsDirectory/<file>` and find
+    /// nothing.
+    func test_a_chosen_folder_and_meeting_name_stay_resolvable_to_an_external_reader() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "ExternalReader")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        store.createFolder("Work")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.nextRecordingFolder = "Work"
+        controller.nextRecordingTitle = "Weekly Sync"
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        let reader = MilaStoreReader(recordingsDirectory: store.recordingsDirectory,
+                                     storeFileURL: store.storeURL)
+
+        let byID = try XCTUnwrap(reader.recording(id: stored.id),
+                                 "mila-mcp could not resolve a recording filed at record time")
+        XCTAssertEqual(byID.title, "Weekly Sync")
+        XCTAssertEqual(byID.folder, "Work")
+        XCTAssertFalse(byID.audioFileName.contains("/"),
+                       "audioFileName must stay a single component relative to recordingsDirectory — the reader has no other root")
+        XCTAssertTrue(FileManager.default.fileExists(
+                        atPath: store.recordingsDirectory
+                            .appendingPathComponent(byID.audioFileName).path),
+                      "the reader resolves recordingsDirectory/<audioFileName>; a real per-recording folder would break that")
+
+        let listed = try reader.listRecordings(filter: .init(folder: "Work"))
+        XCTAssertEqual(listed.map(\.id), [stored.id],
+                       "list_recordings(folder:) must see a folder chosen at record time")
     }
 
     // MARK: - File import → enqueue → transcribe

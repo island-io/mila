@@ -459,6 +459,66 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         XCTAssertEqual(captured, .inline)
     }
 
+    /// A recording saved under a meeting name the user typed must not be
+    /// auto-titled: the baseline guard in `applyAutoSuggestedTitle` can't
+    /// protect it (the baseline IS the user's title), so the CLI suggestion
+    /// would replace the name they chose.
+    func test_present_skips_auto_title_when_the_user_named_the_recording() async throws {
+        let suite = UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.named.\(#function)")!
+        suite.removePersistentDomain(forName: "PostRecordingCoordinatorSendTests.named.\(#function)")
+        let llm = LLMSettings(defaults: suite,
+                              apiKeyKeychainKey: "PostRecordingCoordinatorSendTests.named.\(#function)")
+        llm.tool = .claude
+        llm.nameGenerationEnabled = true
+
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                callCount += 1
+                return "An LLM Title"
+            })
+
+        var rec = addCompletedRecording(text: "the transcript text")
+        rec.title = "Weekly Sync"
+        store.update(rec)
+
+        coordinator.present(rec, titleWasUserProvided: true)
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(callCount, 0, "the auto-title CLI must not run for a user-named recording")
+        XCTAssertEqual(store.recordings.first(where: { $0.id == rec.id })?.title, "Weekly Sync")
+        XCTAssertFalse(coordinator.autoSuggestingIDs.contains(rec.id))
+    }
+
+    /// Discard has to reach the vault, not just the store. Covers the wiring
+    /// `MilaApp` installs — without it the coordinator deletes the recording
+    /// and leaves its exported note behind.
+    func test_cancelAndDiscard_removes_the_obsidian_note() async throws {
+        let vault = tempRoot.appendingPathComponent("Vault", isDirectory: true)
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        let suite = "PostRecordingCoordinatorSendTests.obsidian.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let settings = ObsidianVaultSettings(defaults: defaults)
+        settings.enabled = true
+        settings.subfolder = ""
+        XCTAssertTrue(settings.setVault(vault))
+        let exporter = ObsidianExporter(settings: settings, defaults: defaults)
+        coordinator.obsidianExporter = exporter
+
+        let rec = addCompletedRecording(text: "the transcript text")
+        let note = try XCTUnwrap(exporter.export(rec), "precondition: the note was written")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: note.path))
+
+        coordinator.present(rec)
+        coordinator.cancelAndDiscard()
+
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: note.path),
+                       "discarding the recording must take its note out of the vault")
+    }
+
     // MARK: - Helpers
 
     /// Wait up to `timeoutSeconds` (default 5) for `condition` to hold, polling

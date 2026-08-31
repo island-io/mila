@@ -757,6 +757,9 @@ struct MilaApp: App {
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings
         actions.obsidianExporter = obsidian
+        // Discard un-exports: the note can already be in the vault by the time
+        // the user throws the recording away.
+        coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()

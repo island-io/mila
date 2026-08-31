@@ -891,6 +891,14 @@ final class RecordingStore: ObservableObject {
         return ids
     }
 
+    /// Size of a WAV that captured nothing. `AVAudioFile` reserves a 4 KB
+    /// header block on open, so a recording that never received a frame is
+    /// exactly this big — not the 44 bytes a raw WAV header would suggest.
+    /// The old 512-byte guard therefore never fired, and every empty capture
+    /// came back after the next launch as a "Recovered recording" row that
+    /// transcribed to nothing and settled at `.failed`.
+    static let emptyWAVByteCount = 4096
+
     /// Crash recovery: scan the recordings directory for `.wav` files that
     /// no Recording in the store points at. Each orphan was a recording in
     /// progress when the app died — the audio is on disk (AVAudioFile
@@ -911,10 +919,13 @@ final class RecordingStore: ObservableObject {
         for url in entries where url.pathExtension.lowercased() == "wav" {
             let name = url.lastPathComponent
             if referenced.contains(name) { continue }
-            // Skip empty files — AVAudioFile creates the WAV header on
-            // open but a 44-byte placeholder isn't worth recovering.
+            // Skip captures that hold no audio. The threshold is a byte count
+            // rather than a decoded frame count on purpose: a genuinely crashed
+            // recording has an UNFINALIZED header claiming zero frames while
+            // its samples are on disk, so asking AVAudioFile how long it is
+            // would discard exactly the recordings this sweep exists to save.
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            if size < 512 { continue }
+            if size <= Self.emptyWAVByteCount { continue }
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
             let recovered = Recording(
                 title: recoveryTitle(at: mtime),
