@@ -203,6 +203,46 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertEqual(stored.folder, "Brand New")
     }
 
+    /// A meeting name typed before recording survives the stop: the rename
+    /// sheet's background auto-title job must not hand it to the LLM and
+    /// write the suggestion back over it.
+    func test_stopRecording_does_not_auto_title_a_user_named_recording() async throws {
+        let suite = UserDefaults(suiteName: "QuickActionsControllerTests.autoTitle")!
+        suite.removePersistentDomain(forName: "QuickActionsControllerTests.autoTitle")
+        let llm = LLMSettings(defaults: suite,
+                              apiKeyKeychainKey: "QuickActionsControllerTests.autoTitle")
+        llm.tool = .claude
+        llm.nameGenerationEnabled = true
+
+        var callCount = 0
+        let coordinator = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                callCount += 1
+                return "An LLM Title"
+            })
+        let named = QuickActionsController(session: session,
+                                           store: store,
+                                           transcription: service,
+                                           languageSettings: languageSettings,
+                                           postRecording: coordinator)
+
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "UserNamed")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await named.startFakeRecordingForTesting(outputURL: url)
+        named.nextRecordingTitle = "Weekly Sync"
+
+        await named.stopRecording()
+        await named.awaitFinalizeTails()
+        try await Task.sleep(nanoseconds: 400_000_000)
+
+        XCTAssertEqual(callCount, 0, "the auto-title CLI must not run for a user-named recording")
+        let stored = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        XCTAssertEqual(stored.title, "Weekly Sync")
+    }
+
     // MARK: - Resolved recording title (meeting name override)
 
     /// An empty or whitespace-only meeting name falls back to the

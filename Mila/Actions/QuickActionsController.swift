@@ -652,6 +652,11 @@ final class QuickActionsController: ObservableObject {
         // below once the recording is built so it doesn't carry over.
         let finalTitle = Self.resolvedRecordingTitle(userProvided: nextRecordingTitle,
                                                      defaultTitle: title)
+        // Read before the clear below: the rename sheet needs to know the
+        // title came from the user, so its background auto-title job doesn't
+        // hand the name straight to the LLM and overwrite it.
+        let titleWasUserProvided = !nextRecordingTitle
+            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         // Same one-shot rule as the title: capture, apply, then clear so
         // the next recording in this launch does not inherit the folder.
         let chosenFolder = nextRecordingFolder
@@ -759,7 +764,7 @@ final class QuickActionsController: ObservableObject {
             )
         }
         if sleepReason == nil {
-            postRecording.present(recording)
+            postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
         }
 
         // ---- INLINE LIVE-PIPELINE DRAIN: finalize whatever was still
