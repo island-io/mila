@@ -426,6 +426,34 @@ final class MilaStoreReaderTests: XCTestCase {
                        "bounded by `limit`, not by the size of the store")
     }
 
+    /// A caller asking for nothing must not pay for the whole store. Both sort
+    /// keys used to reach the scan with a cap of zero and throw the work away
+    /// in the trailing `prefix(0)`: relevance scored all 20 recordings, and the
+    /// date path — whose early stop is only checked *after* a hit is appended —
+    /// rendered transcripts up to the first match. The answer was always empty;
+    /// the point of this test is that it now costs nothing to produce.
+    ///
+    /// `limit` reaches the reader `min`-clamped but with no lower bound (see
+    /// `MilaMCPToolHandlers`), so a client really can send `limit: 0`.
+    func test_a_non_positive_limit_reads_nothing_at_all() throws {
+        let log = SidecarReadLog()
+        let recordings = (0..<20).map { rec("Note \($0)", daysAgo: Double($0)) }
+        let reader = try writeStore(recordings, sidecarReads: log)
+        for recording in recordings {
+            try writeSidecar("budget review", for: recording, in: reader)
+        }
+
+        for sort in [MilaStoreReader.SearchSortKey.relevance, .createdAt] {
+            for limit in [0, -5] {
+                let hits = try reader.searchTranscripts(query: "budget",
+                                                        sort: sort, limit: limit)
+                XCTAssertTrue(hits.isEmpty,
+                              "sort \(sort.rawValue), limit \(limit)")
+            }
+        }
+        XCTAssertEqual(log.count, 0, "an empty answer costs no reads")
+    }
+
     /// The early stop must be a pure optimisation: a bounded date search has
     /// to return exactly the prefix the unbounded one does, in both
     /// directions, match counts and snippets included.

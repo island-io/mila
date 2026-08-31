@@ -302,7 +302,10 @@ public struct MilaStoreReader: Sendable {
     ///
     /// **What `limit` bounds.** `sort: .createdAt` is bounded by it: date
     /// order is the traversal order, so the scan stops at the `limit`-th hit
-    /// and never opens the rest of the store.
+    /// and opens no transcript past it. What it bounds is that per-recording
+    /// transcript work; `recordings.json` is still decoded, filtered and
+    /// sorted whole by `listRecordings`, because that metadata is where the
+    /// traversal order the early stop depends on comes from.
     ///
     /// `sort: .relevance` (the default) is NOT, and cannot be: ranking by
     /// match count has to score every candidate before it knows which few
@@ -332,6 +335,14 @@ public struct MilaStoreReader: Sendable {
         case .relevance: sortedByRecency = false
         }
         let cap = max(0, limit)
+        // A caller asking for nothing gets nothing without the store being
+        // touched. The trailing `prefix(cap)` already returned empty, but only
+        // after paying for it: the relevance path scores every candidate, and
+        // even the date path renders transcripts until the *first* hit, because
+        // the early stop below is checked after a hit is appended. Same answer,
+        // zero reads. `limit` is `min`-clamped upstream in the handler but has
+        // no lower bound there, so `limit: 0` is reachable from a client.
+        guard cap > 0 else { return [] }
         let candidates = try listRecordings(filter: Filter(speaker: speaker),
                                             sort: .createdAt,
                                             order: sortedByRecency ? order : .desc,
