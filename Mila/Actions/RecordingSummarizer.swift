@@ -657,9 +657,16 @@ final class RecordingSummarizer: ObservableObject {
     /// worse than not having attempted it. So: if a fence is confidently
     /// identifiable and what it wraps is envelope-shaped, that is the payload;
     /// otherwise the ORIGINAL text is judged on its own merits. An
-    /// unrecognised wrapper — an over-long prefix, content after the closer,
-    /// no closer at all, or a shape neither of us has thought of — costs
-    /// nothing beyond the failed attempt.
+    /// unrecognised wrapper — an over-long label, quoted material rather than
+    /// a wrapper, or a shape nobody enumerated — costs nothing beyond the
+    /// failed attempt.
+    ///
+    /// The reverse is NOT symmetric, which is the trap this went through
+    /// twice: unwrapping too eagerly is not free. A candidate that is
+    /// object-shaped but carries no `"summary"` gets BLANKED as
+    /// `unreadableEnvelope`, so substituting a quoted config snippet for a
+    /// real prose summary destroys it. Hence `unfencedBody` still refuses the
+    /// cases where the block is plainly quoted material.
     ///
     /// The first cut of this stripped the fence *before* the shape test and
     /// returned nil when the wrapper looked wrong, which re-broke the very
@@ -679,12 +686,12 @@ final class RecordingSummarizer: ObservableObject {
     /// wrapper I can be confident about" — NOT "not an envelope"; the caller
     /// falls back to the unmodified text, never to a failed parse.
     private static func unfencedBody(in trimmed: String) -> String? {
-        guard let opening = trimmed.range(of: "```") else { return nil }
-        // Only a short label may precede the fence. THIS guard is load-bearing
-        // and is the one restriction worth keeping: without it, a long prose
-        // summary that happens to quote a fenced JSON object would have that
-        // object substituted for it and then be blanked — losing a good
-        // summary, which is worse than showing a blob.
+        guard let opening = Self.lineLeadingFence(in: trimmed, from: trimmed.startIndex)
+        else { return nil }
+        // Only a short label may precede the fence. Without this, a long prose
+        // summary that quotes a fenced JSON object would have that object
+        // substituted for it and then be blanked — losing a good summary,
+        // which is worse than showing a blob.
         guard trimmed[..<opening.lowerBound].count <= 80 else { return nil }
         let afterOpening = trimmed[opening.upperBound...]
         // Drop the info string (`json`) up to the end of the fence line.
@@ -692,18 +699,43 @@ final class RecordingSummarizer: ObservableObject {
         if let newline = afterOpening.firstIndex(of: "\n") {
             inner = afterOpening[afterOpening.index(after: newline)...]
         }
-        // Neither a MISSING closer nor content after one is a veto. This
-        // function only ever offers a candidate; `envelopeBody` re-tests the
-        // original text when the candidate is not envelope-shaped, so being
-        // generous here cannot cost anything — whereas vetoing can, and did:
-        // an unclosed fence (the model stopped early) sent a labelled
-        // envelope to `.plain` as a raw blob, because a labelled envelope has
-        // no leading `{` to fall back on and `findFirstJSONStructure` gives up
-        // on the odd unescaped quote this whole path exists for.
-        if let closing = inner.range(of: "```") {
-            inner = inner[..<closing.lowerBound]
+        if let closing = Self.lineLeadingFence(in: trimmed, from: inner.startIndex) {
+            // Content after the closer means the block is material QUOTED
+            // INSIDE a larger prose summary, not a wrapper around the whole
+            // output. Taking the block would substitute a config snippet for
+            // the summary and then blank it, discarding the real prose either
+            // side. So this stays a veto, and the caller judges the original.
+            guard trimmed[closing.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            else { return nil }
+            inner = trimmed[inner.startIndex..<closing.lowerBound]
         }
+        // A MISSING closer, by contrast, is not a veto: the model simply
+        // stopped early, there is no trailing prose to lose, and what follows
+        // the opener is still the best candidate.
         return inner.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The next ```` ``` ```` that BEGINS A LINE, at or after `from`.
+    ///
+    /// A fence delimits a block only at the start of a line. Backticks in the
+    /// middle of one are content — a summary quoting `` `code` `` — and must
+    /// neither open a block nor close one. Matching them anywhere let an inner
+    /// run masquerade as the closer, which truncated the candidate mid-value
+    /// and produced a short, plausible-looking WRONG summary: worse than the
+    /// blob, because nothing about it looks broken.
+    private static func lineLeadingFence(
+        in text: String, from start: String.Index
+    ) -> Range<String.Index>? {
+        var searchStart = start
+        while let candidate = text.range(of: "```", range: searchStart..<text.endIndex) {
+            if candidate.lowerBound == text.startIndex
+                || text[text.index(before: candidate.lowerBound)] == "\n" {
+                return candidate
+            }
+            searchStart = candidate.upperBound
+        }
+        return nil
     }
 
     /// The envelope-shaped payload in `text`, or nil when this is prose that

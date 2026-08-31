@@ -843,43 +843,79 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(parsed.items.map(\.text), ["Ship the retry change"])
     }
 
-    /// The unwrapper must never VETO, only offer. Two shapes proved that: a
-    /// fence the model never closed (it stopped early), and a fence followed
-    /// by a chatty sign-off. Both used to abort the unwrap, and a labelled
-    /// envelope has no leading `{` of its own to fall back on.
+    /// An UNCLOSED fence must not abort the unwrap: the model simply stopped
+    /// early, and a labelled envelope has no leading `{` of its own to fall
+    /// back on.
     ///
-    /// Each payload carries an ODD number of unescaped quotes, which leaves
+    /// The payload carries an ODD number of unescaped quotes, which leaves
     /// `findFirstJSONStructure`'s `inString` inverted so the balanced-block
     /// search fails outright — exactly the malformed input this salvage path
     /// exists for. The fence candidate is therefore the ONLY route to the
     /// leading-`{` bypass, which is what makes these assertions discriminating
     /// rather than incidentally true.
-    func test_parse_salvages_a_wrapped_envelope_when_the_fence_is_unclosed_or_trailed() {
+    func test_parse_salvages_a_wrapped_envelope_when_the_fence_is_never_closed() {
         let unclosed = #"""
         Here is the summary:
         ```json
         {"summary": "He said "hi" and left, "items": []}
         """#
 
-        let trailed = #"""
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: unclosed)
+
+        XCTAssertEqual(parsed.origin, .salvagedEnvelope,
+                       "an unclosed fence must still reach the salvage")
+        XCTAssertFalse(parsed.summary.hasPrefix("{"),
+                       "a raw blob must never be shown as the summary")
+        XCTAssertFalse(parsed.summary.contains("```"),
+                       "fence scaffolding must not reach the summary")
+        XCTAssertTrue(parsed.summary.contains("He said"), "got \(parsed.summary)")
+    }
+
+    /// A fenced block with prose AFTER it is quoted material inside a real
+    /// summary — a meeting that showed a config — not a wrapper around the
+    /// output. Taking the block substitutes the snippet for the summary and
+    /// then blanks it (no `"summary"` key → `unreadableEnvelope`), destroying
+    /// the prose on both sides. The lead-in here is deliberately SHORT, so the
+    /// 80-char label guard cannot be what saves it: the structural check has
+    /// to.
+    func test_parse_keeps_prose_that_continues_after_a_quoted_fenced_object() {
+        let prose = """
+        Notes:
+        ```json
+        {"retries": 3}
+        ```
+        The team agreed to raise it next sprint after the incident review.
+        """
+
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: prose)
+
+        XCTAssertEqual(parsed.origin, .plain)
+        XCTAssertTrue(parsed.summary.contains("next sprint after the incident review"),
+                      "the prose after the block must survive; got \(parsed.summary)")
+    }
+
+    /// Backticks in the MIDDLE of a line are content, not a fence. Closing the
+    /// block at the first inner run truncated the candidate mid-value and
+    /// stored a short, plausible-looking WRONG summary ("We fixed the") —
+    /// worse than a blob, because nothing about it looks broken, and the retry
+    /// gate shuts on it just the same.
+    func test_parse_does_not_let_inner_backticks_truncate_a_fenced_salvage() {
+        // Unescaped quotes around "done" break the object decode, which is
+        // what routes this to the salvage in the first place.
+        let fenced = #"""
         Here is the summary:
         ```json
-        {"summary": "He said "hi" and left, "items": []}
+        {"summary": "We fixed the ```retry``` helper and called it "done".", "items": []}
         ```
-        Hope that helps!
         """#
 
-        for (shape, raw) in [("unclosed fence", unclosed), ("trailed fence", trailed)] {
-            let parsed = RecordingSummarizer.parseSummaryAndItems(from: raw)
-            XCTAssertEqual(parsed.origin, .salvagedEnvelope,
-                           "\(shape): must still reach the salvage")
-            XCTAssertFalse(parsed.summary.hasPrefix("{"),
-                           "\(shape): a raw blob must never be shown as the summary")
-            XCTAssertFalse(parsed.summary.contains("```"),
-                           "\(shape): fence scaffolding must not reach the summary")
-            XCTAssertTrue(parsed.summary.contains("He said"),
-                          "\(shape): got \(parsed.summary)")
-        }
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: fenced)
+
+        XCTAssertEqual(parsed.origin, .salvagedEnvelope)
+        XCTAssertTrue(parsed.summary.hasSuffix("called it \"done\"."),
+                      "the summary must not be clipped at an inner backtick run; got \(parsed.summary)")
+        XCTAssertTrue(parsed.summary.contains("```retry```"),
+                      "the quoted backticks are part of the summary text")
     }
 
     /// The counterweight to the test above, and the reason the fix is not
