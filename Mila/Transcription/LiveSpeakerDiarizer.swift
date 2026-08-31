@@ -264,14 +264,17 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// `names` is nil.
     ///
     /// Two callers, both wired in `MilaApp.init`, both answering the same
-    /// question — "the user just revoked something; does the recording that
-    /// is already running honour it?":
+    /// question — "the feature just stopped being allowed to do this; does
+    /// the recording that is already running honour it?":
     ///
     ///   * `SpeakerProfileStore`'s deletion observer, passing the deleted
     ///     `names` (or nil for "delete everything");
-    ///   * `VoiceRecognitionSettings`' enabled observer on opt-out, passing
-    ///     nil — switching the feature off revokes every seeded voice at
-    ///     once, not a named subset.
+    ///   * `VoiceRecognitionSettings`' **gate** observer, passing nil — the
+    ///     feature ceasing to be configured revokes every seeded voice at
+    ///     once, not a named subset. That covers both halves of the gate:
+    ///     the user opting out, and diarization itself being switched off or
+    ///     going unavailable, which is the same revocation reached from the
+    ///     other side (#215).
     ///
     /// Deleting voice profiles is a privacy action, and `seedPool` gave this
     /// object its own copy of the centroids at record-start. Deleting the

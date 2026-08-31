@@ -1,5 +1,16 @@
 import Foundation
+import OSLog
 import MilaKit
+
+// Every path this file logs is doubly user content: the vault root is a folder
+// the user picked, the subfolder under it is a Mila folder name they typed, and
+// the note's own filename is `<date> <title>.md` — the recording title,
+// verbatim. So paths are `.private` throughout and the recording's UUID is the
+// public correlation key; `NSError.domain`/`code` stay public because they are
+// what separates "no permission" from a full disk or a missing vault, and they
+// name nothing. (Issue #213, CWE-532.)
+private let obsidianLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                 category: "ObsidianExporter")
 
 /// Writes a completed recording into the configured Obsidian vault as a
 /// Markdown note, then optionally kicks the git sync.
@@ -121,14 +132,23 @@ final class ObsidianExporter: ObservableObject {
         // It also covers what no naming rule can — a symlink inside the vault
         // whose target is outside it, which is spelled entirely under the vault.
         guard ObsidianPathSanitizer.isContained(destDir, in: vault, fileManager: fileManager) else {
-            print("ObsidianExporter: refusing to write outside the vault: \(destDir.path)")
+            obsidianLog.error("""
+                refusing to write outside the vault for \
+                \(recording.id, privacy: .public): \(destDir.path, privacy: .private)
+                """)
             return nil
         }
 
         do {
             try fileManager.createDirectory(at: destDir, withIntermediateDirectories: true)
         } catch {
-            print("ObsidianExporter: failed to create \(destDir.path): \(error)")
+            let ns = error as NSError
+            obsidianLog.error("""
+                failed to create vault directory for \(recording.id, privacy: .public) \
+                (\(destDir.path, privacy: .private)) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return nil
         }
 
@@ -147,7 +167,10 @@ final class ObsidianExporter: ObservableObject {
         // Re-checked for the file itself, not just its directory: the note name
         // could already exist as a symlink pointing out of the vault.
         guard ObsidianPathSanitizer.isContained(target, in: vault, fileManager: fileManager) else {
-            print("ObsidianExporter: refusing to write outside the vault: \(target.path)")
+            obsidianLog.error("""
+                refusing to write outside the vault for \
+                \(recording.id, privacy: .public): \(target.path, privacy: .private)
+                """)
             return nil
         }
         let newRelative = Self.relativePath(of: target, vault: vault)
@@ -167,7 +190,13 @@ final class ObsidianExporter: ObservableObject {
         do {
             try Self.markdown(for: recording).write(to: target, atomically: true, encoding: .utf8)
         } catch {
-            print("ObsidianExporter: failed to write \(target.path): \(error)")
+            let ns = error as NSError
+            obsidianLog.error("""
+                failed to write note for \(recording.id, privacy: .public) \
+                (\(target.path, privacy: .private)) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return nil
         }
         index[key] = newRelative

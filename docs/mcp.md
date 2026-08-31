@@ -72,6 +72,25 @@ cp -R skills/mila-meetings ~/.claude/skills/
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
 
+### What a search costs
+
+Nothing is cached — every call reads the store as it is right now, which is
+what makes the answers trustworthy while you're still recording. So the
+work a `search_transcripts` call does is worth knowing:
+
+- `sort: "created_at"` stops at the `limit`-th match: no transcript past it is
+  opened or rendered, however large the store is. The `recordings.json` index
+  is still read whole — it is one small file, and the date order the early stop
+  relies on comes from it — so what `limit` bounds here is the per-recording
+  transcript work, not the metadata read.
+- `sort: "relevance"` (the default) ranks by match count, and that means
+  scoring every recording before it can pick the top few. Its cost grows
+  with the size of your library. Recordings with speaker labels are scored
+  from `recordings.json` alone; the rest cost one transcript file read each.
+
+If you only want the most recent mentions, `sort: "created_at"` with a small
+`limit` is both cheaper and usually the better question.
+
 ## Reading past recordings
 
 Just ask, e.g.:

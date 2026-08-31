@@ -17,9 +17,40 @@ final class MilaStoreReaderTests: XCTestCase {
 
     // MARK: - Fixtures
 
+    /// Every sidecar read one reader performed, in order.
+    ///
+    /// The cost #201 is about — a `.txt` read per recording per search — is
+    /// invisible in the results: a read whose text is discarded changes
+    /// nothing a caller can assert on. Counting the reads is the only way an
+    /// assertion can tell the bounded search from the exhaustive one.
+    ///
+    /// `@unchecked Sendable` + a lock because `MilaStoreReader.SidecarReader`
+    /// is `@Sendable` and so may only capture `Sendable` values; the tests
+    /// below all drive it from one thread.
+    private final class SidecarReadLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var urls: [URL] = []
+
+        var count: Int { read { $0.count } }
+        var fileNames: [String] { read { $0.map(\.lastPathComponent) } }
+
+        func record(_ url: URL) {
+            lock.lock()
+            defer { lock.unlock() }
+            urls.append(url)
+        }
+
+        private func read<T>(_ body: ([URL]) -> T) -> T {
+            lock.lock()
+            defer { lock.unlock() }
+            return body(urls)
+        }
+    }
+
     private func writeStore(_ recordings: [StoredRecording],
                             recordingsDir: URL? = nil,
-                            storeFile: URL? = nil) throws -> MilaStoreReader {
+                            storeFile: URL? = nil,
+                            sidecarReads log: SidecarReadLog? = nil) throws -> MilaStoreReader {
         let recsDir = recordingsDir ?? root.appendingPathComponent("Recordings", isDirectory: true)
         let store = storeFile ?? root.appendingPathComponent("recordings.json")
         try FileManager.default.createDirectory(at: recsDir, withIntermediateDirectories: true)
@@ -27,7 +58,24 @@ final class MilaStoreReaderTests: XCTestCase {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(recordings).write(to: store)
-        return MilaStoreReader(recordingsDirectory: recsDir, storeFileURL: store)
+        guard let log else {
+            return MilaStoreReader(recordingsDirectory: recsDir, storeFileURL: store)
+        }
+        // Counts, then reads for real — the reader under test still sees
+        // exactly what production sees.
+        return MilaStoreReader(recordingsDirectory: recsDir, storeFileURL: store,
+                               readSidecar: { url in
+                                   log.record(url)
+                                   return MilaStoreReader.readSidecarFromDisk(url)
+                               })
+    }
+
+    /// Writes the `.txt` sidecar the app keeps beside the audio file.
+    private func writeSidecar(_ text: String, for recording: StoredRecording,
+                              in reader: MilaStoreReader) throws {
+        try text.write(to: reader.recordingsDirectory
+            .appendingPathComponent(recording.transcriptFileName),
+                       atomically: true, encoding: .utf8)
     }
 
     private func rec(_ title: String, daysAgo: Double, duration: Double = 60,
@@ -306,5 +354,192 @@ final class MilaStoreReaderTests: XCTestCase {
                        ["Often", "Once"])
         XCTAssertEqual(try reader.searchTranscripts(query: "kafka", sort: .createdAt)
             .map(\.recording.title), ["Once", "Often"])
+    }
+
+    // MARK: - What a search costs (#201)
+
+    /// NEGATIVE CONTROL. A diarized recording's named transcript is rendered
+    /// from segments that `recordings.json` already handed over; its `.txt`
+    /// sidecar is not part of that rendering at all. The fallback expression
+    /// was nonetheless evaluated EAGERLY, so every recording a search touched
+    /// cost one file read whose text was thrown away — the "N synchronous
+    /// file reads" of #201, unobservable in the output because the results
+    /// were always right, just paid for twice.
+    ///
+    /// Against the unfixed reader this asserts 0 and gets 20.
+    func test_search_reads_no_sidecars_for_diarized_recordings() throws {
+        let log = SidecarReadLog()
+        let recordings = (0..<20).map {
+            rec("Meeting \($0)", daysAgo: Double($0), segments: johnSegments())
+        }
+        let reader = try writeStore(recordings, sidecarReads: log)
+        for recording in recordings {
+            try writeSidecar("hello team", for: recording, in: reader)
+        }
+
+        XCTAssertEqual(try reader.searchTranscripts(query: "hello", limit: 20).count, 20,
+                       "precondition: every recording matches, so none is skipped by luck")
+        XCTAssertEqual(log.count, 0,
+                       "a diarized transcript renders from segments already in memory — "
+                       + "opening its sidecar is work with no observable effect")
+    }
+
+    /// The same waste on the `get_transcript` path, pinned separately from
+    /// search so a change to the search loop cannot hide a regression here.
+    func test_named_transcript_does_not_read_the_sidecar_it_would_discard() throws {
+        let log = SidecarReadLog()
+        let diarized = rec("Diarized", daysAgo: 0, segments: johnSegments())
+        let plain = rec("Plain", daysAgo: 1)
+        let reader = try writeStore([diarized, plain], sidecarReads: log)
+        try writeSidecar("discarded", for: diarized, in: reader)
+        try writeSidecar("used", for: plain, in: reader)
+
+        XCTAssertEqual(reader.namedTranscript(for: diarized),
+                       "SPEAKER_00: hello team\nSPEAKER_01: hi, thanks for joining")
+        XCTAssertEqual(log.count, 0)
+        XCTAssertEqual(reader.namedTranscript(for: plain), "used",
+                       "and a recording with no speaker labels still gets its sidecar — "
+                       + "there its text is the only transcript there is")
+        XCTAssertEqual(log.fileNames, ["Plain.txt"])
+    }
+
+    /// The other half of #201: for a recording with no speaker labels the
+    /// sidecar read is real work, not waste. Ranking by date does not need to
+    /// score the whole store to know the answer, though — date order is the
+    /// traversal order — so the scan stops at the `limit`-th hit.
+    ///
+    /// Against the unfixed reader this asserts 5 and gets 30: it read every
+    /// sidecar in the store to return five results.
+    func test_date_sorted_search_stops_reading_at_the_limit() throws {
+        let log = SidecarReadLog()
+        let recordings = (0..<30).map { rec("Note \($0)", daysAgo: Double($0)) }
+        let reader = try writeStore(recordings, sidecarReads: log)
+        for recording in recordings {
+            try writeSidecar("budget review", for: recording, in: reader)
+        }
+
+        let hits = try reader.searchTranscripts(query: "budget", sort: .createdAt, limit: 5)
+        XCTAssertEqual(hits.map(\.recording.title),
+                       ["Note 0", "Note 1", "Note 2", "Note 3", "Note 4"],
+                       "the newest five — the same answer the exhaustive scan gave")
+        XCTAssertEqual(log.count, 5,
+                       "bounded by `limit`, not by the size of the store")
+    }
+
+    /// A caller asking for nothing must not pay for the whole store. Both sort
+    /// keys used to reach the scan with a cap of zero and throw the work away
+    /// in the trailing `prefix(0)`: relevance scored all 20 recordings, and the
+    /// date path — whose early stop is only checked *after* a hit is appended —
+    /// rendered transcripts up to the first match. The answer was always empty;
+    /// the point of this test is that it now costs nothing to produce.
+    ///
+    /// `limit` reaches the reader `min`-clamped but with no lower bound (see
+    /// `MilaMCPToolHandlers`), so a client really can send `limit: 0`.
+    func test_a_non_positive_limit_reads_nothing_at_all() throws {
+        let log = SidecarReadLog()
+        let recordings = (0..<20).map { rec("Note \($0)", daysAgo: Double($0)) }
+        let reader = try writeStore(recordings, sidecarReads: log)
+        for recording in recordings {
+            try writeSidecar("budget review", for: recording, in: reader)
+        }
+
+        for sort in [MilaStoreReader.SearchSortKey.relevance, .createdAt] {
+            for limit in [0, -5] {
+                let hits = try reader.searchTranscripts(query: "budget",
+                                                        sort: sort, limit: limit)
+                XCTAssertTrue(hits.isEmpty,
+                              "sort \(sort.rawValue), limit \(limit)")
+            }
+        }
+        XCTAssertEqual(log.count, 0, "an empty answer costs no reads")
+    }
+
+    /// The early stop must be a pure optimisation: a bounded date search has
+    /// to return exactly the prefix the unbounded one does, in both
+    /// directions, match counts and snippets included.
+    func test_bounded_date_search_returns_the_same_prefix_as_the_full_scan() throws {
+        let recordings = (0..<8).map { i in
+            rec("Sync \(i)", daysAgo: Double(i),
+                segments: [.init(start: 0, end: 1, text: "budget \(i)", speaker: "SPEAKER_00")])
+        }
+        let reader = try writeStore(recordings)
+        for order in [MilaStoreReader.SortOrder.desc, .asc] {
+            let full = try reader.searchTranscripts(query: "budget", sort: .createdAt,
+                                                    order: order, limit: Int.max)
+            let bounded = try reader.searchTranscripts(query: "budget", sort: .createdAt,
+                                                       order: order, limit: 3)
+            XCTAssertEqual(full.count, 8, "order \(order.rawValue)")
+            XCTAssertEqual(bounded.map(\.recording.title),
+                           Array(full.map(\.recording.title).prefix(3)),
+                           "order \(order.rawValue)")
+            XCTAssertEqual(bounded.map(\.matchCount),
+                           Array(full.map(\.matchCount).prefix(3)),
+                           "order \(order.rawValue)")
+            XCTAssertEqual(bounded.map(\.snippets),
+                           Array(full.map(\.snippets).prefix(3)),
+                           "order \(order.rawValue)")
+        }
+    }
+
+    /// Relevance ranking still scores every candidate, and must: taking the
+    /// top few by match count needs all the counts. Pinned over a MIXED
+    /// store — one transcript rendered from segments, one that exists only in
+    /// its sidecar, one that matches on title alone — so neither the lazy
+    /// fallback nor the containment gate can quietly change which text is
+    /// searched or how it is counted.
+    func test_relevance_ranking_is_unchanged_across_a_mixed_store() throws {
+        let diarized = rec("Diarized", daysAgo: 2, segments: [
+            .init(start: 0, end: 1, text: "budget budget", speaker: "SPEAKER_00"),
+            .init(start: 1, end: 2, text: "and the budget again", speaker: "SPEAKER_01"),
+        ])
+        let sidecarOnly = rec("Plain", daysAgo: 1)
+        let titleOnly = rec("Budget review", daysAgo: 0)
+        let reader = try writeStore([diarized, sidecarOnly, titleOnly])
+        try writeSidecar("we cut the budget", for: sidecarOnly, in: reader)
+        try writeSidecar("nothing relevant here", for: titleOnly, in: reader)
+
+        let hits = try reader.searchTranscripts(query: "budget")
+        XCTAssertEqual(hits.map(\.recording.title), ["Diarized", "Budget review", "Plain"],
+                       "three matches first by count, then newest-first on the tie")
+        XCTAssertEqual(hits.map(\.matchCount), [3, 1, 1])
+        XCTAssertEqual(hits.map(\.snippets), [
+            ["SPEAKER_00: budget budget\nSPEAKER_01: and the budget again",
+             "SPEAKER_00: budget budget\nSPEAKER_01: and the budget again"],
+            [],
+            ["we cut the budget"],
+        ], "a title-only match carries no snippet; the sidecar-only one does")
+    }
+
+    /// The containment check is a gate on the per-line pass, never a
+    /// replacement for it. A query containing a newline matches the joined
+    /// transcript and no single line, so it must still come back as no hit —
+    /// the counts a caller sees stay per-line.
+    func test_a_query_spanning_a_line_break_still_matches_nothing() throws {
+        let recording = rec("Multi", daysAgo: 0, segments: johnSegments())
+        let reader = try writeStore([recording])
+        XCTAssertEqual(reader.namedTranscript(for: recording),
+                       "SPEAKER_00: hello team\nSPEAKER_01: hi, thanks for joining",
+                       "precondition: the two turns are on separate lines")
+        XCTAssertEqual(try reader.searchTranscripts(query: "team\nSPEAKER_01").count, 0)
+    }
+
+    /// The trashed filter lives in `listRecordings`, which produces the
+    /// candidates, so search inherits it — and must keep inheriting it: a
+    /// trashed recording that matches may neither appear in the results nor
+    /// have its transcript opened, whichever ranking or `limit` is in play.
+    func test_search_never_reads_or_returns_a_trashed_recording() throws {
+        let log = SidecarReadLog()
+        let live = rec("Live", daysAgo: 1)
+        let trashed = rec("Trashed", daysAgo: 0, deleted: true)
+        let reader = try writeStore([live, trashed], sidecarReads: log)
+        try writeSidecar("budget talk", for: live, in: reader)
+        try writeSidecar("budget talk", for: trashed, in: reader)
+
+        for sort in [MilaStoreReader.SearchSortKey.relevance, .createdAt] {
+            let hits = try reader.searchTranscripts(query: "budget", sort: sort, limit: 10)
+            XCTAssertEqual(hits.map(\.recording.title), ["Live"], "sort \(sort.rawValue)")
+        }
+        XCTAssertEqual(log.fileNames, ["Live.txt", "Live.txt"],
+                       "a trashed recording's transcript is never opened, let alone returned")
     }
 }

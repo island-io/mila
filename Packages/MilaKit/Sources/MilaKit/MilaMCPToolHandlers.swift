@@ -129,7 +129,9 @@ public struct MilaMCPToolHandlers: Sendable {
             description: """
             Full-text search over recording titles and transcript text (case- and \
             diacritic-insensitive). Returns matching recordings with short context snippets; \
-            follow up with get_transcript for the full text.
+            follow up with get_transcript for the full text. Relevance ranking has to score \
+            every recording, so when you just want the latest mentions prefer \
+            sort "created_at", which stops at `limit` matches.
             """,
             inputSchema: [
                 "type": "object",

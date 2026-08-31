@@ -88,9 +88,23 @@ final class RecordingStore: ObservableObject {
            let legacy = legacyRoots.first(where: { fm.fileExists(atPath: $0.path) }) {
             do {
                 try fm.moveItem(at: legacy, to: newRoot)
-                print("RecordingStore: migrated \(legacy.path) -> \(newRoot.path)")
+                // Deliberately `.public`, both paths and the error text. These
+                // are the fixed legacy app-support roots
+                // (`…/Application Support/IslandWhisper` or `…/IvritWhisper`)
+                // and the fixed new one (`…/Mila`) — this runs BEFORE any user
+                // storage override exists, and none of the three names can be
+                // anything the user chose. A once-per-upgrade migration that
+                // fails silently is unfixable by anyone; the paths are the
+                // report. (Issue #213.)
+                recStoreLog.log("""
+                    migrated \(legacy.path, privacy: .public) -> \
+                    \(newRoot.path, privacy: .public)
+                    """)
             } catch {
-                print("RecordingStore: migration from \(legacy.lastPathComponent) failed (\(error)) — falling back to fresh dir")
+                recStoreLog.error("""
+                    migration from \(legacy.lastPathComponent, privacy: .public) failed \
+                    (\(error.localizedDescription, privacy: .public)) — falling back to fresh dir
+                    """)
             }
         }
         self.init(rootDirectory: newRoot)
@@ -995,7 +1009,17 @@ final class RecordingStore: ObservableObject {
             let data = try JSONEncoder().encode(voiceMemoTombstones)
             try data.write(to: tombstonesURL, options: .atomic)
         } catch {
-            print("RecordingStore tombstones persist error: \(error)")
+            // Deliberately `.public`, and the second of the two writes that
+            // still are — the other is the store-location pointer above.
+            // `tombstonesURL` is anchored to `originalRootDirectory`, which
+            // `relocateRecordings` never moves (it moves `recordingsDirectory`
+            // / `storeURL` / `foldersURL` and leaves this alone), so the folder
+            // Cocoa quotes in the message can only ever be “Mila”. Contrast
+            // `persist()` / `persistFolders()` below, which follow the user's
+            // chosen directory and therefore redact. Was a bare `print`, which
+            // is public with no annotation to reason about at all.
+            // (Issue #213.)
+            recStoreLog.error("tombstones persist error: \(error.localizedDescription, privacy: .public)")
         }
     }
 

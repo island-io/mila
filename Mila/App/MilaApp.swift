@@ -5,6 +5,13 @@ import OSLog
 import Sparkle
 import TranscriptionCore
 
+/// File-scope destination for the launch-recovery sweep, matching the
+/// convention in `RecordingStore` / `TranscriptionService`. The rest of this
+/// file constructs `os.Logger` inline at each site; those lines are UI-test
+/// seams and Live AI wiring, and are left as they are.
+private let appLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                            category: "MilaApp")
+
 /// Wraps Sparkle's `SPUStandardUpdaterController` so SwiftUI menu items can
 /// observe `canCheckForUpdates` and disable themselves while a check is
 /// already in flight. Created once at app launch — Sparkle starts its
@@ -641,21 +648,37 @@ struct MilaApp: App {
         // …and the third holder of copied voice data: the live pool. The two
         // lines above unload the profiles (`SpeakerProfileStore`'s own
         // observer) and drop the snapshots, but `seedPool` handed the
-        // diarizer its own copy of every centroid at record-start, so an
-        // opt-out mid-recording otherwise leaves `assign` matching against
-        // stored voices for the rest of it. The write gates stop the result
-        // being persisted; they do not stop it being *read*, and the user
-        // still watches their transcript auto-fill with names from a feature
-        // they just switched off.
+        // diarizer its own copy of every centroid at record-start, so the
+        // feature becoming unusable mid-recording otherwise leaves `assign`
+        // matching against stored voices for the rest of it. The write gates
+        // stop the result being persisted; they do not stop it being *read*,
+        // and the user still watches their transcript auto-fill with names
+        // from a feature that is no longer on.
         //
         // Exactly the deletion path's problem, so it gets the deletion
-        // path's remedy — see `addDeletionObserver` below. Opt-out is the
+        // path's remedy — see `addDeletionObserver` below. This one is the
         // broader of the two, so it forgets every seeded entry rather than
         // named ones.
-        voiceSettings.addEnabledObserver { [weak liveDiar] nowEnabled in
-            guard !nowEnabled else { return }
+        //
+        // Registered on the **gate**, not the toggle. `isConfigured` is
+        // `isEnabled && diarizationReady`, and either half closing revokes
+        // the feature just as completely: turning diarization off in
+        // Settings mid-recording used to fire nothing at all, so the pool
+        // went on recognising stored voices (#215). `trackDiarizationReadiness`
+        // below is what lets the settings object notice the second half.
+        voiceSettings.addConfiguredObserver { [weak liveDiar] nowConfigured in
+            guard !nowConfigured else { return }
             liveDiar?.forgetSeededProfiles()
         }
+        // The readiness half of that gate lives on `DiarizationSettings`, and
+        // `diarizationReady` above only *reads* it — nothing tells this
+        // object when the answer changes. Both publishers are needed:
+        // `isConfigured` there is `isEnabled && (hasBundledRuntime ?
+        // bootstrap.isReady : status.isGood)`, so the bootstrap's readiness
+        // is a genuinely separate source of truth (`nuclearRepair` clears it
+        // without touching the settings object at all).
+        voiceSettings.trackDiarizationReadiness(diarSettings.objectWillChange,
+                                                diarSettings.bootstrap.objectWillChange)
         // Auto-naming + the per-recording snapshot, driven by the finalize
         // drain rather than by observing `isRecording`. The drain hands over
         // the id of the recording that actually finished, and calls
@@ -681,8 +704,8 @@ struct MilaApp: App {
             case .named(let names): liveDiar?.forgetSeededProfiles(named: names)
             }
         }
-        actions.onRecordingFinalized = { [assigner] recordingID in
-            assigner.finish(recording: recordingID)
+        actions.onRecordingFinalized = { [assigner] recordingID, liveSpeakerNames in
+            assigner.finish(recording: recordingID, liveSpeakerNames: liveSpeakerNames)
         }
         // Save a voice profile when a speaker is named — if the live
         // diarizer observed that speaker *in that recording*, persist it.
@@ -1802,12 +1825,24 @@ struct MilaApp: App {
                     fixed.status = .pending
                     statusChanged.append(fixed)
                 }
-                print("MilaApp: re-enqueuing stale \(recording.status.rawValue) recording \(recording.audioFileName)")
+                // `audioFileName` is derived from the recording's TITLE
+                // (`RecordingStore.freshAudioURL(suggestedName:)`), so logging
+                // it publicly publishes the meeting name. The UUID is the safe
+                // correlation key; the status is app state. (Issue #213.)
+                appLog.log("""
+                    re-enqueuing stale \(recording.status.rawValue, privacy: .public) \
+                    recording \(recording.id, privacy: .public) \
+                    (\(recording.audioFileName, privacy: .private))
+                    """)
                 toEnqueue.append(fixed)
             case .markFailed:
                 fixed.status = .failed
                 statusChanged.append(fixed)
-                print("MilaApp: reset stale \(recording.status.rawValue) recording \(recording.audioFileName) to .failed (WAV missing)")
+                appLog.log("""
+                    reset stale \(recording.status.rawValue, privacy: .public) \
+                    recording \(recording.id, privacy: .public) \
+                    (\(recording.audioFileName, privacy: .private)) to .failed (WAV missing)
+                    """)
             case .leaveAlone:
                 break  // unreachable given the `where` filter above
             }
@@ -1830,7 +1865,10 @@ struct MilaApp: App {
             // the batch run reads it. Awaited so this recording is only
             // enqueued once its own repair has finished.
             await WAVHeaderRepair.repairInBackground(at: store.audioURL(for: recording))
-            print("MilaApp: re-enqueuing recovered recording \(recording.audioFileName)")
+            appLog.log("""
+                re-enqueuing recovered recording \(recording.id, privacy: .public) \
+                (\(recording.audioFileName, privacy: .private))
+                """)
             transcription.enqueue(recording)
         }
     }

@@ -55,6 +55,54 @@ actor RemoteWhisperEngine: RemoteTranscribing {
             }
         }
 
+        /// The log-safe twin of `errorDescription`, matching
+        /// `LLMRunnerError.logDescription`,
+        /// `SpeakerDiarizer.Error.logDescription` and
+        /// `OpenAIRequestError.logDescription`.
+        ///
+        /// Only `.http` differs, and it is the only case that carries bytes
+        /// Mila did not write. `shortMessage(from:)` prefers the endpoint's
+        /// `error.message` but falls back to `String(body.prefix(200))` — an
+        /// unbounded 200-character slice of whatever a configured ASR endpoint
+        /// returned. A real OpenAI 401 reads "Incorrect API key provided:
+        /// sk-…XYZ", so that slice can be a fragment of the user's
+        /// credential, and a proxy answering 502 with the upstream payload can
+        /// put transcript text there.
+        ///
+        /// Volume is what makes it matter: `TranscriptionService`'s live path
+        /// logs this once per *utterance* for the whole recording (its own
+        /// comment says a remote failure "repeats on every utterance"), so one
+        /// misconfigured endpoint writes hundreds of copies into a plaintext
+        /// system log.
+        ///
+        /// The status code stays — 401 vs 404 vs 500 is the entire first
+        /// question and names nothing — and the byte count says whether the
+        /// server explained itself at all. `errorDescription` is untouched:
+        /// `lastError` puts it in the app's own error banner, which is the
+        /// user reading their own failure on their own screen.
+        /// (Issue #213, CWE-532.)
+        var logDescription: String {
+            switch self {
+            case .http(let status, let body):
+                return """
+                    Remote server returned HTTP \(status) \
+                    (\(body.utf8.count)B of server response withheld — it can \
+                    quote your API key)
+                    """
+            case .notConfigured, .noAudioCaptured, .badResponse, .emptyResult:
+                return errorDescription ?? "\(self)"
+            }
+        }
+
+        /// The log-safe message for any error a remote transcription can
+        /// throw — applied where the concrete type is still unknown, since
+        /// `TranscriptionService` catches `Error` and a `CancellationError` or
+        /// a `URLError` lands there too.
+        static func logMessage(for error: Swift.Error) -> String {
+            if let remoteError = error as? RemoteError { return remoteError.logDescription }
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+
         /// Pull a human-readable `error.message` out of an OpenAI-style error
         /// body, falling back to a trimmed prefix of the raw body.
         private static func shortMessage(from body: String) -> String? {

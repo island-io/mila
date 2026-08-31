@@ -1,5 +1,9 @@
 import Foundation
 import Combine
+import OSLog
+
+private let voiceMemosSettingsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                           category: "VoiceMemosSettings")
 
 /// User settings for iPhone Voice Memos folder integration. Persists which
 /// Voice Memos folders Mila watches + auto-transcribes. Follows the same
@@ -125,7 +129,18 @@ final class VoiceMemosSettings: ObservableObject {
                                bookmarkDataIsStale: &isStale)
         } catch {
             // Unreadable blob — drop it so we don't fail on every launch.
-            print("VoiceMemosSettings: failed to resolve folder bookmark: \(error)")
+            //
+            // The bookmark is the folder grant the user made in the open panel
+            // (PR #73 replaced Full Disk Access with this), so the error text
+            // names a path they picked. Domain + code stay public — they say
+            // whether the volume vanished or the blob is corrupt.
+            // (Issue #213.)
+            let ns = error as NSError
+            voiceMemosSettingsLog.error("""
+                failed to resolve folder bookmark \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             defaults.removeObject(forKey: Keys.folderBookmark)
             return
         }
@@ -164,7 +179,12 @@ final class VoiceMemosSettings: ObservableObject {
             resolveFolderAccess()
             return grantedFolderURL != nil
         } catch {
-            print("VoiceMemosSettings: failed to mint folder bookmark for \(url.path): \(error)")
+            let ns = error as NSError
+            voiceMemosSettingsLog.error("""
+                failed to mint folder bookmark for \(url.path, privacy: .private) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return false
         }
     }

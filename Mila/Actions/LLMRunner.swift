@@ -71,6 +71,84 @@ enum LLMRunnerError: LocalizedError {
             return "LLM call was cancelled."
         }
     }
+
+    /// The log-safe twin of `errorDescription`, for the unified log.
+    ///
+    /// The two audiences are not the same one. `errorDescription` is rendered
+    /// on a surface the user is looking at *because they asked* — the Settings
+    /// test panel, the rename sheet, the post-recording banner — and there the
+    /// CLI's own words are the whole value: "command not found", "credit
+    /// balance too low", "unknown flag --foo". The unified log is a plaintext
+    /// store any process on the machine can read without private-data logging
+    /// enabled, and it keeps what it is given for days.
+    ///
+    /// Only `.nonZeroExit` differs between the two, and it is the only case
+    /// that carries the child's own output rather than a sentence Mila wrote:
+    ///
+    ///   * A CLI run verbosely echoes the composed prompt back on stderr —
+    ///     that prompt is the meeting transcript.
+    ///   * `run` constructs this case as
+    ///     `stderr.isEmpty ? outcome.stdout : outcome.stderr`, so a tool that
+    ///     fails silently puts the model's *answer about the meeting* here.
+    ///   * The user's "Extra args" are free text people put credentials in,
+    ///     and a CLI rejecting a bad flag commonly prints its argv back.
+    ///
+    /// So the log gets the shape of the failure — exit status and how many
+    /// bytes the tool produced — and never the bytes. That is the same split
+    /// `logRunEnd` already makes for its `stderr-tail` field, which is
+    /// `.private` for exactly these reasons; this closes the pre-existing hole
+    /// that field's doc comment pointed at. (Issue #193, CWE-532.)
+    ///
+    /// Every other case is a sentence Mila composed out of configuration the
+    /// user typed (tool name, executable path, timeout), which is already
+    /// logged `.public` as `exe=` on the run-start line — so they pass through
+    /// unchanged rather than being redacted for symmetry's sake. A log that
+    /// says `<private>` where it could have said "Could not find claude on
+    /// PATH" is a worse log for no privacy gain.
+    var logDescription: String {
+        switch self {
+        case .nonZeroExit(let code, let stderr):
+            // Byte count, not character count: it answers "did the tool say
+            // anything at all, and roughly how much?" without depending on
+            // how the bytes decode.
+            let bytes = stderr.utf8.count
+            return """
+                LLM CLI exited with status \(code) \
+                (\(bytes)B of tool output withheld — it can contain the \
+                transcript; see Settings → AI Provider → Test)
+                """
+        case .toolDisabled, .executableNotFound, .launchFailed,
+             .timedOut, .emptyOutput, .cancelled:
+            return errorDescription ?? "\(self)"
+        }
+    }
+
+    /// The log-safe message for *any* error thrown by an LLM path.
+    ///
+    /// Call sites catch `Error`, not `LLMRunnerError` — a summary or a Send
+    /// can also fail with an `OpenAIRequestError`, a `CancellationError`, or
+    /// something from `Foundation` — so the redaction has to be applied where
+    /// the type is still unknown, or it gets skipped exactly when it matters.
+    ///
+    /// `OpenAIRequestError` needs the same treatment as `LLMRunnerError`, not
+    /// the pass-through: `run`'s `.openaiCompatible` branch rethrows it
+    /// unchanged from `runOpenAICompatible`, and its `errorDescription`
+    /// embeds the endpoint's own response body (a real 401 quotes a fragment
+    /// of the API key) or, for `.invalidEndpoint`, the configured Base URL
+    /// that this file otherwise refuses to log in full. Falling through to the
+    /// `LocalizedError` branch published both. See
+    /// `OpenAIRequestError.logDescription`. (CodeRabbit; issue #193.)
+    ///
+    /// The final fallback stays `errorDescription`/`localizedDescription` on
+    /// purpose — the helper is a redaction of the two types that are *known*
+    /// to carry someone else's bytes, not a gag on every error. A
+    /// `CancellationError` or a `URLError` reading "The Internet connection
+    /// appears to be offline" is the whole diagnostic and names nothing.
+    static func logMessage(for error: Error) -> String {
+        if let runnerError = error as? LLMRunnerError { return runnerError.logDescription }
+        if let openAIError = error as? OpenAIRequestError { return openAIError.logDescription }
+        return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+    }
 }
 
 /// Everything the Settings → AI Provider test panel needs to explain a run to
@@ -1103,10 +1181,12 @@ enum LLMRunner {
     /// structured always-on excerpt of that content is not something to
     /// enable by default.
     ///
-    /// The precedent that `LLMRunnerError.nonZeroExit` already embeds stderr
-    /// verbatim in `errorDescription` — which `PostRecordingCoordinator` logs
-    /// `.public` — argues that the *existing* line is too loose, not that a
-    /// new and broader one is fine. (Worth tightening separately.)
+    /// `LLMRunnerError.nonZeroExit` used to embed stderr verbatim in
+    /// `errorDescription`, which `PostRecordingCoordinator` logged `.public` —
+    /// a looser leak than this field, through a path that had no annotation to
+    /// tighten. That is now closed: `LLMRunnerError.logDescription` gives the
+    /// log the exit status and a byte count, and every log site goes through
+    /// `LLMRunnerError.logMessage(for:)`. (Issue #193.)
     ///
     /// What stays `.public` is the part that answers the question at a
     /// glance: exit code, stderr/stdout byte counts, duration, and the
@@ -1225,10 +1305,12 @@ enum LLMRunner {
     /// A run that never got as far as a process: no tool configured, no
     /// executable found, or (for the HTTP path) no base URL. `error` because
     /// the user asked for something and got nothing, and the message is
-    /// `errorDescription` — the same sentence the UI shows, which contains
-    /// only the tool/path the user typed.
+    /// `logDescription` — for every error this path can actually see, the same
+    /// sentence the UI shows, which contains only the tool/path the user typed.
+    /// Routed through `logMessage(for:)` anyway so a future error that *does*
+    /// carry tool output can't reach the log by being thrown one frame higher.
     static func logSetupFailure(feature: LLMFeature, tool: LLMTool, error: Error) {
-        let message = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+        let message = LLMRunnerError.logMessage(for: error)
         llmRunnerLog.error("""
             llm run setup failed feature=\(feature.rawValue, privacy: .public) \
             tool=\(tool.rawValue, privacy: .public): \(message, privacy: .public)
@@ -1243,7 +1325,7 @@ enum LLMRunner {
                                  duration: TimeInterval,
                                  command: String,
                                  error: Error) {
-        let message = (error as? LLMRunnerError)?.errorDescription ?? error.localizedDescription
+        let message = LLMRunnerError.logMessage(for: error)
         llmRunnerLog.error("""
             llm run launch failed feature=\(feature.rawValue, privacy: .public) \
             tool=\(tool.rawValue, privacy: .public) \
@@ -1272,7 +1354,7 @@ enum LLMRunner {
                                host: String,
                                duration: TimeInterval,
                                error: Error) {
-        let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        let message = LLMRunnerError.logMessage(for: error)
         llmRunnerLog.error("""
             llm http failed feature=\(feature.rawValue, privacy: .public) \
             host=\(host, privacy: .public) \

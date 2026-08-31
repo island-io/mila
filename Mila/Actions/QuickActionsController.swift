@@ -166,7 +166,20 @@ final class QuickActionsController: ObservableObject {
     /// recovering one from `store.recordings.first` is unreliable because
     /// `add` inserts at index 0 with no re-sort, so any recording added in
     /// between (a Voice Memos import, say) becomes `first`.
-    var onRecordingFinalized: ((UUID) -> Void)?
+    ///
+    /// The second argument is the speaker names the user assigned from the
+    /// LIVE transcript pane while the recording ran (`LiveTranscriber.
+    /// speakerNames`). They travel through this hook rather than being copied
+    /// onto the row here because that copy was the bug in island-io/mila#209:
+    /// a name already on the row makes `RecordingStore.setSpeakerName`
+    /// no-change-guard out before it can fire `onSpeakerNamed`, the one hook
+    /// that persists a voice profile — so a mid-recording label stuck to the
+    /// transcript and taught the recogniser nothing, silently. There is no
+    /// row to name while the recording runs (`store.add` happens in
+    /// `stopRecording`), so deferring to here is what makes that single
+    /// persistence trigger reachable at all. See `RecognisedSpeakerAssigner.
+    /// finish(recording:liveSpeakerNames:)`.
+    var onRecordingFinalized: ((_ recordingID: UUID, _ liveSpeakerNames: [String: String]) -> Void)?
 
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
@@ -675,6 +688,20 @@ final class QuickActionsController: ObservableObject {
         // and chunk modes produce live segments we want to preserve,
         // so the initial-status gate is segment-presence, not mode.
         let initialStatus: TranscriptionStatus = initialTranscriptSegments.isEmpty ? .pending : .running
+        // `speakerNames` is deliberately NOT seeded from `liveTranscriber`
+        // below, and neither is it copied onto `updated` in the drain. Both
+        // copies used to exist, and between them they made mid-recording
+        // speaker naming teach the recogniser nothing at all
+        // (island-io/mila#209): the name was already on the row by the time
+        // `onRecordingFinalized` fired, so `setSpeakerName`'s no-change guard
+        // returned before firing `onSpeakerNamed` — the only hook that writes
+        // a voice profile. The live map now travels through that hook instead,
+        // which applies it via `setSpeakerName` and so keeps ONE persistence
+        // trigger (a parallel write is what caused the double-merge fixed in
+        // #204). Nothing reads the row's names in the meantime: the
+        // post-record sheet renders the transcript only once the row leaves
+        // `.pending`/`.running`, and the live MCP sidecar carries its own copy
+        // of the map.
         let recording = Recording(
             title: title,
             duration: duration,
@@ -687,8 +714,7 @@ final class QuickActionsController: ObservableObject {
             appName: appName,
             appBundleID: appBundleID,
             summary: initialSummary.isEmpty ? nil : initialSummary,
-            actionItems: initialItems.isEmpty ? nil : initialItems,
-            speakerNames: liveTranscriber?.speakerNames ?? [:]
+            actionItems: initialItems.isEmpty ? nil : initialItems
         )
         store.add(recording)
         // The live sidecar is deliberately NOT closed here. `finish()`
@@ -859,11 +885,15 @@ final class QuickActionsController: ObservableObject {
             return
         }
         updated.segments = finalTranscriptSegments
-        // Mid-recording speaker renames from the live pane. Snapshotted
-        // here (before `liveTranscriber?.stop()` below) alongside the
-        // segments they label; `finalizeTail` remaps them if the offline
-        // re-diarize pass re-keys the speaker IDs.
-        updated.speakerNames = liveTranscriber?.speakerNames ?? [:]
+        // Mid-recording speaker renames from the live pane are NOT copied
+        // onto the row here — see the note at `store.add` above. They are
+        // handed to `onRecordingFinalized` below (still before
+        // `liveTranscriber?.stop()`, so the map is intact) and applied with
+        // `store.setSpeakerName`, which is what lets them persist a voice
+        // profile. `finalizeTail` still remaps whatever the row ends up
+        // holding if the offline re-diarize pass re-keys the speaker IDs — it
+        // re-reads the row rather than using this snapshot, precisely so a
+        // name assigned after this line is not lost.
         // Always preserve fullText when we have live segments — the
         // sheet should show what the user just saw on screen, even
         // for chunk mode while the batch diarization pass is still
@@ -919,7 +949,21 @@ final class QuickActionsController: ObservableObject {
         // which carries no id and had to guess with `store.recordings.first`
         // — and `add` inserts at index 0, so a Voice Memos import landing in
         // between made the memo "the recording that just stopped".
-        onRecordingFinalized?(recording.id)
+        //
+        // It also carries the live pane's speaker names, which is what makes
+        // naming a speaker mid-recording learn a voice profile at all
+        // (island-io/mila#209). Read from `liveTranscriber` here — before the
+        // teardown below — and applied on the far side through
+        // `store.setSpeakerName`, the single persistence trigger.
+        onRecordingFinalized?(recording.id, liveTranscriber?.speakerNames ?? [:])
+        // Those names are written into the STORED row by `setSpeakerName`, not
+        // into this local copy, so re-read it. Without this the tail below
+        // carries a `speakerNames`-less snapshot and its
+        // `TranscriptExporter.writeSRT(for: updated, …)` would overwrite the
+        // named `.srt` that `setSpeakerName` just wrote with an unnamed one.
+        if let named = store.recordings.first(where: { $0.id == recording.id }) {
+            updated = named
+        }
 
         // ---- END OF THE LIVE-PIPELINE-OWNING PHASE.
         //

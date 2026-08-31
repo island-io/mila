@@ -1,4 +1,8 @@
 import Foundation
+import OSLog
+
+private let speakerDirLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                   category: "SpeakerDirectory")
 
 /// App-wide directory of speaker names the user has assigned across
 /// recordings — the pick-list behind the speaker rename popover. Most
@@ -92,7 +96,14 @@ final class SpeakerDirectory: ObservableObject {
                                                     withIntermediateDirectories: true)
             try data.write(to: fileURL, options: .atomic)
         } catch {
-            print("SpeakerDirectory persist error: \(error)")
+            // Deliberately `.public`, on the same grounds as the voice-memo
+            // tombstones: `speaker-names.json` sits at the Application
+            // Support/Mila root and does NOT travel with a relocated
+            // recordings folder (see this type's doc comment), so the folder
+            // Cocoa quotes can only ever be “Mila”. The NAMES are user content
+            // and are never logged — only the failure to write the file is.
+            // (Issue #213.)
+            speakerDirLog.error("persist error: \(error.localizedDescription, privacy: .public)")
         }
     }
 }

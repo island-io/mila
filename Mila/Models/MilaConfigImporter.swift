@@ -78,11 +78,34 @@ final class MilaConfigImporter: ObservableObject {
             pending = PendingImport(config: config,
                                     changes: plannedChanges(for: config),
                                     sourceName: url.lastPathComponent)
-            log.log("staged \(url.lastPathComponent, privacy: .public) for import (\(self.pending?.changes.count ?? 0) change(s))")
+            // The FILENAME is user-chosen — a `.milaconfig` handed round a
+            // team is commonly named for the org or the server it configures
+            // ("acme-asr.milaconfig"), which is the same "names an employer or
+            // a customer" exposure as the storage folder. The change count is
+            // the diagnostic and stays public. (Issue #213.)
+            log.log("""
+                staged \(url.lastPathComponent, privacy: .private) for import \
+                (\(self.pending?.changes.count ?? 0, privacy: .public) change(s))
+                """)
         } catch {
+            // `errorMessage` is the sheet the user is looking at — it keeps
+            // the full text, including the quoted filename. The LOG does not:
+            // the success line above redacts `url.lastPathComponent` for a
+            // reason, and `String(describing:)` on a
+            // `MilaConfig.LoadError.unreadable` published exactly that name
+            // (plus its containing folder) right back, because the case wraps
+            // `Data(contentsOf:).localizedDescription`. Same success-redacted
+            // / failure-public asymmetry Bugbot found in `WAVHeaderRepair`.
+            // The failure KIND stays public; the message goes `.private` so it
+            // is still there for anyone who enables private-data logging.
+            // (Issue #213, CWE-532.)
             errorMessage = (error as? MilaConfig.LoadError)?.errorDescription
                 ?? error.localizedDescription
-            log.error("failed to load config: \(String(describing: error), privacy: .public)")
+            log.error("""
+                failed to load config: \
+                \(MilaConfig.LoadError.logMessage(for: error), privacy: .public) \
+                (\(String(describing: error), privacy: .private))
+                """)
         }
     }
 

@@ -1,5 +1,9 @@
 import Foundation
+import OSLog
 import TranscriptionCore
+
+private let exporterLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                 category: "TranscriptExporter")
 
 enum TranscriptExporter {
 
@@ -17,9 +21,31 @@ enum TranscriptExporter {
         }
         do {
             try body.write(to: url, atomically: true, encoding: .utf8)
-            print("TranscriptExporter: wrote \(srtName)")
+            // `srtName` is `recording.audioFileName` with the extension
+            // swapped, and `audioFileName` comes from the recording's TITLE
+            // (`RecordingStore.freshAudioURL(suggestedName:)`, and
+            // `FileTranscriber`'s `safeStem` for imports). This line fires on
+            // every completed transcription — the highest-volume title leak in
+            // the app — so the name is `.private` and the recording's UUID is
+            // the public correlation key. (Issue #213, CWE-532.)
+            exporterLog.log("""
+                wrote SRT for \(recording.id, privacy: .public) \
+                (\(srtName, privacy: .private))
+                """)
         } catch {
-            print("TranscriptExporter: failed to write \(srtName): \(error)")
+            // The error string needs the same care as the name: Cocoa quotes
+            // the offending file — and its containing folder, which is the
+            // user's chosen recordings directory — inside
+            // `localizedDescription`. Domain + code stay public so "no
+            // permission" is still distinguishable from a full disk or a
+            // missing directory without exposing either.
+            let ns = error as NSError
+            exporterLog.error("""
+                failed to write SRT for \(recording.id, privacy: .public) \
+                (\(srtName, privacy: .private)) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
         }
     }
 

@@ -1,8 +1,9 @@
 import Foundation
 
-/// Applies stored voice-profile names to the speakers a finished recording
-/// actually recognised, and snapshots that recording's observations so a
-/// later rename can persist the right voice.
+/// Reconciles a finished recording's speaker names: applies the names the
+/// user typed into the live transcript, applies stored voice-profile names to
+/// the speakers it actually recognised, and snapshots that recording's
+/// observations so a later rename can persist the right voice.
 ///
 /// Extracted from `MilaApp` for one reason above all: **it must be told which
 /// recording finished, never infer it.** The previous version ran off
@@ -59,12 +60,36 @@ final class RecognisedSpeakerAssigner {
         self.profileStillStored = profileStillStored
     }
 
-    /// Call once per finished recording, with that recording's id.
+    /// Call once per finished recording, with that recording's id and the
+    /// names the user assigned from the live transcript while it ran.
     ///
-    /// No-ops entirely while voice recognition is off — the pool would carry
-    /// no `profileName` anyway (nothing was seeded), but an explicit gate
-    /// keeps the guarantee readable rather than emergent, and it also stops
-    /// the snapshot below from holding embeddings for an opted-out user.
+    /// **Why the live names arrive here rather than being written onto the
+    /// row.** There is no `Recording` in the store while a recording is
+    /// running — `QuickActionsController.stopRecording` calls `store.add`
+    /// *after* `session.stop()` — so `setSpeakerName(recordingID:)` is
+    /// literally unreachable from the live pane: it resolves the id to a row
+    /// index and returns when there is none. The live pane therefore holds
+    /// the name in `LiveTranscriber.speakerNames`, and the drain used to copy
+    /// that map straight onto the row (`store.add(speakerNames:)`, then
+    /// `updated.speakerNames = …`). The label stuck and nothing was learned:
+    /// by the time this method ran, the row already carried the name, so
+    /// `setSpeakerName`'s no-change guard returned before firing
+    /// `onSpeakerNamed` — the one hook that persists a voice profile
+    /// (island-io/mila#209). Naming the same speaker afterwards from the
+    /// detail view *did* persist, which is what made it easy to miss.
+    ///
+    /// So the drain no longer writes those names at all; it hands them here,
+    /// and they go through `store.setSpeakerName` like every other name. That
+    /// keeps **one** persistence trigger, which is the invariant the loop
+    /// below documents at length — a second, parallel write is what caused
+    /// the double-merge fixed in #204.
+    ///
+    /// The voice-recognition gate covers the snapshot and the auto-naming
+    /// loop, **not** the live names: a display name is not voice data, it
+    /// must keep working with recognition switched off (see
+    /// `VoiceRecognitionGateTests.test_while_off_naming_a_speaker_persists_no_embedding`),
+    /// and gating it would have silently dropped every mid-recording label
+    /// for the majority of users who never opt in.
     ///
     /// **On the removed `intervals` check.** This loop used to also require
     /// `diarizer.intervals.contains { $0.speaker == entry.id }`, justified as
@@ -81,16 +106,44 @@ final class RecognisedSpeakerAssigner {
     /// expecting extra safety; it adds none, and it made this method
     /// unreachable from a unit test (`intervals` is `private(set)` and only
     /// fills via the daemon).
-    func finish(recording recordingID: UUID) {
-        guard settings.isConfigured else { return }
-        let poolEntries = diarizer.currentProfiles()
+    func finish(recording recordingID: UUID, liveSpeakerNames: [String: String] = [:]) {
+        // `isConfigured` is a computed property over two settings values, and
+        // it now gates two separate things here (the snapshot, and the
+        // auto-naming loop) with an ungated stretch between them. Read once
+        // into a local so those two can never disagree — snapshotting
+        // embeddings and then skipping the loop that consumes them, or the
+        // reverse, would each be a silent half-behaviour.
+        let recognitionOn = settings.isConfigured
+        let poolEntries = recognitionOn ? diarizer.currentProfiles() : []
 
         // Snapshot against this recording's id BEFORE naming anything:
         // `setSpeakerName` fires `onSpeakerNamed` synchronously, and that
         // hook resolves the voice through this snapshot. Every pool entry is
         // kept, not just seeded ones, because a speaker the user names by
-        // hand later needs the same lookup.
-        snapshots.record(poolEntries, for: recordingID)
+        // hand — mid-recording in the loop just below, or later from the
+        // detail view — needs the same lookup.
+        //
+        // Gated: an opted-out user has no embeddings held here either. That
+        // is also why `poolEntries` is left empty above rather than read and
+        // discarded.
+        if recognitionOn {
+            snapshots.record(poolEntries, for: recordingID)
+        }
+
+        // The names the user typed into the live transcript while this
+        // recording ran. Applied through `setSpeakerName` — the single
+        // persistence trigger — and applied FIRST, so a label the user chose
+        // deliberately is never overwritten by the auto-naming loop below,
+        // and so each raw id fires `onSpeakerNamed` at most once.
+        //
+        // Sorted for a deterministic order: `Dictionary` iteration order is
+        // unspecified and varies per process, and this drives log lines and
+        // an `.srt` rewrite per entry.
+        for (rawID, name) in liveSpeakerNames.sorted(by: { $0.key < $1.key }) {
+            store.setSpeakerName(name, forSpeaker: rawID, recordingID: recordingID)
+        }
+
+        guard recognitionOn else { return }
 
         // Persistence is `setSpeakerName`'s job, not this loop's — one
         // recognition must fold into the stored centroid exactly once.
@@ -107,6 +160,15 @@ final class RecognisedSpeakerAssigner {
         // for the same recording idempotent: the name already matches, so
         // `setSpeakerName` returns without firing the hook.
         for entry in poolEntries {
+            // 0. The user did not already name this speaker themselves.
+            //    Their label wins over a recogniser's guess, and skipping
+            //    is what keeps the hook to one fire per raw id: overwriting
+            //    "Bob" with "Alice" here would fire `onSpeakerNamed` a second
+            //    time and fold this recording's centroid into *both*
+            //    profiles. (Before the live names came through this method
+            //    the auto-name silently clobbered them — the label the user
+            //    typed mid-recording was replaced by the seeded profile's.)
+            guard liveSpeakerNames[entry.id] == nil else { continue }
             // 1. Seeded from a stored profile — there is a name to assign.
             guard let profileName = entry.profileName else { continue }
             // 2. Confidently matched this recording. `assign` deliberately
