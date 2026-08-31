@@ -748,9 +748,30 @@ final class QuickActionsController: ObservableObject {
         // drain, after `store.update`. Every exit from the drain below must
         // finish it: with the id when the row was updated, with `nil` when
         // the row is gone and there is nothing to hand off.
-        // `add` already persisted the folder field. `assign` is only needed
-        // when the name is not already in `store.folders` (brand-new folder
-        // or a case-insensitive match that needs normalizing).
+        // `add` already persisted the folder field, so this is NOT the common
+        // path: `NextRecordingFolderPicker` only ever offers names that are
+        // already in `store.folders`, and for those this branch is skipped.
+        //
+        // It is the reconciliation for a pick that went stale between
+        // selection and Stop, which is the only way the UI can reach it: the
+        // user deleted or renamed that folder in the sidebar mid-recording, so
+        // `store.folders` no longer holds the name. (A caller setting
+        // `nextRecordingFolder` programmatically to a brand-new name, or to one
+        // differing only by case/whitespace, lands here too — `assign`
+        // auto-creates and case-normalizes.)
+        //
+        // Do NOT drop the `assign` on the grounds that `add` already wrote
+        // `folder`: it is what keeps the invariant the sidebar is built on —
+        // a recording's `folder` is always a name present in `store.folders`.
+        // Without it a folder deleted mid-recording leaves the new recording
+        // tagged with a folder that has no row to reach it from.
+        //
+        // Honouring the stale pick (rather than silently unfiling) is
+        // deliberate: "Save to <name>" was on screen right up to Stop, so
+        // filing it there is what the user was told would happen. The folder
+        // reappearing in the sidebar is the visible cost of that, and it is
+        // the honest one. `RecordingFolderMenu` in the detail view is the
+        // one-click undo.
         if let chosenFolder, !store.folders.contains(chosenFolder) {
             store.assign(recording, toFolder: chosenFolder)
         }
