@@ -773,6 +773,77 @@ final class RecordingSummarizerTests: XCTestCase {
                       "an unreadable object must yield no summary; got \(parsed.summary)")
     }
 
+    /// The same malformed envelope, WRAPPED — a label line plus ```json
+    /// fences, which is the shape an LLM emits most often. `parseEnvelope`
+    /// accepts that wrapper (it plucks the first balanced block out of the
+    /// string rather than requiring position 0), but the salvage and
+    /// `unreadableEnvelope` branches were gated on `trimmed.hasPrefix("{")`.
+    /// So the wrapped form failed the object decode AND the prefix test and
+    /// landed in `.plain`, storing the whole fenced blob as the summary — the
+    /// reported bug, for the commonest shape.
+    func test_parse_salvages_a_malformed_envelope_inside_fences_and_a_label() {
+        let fenced = """
+        Here is the summary:
+        ```json
+        {
+          "summary": "Team review. Baylis acts as if he is "on another planet".",
+          "items": [
+            {"id": "a", "text": "Give Baylis direct feedback", "source": "inferred"}
+          ]
+        }
+        ```
+        """
+
+        let parsed = RecordingSummarizer.parseSummaryAndItems(from: fenced)
+
+        XCTAssertEqual(parsed.origin, .salvagedEnvelope,
+                       "a fenced malformed envelope is still an envelope")
+        XCTAssertFalse(parsed.summary.contains("```"),
+                       "fence scaffolding must never reach the summary")
+        XCTAssertFalse(parsed.summary.contains("\"items\""),
+                       "the items scaffolding must not leak into the summary")
+        XCTAssertFalse(parsed.summary.hasPrefix("Here is the summary:"),
+                       "the label must not be stored as the summary")
+        XCTAssertTrue(parsed.summary.hasSuffix("\"on another planet\"."),
+                      "the salvaged value must be the summary; got \(parsed.summary)")
+        XCTAssertEqual(parsed.items.map(\.text), ["Give Baylis direct feedback"],
+                       "items recovered by the lenient parse must survive the wrapper")
+
+        // The unfenced label-only variant takes the same branch.
+        let labelled = #"""
+        Here is the JSON:
+        {"summary": "A "quoted" thing.", "items": []}
+        """#
+        let labelledParse = RecordingSummarizer.parseSummaryAndItems(from: labelled)
+        XCTAssertEqual(labelledParse.origin, .salvagedEnvelope)
+        XCTAssertEqual(labelledParse.summary, "A \"quoted\" thing.")
+    }
+
+    /// The counterweight to the test above, and the reason the fix is not
+    /// simply "the output contains a `{`". A real summary may quote braces or
+    /// a code block; blanking a GOOD summary is a worse outcome than showing
+    /// a blob, so an object must be what the output IS — nothing but
+    /// whitespace after it, and at most a short label before it.
+    func test_parse_keeps_prose_that_merely_quotes_braces_or_a_code_block() {
+        let braces = "The team reviewed the config {mode: fast} and shipped it."
+        let bracesParse = RecordingSummarizer.parseSummaryAndItems(from: braces)
+        XCTAssertEqual(bracesParse.origin, .plain)
+        XCTAssertEqual(bracesParse.summary, braces,
+                       "prose that mentions a brace block must survive intact")
+
+        let withCode = """
+        The team walked through the retry handler at length and agreed the \
+        default should change before the next release ships to users.
+        ```
+        {"retries": 3}
+        ```
+        """
+        let codeParse = RecordingSummarizer.parseSummaryAndItems(from: withCode)
+        XCTAssertEqual(codeParse.origin, .plain)
+        XCTAssertTrue(codeParse.summary.hasPrefix("The team walked through"),
+                      "a prose summary quoting a fenced block must survive intact")
+    }
+
     // MARK: - Dictated action items survive the one-shot pass
 
     /// For a Live-AI recording, `QuickActionsController` snapshots the live
@@ -882,6 +953,42 @@ final class RecordingSummarizerTests: XCTestCase {
         let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertNil(updated.summary,
                      "a blob must not be stored — the recording stays eligible for a retry")
+        XCTAssertTrue(summarizer.shouldSummarize(updated),
+                      "and the retry gate must actually still be open")
+    }
+
+    /// The same end-to-end control for the WRAPPED shape. This is the half of
+    /// the bug that bites hardest: the stored blob satisfies
+    /// `shouldSummarize`'s "already has a summary" gate, so the recording is
+    /// never retried and the blob is what the detail view, the Obsidian note
+    /// and the MCP surface report forever. Fences are the likeliest wrapper,
+    /// so gating the recovery on a leading `{` left the common case broken.
+    func test_summarize_never_stores_a_fenced_unreadable_json_object() async throws {
+        llm.tool = .claude
+        let fenced = """
+        Here is the summary:
+        ```json
+        {"resumen": "clave equivocada", "items": []}
+        ```
+        """
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in fenced }
+
+        let audioURL = store.freshAudioURL(suggestedName: "FencedUnreadable")
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(
+            title: "FencedUnreadable",
+            source: .microphone,
+            audioFileName: audioURL.lastPathComponent,
+            fullText: "the full transcript"
+        )
+        store.add(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertNil(updated.summary,
+                     "a fenced blob must not be stored; got \(updated.summary ?? "nil")")
         XCTAssertTrue(summarizer.shouldSummarize(updated),
                       "and the retry gate must actually still be open")
     }

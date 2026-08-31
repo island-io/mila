@@ -581,9 +581,11 @@ final class RecordingSummarizer: ObservableObject {
     ///   2. A JSON envelope `{"summary":...,"items":[...]}` the model may have
     ///      returned out of habit — decoded via `LiveAISession.parseEnvelope`.
     ///   3. Malformed JSON that LOOKS like an envelope (the failure the user
-    ///      hit: unescaped quotes broke the object decode). Salvage the
-    ///      summary text so a raw `{...}` blob is never shown, and keep any
-    ///      items the lenient array parse recovered.
+    ///      hit: unescaped quotes broke the object decode) — bare, inside
+    ///      ```` ```json ```` fences, or behind a one-line label, since
+    ///      `parseEnvelope` accepts all three. Salvage the summary text so a
+    ///      raw `{...}` blob is never shown, and keep any items the lenient
+    ///      array parse recovered.
     ///   4. Plain prose — the whole output is the summary, no items.
     ///
     /// A JSON object that reaches step 3 and yields nothing readable returns
@@ -603,10 +605,11 @@ final class RecordingSummarizer: ObservableObject {
         if !parsed.summary.isEmpty {
             return (parsed.summary, parsed.items, .envelope)
         }
-        // Object decode produced no summary. If it still looks like an
-        // envelope, salvage the summary value rather than surfacing the blob.
-        if trimmed.hasPrefix("{") {
-            let salvaged = Self.salvageSummaryValue(from: trimmed)
+        // Object decode produced no summary. If the output still IS an
+        // envelope — bare, fenced, or behind a label — salvage the summary
+        // value rather than surfacing the blob.
+        if let envelope = Self.envelopeBody(in: trimmed) {
+            let salvaged = Self.salvageSummaryValue(from: envelope)
             if !salvaged.isEmpty {
                 return (salvaged, parsed.items, .salvagedEnvelope)
             }
@@ -625,7 +628,72 @@ final class RecordingSummarizer: ObservableObject {
             // lenient array parse recovered are still returned.
             return ("", parsed.items, .unreadableEnvelope)
         }
+        // Genuine prose. Items stay empty: every shape from which the lenient
+        // parse can actually recover an items array is an envelope, and those
+        // now route through the branch above instead of falling to here.
         return (trimmed, [], .plain)
+    }
+
+    /// The envelope-shaped payload inside the wrappers
+    /// `LiveAISession.parseEnvelope` accepts — a ```` ```json ```` fence, or a
+    /// one-line "Here is the JSON:" label — or nil when the output is prose
+    /// that merely CONTAINS a brace.
+    ///
+    /// Why this exists: the salvage and `unreadableEnvelope` branches were
+    /// gated on `trimmed.hasPrefix("{")`, but `parseEnvelope` does not require
+    /// its object to be at position 0 — it plucks the first balanced block out
+    /// of the string (`findFirstJSONStructure`) precisely because "the CLI
+    /// occasionally wraps output in prose or ```json fences". A fenced or
+    /// prefixed BROKEN envelope therefore failed the object decode *and* the
+    /// prefix test and landed in `.plain`, which stores the raw blob as the
+    /// summary — the exact bug this fix exists to remove, and the
+    /// self-perpetuating one, since a stored blob satisfies
+    /// `shouldSummarize`'s "already has a summary" gate and is never retried.
+    /// Fences are the single most likely shape for an LLM to emit, so the
+    /// promise held only for the tidiest case.
+    ///
+    /// Deliberately NOT "contains a `{`": a legitimate prose summary can quote
+    /// braces, and blanking a good summary is a worse outcome than showing the
+    /// blob. The object must be what the output IS, not something it mentions
+    /// — so only a short single-line label may precede it and nothing but
+    /// whitespace may follow it.
+    static func envelopeBody(in trimmed: String) -> String? {
+        var body = trimmed
+        // Unwrap a ``` / ```json fenced block. Matched wherever it starts, not
+        // just at position 0, because a chatty model puts a label line ahead
+        // of the fence — the commonest shape of all.
+        if let opening = body.range(of: "```") {
+            // Only a short label may precede the fence and nothing but
+            // whitespace may follow it; otherwise this is prose that quotes a
+            // code block, not an envelope in a wrapper.
+            guard body[..<opening.lowerBound].count <= 80 else { return nil }
+            let afterOpening = body[opening.upperBound...]
+            // Drop the info string (`json`) up to the end of the fence line.
+            var inner = afterOpening
+            if let newline = afterOpening.firstIndex(of: "\n") {
+                inner = afterOpening[afterOpening.index(after: newline)...]
+            }
+            if let closing = inner.range(of: "```") {
+                guard inner[closing.upperBound...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                else { return nil }
+                inner = inner[..<closing.lowerBound]
+            }
+            body = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // The object IS the payload. Accepted without a balanced-block check,
+        // because the malformed input this path exists for can defeat the
+        // depth counter (an odd number of unescaped quotes leaves `inString`
+        // inverted) while `salvageSummaryValue` still reads the summary fine.
+        if body.hasPrefix("{") { return body }
+        guard let range = LiveAISession.findFirstJSONStructure(
+            in: body, opening: "{", closing: "}"
+        ) else { return nil }
+        guard body[..<range.lowerBound].count <= 80,
+              body[range.upperBound...]
+                .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return nil }
+        return String(body[range])
     }
 
     /// Which branch of `parseSummaryAndItems` produced the result. Logged so
