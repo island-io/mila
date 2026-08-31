@@ -72,6 +72,70 @@ final class LiveTranscriptSidecarWriterTests: XCTestCase {
         XCTAssertEqual(snap.revision, 3)
     }
 
+    // MARK: - A deleted line has to be announced to pollers
+
+    /// Deleting a line from the live pane arrives here as an ordinary content
+    /// tick with a shorter list. The snapshot has to say so: the incremental
+    /// `get_live_transcript` cursor is a count plus "re-read the last entry",
+    /// so nothing in a delta can tell a poller that a line it already holds is
+    /// gone. `segmentsRemovedAtRevision` is what makes the next stale-cursor
+    /// poll a full resend instead.
+    func test_removing_a_line_stamps_the_removal_revision() throws {
+        let writer = LiveTranscriptSidecarWriter(root: root, minWriteInterval: 0)
+        writer.begin(title: nil, source: nil, liveAvailable: true)
+        writer.update(segments: segs("one", "two", "three"), speakerNames: [:])
+        XCTAssertNil(try XCTUnwrap(snapshot()).segmentsRemovedAtRevision,
+                     "precondition: growing the transcript is not a removal")
+
+        // The user deletes the middle line. `segs` re-numbers from 0, so
+        // build the survivors explicitly to keep their original timings —
+        // that is what the real feed publishes.
+        let survivors = [
+            TranscriptSegment(start: 0, end: 1, text: "one", speaker: "SPEAKER_00"),
+            TranscriptSegment(start: 2, end: 3, text: "three", speaker: "SPEAKER_00"),
+        ]
+        writer.update(segments: survivors, speakerNames: [:])
+
+        let snap = try XCTUnwrap(snapshot())
+        XCTAssertEqual(snap.segments.map(\.text), ["one", "three"])
+        XCTAssertEqual(snap.segmentsRemovedAtRevision, snap.revision,
+                       "the marker must name the revision that carries the removal")
+    }
+
+    /// The counter-test: the trailing line growing as whisper gets more audio
+    /// is the normal case, and the delta protocol already re-sends that entry.
+    /// Flagging it would make every tick a full resend.
+    func test_extending_the_trailing_line_is_not_flagged_as_a_removal() throws {
+        let writer = LiveTranscriptSidecarWriter(root: root, minWriteInterval: 0)
+        writer.begin(title: nil, source: nil, liveAvailable: true)
+        writer.update(segments: segs("one", "two"), speakerNames: [:])
+        writer.update(segments: [
+            TranscriptSegment(start: 0, end: 1, text: "one", speaker: "SPEAKER_00"),
+            TranscriptSegment(start: 1, end: 5, text: "two and then some", speaker: "SPEAKER_00"),
+        ], speakerNames: [:])
+        let snap = try XCTUnwrap(snapshot())
+        XCTAssertEqual(snap.segments.map(\.text), ["one", "two and then some"])
+        XCTAssertNil(snap.segmentsRemovedAtRevision)
+    }
+
+    /// And a late speaker label landing on an already-published line is an
+    /// update, not a removal — live diarization does this constantly.
+    func test_a_late_speaker_label_is_not_flagged_as_a_removal() throws {
+        let writer = LiveTranscriptSidecarWriter(root: root, minWriteInterval: 0)
+        writer.begin(title: nil, source: nil, liveAvailable: true)
+        writer.update(segments: [
+            TranscriptSegment(start: 0, end: 1, text: "one", speaker: nil),
+            TranscriptSegment(start: 1, end: 2, text: "two", speaker: nil),
+            TranscriptSegment(start: 2, end: 3, text: "three", speaker: nil),
+        ], speakerNames: [:])
+        writer.update(segments: [
+            TranscriptSegment(start: 0, end: 1, text: "one", speaker: "SPEAKER_00"),
+            TranscriptSegment(start: 1, end: 2, text: "two", speaker: "SPEAKER_01"),
+            TranscriptSegment(start: 2, end: 3, text: "three", speaker: nil),
+        ], speakerNames: [:])
+        XCTAssertNil(try XCTUnwrap(snapshot()).segmentsRemovedAtRevision)
+    }
+
     func test_finish_marks_completed_with_handoff_id_and_stops_updates() throws {
         let writer = LiveTranscriptSidecarWriter(root: root, minWriteInterval: 0)
         writer.begin(title: nil, source: nil, liveAvailable: true)
