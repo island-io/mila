@@ -253,6 +253,51 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         }
     }
 
+    /// Deleting the *last* remaining line empties `segments` — and an empty
+    /// live transcript is exactly what `stopRecording` reads as "the live path
+    /// produced nothing, so run the batch pass". That fallback re-transcribes
+    /// the WAV, which means the strongest statement a user can make ("delete
+    /// all of it") was the one input that brought all of it back into
+    /// `recordings.json`, the `.txt` sidecar and the `.srt`. Emptiness alone
+    /// cannot distinguish a hand-emptied transcript from one that never
+    /// existed, so the gate keys on the deletions having happened.
+    /// (Cursor Bugbot on #229.)
+    ///
+    /// The stub engine is still canned with BOTH lines, so the batch pass this
+    /// must not provoke would write both back; `waitForIdle()` drains anything
+    /// the tail queued so a resurrection can't hide behind timing.
+    func test_deleting_every_line_does_not_resurrect_the_transcript() async throws {
+        try await recordTwoLinesAndDeleteTheSecond()
+
+        let survivor = try XCTUnwrap(transcriber.segments.first)
+        XCTAssertEqual(survivor.text, Self.keptLine,
+                       "precondition: exactly one line left to delete")
+        transcriber.removeSegment(id: survivor.id)
+        feedSidecar()
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "precondition: the user has emptied the live transcript")
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+
+        let saved = try XCTUnwrap(store.recordings.first)
+        XCTAssertEqual(saved.status, .completed,
+                       "an emptied live transcript has to stay authoritative — a `.pending` row "
+                       + "means a batch pass is still owed, and that pass re-transcribes the WAV")
+        XCTAssertTrue(saved.segments.isEmpty,
+                      "the emptied transcript came back as \(saved.segments.count) segment(s)")
+        XCTAssertFalse(saved.fullText.contains(Self.keptLine))
+        XCTAssertFalse(saved.fullText.contains(Self.deletedLine))
+
+        for marker in [Self.keptLine, Self.deletedLine] {
+            for file in allTextOnDisk() {
+                XCTAssertFalse(file.text.contains(marker),
+                               "deleted transcript text survived in \(file.path)")
+            }
+        }
+    }
+
     /// The MCP read paths specifically. `search_transcripts` goes through
     /// `namedTranscript` → the `.txt` sidecar, so it can serve text the store
     /// row no longer has; a retained recording id must not be a way back in

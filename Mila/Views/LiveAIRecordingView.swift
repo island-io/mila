@@ -78,6 +78,12 @@ struct LiveAIRecordingView: View {
     /// `.srt`. Editing affordances are hidden in that mode rather than
     /// silently undone (`bugbot-rules/deleted-data-stays-deleted.md`: a
     /// delete must not come back).
+    ///
+    /// It stays a pure mode check: deleting the *last* line would otherwise
+    /// empty `segments` and flip `liveTranscriptIsAuthoritative` by itself, but
+    /// that route is closed in `stopRecording` (an emptied transcript stays
+    /// authoritative) rather than by refusing the delete here. Emptying the
+    /// transcript is a legitimate thing to want.
     private var liveTranscriptIsSaved: Bool { liveAISettings.useVAD }
 
     /// RTL for the AI pane (summary + action items). The AI output is its

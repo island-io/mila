@@ -249,6 +249,15 @@ final class LiveTranscriber: ObservableObject {
         liveLog.log("LiveTranscriber.removeSegment start=\(seg.startSeconds, privacy: .public) end=\(seg.endSeconds, privacy: .public) remaining=\(self.segments.count, privacy: .public)")
     }
 
+    /// Whether the user deleted at least one line from THIS recording's live
+    /// transcript (reset by `start()` along with `deletedRanges`).
+    ///
+    /// Read at Stop, where it is the only thing that tells an *emptied* live
+    /// transcript apart from one that was never produced. Those two look
+    /// identical in `segments` and must be handled oppositely — see
+    /// `liveTranscriptIsAuthoritative` in `QuickActionsController.stopRecording`.
+    var hasUserDeletedSegments: Bool { !deletedRanges.isEmpty }
+
     /// Whether an incoming segment's absolute time range overlaps a range
     /// the user deleted. Any positive overlap counts — the intent of a
     /// delete is "drop what was said in that span," so re-emitted content

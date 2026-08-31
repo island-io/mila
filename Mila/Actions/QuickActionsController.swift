@@ -789,6 +789,11 @@ final class QuickActionsController: ObservableObject {
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
         let finalLiveSegments = liveTranscriber?.segments ?? []
+        // Snapshotted here for the same reason as the segments themselves —
+        // before `liveTranscriber?.stop()` below — because it is what tells an
+        // emptied live transcript apart from one that never existed. See
+        // `liveTranscriptIsAuthoritative`.
+        let userDeletedLiveLines = liveTranscriber?.hasUserDeletedSegments ?? false
         let finalSummary = (liveAISession?.summary ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = liveAISession?.actionItems ?? []
@@ -835,7 +840,21 @@ final class QuickActionsController: ObservableObject {
         // `vadActive` here is whatever was passed in by the caller —
         // typically `liveAISettings.useVAD && liveAISettings.enabled`.
         let hasLiveSegments = !finalLiveSegments.isEmpty
-        let liveTranscriptIsAuthoritative = hasLiveSegments && vadActive
+        // A live transcript the user EMPTIED by deleting every line is not the
+        // same thing as one that was never produced, and `hasLiveSegments`
+        // cannot tell them apart on its own. It exists for the second case: no
+        // live text means the live path gave us nothing, so fall back to the
+        // batch pass. Run that fallback after a hand-emptied transcript and the
+        // batch pass re-transcribes the WAV and writes every deleted line back
+        // into recordings.json, the `.txt` sidecar and the `.srt` — the
+        // resurrection `bugbot-rules/deleted-data-stays-deleted.md` describes,
+        // reached by the one route the UI-side gate cannot cover, because
+        // emptying `segments` is itself what flips this gate. Deleting every
+        // line is the strongest statement a user can make that this must not be
+        // recorded, so a deliberate emptying stays authoritative and saves
+        // empty. (Cursor Bugbot on #229.)
+        let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
+        let liveTranscriptIsAuthoritative = (hasLiveSegments || userEmptiedLiveTranscript) && vadActive
         let finalTranscriptSegments: [TranscriptSegment] = finalLiveSegments.map { ls in
             TranscriptSegment(start: ls.startSeconds, end: ls.endSeconds,
                               text: ls.text, speaker: ls.speaker)
