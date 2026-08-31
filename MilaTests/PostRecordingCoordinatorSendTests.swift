@@ -491,6 +491,34 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         XCTAssertFalse(coordinator.autoSuggestingIDs.contains(rec.id))
     }
 
+    /// Discard has to reach the vault, not just the store. Covers the wiring
+    /// `MilaApp` installs — without it the coordinator deletes the recording
+    /// and leaves its exported note behind.
+    func test_cancelAndDiscard_removes_the_obsidian_note() async throws {
+        let vault = tempRoot.appendingPathComponent("Vault", isDirectory: true)
+        try FileManager.default.createDirectory(at: vault, withIntermediateDirectories: true)
+        let suite = "PostRecordingCoordinatorSendTests.obsidian.\(UUID())"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let settings = ObsidianVaultSettings(defaults: defaults)
+        settings.enabled = true
+        settings.subfolder = ""
+        XCTAssertTrue(settings.setVault(vault))
+        let exporter = ObsidianExporter(settings: settings, defaults: defaults)
+        coordinator.obsidianExporter = exporter
+
+        let rec = addCompletedRecording(text: "the transcript text")
+        let note = try XCTUnwrap(exporter.export(rec), "precondition: the note was written")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: note.path))
+
+        coordinator.present(rec)
+        coordinator.cancelAndDiscard()
+
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: note.path),
+                       "discarding the recording must take its note out of the vault")
+    }
+
     // MARK: - Helpers
 
     /// Wait up to `timeoutSeconds` (default 5) for `condition` to hold, polling

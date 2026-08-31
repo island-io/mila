@@ -69,6 +69,51 @@ final class ObsidianExporter: ObservableObject {
         return write.written
     }
 
+    /// Undo the export for `recording`: drop it from the pending gate so a
+    /// summary still in flight can't file it later, and delete the note if one
+    /// was already written. Returns the removed file, or nil when there was
+    /// nothing in the vault for this recording.
+    ///
+    /// Called when the user throws a recording away. Export is driven off the
+    /// summarizer's completion hook, which can fire either side of a discard,
+    /// so clearing the gate alone would still leave a note behind whenever the
+    /// summary happened to land first — and "I discarded it and it's in my
+    /// vault anyway" reads as the app ignoring the discard.
+    @discardableResult
+    func discardNote(for recording: Recording) -> URL? {
+        clearPending(recording.id)
+        guard let vault = settings.vaultURL else { return nil }
+        var index = writtenIndex()
+        let key = Self.indexKey(vault: vault, id: recording.id)
+        migrateLegacyIndexEntry(&index, key: key, vault: vault, id: recording.id)
+        guard let relative = index[key] else {
+            // The migration above may have dropped a legacy entry.
+            setWrittenIndex(index)
+            return nil
+        }
+        index[key] = nil
+        setWrittenIndex(index)
+
+        let note = vault.appendingPathComponent(relative)
+        // Same rule the write path follows: never resolve a stored path back
+        // out of the vault. A path that no longer sits inside it is one we
+        // must not delete, whatever the index says.
+        guard ObsidianPathSanitizer.isContained(note, in: vault, fileManager: fileManager),
+              fileManager.fileExists(atPath: note.path) else { return nil }
+        do {
+            try fileManager.removeItem(at: note)
+        } catch {
+            print("ObsidianExporter: failed to remove \(note.path): \(error)")
+            return nil
+        }
+        if settings.gitSyncEnabled {
+            let title = Self.singleLine(recording.title)
+            let message = "Remove discarded transcript: \(title.isEmpty ? "Untitled recording" : title)"
+            kickGitSync(vault: vault, changedPaths: [note], commitMessage: message)
+        }
+        return note
+    }
+
     /// Backfill: write every provided recording into the vault, then kick a
     /// single git sync covering all of them. Used by "Sync existing
     /// transcripts". Returns the count of notes actually written.

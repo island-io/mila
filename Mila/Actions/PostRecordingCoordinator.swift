@@ -31,6 +31,12 @@ final class PostRecordingCoordinator: ObservableObject {
     private let transcription: TranscriptionService
     private let llm: LLMSettings
 
+    /// Late-bound by `MilaApp`, like the exporter wiring on
+    /// `QuickActionsController`. Discard has to reach the vault: export runs
+    /// off the summarizer's completion hook, which can land either side of the
+    /// user throwing the recording away.
+    var obsidianExporter: ObsidianExporter?
+
     /// Injectable LLM-run seam so tests can assert what `PostRecordingCoordinator`
     /// sends to `LLMRunner` (e.g. that the OpenAI path threads `openAIModelName`
     /// — issue celarent7/mila#3) without spawning a CLI or hitting the network.
@@ -482,7 +488,8 @@ final class PostRecordingCoordinator: ObservableObject {
     ///  2. trip the transcription service's abort flag so whisper.cpp
     ///     unwinds within ~100ms instead of finishing
     ///  3. permanently delete the recording + its audio file
-    ///  4. dismiss the sheet
+    ///  4. un-export it from the Obsidian vault
+    ///  5. dismiss the sheet
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
         autoSuggestingIDs.remove(recording.id)
@@ -493,9 +500,14 @@ final class PostRecordingCoordinator: ObservableObject {
             task.cancel()
         }
         transcription.cancel(recordingID: recording.id)
-        if let stored = store.recordings.first(where: { $0.id == recording.id }) {
+        let stored = store.recordings.first(where: { $0.id == recording.id })
+        if let stored {
             store.permanentlyDelete(stored)
         }
+        // After the delete, and against the STORED row when there is one: its
+        // title is what named the note on disk, and the `pending` snapshot's
+        // may predate a rename made in the sheet.
+        obsidianExporter?.discardNote(for: stored ?? recording)
         pending = nil
     }
 

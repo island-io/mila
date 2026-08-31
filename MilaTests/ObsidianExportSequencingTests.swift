@@ -191,6 +191,47 @@ final class ObsidianExportSequencingTests: XCTestCase {
                        "a recording trashed mid-flight must not be filed")
     }
 
+    // MARK: - Discard un-exports
+
+    /// The export already landed before the user hit Discard — the note has to
+    /// come back out of the vault, or discarding is something the app visibly
+    /// ignored.
+    func test_discardNote_removes_an_already_exported_note() async throws {
+        let rec = addRecording()
+        exporter.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: expected.path), "precondition")
+
+        exporter.discardNote(for: rec)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expected.path),
+                       "the note for a discarded recording is still in the vault")
+    }
+
+    /// The other ordering: Discard lands while the summary is still running,
+    /// so the export hasn't happened yet and must never happen.
+    func test_discard_before_the_summary_lands_blocks_the_export() async throws {
+        let rec = addRecording()
+        exporter.markPending(rec.id)
+        summarizer.summarizeIfNeeded(rec)
+        exporter.discardNote(for: rec)
+        await summarizer.awaitInFlight(rec.id)
+
+        let expected = vault.appendingPathComponent(ObsidianExporter.fileName(for: rec))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expected.path),
+                       "a summary landing after Discard must not file the note")
+        XCTAssertFalse(exporter.isPending(rec.id))
+    }
+
+    /// Nothing was ever written for this recording — removal is a no-op rather
+    /// than a delete of whatever happens to share the name.
+    func test_discardNote_is_a_noop_when_nothing_was_exported() {
+        let rec = addRecording()
+        XCTAssertNil(exporter.discardNote(for: rec))
+    }
+
     /// The hook fires exactly once per attempt: a second export for the same
     /// recording only happens on a second, deliberate summarize attempt.
     func test_hook_fires_once_per_attempt() async throws {
