@@ -400,9 +400,25 @@ final class PostRecordingCoordinator: ObservableObject {
                 // send) — no banner, the cancellation was deliberate.
             } catch {
                 if Task.isCancelled { return }
+                // The BANNER keeps `localizedDescription` — for
+                // `LLMRunnerError.nonZeroExit` that is the CLI's own stderr,
+                // and it is the only thing that turns "Claude failed" into
+                // something the user can act on. It is their transcript, on
+                // their screen, in response to a button they pressed.
+                //
+                // The LOG gets `logMessage(for:)` instead: exit status and a
+                // byte count, no tool output. This line was the reported site
+                // in issue #193 — a verbose CLI echoes the composed prompt
+                // (the transcript) on stderr, and `nonZeroExit` falls back to
+                // stdout (the model's answer about the meeting), so `.public`
+                // here put meeting content into a plaintext system log that
+                // needs no private-data logging to read.
                 self.postStatus("\(toolName) failed: \(error.localizedDescription)",
                                 isError: true)
-                postRecordingLog.error("send failed \(recordingID.uuidString.prefix(8), privacy: .public): \(error.localizedDescription, privacy: .public)")
+                postRecordingLog.error("""
+                    send failed \(recordingID.uuidString.prefix(8), privacy: .public): \
+                    \(LLMRunnerError.logMessage(for: error), privacy: .public)
+                    """)
             }
         }
         sendTasks[recordingID] = task

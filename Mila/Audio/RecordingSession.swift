@@ -162,7 +162,20 @@ final class RecordingSession: ObservableObject {
             // Recording permission denied) left the mic engine hot and the
             // WAV file open, appending mic audio indefinitely — and since
             // `state` is still .idle, `cancelAll()` refused to clean it up.
-            recLog.error("start(\(source.rawValue, privacy: .public)) failed mid-bring-up — tearing down partial session: \(error.localizedDescription, privacy: .public)")
+            // `AVAudioFile(forWriting: outputURL, …)` is inside this `do`, so
+            // the failure being reported can be "couldn't create the recording
+            // file" — and `outputURL` is `freshAudioURL`, a title-derived name
+            // inside the user's chosen recordings folder, both of which Cocoa
+            // quotes in `localizedDescription`. The far more common failure
+            // here (Screen Recording permission denied) is fully described by
+            // the source + domain + code, which stay public. (Issue #213.)
+            let ns = error as NSError
+            recLog.error("""
+                start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
+                — tearing down partial session \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             micTask?.cancel(); micTask = nil
             systemTask?.cancel(); systemTask = nil
             await mic.stop()
@@ -492,7 +505,19 @@ final class RecordingSession: ObservableObject {
         do {
             try file.write(from: buffer)
         } catch {
-            recLog.error("audio file write error: \(error.localizedDescription, privacy: .public)")
+            // The file being written lives in the recordings directory, which
+            // is the folder the user chose in Settings → Storage, and Cocoa
+            // quotes both the file and its containing folder in
+            // `localizedDescription`. Domain + code stay public — a disk-full
+            // versus a revoked-permission versus a vanished-volume write
+            // failure is exactly what this line exists to tell apart, and
+            // neither names a path. (Issue #213, CWE-532.)
+            let ns = error as NSError
+            recLog.error("""
+                audio file write error \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
         }
         // Live-transcription feed: `.microphone` and `.meeting` fire
         // `onLiveSamples` from `consumeMic` (the latter with the mic+system

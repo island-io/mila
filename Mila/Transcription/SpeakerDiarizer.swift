@@ -43,6 +43,58 @@ enum SpeakerDiarizer {
                 return "Speaker diarization failed: \(msg)"
             }
         }
+
+        /// The log-safe twin of `errorDescription`, matching
+        /// `LLMRunnerError.logDescription`.
+        ///
+        /// `.diarizationFailed` is built from the Python subprocess's stderr
+        /// (falling back to its stdout), and that stderr is not neutral: the
+        /// inline diarize script prints `diarize: running on {wav_path}`, and
+        /// the WAV's name is derived from the recording's title — see
+        /// `RecordingStore.freshAudioURL(suggestedName:)` and
+        /// `FileTranscriber`'s `safeStem`. A traceback also quotes the path.
+        /// So logging the message `.public` publishes the meeting title, the
+        /// same way `LLMRunnerError.nonZeroExit` published the transcript.
+        /// (Issues #213 / #193, CWE-532.)
+        ///
+        /// `.pythonNotFound` passes through: the interpreter path is a value
+        /// the user typed into Settings → Speakers, it names no recording, and
+        /// it is the entire diagnostic.
+        var logDescription: String {
+            switch self {
+            case .pythonNotFound:
+                return errorDescription ?? "\(self)"
+            case .diarizationFailed(let msg):
+                return "Speaker diarization failed (\(msg.utf8.count)B of subprocess output withheld)"
+            }
+        }
+
+        /// The log-safe message for any error a diarization call can throw —
+        /// applied where the concrete type is still unknown, since callers
+        /// catch `Error` and a cancellation or a decode failure lands here too.
+        ///
+        /// The fallback is deliberately **not** `localizedDescription`, for the
+        /// same reason as `MilaConfig.LoadError.logMessage(for:)`: `diarize` is
+        /// a file-open path. Any recording that is not already a WAV goes
+        /// through `AudioCompressor.decodeToTempWAV`, so an
+        /// `AVAudioFile(forReading:)` failure on a title-derived `.m4a` in the
+        /// user-chosen recordings folder arrives here as a plain `NSError` —
+        /// the shape Cocoa fills with the file's name and its containing
+        /// folder. Passing it through undid the redaction the two
+        /// `SpeakerDiarizer.Error` cases above had just applied, at the same
+        /// two `.public` log fields. Domain + code keep it diagnosable without
+        /// guessing. (Issue #213, CWE-532.)
+        ///
+        /// Cancellation is named explicitly because it is the common non-error
+        /// arrival here and carries nothing worth withholding — a bare
+        /// `[Swift.CancellationError 1]` would be the over-redaction
+        /// `bugbot-rules/no-user-content-in-logs.md` warns about.
+        static func logMessage(for error: Swift.Error) -> String {
+            if let diarError = error as? SpeakerDiarizer.Error { return diarError.logDescription }
+            if error is CancellationError { return "diarization cancelled" }
+            let ns = error as NSError
+            return "unexpected error [\(ns.domain) \(ns.code)]"
+        }
     }
 
     struct PythonResult {

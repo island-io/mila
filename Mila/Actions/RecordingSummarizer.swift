@@ -460,7 +460,18 @@ final class RecordingSummarizer: ObservableObject {
                 summarizerLog.log("succeeded \(self.shortID(id), privacy: .public) length=\(cleaned.count, privacy: .public) elapsed=\(elapsedMs, privacy: .public)ms")
                 self.onSummaryFinished?(current)
             } catch {
-                summarizerLog.error("failed \(self?.shortID(id) ?? "?", privacy: .public): \(error.localizedDescription, privacy: .public)")
+                // `logMessage(for:)`, not `localizedDescription`: this catches
+                // whatever `LLMRunner.run` threw, and
+                // `LLMRunnerError.nonZeroExit.errorDescription` embeds the
+                // CLI's stderr verbatim — which for a summary run is the
+                // composed prompt, i.e. the meeting transcript. Same leak as
+                // `PostRecordingCoordinator`'s send line, found in the same
+                // sweep. (Issue #193.) The summarizer has no user-facing
+                // surface for a failure, so nothing is lost here.
+                summarizerLog.error("""
+                    failed \(self?.shortID(id) ?? "?", privacy: .public): \
+                    \(LLMRunnerError.logMessage(for: error), privacy: .public)
+                    """)
                 // Failed generation — signal so a pending export can still
                 // write the transcript fallback. A permanent delete cancels
                 // the task, which lands here as a CancellationError, so the

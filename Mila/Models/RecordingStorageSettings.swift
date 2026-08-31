@@ -1,5 +1,9 @@
 import Foundation
 import Combine
+import OSLog
+
+private let storageSettingsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                        category: "RecordingStorageSettings")
 
 /// User-configurable destination for new recordings + the per-recording
 /// metadata sidecars (`recordings.json`, `folders.json`, `.txt` transcripts,
@@ -163,7 +167,20 @@ final class RecordingStorageSettings: ObservableObject {
         } catch {
             // Bookmark blob unreadable — drop it so we don't keep
             // failing on every launch.
-            print("RecordingStorageSettings: failed to resolve bookmark: \(error)")
+            // The bookmark blob resolves to the folder the user picked for
+            // their recordings, and a resolution failure names it: Cocoa
+            // quotes the path (or its containing folder) in
+            // `localizedDescription`, and that folder can be a client name, an
+            // employer, a project. Domain + code stay public — they are what
+            // says "the volume is gone" versus "permission denied" versus
+            // "corrupt blob", which is the whole diagnostic here.
+            // (Issue #213, CWE-532.)
+            let ns = error as NSError
+            storageSettingsLog.error("""
+                failed to resolve bookmark \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             defaults.removeObject(forKey: Self.bookmarkKey)
             return
         }
@@ -219,7 +236,15 @@ final class RecordingStorageSettings: ObservableObject {
             resolveAndStartAccessing()
             return customDirectory != nil
         } catch {
-            print("RecordingStorageSettings: failed to mint bookmark for \(url.path): \(error)")
+            // `url` IS the folder the user just chose in the open panel — the
+            // reported site in issue #213, and the most direct version of the
+            // leak: a full POSIX path straight into the log.
+            let ns = error as NSError
+            storageSettingsLog.error("""
+                failed to mint bookmark for \(url.path, privacy: .private) \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             return false
         }
     }

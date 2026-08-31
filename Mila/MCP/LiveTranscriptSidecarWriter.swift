@@ -19,6 +19,17 @@ private let sidecarLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 @MainActor
 final class LiveTranscriptSidecarWriter: ObservableObject {
 
+    /// Every file this type writes lives at `<root>/live/`, and `root` is
+    /// `RecordingStore.originalRootDirectory` in production (see `MilaApp`) —
+    /// the fixed app-support root, which `relocateRecordings` never moves. So
+    /// the three write-failure lines below keep `error.localizedDescription`
+    /// `.public` on purpose: the folder Cocoa quotes in the message can only
+    /// ever be “Mila”, no title or user-chosen path can reach them, and a
+    /// readable message is what makes a broken MCP handoff diagnosable. Same
+    /// established exception as `store-location.json` and `persistTombstones`
+    /// in `RecordingStore`; contrast `persist()` / `persistFolders()` there,
+    /// which follow the user's chosen directory and therefore redact.
+    /// (Issue #213.)
     private let root: URL
     private let minWriteInterval: TimeInterval
     private let heartbeatInterval: TimeInterval
