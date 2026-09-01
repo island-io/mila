@@ -229,9 +229,22 @@ final class LLMRunnerTests: XCTestCase {
     /// Adopting a 300s bound under a 240s allowance is what takes the safety
     /// net away.
     ///
-    /// 30s matches every other spawning test here and keeps the worst case
-    /// (30s wait + 1s SIGTERM grace + 5s SIGKILL grace + 3s drain) an order of
-    /// magnitude inside the allowance.
+    /// 30s matches the other *synthetic* spawning tests here — the ones whose
+    /// child is a shell script — and keeps the worst case (30s wait + 1s
+    /// SIGTERM grace + 5s SIGKILL grace + 3s drain) an order of magnitude
+    /// inside the allowance.
+    ///
+    /// Two sets of deliberate exceptions, both still under 240s:
+    ///
+    ///   * `timeout: 1` in `test_timeout_fires_when_process_exceeds_limit`,
+    ///     `test_timeout_returns_even_when_grandchild_holds_pipes_open` and
+    ///     `test_diagnose_reports_timeout_without_throwing` — those exercise
+    ///     the timeout path itself, so the bound IS the thing under test.
+    ///   * `timeout: 120` in the three real-CLI smoke tests
+    ///     (`test_claude_cli_…`, `test_cursor_cli_…`, `test_gemini_cli_…`),
+    ///     which wait on a live model round-trip rather than a script. They
+    ///     auto-skip when the CLI isn't installed, so they don't run in CI at
+    ///     all — but 120s would fit the allowance even if they did.
     func test_runner_surfaces_nonzero_exit_code() async {
         // `/usr/bin/false` always exits 1.
         do {
