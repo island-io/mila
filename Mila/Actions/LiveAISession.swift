@@ -239,7 +239,7 @@ final class LiveAISession: ObservableObject {
             scheduleKick(immediate: true)
         }
         // Drain the in-flight tick and any coalesced follow-up. The tick
-        // task sets `inFlight = nil` in its tail before potentially
+        // task clears `inFlight` from its `defer` before potentially
         // scheduling another (immediate, since isFinalizing) kick, so
         // looping until `inFlight` is nil drains everything.
         while let handle = inFlight {
@@ -550,6 +550,35 @@ TRANSCRIPT SO FAR:
         let openAIBaseURL = llmSettings.openAIBaseURL
         let openAIAPIKey = llmSettings.openAIAPIKey
         inFlight = Task { @MainActor [weak self] in
+            // In a `defer` rather than at the tail, because the two
+            // "session changed mid-flight" guards below `return` out of this
+            // closure and would skip it (issue #239). Until
+            // `noteTranscriptEdited()` existed nothing could change
+            // `sessionID` while a tick was running -- `kick()` only runs when
+            // `inFlight == nil`, and `cancel()` clears `inFlight` itself -- so
+            // those guards were unreachable except on a path that had already
+            // cleaned up. A deletion during an in-flight tick makes them
+            // reachable for real, and leaving `inFlight` set wedges Live AI
+            // for the rest of the recording: `scheduleKick` coalesces every
+            // later tick behind a task that will never clear.
+            //
+            // Running the coalesced re-kick from here too is what makes the
+            // deletion RECOVER rather than merely not-crash: the feed of the
+            // shortened transcript set `coalesced` while this tick was in
+            // flight, so the dropped tick is immediately replaced by one on
+            // the new session carrying the post-deletion text.
+            // (CodeRabbit on #242.)
+            defer {
+                self?.isThinking = false
+                self?.inFlight = nil
+                if let self, self.coalesced {
+                    self.coalesced = false
+                    // Route through the throttle: honours the min-interval
+                    // floor during normal operation, fires immediately while
+                    // finalizing.
+                    self.scheduleKick()
+                }
+            }
             let llmStart = Date()
             do {
                 let raw = try await perform(LLMCall(
@@ -628,17 +657,6 @@ TRANSCRIPT SO FAR:
                     self.sessionID = UUID()
                     self.lastTranscriptSent = ""
                 }
-            }
-            self?.isThinking = false
-            self?.inFlight = nil
-            // If new text arrived while we were running, fire one more
-            // pass with the latest snapshot.
-            if let self, self.coalesced {
-                self.coalesced = false
-                // Route through the throttle: honours the min-interval
-                // floor during normal operation, fires immediately while
-                // finalizing.
-                self.scheduleKick()
             }
         }
     }

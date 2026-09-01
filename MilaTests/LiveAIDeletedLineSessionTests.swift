@@ -145,6 +145,49 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         XCTAssertTrue(calls.value[1].transcript.contains("Two."))
     }
 
+    /// A deletion while a tick is IN FLIGHT must not wedge Live AI -- and must
+    /// still recover onto a new session.
+    ///
+    /// This is the failure mode `noteTranscriptEdited()` introduced and the
+    /// `defer` in `kick()`'s task fixes. Both "session changed mid-flight"
+    /// guards `return` out of that closure, which used to skip the tail that
+    /// clears `inFlight`. Nothing could reach them before: `kick()` only runs
+    /// when `inFlight == nil`, so the notes-edit restart cannot land mid-call,
+    /// and `cancel()` clears `inFlight` itself. A per-line delete can, and a
+    /// stranded `inFlight` makes `scheduleKick` coalesce every later tick
+    /// behind a task that will never clear -- Live AI silently stops for the
+    /// rest of the meeting.
+    ///
+    /// Revert the `defer` and this hangs at the second wait. (CodeRabbit
+    /// raised the mechanism on #242; verified against the code before fixing.)
+    func test_deleting_during_an_in_flight_tick_recovers_on_a_new_session() async {
+        let gate = Gate()
+        let (session, calls) = makeSession(suite: "LiveAIDeletedLineSessionTests.inflight",
+                                           hold: gate)
+
+        session.feed(transcript: "[00:00] One.\n[00:05] Two.", immediate: true)
+        let started = await waitUntil { calls.value.count == 1 }
+        XCTAssertTrue(started, "precondition: the first tick must actually be in flight")
+
+        // The user deletes "Two." while that call is still running, and the
+        // feed loop follows with the shortened transcript -- which coalesces,
+        // because a call is in flight.
+        session.noteTranscriptEdited()
+        session.feed(transcript: "[00:00] One.", immediate: true)
+
+        gate.isOpen = true
+
+        let recovered = await waitUntil(timeout: 5) { calls.value.count == 2 }
+        XCTAssertTrue(recovered,
+                      "Live AI wedged: the dropped tick left `inFlight` set, so every later tick coalesced behind a task that never clears")
+        XCTAssertEqual(kind(calls.value[1].session), "new",
+                       "the replacement tick must open a new session, not resume the abandoned one")
+        XCTAssertTrue(calls.value[1].transcript.contains("One."))
+        XCTAssertFalse(calls.value[1].transcript.contains("Two."),
+                       "the recovery tick must carry the post-deletion transcript")
+        XCTAssertFalse(session.isThinking, "the thinking indicator must not be left on")
+    }
+
     // MARK: - Helpers
     //
     // Deliberately the same shape as `LiveAIMeetingContextTests`, which pins
@@ -152,6 +195,12 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
 
     private final class Calls {
         var value: [LiveAISession.LLMCall] = []
+    }
+
+    /// Lets a test park the first `performCall` so a deletion can land while a
+    /// tick is genuinely in flight, rather than in the gap between ticks.
+    private final class Gate {
+        var isOpen = false
     }
 
     private func kind(_ session: LLMSession) -> String {
@@ -170,7 +219,8 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
     }
 
     private func makeSession(suite: String,
-                             tool: LLMTool = .claude) -> (LiveAISession, Calls) {
+                             tool: LLMTool = .claude,
+                             hold: Gate? = nil) -> (LiveAISession, Calls) {
         UserDefaults().removePersistentDomain(forName: "\(suite).llm")
         UserDefaults().removePersistentDomain(forName: "\(suite).live")
         let llm = LLMSettings(defaults: UserDefaults(suiteName: "\(suite).llm")!)
@@ -183,10 +233,30 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         let session = LiveAISession(llmSettings: llm, liveAISettings: live)
         session.performCall = { call in
             calls.value.append(call)
+            // Park the FIRST call only, so the test can act while the tick is
+            // demonstrably inside the runner.
+            if let hold, calls.value.count == 1 {
+                while !hold.isOpen {
+                    try? await Task.sleep(nanoseconds: 500_000)
+                }
+            }
             return #"{"summary":"ok","items":[]}"#
         }
         session.start()
         return (session, calls)
+    }
+
+    /// Spin until `condition` holds, or the timeout expires. Returns whether
+    /// it held -- callers assert on that rather than hanging the suite.
+    private func waitUntil(timeout: TimeInterval = 2,
+                           _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            await Task.yield()
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        return condition()
     }
 
     private func waitUntilIdle(_ session: LiveAISession,
