@@ -261,13 +261,13 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                        "a different session reused this session's id; argv was: \(other.argv)")
     }
 
-    /// One run of `makeCWDAndArgvEchoScript`, split back into its two lines.
+    /// One run of `makeCWDAndArgvEchoScript`, split back into its two parts.
     private struct EchoedRun {
         let cwd: String
         let argv: String
     }
 
-    /// Run the cwd+argv echo script and parse its two marked lines.
+    /// Run the cwd+argv echo script and split its output at the two markers.
     ///
     /// Parsing rather than asserting on the raw string because
     /// `executeProcess` has a documented path that returns an EMPTY string
@@ -286,17 +286,21 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                                              executablePathOverride: script.path,
                                              session: session,
                                              timeout: Self.spawnTimeout)
-        let lines = output.components(separatedBy: "\n")
-        func value(_ marker: String) -> String? {
-            lines.first { $0.hasPrefix(marker) }.map { String($0.dropFirst(marker.count)) }
-        }
-        guard let cwd = value("CWD:"), let argv = value("ARGV:") else {
-            XCTFail("the child produced no CWD:/ARGV: lines — a successful run "
-                    + "with no output proves nothing. Got: \(output.debugDescription)",
+        // Split on the ARGV marker, NOT on newlines. `CWD:` is one line, but
+        // `ARGV:` is not: the composed prompt is a single argv element
+        // containing newlines, so argv runs from its marker to the end of the
+        // output. A line-wise parse silently truncates it to `-p x` and then
+        // fails the UUID assertions on a run that passed the UUID correctly —
+        // CI caught exactly that on the first version of this helper.
+        guard output.hasPrefix("CWD:"), let marker = output.range(of: "\nARGV:") else {
+            XCTFail("the child produced no CWD:/ARGV: markers — a successful "
+                    + "run with no output proves nothing. Got: "
+                    + "\(output.debugDescription)",
                     file: file, line: line)
             return EchoedRun(cwd: "", argv: "")
         }
-        return EchoedRun(cwd: cwd, argv: argv)
+        return EchoedRun(cwd: String(output[..<marker.lowerBound].dropFirst("CWD:".count)),
+                         argv: String(output[marker.upperBound...]))
     }
 
     /// The PR claims concurrent invocations can share one cwd. Sequential runs
