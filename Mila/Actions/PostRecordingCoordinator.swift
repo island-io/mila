@@ -93,7 +93,18 @@ final class PostRecordingCoordinator: ObservableObject {
     /// caller hands us an empty transcript we poll the store until the
     /// recording lands in a terminal state. Generous bound: a long file
     /// can still be transcribing minutes after the user walks away.
+    ///
+    /// One budget covers BOTH halves of "is this transcript final" — the
+    /// text and then the speaker labels (issue #211) — rather than two
+    /// stacked timeouts that could add up to twice the advertised bound.
     var transcriptWaitTimeout: TimeInterval = 600
+
+    /// Shown while a send is parked waiting for the offline speaker pass to
+    /// re-key `SPEAKER_NN`. A named constant because it is the difference
+    /// between "the app is thinking" and an unexplained delay before
+    /// "Sending to Claude…", and the tests assert on the same string the
+    /// user reads. (Issue #211.)
+    static let waitingForSpeakersStatus = "Waiting for speaker identification…"
 
     init(store: RecordingStore,
          transcription: TranscriptionService,
@@ -161,8 +172,8 @@ final class PostRecordingCoordinator: ObservableObject {
     /// the meantime. (Issue #34.)
     ///
     /// The transcript is usually still being finalized at add time, so we
-    /// reuse `awaitTranscript` (the same poller "Send to <LLM>" uses) to wait
-    /// for it before invoking the CLI.
+    /// reuse `awaitFinalTranscript` (the same poller "Send to <LLM>" uses) to
+    /// wait for it — text and speaker labels both — before invoking the CLI.
     private func armAutoSuggestTitle(for recording: Recording) {
         guard llm.isConfigured, llm.nameGenerationEnabled else { return }
         let id = recording.id
@@ -196,8 +207,14 @@ final class PostRecordingCoordinator: ObservableObject {
                 if !Task.isCancelled { self?.clearLLM(for: id) }
             }
             guard let self else { return }
-            guard let transcript = await self.awaitTranscript(for: id,
-                                                              timeout: waitTimeout) else {
+            // Same wait as the Send path, and for the same reason (issue
+            // #211): a title generated from the live diarizer's
+            // over-segmented speakers is less wrong than a summary built on
+            // them, but it is the same stale input. Silent here — this job
+            // runs unattended on every recording, so a banner explaining a
+            // wait the user never asked for would be noise.
+            guard let transcript = await self.awaitFinalTranscript(
+                for: id, timeout: waitTimeout, announceSpeakerWait: false) else {
                 return  // discarded, timed out, or empty transcript
             }
             if Task.isCancelled { return }
@@ -305,13 +322,15 @@ final class PostRecordingCoordinator: ObservableObject {
     /// dismiss BEFORE calling this, so the call genuinely runs in the
     /// background — the user can close the sheet and walk away.
     ///
-    /// `transcript` is whatever the caller had at click time. When the
-    /// user fires before transcription finishes it'll be empty; in that
-    /// case we wait for the recording to reach a terminal state and pull
-    /// the finished transcript out of the store ourselves, rather than
-    /// blocking the UI behind a disabled button. (The sheet used to gate
-    /// the button on `transcriptReady` for exactly this reason — now the
-    /// readiness wait lives here so "Send" is always pressable.)
+    /// `transcript` is whatever the caller had at click time. We do not send
+    /// it: we wait for the recording to be genuinely final — transcribed AND
+    /// past the offline speaker pass — and read the text back out of the
+    /// store, rather than blocking the UI behind a disabled button. (The
+    /// sheet used to gate the button on `transcriptReady` for exactly this
+    /// reason — now the readiness wait lives here so "Send" is always
+    /// pressable.) The click-time text is the fallback for a row the store
+    /// cannot answer for at all; see `awaitFinalTranscript` for why it can no
+    /// longer be a shortcut past the wait (issue #211).
     ///
     /// Idempotent per id: a second send for the same recording cancels and
     /// replaces the first (no use case for two competing CLI calls writing
@@ -364,21 +383,39 @@ final class PostRecordingCoordinator: ObservableObject {
                 if let self, !Task.isCancelled { self.sendTasks[recordingID] = nil }
             }
             guard let self else { return }
-            // Resolve the transcript: use the click-time snapshot if it
-            // already has text, otherwise wait for transcription to finish.
+            // Resolve the transcript from the STORE, waiting until it is
+            // final in both senses — the text has been produced, and the
+            // speaker labels on it will not be re-keyed again.
+            //
+            // The click-time snapshot is no longer a shortcut past that wait,
+            // only a fallback for when the store cannot answer at all (the
+            // row was discarded, or was never there). It has to be: on the
+            // live/VAD path the snapshot is ALWAYS non-empty — the sheet is
+            // showing the live transcript — so preferring it made the wait
+            // unreachable on the one path that has the race (issue #211).
+            // And it is a snapshot of the pre-re-diarize labels by
+            // construction, so even a correct wait would have sent stale
+            // text if we then used it instead of re-reading.
             let resolved: String
-            if transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                guard let waited = await self.awaitTranscript(for: recordingID,
-                                                              timeout: timeout) else {
-                    if Task.isCancelled { return }
-                    self.postStatus("\(toolName): no transcript to send.", isError: true)
-                    return
-                }
-                resolved = waited
-            } else {
+            if let final = await self.awaitFinalTranscript(for: recordingID,
+                                                           timeout: timeout,
+                                                           announceSpeakerWait: true) {
+                resolved = final
+            } else if !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 resolved = transcript
+            } else {
+                if Task.isCancelled { return }
+                self.postStatus("\(toolName): no transcript to send.", isError: true)
+                return
             }
             if Task.isCancelled { return }
+            // Re-assert the banner now the waiting is over. The click-time
+            // "Sending to …" may have auto-cleared minutes ago (a long
+            // transcription, then the speaker pass), and the speaker wait
+            // clears its own message on the way out — so without this the
+            // last thing the user saw is nothing at all, right at the point
+            // the CLI actually starts.
+            self.postStatus("Sending to \(toolName)…")
             do {
                 // OpenAI-compatible runs need the model name threaded (the
                 // HTTP path can't pick its own). Issue celarent7/mila#3.
@@ -400,10 +437,13 @@ final class PostRecordingCoordinator: ObservableObject {
                     false,
                     nil,
                     .action,
-                    // Resolved here, after the transcript wait: the `.srt` is
-                    // written at the end of the transcription pass, so asking
-                    // any earlier would find nothing and fall back to inline
-                    // for every send fired mid-recording.
+                    // Resolved here, after the transcript AND speaker waits:
+                    // the `.srt` is written at the end of the transcription
+                    // pass — and, on the live path, only after the offline
+                    // re-diarize inside `finalizeTail` — so asking any earlier
+                    // would find nothing and fall back to inline for every
+                    // send fired mid-recording or straight after Stop
+                    // (issue #211).
                     byPath ? self.transcriptReferences(for: recordingID) : .inline)
                 let preview = output
                     .replacingOccurrences(of: "\n", with: " ")
@@ -462,32 +502,136 @@ final class PostRecordingCoordinator: ObservableObject {
                                     audio: store.audioURL(for: rec)))
     }
 
+    /// The transcript to hand an LLM for `recordingID`, once it is genuinely
+    /// final — in BOTH senses:
+    ///
+    ///  1. the text exists and the recording has left `.pending`/`.running`;
+    ///  2. its speaker labels will not change again (issue #211).
+    ///
+    /// Step 2 exists because on the live/VAD path the row is already
+    /// `.completed` when Stop returns, while the offline re-diarize that
+    /// fixes the live diarizer's over-segmentation runs afterwards in
+    /// `QuickActionsController.finalizeTail`. Everything sent in that window
+    /// carries one person split across several `SPEAKER_NN`, with names on
+    /// the wrong turns, and nothing reconciles the CLI's answer once the good
+    /// labels land.
+    ///
+    /// Order matters: the speaker check comes SECOND. A send fired mid-
+    /// recording sees no marker yet — the tail that publishes it has not been
+    /// reached — so checking speakers first would sail straight through.
+    /// Waiting for the terminal status first lands us past the marker's
+    /// publication, which happens in the same main-actor run as the
+    /// `store.update` that flips the status.
+    ///
+    /// Both halves share one `deadline`, so the caller's `timeout` is the
+    /// total bound rather than a per-phase one. Returns nil if the recording
+    /// disappears, ends up with no text, or the wait times out / is
+    /// cancelled; the wait honours task cancellation so `cancelAndDiscard`
+    /// unblocks it immediately.
+    private func awaitFinalTranscript(for recordingID: UUID,
+                                      timeout: TimeInterval,
+                                      announceSpeakerWait: Bool) async -> String? {
+        let deadline = Date().addingTimeInterval(timeout)
+        guard let text = await awaitTranscript(for: recordingID, until: deadline) else {
+            return nil
+        }
+        guard await awaitSpeakerFinalization(for: recordingID,
+                                             until: deadline,
+                                             announce: announceSpeakerWait) else {
+            // Nothing was pending, so the text above already carries final
+            // labels — and no wait was paid.
+            return text
+        }
+        // The offline pass re-keys every `SPEAKER_NN` and moves
+        // `speakerNames` onto the new ids, so the text read before the wait
+        // is stale by construction. Re-read.
+        return storedTranscript(for: recordingID) ?? text
+    }
+
     /// Poll the store until `recordingID` has a non-empty transcript and
     /// has left the in-progress states (`.pending` / `.running`), then
     /// return the speaker-aware plain text. Returns nil if the recording
-    /// disappears, ends up with no text, or the wait times out / is
+    /// disappears, ends up with no text, or `deadline` passes / the task is
     /// cancelled. The wait is cheap (a short sleep between checks) and
     /// honours task cancellation so `cancelAndDiscard` unblocks it
     /// immediately.
     private func awaitTranscript(for recordingID: UUID,
-                                 timeout: TimeInterval) async -> String? {
-        let deadline = Date().addingTimeInterval(timeout)
+                                 until deadline: Date) async -> String? {
         while Date() < deadline {
             if Task.isCancelled { return nil }
             guard let rec = store.recordings.first(where: { $0.id == recordingID }) else {
                 return nil  // discarded out from under us
             }
             if rec.status != .pending && rec.status != .running {
-                let text = TranscriptFormatter.plainText(segments: rec.segments,
-                                                         fallback: rec.fullText,
-                                                         names: rec.speakerNames)
-                return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    ? nil
-                    : text
+                return storedTranscript(for: recordingID)
             }
             try? await Task.sleep(nanoseconds: 250_000_000)
         }
         return nil
+    }
+
+    /// Park until the offline speaker pass for `recordingID` is done, so the
+    /// caller reads the CLEANED labels rather than the live diarizer's
+    /// over-segmented ones.
+    ///
+    /// Returns `true` when there was something to wait for — the caller must
+    /// then re-read the transcript, because the pass re-keys the speaker ids.
+    /// Returns `false` when nothing was pending, which is the common case and
+    /// costs NOTHING: diarization off, a recording the live pass already
+    /// pinned at ≤ `QuickActionsController.maxLiveSpeakersToSkipRediarize`
+    /// speakers, or a batch-transcribed recording (whose diarization happens
+    /// inside the transcription pass, before it leaves `.pending`).
+    ///
+    /// `announce` drives the user-visible banner, and only the interactive
+    /// Send path passes it — the unattended auto-title job must not narrate a
+    /// wait the user never asked for.
+    private func awaitSpeakerFinalization(for recordingID: UUID,
+                                          until deadline: Date,
+                                          announce: Bool) async -> Bool {
+        guard transcription.isAwaitingSpeakerFinalization(recordingID) else { return false }
+        // Set directly rather than through `postStatus`, which auto-clears
+        // after a few seconds. This banner has to stay up for as long as the
+        // pass runs — a minute or more on a long meeting — and re-posting the
+        // same string cannot outrun its own pending clear, which matches on
+        // the message text. Cleared on the way out (below) so a cancelled or
+        // timed-out send never strands it.
+        if announce {
+            activityStatus = Self.waitingForSpeakersStatus
+            activityIsError = false
+        }
+        defer {
+            if announce, activityStatus == Self.waitingForSpeakersStatus {
+                activityStatus = nil
+            }
+        }
+        while Date() < deadline {
+            if Task.isCancelled { return true }
+            // Gone from the store: nothing will ever release the marker for a
+            // row that no longer exists, so stop waiting. A user-initiated
+            // discard has already cancelled this task (`cancelAndDiscard`),
+            // and the caller re-checks cancellation before it sends.
+            guard store.recordings.contains(where: { $0.id == recordingID }) else { return true }
+            guard transcription.isAwaitingSpeakerFinalization(recordingID) else { return true }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        // Timed out. Fall through rather than failing the send: the labels
+        // may be imperfect, but a summary the user asked for beats no summary
+        // at all, and the bound is what keeps this from hanging forever.
+        return true
+    }
+
+    /// The recording's speaker-aware plain text as the store holds it right
+    /// now, or nil when the row is gone or has no text. The single place the
+    /// transcript is rendered from a stored row, so the pre-wait read and the
+    /// post-wait re-read cannot drift apart.
+    private func storedTranscript(for recordingID: UUID) -> String? {
+        guard let rec = store.recordings.first(where: { $0.id == recordingID }) else {
+            return nil
+        }
+        let text = TranscriptFormatter.plainText(segments: rec.segments,
+                                                 fallback: rec.fullText,
+                                                 names: rec.speakerNames)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : text
     }
 
     /// The Cancel button in the rename sheet: throw away EVERYTHING related
