@@ -123,7 +123,22 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
+        // Report a removal that FAILED, rather than swallowing it with `try?`.
+        // The ledger in `setUp` is the cross-test net, but it is only read by
+        // the NEXT test — so without this the last test in the class could leak
+        // and nothing would ever say so. `tearDown` still runs in the failing
+        // test's own context, so the attribution is right either way.
+        if let tempRoot, FileManager.default.fileExists(atPath: tempRoot.path) {
+            do {
+                try FileManager.default.removeItem(at: tempRoot)
+                Self.previousRoots.removeAll { $0 == tempRoot }
+            } catch {
+                XCTFail("could not remove this test's temp root "
+                        + "\(tempRoot.lastPathComponent): \(error.localizedDescription)")
+            }
+        } else if let tempRoot {
+            Self.previousRoots.removeAll { $0 == tempRoot }
+        }
         try super.tearDownWithError()
     }
 

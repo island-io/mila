@@ -45,6 +45,42 @@ import Foundation
 /// work — private serial queues target an *overcommit* root queue, so they
 /// always get a thread — but that is a subtle property to rely on, and it is
 /// invisible at the call site. `Thread` says what it means.
+///
+/// ## What bounds the thread count
+///
+/// The obvious objection to "a thread per blocking wait" is that it trades a
+/// bounded pool that starves for unbounded native threads that do not. It is
+/// worth being precise about why that is not what happens here.
+///
+/// A subprocess invocation costs **four** threads for its lifetime: two pipe
+/// readers, one `waitUntilExit()` backstop, and the caller blocked inside
+/// `executeProcess` / `runSync`. So the ceiling is four times the number of
+/// concurrent CHILD PROCESSES — and every path that spawns one is already
+/// bounded, upstream, by something that exists to bound *processes*, which is
+/// the scarcer resource:
+///
+/// | caller | what bounds it | concurrent children |
+/// |---|---|---|
+/// | `RecordingSummarizer` backfill / regeneration | `maxConcurrent = 2`, with `backfillQueue` holding the rest — added so a 20-recording catch-up sweep does not fork 20 `claude -p` processes | 2 |
+/// | `LiveAISession` ticks | one `inFlight` Task, with coalescing | 1 |
+/// | `PostRecordingCoordinator` | one in-flight handle | 1 |
+/// | `RenameRecordingSheet` "Suggest" | one modal sheet, guarded by `isFetchingName` | 1 |
+/// | `LLMSettings.diagnose` (Settings → Test) | one Settings panel, user-driven | 1 |
+/// | `ProcessGitCommandRunner` via `ObsidianGitSyncer` | an `actor`, and `sync` issues its commands sequentially | 1 |
+///
+/// Even with every one of those in flight at once — a batch summary sweep
+/// during a live meeting while an Obsidian sync runs — that is ~7 children and
+/// ~28 threads, transient, against a per-process limit in the hundreds.
+///
+/// Note this is the SAME bound as before. The old code created exactly the same
+/// number of work items; the only difference is that they used to contend for a
+/// capped shared pool, which is what starved. The change does not raise
+/// concurrency, it moves where the concurrency lands.
+///
+/// **Do not add a cap here.** A limit on thread creation inside this type would
+/// re-queue blocked work behind a bound — which is precisely the failure this
+/// exists to remove. A new caller that can spawn subprocesses in a batch needs
+/// a concurrency limit of its own, like `RecordingSummarizer.maxConcurrent`.
 enum BlockingWork {
 
     /// Start `body` on a thread of its own, right now.

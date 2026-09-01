@@ -77,7 +77,21 @@ never started.
 3. Keep the `waitUntilExit()` backstop even with a `terminationHandler`: macOS
    26 has a reaping race where `waitUntilExit` never returns even after
    `SIGKILL`. The two paths fail independently; whichever notices first signals.
-   Only wait on the semaphore once, so a double signal is harmless.
+   Both may signal, and that is harmless: a `DispatchSemaphore` is only unsafe
+   to destroy while its value is *below* where it started, and every wait on it
+   is bounded (`wait(timeout:)`), including the further waits the
+   SIGTERM-then-SIGKILL escalation performs. Never add an unbounded
+   `semaphore.wait()` — that is the hang this whole section exists to remove.
+
+**Bounding the threads.** A dedicated thread per blocking wait means the thread
+count follows the number of concurrent CHILD PROCESSES, so that is what has to
+be bounded — and it already is, upstream, where it also bounds the thing users
+actually care about (`RecordingSummarizer.maxConcurrent = 2` exists so a
+20-recording catch-up sweep does not fork 20 `claude -p` processes). Do not
+"fix" this by capping thread creation inside `BlockingWork`: a cap there just
+re-queues blocked work behind a limit, which is the original bug. If you add a
+new caller that can spawn subprocesses in a batch, give the CALLER a concurrency
+limit.
 
 This applies to tests as much as to production code — the test host is one
 process, and a suite that parks blocking work on the shared pool degrades every

@@ -41,15 +41,31 @@ final class LLMSandboxDirectoryTests: XCTestCase {
     /// Time allowed for the tick to spawn and write its handshake file.
     private static let tickReadyTimeout: TimeInterval = 20
 
-    /// A stand-in for `claude -p` that just prints its working directory.
-    /// Prints the cwd and then its whole argv, on separate marked lines, so a
-    /// test can assert both "where did it run" and "what was it told" from one
-    /// invocation. The cwd assertions can't speak to argv, which is what let
-    /// the session-UUID claim go unchecked.
+    /// A stand-in for `claude -p` that reports where it ran and what it was
+    /// told, so one invocation can answer both questions. The cwd assertions
+    /// can't speak to argv, which is what let the session-UUID claim go
+    /// unchecked.
+    ///
+    /// Three markers, and the middle one is the important one:
+    ///
+    ///     CWD:<pwd>          one line
+    ///     ARGC:<count>       one line — `$#`, taken before any joining
+    ///     ARGV:<joined>      NOT one line: `$*` carries the prompt's newlines
+    ///
+    /// `ARGC` exists because `ARGV` alone cannot tell "the CLI was never given
+    /// `--session-id`" apart from "our parse of `$*` dropped it". `$*` also
+    /// collapses argument boundaries, so a count taken before the join is the
+    /// only value here that can see an argument disappear. The first version
+    /// of this fixture had no count and a line-wise parse, and CI reported
+    /// `argv was: -p x` — on its face indistinguishable from a production
+    /// regression that had stopped passing the session flag.
     private func makeCWDAndArgvEchoScript() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("island-mila-sandbox-test-\(UUID().uuidString).sh")
-        try? "#!/bin/sh\nprintf 'CWD:%s\\n' \"$PWD\"\nprintf 'ARGV:%s\\n' \"$*\"\n".write(
+        try? ("#!/bin/sh\n"
+              + "printf 'CWD:%s\\n' \"$PWD\"\n"
+              + "printf 'ARGC:%s\\n' \"$#\"\n"
+              + "printf 'ARGV:%s\\n' \"$*\"\n").write(
             to: url, atomically: true, encoding: .utf8)
         try? FileManager.default.setAttributes([.posixPermissions: 0o755],
                                               ofItemAtPath: url.path)
@@ -248,6 +264,22 @@ final class LLMSandboxDirectoryTests: XCTestCase {
         // assertions cannot show it: "UUID absent from the cwd" is equally
         // consistent with "never passed at all". Now checked on the SAME runs
         // rather than on two extra spawns.
+        //
+        // Assert the COUNT before the contents. `LLMTool.arguments` adds
+        // exactly two arguments for a session (`--session-id <uuid>` for
+        // `.new`, `--resume <uuid>` for `.resume`) and nothing else differs
+        // between these four runs, so the delta is exactly 2. That check
+        // depends on no string matching at all, which matters twice: it
+        // catches a production path that stopped emitting the flag — every
+        // Live AI tick would then silently start a fresh conversation instead
+        // of continuing the meeting — and it cannot be satisfied by a uuid
+        // that merely appears somewhere in the output.
+        XCTAssertEqual(newSession.argc, oneShot.argc + 2,
+                       "a new session must add `--session-id <uuid>`: "
+                       + "\(newSession.argc) arguments vs \(oneShot.argc) for the one-shot")
+        XCTAssertEqual(resumed.argc, oneShot.argc + 2,
+                       "a resumed session must add `--resume <uuid>`: "
+                       + "\(resumed.argc) arguments vs \(oneShot.argc) for the one-shot")
         XCTAssertTrue(newSession.argv.contains(id.uuidString),
                       "a new session must pass its UUID to the CLI; argv was: \(newSession.argv)")
         XCTAssertTrue(resumed.argv.contains(id.uuidString),
@@ -261,13 +293,16 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                        "a different session reused this session's id; argv was: \(other.argv)")
     }
 
-    /// One run of `makeCWDAndArgvEchoScript`, split back into its two parts.
+    /// One run of `makeCWDAndArgvEchoScript`, split back into its three parts.
     private struct EchoedRun {
         let cwd: String
+        /// `$#` — the count BEFORE `$*` joined everything with spaces. The
+        /// only value here that can detect an argument going missing.
+        let argc: Int
         let argv: String
     }
 
-    /// Run the cwd+argv echo script and split its output at the two markers.
+    /// Run the echo script and split its output at the three markers.
     ///
     /// Parsing rather than asserting on the raw string because
     /// `executeProcess` has a documented path that returns an EMPTY string
@@ -286,21 +321,26 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                                              executablePathOverride: script.path,
                                              session: session,
                                              timeout: Self.spawnTimeout)
-        // Split on the ARGV marker, NOT on newlines. `CWD:` is one line, but
-        // `ARGV:` is not: the composed prompt is a single argv element
-        // containing newlines, so argv runs from its marker to the end of the
-        // output. A line-wise parse silently truncates it to `-p x` and then
-        // fails the UUID assertions on a run that passed the UUID correctly —
+        // Split on the MARKERS, never on newlines. `CWD:` and `ARGC:` are one
+        // line each, but `ARGV:` is not — the composed prompt is a single argv
+        // element containing newlines, so argv runs from its marker to the end
+        // of the output. A line-wise parse truncates it to `-p x` and then
+        // fails the UUID assertions on a run that passed the UUID correctly;
         // CI caught exactly that on the first version of this helper.
-        guard output.hasPrefix("CWD:"), let marker = output.range(of: "\nARGV:") else {
-            XCTFail("the child produced no CWD:/ARGV: markers — a successful "
-                    + "run with no output proves nothing. Got: "
+        guard output.hasPrefix("CWD:"),
+              let argcMarker = output.range(of: "\nARGC:"),
+              let argvMarker = output.range(of: "\nARGV:"),
+              argcMarker.upperBound <= argvMarker.lowerBound,
+              let argc = Int(output[argcMarker.upperBound..<argvMarker.lowerBound]) else {
+            XCTFail("the child produced no CWD:/ARGC:/ARGV: markers — a "
+                    + "successful run with no output proves nothing. Got: "
                     + "\(output.debugDescription)",
                     file: file, line: line)
-            return EchoedRun(cwd: "", argv: "")
+            return EchoedRun(cwd: "", argc: 0, argv: "")
         }
-        return EchoedRun(cwd: String(output[..<marker.lowerBound].dropFirst("CWD:".count)),
-                         argv: String(output[marker.upperBound...]))
+        return EchoedRun(cwd: String(output[..<argcMarker.lowerBound].dropFirst("CWD:".count)),
+                         argc: argc,
+                         argv: String(output[argvMarker.upperBound...]))
     }
 
     /// The PR claims concurrent invocations can share one cwd. Sequential runs
