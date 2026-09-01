@@ -17,6 +17,31 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     /// so `tearDown` can put them back. `nil` value == the var was unset.
     private var savedEnvironment: [String: String?] = [:]
 
+    /// Per-`git`-invocation bound, for BOTH the setup helper below and the
+    /// production runner the tests drive (issue #208).
+    ///
+    /// Nothing here is slow: every command runs against a three-object local
+    /// repo and finishes in milliseconds, so 60s is ~4 orders of magnitude of
+    /// headroom and cannot fail a loaded runner. What it buys is the
+    /// difference between the two ways a wedged `git` can end.
+    ///
+    /// CI gives each test 240s (`-default-test-execution-time-allowance`, see
+    /// `.github/workflows/ios-tests.yml`). An unbounded wait therefore cannot
+    /// fail *as a test*: XCTest kills the whole test HOST first, which records
+    /// no assertion message and cannot be recovered by
+    /// `-retry-tests-on-failure`, so the job prints a bare `Failing tests: …`
+    /// line with no cause anywhere in the log. A bounded wait fails normally,
+    /// says which command hung, and gets retried.
+    ///
+    /// This is not hypothetical for `Process`. `LLMRunner.executeProcess`
+    /// documents a macOS 26 reaping race where `waitUntilExit` never returns
+    /// even after `SIGKILL`, and `readDataToEndOfFile` never returns while any
+    /// process — including a helper `git` spawned that outlived it — still
+    /// holds the write end of the pipe. `ProcessGitCommandRunner.runSync`
+    /// bounds both for exactly these reasons; this helper did not, and it is
+    /// the last unbounded subprocess wait in the bundle.
+    private static let gitCommandTimeout: TimeInterval = 60
+
     override func setUpWithError() throws {
         try super.setUpWithError()
         guard let git = ProcessGitCommandRunner.gitExecutable() else {
@@ -95,7 +120,7 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         let note = vault.appendingPathComponent("2026-01-02 Meeting.md")
         try write("# Meeting\n\nSummary body.\n", to: note)
 
-        let syncer = ObsidianGitSyncer()   // real ProcessGitCommandRunner
+        let syncer = ObsidianGitSyncer(runner: Self.boundedRunner())
         let error = await syncer.sync(vault: vault,
                                       changedPaths: [note],
                                       branch: "main",
@@ -126,7 +151,7 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         // the remote's commit, then push both.
         let note = vault.appendingPathComponent("a.md")
         try write("local-added\n", to: note)
-        let syncer = ObsidianGitSyncer()
+        let syncer = ObsidianGitSyncer(runner: Self.boundedRunner())
         let error = await syncer.sync(vault: vault,
                                       changedPaths: [note],
                                       branch: "main",
@@ -139,6 +164,21 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// The REAL production runner — still `ProcessGitCommandRunner`, so these
+    /// stay integration tests — with its per-command bound brought inside the
+    /// per-test allowance (issue #208).
+    ///
+    /// Its shipped 120s is right for a background sync over the network and
+    /// wrong here: `sync` issues up to six commands, so 6 × (120s + kill
+    /// grace) is ~780s against a 240s allowance. One wedged command would take
+    /// the test host with it instead of failing the test. 20s is still ~4
+    /// orders of magnitude above what a local-path git command costs.
+    private static func boundedRunner() -> ProcessGitCommandRunner {
+        var runner = ProcessGitCommandRunner()
+        runner.timeout = 20
+        return runner
+    }
 
     @discardableResult
     private func runGit(_ arguments: [String], in directory: URL) throws -> String {
@@ -180,10 +220,45 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
                 drain.leave()
             }
         }
-        process.waitUntilExit()
-        drain.wait()
+        // Both waits are BOUNDED (issue #208), mirroring
+        // `ProcessGitCommandRunner.runSync`. They used to be
+        // `process.waitUntilExit()` / `drain.wait()` with no deadline, which
+        // meant a single wedged `git` in `setUp` hung this test until XCTest
+        // killed the test host — a red run naming a test with no reason
+        // attached, and one the retry policy cannot recover. See
+        // `gitCommandTimeout` for why that distinction is the whole point.
+        let running = DispatchGroup()
+        running.enter()
+        DispatchQueue.global().async {
+            process.waitUntilExit()
+            running.leave()
+        }
+        var timedOut = false
+        if running.wait(timeout: .now() + .seconds(Int(Self.gitCommandTimeout))) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if running.wait(timeout: .now() + 2) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = running.wait(timeout: .now() + 3)
+            }
+        }
+        // Bounded too: EOF is not guaranteed even after exit, because a helper
+        // `git` spawned can inherit the pipes and outlive it. The readers are
+        // abandoned rather than waited out; they exit when the pipes close.
+        _ = drain.wait(timeout: .now() + 5)
+        // Take the lock: unlike the old unbounded `drain.wait()`, the readers
+        // are not guaranteed to be finished here.
+        lock.lock()
         let stdout = String(data: outData, encoding: .utf8) ?? ""
         let stderr = String(data: errData, encoding: .utf8) ?? ""
+        lock.unlock()
+        if timedOut {
+            throw NSError(domain: "git", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) "
+                    + "did not exit within \(Int(Self.gitCommandTimeout))s and was killed"
+                    + " (stderr so far: \(stderr))"
+            ])
+        }
         if process.terminationStatus != 0 {
             throw NSError(domain: "git", code: Int(process.terminationStatus), userInfo: [
                 NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(stderr)\(stdout)"
