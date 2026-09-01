@@ -144,6 +144,20 @@ final class OfflineVoiceEmbedder {
     /// matching whenever a snapshot already existed, so the stale one could
     /// never be replaced). Dropping it and re-extracting is the fix; the
     /// skip guard is gone.
+    ///
+    /// **What removing that guard costs, and why it is worth it.** The guard
+    /// also happened to prevent a second fold into a profile for one
+    /// recording. That is now reachable by exactly one route: an explicit
+    /// re-transcribe of a live VAD recording, whose speakers `finish` already
+    /// learned from the pool. Chunk mode does not reach it (its live diarizer
+    /// never runs, so the snapshot `finish` takes is empty) and a VAD
+    /// recording that is not re-transcribed never runs a batch pass at all.
+    /// On that one route the second observation is a genuinely different
+    /// extract from a re-clustered segmentation, folded at `sampleCount: 1`
+    /// — not the #204 pathology, which re-folded the *identical* centroid on
+    /// every recording and inflated `sampleCount` without adding
+    /// information. A stale embedding resolving to the wrong person is the
+    /// worse failure, so this is the trade taken deliberately.
     func matchAfterPass(recordingID: UUID) {
         snapshots.invalidate(recordingID)
         guard settings.isConfigured, !profiles.profiles.isEmpty, let store else { return }
