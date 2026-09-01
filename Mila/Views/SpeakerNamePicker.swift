@@ -13,6 +13,9 @@ struct SpeakerNamePicker: View {
     let currentName: String?
     /// Called with the chosen name, or nil to reset to the default label.
     let onAssign: (String?) -> Void
+    /// Split this segment into a new speaker. Nil when not applicable
+    /// (live transcript, or segment has no speaker).
+    var onSplit: (() -> Void)?
 
     @EnvironmentObject private var directory: SpeakerDirectory
     @Environment(\.dismiss) private var dismiss
@@ -79,15 +82,29 @@ struct SpeakerNamePicker: View {
             }
             .frame(maxHeight: 180)
 
-            if currentName != nil {
+            if currentName != nil || onSplit != nil {
                 Divider()
-                row {
-                    onAssign(nil)
-                    dismiss()
-                } label: {
-                    Label("Use default (\(defaultLabel))", systemImage: "arrow.uturn.backward")
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                VStack(alignment: .leading, spacing: 0) {
+                    if currentName != nil {
+                        row {
+                            onAssign(nil)
+                            dismiss()
+                        } label: {
+                            Label("Use default (\(defaultLabel))", systemImage: "arrow.uturn.backward")
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
+                    if onSplit != nil {
+                        row {
+                            onSplit?()
+                            dismiss()
+                        } label: {
+                            Label("Split this line", systemImage: "arrow.triangle.branch")
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                    }
                 }
                 .padding(.vertical, 4)
             }
@@ -149,6 +166,8 @@ struct SpeakerLabelButton: View {
     /// Receives the chosen name (nil = reset to the default label);
     /// the caller persists it wherever this transcript's names live.
     let onAssign: (String?) -> Void
+    /// Split this segment into a new speaker.
+    var onSplit: (() -> Void)?
 
     @State private var showingPicker = false
     @State private var hovering = false
@@ -165,7 +184,8 @@ struct SpeakerLabelButton: View {
                 SpeakerNamePicker(
                     defaultLabel: rawID.friendlySpeakerLabel(language: language),
                     currentName: names[rawID],
-                    onAssign: onAssign
+                    onAssign: onAssign,
+                    onSplit: onSplit
                 )
             }
             .help("Rename speaker")

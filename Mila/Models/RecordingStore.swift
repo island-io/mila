@@ -28,6 +28,12 @@ final class RecordingStore: ObservableObject {
     /// Used by voice recognition to save voice profiles.
     var onSpeakerNamed: ((_ recordingID: UUID, _ rawID: String, _ name: String) -> Void)?
 
+    /// Called when a speaker name is cleared or replaced. Provides the
+    /// recording ID, raw speaker ID, and the *previous* name that was
+    /// removed. Used by voice recognition to subtract the recording's
+    /// observed embedding from the old profile.
+    var onSpeakerUnnamed: ((_ recordingID: UUID, _ rawID: String, _ previousName: String) -> Void)?
+
     private let fileManager = FileManager.default
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
@@ -507,15 +513,71 @@ final class RecordingStore: ObservableObject {
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmed, !trimmed.isEmpty {
             guard recordings[idx].speakerNames[rawID] != trimmed else { return }
+            // If another speaker in this recording already has this name,
+            // merge: reassign all segments of rawID into that speaker.
+            if let existingRaw = recordings[idx].speakerNames.first(where: { $0.key != rawID && $0.value == trimmed })?.key {
+                mergeSpeakers(from: rawID, into: existingRaw, recordingID: recordingID)
+                return
+            }
+            let previousName = recordings[idx].speakerNames[rawID]
             recordings[idx].speakerNames[rawID] = trimmed
+            // Renaming: subtract from old profile before merging into new.
+            if let previousName {
+                onSpeakerUnnamed?(recordingID, rawID, previousName)
+            }
             onSpeakerNamed?(recordingID, rawID, trimmed)
         } else {
-            guard recordings[idx].speakerNames[rawID] != nil else { return }
+            guard let previousName = recordings[idx].speakerNames[rawID] else { return }
             recordings[idx].speakerNames.removeValue(forKey: rawID)
+            onSpeakerUnnamed?(recordingID, rawID, previousName)
         }
         persist()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
+    }
+
+    /// Merge all segments of one speaker into another within a recording.
+    /// Triggered automatically when a user names a speaker with a name
+    /// already used by another speaker in the same recording — meaning
+    /// they're the same person. Reassigns every segment and cleans up
+    /// the source speaker's name entry.
+    func mergeSpeakers(from sourceRawID: String, into targetRawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
+              sourceRawID != targetRawID else { return }
+        for i in recordings[idx].segments.indices {
+            if recordings[idx].segments[i].speaker == sourceRawID {
+                recordings[idx].segments[i].speaker = targetRawID
+            }
+        }
+        // Clean up the source speaker's name. If it had a name, fire
+        // onSpeakerUnnamed so the profile can be corrected.
+        if let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID) {
+            onSpeakerUnnamed?(recordingID, sourceRawID, previousName)
+        }
+        persist()
+        if recordings[idx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
+    }
+
+    /// Split a single segment into a new speaker. Generates the next
+    /// unused SPEAKER_NN id and assigns it to just this segment. The
+    /// user can then name the new speaker via the normal label popover;
+    /// if they pick a name already in use, `setSpeakerName` auto-merges.
+    func splitSegmentSpeaker(segmentID: UUID, recordingID: UUID) {
+        guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
+              let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID })
+        else { return }
+        // Find the next unused SPEAKER_NN id.
+        let used = Set(recordings[recIdx].segments.compactMap(\.speaker))
+        var next = 0
+        while used.contains(String(format: "SPEAKER_%02d", next)) { next += 1 }
+        let newRawID = String(format: "SPEAKER_%02d", next)
+        recordings[recIdx].segments[segIdx].speaker = newRawID
+        persist()
+        if recordings[recIdx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
         }
     }
 
