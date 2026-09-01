@@ -308,6 +308,57 @@ final class SpeakerProfileStore: ObservableObject {
         }
     }
 
+    /// Reverse a prior `updateProfile` merge: subtract an observation's
+    /// contribution from a profile's weighted-average centroid. Called when
+    /// a speaker is un-named or renamed, so the old profile no longer
+    /// carries this recording's (possibly wrong) embedding.
+    ///
+    /// If the subtraction would leave the profile with zero or fewer
+    /// samples, the profile is deleted entirely. If the resulting centroid
+    /// contains non-finite values (numerical drift), the profile is also
+    /// deleted as irrecoverable.
+    func subtractObservation(name: String, embedding: [Float], sampleCount: Int) {
+        guard settings.isConfigured else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              !embedding.isEmpty,
+              embedding.allSatisfy({ $0.isFinite }),
+              sampleCount > 0 else { return }
+
+        guard let idx = profiles.firstIndex(where: { $0.name == trimmed }) else { return }
+        let existing = profiles[idx]
+        guard existing.embedding.count == embedding.count else {
+            profileLog.log("subtractObservation: dimension mismatch (\(existing.embedding.count) vs \(embedding.count)) for \(trimmed, privacy: .private)")
+            return
+        }
+
+        let remaining = existing.sampleCount - sampleCount
+        if remaining <= 0 {
+            profileLog.log("subtractObservation: removing \(trimmed, privacy: .private) (samples would drop to \(remaining))")
+            deleteProfile(name: trimmed)
+            return
+        }
+
+        var restored = [Float](repeating: 0, count: embedding.count)
+        for i in 0..<restored.count {
+            restored[i] = (existing.embedding[i] * Float(existing.sampleCount)
+                         - embedding[i] * Float(sampleCount)) / Float(remaining)
+        }
+
+        // If subtraction produced non-finite values, the centroid is
+        // irrecoverable — delete rather than persist poison.
+        guard restored.allSatisfy({ $0.isFinite }) else {
+            profileLog.log("subtractObservation: non-finite result for \(trimmed, privacy: .private), deleting profile")
+            deleteProfile(name: trimmed)
+            return
+        }
+
+        profiles[idx].embedding = restored
+        profiles[idx].sampleCount = remaining
+        profileLog.log("subtractObservation: corrected \(trimmed, privacy: .private) (now \(remaining) samples)")
+        save()
+    }
+
     func deleteProfile(id: UUID) {
         let removed = Set(profiles.filter { $0.id == id }.map(\.name))
         profiles.removeAll { $0.id == id }

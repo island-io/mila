@@ -347,6 +347,10 @@ struct RecordingDetailView: View {
                                        onAssignName: { raw, name in
                                            store.setSpeakerName(name, forSpeaker: raw,
                                                                 recordingID: recording.id)
+                                       },
+                                       onSplit: {
+                                           store.splitSegmentSpeaker(segmentID: seg.id,
+                                                                     recordingID: recording.id)
                                        })
                         }
                     }
@@ -584,6 +588,8 @@ private struct SegmentRow: View {
     /// Persists a rename picked from the label's popover:
     /// (raw speaker ID, chosen name or nil-to-reset).
     let onAssignName: (String, String?) -> Void
+    /// Split this segment into a new unnamed speaker.
+    var onSplit: (() -> Void)?
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -598,7 +604,8 @@ private struct SegmentRow: View {
                     language: language,
                     color: useSpeakerColor ? raw.speakerColor(names: speakerNames) : Color.accentColor,
                     suffix: ":",
-                    onAssign: { name in onAssignName(raw, name) }
+                    onAssign: { name in onAssignName(raw, name) },
+                    onSplit: onSplit
                 )
                 .fixedSize(horizontal: true, vertical: false)
             }

@@ -40,17 +40,17 @@ final class ObservedVoiceSnapshots {
         let profileName: String?
     }
 
-    /// How many recordings' snapshots to keep. Naming happens right after a
-    /// recording in the overwhelming majority of cases; a handful of slots
-    /// covers "record a few back-to-back, then go back and label them"
-    /// without letting embeddings accumulate for the life of the process.
+    /// How many recordings' snapshots to keep. Raised from 8 to 20 so
+    /// un-naming a speaker (to correct a false recognition) can still find
+    /// the snapshot and subtract it from the voice profile. Memory cost is
+    /// negligible (~1 KB per speaker per recording).
     private let limit: Int
 
     private var byRecording: [UUID: [String: Observation]] = [:]
     /// Insertion order, oldest first — the eviction queue.
     private var order: [UUID] = []
 
-    init(limit: Int = 8) {
+    init(limit: Int = 20) {
         self.limit = max(1, limit)
     }
 
