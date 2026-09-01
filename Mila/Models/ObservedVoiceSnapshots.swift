@@ -71,16 +71,52 @@ final class ObservedVoiceSnapshots {
     ///
     /// Re-snapshotting the same recording replaces its entry and keeps its
     /// original position in the eviction queue.
+    ///
+    /// **Whole-map replace, and callers must want that.** This is the live
+    /// stop path's method: it hands over the complete pool, so replacing is
+    /// right. A caller holding observations for *some* of a recording's
+    /// speakers wants `merge` — passing a partial set here silently discards
+    /// every speaker it does not mention (island-io/mila#237).
     func record(
         _ entries: [(id: String, observedCentroid: [Float], observedCount: Int, profileName: String?)],
         for recordingID: UUID
     ) {
+        store(observations(from: entries), for: recordingID, mergingIntoExisting: false)
+    }
+
+    /// Add observations for *some* of a recording's speakers, leaving the
+    /// ones already held for speakers this call does not mention untouched.
+    ///
+    /// The on-demand embedding path (`OfflineVoiceEmbedder`) writes one
+    /// speaker at a time — naming `SPEAKER_00` and then `SPEAKER_01` on an
+    /// old recording are two independent extractions — and with `record`
+    /// the second wiped the first. That is not cosmetic: un-naming the
+    /// first speaker afterwards finds no observation, so the profile it
+    /// polluted is never corrected, which is the whole point of #237.
+    func merge(
+        _ entries: [(id: String, observedCentroid: [Float], observedCount: Int, profileName: String?)],
+        for recordingID: UUID
+    ) {
+        store(observations(from: entries), for: recordingID, mergingIntoExisting: true)
+    }
+
+    private func observations(
+        from entries: [(id: String, observedCentroid: [Float], observedCount: Int, profileName: String?)]
+    ) -> [String: Observation] {
         var observations: [String: Observation] = [:]
         for entry in entries {
             observations[entry.id] = Observation(observedCentroid: entry.observedCentroid,
                                                  observedCount: entry.observedCount,
                                                  profileName: entry.profileName)
         }
+        return observations
+    }
+
+    private func store(_ incoming: [String: Observation],
+                       for recordingID: UUID,
+                       mergingIntoExisting: Bool) {
+        var observations = mergingIntoExisting ? (byRecording[recordingID] ?? [:]) : [:]
+        observations.merge(incoming) { _, new in new }
         if byRecording.updateValue(observations, forKey: recordingID) == nil {
             order.append(recordingID)
         }
@@ -89,6 +125,43 @@ final class ObservedVoiceSnapshots {
             byRecording.removeValue(forKey: evicted)
         }
         snapshotLog.log("snapshot: \(observations.count, privacy: .public) speakers for a recording (holding \(self.order.count, privacy: .public))")
+    }
+
+    /// Forget everything held for one recording.
+    ///
+    /// Called when a pass re-keys that recording's `SPEAKER_NN` ids. The ids
+    /// are positional — pyannote assigns them by first-appearance order on
+    /// each clustering — so after a re-transcribe or an offline re-diarize
+    /// the *same string* denotes a possibly different person. Keeping the
+    /// old observations would resolve a name applied to the new
+    /// `SPEAKER_00` against the previous run's voice: precisely the
+    /// cross-recording confusion this type's header says the recording-id
+    /// keying exists to prevent, reintroduced across a re-clustering
+    /// boundary instead of across recordings (island-io/mila#237).
+    ///
+    /// Deliberately ungated: dropping held data is always safe, and a gate
+    /// would leave stale embeddings behind for anyone who opted out between
+    /// the pass starting and finishing.
+    func invalidate(_ recordingID: UUID) {
+        guard byRecording.removeValue(forKey: recordingID) != nil else { return }
+        order.removeAll { $0 == recordingID }
+        snapshotLog.log("snapshot invalidated for a re-keyed recording (holding \(self.order.count, privacy: .public))")
+    }
+
+    /// Forget one speaker's observation within a recording, for a raw id
+    /// that has stopped existing there — the source of a merge, or a
+    /// speaker whose last segment was reassigned away.
+    ///
+    /// Without this the observation outlives the id, and `SPEAKER_NN` ids
+    /// get reused: `splitSegmentSpeaker` mints the lowest free number, so a
+    /// merged-away `SPEAKER_01` is handed straight back to the next split.
+    /// Naming that new speaker would then fold the *previous* speaker's
+    /// embedding into their profile.
+    func forget(speaker rawID: String, in recordingID: UUID) {
+        guard var observations = byRecording[recordingID],
+              observations.removeValue(forKey: rawID) != nil else { return }
+        byRecording[recordingID] = observations
+        snapshotLog.log("snapshot: dropped a retired speaker id")
     }
 
     /// The observation for `rawID` **in that specific recording**, or nil

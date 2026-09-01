@@ -34,6 +34,17 @@ final class RecordingStore: ObservableObject {
     /// observed embedding from the old profile.
     var onSpeakerUnnamed: ((_ recordingID: UUID, _ rawID: String, _ previousName: String) -> Void)?
 
+    /// Called when a raw `SPEAKER_NN` id stops existing in a recording — the
+    /// source of a merge, or a speaker whose last segment was reassigned
+    /// away. Used by voice recognition to drop that id's observed embedding.
+    ///
+    /// Separate from `onSpeakerUnnamed`, which is about a *name*: a retired
+    /// id may never have had one, and its embedding is the thing that
+    /// outlives it. `splitSegmentSpeaker` hands the lowest free number to the
+    /// next split, so a retired id comes back — pointing, without this, at
+    /// the previous speaker's voice.
+    var onSpeakerIDRetired: ((_ recordingID: UUID, _ rawID: String) -> Void)?
+
     private let fileManager = FileManager.default
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
@@ -508,17 +519,23 @@ final class RecordingStore: ObservableObject {
     /// `SPEAKER_NN` IDs — the name is a display overlay resolved at
     /// render/export time. Regenerates the `.srt` sidecar for completed
     /// recordings so the on-disk export matches what the UI shows.
+    ///
+    /// **A pure label write.** It never moves a segment between speakers.
+    /// An earlier revision merged automatically when the typed name matched
+    /// another speaker's, which read well from the popover and was a trap
+    /// everywhere else: `RecognisedSpeakerAssigner` and the post-pass
+    /// auto-match both loop over `setSpeakerName`, and two clusters matching
+    /// one stored profile — two similar voices, one threshold — silently
+    /// collapsed into one speaker with no user action, no confirmation and
+    /// no undo. Which of the two survived was not even stable, since the
+    /// embeddings arrive in a `Dictionary`. Merging is destructive, so it is
+    /// a deliberate user action: `mergeSpeakers`, reached from the speaker
+    /// popover behind a confirmation (island-io/mila#237).
     func setSpeakerName(_ name: String?, forSpeaker rawID: String, recordingID: UUID) {
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
         let trimmed = name?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let trimmed, !trimmed.isEmpty {
             guard recordings[idx].speakerNames[rawID] != trimmed else { return }
-            // If another speaker in this recording already has this name,
-            // merge: reassign all segments of rawID into that speaker.
-            if let existingRaw = recordings[idx].speakerNames.first(where: { $0.key != rawID && $0.value == trimmed })?.key {
-                mergeSpeakers(from: rawID, into: existingRaw, recordingID: recordingID)
-                return
-            }
             let previousName = recordings[idx].speakerNames[rawID]
             recordings[idx].speakerNames[rawID] = trimmed
             // Renaming: subtract from old profile before merging into new.
@@ -537,11 +554,21 @@ final class RecordingStore: ObservableObject {
         }
     }
 
-    /// Merge all segments of one speaker into another within a recording.
-    /// Triggered automatically when a user names a speaker with a name
-    /// already used by another speaker in the same recording — meaning
-    /// they're the same person. Reassigns every segment and cleans up
-    /// the source speaker's name entry.
+    /// Merge all segments of one speaker into another within a recording:
+    /// the diarizer split one person in two and the user is putting them
+    /// back together. Destructive and not undoable, so every caller is a
+    /// confirmed user action — see the note on `setSpeakerName`.
+    ///
+    /// The voice bookkeeping matters as much as the segments. The source
+    /// id's observed embedding was folded into the source's profile when it
+    /// was named; the merge is the user saying that observation belongs to
+    /// the *target* person instead. So it is subtracted from the old profile
+    /// and added to the target's — the same subtract-then-add the rename
+    /// branch of `setSpeakerName` does, and it resolves correctly because
+    /// the snapshot is still keyed to the source raw id at this point.
+    /// Landing only the subtraction (which is what the auto-merge did) left
+    /// the observation nowhere: the wrong profile lost it and the right one
+    /// never gained it.
     func mergeSpeakers(from sourceRawID: String, into targetRawID: String, recordingID: UUID) {
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
               sourceRawID != targetRawID else { return }
@@ -550,27 +577,84 @@ final class RecordingStore: ObservableObject {
                 recordings[idx].segments[i].speaker = targetRawID
             }
         }
-        // Clean up the source speaker's name. If it had a name, fire
-        // onSpeakerUnnamed so the profile can be corrected.
-        if let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID) {
-            onSpeakerUnnamed?(recordingID, sourceRawID, previousName)
+        let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID)
+        let targetName = recordings[idx].speakerNames[targetRawID]
+        // Same name on both sides (the shape the old auto-merge always had):
+        // subtracting and re-adding the identical observation is a no-op on
+        // the centroid but not on `sampleCount` — a profile sitting at one
+        // sample would be *deleted* by the subtraction and then recreated,
+        // losing its id and its history. Skip both halves instead.
+        if previousName != targetName {
+            if let previousName {
+                onSpeakerUnnamed?(recordingID, sourceRawID, previousName)
+            }
+            if let targetName {
+                onSpeakerNamed?(recordingID, sourceRawID, targetName)
+            }
         }
+        // Last: the id is gone from the transcript, so its embedding must go
+        // too — `splitSegmentSpeaker` will hand this number out again. Fired
+        // after the hooks above, which still need to resolve through it.
+        onSpeakerIDRetired?(recordingID, sourceRawID)
         persist()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
     }
 
-    /// Split a single segment into a new speaker. Generates the next
-    /// unused SPEAKER_NN id and assigns it to just this segment. The
-    /// user can then name the new speaker via the normal label popover;
-    /// if they pick a name already in use, `setSpeakerName` auto-merges.
-    func splitSegmentSpeaker(segmentID: UUID, recordingID: UUID) {
+    /// Move one segment to a different speaker already present in the
+    /// recording — the diarizer mis-tagged a single line and the user is
+    /// putting it where it belongs, without re-transcribing.
+    ///
+    /// Non-destructive on its own, but it can empty a speaker out: moving
+    /// the *last* segment of `SPEAKER_01` away retires that id, so its name
+    /// and its embedding go with it.
+    func reassignSegmentSpeaker(segmentID: UUID, toSpeaker targetRawID: String, recordingID: UUID) {
         guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
               let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID })
         else { return }
-        // Find the next unused SPEAKER_NN id.
-        let used = Set(recordings[recIdx].segments.compactMap(\.speaker))
+        let previousSpeaker = recordings[recIdx].segments[segIdx].speaker
+        guard previousSpeaker != targetRawID else { return }
+        recordings[recIdx].segments[segIdx].speaker = targetRawID
+        if let prev = previousSpeaker,
+           !recordings[recIdx].segments.contains(where: { $0.speaker == prev }) {
+            if let previousName = recordings[recIdx].speakerNames.removeValue(forKey: prev) {
+                onSpeakerUnnamed?(recordingID, prev, previousName)
+            }
+            onSpeakerIDRetired?(recordingID, prev)
+        }
+        persist()
+        if recordings[recIdx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
+        }
+    }
+
+    /// Split a single segment out into a new, unnamed speaker: the diarizer
+    /// folded two people into one cluster and this line belongs to the other
+    /// one. The user names the new speaker through the normal popover, or
+    /// merges it into an existing speaker.
+    ///
+    /// **The new id must not be one the recording has used.** `used` spans
+    /// the segments *and* `speakerNames`, because a name outlives its
+    /// segments: name `SPEAKER_01` "Bob", split his only line away, and
+    /// `SPEAKER_01` carries no segment while `speakerNames["SPEAKER_01"]`
+    /// still says Bob — hand that number to the next split and the new line
+    /// renders as Bob, in the transcript and in the regenerated `.srt`.
+    /// Embeddings are kept out of the same trap by `onSpeakerIDRetired`,
+    /// which drops a retired id's observation rather than leaving it for a
+    /// reused number to resolve against.
+    func splitSegmentSpeaker(segmentID: UUID, recordingID: UUID) {
+        guard let recIdx = recordings.firstIndex(where: { $0.id == recordingID }),
+              let segIdx = recordings[recIdx].segments.firstIndex(where: { $0.id == segmentID }),
+              let current = recordings[recIdx].segments[segIdx].speaker
+        else { return }
+        // Splitting a speaker's ONLY line just renames its id: same one
+        // segment, same one speaker, but the old id is stranded (with its
+        // name, and its embedding) for no gain. Nothing to do.
+        guard recordings[recIdx].segments.contains(where: { $0.id != segmentID && $0.speaker == current })
+        else { return }
+        var used = Set(recordings[recIdx].segments.compactMap(\.speaker))
+        used.formUnion(recordings[recIdx].speakerNames.keys)
         var next = 0
         while used.contains(String(format: "SPEAKER_%02d", next)) { next += 1 }
         let newRawID = String(format: "SPEAKER_%02d", next)

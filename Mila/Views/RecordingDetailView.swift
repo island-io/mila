@@ -18,7 +18,17 @@ struct RecordingDetailView: View {
     @State private var timeObserver: Any?
     @State private var isEditingTitle = false
     @State private var titleDraft = ""
+    /// Set when the user picks a merge target in the speaker popover; drives
+    /// the confirmation alert, which is what actually performs the merge.
+    @State private var pendingMerge: PendingSpeakerMerge?
+
     @FocusState private var titleFieldFocused: Bool
+
+    /// Every raw speaker id the transcript uses, in first-appearance order.
+    private var distinctSpeakerIDs: [String] {
+        var seen = Set<String>()
+        return recording.segments.compactMap(\.speaker).filter { seen.insert($0).inserted }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -336,6 +346,11 @@ struct RecordingDetailView: View {
                         // one distinct speaker to tell apart — a single-
                         // speaker recording keeps the plain tint color.
                         let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
+                        // Distinct raw ids in transcript order — the targets
+                        // offered for "move this line" and "merge into".
+                        // Hoisted out of the row so it is computed once, not
+                        // once per segment.
+                        let distinctSpeakers = distinctSpeakerIDs
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,
@@ -343,6 +358,7 @@ struct RecordingDetailView: View {
                                        useSpeakerColor: hasMultipleSpeakers,
                                        language: recording.language,
                                        speakerNames: recording.speakerNames,
+                                       allSpeakers: distinctSpeakers,
                                        onTap: { seek(to: seg.start) },
                                        onAssignName: { raw, name in
                                            store.setSpeakerName(name, forSpeaker: raw,
@@ -351,6 +367,22 @@ struct RecordingDetailView: View {
                                        onSplit: {
                                            store.splitSegmentSpeaker(segmentID: seg.id,
                                                                      recordingID: recording.id)
+                                       },
+                                       onMoveLine: { target in
+                                           store.reassignSegmentSpeaker(segmentID: seg.id,
+                                                                        toSpeaker: target,
+                                                                        recordingID: recording.id)
+                                       },
+                                       onRequestMerge: { source, target in
+                                           pendingMerge = PendingSpeakerMerge(
+                                               source: source,
+                                               target: target,
+                                               sourceName: source.displaySpeakerName(
+                                                   names: recording.speakerNames,
+                                                   language: recording.language),
+                                               targetName: target.displaySpeakerName(
+                                                   names: recording.speakerNames,
+                                                   language: recording.language))
                                        })
                         }
                     }
@@ -374,7 +406,34 @@ struct RecordingDetailView: View {
                         .disabled(recording.fullText.isEmpty)
                 }
             }
+            // Presented HERE, not inside the speaker popover: the tap that
+            // asks for a merge also dismisses that popover, and an alert
+            // attached to a disappearing view is how the previous attempt at
+            // this action ended up doing nothing. Merging is destructive and
+            // has no undo, so it is always confirmed.
+            .alert("Merge speakers?",
+                   isPresented: Binding(get: { pendingMerge != nil },
+                                        set: { if !$0 { pendingMerge = nil } }),
+                   presenting: pendingMerge) { merge in
+                Button("Merge", role: .destructive) {
+                    store.mergeSpeakers(from: merge.source, into: merge.target,
+                                        recordingID: recording.id)
+                    pendingMerge = nil
+                }
+                Button("Cancel", role: .cancel) { pendingMerge = nil }
+            } message: { merge in
+                Text("Every line from \(merge.sourceName) becomes \(merge.targetName). This can't be undone.")
+            }
         }
+    }
+
+    /// A merge the user asked for and has not yet confirmed.
+    struct PendingSpeakerMerge: Identifiable {
+        let source: String
+        let target: String
+        let sourceName: String
+        let targetName: String
+        var id: String { "\(source)->\(target)" }
     }
 
     @ViewBuilder
@@ -584,12 +643,30 @@ private struct SegmentRow: View {
     let language: String
     /// User-assigned speaker names for this recording (raw ID → name).
     let speakerNames: [String: String]
+    /// Every distinct raw speaker id in the recording, in transcript order.
+    /// The popover offers the ones that aren't this row's as move/merge
+    /// targets.
+    let allSpeakers: [String]
     let onTap: () -> Void
     /// Persists a rename picked from the label's popover:
     /// (raw speaker ID, chosen name or nil-to-reset).
     let onAssignName: (String, String?) -> Void
     /// Split this segment into a new unnamed speaker.
     var onSplit: (() -> Void)?
+    /// Move just this segment to the given raw speaker id.
+    var onMoveLine: ((String) -> Void)?
+    /// Ask to merge this row's speaker (first argument) into another raw id.
+    /// The caller confirms before anything happens.
+    var onRequestMerge: ((_ from: String, _ into: String) -> Void)?
+
+    /// The other speakers, resolved to what the transcript shows for them.
+    private func otherSpeakers(besides raw: String) -> [SpeakerChoice] {
+        allSpeakers.filter { $0 != raw }.map {
+            SpeakerChoice(rawID: $0,
+                          displayName: $0.displaySpeakerName(names: speakerNames,
+                                                             language: language))
+        }
+    }
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -605,7 +682,12 @@ private struct SegmentRow: View {
                     color: useSpeakerColor ? raw.speakerColor(names: speakerNames) : Color.accentColor,
                     suffix: ":",
                     onAssign: { name in onAssignName(raw, name) },
-                    onSplit: onSplit
+                    onSplit: onSplit,
+                    otherSpeakers: otherSpeakers(besides: raw),
+                    onMoveLine: onMoveLine,
+                    onRequestMerge: onRequestMerge.map { request in
+                        { target in request(raw, target) }
+                    }
                 )
                 .fixedSize(horizontal: true, vertical: false)
             }
