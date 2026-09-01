@@ -241,44 +241,66 @@ final class ObservedVoiceSnapshots {
     /// reassigns `.speaker` on the *same* segment array, so per-index pairs
     /// say which old speaker each new one was.
     ///
-    /// **The mapping is old→new, and that direction is load-bearing.** The
-    /// two ways a re-key can reshape speakers pull in opposite directions:
+    /// **Carries exactly one old observation per new id: the dominant one,
+    /// the same old id `SpeakerNameRemapper.remap` took that new id's NAME
+    /// from.** That pairing is the whole safety argument. The name and the
+    /// embedding arrive from the same fragment, so un-naming the new speaker
+    /// subtracts precisely what naming that old fragment added — an exact
+    /// inverse, with no knowledge of the other fragments required.
     ///
-    ///  * **Many old → one new** (the pass collapsing live over-segmentation,
-    ///    which is the entire reason it runs). `finish` folded *every*
-    ///    fragment into the profile, so all of them have to arrive on the new
-    ///    id, combined — keeping only the dominant one would let un-naming
-    ///    give back a fraction of what this recording contributed and strand
-    ///    the rest. They are folded with `absorb`'s weighted mean, the same
-    ///    one `updateProfile` uses, so the combined observation is exactly
-    ///    what the profile received.
-    ///  * **One old → many new** (the pass splitting a live speaker). The
-    ///    name is duplicated onto both halves, harmlessly; the embedding must
-    ///    not be, because un-naming both would subtract one observation
-    ///    twice. Keying old→new makes that unrepresentable rather than
-    ///    guarded — a dictionary gives each old id exactly one destination —
-    ///    so the observation lands on whichever half took most of it and the
-    ///    other simply has none. Under-correcting is the safe direction here,
-    ///    and it is already this type's behaviour for a missing snapshot.
-    func remapSpeakerIDs(_ oldToNew: [String: String], in recordingID: UUID) {
+    /// **What is deliberately given up.** When the pass collapses several old
+    /// ids into one — which is the main reason it runs — the non-dominant
+    /// fragments' observations are dropped rather than folded in. If such a
+    /// fragment had been named, its contribution stays in that profile and
+    /// un-naming will not remove it: residue.
+    ///
+    /// **Why residue is the right side to err on, with the arithmetic.** An
+    /// earlier revision folded every fragment onto the survivor, reasoning
+    /// that `finish` had folded them all into the profile. It has not:
+    /// `finish` snapshots *every* pool entry but names only the ones seeded
+    /// from a stored profile or typed by hand, and over-segmentation is
+    /// exactly the case that produces unseeded, unnamed fragments of a person
+    /// who also has a named one. With a profile at `S` samples, a named
+    /// fragment `(obs_A, n_A)` and an unnamed `(obs_B, n_B)`, the profile
+    /// holds `S + n_A` while the folded snapshot claims `n_A + n_B` — so
+    /// un-naming leaves `S − n_B`, which **deletes the profile** whenever
+    /// `S ≤ n_B` (reachable at `S == 1`, the count of a profile created once
+    /// through the on-demand path) and otherwise writes back a centroid
+    /// dragged toward a voice the profile never received.
+    ///
+    /// Residue is recoverable — the user can delete the profile and let it
+    /// re-learn. A deleted profile is not, and a quietly corrupted centroid
+    /// is worse than either, because it degrades recognition invisibly, which
+    /// is the failure this whole feature exists to remove. `main` under-
+    /// corrects on every path (it has no subtraction at all), so this is a
+    /// limitation the codebase already lives with rather than a new one.
+    ///
+    /// **Do not "fix" this by folding again without also knowing which
+    /// fragments the profile actually received.** That information is not in
+    /// this type — it holds what was *observed*, which stops being the same
+    /// thing the moment a fragment goes unnamed. See island-io/mila#254 for
+    /// the exact rule and the structural fix.
+    ///
+    /// A split is the other direction: one old id dominating two new ids
+    /// would hand its observation to both, and un-naming both would subtract
+    /// it twice. Such an id is dropped rather than duplicated — again the
+    /// under-correcting side.
+    func remapSpeakerIDs(_ newToOld: [String: String], in recordingID: UUID) {
         guard let existing = byRecording[recordingID] else { return }
+        var timesDominant: [String: Int] = [:]
+        for oldID in newToOld.values { timesDominant[oldID, default: 0] += 1 }
+
         var remapped: [String: Observation] = [:]
-        // Sorted so a fold of three-plus fragments is bit-for-bit
-        // reproducible rather than dependent on `Dictionary` order.
-        for (oldID, newID) in oldToNew.sorted(by: { $0.key < $1.key }) {
-            guard let observation = existing[oldID] else { continue }
-            guard let alreadyThere = remapped[newID] else {
-                remapped[newID] = observation
-                continue
-            }
-            remapped[newID] = Self.combining(alreadyThere, observation) ?? alreadyThere
+        for (newID, oldID) in newToOld {
+            guard timesDominant[oldID] == 1, let observation = existing[oldID] else { continue }
+            remapped[newID] = observation
         }
         guard !remapped.isEmpty else {
             invalidate(recordingID)
             return
         }
         byRecording[recordingID] = remapped
-        snapshotLog.log("snapshot: carried \(existing.count, privacy: .public) observations onto \(remapped.count, privacy: .public) re-keyed speakers")
+        snapshotLog.log("snapshot: carried \(remapped.count, privacy: .public) of \(existing.count, privacy: .public) observations across a re-key")
     }
 
     /// The observation for `rawID` **in that specific recording**, or nil

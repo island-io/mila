@@ -33,6 +33,12 @@ enum SpeakerNameRemapper {
     /// segment duration. Handles the offline pass merging over-segmented
     /// live speakers (the dominant old ID's name wins) and splitting one
     /// live speaker into two (the name propagates to both halves).
+    ///
+    /// `ObservedVoiceSnapshots.remapSpeakerIDs` consumes the same mapping, so
+    /// a new id's carried embedding comes from the very fragment its NAME
+    /// came from. That pairing is what keeps un-naming an exact inverse of
+    /// naming across a re-key — feed the two from different mappings and an
+    /// observation ends up subtracted from a profile it was never added to.
     static func dominantOldIDs(from old: [TranscriptSegment],
                                to new: [TranscriptSegment]) -> [String: String] {
         var dominant: [String: String] = [:]
@@ -44,43 +50,6 @@ enum SpeakerNameRemapper {
             if let winner { dominant[newID] = winner }
         }
         return dominant
-    }
-
-    /// For each **old** speaker ID, the new ID that took most of it — the
-    /// transpose of `dominantOldIDs`, and the mapping the observed
-    /// embeddings travel on.
-    ///
-    /// **Why the embeddings need the other direction.** A name may be
-    /// duplicated across a re-key: the offline pass splitting one live
-    /// speaker in two gives both halves the same name, harmlessly. An
-    /// embedding may not, because un-naming both halves would then subtract
-    /// one observation twice. Keying old→new makes that unrepresentable —
-    /// a dictionary gives each old id exactly one destination — while still
-    /// letting several old ids land on the same new one, which is the case
-    /// that matters most: collapsing live over-segmentation is the entire
-    /// reason the offline pass runs, and `RecognisedSpeakerAssigner.finish`
-    /// has already folded *every* fragment into the profile. Those have to
-    /// be combined rather than reduced to the dominant one, or un-naming
-    /// gives back a fraction of what the recording contributed. See
-    /// `ObservedVoiceSnapshots.remapSpeakerIDs`.
-    static func owningNewIDs(from old: [TranscriptSegment],
-                             to new: [TranscriptSegment]) -> [String: String] {
-        // Transpose the votes: for each old id, which new id took most of it.
-        var byOldID: [String: [String: Double]] = [:]
-        for (newID, tally) in votes(from: old, to: new) {
-            for (oldID, duration) in tally {
-                byOldID[oldID, default: [:]][newID, default: 0] += duration
-            }
-        }
-        var owner: [String: String] = [:]
-        for (oldID, tally) in byOldID {
-            let winner = tally.max { a, b in
-                if a.value != b.value { return a.value < b.value }
-                return a.key > b.key  // deterministic tie-break: lower new ID wins
-            }?.key
-            if let winner { owner[oldID] = winner }
-        }
-        return owner
     }
 
     /// Carry each new speaker ID's name over from the old ID that dominates

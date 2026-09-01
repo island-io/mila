@@ -316,9 +316,9 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
         snapshots.record(entries([("SPEAKER_00", [1, 0], 2, "Alice"),
                                   ("SPEAKER_01", [0, 1], 3, nil)]), for: rec)
 
-        // old -> new: the pass renumbered them the other way round.
-        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_01",
-                                   "SPEAKER_01": "SPEAKER_00"], in: rec)
+        // new -> old: the pass renumbered them the other way round.
+        snapshots.remapSpeakerIDs(["SPEAKER_01": "SPEAKER_00",
+                                   "SPEAKER_00": "SPEAKER_01"], in: rec)
 
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec),
                        .init(observedCentroid: [1, 0], observedCount: 2, profileName: "Alice"))
@@ -326,69 +326,60 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
                        .init(observedCentroid: [0, 1], observedCount: 3, profileName: nil))
     }
 
-    /// **Collapsing over-segmentation is what the offline pass is FOR**, so
-    /// this is the common outcome, not an edge. `finish` folded all three
-    /// fragments into one profile; all three have to arrive on the new id,
-    /// combined — keeping only the dominant one would let un-naming give
-    /// back a third of what the recording contributed and strand the rest.
-    func test_remapping_combines_every_fragment_that_lands_on_one_new_id() {
+    /// **A collapse carries only the dominant fragment, deliberately.**
+    ///
+    /// This pins a documented limitation, not a nicety. An earlier revision
+    /// folded all three fragments onto the survivor, on the theory that
+    /// `finish` had folded all three into the profile. It has not:
+    /// `finish` snapshots *every* pool entry but names only seeded or
+    /// hand-typed ones, so a collapse routinely mixes fragments the profile
+    /// received with fragments it never did. Folding then makes the snapshot
+    /// claim more than the profile holds, and un-naming subtracts the
+    /// difference out of the profile's other recordings — deleting it
+    /// outright once `S ≤ n_B`. Carrying only the dominant fragment — the one
+    /// whose NAME the new id also inherited — keeps un-naming an exact
+    /// inverse of that fragment's naming and leaves the rest as residue.
+    ///
+    /// The `6` this asserted before is the bug; `2` is the dominant
+    /// fragment's own count. See island-io/mila#254.
+    func test_a_collapse_carries_only_the_dominant_fragment() {
         let snapshots = ObservedVoiceSnapshots()
         let rec = UUID()
         snapshots.record(entries([("SPEAKER_00", [1, 0], 2, "Alice"),
-                                  ("SPEAKER_03", [1, 0], 1, "Alice"),
-                                  ("SPEAKER_07", [1, 0], 3, "Alice")]), for: rec)
+                                  ("SPEAKER_03", [1, 0], 1, nil),
+                                  ("SPEAKER_07", [1, 0], 3, nil)]), for: rec)
 
-        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
-                                   "SPEAKER_03": "SPEAKER_00",
-                                   "SPEAKER_07": "SPEAKER_00"], in: rec)
+        // new -> old: all three collapsed onto new SPEAKER_00, dominated by
+        // old SPEAKER_00 — which is also where its name came from.
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00"], in: rec)
 
         let carried = snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)
-        XCTAssertEqual(carried?.observedCount, 6,
-                       "2 + 1 + 3 — every fragment the profile received")
-        XCTAssertEqual(carried?.observedCentroid, [1, 0])
+        XCTAssertEqual(carried?.observedCount, 2,
+                       "the dominant fragment's own count — folding the other two in "
+                       + "would claim 6 against a profile that received 2")
+        XCTAssertEqual(carried?.profileName, "Alice")
         XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_03", in: rec))
         XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_07", in: rec))
     }
 
-    /// The fold is weighted, so a combined fragment set is worth exactly what
-    /// the separate `updateProfile` calls put into the profile.
-    func test_remapping_weights_the_combined_fragments() {
-        let snapshots = ObservedVoiceSnapshots()
-        let rec = UUID()
-        snapshots.record(entries([("SPEAKER_00", [1, 0], 3, nil),
-                                  ("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
-
-        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
-                                   "SPEAKER_01": "SPEAKER_00"], in: rec)
-
-        let carried = snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)
-        XCTAssertEqual(carried?.observedCount, 4)
-        XCTAssertEqual(carried?.observedCentroid.first ?? 0, 0.75, accuracy: 0.0001)
-        XCTAssertEqual(carried?.observedCentroid.last ?? 0, 0.25, accuracy: 0.0001)
-    }
-
-    /// The other direction: an old speaker the pass SPLIT in two must not
-    /// hand the same embedding to both halves, or un-naming both subtracts
-    /// one observation twice. Keying the mapping old→new makes that
-    /// unrepresentable — the split speaker has exactly one destination, and
-    /// the other half simply has no observation.
-    func test_a_split_speaker_lands_on_one_half_only() {
+    /// The other direction: one old speaker the pass SPLIT across two new ids
+    /// dominates both, and handing its observation to each would let
+    /// un-naming both subtract it twice. It is dropped instead — the same
+    /// under-correcting side as the collapse above.
+    func test_a_split_speaker_is_dropped_rather_than_duplicated() {
         let snapshots = ObservedVoiceSnapshots()
         let rec = UUID()
         snapshots.record(entries([("SPEAKER_00", [1, 0], 2, nil),
                                   ("SPEAKER_01", [0, 1], 2, nil)]), for: rec)
 
-        // The pass split old SPEAKER_00 across new SPEAKER_00 and SPEAKER_02,
-        // and SPEAKER_02 took more of it — so that is where its voice goes,
-        // and new SPEAKER_00 is left holding nothing despite sharing the id.
-        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_02",
+        // Old SPEAKER_00 dominates both halves of the split.
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
+                                   "SPEAKER_02": "SPEAKER_00",
                                    "SPEAKER_01": "SPEAKER_01"], in: rec)
 
-        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec)?.observedCount, 2,
-                       "the split speaker's voice lands on the half that owns it")
         XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
-                     "the other half carries no copy to double-subtract — and note the id "
-                     + "still exists in the transcript, so a stale entry would be found")
+                     "neither half may claim it — one copy each is one subtraction too many")
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec))
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec)?.observedCentroid,
                        [0, 1], "the speaker that mapped one-to-one is unaffected")
     }

@@ -289,30 +289,38 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
         XCTAssertEqual(speakers(w), ["SPEAKER_00"])
     }
 
-    /// The same round trip across the **offline re-diarize**, which is where
-    /// it is most likely to go wrong: collapsing live over-segmentation is
-    /// the entire reason that pass runs, so a recording arriving with three
-    /// fragments of one person is the ordinary case rather than an edge.
-    /// `finish` folded all three into the profile; if the re-key carries only
-    /// the dominant one, un-naming gives back a fraction and strands the rest
-    /// where nothing can reach it.
-    func test_collapsing_over_segmentation_then_un_naming_leaves_no_residue() throws {
+    /// The same round trip across the **offline re-diarize**, pinning the one
+    /// place this PR deliberately does NOT come out clean.
+    ///
+    /// A collapse carries only the dominant fragment's observation, so
+    /// un-naming reverses that fragment exactly and leaves the other
+    /// fragments' contributions in the profile as residue. That is chosen
+    /// over folding them all in, because `finish` names only *some* fragments
+    /// — a fold then claims more than the profile ever received, and
+    /// un-naming subtracts the difference out of the profile's OTHER
+    /// recordings, deleting it outright when its stored count is small.
+    /// Residue can be undone by deleting the profile and letting it re-learn;
+    /// a deleted profile cannot. See `ObservedVoiceSnapshots.remapSpeakerIDs`
+    /// and island-io/mila#254.
+    ///
+    /// Discriminating in both directions: folding deletes Alice, carrying
+    /// nothing leaves her at 2.
+    func test_a_collapsed_speaker_leaves_residue_rather_than_over_subtracting() throws {
         let voice: [Float] = [1, 0, 0, 0]
         let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
-                                     segment("SPEAKER_03", 2, "two"),
-                                     segment("SPEAKER_07", 4, "three")],
-                          snapshotEntries: [("SPEAKER_00", voice, 2),
-                                            ("SPEAKER_03", voice, 1),
-                                            ("SPEAKER_07", voice, 3)])
-        for raw in ["SPEAKER_00", "SPEAKER_03", "SPEAKER_07"] {
+                                     segment("SPEAKER_03", 2, "two")],
+                          snapshotEntries: [("SPEAKER_00", voice, 1),
+                                            ("SPEAKER_03", voice, 1)])
+        // Both fragments named, so the profile received both.
+        for raw in ["SPEAKER_00", "SPEAKER_03"] {
             w.store.setSpeakerName("Alice", forSpeaker: raw, recordingID: w.recordingID)
         }
-        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 6,
-                       "precondition: the profile received all three fragments")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 2,
+                       "precondition: two fragments, two contributions")
 
         // What `finalizeTail` does when the offline pass collapses them into
-        // one speaker: swap the segments, remap the names, carry the
-        // observations on the same old→new mapping.
+        // one speaker: swap the segments, remap the names, and carry the
+        // observations on the same new-to-old mapping the names used.
         var rediarized = row(w)
         rediarized.segments = rediarized.segments.map {
             var seg = $0
@@ -321,15 +329,16 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
         }
         rediarized.speakerNames = ["SPEAKER_00": "Alice"]
         w.store.update(rediarized)
-        w.snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
-                                     "SPEAKER_03": "SPEAKER_00",
-                                     "SPEAKER_07": "SPEAKER_00"], in: w.recordingID)
+        w.snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00"], in: w.recordingID)
 
         w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
 
-        XCTAssertNil(w.profiles.profile(named: "Alice"),
-                     "all six samples came back out; carrying only the dominant "
-                     + "fragment would leave the profile alive at three")
+        let alice = try XCTUnwrap(
+            w.profiles.profile(named: "Alice"),
+            "Alice must survive — folding both fragments into the snapshot would "
+            + "subtract 2 from 2 and delete her, which is the failure this shape avoids")
+        XCTAssertEqual(alice.sampleCount, 1,
+                       "the dominant fragment came back out exactly; the other is residue")
     }
 
     // MARK: - Move one line
