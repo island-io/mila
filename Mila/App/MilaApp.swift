@@ -707,6 +707,15 @@ struct MilaApp: App {
         actions.onRecordingFinalized = { [assigner] recordingID, liveSpeakerNames in
             assigner.finish(recording: recordingID, liveSpeakerNames: liveSpeakerNames)
         }
+        // The offline re-diarize pass re-keys every `SPEAKER_NN`, so the
+        // snapshot `finish` just took is keyed to ids that no longer mean the
+        // same voices. The observations move with the names, on the same
+        // dominance mapping — dropping them instead would leave every
+        // re-diarized recording's profile contributions impossible to
+        // un-name away, which is the correction #237 exists for.
+        actions.onSpeakerIDsRekeyed = { recordingID, newToOld in
+            voiceSnapshots.remapSpeakerIDs(newToOld, in: recordingID)
+        }
         // Save a voice profile when a speaker is named — if the live
         // diarizer observed that speaker *in that recording*, persist it.
         // The store refuses writes while the feature is off; the guard here
@@ -725,15 +734,102 @@ struct MilaApp: App {
         // weight already stored on disk, and folding it back counts it twice.
         // This is the only place voice profiles are written, so a recognised
         // speaker merges exactly once per recording.
-        store.onSpeakerNamed = { recordingID, rawID, name in
+        let voiceLog = os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "VoiceProfile")
+        // Voice recognition for the recordings the live pool never covered —
+        // imports, batch-transcribed files, anything from before the feature
+        // was switched on. Extracted into its own object rather than written
+        // inline here: it writes to speaker labels and voice profiles across
+        // an `await` that spans a Python process, and closures in an `App`
+        // initializer cannot be unit-tested. See `OfflineVoiceEmbedder`.
+        let offlineEmbedder = OfflineVoiceEmbedder(
+            store: store,
+            snapshots: voiceSnapshots,
+            profiles: profileStoreRef,
+            settings: voiceSettings,
+            // The user's own similarity slider, not `match`'s default. Someone
+            // who tightened it because of false matches should get the tighter
+            // threshold everywhere recognition happens, not only live.
+            matchThreshold: { [weak liveAI] in
+                liveAI?.speakerSimilarityThreshold ?? 0.55
+            },
+            embed: { url, spans in
+                let pythonPath = await MainActor.run { diarSettings.pythonPath }
+                var segments: [String: (start: Double, end: Double)] = [:]
+                for span in spans { segments[span.rawID] = (start: span.start, end: span.end) }
+                return try await SpeakerDiarizer.embedSpeakers(
+                    wavURL: url, pythonPath: pythonPath, speakerSegments: segments)
+            })
+        store.onSpeakerNamed = { [offlineEmbedder] recordingID, rawID, name in
             guard voiceSettings.isConfigured else { return }
-            guard let observed = voiceSnapshots.observation(forSpeaker: rawID,
-                                                           in: recordingID) else { return }
-            profileStoreRef.updateProfile(
-                name: name,
-                embedding: observed.observedCentroid,
-                sampleCount: observed.observedCount
-            )
+            if let observed = voiceSnapshots.observation(forSpeaker: rawID,
+                                                         in: recordingID) {
+                // Snapshot exists (live or batch) — save immediately.
+                profileStoreRef.updateProfile(
+                    name: name,
+                    embedding: observed.observedCentroid,
+                    sampleCount: observed.observedCount
+                )
+            } else {
+                // No observation for this speaker (an old recording, an
+                // import, or a batch pass whose extraction hasn't landed).
+                // Extract one on demand from their longest segment.
+                offlineEmbedder.learnNamedSpeaker(recordingID: recordingID,
+                                                  rawID: rawID, name: name)
+            }
+        }
+
+        // A raw `SPEAKER_NN` whose audio became another speaker's hands its
+        // observation over with it. Two things depend on this: the id comes
+        // back (`splitSegmentSpeaker` mints the lowest free number) and would
+        // otherwise resolve to the previous speaker's voice, and the store
+        // has just moved the source's profile contribution to the target, so
+        // the target's snapshot has to account for it or a later un-name
+        // cannot reverse the whole thing.
+        store.onSpeakerIDAbsorbed = { recordingID, sourceRawID, targetRawID in
+            voiceSnapshots.absorb(speaker: sourceRawID, into: targetRawID, in: recordingID)
+        }
+
+        // Reverse a profile merge when a speaker is un-named or renamed.
+        // Looks up the snapshot for what was merged when the speaker was
+        // originally named; if available, subtracts that observation from
+        // the old profile. If the snapshot has been evicted, the name is
+        // still cleared but the profile is left untouched (safe default).
+        store.onSpeakerUnnamed = { recordingID, rawID, previousName in
+            guard voiceSettings.isConfigured else { return }
+            if let observed = voiceSnapshots.observation(forSpeaker: rawID,
+                                                         in: recordingID) {
+                profileStoreRef.subtractObservation(
+                    name: previousName,
+                    embedding: observed.observedCentroid,
+                    sampleCount: observed.observedCount)
+            } else {
+                // No observation held: the snapshot was evicted (the LRU holds
+                // 20 recordings), or this speaker's was never taken. Leaving
+                // the profile alone is the safe direction, but it is not a
+                // clean outcome — whatever this speaker contributed when they
+                // were named STAYS under `previousName`, and the asymmetry is
+                // real: `onSpeakerNamed` can still *add*, through
+                // `OfflineVoiceEmbedder.learnNamedSpeaker`, which extracts a
+                // fresh observation on demand, while nothing can subtract one
+                // that is no longer held. So corrections here degrade to
+                // under-correcting, never to removing the wrong thing.
+                voiceLog.log("un-name: no snapshot for \(rawID, privacy: .public) — profile keeps this recording's contribution")
+            }
+        }
+
+        // Batch voice matching: after any transcription completes, embed
+        // each speaker's longest segment and match against stored voice
+        // profiles. Uses embedSpeakers (embedding model only, ~0.5s)
+        // instead of the full pyannote pipeline (30-60min).
+        //
+        // It also *invalidates* whatever snapshot the recording held —
+        // unconditionally, and that is the point. A pass that reaches this
+        // hook re-keyed every `SPEAKER_NN`, so the embeddings held under
+        // those ids no longer denote the same voices. See `matchAfterPass`.
+        let existingCallback = svc.onTranscriptionCompleted
+        svc.onTranscriptionCompleted = { [offlineEmbedder] rec, wasRetranscription in
+            existingCallback?(rec, wasRetranscription)
+            offlineEmbedder.matchAfterPass(recordingID: rec.id)
         }
 
         // Auto-drop accidental short+empty captures (issue #61). A recording

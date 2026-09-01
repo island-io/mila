@@ -356,6 +356,174 @@ enum SpeakerDiarizer {
         return try JSONDecoder().decode([SpeakerTurn].self, from: result.stdout)
     }
 
+    /// Embed specific speaker segments from an already-diarized recording.
+    ///
+    /// Unlike `diarize`, this **runs** only the embedding model: the
+    /// `Pipeline.from_pretrained` call still instantiates the whole
+    /// `SpeakerDiarization` pipeline (segmentation model included, that is
+    /// the ~0.4 s), but nothing here segments or clusters — it reaches
+    /// straight for `pipeline._embedding` and pushes known spans through it,
+    /// ~0.04 s per speaker. Skipping the *running* of segmentation and
+    /// clustering is where the 30-60+ minutes go.
+    ///
+    /// `speakerSegments` maps raw speaker IDs to their (start, end) time
+    /// ranges — typically the longest segment per speaker from the
+    /// already-completed transcription.
+    ///
+    /// **These embeddings are noisier than the live daemon's.** A whisper
+    /// segment is not a VAD-trimmed utterance: it can straddle a speaker
+    /// change or open with silence. They land in the same space as the
+    /// stored profiles (same model, same `(1, 1, N)` tensor shape as
+    /// `LiveSpeakerDiarizer.daemonScript`) and are comparable, but callers
+    /// fold them in at `sampleCount: 1` for a reason.
+    ///
+    /// Throws `Error.diarizationFailed` carrying the subprocess's stderr when
+    /// the script fails, rather than returning an empty dictionary — "no
+    /// speaker matched" and "pyannote could not be imported" are not the same
+    /// answer, and the second one needs to reach a log. An empty result now
+    /// means exactly one thing: no span was long enough to embed (or none was
+    /// asked for).
+    static func embedSpeakers(
+        wavURL: URL,
+        pythonPath: String,
+        speakerSegments: [String: (start: Double, end: Double)]
+    ) async throws -> [String: [Float]] {
+        guard let modelsPath = bundledModelsPath else {
+            throw Error.diarizationFailed("Bundled diarization models not found in app")
+        }
+        guard !speakerSegments.isEmpty else { return [:] }
+        var pythonInputURL = wavURL
+        var tempWAVToCleanUp: URL?
+        if wavURL.pathExtension.lowercased() != "wav" {
+            pythonInputURL = try AudioCompressor.decodeToTempWAV(wavURL)
+            tempWAVToCleanUp = pythonInputURL
+        }
+        defer {
+            if let temp = tempWAVToCleanUp { try? FileManager.default.removeItem(at: temp) }
+        }
+        let resolvedPython = resolvePython(userConfigured: pythonPath)
+        let extraEnv = pythonEnvironment()
+
+        // Encode speaker segments as JSON for the Python script.
+        let segmentsJSON = try JSONSerialization.data(
+            withJSONObject: speakerSegments.mapValues { ["start": $0.start, "end": $0.end] },
+            options: [])
+        let segmentsArg = String(data: segmentsJSON, encoding: .utf8) ?? "{}"
+
+        let script = """
+        import json, sys, os, types
+
+        try:
+            import speechbrain.utils.importutils as _sbiu
+            _orig_ensure = _sbiu.LazyModule.ensure_module
+            def _safe_ensure(self, *a, **kw):
+                try:
+                    return _orig_ensure(self, *a, **kw)
+                except ImportError:
+                    self.lazy_module = types.ModuleType(self.target)
+                    return self.lazy_module
+            _sbiu.LazyModule.ensure_module = _safe_ensure
+        except Exception:
+            pass
+
+        import torch
+        _orig_torch_load = torch.load
+        def _patched_torch_load(*args, **kwargs):
+            kwargs["weights_only"] = False
+            return _orig_torch_load(*args, **kwargs)
+        torch.load = _patched_torch_load
+
+        import soundfile as sf
+        import tempfile
+        from pyannote.audio import Pipeline
+
+        wav_path = sys.argv[1]
+        models_dir = sys.argv[2]
+        segments = json.loads(sys.argv[3])
+
+        config_path = os.path.join(models_dir, "config.yaml")
+        with open(config_path) as f:
+            config_text = f.read().replace("__MODELS_DIR__", models_dir)
+
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        tmp.write(config_text)
+        tmp.close()
+
+        try:
+            pipeline = Pipeline.from_pretrained(tmp.name)
+            embedder = getattr(pipeline, "_embedding", None)
+            if embedder is None:
+                # Not "nothing matched" — the pipeline shape changed under us
+                # (a pyannote upgrade renaming the attribute is the likely
+                # cause). Fail loudly; a silent {} makes this indistinguishable
+                # from a recording with no usable speech.
+                print("embedSpeakers: pipeline has no _embedding attribute", file=sys.stderr)
+                sys.exit(2)
+
+            # Read each span on its own rather than the whole file: a 3-hour
+            # 16 kHz mono capture is ~690 MB of float32, and this runs right
+            # after every completed transcription, alongside the compression
+            # pass reading the same file.
+            info = sf.info(wav_path)
+            sr = info.samplerate
+            min_samples = int(sr * 0.3)
+
+            embeddings = {}
+            skipped = 0
+            for sp, seg in segments.items():
+                start_sample = max(int(seg["start"] * sr), 0)
+                stop_sample = min(int(seg["end"] * sr), info.frames)
+                if stop_sample - start_sample < min_samples:
+                    skipped += 1
+                    continue
+                chunk, _ = sf.read(wav_path, dtype="float32",
+                                   start=start_sample, stop=stop_sample)
+                if chunk.ndim > 1:
+                    chunk = chunk.mean(axis=1)
+                if len(chunk) < min_samples:
+                    skipped += 1
+                    continue
+                wave = torch.from_numpy(chunk).unsqueeze(0).unsqueeze(0)
+                emb = embedder(wave)
+                if hasattr(emb, 'detach'):
+                    arr = emb.detach().cpu().numpy().flatten()
+                else:
+                    import numpy
+                    arr = numpy.array(emb).flatten()
+                embeddings[sp] = arr.tolist()
+
+            print(f"embedSpeakers: embedded {len(embeddings)} of {len(segments)} speakers ({skipped} spans too short)", file=sys.stderr)
+            json.dump(embeddings, sys.stdout)
+        finally:
+            os.unlink(tmp.name)
+        """
+
+        let result = try await runPython(
+            path: resolvedPython,
+            arguments: ["-c", script, pythonInputURL.path, modelsPath, segmentsArg],
+            environment: extraEnv
+        )
+        // Same contract as `diarize`: a non-zero exit carries the subprocess's
+        // stderr out as an error rather than collapsing into `[:]`. Both new
+        // callers used to `try?` an empty dictionary, so a missing audio file
+        // and a broken pyannote import looked exactly like "nobody matched" —
+        // and a bug report carried nothing usable
+        // (`.claude/rules/python-subprocess.md`).
+        guard result.exitCode == 0 else {
+            let errMsg = String(data: result.stderr, encoding: .utf8) ?? "exit code \(result.exitCode)"
+            throw Error.diarizationFailed(errMsg)
+        }
+        guard !result.stdout.isEmpty else {
+            throw Error.diarizationFailed(String(data: result.stderr, encoding: .utf8) ?? "empty stdout")
+        }
+        do {
+            return try JSONDecoder().decode([String: [Float]].self, from: result.stdout)
+        } catch {
+            throw Error.diarizationFailed("undecodable embedding output; stderr: "
+                                          + (String(data: result.stderr, encoding: .utf8) ?? ""))
+        }
+    }
+
     struct VerifyResult: Codable {
         let pyannoteInstalled: Bool
         let torchInstalled: Bool

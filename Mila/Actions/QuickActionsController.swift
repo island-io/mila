@@ -196,6 +196,24 @@ final class QuickActionsController: ObservableObject {
     /// finish(recording:liveSpeakerNames:)`.
     var onRecordingFinalized: ((_ recordingID: UUID, _ liveSpeakerNames: [String: String]) -> Void)?
 
+    /// Called when the offline re-diarize pass has re-keyed a recording's raw
+    /// `SPEAKER_NN` ids, carrying the **same** new→old mapping the names were
+    /// remapped on (`SpeakerNameRemapper.dominantOldIDs`). MilaApp wires it
+    /// to `ObservedVoiceSnapshots.remapSpeakerIDs`.
+    ///
+    /// Passing the identical mapping is the point, not an economy: it makes a
+    /// new id's carried embedding come from the very fragment its name came
+    /// from, so un-naming subtracts exactly what naming that fragment added.
+    /// Deriving the two from different mappings is how an observation gets
+    /// subtracted from a profile it was never added to.
+    ///
+    /// The observed embeddings have to cross this boundary on **the same**
+    /// evidence as the names, or the two disagree: the names (and so the
+    /// profile contributions they justified) survive while the observations
+    /// that would reverse them do not, and un-naming a speaker after a
+    /// re-diarize silently corrects nothing.
+    var onSpeakerIDsRekeyed: ((_ recordingID: UUID, _ newToOldSpeakerIDs: [String: String]) -> Void)?
+
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
     /// VAD path already produced segments), TranscriptionService's
@@ -1266,6 +1284,15 @@ final class QuickActionsController: ObservableObject {
                                 to: rediarized)
                             self.store.update(current)
                             updated = current
+                            // The observed embeddings follow the utterances
+                            // onto the new ids, on the same dominance mapping
+                            // the names just used. Anything else leaves the
+                            // profile contributions those names justified
+                            // impossible to reverse.
+                            self.onSpeakerIDsRekeyed?(
+                                id,
+                                SpeakerNameRemapper.dominantOldIDs(from: preRediarize,
+                                                                   to: rediarized))
                         }
                     }
                 }
