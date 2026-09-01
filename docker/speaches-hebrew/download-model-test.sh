@@ -78,7 +78,23 @@ else
     failures=$((failures + 1))
 fi
 
-# 5. A missing model id is a usage error, not a silent five-attempt no-op.
+# 5. The exact invocation is pinned. A stub interpreter accepts ANY arguments,
+#    so tests 1-4 pass just as happily against a call the real
+#    `huggingface_hub` would reject -- which is precisely what happened when
+#    this script briefly passed `max_retries=3`, a parameter the version in
+#    the speaches base image does not have: every attempt raised TypeError and
+#    the loop dutifully retried something that could never succeed. Nothing
+#    here can check the real signature, so instead the call is frozen to the
+#    one the image has always used. Changing it deliberately means changing
+#    this string too -- and then verifying it against the actual library,
+#    because this test cannot.
+stub="$(make_stub 0)"
+PATH="$stub:$PATH" MODEL_DOWNLOAD_BACKOFF_SECONDS=0 sh "$SCRIPT" some/model
+expected="-c from huggingface_hub import snapshot_download; snapshot_download(repo_id='some/model')"
+check "the download call is exactly the one the base image accepts" \
+    "$expected" "$(cat "$stub/calls")"
+
+# 6. A missing model id is a usage error, not a silent five-attempt no-op.
 set +e
 sh "$SCRIPT" >/dev/null 2>&1
 rc=$?

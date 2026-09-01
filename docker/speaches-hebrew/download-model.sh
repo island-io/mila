@@ -20,10 +20,15 @@
 # into the HF cache and picks up where it left off, so a retry after a
 # partial transfer does not re-fetch the ~1.6 GB from the start.
 #
-# `max_retries` on `snapshot_download` is NOT sufficient on its own — it
-# covers the per-file HTTP layer, not the initial repo HEAD call that failed
-# above. Hence both: the inner one for transfer blips, this outer loop for
-# reachability.
+# The download call itself is left EXACTLY as it was. An earlier revision of
+# this script also passed `max_retries=3`, on the theory that the per-file
+# HTTP layer should retry too; the `huggingface_hub` pinned in the speaches
+# base image has no such parameter, so every attempt died instantly with
+# `TypeError: snapshot_download() got an unexpected keyword argument
+# 'max_retries'` and the loop faithfully retried a call that could never
+# work. The retry is the only thing this script adds — the invocation is the
+# one the image has always used, and download-model-test.sh pins it, because
+# nothing here can verify the real library's signature.
 #
 # Usage: download-model.sh <hf-model-id>
 set -eu
@@ -40,7 +45,7 @@ attempt=1
 while :; do
     # `if` suppresses errexit for the condition, so a failure lands below
     # rather than aborting the script.
-    if python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${MODEL_ID}', max_retries=3)"; then
+    if python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${MODEL_ID}')"; then
         exit 0
     fi
     if [ "$attempt" -ge "$ATTEMPTS" ]; then
