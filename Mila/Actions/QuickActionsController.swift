@@ -196,6 +196,16 @@ final class QuickActionsController: ObservableObject {
     /// finish(recording:liveSpeakerNames:)`.
     var onRecordingFinalized: ((_ recordingID: UUID, _ liveSpeakerNames: [String: String]) -> Void)?
 
+    /// Called when the offline re-diarize pass has re-keyed a recording's raw
+    /// `SPEAKER_NN` ids. `SpeakerNameRemapper` carries the *names* across that
+    /// boundary; nothing carried the observed *embeddings*, which stayed
+    /// keyed to the ids the pass just retired. MilaApp wires this to
+    /// `ObservedVoiceSnapshots.invalidate` — an embedding under a re-keyed id
+    /// may belong to a different person, and no snapshot at all is the honest
+    /// answer (the on-demand extractor can produce a fresh one when a speaker
+    /// is next named).
+    var onSpeakerIDsRekeyed: ((_ recordingID: UUID) -> Void)?
+
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
     /// VAD path already produced segments), TranscriptionService's
@@ -1266,6 +1276,11 @@ final class QuickActionsController: ObservableObject {
                                 to: rediarized)
                             self.store.update(current)
                             updated = current
+                            // The names followed the utterances; the observed
+                            // embeddings could not — they are keyed to the ids
+                            // this pass just retired. Drop them rather than let
+                            // a reused `SPEAKER_NN` resolve to another voice.
+                            self.onSpeakerIDsRekeyed?(id)
                         }
                     }
                 }

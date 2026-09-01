@@ -357,20 +357,40 @@ enum SpeakerDiarizer {
     }
 
     /// Embed specific speaker segments from an already-diarized recording.
-    /// Unlike `diarize` (which runs the full pyannote pipeline), this loads
-    /// ONLY the embedding model and extracts centroids from known speaker
-    /// segments. Takes ~0.4s to load + ~0.04s per speaker vs. 30-60+
-    /// minutes for full diarization.
+    ///
+    /// Unlike `diarize`, this **runs** only the embedding model: the
+    /// `Pipeline.from_pretrained` call still instantiates the whole
+    /// `SpeakerDiarization` pipeline (segmentation model included, that is
+    /// the ~0.4 s), but nothing here segments or clusters — it reaches
+    /// straight for `pipeline._embedding` and pushes known spans through it,
+    /// ~0.04 s per speaker. Skipping the *running* of segmentation and
+    /// clustering is where the 30-60+ minutes go.
     ///
     /// `speakerSegments` maps raw speaker IDs to their (start, end) time
     /// ranges — typically the longest segment per speaker from the
     /// already-completed transcription.
+    ///
+    /// **These embeddings are noisier than the live daemon's.** A whisper
+    /// segment is not a VAD-trimmed utterance: it can straddle a speaker
+    /// change or open with silence. They land in the same space as the
+    /// stored profiles (same model, same `(1, 1, N)` tensor shape as
+    /// `LiveSpeakerDiarizer.daemonScript`) and are comparable, but callers
+    /// fold them in at `sampleCount: 1` for a reason.
+    ///
+    /// Throws `Error.diarizationFailed` carrying the subprocess's stderr when
+    /// the script fails, rather than returning an empty dictionary — "no
+    /// speaker matched" and "pyannote could not be imported" are not the same
+    /// answer, and the second one needs to reach a log. An empty result now
+    /// means exactly one thing: no span was long enough to embed (or none was
+    /// asked for).
     static func embedSpeakers(
         wavURL: URL,
         pythonPath: String,
         speakerSegments: [String: (start: Double, end: Double)]
     ) async throws -> [String: [Float]] {
-        guard let modelsPath = bundledModelsPath else { return [:] }
+        guard let modelsPath = bundledModelsPath else {
+            throw Error.diarizationFailed("Bundled diarization models not found in app")
+        }
         guard !speakerSegments.isEmpty else { return [:] }
         var pythonInputURL = wavURL
         var tempWAVToCleanUp: URL?
@@ -433,19 +453,35 @@ enum SpeakerDiarizer {
             pipeline = Pipeline.from_pretrained(tmp.name)
             embedder = getattr(pipeline, "_embedding", None)
             if embedder is None:
-                json.dump({}, sys.stdout)
-                sys.exit(0)
+                # Not "nothing matched" — the pipeline shape changed under us
+                # (a pyannote upgrade renaming the attribute is the likely
+                # cause). Fail loudly; a silent {} makes this indistinguishable
+                # from a recording with no usable speech.
+                print("embedSpeakers: pipeline has no _embedding attribute", file=sys.stderr)
+                sys.exit(2)
 
-            samples, sr = sf.read(wav_path, dtype="float32")
-            if samples.ndim > 1:
-                samples = samples.mean(axis=1)
+            # Read each span on its own rather than the whole file: a 3-hour
+            # 16 kHz mono capture is ~690 MB of float32, and this runs right
+            # after every completed transcription, alongside the compression
+            # pass reading the same file.
+            info = sf.info(wav_path)
+            sr = info.samplerate
+            min_samples = int(sr * 0.3)
 
             embeddings = {}
+            skipped = 0
             for sp, seg in segments.items():
-                start_sample = int(seg["start"] * sr)
-                end_sample = int(seg["end"] * sr)
-                chunk = samples[start_sample:end_sample]
-                if len(chunk) < sr * 0.3:
+                start_sample = max(int(seg["start"] * sr), 0)
+                stop_sample = min(int(seg["end"] * sr), info.frames)
+                if stop_sample - start_sample < min_samples:
+                    skipped += 1
+                    continue
+                chunk, _ = sf.read(wav_path, dtype="float32",
+                                   start=start_sample, stop=stop_sample)
+                if chunk.ndim > 1:
+                    chunk = chunk.mean(axis=1)
+                if len(chunk) < min_samples:
+                    skipped += 1
                     continue
                 wave = torch.from_numpy(chunk).unsqueeze(0).unsqueeze(0)
                 emb = embedder(wave)
@@ -456,6 +492,7 @@ enum SpeakerDiarizer {
                     arr = numpy.array(emb).flatten()
                 embeddings[sp] = arr.tolist()
 
+            print(f"embedSpeakers: embedded {len(embeddings)} of {len(segments)} speakers ({skipped} spans too short)", file=sys.stderr)
             json.dump(embeddings, sys.stdout)
         finally:
             os.unlink(tmp.name)
@@ -466,8 +503,25 @@ enum SpeakerDiarizer {
             arguments: ["-c", script, pythonInputURL.path, modelsPath, segmentsArg],
             environment: extraEnv
         )
-        guard result.exitCode == 0, !result.stdout.isEmpty else { return [:] }
-        return (try? JSONDecoder().decode([String: [Float]].self, from: result.stdout)) ?? [:]
+        // Same contract as `diarize`: a non-zero exit carries the subprocess's
+        // stderr out as an error rather than collapsing into `[:]`. Both new
+        // callers used to `try?` an empty dictionary, so a missing audio file
+        // and a broken pyannote import looked exactly like "nobody matched" —
+        // and a bug report carried nothing usable
+        // (`.claude/rules/python-subprocess.md`).
+        guard result.exitCode == 0 else {
+            let errMsg = String(data: result.stderr, encoding: .utf8) ?? "exit code \(result.exitCode)"
+            throw Error.diarizationFailed(errMsg)
+        }
+        guard !result.stdout.isEmpty else {
+            throw Error.diarizationFailed(String(data: result.stderr, encoding: .utf8) ?? "empty stdout")
+        }
+        do {
+            return try JSONDecoder().decode([String: [Float]].self, from: result.stdout)
+        } catch {
+            throw Error.diarizationFailed("undecodable embedding output; stderr: "
+                                          + (String(data: result.stderr, encoding: .utf8) ?? ""))
+        }
     }
 
     struct VerifyResult: Codable {

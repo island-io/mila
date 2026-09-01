@@ -707,6 +707,14 @@ struct MilaApp: App {
         actions.onRecordingFinalized = { [assigner] recordingID, liveSpeakerNames in
             assigner.finish(recording: recordingID, liveSpeakerNames: liveSpeakerNames)
         }
+        // The offline re-diarize pass re-keys every `SPEAKER_NN`, so the
+        // snapshot `finish` just took above is keyed to ids that no longer
+        // mean the same voices. `SpeakerNameRemapper` moves the names; the
+        // embeddings cannot follow (a merged cluster's centroid is only
+        // partly the right person), so they are dropped instead.
+        actions.onSpeakerIDsRekeyed = { recordingID in
+            voiceSnapshots.invalidate(recordingID)
+        }
         // Save a voice profile when a speaker is named — if the live
         // diarizer observed that speaker *in that recording*, persist it.
         // The store refuses writes while the feature is off; the guard here
@@ -726,7 +734,31 @@ struct MilaApp: App {
         // This is the only place voice profiles are written, so a recognised
         // speaker merges exactly once per recording.
         let voiceLog = os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "VoiceProfile")
-        store.onSpeakerNamed = { [weak store, weak diarSettings] recordingID, rawID, name in
+        // Voice recognition for the recordings the live pool never covered —
+        // imports, batch-transcribed files, anything from before the feature
+        // was switched on. Extracted into its own object rather than written
+        // inline here: it writes to speaker labels and voice profiles across
+        // an `await` that spans a Python process, and closures in an `App`
+        // initializer cannot be unit-tested. See `OfflineVoiceEmbedder`.
+        let offlineEmbedder = OfflineVoiceEmbedder(
+            store: store,
+            snapshots: voiceSnapshots,
+            profiles: profileStoreRef,
+            settings: voiceSettings,
+            // The user's own similarity slider, not `match`'s default. Someone
+            // who tightened it because of false matches should get the tighter
+            // threshold everywhere recognition happens, not only live.
+            matchThreshold: { [weak liveAI] in
+                liveAI?.speakerSimilarityThreshold ?? 0.55
+            },
+            embed: { url, spans in
+                let pythonPath = await MainActor.run { diarSettings.pythonPath }
+                var segments: [String: (start: Double, end: Double)] = [:]
+                for span in spans { segments[span.rawID] = (start: span.start, end: span.end) }
+                return try await SpeakerDiarizer.embedSpeakers(
+                    wavURL: url, pythonPath: pythonPath, speakerSegments: segments)
+            })
+        store.onSpeakerNamed = { [offlineEmbedder] recordingID, rawID, name in
             guard voiceSettings.isConfigured else { return }
             if let observed = voiceSnapshots.observation(forSpeaker: rawID,
                                                          in: recordingID) {
@@ -736,52 +768,21 @@ struct MilaApp: App {
                     embedding: observed.observedCentroid,
                     sampleCount: observed.observedCount
                 )
-            } else if let store {
-                // No snapshot (old recording, never re-transcribed).
-                // Extract the embedding on demand (~0.5s) from the
-                // speaker's longest segment in this recording.
-                guard let rec = store.recordings.first(where: { $0.id == recordingID }) else { return }
-                var best: (start: Double, end: Double)?
-                for seg in rec.segments where seg.speaker == rawID {
-                    let dur = seg.end - seg.start
-                    if best == nil || dur > (best!.end - best!.start) {
-                        best = (seg.start, seg.end)
-                    }
-                }
-                guard let segment = best else { return }
-                let pythonPath = diarSettings?.pythonPath ?? "/usr/bin/python3"
-                let capturedName = name
-                let capturedRecID = recordingID
-                let capturedRawID = rawID
-                // Capture the audio URL now, before compression can
-                // change the recording's audioFileName to .m4a.
-                let wavURL = store.audioURL(for: rec)
-                Task.detached(priority: .utility) {
-                    guard FileManager.default.fileExists(atPath: wavURL.path) else { return }
-                    do {
-                        let embeddings = try await SpeakerDiarizer.embedSpeakers(
-                            wavURL: wavURL, pythonPath: pythonPath,
-                            speakerSegments: [capturedRawID: segment])
-                        guard let emb = embeddings[capturedRawID] else { return }
-                        await MainActor.run {
-                            // Re-check after await: user may have opted
-                            // out while the embedding was being extracted.
-                            guard voiceSettings.isConfigured else { return }
-                            voiceLog.log("on-demand voice profile saved for \(capturedRawID, privacy: .public)")
-                            voiceSnapshots.record(
-                                [(id: capturedRawID, observedCentroid: emb,
-                                  observedCount: 1, profileName: nil)],
-                                for: capturedRecID)
-                            profileStoreRef.updateProfile(
-                                name: capturedName,
-                                embedding: emb,
-                                sampleCount: 1)
-                        }
-                    } catch {
-                        voiceLog.log("on-demand embedding failed: \(error.localizedDescription, privacy: .private)")
-                    }
-                }
+            } else {
+                // No observation for this speaker (an old recording, an
+                // import, or a batch pass whose extraction hasn't landed).
+                // Extract one on demand from their longest segment.
+                offlineEmbedder.learnNamedSpeaker(recordingID: recordingID,
+                                                  rawID: rawID, name: name)
             }
+        }
+
+        // A raw `SPEAKER_NN` that no longer exists in the recording must not
+        // leave its embedding behind: `splitSegmentSpeaker` hands the lowest
+        // free number to the next split, so the id comes back — and would
+        // resolve against the previous speaker's voice.
+        store.onSpeakerIDRetired = { recordingID, rawID in
+            voiceSnapshots.forget(speaker: rawID, in: recordingID)
         }
 
         // Reverse a profile merge when a speaker is un-named or renamed.
@@ -807,71 +808,14 @@ struct MilaApp: App {
         // profiles. Uses embedSpeakers (embedding model only, ~0.5s)
         // instead of the full pyannote pipeline (30-60min).
         //
-        // Skipped when the recording already has a snapshot from the live
-        // stop path (`RecognisedSpeakerAssigner.finish`), which stores
-        // richer multi-sample observations and already names recognised
-        // speakers. Without this guard the batch path would overwrite
-        // those observations with single-segment extracts and double-
-        // learn by firing `onSpeakerNamed` a second time.
+        // It also *invalidates* whatever snapshot the recording held —
+        // unconditionally, and that is the point. A pass that reaches this
+        // hook re-keyed every `SPEAKER_NN`, so the embeddings held under
+        // those ids no longer denote the same voices. See `matchAfterPass`.
         let existingCallback = svc.onTranscriptionCompleted
-        svc.onTranscriptionCompleted = { [weak store, weak diarSettings] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [offlineEmbedder] rec, wasRetranscription in
             existingCallback?(rec, wasRetranscription)
-            guard voiceSettings.isConfigured,
-                  !profileStoreRef.profiles.isEmpty,
-                  rec.speakerNames.isEmpty,
-                  rec.segments.contains(where: { $0.speaker != nil }),
-                  // Skip if the live stop already snapshotted this
-                  // recording — its observations are richer and it
-                  // already named recognised speakers.
-                  voiceSnapshots.observation(forSpeaker: rec.segments.first(where: { $0.speaker != nil })!.speaker!, in: rec.id) == nil,
-                  let store else { return }
-            // Build a map of each speaker's longest segment.
-            var longest: [String: (start: Double, end: Double)] = [:]
-            for seg in rec.segments {
-                guard let sp = seg.speaker else { continue }
-                let dur = seg.end - seg.start
-                if let existing = longest[sp] {
-                    if dur > (existing.end - existing.start) {
-                        longest[sp] = (seg.start, seg.end)
-                    }
-                } else {
-                    longest[sp] = (seg.start, seg.end)
-                }
-            }
-            guard !longest.isEmpty else { return }
-            let pythonPath = diarSettings?.pythonPath ?? "/usr/bin/python3"
-            // Capture URL before the detached task — compression runs
-            // concurrently and may delete the WAV or change the path.
-            let wavURL = store.audioURL(for: rec)
-            Task.detached(priority: .utility) {
-                guard FileManager.default.fileExists(atPath: wavURL.path) else { return }
-                let embeddings = (try? await SpeakerDiarizer.embedSpeakers(
-                    wavURL: wavURL, pythonPath: pythonPath,
-                    speakerSegments: longest)) ?? [:]
-                guard !embeddings.isEmpty else { return }
-                await MainActor.run {
-                    // Re-check after await: user may have opted out.
-                    guard voiceSettings.isConfigured else { return }
-                    // Store embeddings as snapshots so naming a speaker
-                    // later (via onSpeakerNamed) can save the voice
-                    // profile even for batch-transcribed recordings.
-                    let entries = embeddings.map { (rawID, emb) in
-                        (id: rawID,
-                         observedCentroid: emb,
-                         observedCount: 1,
-                         profileName: nil as String?)
-                    }
-                    voiceSnapshots.record(entries, for: rec.id)
-
-                    for (rawID, emb) in embeddings {
-                        if let profile = profileStoreRef.match(embedding: emb) {
-                            store.setSpeakerName(
-                                profile.name, forSpeaker: rawID,
-                                recordingID: rec.id)
-                        }
-                    }
-                }
-            }
+            offlineEmbedder.matchAfterPass(recordingID: rec.id)
         }
 
         // Auto-drop accidental short+empty captures (issue #61). A recording
