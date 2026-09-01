@@ -563,7 +563,10 @@ enum LLMRunner {
         let handle = ProcessHandle()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async {
+                // A thread of its own: `executeProcess` blocks for the whole
+                // life of the child, and a pooled thread parked there starves
+                // everything else queued behind it (issue #246).
+                BlockingWork.onDedicatedThread(named: "io.island.mila.llm.run") {
                     do {
                         let outcome = try executeProcess(executable: executable,
                                                          arguments: arguments,
@@ -840,7 +843,9 @@ enum LLMRunner {
         let handle = ProcessHandle()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                DispatchQueue.global(qos: .userInitiated).async {
+                // See `run` above — `executeProcess` blocks, so it must not
+                // hold a shared pool thread (issue #246).
+                BlockingWork.onDedicatedThread(named: "io.island.mila.llm.diagnose") {
                     let elapsed: () -> TimeInterval = { Date().timeIntervalSince(start) }
                     do {
                         let outcome = try executeProcess(executable: executable,
@@ -1425,6 +1430,21 @@ enum LLMRunner {
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
 
+        // Observe the exit WITHOUT parking a blocking wait on the shared
+        // `DispatchQueue.global()` pool (issue #246 — the reasoning is in
+        // `BlockingWork`). `terminationHandler` is driven by Foundation's own
+        // child-reaping source, so nothing of ours is blocked to notice the
+        // exit; it has to be installed BEFORE `run()`.
+        //
+        // The `waitUntilExit()` backstop further down is not redundant with
+        // it: this method already documents a macOS 26 reaping race where
+        // that call never returns even after `SIGKILL`, so the two paths can
+        // fail independently. Whichever notices first signals. Only one wait
+        // below ever succeeds, so a second signal is harmless (a semaphore is
+        // only unsafe to destroy while its value is BELOW where it started).
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+
         do {
             try process.run()
         } catch {
@@ -1439,8 +1459,8 @@ enum LLMRunner {
         // result the user no longer cares about.
         handle.attach(process)
 
-        // Read stdout/stderr eagerly on background queues so a chatty CLI
-        // can't deadlock by filling the OS pipe buffer while we waitUntilExit.
+        // Read stdout/stderr eagerly on background threads so a chatty CLI
+        // can't deadlock by filling the OS pipe buffer while we wait for exit.
         // Chunked reads into lock-guarded boxes (not one readDataToEndOfFile
         // into a captured var) so the bounded drain below can snapshot what
         // arrived so far without racing a still-blocked reader.
@@ -1449,7 +1469,13 @@ enum LLMRunner {
         let group = DispatchGroup()
         for (pipe, box) in [(stdoutPipe, outBox), (stderrPipe, errBox)] {
             group.enter()
-            DispatchQueue.global().async {
+            // A thread of its own, NOT the global pool: `availableData` blocks
+            // until EOF, and a pooled thread parked there is one the whole
+            // process cannot use (issue #246, see `BlockingWork`). It also
+            // means the documented "an orphaned grandchild still holds the
+            // pipe" leak below costs a thread instead of a pool slot.
+            let stream = pipe === stdoutPipe ? "stdout" : "stderr"
+            BlockingWork.onDedicatedThread(named: "io.island.mila.llm.drain.\(stream)") {
                 let handle = pipe.fileHandleForReading
                 while true {
                     let chunk = handle.availableData   // blocks until data or EOF
@@ -1460,21 +1486,23 @@ enum LLMRunner {
             }
         }
 
-        // Bounded wait — kill the process if it's still running at deadline.
-        let runningGroup = DispatchGroup()
-        runningGroup.enter()
-        DispatchQueue.global().async {
+        // Backstop for `terminationHandler`, on a thread of its own for the
+        // same reason as the readers — and so that a `waitUntilExit()` which
+        // never returns (see below) leaks one thread rather than a pool slot.
+        BlockingWork.onDedicatedThread(named: "io.island.mila.llm.reap") {
             process.waitUntilExit()
-            runningGroup.leave()
+            exited.signal()
         }
+
+        // Bounded wait — kill the process if it's still running at deadline.
         let deadline = DispatchTime.now() + .seconds(Int(timeout.rounded(.up)))
-        let timedOut = runningGroup.wait(timeout: deadline) == .timedOut
+        let timedOut = exited.wait(timeout: deadline) == .timedOut
         if timedOut {
             // SIGTERM first; if the CLI ignores it, hard-kill after a short
             // grace period so we don't read half-drained pipes or remove the
             // sandbox out from under a still-running child.
             process.terminate()
-            if runningGroup.wait(timeout: .now() + 1) == .timedOut {
+            if exited.wait(timeout: .now() + 1) == .timedOut {
                 kill(process.processIdentifier, SIGKILL)
                 // BOUNDED: `waitUntilExit` has been observed never returning
                 // even after a SIGKILL (macOS 26, sampled live — likely a
@@ -1482,7 +1510,7 @@ enum LLMRunner {
                 // either way, and this is the timedOut path so its exit
                 // status is already being discarded — don't hang the caller
                 // (and its awaiting continuation) on the obituary.
-                if runningGroup.wait(timeout: .now() + 5) == .timedOut {
+                if exited.wait(timeout: .now() + 5) == .timedOut {
                     // `error`: a child that outlives SIGKILL is a genuine
                     // anomaly (see the comment above), and it explains a
                     // truncated result — it must not need `--debug` to see.

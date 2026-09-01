@@ -22,6 +22,25 @@ import XCTest
 /// `cursor-agent` / `gemini` binaries.
 final class LLMSandboxDirectoryTests: XCTestCase {
 
+    /// Per-spawn bound for the echo scripts. Nothing here does more than
+    /// `printf`, so this is a hang detector, not a budget.
+    ///
+    /// It has to stay well under CI's 240s `-default-test-execution-time-`
+    /// `allowance` MULTIPLIED BY the number of children a test spawns, plus
+    /// each child's kill grace (~6s) — over the allowance XCTest kills the
+    /// test host, which records no message and cannot be retried, which is the
+    /// whole subject of #245. Four spawns at 30s + grace is ~156s worst case.
+    private static let spawnTimeout: TimeInterval = 30
+
+    /// `test_a_oneshot_run_does_not_sweep_a_concurrent_tick` holds a child
+    /// inside the sandbox for as long as the rest of the test takes, so its
+    /// bound must EXCEED every wait that has to finish before the barrier
+    /// releasing it can be written. `test_tick_budget_exceeds_the_waits_it_`
+    /// `spans` pins that; the numbers below are what makes it true.
+    private static let tickTimeout: TimeInterval = 120
+    /// Time allowed for the tick to spawn and write its handshake file.
+    private static let tickReadyTimeout: TimeInterval = 20
+
     /// A stand-in for `claude -p` that just prints its working directory.
     /// Prints the cwd and then its whole argv, on separate marked lines, so a
     /// test can assert both "where did it run" and "what was it told" from one
@@ -172,11 +191,11 @@ final class LLMSandboxDirectoryTests: XCTestCase {
         let first = try await LLMRunner.run(tool: .claude,
                                             prompt: "x", transcript: "y",
                                             executablePathOverride: script.path,
-                                            timeout: 30)
+                                            timeout: Self.spawnTimeout)
         let second = try await LLMRunner.run(tool: .claude,
                                              prompt: "x", transcript: "y",
                                              executablePathOverride: script.path,
-                                             timeout: 30)
+                                             timeout: Self.spawnTimeout)
         XCTAssertFalse(first.isEmpty)
         XCTAssertEqual(first, second,
                        "each invocation got its own CWD — that is one leaked "
@@ -188,84 +207,96 @@ final class LLMSandboxDirectoryTests: XCTestCase {
     /// in argv, never from the cwd, so `--resume` continuity survives — while
     /// a per-session cwd would mint a project directory per recording.
     func test_session_runs_share_the_same_directory_as_oneshot_runs() async throws {
-        let script = makeCWDEchoScript()
+        // ONE script that echoes both the cwd and argv, used for all four
+        // runs (issue #246). This test used to spawn six children: four
+        // cwd-only runs, then two more that re-ran the session/resume pair
+        // just to look at argv. Six children at `spawnTimeout` each, plus
+        // their kill grace, put the worst case within sight of CI's 240s
+        // per-test allowance — and over that line XCTest kills the test host
+        // instead of failing the test, which is unretryable and reports no
+        // reason (#245). Four children asserting BOTH properties on every run
+        // is strictly more coverage for two-thirds of the spawns.
+        let script = makeCWDAndArgvEchoScript()
         defer { try? FileManager.default.removeItem(at: script) }
-        let oneShot = try await LLMRunner.run(tool: .claude,
-                                              prompt: "x", transcript: "y",
-                                              executablePathOverride: script.path,
-                                              timeout: 30)
         let id = UUID()
-        let newSession = try await LLMRunner.run(tool: .claude,
-                                                 prompt: "x", transcript: "y",
-                                                 executablePathOverride: script.path,
-                                                 session: .new(id),
-                                                 timeout: 30)
-        let resumed = try await LLMRunner.run(tool: .claude,
-                                               prompt: "x", transcript: "y",
-                                               executablePathOverride: script.path,
-                                               session: .resume(id),
-                                               timeout: 30)
-        let other = try await LLMRunner.run(tool: .claude,
-                                             prompt: "x", transcript: "y",
-                                             executablePathOverride: script.path,
-                                             session: .new(UUID()),
-                                             timeout: 30)
-        // Diagnostics, not a new contract (issue #208). This test failed once
-        // on PR #242 and passed on a rerun of the same code, and the reason is
-        // not recoverable from the CI log — so the next occurrence should at
-        // least name itself.
-        //
-        // Every assertion below is an equality between two script outputs,
-        // and `executeProcess` has a documented path that returns an EMPTY
-        // string from a successful run: on normal exit it waits up to 30s for
-        // the pipe readers to reach EOF and, when that expires, logs and
-        // returns whatever it buffered — exit code 0, `timedOut` false. On a
-        // loaded macos-26 VM that dispatch latency is real; the sibling
-        // `LLMRunnerTests` case notes 10-15s of it, and the 30s grace exists
-        // precisely because a tighter one "truncated perfectly good output
-        // mid-stream".
-        //
-        // Without this guard that failure mode is indistinguishable from a
-        // real regression when it hits one run ("" != "/path/…"), and is
-        // INVISIBLE when it hits all of them — four empty strings compare
-        // equal and the test passes having proven nothing. `oneShot` is the
-        // value every other assertion is measured against, so guarding it
-        // covers both. Mirrors the guard
-        // `test_two_oneshot_runs_share_one_working_directory` already has.
-        XCTAssertFalse(oneShot.isEmpty,
+        let oneShot = try await runEcho(script)
+        let newSession = try await runEcho(script, session: .new(id))
+        let resumed = try await runEcho(script, session: .resume(id))
+        let other = try await runEcho(script, session: .new(UUID()))
+        // Diagnostics, not a new contract (issue #208): this test failed once
+        // on PR #242 and passed on a rerun of the same code, so the next
+        // occurrence should at least name itself. `runEcho` carries the bulk
+        // of that guard now — a run that produced no output fails there, by
+        // name, instead of arriving here as `"" == ""`. This is the last
+        // remaining hole: a child that printed the markers and nothing after
+        // them.
+        XCTAssertFalse(oneShot.cwd.isEmpty,
                        "the child printed no cwd at all — the run produced no "
                        + "output rather than the wrong output, so the "
                        + "comparisons below prove nothing")
-        XCTAssertEqual(newSession, oneShot)
-        XCTAssertEqual(resumed, oneShot)
-        XCTAssertEqual(other, oneShot,
+        XCTAssertEqual(newSession.cwd, oneShot.cwd)
+        XCTAssertEqual(resumed.cwd, oneShot.cwd)
+        XCTAssertEqual(other.cwd, oneShot.cwd,
                        "a second session got its own CWD — one project "
                        + "directory per Live AI session, which is the leak")
         // The cwd must not carry the UUID...
-        XCTAssertFalse(newSession.contains(id.uuidString),
-                       "session UUID leaked into the CWD: \(newSession)")
+        XCTAssertFalse(newSession.cwd.contains(id.uuidString),
+                       "session UUID leaked into the CWD: \(newSession.cwd)")
 
         // ...but the UUID does have to reach the CLI, because that is what
-        // keeps the conversations apart inside the one shared project. The
-        // assertion above cannot show it: this script echoes only the cwd, so
-        // "UUID absent" is equally consistent with "never passed at all".
-        // Check argv directly.
-        let argvScript = makeCWDAndArgvEchoScript()
-        defer { try? FileManager.default.removeItem(at: argvScript) }
-        let newOut = try await LLMRunner.run(tool: .claude,
+        // keeps the conversations apart inside the one shared project. The cwd
+        // assertions cannot show it: "UUID absent from the cwd" is equally
+        // consistent with "never passed at all". Now checked on the SAME runs
+        // rather than on two extra spawns.
+        XCTAssertTrue(newSession.argv.contains(id.uuidString),
+                      "a new session must pass its UUID to the CLI; argv was: \(newSession.argv)")
+        XCTAssertTrue(resumed.argv.contains(id.uuidString),
+                      "a resumed session must pass its UUID to the CLI; argv was: \(resumed.argv)")
+        // The negative half, which the old shape never checked: a run with no
+        // session must not carry one, and a different session must not carry
+        // this one's id.
+        XCTAssertFalse(oneShot.argv.contains(id.uuidString),
+                       "a one-shot run must not carry a session id; argv was: \(oneShot.argv)")
+        XCTAssertFalse(other.argv.contains(id.uuidString),
+                       "a different session reused this session's id; argv was: \(other.argv)")
+    }
+
+    /// One run of `makeCWDAndArgvEchoScript`, split back into its two lines.
+    private struct EchoedRun {
+        let cwd: String
+        let argv: String
+    }
+
+    /// Run the cwd+argv echo script and parse its two marked lines.
+    ///
+    /// Parsing rather than asserting on the raw string because
+    /// `executeProcess` has a documented path that returns an EMPTY string
+    /// from a SUCCESSFUL run: on normal exit it waits a bounded time for the
+    /// pipe readers to reach EOF and, on expiry, logs and returns whatever it
+    /// buffered — exit code 0, `timedOut` false. Left as a raw comparison that
+    /// is either inscrutable (`"" != "/path/…"`) or, when it hits every run,
+    /// invisible: four empty strings compare equal and the test passes having
+    /// proven nothing. Missing markers fail here, by name.
+    private func runEcho(_ script: URL,
+                         session: LLMSession = .none,
+                         file: StaticString = #filePath,
+                         line: UInt = #line) async throws -> EchoedRun {
+        let output = try await LLMRunner.run(tool: .claude,
                                              prompt: "x", transcript: "y",
-                                             executablePathOverride: argvScript.path,
-                                             session: .new(id),
-                                             timeout: 30)
-        let resumedOut = try await LLMRunner.run(tool: .claude,
-                                                 prompt: "x", transcript: "y",
-                                                 executablePathOverride: argvScript.path,
-                                                 session: .resume(id),
-                                                 timeout: 30)
-        XCTAssertTrue(newOut.contains(id.uuidString),
-                      "a new session must pass its UUID to the CLI; argv was: \(newOut)")
-        XCTAssertTrue(resumedOut.contains(id.uuidString),
-                      "a resumed session must pass its UUID to the CLI; argv was: \(resumedOut)")
+                                             executablePathOverride: script.path,
+                                             session: session,
+                                             timeout: Self.spawnTimeout)
+        let lines = output.components(separatedBy: "\n")
+        func value(_ marker: String) -> String? {
+            lines.first { $0.hasPrefix(marker) }.map { String($0.dropFirst(marker.count)) }
+        }
+        guard let cwd = value("CWD:"), let argv = value("ARGV:") else {
+            XCTFail("the child produced no CWD:/ARGV: lines — a successful run "
+                    + "with no output proves nothing. Got: \(output.debugDescription)",
+                    file: file, line: line)
+            return EchoedRun(cwd: "", argv: "")
+        }
+        return EchoedRun(cwd: cwd, argv: argv)
     }
 
     /// The PR claims concurrent invocations can share one cwd. Sequential runs
@@ -306,7 +337,7 @@ final class LLMSandboxDirectoryTests: XCTestCase {
         _ = try await LLMRunner.run(tool: .claude,
                                     prompt: "x", transcript: "y",
                                     executablePathOverride: script.path,
-                                    timeout: 30)
+                                    timeout: Self.spawnTimeout)
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: LLMRunner.sandboxDirectory().path),
             "shared sandbox was torn down after the run")
@@ -361,6 +392,37 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                        + "invocation left: \(marker.path)")
     }
 
+    /// The budget invariant behind `test_a_oneshot_run_does_not_sweep_a_`
+    /// `concurrent_tick`, asserted separately so it is checked in
+    /// milliseconds instead of only being discovered by a two-minute timeout.
+    ///
+    /// The tick's clock starts when it is spawned, but it cannot RETURN until
+    /// the barrier is written — and the barrier is written only after the two
+    /// waits above it have finished. So its budget has to exceed their sum, or
+    /// the test times out its own child by construction.
+    ///
+    /// It did: the bounds were 120 for the tick and 60 + 60 for the waits it
+    /// spans, i.e. exactly zero margin, and it survived only because both
+    /// waits normally take milliseconds. It was observed failing with
+    /// `timedOut(seconds: 120)` at 126.8s (issue #246).
+    ///
+    /// The fix is NOT a bigger tick budget — 120s is already half of CI's 240s
+    /// per-test allowance, and crossing that swaps an ordinary retryable
+    /// failure for a test-host kill (#245). It is a smaller sum, checked here
+    /// so the next person to touch a number finds out immediately.
+    func test_tick_budget_exceeds_the_waits_it_spans() {
+        XCTAssertGreaterThan(Self.tickTimeout,
+                             2 * (Self.tickReadyTimeout + Self.spawnTimeout),
+                             "the concurrent-tick test cannot release its tick "
+                             + "until \(Self.tickReadyTimeout)s + "
+                             + "\(Self.spawnTimeout)s of waits have elapsed, so a "
+                             + "\(Self.tickTimeout)s tick budget leaves no margin")
+        XCTAssertLessThan(Self.tickTimeout, 240,
+                          "a bound at or above CI's -default-test-execution-time-"
+                          + "allowance makes XCTest kill the test HOST rather "
+                          + "than fail the test — no message, and no retry")
+    }
+
     /// The same property with real children, because the lease test cannot show
     /// that `executeProcess` actually holds its lease for the whole life of the
     /// child rather than just across the launch.
@@ -386,16 +448,17 @@ final class LLMSandboxDirectoryTests: XCTestCase {
 
         async let live = LLMRunner.run(tool: .claude, prompt: "x", transcript: "y",
                                        executablePathOverride: tick.path,
-                                       session: .new(UUID()), timeout: 120)
+                                       session: .new(UUID()),
+                                       timeout: Self.tickTimeout)
         // Don't start the one-shot until the tick is genuinely inside with its
         // file written — otherwise the two might not overlap at all and the
         // test would pass without exercising anything.
-        try await waitForFile(ready, timeout: 60)
+        try await waitForFile(ready, timeout: Self.tickReadyTimeout)
 
         let oneShotCWD = try await LLMRunner.run(tool: .claude,
                                                  prompt: "x", transcript: "y",
                                                  executablePathOverride: oneShot.path,
-                                                 timeout: 60)
+                                                 timeout: Self.spawnTimeout)
         XCTAssertEqual(oneShotCWD, LLMRunner.sandboxDirectory().path,
                        "the one-shot didn't run in the shared sandbox, so it "
                        + "never had the chance to sweep the tick's file")
@@ -416,7 +479,7 @@ final class LLMSandboxDirectoryTests: XCTestCase {
         let result = await LLMRunner.diagnose(tool: .claude,
                                               prompt: "x", transcript: "y",
                                               executablePathOverride: script.path,
-                                              timeout: 30)
+                                              timeout: Self.spawnTimeout)
         XCTAssertTrue(result.succeeded, "diagnose failed: \(result)")
         XCTAssertEqual(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines),
                        LLMRunner.sandboxDirectory().path)

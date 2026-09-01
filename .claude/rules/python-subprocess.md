@@ -39,6 +39,50 @@ let stdoutData = stdout.fileHandleForReading.readDataToEndOfFile()  // too late
 let stderrData = stderr.fileHandleForReading.readDataToEndOfFile()
 ```
 
+## Never Park a Blocking Subprocess Wait on `DispatchQueue.global()`
+
+The global concurrent queues are **non-overcommit**: libdispatch will not spin
+up a thread for a queued work item just because the existing ones are blocked in
+the kernel. It notices the stall on a delay and grows the pool slowly, up to a
+hard cap. So every blocking item you park there makes the *next* one slower to
+be **scheduled at all** — and that delay is unbounded in the bad case.
+
+A subprocess wait is three blocking items if you write it the obvious way: two
+pipe readers parked in `availableData` until EOF, and one thread parked in
+`waitUntilExit()`. The caller then blocks a fourth waiting on the group. Under
+load this produced ordinary-looking timeouts on commands that had already
+succeeded (issue #246):
+
+```text
+git checkout -b main did not exit within 60s and was killed
+  (stderr so far: Switched to a new branch 'main'
+```
+
+`Switched to a new branch 'main'` is git's own success message. git ran,
+succeeded, and wrote to a pipe we were reading — and 65s later the work item
+meant to notice its exit still had not run. Not a slow command; a wait that
+never started.
+
+**Rules:**
+
+1. Observe the exit with `process.terminationHandler` plus a
+   `DispatchSemaphore`, installed **before** `process.run()`. That costs no
+   thread of ours at all.
+2. Anything that must genuinely block — a pipe reader, a `waitUntilExit()`
+   backstop, a synchronous `runSync` body — goes on a thread of its own via
+   `BlockingWork.onDedicatedThread(named:)` (`Mila/Actions/BlockingWork.swift`).
+   A dedicated thread cannot be starved, cannot starve anyone else, and if it
+   leaks (a grandchild holding a pipe open forever) it costs one thread rather
+   than a slot in a pool the whole process shares.
+3. Keep the `waitUntilExit()` backstop even with a `terminationHandler`: macOS
+   26 has a reaping race where `waitUntilExit` never returns even after
+   `SIGKILL`. The two paths fail independently; whichever notices first signals.
+   Only wait on the semaphore once, so a double signal is harmless.
+
+This applies to tests as much as to production code — the test host is one
+process, and a suite that parks blocking work on the shared pool degrades every
+other suite in the bundle.
+
 ## Known Compatibility Patches
 These monkey-patches are required as of pyannote.audio 3.x + PyTorch >= 2.6 + speechbrain:
 
