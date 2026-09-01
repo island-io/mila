@@ -585,9 +585,11 @@ final class RecordingStore: ObservableObject {
         }
         retireSpeaker(sourceRawID, into: targetRawID, at: idx, recordingID: recordingID)
         persist()
-        if recordings[idx].status == .completed {
-            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
-        }
+        // Re-resolve: `retireSpeaker` ran caller-supplied hooks, and an index
+        // held across a callback is only valid while nothing reorders or
+        // removes a row. Nothing wired today does, which is exactly why this
+        // would be found the hard way.
+        writeSRTIfCompleted(recordingID)
     }
 
     /// Move one segment to a different speaker already present in the
@@ -612,9 +614,16 @@ final class RecordingStore: ObservableObject {
             retireSpeaker(prev, into: targetRawID, at: recIdx, recordingID: recordingID)
         }
         persist()
-        if recordings[recIdx].status == .completed {
-            TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
-        }
+        writeSRTIfCompleted(recordingID)
+    }
+
+    /// Regenerate the `.srt` sidecar for a completed recording, resolving the
+    /// row by id. Used where a callback may have run since the index was
+    /// taken.
+    private func writeSRTIfCompleted(_ recordingID: UUID) {
+        guard let recording = recordings.first(where: { $0.id == recordingID }),
+              recording.status == .completed else { return }
+        TranscriptExporter.writeSRT(for: recording, in: recordingsDirectory)
     }
 
     /// One raw speaker id's audio has become another's. Move the name, the

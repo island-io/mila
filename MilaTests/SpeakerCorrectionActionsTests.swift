@@ -72,9 +72,13 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
         speakerNames: [String: String] = [:],
         snapshotEntries: [(String, [Float], Int)] = []
     ) -> World {
+        // Its own directory, so a test that builds two worlds cannot have the
+        // second load the first's profiles.json off disk.
+        let root = tempRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let settings = makeSettings()
-        let profiles = SpeakerProfileStore(directory: tempRoot, settings: settings)
-        let store = RecordingStore(rootDirectory: tempRoot)
+        let profiles = SpeakerProfileStore(directory: root, settings: settings)
+        let store = RecordingStore(rootDirectory: root)
         let snapshots = ObservedVoiceSnapshots()
 
         let rec = Recording(title: "Meeting",

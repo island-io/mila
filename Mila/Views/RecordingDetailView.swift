@@ -30,6 +30,18 @@ struct RecordingDetailView: View {
         return recording.segments.compactMap(\.speaker).filter { seen.insert($0).inserted }
     }
 
+    /// How many lines each raw speaker id carries. Drives whether "Split this
+    /// line" is offered at all: `RecordingStore.splitSegmentSpeaker` no-ops on
+    /// a speaker's only line (splitting it would just rename the id and
+    /// strand the old one), so offering it there is an enabled menu item that
+    /// does nothing.
+    private var lineCountsBySpeaker: [String: Int] {
+        recording.segments.reduce(into: [:]) { counts, seg in
+            guard let raw = seg.speaker else { return }
+            counts[raw, default: 0] += 1
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -351,6 +363,7 @@ struct RecordingDetailView: View {
                         // Hoisted out of the row so it is computed once, not
                         // once per segment.
                         let distinctSpeakers = distinctSpeakerIDs
+                        let lineCounts = lineCountsBySpeaker
                         ForEach(recording.segments) { seg in
                             SegmentRow(segment: seg,
                                        isActive: currentTime >= seg.start && currentTime < seg.end,
@@ -364,10 +377,14 @@ struct RecordingDetailView: View {
                                            store.setSpeakerName(name, forSpeaker: raw,
                                                                 recordingID: recording.id)
                                        },
-                                       onSplit: {
-                                           store.splitSegmentSpeaker(segmentID: seg.id,
-                                                                     recordingID: recording.id)
-                                       },
+                                       // Only when the speaker has another
+                                       // line to keep — see `lineCountsBySpeaker`.
+                                       onSplit: (seg.speaker.map { lineCounts[$0] ?? 0 } ?? 0) > 1
+                                           ? {
+                                               store.splitSegmentSpeaker(segmentID: seg.id,
+                                                                         recordingID: recording.id)
+                                           }
+                                           : nil,
                                        onMoveLine: { target in
                                            store.reassignSegmentSpeaker(segmentID: seg.id,
                                                                         toSpeaker: target,

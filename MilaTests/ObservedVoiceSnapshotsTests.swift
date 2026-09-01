@@ -378,16 +378,19 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
         snapshots.record(entries([("SPEAKER_00", [1, 0], 2, nil),
                                   ("SPEAKER_01", [0, 1], 2, nil)]), for: rec)
 
-        // SPEAKER_00 was split; it owns the half that took most of it.
-        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
+        // The pass split old SPEAKER_00 across new SPEAKER_00 and SPEAKER_02,
+        // and SPEAKER_02 took more of it — so that is where its voice goes,
+        // and new SPEAKER_00 is left holding nothing despite sharing the id.
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_02",
                                    "SPEAKER_01": "SPEAKER_01"], in: rec)
 
-        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCount, 2,
-                       "counted once, on one half")
-        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec),
-                     "the other half of the split carries no observation to double-subtract")
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec)?.observedCount, 2,
+                       "the split speaker's voice lands on the half that owns it")
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
+                     "the other half carries no copy to double-subtract — and note the id "
+                     + "still exists in the transcript, so a stale entry would be found")
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec)?.observedCentroid,
-                       [0, 1])
+                       [0, 1], "the speaker that mapped one-to-one is unaffected")
     }
 
     /// A mapping that carries nothing is an invalidation, eviction slot and

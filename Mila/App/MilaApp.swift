@@ -803,7 +803,17 @@ struct MilaApp: App {
                     embedding: observed.observedCentroid,
                     sampleCount: observed.observedCount)
             } else {
-                voiceLog.log("un-name: no snapshot for \(rawID, privacy: .public) — profile not adjusted")
+                // No observation held: the snapshot was evicted (the LRU holds
+                // 20 recordings), or this speaker's was never taken. Leaving
+                // the profile alone is the safe direction, but it is not a
+                // clean outcome — whatever this speaker contributed when they
+                // were named STAYS under `previousName`, and the asymmetry is
+                // real: `onSpeakerNamed` can still *add*, through
+                // `OfflineVoiceEmbedder.learnNamedSpeaker`, which extracts a
+                // fresh observation on demand, while nothing can subtract one
+                // that is no longer held. So corrections here degrade to
+                // under-correcting, never to removing the wrong thing.
+                voiceLog.log("un-name: no snapshot for \(rawID, privacy: .public) — profile keeps this recording's contribution")
             }
         }
 

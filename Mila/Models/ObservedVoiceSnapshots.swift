@@ -160,6 +160,15 @@ final class ObservedVoiceSnapshots {
     func forget(speaker rawID: String, in recordingID: UUID) {
         guard var observations = byRecording[recordingID],
               observations.removeValue(forKey: rawID) != nil else { return }
+        // Dropping the last one releases the recording rather than leaving an
+        // empty entry, which would hold one of the 20 retention slots while
+        // describing no voice at all — and evict a recording that still has
+        // observations a later un-name needs. Same rule `remapSpeakerIDs`
+        // applies when a mapping carries nothing.
+        guard !observations.isEmpty else {
+            invalidate(recordingID)
+            return
+        }
         byRecording[recordingID] = observations
         snapshotLog.log("snapshot: dropped a retired speaker id")
     }

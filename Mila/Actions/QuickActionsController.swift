@@ -197,8 +197,17 @@ final class QuickActionsController: ObservableObject {
     var onRecordingFinalized: ((_ recordingID: UUID, _ liveSpeakerNames: [String: String]) -> Void)?
 
     /// Called when the offline re-diarize pass has re-keyed a recording's raw
-    /// `SPEAKER_NN` ids, carrying the new→old mapping the names were remapped
-    /// on. MilaApp wires it to `ObservedVoiceSnapshots.remapSpeakerIDs`.
+    /// `SPEAKER_NN` ids, carrying an **old→new** mapping
+    /// (`SpeakerNameRemapper.owningNewIDs`). MilaApp wires it to
+    /// `ObservedVoiceSnapshots.remapSpeakerIDs`.
+    ///
+    /// The direction is load-bearing and is *not* the one the names travel
+    /// on (`dominantOldIDs`, new→old). Keying old→new gives every old id
+    /// exactly one destination, which is what stops a speaker the pass split
+    /// in two from handing the same embedding to both halves — un-naming both
+    /// would then subtract one observation twice. Wire the inverse here and
+    /// every observation is silently dropped, so the mismatch is worth
+    /// noticing at the call site rather than in the consumer.
     ///
     /// The observed embeddings have to cross this boundary on **the same**
     /// evidence as the names, or the two disagree: the names (and so the
