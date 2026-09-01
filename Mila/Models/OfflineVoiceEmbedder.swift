@@ -1,5 +1,6 @@
 import Foundation
 import os
+import TranscriptionCore
 
 private let embedLog = Logger(
     subsystem: "io.island.whisper.IslandWhisper", category: "OfflineVoiceEmbedder")
