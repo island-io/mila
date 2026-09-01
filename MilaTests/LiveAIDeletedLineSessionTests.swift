@@ -178,9 +178,18 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
 
         gate.release(1)
 
-        let recovered = await waitUntil(timeout: 5) { calls.value.count == 2 }
+        // `mustHappen`, not a hand-picked 5s: this waits on a chain of six
+        // hops (gate release -> the in-flight task finishes -> its `defer`
+        // runs -> `coalesced` is observed -> `scheduleKick` fires -> the new
+        // tick records its call), and a wedge never completes it however long
+        // we wait. See `mustHappen`.
+        let recovered = await waitUntil { calls.value.count == 2 }
         XCTAssertTrue(recovered,
-                      "Live AI wedged: the dropped tick left `inFlight` set, so every later tick coalesced behind a task that never clears")
+                      "the replacement tick never ran within \(Int(Self.mustHappen))s. "
+                      + "The behaviour under test is that a dropped tick must not "
+                      + "strand `inFlight` — if it did, every later tick coalesces "
+                      + "behind a task that never clears and Live AI is silently "
+                      + "dead for the rest of the meeting")
         XCTAssertEqual(kind(calls.value[1].session), "new",
                        "the replacement tick must open a new session, not resume the abandoned one")
         XCTAssertTrue(calls.value[1].transcript.contains("One."))
@@ -230,17 +239,24 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
 
         // Asserted as a negative, because the harm is state being cleared that
         // belongs to the tick still running.
-        let wentIdle = await waitUntil(timeout: 1) { !session.isThinking }
+        //
+        // `quietWindow`, deliberately NOT `mustHappen`: these two are watching
+        // for something that must never happen, so the timeout is a window of
+        // required quiet rather than a deadline. `waitUntil` returns the moment
+        // its condition holds, so the full budget is spent only when the
+        // assertion PASSES — widening it would slow every green run and would
+        // make a spurious pass more likely, not less. See `quietWindow`.
+        let wentIdle = await waitUntil(timeout: Self.quietWindow) { !session.isThinking }
         XCTAssertFalse(wentIdle,
                        "the cancelled tick cleared `isThinking` while the new recording's tick was still running")
 
-        let startedAThird = await waitUntil(timeout: 1) { calls.value.count == 3 }
+        let startedAThird = await waitUntil(timeout: Self.quietWindow) { calls.value.count == 3 }
         XCTAssertFalse(startedAThird,
                        "`inFlight` was clobbered: a third call started while the second was still in flight")
 
         // And the surviving tick still completes normally once released.
         gate.release(2)
-        let drained = await waitUntil(timeout: 3) { !session.isThinking }
+        let drained = await waitUntil { !session.isThinking }
         XCTAssertTrue(drained,
                       "the new recording's tick must still finish and clear state on its own")
     }
@@ -327,9 +343,43 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         return (session, calls)
     }
 
+    /// Bound for a wait on something that MUST happen (the caller asserts the
+    /// result is `true`).
+    ///
+    /// Chosen on the principle that **the only way to exceed it is the failure
+    /// mode under test**. Every such wait here is for state that a genuine bug
+    /// leaves wrong *forever* — a wedged `inFlight` is never cleared, however
+    /// long you wait — so a generous bound removes contention-induced failures
+    /// without costing one bit of discriminating power. It is also free on a
+    /// passing run: the condition holds in milliseconds, so this budget is
+    /// spent only when the test is failing anyway.
+    ///
+    /// These were 2-5s, and the 5s one is what failed on a loaded CI runner
+    /// while reporting "Live AI wedged" — a diagnosis that was simply false;
+    /// the machine was slow (issue #250). Same mistake as the 5s pipe-drain
+    /// bound #245 had to widen. **Do not re-tighten them.** 30s still fails
+    /// fast against CI's 240s per-test allowance, and no test here makes more
+    /// than three of these waits, so the worst case stays well inside it.
+    private static let mustHappen: TimeInterval = 30
+
+    /// Window for watching that something must NOT happen (the caller asserts
+    /// the result is `false`).
+    ///
+    /// This is the OPPOSITE case and it must stay short. `waitUntil` returns
+    /// the instant its condition holds, so a negative assertion only ever
+    /// spends its whole budget when it is **passing** — raising it would add
+    /// that budget to every green run for no gain at all. And a longer window
+    /// gives unrelated scheduling more chance to satisfy the condition, so it
+    /// makes a spurious *pass* more likely, not less. 1s is already ~1000x the
+    /// scale these transitions happen on.
+    private static let quietWindow: TimeInterval = 1
+
     /// Spin until `condition` holds, or the timeout expires. Returns whether
     /// it held -- callers assert on that rather than hanging the suite.
-    private func waitUntil(timeout: TimeInterval = 2,
+    ///
+    /// Defaults to `mustHappen` because that is the common case; a caller
+    /// asserting the result is `false` must pass `quietWindow` explicitly.
+    private func waitUntil(timeout: TimeInterval = LiveAIDeletedLineSessionTests.mustHappen,
                            _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -340,8 +390,11 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         return condition()
     }
 
+    /// Settle an in-flight tick. Same `mustHappen` reasoning: a session that
+    /// never goes idle is broken, and the assertions after the call are what
+    /// report it — this wait only has to avoid expiring on a slow runner.
     private func waitUntilIdle(_ session: LiveAISession,
-                               timeout: TimeInterval = 2) async {
+                               timeout: TimeInterval = LiveAIDeletedLineSessionTests.mustHappen) async {
         let deadline = Date().addingTimeInterval(timeout)
         while session.isThinking && Date() < deadline {
             await Task.yield()
