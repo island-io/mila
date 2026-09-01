@@ -91,6 +91,15 @@ jobs:
           # leaves room for the slowest legit test (the model-reenqueue test
           # awaits waitForIdle TWICE, up to 90s each under load) while still
           # bounding a true hang to minutes. Mirrors ci.yml's build-and-test.
+          #
+          # `tee` before `tail` (issue #208). `tail -200` alone is why nobody
+          # could diagnose the flakes in this job: a ~1000-test run emits
+          # thousands of lines, so the only thing that ever reached the log
+          # was the closing summary. A suite in the alphabetical middle could
+          # fail and its assertion message — the one line that says WHY —
+          # was gone before the log was written. Keep the whole thing on disk
+          # so the summary step below can mine it and the artifact carries it.
+          mkdir -p build
           xcodebuild -project Mila.xcodeproj \
             -scheme Mila \
             -configuration Debug \
@@ -102,7 +111,41 @@ jobs:
             -test-timeouts-enabled YES \
             -default-test-execution-time-allowance 240 \
             -maximum-test-execution-time-allowance 480 \
-            test 2>&1 | tail -200
+            test 2>&1 | tee build/unit-tests.log | tail -200
+
+      # Issue #208: with `-retry-tests-on-failure`, a green job can sit on top
+      # of a pile of failed executions — one run logged
+      # "Executed 929 tests ... 7 failures" followed by "** TEST SUCCEEDED **".
+      # Those recovered flakes are the trend worth watching, and today they are
+      # invisible unless someone downloads the raw log. Surface the count and
+      # the failure lines in the job summary, pass or fail.
+      - name: Summarise test failures
+        if: always()
+        run: |
+          log=build/unit-tests.log
+          [ -f "$log" ] || exit 0
+          # `|| true`: grep exits 1 when it matches nothing, which is the
+          # good case here and must not fail the step.
+          executions=$(grep -c "^Test Case .* failed (" "$log" || true)
+          {
+            echo "### Unit tests"
+            echo
+            echo "Failed test-case **executions**: ${executions:-0} (counts every retry iteration, so a green job can show a non-zero number — that is the point)."
+            echo
+            echo "<details><summary>Failure lines</summary>"
+            echo
+            echo '```'
+            # Three shapes, all of them things you cannot get from the tail:
+            # the per-case "failed" lines (one per retry iteration), the
+            # `file:line: error:` assertion messages, and the closing
+            # `Failing tests:` block plus its indented `Suite.test()` names.
+            # `[[:space:]]` not `\s` — BSD grep on the macOS runner has no
+            # `\s` in ERE.
+            grep -E "^Test Case .* failed \(|: error: |^Failing tests:|^[[:space:]]+[A-Za-z_][A-Za-z0-9_.]*\(\)$" "$log" | head -200 || true
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run UI tests
         # XCUIApplication.launch() repeatedly fails on GitHub-hosted
@@ -129,5 +172,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: xcresult
-          path: build/Logs/Test/*.xcresult
+          # The raw xcodebuild log travels with the xcresult (issue #208): the
+          # bundle is ~115 MB and awkward to read, whereas the log answers
+          # "which assertion failed, and on which iteration" with a grep.
+          path: |
+            build/Logs/Test/*.xcresult
+            build/unit-tests.log
           retention-days: 7
