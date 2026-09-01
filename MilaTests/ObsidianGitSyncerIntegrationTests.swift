@@ -17,6 +17,40 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     /// so `tearDown` can put them back. `nil` value == the var was unset.
     private var savedEnvironment: [String: String?] = [:]
 
+    /// Per-`git`-invocation bound, for BOTH the setup helper below and the
+    /// production runner the tests drive (issue #208).
+    ///
+    /// Nothing here is slow: every command runs against a three-object local
+    /// repo and finishes in milliseconds, so 60s is ~4 orders of magnitude of
+    /// headroom and cannot fail a loaded runner. What it buys is the
+    /// difference between the two ways a wedged `git` can end.
+    ///
+    /// CI gives each test 240s (`-default-test-execution-time-allowance`, see
+    /// `.github/workflows/ios-tests.yml`). An unbounded wait therefore cannot
+    /// fail *as a test*: XCTest kills the whole test HOST first, which records
+    /// no assertion message and cannot be recovered by
+    /// `-retry-tests-on-failure`, so the job prints a bare `Failing tests: …`
+    /// line with no cause anywhere in the log. A bounded wait fails normally,
+    /// says which command hung, and gets retried.
+    ///
+    /// This is not hypothetical for `Process`. `LLMRunner.executeProcess`
+    /// documents a macOS 26 reaping race where `waitUntilExit` never returns
+    /// even after `SIGKILL`, and `readDataToEndOfFile` never returns while any
+    /// process — including a helper `git` spawned that outlived it — still
+    /// holds the write end of the pipe. `ProcessGitCommandRunner.runSync`
+    /// bounds both for exactly these reasons; this helper did not, and it is
+    /// the last unbounded subprocess wait in the bundle.
+    private static let gitCommandTimeout: TimeInterval = 60
+
+    /// How long to wait for the output pipes to reach EOF once `git` has
+    /// exited. Separate from `gitCommandTimeout` because it bounds a different
+    /// hazard: not a wedged `git`, but a reader work item that has not been
+    /// scheduled yet. `executeProcess` documents 10-15s of dispatch latency on
+    /// the macos-26 CI image and each `runGit` parks three blocking items on
+    /// the global queue, so this has to clear that comfortably — 5s did not,
+    /// and cost this suite a deterministic failure.
+    private static let pipeDrainTimeout: TimeInterval = 30
+
     override func setUpWithError() throws {
         try super.setUpWithError()
         guard let git = ProcessGitCommandRunner.gitExecutable() else {
@@ -95,7 +129,7 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         let note = vault.appendingPathComponent("2026-01-02 Meeting.md")
         try write("# Meeting\n\nSummary body.\n", to: note)
 
-        let syncer = ObsidianGitSyncer()   // real ProcessGitCommandRunner
+        let syncer = ObsidianGitSyncer(runner: Self.boundedRunner())
         let error = await syncer.sync(vault: vault,
                                       changedPaths: [note],
                                       branch: "main",
@@ -126,7 +160,7 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         // the remote's commit, then push both.
         let note = vault.appendingPathComponent("a.md")
         try write("local-added\n", to: note)
-        let syncer = ObsidianGitSyncer()
+        let syncer = ObsidianGitSyncer(runner: Self.boundedRunner())
         let error = await syncer.sync(vault: vault,
                                       changedPaths: [note],
                                       branch: "main",
@@ -139,6 +173,21 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     }
 
     // MARK: - Helpers
+
+    /// The REAL production runner — still `ProcessGitCommandRunner`, so these
+    /// stay integration tests — with its per-command bound brought inside the
+    /// per-test allowance (issue #208).
+    ///
+    /// Its shipped 120s is right for a background sync over the network and
+    /// wrong here: `sync` issues up to six commands, so 6 × (120s + kill
+    /// grace) is ~780s against a 240s allowance. One wedged command would take
+    /// the test host with it instead of failing the test. 20s is still ~4
+    /// orders of magnitude above what a local-path git command costs.
+    private static func boundedRunner() -> ProcessGitCommandRunner {
+        var runner = ProcessGitCommandRunner()
+        runner.timeout = 20
+        return runner
+    }
 
     @discardableResult
     private func runGit(_ arguments: [String], in directory: URL) throws -> String {
@@ -173,17 +222,91 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         for (pipe, isStdout) in [(out, true), (err, false)] {
             drain.enter()
             DispatchQueue.global().async {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                lock.lock()
-                if isStdout { outData = data } else { errData = data }
-                lock.unlock()
+                // Append chunk-by-chunk rather than one `readDataToEndOfFile()`
+                // — the same shape as `ProcessGitCommandRunner.runSync`, and
+                // load-bearing now that the drain below is bounded.
+                //
+                // `readDataToEndOfFile()` assigns only once it has read
+                // EVERYTHING. Pair that with a bounded wait and an expiry
+                // leaves `outData` as the empty `Data()` it was initialised
+                // with, so a SUCCESSFUL git reports empty stdout: exit code 0,
+                // no output, no error. Callers assert on that stdout
+                // (`ls-tree`, `log --oneline`, `show`), so it is an invisible
+                // way to fail a test for a reason unrelated to what it tests.
+                // Appending as chunks arrive means whatever was read survives.
+                let handle = pipe.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData   // blocks until data or EOF
+                    if chunk.isEmpty { break }
+                    lock.lock()
+                    if isStdout { outData.append(chunk) } else { errData.append(chunk) }
+                    lock.unlock()
+                }
                 drain.leave()
             }
         }
-        process.waitUntilExit()
-        drain.wait()
+        // Both waits are BOUNDED (issue #208), mirroring
+        // `ProcessGitCommandRunner.runSync`. They used to be
+        // `process.waitUntilExit()` / `drain.wait()` with no deadline, which
+        // meant a single wedged `git` in `setUp` hung this test until XCTest
+        // killed the test host — a red run naming a test with no reason
+        // attached, and one the retry policy cannot recover. See
+        // `gitCommandTimeout` for why that distinction is the whole point.
+        let running = DispatchGroup()
+        running.enter()
+        DispatchQueue.global().async {
+            process.waitUntilExit()
+            running.leave()
+        }
+        var timedOut = false
+        if running.wait(timeout: .now() + .seconds(Int(Self.gitCommandTimeout))) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if running.wait(timeout: .now() + 2) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = running.wait(timeout: .now() + 3)
+            }
+        }
+        // Bounded too: EOF is not guaranteed even after exit, because a helper
+        // `git` spawned can inherit the pipes and outlive it.
+        //
+        // The bound is generous on purpose. 5s was too tight and it regressed
+        // this suite: `executeProcess` documents 10-15s of dispatch latency on
+        // this CI image, and each `runGit` now parks three blocking work items
+        // on the global queue, so a reader simply not being SCHEDULED inside 5s
+        // is ordinary here, not pathological.
+        let drained = drain.wait(timeout: .now() + .seconds(Int(Self.pipeDrainTimeout))) != .timedOut
+        // Take the lock: unlike an unbounded `drain.wait()`, the readers are
+        // not guaranteed to be finished here.
+        lock.lock()
         let stdout = String(data: outData, encoding: .utf8) ?? ""
         let stderr = String(data: errData, encoding: .utf8) ?? ""
+        // Byte counts for the diagnostic below, snapshotted here: on the
+        // timed-out path the readers may still be appending, so reading
+        // `outData.count` outside the lock would itself be a data race.
+        let stdoutBytes = outData.count, stderrBytes = errData.count
+        lock.unlock()
+        if timedOut {
+            throw NSError(domain: "git", code: -1, userInfo: [
+                NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) "
+                    + "did not exit within \(Int(Self.gitCommandTimeout))s and was killed"
+                    + " (stderr so far: \(stderr))"
+            ])
+        }
+        // A drain that expired means `stdout` may be TRUNCATED. Returning it
+        // would hand the caller a short answer that looks like a real one —
+        // `files.contains("a.md")` would simply be false — which is the
+        // silently-wrong outcome this whole branch exists to remove. Fail
+        // loudly instead, and say how much did arrive.
+        guard drained else {
+            throw NSError(domain: "git", code: -2, userInfo: [
+                NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) "
+                    + "exited but its pipes did not reach EOF within "
+                    + "\(Int(Self.pipeDrainTimeout))s — refusing to report "
+                    + "possibly-truncated output (\(stdoutBytes) bytes stdout, "
+                    + "\(stderrBytes) bytes stderr so far)"
+            ])
+        }
         if process.terminationStatus != 0 {
             throw NSError(domain: "git", code: Int(process.terminationStatus), userInfo: [
                 NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) failed: \(stderr)\(stdout)"

@@ -198,13 +198,61 @@ final class LLMRunnerTests: XCTestCase {
         return url
     }
 
+    /// ## Why every spawning test in this file passes an explicit `timeout:`
+    ///
+    /// Issue #208. Omitting it adopts `LLMRunner.defaultTimeout` — 300s, a
+    /// production number sized for a real LLM chewing on a real transcript.
+    /// CI runs this bundle with `-default-test-execution-time-allowance 240`
+    /// (`.github/workflows/ios-tests.yml`), so a 300s bound is LONGER than the
+    /// window XCTest gives the test. That inverts which watchdog fires first,
+    /// and the two outcomes are not equivalent:
+    ///
+    ///   * bound < allowance — the runner's own wait expires, it SIGTERMs
+    ///     (then SIGKILLs) the child, and `run` throws `.timedOut`. The test
+    ///     fails normally, with a message, and `-retry-tests-on-failure`
+    ///     re-runs it.
+    ///   * bound > allowance — XCTest kills the whole test HOST at 240s.
+    ///     There is no assertion failure to report and nothing to retry.
+    ///
+    /// The second shape is what took `main` red on aec65fc. The job printed
+    /// `Executed 1057 tests, with 7 tests skipped and 0 failures` and then,
+    /// with no explanation anywhere in the log,
+    /// `Failing tests: LLMRunnerTests.test_runner_surfaces_nonzero_exit_code()`.
+    /// (`IDETestOperationsObserverDebug` reported 378s elapsed for a session
+    /// whose surviving run took 97.7s — the missing ~280s is the killed first
+    /// attempt.) A red tick with no cause attached is exactly what #208 is
+    /// about, and this shape is unretryable by construction.
+    ///
+    /// This does not need the child to misbehave. `executeProcess` documents a
+    /// macOS 26 reaping race where `waitUntilExit` never returns even after
+    /// `SIGKILL`; the runner survives that *because* its wait is bounded.
+    /// Adopting a 300s bound under a 240s allowance is what takes the safety
+    /// net away.
+    ///
+    /// 30s matches the other *synthetic* spawning tests here — the ones whose
+    /// child is a shell script — and keeps the worst case (30s wait + 1s
+    /// SIGTERM grace + 5s SIGKILL grace + 3s drain) an order of magnitude
+    /// inside the allowance.
+    ///
+    /// Two sets of deliberate exceptions, both still under 240s:
+    ///
+    ///   * `timeout: 1` in `test_timeout_fires_when_process_exceeds_limit`,
+    ///     `test_timeout_returns_even_when_grandchild_holds_pipes_open` and
+    ///     `test_diagnose_reports_timeout_without_throwing` — those exercise
+    ///     the timeout path itself, so the bound IS the thing under test.
+    ///   * `timeout: 120` in the three real-CLI smoke tests
+    ///     (`test_claude_cli_…`, `test_cursor_cli_…`, `test_gemini_cli_…`),
+    ///     which wait on a live model round-trip rather than a script. They
+    ///     auto-skip when the CLI isn't installed, so they don't run in CI at
+    ///     all — but 120s would fit the allowance even if they did.
     func test_runner_surfaces_nonzero_exit_code() async {
         // `/usr/bin/false` always exits 1.
         do {
             _ = try await LLMRunner.run(tool: .claude,
                                         prompt: "x",
                                         transcript: "y",
-                                        executablePathOverride: "/usr/bin/false")
+                                        executablePathOverride: "/usr/bin/false",
+                                        timeout: 30)
             XCTFail("Expected nonZeroExit error")
         } catch let error as LLMRunnerError {
             if case .nonZeroExit(let code, _) = error {
@@ -478,10 +526,17 @@ final class LLMRunnerTests: XCTestCase {
     }
 
     func test_diagnose_captures_nonzero_exit_without_throwing() async {
+        // Stated bound rather than the inherited default — see the note on
+        // `test_runner_surfaces_nonzero_exit_code` (issue #208). `diagnose`'s
+        // own default is 120s, which does still fit inside CI's 240s per-test
+        // allowance, so this one was not over the line; it is spelled out so
+        // the rule ("a spawning test states its bound") holds file-wide and
+        // the next person adding a case here has a pattern to copy.
         let result = await LLMRunner.diagnose(tool: .claude,
                                               prompt: "x",
                                               transcript: "y",
-                                              executablePathOverride: "/usr/bin/false")
+                                              executablePathOverride: "/usr/bin/false",
+                                              timeout: 30)
         XCTAssertFalse(result.succeeded)
         XCTAssertTrue(result.didLaunch)
         XCTAssertEqual(result.exitCode, 1)
@@ -530,11 +585,17 @@ final class LLMRunnerTests: XCTestCase {
     }
 
     func test_diagnose_appends_extra_args_to_command() async {
+        // Only `result.command` is under test, but the call still spawns
+        // `/usr/bin/true` — so it states a bound like every other spawning
+        // case here (issue #208). Same note as above: `diagnose` defaults to
+        // 120s, which fits the allowance; `run` defaults to 300s, which does
+        // not.
         let result = await LLMRunner.diagnose(tool: .claude,
                                               prompt: "x",
                                               transcript: "y",
                                               extraArgs: ["--model", "claude sonnet"],
-                                              executablePathOverride: "/usr/bin/true")
+                                              executablePathOverride: "/usr/bin/true",
+                                              timeout: 30)
         // The space-bearing arg must round-trip through shell quoting.
         XCTAssertTrue(result.command.contains("--model 'claude sonnet'"),
                       "command: \(result.command)")

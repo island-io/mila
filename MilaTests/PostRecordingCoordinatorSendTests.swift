@@ -22,6 +22,48 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
 
     private let diarSuite = "PostRecordingCoordinatorSendTests.diarization"
 
+    // MARK: - Bounds (issue #208)
+    //
+    // Both constants exist for one reason: **a test must never adopt a
+    // production timeout that is longer than the budget CI gives the test.**
+    // This bundle runs with `-default-test-execution-time-allowance 240`
+    // (`.github/workflows/ios-tests.yml`), and the two waits a send makes
+    // ship at 600s and 300s respectively. When the test's bound is the longer
+    // one, it decides which watchdog fires first — and the two outcomes are
+    // not equivalent:
+    //
+    //   * bound < allowance — the wait expires on its own, the assertion
+    //     fails with a message, and `-retry-tests-on-failure` re-runs it.
+    //   * bound > allowance — XCTest kills the whole test HOST. There is no
+    //     assertion message and nothing for the retry policy to recover, so
+    //     the job reports a bare `Failing tests: …` line with no cause
+    //     attached anywhere in the log.
+    //
+    // The second shape is what took main red on aec65fc (via `LLMRunnerTests`)
+    // and it is the "red tick that tells you nothing" #208 is about.
+
+    /// Bound for `awaitFinalTranscript`. `transcriptWaitTimeout` ships at
+    /// **600s** — right for a user who hit Send while a long meeting is still
+    /// transcribing, wrong here.
+    ///
+    /// This suite is not hypothetically exposed to that wait; several cases
+    /// enter it on purpose. `test_send_waits_for_transcript_when_fired_early`
+    /// fires before the transcript exists, and the #211 cases park in
+    /// `awaitSpeakerFinalization` until the test releases the marker. If
+    /// whatever is supposed to release the wait ever doesn't, 60s vs 600s is
+    /// the difference between a legible, retryable failure and a dead runner.
+    ///
+    /// 60s is still far longer than the longest wait any case here actually
+    /// needs (hundreds of milliseconds), so it cannot make a slow runner
+    /// fail; it only caps the pathological case. Cases that assert the wait
+    /// is NOT taken set their own, shorter value on top of this.
+    private static let testTranscriptWait: TimeInterval = 60
+
+    /// Bound for the CLI half: `sendToLLM`'s `cliTimeout` defaults to
+    /// `LLMRunner.defaultTimeout` (300s), also longer than the allowance. The
+    /// longest script in this file sleeps 20s.
+    private static let testCLITimeout: TimeInterval = 30
+
     override func setUp() async throws {
         try await super.setUp()
         tempRoot = TestSupport.makeTempRoot(label: "PostRecordingCoordinatorSendTests")
@@ -39,6 +81,7 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         )
         coordinator = PostRecordingCoordinator(store: store, transcription: service,
                                                llm: LLMSettings(defaults: UserDefaults(suiteName: "PostRecordingCoordinatorSendTests.llm")!))
+        coordinator.transcriptWaitTimeout = Self.testTranscriptWait
     }
 
     override func tearDown() async throws {
@@ -69,7 +112,8 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
                               prompt: "Summarize",
                               transcript: "the transcript text",
                               summary: "",
-                              executableOverride: script.path)
+                              executableOverride: script.path,
+                              cliTimeout: Self.testCLITimeout)
         // Yield so the task body starts and registers itself.
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertTrue(coordinator.isSending(rec.id),
@@ -104,11 +148,13 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
 
         coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
                               transcript: "transcript", summary: "",
-                              executableOverride: slow.path)
+                              executableOverride: slow.path,
+                              cliTimeout: Self.testCLITimeout)
         try await Task.sleep(nanoseconds: 100_000_000)
         coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
                               transcript: "transcript", summary: "",
-                              executableOverride: fast.path)
+                              executableOverride: fast.path,
+                              cliTimeout: Self.testCLITimeout)
 
         // The fast replacement wins; the slow one was cancelled (its
         // .cancelled error is swallowed silently).
@@ -145,13 +191,15 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
 
         coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
                               transcript: "transcript", summary: "",
-                              executableOverride: first.path)
+                              executableOverride: first.path,
+                              cliTimeout: Self.testCLITimeout)
         try await Task.sleep(nanoseconds: 150_000_000)
         // Replace: cancels the first task (its CLI gets SIGTERM'd and it
         // unwinds through its defer while the second is still running).
         coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
                               transcript: "transcript", summary: "",
-                              executableOverride: second.path)
+                              executableOverride: second.path,
+                              cliTimeout: Self.testCLITimeout)
         // Give the replaced task ample time to unwind and run its cleanup.
         try await Task.sleep(nanoseconds: 1_000_000_000)
 
@@ -192,7 +240,8 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
 
         coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
                               transcript: "transcript", summary: "",
-                              executableOverride: slow.path)
+                              executableOverride: slow.path,
+                              cliTimeout: Self.testCLITimeout)
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertTrue(coordinator.isSending(rec.id))
 
@@ -233,7 +282,8 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "Do it",
                               transcript: "",  // empty: fired early
                               summary: "",
-                              executableOverride: script.path)
+                              executableOverride: script.path,
+                              cliTimeout: Self.testCLITimeout)
         // It should still be in flight (waiting on the transcript), not
         // bailed out.
         try await Task.sleep(nanoseconds: 200_000_000)
@@ -761,8 +811,15 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         let llm = LLMSettings(defaults: UserDefaults(suiteName: suiteName)!,
                               apiKeyKeychainKey: suiteName)
         llm.tool = .claude
-        return PostRecordingCoordinator(store: store, transcription: service,
-                                        llm: llm, runLLM: runLLM)
+        let made = PostRecordingCoordinator(store: store, transcription: service,
+                                            llm: llm, runLLM: runLLM)
+        // Same bound as the setUp coordinator — see `testTranscriptWait`.
+        // These coordinators are the ones that deliberately park in
+        // `awaitSpeakerFinalization`, so they are the ones most exposed to the
+        // 600s production default outliving CI's 240s per-test allowance.
+        // Cases that want a shorter wait still override it after this.
+        made.transcriptWaitTimeout = Self.testTranscriptWait
+        return made
     }
 
     private func waitForBanner(containing needle: String,
