@@ -210,6 +210,32 @@ final class LLMSandboxDirectoryTests: XCTestCase {
                                              executablePathOverride: script.path,
                                              session: .new(UUID()),
                                              timeout: 30)
+        // Diagnostics, not a new contract (issue #208). This test failed once
+        // on PR #242 and passed on a rerun of the same code, and the reason is
+        // not recoverable from the CI log — so the next occurrence should at
+        // least name itself.
+        //
+        // Every assertion below is an equality between two script outputs,
+        // and `executeProcess` has a documented path that returns an EMPTY
+        // string from a successful run: on normal exit it waits up to 30s for
+        // the pipe readers to reach EOF and, when that expires, logs and
+        // returns whatever it buffered — exit code 0, `timedOut` false. On a
+        // loaded macos-26 VM that dispatch latency is real; the sibling
+        // `LLMRunnerTests` case notes 10-15s of it, and the 30s grace exists
+        // precisely because a tighter one "truncated perfectly good output
+        // mid-stream".
+        //
+        // Without this guard that failure mode is indistinguishable from a
+        // real regression when it hits one run ("" != "/path/…"), and is
+        // INVISIBLE when it hits all of them — four empty strings compare
+        // equal and the test passes having proven nothing. `oneShot` is the
+        // value every other assertion is measured against, so guarding it
+        // covers both. Mirrors the guard
+        // `test_two_oneshot_runs_share_one_working_directory` already has.
+        XCTAssertFalse(oneShot.isEmpty,
+                       "the child printed no cwd at all — the run produced no "
+                       + "output rather than the wrong output, so the "
+                       + "comparisons below prove nothing")
         XCTAssertEqual(newSession, oneShot)
         XCTAssertEqual(resumed, oneShot)
         XCTAssertEqual(other, oneShot,
