@@ -83,6 +83,145 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCount, 4)
     }
 
+    // MARK: - Partial writes (`merge`)
+
+    /// The bug this method exists for. The on-demand extractor writes one
+    /// speaker at a time — naming `SPEAKER_00` and then `SPEAKER_01` on an
+    /// old recording are two independent Python runs — and `record` replaces
+    /// the whole per-recording map, so the second landing erased the first.
+    /// Un-naming the first speaker afterwards then found nothing to subtract
+    /// and left the polluted profile alone, which is the failure
+    /// island-io/mila#237 exists to remove.
+    func test_merging_a_single_speaker_keeps_the_others() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+
+        snapshots.merge(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+        snapshots.merge(entries([("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
+
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCentroid,
+                       [1, 0], "the first extraction must survive the second")
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec)?.observedCentroid,
+                       [0, 1])
+        XCTAssertEqual(snapshots.heldRecordingCount, 1)
+    }
+
+    /// The negative control: `record` still replaces, because the live-stop
+    /// path hands over the complete pool and wants exactly that.
+    func test_record_still_replaces_the_whole_map() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+        snapshots.record(entries([("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
+
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
+                     "if this passes as non-nil, `merge` above is no longer testing anything")
+    }
+
+    func test_merging_the_same_speaker_twice_takes_the_newer_observation() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+
+        snapshots.merge(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+        snapshots.merge(entries([("SPEAKER_00", [0, 1], 3, "Alice")]), for: rec)
+
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
+                       .init(observedCentroid: [0, 1], observedCount: 3, profileName: "Alice"))
+    }
+
+    /// A merge into a recording nothing is held for still enrols it in the
+    /// eviction queue exactly once.
+    func test_merging_into_an_unknown_recording_enrols_it_once() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+
+        snapshots.merge(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+        snapshots.merge(entries([("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
+
+        XCTAssertEqual(snapshots.heldRecordingCount, 1,
+                       "two partial writes to one recording must not take two eviction slots")
+    }
+
+    // MARK: - Invalidation on a re-key
+
+    /// A pass that re-keys `SPEAKER_NN` makes every held embedding meaningless
+    /// — the same string may now denote a different person. Nothing must
+    /// resolve through them afterwards.
+    func test_invalidating_a_recording_drops_everything_it_held() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID(), other = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 2, "Alice"),
+                                  ("SPEAKER_01", [0, 1], 2, nil)]), for: rec)
+        snapshots.record(entries([("SPEAKER_00", [1, 1], 2, nil)]), for: other)
+
+        snapshots.invalidate(rec)
+
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec))
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec))
+        XCTAssertEqual(snapshots.heldRecordingCount, 1, "its eviction slot goes too")
+        XCTAssertNotNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: other),
+                        "other recordings are untouched")
+    }
+
+    /// Invalidation must free the slot, not merely blank the entry —
+    /// otherwise a re-keyed recording keeps holding a place in the queue and
+    /// evicts a live one.
+    func test_invalidating_frees_the_eviction_slot() {
+        let snapshots = ObservedVoiceSnapshots(limit: 2)
+        let a = UUID(), b = UUID(), c = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: a)
+        snapshots.invalidate(a)
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: b)
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: c)
+
+        XCTAssertNotNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: b),
+                        "b must not have been evicted by a slot `a` no longer needs")
+        XCTAssertNotNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: c))
+    }
+
+    func test_invalidating_an_unknown_recording_is_a_no_op() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+
+        snapshots.invalidate(UUID())
+
+        XCTAssertEqual(snapshots.heldRecordingCount, 1)
+        XCTAssertNotNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec))
+    }
+
+    // MARK: - Retiring one speaker id
+
+    /// `splitSegmentSpeaker` hands out the lowest free `SPEAKER_NN`, so an id
+    /// that a merge retired comes back. Its embedding must not.
+    func test_forgetting_a_retired_speaker_leaves_the_rest_of_the_recording() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 2, nil),
+                                  ("SPEAKER_01", [0, 1], 2, "Bob")]), for: rec)
+
+        snapshots.forget(speaker: "SPEAKER_01", in: rec)
+
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec))
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCentroid,
+                       [1, 0])
+        XCTAssertEqual(snapshots.heldRecordingCount, 1,
+                       "the recording is still held — only one speaker went")
+    }
+
+    func test_forgetting_an_unknown_speaker_or_recording_is_a_no_op() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 2, nil)]), for: rec)
+
+        snapshots.forget(speaker: "SPEAKER_09", in: rec)
+        snapshots.forget(speaker: "SPEAKER_00", in: UUID())
+
+        XCTAssertNotNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec))
+        XCTAssertEqual(snapshots.heldRecordingCount, 1)
+    }
+
     // MARK: - Bounded retention
 
     /// Held snapshots are capped, oldest evicted first, so embeddings don't
