@@ -50,6 +50,19 @@ updates:
       - dependency-name: "swift-actions/setup-swift"
         versions: [">= 3.a, < 4"]
 
+  # The speaches base image behind the Hebrew remote-transcription E2E.
+  #
+  # This entry did nothing at all for its first months: the Dockerfile said
+  # `FROM ghcr.io/speaches-ai/speaches:${SPEACHES_TAG}`, and dependabot's
+  # Dockerfile parser does not resolve ARGs — its FROM regex wants a literal
+  # tag, and a FROM line with neither tag nor digest is skipped, so there was
+  # no dependency to update and never a PR (issue #243).
+  #
+  # So: the FROM in docker/speaches-hebrew/Dockerfile must stay a LITERAL
+  # `image:tag@sha256:digest`. The digest is the pin; the tag is what
+  # dependabot compares versions on (a tag with no version in it — `latest-cpu`
+  # — can never be bumped). Re-introducing a variable there re-breaks this
+  # silently, since an inert ecosystem entry looks exactly like a quiet one.
   - package-ecosystem: "docker"
     directory: "/docker/speaches-hebrew"
     schedule:

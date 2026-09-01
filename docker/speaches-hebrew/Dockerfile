@@ -22,10 +22,52 @@
 # build time so the container is fully self-contained and needs no network at
 # run time (important for hermetic CI). Override with --build-arg MODEL_ID=... .
 
-ARG SPEACHES_TAG=latest-cpu
-FROM ghcr.io/speaches-ai/speaches:${SPEACHES_TAG}
+# BASE IMAGE — pinned to a digest, refreshed by dependabot (issue #243)
+# ----------------------------------------------------------------------
+# We inherit this image's ENTIRE Python environment: huggingface_hub,
+# faster-whisper, ctranslate2, the lot. It used to be `latest-cpu`, so that
+# environment could change between two builds of an unchanged Dockerfile —
+# and did: #242 called `snapshot_download(max_retries=3)`, a parameter that
+# does not exist in the huggingface_hub this image ships, and the build broke
+# for reasons nothing in this repo could explain. With a pin, the contract is
+# knowable: as of this digest the base is speaches 0.8.3 (upstream commit
+# c78b77d), whose uv.lock — installed with `uv sync --frozen` — gives
+# huggingface_hub 0.33.4, faster-whisper 1.1.1, ctranslate2 4.5.0.
+#
+# WHY tag AND digest, not one or the other
+#   - The digest is the pin. A tag, semver or not, is mutable at the
+#     registry's discretion; upstream re-points `latest-cpu` on every release.
+#     `sha256:21e3df…` is the only form that cannot move under us.
+#   - The tag is not decoration. Docker resolves by digest and ignores it, but
+#     dependabot keys its version search on the tag, and only a tag with a
+#     comparable version can move: `latest-cpu` has none, so dependabot could
+#     never bump it. `0.8.3-cpu` parses as version 0.8.3 + suffix `-cpu`, and
+#     dependabot only compares tags with a matching suffix — so it will offer
+#     `0.9.0-cpu` and never a `-cuda` or `-rc` tag. It also tells a human
+#     reading the diff what they are actually on.
+#
+# WHY NOT `ARG SPEACHES_TAG` + `FROM …:${SPEACHES_TAG}` (what this replaced)
+#   Dependabot's Dockerfile parser does not resolve ARGs. Its FROM regex wants
+#   a literal tag (`[\w][\w.-]{0,127}`), `${SPEACHES_TAG}` cannot match it, and
+#   a FROM line with neither tag nor digest is skipped outright. The `docker`
+#   entry in .github/dependabot.yml has existed since #95 and has never opened
+#   a PR — it had nothing to parse. Keep this line literal or it goes inert
+#   again, silently.
+#
+# REFRESH PATH (a pin that freezes security updates is its own hazard)
+#   1. Dependabot, weekly, with the 7-day cooldown in .github/dependabot.yml:
+#      new upstream release -> a `docker:` PR bumping tag + digest together.
+#      A same-tag digest refresh (upstream re-pushing patched bytes under
+#      `0.8.3-cpu`) is also something dependabot can propose, but whether it
+#      does is governed by a server-side dependabot experiment we cannot
+#      observe from here — do not rely on it as the only path.
+#   2. Manual: `Build Speaches Hebrew Image` has a `workflow_dispatch` for
+#      exactly this, and any bump lands as a reviewable PR that rebuilds the
+#      image and runs the Hebrew E2E against it.
+FROM ghcr.io/speaches-ai/speaches:0.8.3-cpu@sha256:21e3df06d842fb7802ab470dd77c25f0e8c0d22950e8d8c6ae886e851af53ef8
 
-# Redeclare after FROM so it's visible in the build stage.
+# Declared after FROM so it's visible in this build stage — an ARG before FROM
+# only reaches the FROM line itself.
 ARG MODEL_ID=ivrit-ai/whisper-large-v3-turbo-ct2
 
 LABEL org.opencontainers.image.source="https://github.com/island-io/mila"
