@@ -42,6 +42,69 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// Tunable in Settings.
     var similarityThreshold: Double = 0.55
 
+    /// How many of *this* session's utterances a returning speaker's stored
+    /// centroid is worth when matching — the seed anchor weight, **n₀**.
+    ///
+    /// `seedPool` gives each seeded entry `sampleCount = min(stored, n₀)`.
+    /// `assign`'s confident-match fold is a running mean, so over *k*
+    /// confident matches in one recording it telescopes exactly to
+    ///
+    ///     centroid_k = (n₀·c₀ + Σ eⱼ) / (n₀ + k)
+    ///
+    /// which makes n₀ literally the stored voice's share of the centroid the
+    /// next utterance is compared against — `n₀ / (n₀ + k)`:
+    ///
+    /// | k  | n₀=1 | n₀=2 | **n₀=3** | n₀=6 | uncapped (40) |
+    /// |----|------|------|----------|------|---------------|
+    /// | 1  |  50% |  67% | **75%**  |  86% |  98% |
+    /// | 3  |  25% |  40% | **50%**  |  67% |  93% |
+    /// | 10 |   9% |  17% | **23%**  |  38% |  80% |
+    ///
+    /// Since #204 this is a **matching-only** knob: the persisted delta is
+    /// `observedCentroid`/`observedCount`, which n₀ never touches, so no
+    /// value here can corrupt a stored profile.
+    ///
+    /// **Why 3, and why it has not moved.** The arithmetic pins the ends, not
+    /// the interior, and both ends are real failures:
+    ///
+    ///   * **n₀ = 0 is provably wrong.** `(0·c₀ + e)/1 == e` — the stored
+    ///     voice would be discarded by its own first match, so seeding would
+    ///     affect the first comparison of a recording and nothing after it.
+    ///   * **No cap is wrong too.** A mature profile sits at
+    ///     `VoiceProfile.maxSampleCount`, so within-recording adaptation
+    ///     becomes arithmetically impossible. A returning speaker whose
+    ///     acoustics genuinely changed (new headset, different room, a cold)
+    ///     then never clears `similarityThreshold`, never gets a confident
+    ///     match, so `observedCount` stays 0 and
+    ///     `RecognisedSpeakerAssigner.finish` correctly refuses to auto-name
+    ///     them — meaning **nothing is learned and the profile can never
+    ///     adapt in a future recording either.** The profile that most needs
+    ///     updating becomes the one that cannot be updated.
+    ///
+    /// Between those ends the failures are asymmetric, and that asymmetry —
+    /// not a measurement — is what keeps n₀ small. A too-light anchor lets
+    /// one noisy or false-positive match half-steal the entry, but the damage
+    /// is confined to a single recording. A too-heavy anchor's damage
+    /// persists across every future recording, per the bullet above. It also
+    /// runs the opposite way to intuition: a heavier anchor keeps the entry
+    /// further from today's acoustics, so a returning speaker's *later*
+    /// utterances are more likely to fall below `createThreshold` and mint a
+    /// duplicate `SPEAKER_NN` — a stronger anchor can *increase*
+    /// over-segmentation.
+    ///
+    /// What the asymmetry does **not** do is choose between 2, 3 and 4. Every
+    /// n₀ ≥ 1 is well-formed — the divisor is never zero and the fold is
+    /// always a proper convex combination — so there is no degenerate value
+    /// in that range and no discontinuity at the cap boundary. Picking among
+    /// them is empirical, and needs multi-recording audio of the same
+    /// speakers across different capture setups. #206 records the replay
+    /// protocol (embed once, cache, sweep n₀ × `similarityThreshold`) and the
+    /// decision rule; until someone runs it, changing 3 to another unmeasured
+    /// number would only move the guess.
+    ///
+    /// `SeedAnchorWeightTests` pins this value and the behaviour it buys.
+    static let seedAnchorWeight = 3
+
     private var pool: [SpeakerProfile] = []
     private var process: Process?
     private var stdinPipe: Pipe?
@@ -236,8 +299,13 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// Pre-populate the pool with known speaker voice profiles so
     /// returning speakers are auto-recognised. Call after `reset()` at
     /// recording start. Each entry gets a fresh `SPEAKER_NN` ID and a
-    /// capped `sampleCount` so the centroid can adapt to current-session
-    /// acoustics on the first few matches.
+    /// `sampleCount` capped at `seedAnchorWeight` so the centroid can adapt
+    /// to current-session acoustics on the first few matches — see that
+    /// constant for what the cap buys and why it is 3.
+    ///
+    /// The cap is a **ceiling, not a floor**: a young profile with one or two
+    /// stored samples seeds at its true count, so a barely-known voice
+    /// anchors more weakly than a well-known one.
     ///
     /// The seeded weight goes into `sampleCount` only — the matching side.
     /// `observedCount` starts at zero because nothing has been observed in
@@ -251,7 +319,7 @@ final class LiveSpeakerDiarizer: ObservableObject {
             pool.append(SpeakerProfile(
                 id: id,
                 centroid: entry.centroid,
-                sampleCount: min(entry.sampleCount, 3),
+                sampleCount: min(entry.sampleCount, Self.seedAnchorWeight),
                 observedCentroid: [],
                 observedCount: 0,
                 profileName: entry.name
