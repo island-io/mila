@@ -55,6 +55,12 @@ jobs:
           IMAGE_NAME: ${{ env.IMAGE_NAME }}
         run: echo "name=$(echo "$IMAGE_NAME" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
+      # Runs before the build: it takes about a second, needs no Docker, and
+      # a broken retry loop should be reported as such rather than as a
+      # 10-minute image build that failed for an unclear reason.
+      - name: Test the model-download retry
+        run: sh docker/speaches-hebrew/download-model-test.sh
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 

@@ -239,7 +239,7 @@ final class LiveAISession: ObservableObject {
             scheduleKick(immediate: true)
         }
         // Drain the in-flight tick and any coalesced follow-up. The tick
-        // task sets `inFlight = nil` in its tail before potentially
+        // task clears `inFlight` from its `defer` before potentially
         // scheduling another (immediate, since isFinalizing) kick, so
         // looping until `inFlight` is nil drains everything.
         while let handle = inFlight {
@@ -291,6 +291,47 @@ final class LiveAISession: ObservableObject {
     func feed(transcript: String, immediate: Bool = false) {
         latestTranscript = transcript
         scheduleKick(immediate: immediate)
+    }
+
+    /// Tell the session that text it may ALREADY have shipped to the model has
+    /// been removed from the transcript — today only via
+    /// `LiveTranscriber.removeSegment(id:)`, the per-line delete.
+    ///
+    /// This exists because in session mode the prompt is only half the story
+    /// (issue #239). Every tick after the first is `claude --resume <uuid>`,
+    /// which carries the whole earlier conversation, so a line already sent
+    /// stays in the model's history however the next prompt is worded. The
+    /// per-line delete otherwise reached everywhere the user can see — the
+    /// pane, the sidecar, the SRT, the saved transcript — and nowhere the
+    /// model can, and kept informing every later summary and action item.
+    /// `bugbot-rules/deleted-data-stays-deleted.md` treats this as a privacy
+    /// action, not a cache eviction.
+    ///
+    /// The remedy is the one the notes path already uses: abandon the
+    /// conversation and open a fresh one. Two deliberate choices:
+    ///
+    ///  * **Eager, not deferred to the next tick.** The stale session id is
+    ///    dropped the instant the user deletes, so nothing can `--resume` it
+    ///    even if no further tick ever happens — which is exactly what a
+    ///    delete of the LAST remaining line produces, since an empty
+    ///    transcript never reaches `kick()`.
+    ///  * **Coalescing is free.** A restart mints a UUID and clears
+    ///    `sessionEstablished`; until a tick actually succeeds, no call has
+    ///    been made, so a second deletion just replaces an unused id. Deleting
+    ///    five lines in a row costs one new session, not five.
+    ///
+    /// A no-op for stateless tools (`sessionID == nil`, e.g. cursor-agent):
+    /// each of their ticks is independent and already carries only the current
+    /// transcript, so there is no history to abandon.
+    func noteTranscriptEdited() {
+        guard let stale = sessionID else { return }
+        liveAILog.log("transcript edited — restarting session (was \(stale.uuidString.prefix(8), privacy: .public))")
+        sessionID = UUID()
+        sessionEstablished = false
+        // The new session has been told nothing, so the next tick must ship
+        // the whole (post-deletion) transcript rather than a delta against
+        // what the ABANDONED session was sent.
+        lastTranscriptSent = ""
     }
 
     /// The single funnel all feed paths go through, so the throttle is
@@ -426,10 +467,19 @@ final class LiveAISession: ObservableObject {
         let augmentedTranscript: String
         if useSession {
             // Compute the delta. If the snapshot doesn't extend the
-            // previously-sent prefix (e.g. transcript was reset), fall
-            // back to sending the whole snapshot — the session will
-            // have it twice, harmless, and the model just sees a re-
-            // statement.
+            // previously-sent prefix, fall back to sending the whole
+            // snapshot — the session will have it twice, harmless, and
+            // the model just sees a re-statement. In practice that is the
+            // fixed-window path revising its last line (`merge` replaces
+            // the tail utterance as whisper hears more of it), which is a
+            // re-statement and nothing more.
+            //
+            // It is NOT how a deleted line is handled: re-sending a
+            // shortened transcript would leave the removed text sitting in
+            // the resumed conversation regardless. Deletions restart the
+            // session outright — see `noteTranscriptEdited()` (issue #239) —
+            // which also clears `lastTranscriptSent`, so by the time a tick
+            // gets here after a delete the prefix check passes trivially.
             let delta: String
             if snapshot.hasPrefix(lastTranscriptSent) {
                 delta = String(snapshot.dropFirst(lastTranscriptSent.count))
@@ -500,6 +550,59 @@ TRANSCRIPT SO FAR:
         let openAIBaseURL = llmSettings.openAIBaseURL
         let openAIAPIKey = llmSettings.openAIAPIKey
         inFlight = Task { @MainActor [weak self] in
+            // In a `defer` rather than at the tail, because the two
+            // "session changed mid-flight" guards below `return` out of this
+            // closure and would skip it (issue #239). Until
+            // `noteTranscriptEdited()` existed nothing could change
+            // `sessionID` while a tick was running -- `kick()` only runs when
+            // `inFlight == nil`, and `cancel()` clears `inFlight` itself -- so
+            // those guards were unreachable except on a path that had already
+            // cleaned up. A deletion during an in-flight tick makes them
+            // reachable for real, and leaving `inFlight` set wedges Live AI
+            // for the rest of the recording: `scheduleKick` coalesces every
+            // later tick behind a task that will never clear.
+            //
+            // Running the coalesced re-kick from here too is what makes the
+            // deletion RECOVER rather than merely not-crash: the feed of the
+            // shortened transcript set `coalesced` while this tick was in
+            // flight, so the dropped tick is immediately replaced by one on
+            // the new session carrying the post-deletion text.
+            // (CodeRabbit on #242.)
+            //
+            // Gated on cancellation, and the two cases it separates are
+            // opposites. `cancel()` cancels this task AND clears `inFlight`
+            // itself, then `start()` can put the NEXT recording's first tick
+            // in that slot -- stopRecording frees the record button without
+            // waiting for the LLM, so the overlap is ordinary, not exotic. A
+            // cancelled tick that cleared the slot from here would clobber
+            // that newer handle, leaving Live AI running with `inFlight ==
+            // nil`: a second concurrent `claude` on the same session id, or a
+            // drain loop that thinks it is finished. Same rule and same
+            // reasoning as `PostRecordingCoordinator.sendToLLM`'s defer.
+            //
+            // A deletion is the opposite: it swaps `sessionID` WITHOUT
+            // cancelling, so the tick is not cancelled, the slot IS released,
+            // and the coalesced re-kick fires on the new session. Cancellation
+            // is exactly what tells the two apart.
+            //
+            // (The old tail happened to be safe here only by accident: the
+            // guards below return before it, and `cancel()` nils `sessionID`,
+            // so a cancelled tick always failed the id check and never reached
+            // it. Making the cleanup unconditional removed that accident,
+            // which Bugbot caught on a86b392.)
+            defer {
+                if !Task.isCancelled {
+                    self?.isThinking = false
+                    self?.inFlight = nil
+                    if let self, self.coalesced {
+                        self.coalesced = false
+                        // Route through the throttle: honours the min-interval
+                        // floor during normal operation, fires immediately
+                        // while finalizing.
+                        self.scheduleKick()
+                    }
+                }
+            }
             let llmStart = Date()
             do {
                 let raw = try await perform(LLMCall(
@@ -578,17 +681,6 @@ TRANSCRIPT SO FAR:
                     self.sessionID = UUID()
                     self.lastTranscriptSent = ""
                 }
-            }
-            self?.isThinking = false
-            self?.inFlight = nil
-            // If new text arrived while we were running, fire one more
-            // pass with the latest snapshot.
-            if let self, self.coalesced {
-                self.coalesced = false
-                // Route through the throttle: honours the min-interval
-                // floor during normal operation, fires immediately while
-                // finalizing.
-                self.scheduleKick()
             }
         }
     }
