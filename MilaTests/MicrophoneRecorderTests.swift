@@ -393,6 +393,18 @@ final class MicrophoneWatchdogTests: XCTestCase {
 @MainActor
 final class MicrophoneConfigurationChangeTests: XCTestCase {
 
+    /// Rebuilds `test_a_storm_of_configuration_changes_is_bounded` tolerates.
+    /// One is the expected answer — the burst window sits inside the 1s
+    /// `minimumRebuildInterval` — and 2 allows for clock jitter at the edge.
+    /// This is the assertion the test exists for; it passes and must not move.
+    private static let maximumExpectedRebuilds = 2
+
+    /// The burst's wall-clock window. Must stay BELOW `minimumRebuildInterval`
+    /// (1s, set in `makeRecorder`) or "at most one rebuild" stops being the
+    /// right expectation and the test would be judging the policy over a
+    /// window it was never given.
+    private static let burstWindow: TimeInterval = 0.6
+
     /// `grace` is per-test on purpose. The handler timestamps a notification
     /// when it RUNS, not when it was posted, so a test that wants a change
     /// treated as self-inflicted needs a window comfortably longer than any
@@ -487,11 +499,22 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
 
         // Post continuously for a fixed WALL-CLOCK window at roughly the
         // cadence observed in the bug (~150ms, compressed to 15ms here).
-        // Wall-clock rather than a fixed iteration count so a slow CI runner
-        // stretches the number of posts, not the window the policy is judged
-        // over.
+        //
+        // The WINDOW is what must stay fixed, and it is load-bearing for the
+        // assertion below: 0.6s sits inside the 1s `minimumRebuildInterval`,
+        // which is what makes "one rebuild" the expected answer. A fixed
+        // iteration count would let a slow runner stretch the window past that
+        // floor and legitimately produce more rebuilds, so the policy would be
+        // judged over a window it was never given.
+        //
+        // The COUNT is the part that moves, and it moves DOWNWARDS under load.
+        // (A previous version of this comment claimed a slow runner "stretches
+        // the number of posts". It does the opposite: `Task.sleep(15ms)` is a
+        // floor, so a loaded machine makes each iteration cost more and fewer
+        // of them fit in the fixed window. Nominal yield is 40; CI has been
+        // observed at 6-10, i.e. ~4-6x scheduling overhead.)
         var posts = 0
-        let deadline = Date().addingTimeInterval(0.6)
+        let deadline = Date().addingTimeInterval(Self.burstWindow)
         while Date() < deadline {
             postConfigurationChange(to: mic)
             posts += 1
@@ -499,12 +522,30 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         }
         try await Task.sleep(nanoseconds: 200_000_000)
 
-        XCTAssertGreaterThan(posts, 10, "the burst should have delivered plenty of notifications")
+        // PRECONDITION, not the property under test — the property is the
+        // rebuild bound on the next line. All this has to establish is that
+        // enough notifications arrived for "paced" and "one rebuild per
+        // notification" to be visibly different outcomes, and at twice the
+        // rebuild bound they already are: the bug would have produced
+        // `posts` rebuilds, and `posts` is at least double what is allowed.
+        //
+        // It used to demand `> 10`, which was not derived from that argument —
+        // it sat exactly on the yield the loop happens to produce, so it was a
+        // load sensor rather than a sanity check, and it failed at its own trip
+        // point on loaded runners with 10, 9, 10 and 8, 6, 6 (#246, #250). The
+        // 0.6s window is untouched; only the bar that never had timing meaning
+        // moves. Do not raise this back towards the nominal yield: a bigger
+        // number adds no discriminating power and re-arms the same failure.
+        XCTAssertGreaterThan(posts, 2 * Self.maximumExpectedRebuilds,
+                             "the burst delivered only \(posts) notifications, which is too "
+                             + "few to tell a paced rebuild policy apart from one rebuild "
+                             + "per notification — the storm never happened, so the bound "
+                             + "below proves nothing")
         // Floor is 1s and the burst is 0.6s, so one rebuild is the expected
         // answer; the bound is 2 purely for CI clock jitter. The point is that
         // the count tracks the POLICY, not the number of notifications.
-        XCTAssertLessThanOrEqual(mic.restartCount, 2,
-                                 "\(posts) configuration changes in 0.6s produced \(mic.restartCount) rebuilds — the notification path is not paced")
+        XCTAssertLessThanOrEqual(mic.restartCount, Self.maximumExpectedRebuilds,
+                                 "\(posts) configuration changes in \(Self.burstWindow)s produced \(mic.restartCount) rebuilds — the notification path is not paced")
         XCTAssertLessThanOrEqual(bringUps(), 3)
         await mic.stop()
     }

@@ -847,10 +847,18 @@ final class TranscriptionServiceTests: XCTestCase {
 
         // Force the post-completion compression to FULLY complete: this renames
         // the WAV to .m4a and deletes the WAV — exactly the on-disk state the CI
-        // flake hit when compression won the race against re-transcribe. (The
-        // first pass also auto-kicks a compression; awaiting here is idempotent
-        // and guarantees the on-disk file is the .m4a regardless of which won.)
-        await store.compressRecordingAudio(id: fixture.recording.id)
+        // flake hit when compression won the race against re-transcribe.
+        //
+        // Via `drainPostCompletionCompression`, NOT a bare
+        // `await store.compressRecordingAudio(id:)`. That call is not a join:
+        // its `compressingIDs` guard is taken before the first suspension, so
+        // when the first pass's auto-kicked transcode is already mid-encode our
+        // call returns straight back having done nothing, and the assertions
+        // below then run against the still-`.wav` state. That is a scheduling
+        // race, not a code fault, and it is what this test failed on in CI —
+        // three wrong values in 0.124s, i.e. it never paid for an encode
+        // (issue #255). The helper waits for the observable end state instead.
+        await drainPostCompletionCompression(fixture.recording.id)
         let compressed = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id })
         XCTAssertTrue(compressed.audioFileName.lowercased().hasSuffix(".m4a"),
                       "Compression should have swapped the audio to .m4a")
@@ -886,10 +894,14 @@ final class TranscriptionServiceTests: XCTestCase {
         await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "done")])
         service.enqueue(fixture.recording)
         await service.waitForIdle()
-        await store.compressRecordingAudio(id: fixture.recording.id)
+        // Same reason as the test above: `compressRecordingAudio` no-ops rather
+        // than joins when the auto-kicked transcode is already in flight, so
+        // wait for the end state (issue #255).
+        await drainPostCompletionCompression(fixture.recording.id)
 
         let beforeName = try XCTUnwrap(store.recordings.first { $0.id == fixture.recording.id }).audioFileName
-        XCTAssertTrue(beforeName.lowercased().hasSuffix(".m4a"))
+        XCTAssertTrue(beforeName.lowercased().hasSuffix(".m4a"),
+                      "compression must have run before this asserts on its result")
 
         let prepared = try XCTUnwrap(store.prepareForRetranscription(id: fixture.recording.id, language: "en"))
         XCTAssertEqual(prepared.audioFileName, beforeName, "audioFileName must be preserved")

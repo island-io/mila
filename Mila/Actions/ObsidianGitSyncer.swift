@@ -133,11 +133,30 @@ actor ObsidianGitSyncer {
 struct ProcessGitCommandRunner: GitCommandRunning {
     var timeout: TimeInterval = 120
 
+    /// Extra environment applied to the child `git` only, after the defaults
+    /// below and before `run()`. Empty in production.
+    ///
+    /// It exists so a test can isolate git's config discovery
+    /// (`GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`, `HOME`) **per invocation**
+    /// instead of via `setenv` on the test host (issue #246). The host is a
+    /// live SwiftUI app: `setenv` can `realloc` `environ` underneath a
+    /// concurrent `getenv`/`posix_spawn` on another thread, which is a real
+    /// data race and not one the suite doing it can contain.
+    var environment: [String: String] = [:]
+
     func run(_ arguments: [String], in directory: URL) async -> GitCommandResult {
         let timeout = self.timeout
+        let environment = self.environment
         return await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
-                continuation.resume(returning: Self.runSync(arguments, in: directory, timeout: timeout))
+            // A thread of its own, not `DispatchQueue.global()`: `runSync`
+            // blocks for the whole life of the child, and a pooled thread
+            // parked there starves whatever is queued behind it (issue #246,
+            // see `BlockingWork`).
+            BlockingWork.onDedicatedThread(named: "io.island.mila.git.run") {
+                continuation.resume(returning: Self.runSync(arguments,
+                                                            in: directory,
+                                                            timeout: timeout,
+                                                            environment: environment))
             }
         }
     }
@@ -181,7 +200,8 @@ struct ProcessGitCommandRunner: GitCommandRunning {
 
     private static func runSync(_ arguments: [String],
                                 in directory: URL,
-                                timeout: TimeInterval) -> GitCommandResult {
+                                timeout: TimeInterval,
+                                environment: [String: String]) -> GitCommandResult {
         guard let git = gitExecutable() else {
             return GitCommandResult(exitCode: -1, stdout: "",
                                     stderr: "git executable not found on PATH", timedOut: false)
@@ -214,6 +234,9 @@ struct ProcessGitCommandRunner: GitCommandRunning {
         env["LC_ALL"] = "C"
         env["LANG"] = "C"
         env.removeValue(forKey: "LANGUAGE")
+        // Caller overrides last, so a test can pin git's config discovery for
+        // this child without touching the host process's `environ`.
+        for (key, value) in environment { env[key] = value }
         process.environment = env
 
         let stdinPipe = Pipe()
@@ -222,6 +245,13 @@ struct ProcessGitCommandRunner: GitCommandRunning {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
+
+        // Exit notification with no blocking wait on the shared pool — same
+        // change, same reason, as `LLMRunner.executeProcess` (issue #246).
+        // Must be installed before `run()`. The `waitUntilExit()` backstop
+        // below covers the macOS 26 reaping race the runner documents.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
 
         do {
             try process.run()
@@ -239,7 +269,10 @@ struct ProcessGitCommandRunner: GitCommandRunning {
         let drain = DispatchGroup()
         for (pipe, box) in [(stdoutPipe, outBox), (stderrPipe, errBox)] {
             drain.enter()
-            DispatchQueue.global().async {
+            // Dedicated threads, not the global pool: `availableData` blocks
+            // until EOF (issue #246, see `BlockingWork`).
+            let stream = pipe === stdoutPipe ? "stdout" : "stderr"
+            BlockingWork.onDedicatedThread(named: "io.island.mila.git.drain.\(stream)") {
                 let handle = pipe.fileHandleForReading
                 while true {
                     let chunk = handle.availableData
@@ -250,22 +283,28 @@ struct ProcessGitCommandRunner: GitCommandRunning {
             }
         }
 
-        let running = DispatchGroup()
-        running.enter()
-        DispatchQueue.global().async {
+        BlockingWork.onDedicatedThread(named: "io.island.mila.git.reap") {
             process.waitUntilExit()
-            running.leave()
+            exited.signal()
         }
         let deadline = DispatchTime.now() + .seconds(Int(timeout.rounded(.up)))
-        let timedOut = running.wait(timeout: deadline) == .timedOut
+        let timedOut = exited.wait(timeout: deadline) == .timedOut
         if timedOut {
             process.terminate()
-            if running.wait(timeout: .now() + 2) == .timedOut {
+            if exited.wait(timeout: .now() + 2) == .timedOut {
                 kill(process.processIdentifier, SIGKILL)
-                _ = running.wait(timeout: .now() + 3)
+                _ = exited.wait(timeout: .now() + 3)
             }
         }
-        _ = drain.wait(timeout: .now() + 5)
+        // 5s used to be a coin toss: the readers were queued on the
+        // non-overcommit global pool, where simply BEING SCHEDULED could take
+        // 10-15s on a loaded runner, and an expired drain here silently
+        // returns short output. They now run on threads of their own and hit
+        // EOF as soon as git's write ends close, so this bounds a genuinely
+        // stuck reader (a helper git spawned still holding the pipes) rather
+        // than dispatch latency — but keep the headroom anyway, because the
+        // cost of expiring early is a wrong answer, not a slow one.
+        _ = drain.wait(timeout: .now() + 15)
 
         let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
         let stderr = String(data: errBox.withLock { $0 }, encoding: .utf8) ?? ""

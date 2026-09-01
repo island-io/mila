@@ -13,9 +13,19 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     private var home: URL!
     private var remote: URL!
     private var vault: URL!
-    /// Original values of the git-config env vars we override on THIS process,
-    /// so `tearDown` can put them back. `nil` value == the var was unset.
-    private var savedEnvironment: [String: String?] = [:]
+
+    /// Temp roots this class has created so far in this process.
+    ///
+    /// `setUp` asserts every EARLIER one is gone (issue #246). Checking in
+    /// `setUp` rather than `tearDown` is the point: a root is named after the
+    /// test that created it, so the failure says which test leaked rather than
+    /// landing on whichever test happened to run next. The ledger is drained
+    /// as it is checked, so one leak reports once instead of reddening every
+    /// remaining test in the class.
+    ///
+    /// Not concurrency-guarded because XCTest runs a class's tests serially on
+    /// one thread; `setUp` is the only reader and writer.
+    private static var previousRoots: [URL] = []
 
     /// Per-`git`-invocation bound, for BOTH the setup helper below and the
     /// production runner the tests drive (issue #208).
@@ -44,11 +54,15 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
 
     /// How long to wait for the output pipes to reach EOF once `git` has
     /// exited. Separate from `gitCommandTimeout` because it bounds a different
-    /// hazard: not a wedged `git`, but a reader work item that has not been
-    /// scheduled yet. `executeProcess` documents 10-15s of dispatch latency on
-    /// the macos-26 CI image and each `runGit` parks three blocking items on
-    /// the global queue, so this has to clear that comfortably — 5s did not,
-    /// and cost this suite a deterministic failure.
+    /// hazard: not a wedged `git`, but a reader that has not finished.
+    ///
+    /// It used to bound a reader that had not been SCHEDULED — the readers sat
+    /// on the non-overcommit global queue, where 10-15s of dispatch latency is
+    /// documented for this CI image, and a 5s bound cost this suite a
+    /// deterministic failure. They now run on threads of their own (issue
+    /// #246), so scheduling is immediate and this bounds only a reader still
+    /// blocked on a pipe some helper `git` spawned is holding open. Kept
+    /// generous anyway: expiring early returns a WRONG answer, not a slow one.
     private static let pipeDrainTimeout: TimeInterval = 30
 
     override func setUpWithError() throws {
@@ -57,28 +71,36 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
             throw XCTSkip("git is not installed on this machine")
         }
         gitURL = git
+
+        // Cleanliness is asserted HERE, before this test creates anything, so
+        // a leaked root is reported against the test named in its own path
+        // (issue #246). Drain the ledger while checking it: the leak is a fact
+        // about the run that caused it, not about every test after it.
+        let stale = Self.previousRoots.filter {
+            FileManager.default.fileExists(atPath: $0.path)
+        }
+        Self.previousRoots.removeAll()
+        for root in stale {
+            XCTFail("a previous test in this class left its temp root behind — "
+                    + "the directory name says which one: \(root.lastPathComponent)")
+            try? FileManager.default.removeItem(at: root)
+        }
+
         tempRoot = FileManager.default.temporaryDirectory
-            .appendingPathComponent("MilaGitIntegration-\(UUID())", isDirectory: true)
+            .appendingPathComponent("MilaGitIntegration-\(testLabel)-\(UUID())",
+                                    isDirectory: true)
+        Self.previousRoots.append(tempRoot)
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         // Isolated HOME so setup commands don't read the developer's global
         // git config (default branch name, gpg signing, hooks).
         home = tempRoot.appendingPathComponent("home", isDirectory: true)
         try FileManager.default.createDirectory(at: home, withIntermediateDirectories: true)
 
-        // `runGit` can isolate its own child env, but the code under test runs
-        // through `ProcessGitCommandRunner`, which inherits this process's
-        // environment verbatim. Without overriding these here, the sync steps
-        // would read the developer's / CI machine's real global + system git
-        // config (default branch, gpg signing, hooks, insteadOf rewrites).
-        // `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` need git >= 2.32; the older
-        // `GIT_CONFIG_NOSYSTEM` is set too so isolation still holds below that.
-        let globalConfig = home.appendingPathComponent(".gitconfig")
-        FileManager.default.createFile(atPath: globalConfig.path, contents: nil)
-        setEnvironment([
-            "GIT_CONFIG_GLOBAL": globalConfig.path,
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            "GIT_CONFIG_NOSYSTEM": "1"
-        ])
+        // The empty global config `gitIsolation` points at. Both `runGit` and
+        // the production runner receive that pointer as CHILD environment (see
+        // `gitIsolation`) — this process's own `environ` is never touched.
+        FileManager.default.createFile(atPath: home.appendingPathComponent(".gitconfig").path,
+                                       contents: nil)
 
         remote = tempRoot.appendingPathComponent("remote.git", isDirectory: true)
         vault = tempRoot.appendingPathComponent("vault", isDirectory: true)
@@ -101,26 +123,57 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
-        restoreEnvironment()
-        if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
+        // Report a removal that FAILED, rather than swallowing it with `try?`.
+        // The ledger in `setUp` is the cross-test net, but it is only read by
+        // the NEXT test — so without this the last test in the class could leak
+        // and nothing would ever say so. `tearDown` still runs in the failing
+        // test's own context, so the attribution is right either way.
+        if let tempRoot, FileManager.default.fileExists(atPath: tempRoot.path) {
+            do {
+                try FileManager.default.removeItem(at: tempRoot)
+                Self.previousRoots.removeAll { $0 == tempRoot }
+            } catch {
+                XCTFail("could not remove this test's temp root "
+                        + "\(tempRoot.lastPathComponent): \(error.localizedDescription)")
+            }
+        } else if let tempRoot {
+            Self.previousRoots.removeAll { $0 == tempRoot }
+        }
         try super.tearDownWithError()
     }
 
-    /// Override env vars on this process, remembering the previous values.
-    private func setEnvironment(_ values: [String: String]) {
-        for (key, value) in values {
-            if !savedEnvironment.keys.contains(key) {
-                savedEnvironment[key] = ProcessInfo.processInfo.environment[key]
-            }
-            setenv(key, value, 1)
-        }
+    /// `name` is `-[ObsidianGitSyncerIntegrationTests test_foo]`; keep the
+    /// `test_foo` so a leaked temp root names the test that leaked it.
+    private var testLabel: String {
+        let raw = name.split(separator: " ").last.map(String.init) ?? name
+        return String(raw.filter { $0.isLetter || $0.isNumber || $0 == "_" })
     }
 
-    private func restoreEnvironment() {
-        for (key, value) in savedEnvironment {
-            if let value { setenv(key, value, 1) } else { unsetenv(key) }
-        }
-        savedEnvironment.removeAll()
+    /// Git-config isolation, as CHILD environment rather than as a mutation of
+    /// this process (issue #246).
+    ///
+    /// This used to be `setenv`/`unsetenv` in `setUp`/`tearDown`, because the
+    /// code under test runs through `ProcessGitCommandRunner`, which inherits
+    /// the host's environment verbatim and had no other way in. The test host
+    /// is a live SwiftUI app: `setenv` can `realloc` `environ` underneath a
+    /// concurrent `getenv` or `posix_spawn` on another thread, so a suite
+    /// reaching for it is a process-wide data race that no amount of care
+    /// inside this class can contain. `ProcessGitCommandRunner` now takes
+    /// per-invocation `environment`, so nothing here escapes the child.
+    ///
+    /// `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_SYSTEM` need git >= 2.32; the older
+    /// `GIT_CONFIG_NOSYSTEM` is set too so isolation still holds below that.
+    /// Without them the sync steps would read the developer's / CI machine's
+    /// real global + system git config (default branch, gpg signing, hooks,
+    /// insteadOf rewrites).
+    private var gitIsolation: [String: String] {
+        [
+            "HOME": home.path,
+            "GIT_CONFIG_GLOBAL": home.appendingPathComponent(".gitconfig").path,
+            "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0"
+        ]
     }
 
     // MARK: - Tests
@@ -129,7 +182,7 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         let note = vault.appendingPathComponent("2026-01-02 Meeting.md")
         try write("# Meeting\n\nSummary body.\n", to: note)
 
-        let syncer = ObsidianGitSyncer(runner: Self.boundedRunner())
+        let syncer = ObsidianGitSyncer(runner: boundedRunner())
         let error = await syncer.sync(vault: vault,
                                       changedPaths: [note],
                                       branch: "main",
@@ -160,7 +213,7 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         // the remote's commit, then push both.
         let note = vault.appendingPathComponent("a.md")
         try write("local-added\n", to: note)
-        let syncer = ObsidianGitSyncer(runner: Self.boundedRunner())
+        let syncer = ObsidianGitSyncer(runner: boundedRunner())
         let error = await syncer.sync(vault: vault,
                                       changedPaths: [note],
                                       branch: "main",
@@ -183,9 +236,10 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     /// grace) is ~780s against a 240s allowance. One wedged command would take
     /// the test host with it instead of failing the test. 20s is still ~4
     /// orders of magnitude above what a local-path git command costs.
-    private static func boundedRunner() -> ProcessGitCommandRunner {
+    private func boundedRunner() -> ProcessGitCommandRunner {
         var runner = ProcessGitCommandRunner()
         runner.timeout = 20
+        runner.environment = gitIsolation
         return runner
     }
 
@@ -196,10 +250,13 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         process.arguments = arguments
         process.currentDirectoryURL = directory
         var env = ProcessInfo.processInfo.environment
-        env["HOME"] = home.path
-        env["GIT_TERMINAL_PROMPT"] = "0"
-        env["GIT_CONFIG_NOSYSTEM"] = "1"
+        for (key, value) in gitIsolation { env[key] = value }
         process.environment = env
+
+        // Exit notification that costs no thread at all, installed before
+        // `run()` — mirrors `ProcessGitCommandRunner.runSync` (issue #246).
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
 
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
@@ -216,12 +273,19 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         // is synchronous: the rule prefers `Task.detached` specifically to
         // avoid blocking a cooperative thread from an *async* context, which
         // this is not.
+        //
+        // The readers run on threads of their OWN rather than on
+        // `DispatchQueue.global()` (issue #246). `availableData` blocks until
+        // EOF, and the global queues are non-overcommit: a pooled thread
+        // parked in a blocking read is one the whole process loses, and the
+        // items queued behind it then wait to be *scheduled* — which is what
+        // the dispatch latency `pipeDrainTimeout` describes actually was.
         let lock = NSLock()
         var outData = Data(), errData = Data()
         let drain = DispatchGroup()
         for (pipe, isStdout) in [(out, true), (err, false)] {
             drain.enter()
-            DispatchQueue.global().async {
+            BlockingWork.onDedicatedThread(named: "mila.test.git.drain") {
                 // Append chunk-by-chunk rather than one `readDataToEndOfFile()`
                 // — the same shape as `ProcessGitCommandRunner.runSync`, and
                 // load-bearing now that the drain below is bounded.
@@ -252,29 +316,35 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         // killed the test host — a red run naming a test with no reason
         // attached, and one the retry policy cannot recover. See
         // `gitCommandTimeout` for why that distinction is the whole point.
-        let running = DispatchGroup()
-        running.enter()
-        DispatchQueue.global().async {
+        //
+        // The exit is now observed by `terminationHandler` (installed above)
+        // with `waitUntilExit()` on a dedicated thread as a backstop, rather
+        // than by a `waitUntilExit()` parked on the global queue. That is what
+        // produced this suite's most legible failure to date (issue #246):
+        //
+        //     git checkout -b main did not exit within 60s and was killed
+        //       (stderr so far: Switched to a new branch 'main'
+        //
+        // `Switched to a new branch 'main'` is git's own success message, so
+        // git had run, succeeded, and written to a pipe we were reading — and
+        // 65s later the work item meant to notice its exit still had not been
+        // scheduled.
+        BlockingWork.onDedicatedThread(named: "mila.test.git.reap") {
             process.waitUntilExit()
-            running.leave()
+            exited.signal()
         }
         var timedOut = false
-        if running.wait(timeout: .now() + .seconds(Int(Self.gitCommandTimeout))) == .timedOut {
+        if exited.wait(timeout: .now() + .seconds(Int(Self.gitCommandTimeout))) == .timedOut {
             timedOut = true
             process.terminate()
-            if running.wait(timeout: .now() + 2) == .timedOut {
+            if exited.wait(timeout: .now() + 2) == .timedOut {
                 kill(process.processIdentifier, SIGKILL)
-                _ = running.wait(timeout: .now() + 3)
+                _ = exited.wait(timeout: .now() + 3)
             }
         }
         // Bounded too: EOF is not guaranteed even after exit, because a helper
-        // `git` spawned can inherit the pipes and outlive it.
-        //
-        // The bound is generous on purpose. 5s was too tight and it regressed
-        // this suite: `executeProcess` documents 10-15s of dispatch latency on
-        // this CI image, and each `runGit` now parks three blocking work items
-        // on the global queue, so a reader simply not being SCHEDULED inside 5s
-        // is ordinary here, not pathological.
+        // `git` spawned can inherit the pipes and outlive it. See
+        // `pipeDrainTimeout` for why the bound is generous.
         let drained = drain.wait(timeout: .now() + .seconds(Int(Self.pipeDrainTimeout))) != .timedOut
         // Take the lock: unlike an unbounded `drain.wait()`, the readers are
         // not guaranteed to be finished here.
