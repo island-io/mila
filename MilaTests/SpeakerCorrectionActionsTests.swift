@@ -285,6 +285,49 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
         XCTAssertEqual(speakers(w), ["SPEAKER_00"])
     }
 
+    /// The same round trip across the **offline re-diarize**, which is where
+    /// it is most likely to go wrong: collapsing live over-segmentation is
+    /// the entire reason that pass runs, so a recording arriving with three
+    /// fragments of one person is the ordinary case rather than an edge.
+    /// `finish` folded all three into the profile; if the re-key carries only
+    /// the dominant one, un-naming gives back a fraction and strands the rest
+    /// where nothing can reach it.
+    func test_collapsing_over_segmentation_then_un_naming_leaves_no_residue() throws {
+        let voice: [Float] = [1, 0, 0, 0]
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_03", 2, "two"),
+                                     segment("SPEAKER_07", 4, "three")],
+                          snapshotEntries: [("SPEAKER_00", voice, 2),
+                                            ("SPEAKER_03", voice, 1),
+                                            ("SPEAKER_07", voice, 3)])
+        for raw in ["SPEAKER_00", "SPEAKER_03", "SPEAKER_07"] {
+            w.store.setSpeakerName("Alice", forSpeaker: raw, recordingID: w.recordingID)
+        }
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 6,
+                       "precondition: the profile received all three fragments")
+
+        // What `finalizeTail` does when the offline pass collapses them into
+        // one speaker: swap the segments, remap the names, carry the
+        // observations on the same old→new mapping.
+        var rediarized = row(w)
+        rediarized.segments = rediarized.segments.map {
+            var seg = $0
+            seg.speaker = "SPEAKER_00"
+            return seg
+        }
+        rediarized.speakerNames = ["SPEAKER_00": "Alice"]
+        w.store.update(rediarized)
+        w.snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
+                                     "SPEAKER_03": "SPEAKER_00",
+                                     "SPEAKER_07": "SPEAKER_00"], in: w.recordingID)
+
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+
+        XCTAssertNil(w.profiles.profile(named: "Alice"),
+                     "all six samples came back out; carrying only the dominant "
+                     + "fragment would leave the profile alive at three")
+    }
+
     // MARK: - Move one line
 
     func test_reassigning_moves_only_the_named_segment() {

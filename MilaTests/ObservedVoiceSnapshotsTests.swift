@@ -316,9 +316,9 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
         snapshots.record(entries([("SPEAKER_00", [1, 0], 2, "Alice"),
                                   ("SPEAKER_01", [0, 1], 3, nil)]), for: rec)
 
-        // The pass renumbered them the other way round.
-        snapshots.remapSpeakerIDs(["SPEAKER_01": "SPEAKER_00",
-                                   "SPEAKER_00": "SPEAKER_01"], in: rec)
+        // old -> new: the pass renumbered them the other way round.
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_01",
+                                   "SPEAKER_01": "SPEAKER_00"], in: rec)
 
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec),
                        .init(observedCentroid: [1, 0], observedCount: 2, profileName: "Alice"))
@@ -326,24 +326,68 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
                        .init(observedCentroid: [0, 1], observedCount: 3, profileName: nil))
     }
 
-    /// An old speaker the pass SPLIT in two must not hand the same embedding
-    /// to both halves: un-naming both would subtract one observation twice.
-    /// Names can be duplicated across a split harmlessly; embeddings cannot.
-    func test_remapping_drops_an_observation_a_split_would_duplicate() {
+    /// **Collapsing over-segmentation is what the offline pass is FOR**, so
+    /// this is the common outcome, not an edge. `finish` folded all three
+    /// fragments into one profile; all three have to arrive on the new id,
+    /// combined — keeping only the dominant one would let un-naming give
+    /// back a third of what the recording contributed and strand the rest.
+    func test_remapping_combines_every_fragment_that_lands_on_one_new_id() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 2, "Alice"),
+                                  ("SPEAKER_03", [1, 0], 1, "Alice"),
+                                  ("SPEAKER_07", [1, 0], 3, "Alice")]), for: rec)
+
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
+                                   "SPEAKER_03": "SPEAKER_00",
+                                   "SPEAKER_07": "SPEAKER_00"], in: rec)
+
+        let carried = snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)
+        XCTAssertEqual(carried?.observedCount, 6,
+                       "2 + 1 + 3 — every fragment the profile received")
+        XCTAssertEqual(carried?.observedCentroid, [1, 0])
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_03", in: rec))
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_07", in: rec))
+    }
+
+    /// The fold is weighted, so a combined fragment set is worth exactly what
+    /// the separate `updateProfile` calls put into the profile.
+    func test_remapping_weights_the_combined_fragments() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 3, nil),
+                                  ("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
+
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
+                                   "SPEAKER_01": "SPEAKER_00"], in: rec)
+
+        let carried = snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)
+        XCTAssertEqual(carried?.observedCount, 4)
+        XCTAssertEqual(carried?.observedCentroid.first ?? 0, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(carried?.observedCentroid.last ?? 0, 0.25, accuracy: 0.0001)
+    }
+
+    /// The other direction: an old speaker the pass SPLIT in two must not
+    /// hand the same embedding to both halves, or un-naming both subtracts
+    /// one observation twice. Keying the mapping old→new makes that
+    /// unrepresentable — the split speaker has exactly one destination, and
+    /// the other half simply has no observation.
+    func test_a_split_speaker_lands_on_one_half_only() {
         let snapshots = ObservedVoiceSnapshots()
         let rec = UUID()
         snapshots.record(entries([("SPEAKER_00", [1, 0], 2, nil),
                                   ("SPEAKER_01", [0, 1], 2, nil)]), for: rec)
 
+        // SPEAKER_00 was split; it owns the half that took most of it.
         snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
-                                   "SPEAKER_02": "SPEAKER_00",
                                    "SPEAKER_01": "SPEAKER_01"], in: rec)
 
-        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
-                     "SPEAKER_00 was split across two new ids — neither may claim its voice")
-        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec))
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCount, 2,
+                       "counted once, on one half")
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec),
+                     "the other half of the split carries no observation to double-subtract")
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec)?.observedCentroid,
-                       [0, 1], "the speaker that mapped one-to-one is unaffected")
+                       [0, 1])
     }
 
     /// A mapping that carries nothing is an invalidation, eviction slot and

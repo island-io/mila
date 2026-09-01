@@ -205,7 +205,7 @@ final class QuickActionsController: ObservableObject {
     /// profile contributions they justified) survive while the observations
     /// that would reverse them do not, and un-naming a speaker after a
     /// re-diarize silently corrects nothing.
-    var onSpeakerIDsRekeyed: ((_ recordingID: UUID, _ newToOldSpeakerIDs: [String: String]) -> Void)?
+    var onSpeakerIDsRekeyed: ((_ recordingID: UUID, _ oldToNewSpeakerIDs: [String: String]) -> Void)?
 
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
@@ -1284,8 +1284,8 @@ final class QuickActionsController: ObservableObject {
                             // impossible to reverse.
                             self.onSpeakerIDsRekeyed?(
                                 id,
-                                SpeakerNameRemapper.dominantOldIDs(from: preRediarize,
-                                                                   to: rediarized))
+                                SpeakerNameRemapper.owningNewIDs(from: preRediarize,
+                                                                 to: rediarized))
                         }
                     }
                 }

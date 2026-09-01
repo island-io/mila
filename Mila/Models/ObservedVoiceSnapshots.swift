@@ -232,26 +232,44 @@ final class ObservedVoiceSnapshots {
     /// reassigns `.speaker` on the *same* segment array, so per-index pairs
     /// say which old speaker each new one was.
     ///
-    /// An old id that dominates **more than one** new id is dropped rather
-    /// than copied to both. Duplicating a name across a split is harmless;
-    /// duplicating an embedding is not, because un-naming both halves would
-    /// subtract the same observation twice.
-    func remapSpeakerIDs(_ newToOld: [String: String], in recordingID: UUID) {
+    /// **The mapping is old→new, and that direction is load-bearing.** The
+    /// two ways a re-key can reshape speakers pull in opposite directions:
+    ///
+    ///  * **Many old → one new** (the pass collapsing live over-segmentation,
+    ///    which is the entire reason it runs). `finish` folded *every*
+    ///    fragment into the profile, so all of them have to arrive on the new
+    ///    id, combined — keeping only the dominant one would let un-naming
+    ///    give back a fraction of what this recording contributed and strand
+    ///    the rest. They are folded with `absorb`'s weighted mean, the same
+    ///    one `updateProfile` uses, so the combined observation is exactly
+    ///    what the profile received.
+    ///  * **One old → many new** (the pass splitting a live speaker). The
+    ///    name is duplicated onto both halves, harmlessly; the embedding must
+    ///    not be, because un-naming both would subtract one observation
+    ///    twice. Keying old→new makes that unrepresentable rather than
+    ///    guarded — a dictionary gives each old id exactly one destination —
+    ///    so the observation lands on whichever half took most of it and the
+    ///    other simply has none. Under-correcting is the safe direction here,
+    ///    and it is already this type's behaviour for a missing snapshot.
+    func remapSpeakerIDs(_ oldToNew: [String: String], in recordingID: UUID) {
         guard let existing = byRecording[recordingID] else { return }
-        var timesUsed: [String: Int] = [:]
-        for oldID in newToOld.values { timesUsed[oldID, default: 0] += 1 }
-
         var remapped: [String: Observation] = [:]
-        for (newID, oldID) in newToOld {
-            guard timesUsed[oldID] == 1, let observation = existing[oldID] else { continue }
-            remapped[newID] = observation
+        // Sorted so a fold of three-plus fragments is bit-for-bit
+        // reproducible rather than dependent on `Dictionary` order.
+        for (oldID, newID) in oldToNew.sorted(by: { $0.key < $1.key }) {
+            guard let observation = existing[oldID] else { continue }
+            guard let alreadyThere = remapped[newID] else {
+                remapped[newID] = observation
+                continue
+            }
+            remapped[newID] = Self.combining(alreadyThere, observation) ?? alreadyThere
         }
         guard !remapped.isEmpty else {
             invalidate(recordingID)
             return
         }
         byRecording[recordingID] = remapped
-        snapshotLog.log("snapshot: carried \(remapped.count, privacy: .public) of \(existing.count, privacy: .public) observations across a re-key")
+        snapshotLog.log("snapshot: carried \(existing.count, privacy: .public) observations onto \(remapped.count, privacy: .public) re-keyed speakers")
     }
 
     /// The observation for `rawID` **in that specific recording**, or nil

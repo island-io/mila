@@ -713,8 +713,8 @@ struct MilaApp: App {
         // dominance mapping — dropping them instead would leave every
         // re-diarized recording's profile contributions impossible to
         // un-name away, which is the correction #237 exists for.
-        actions.onSpeakerIDsRekeyed = { recordingID, newToOld in
-            voiceSnapshots.remapSpeakerIDs(newToOld, in: recordingID)
+        actions.onSpeakerIDsRekeyed = { recordingID, oldToNew in
+            voiceSnapshots.remapSpeakerIDs(oldToNew, in: recordingID)
         }
         // Save a voice profile when a speaker is named — if the live
         // diarizer observed that speaker *in that recording*, persist it.
