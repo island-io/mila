@@ -544,7 +544,6 @@ public struct MilaStoreReader: Sendable {
         guard recording.segments.contains(where: { $0.speaker != nil }) else { return .unknown }
         guard let probe = longestWhitespaceFreeRun(in: query) else { return .unknown }
 
-        var labelCarriesProbe = false
         var seenSpeakers = Set<String>()
         for segment in recording.segments {
             guard let raw = segment.speaker, seenSpeakers.insert(raw).inserted else { continue }
@@ -552,12 +551,14 @@ public struct MilaStoreReader: Sendable {
             // whitespace-free query that matches the rendered line while
             // matching neither the label nor any segment on its own.
             if contains(probe, in: (recording.speakerNames[raw] ?? raw) + ":") {
-                labelCarriesProbe = true
-                break
+                return .unknown
             }
         }
 
-        let exact = !labelCarriesProbe && probe.count == query.count
+        // No label carries the probe, so every occurrence is inside one
+        // segment — countable when the probe is the whole query, and merely
+        // rulable-out when it is one word of a phrase.
+        let exact = probe.count == query.count
         var total = 0
         for segment in recording.segments {
             if exact {
@@ -566,8 +567,7 @@ public struct MilaStoreReader: Sendable {
                 return .unknown
             }
         }
-        if exact { return .exact(total) }
-        return labelCarriesProbe ? .unknown : .noMatch
+        return exact ? .exact(total) : .noMatch
     }
 
     /// The longest stretch of `query` with no whitespace in it, or nil when
