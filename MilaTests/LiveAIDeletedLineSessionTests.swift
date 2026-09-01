@@ -162,6 +162,7 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
     /// raised the mechanism on #242; verified against the code before fixing.)
     func test_deleting_during_an_in_flight_tick_recovers_on_a_new_session() async {
         let gate = Gate()
+        defer { gate.releaseAll() }
         let (session, calls) = makeSession(suite: "LiveAIDeletedLineSessionTests.inflight",
                                            hold: gate)
 
@@ -175,7 +176,7 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         session.noteTranscriptEdited()
         session.feed(transcript: "[00:00] One.", immediate: true)
 
-        gate.isOpen = true
+        gate.release(1)
 
         let recovered = await waitUntil(timeout: 5) { calls.value.count == 2 }
         XCTAssertTrue(recovered,
@@ -188,6 +189,59 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         XCTAssertFalse(session.isThinking, "the thinking indicator must not be left on")
     }
 
+    /// The mirror-image hazard, and the reason the `defer` is gated on
+    /// cancellation rather than unconditional.
+    ///
+    /// `cancel()` cancels the running tick AND clears `inFlight` itself, then
+    /// `start()` can put the NEXT recording's first tick into that slot --
+    /// ordinary, because `stopRecording` frees the record button without
+    /// waiting for the LLM. If the abandoned tick cleared the slot from its
+    /// own `defer`, it would clobber the newer handle: Live AI would then be
+    /// running with `inFlight == nil`, free to launch a second concurrent
+    /// `claude` on the same session id.
+    ///
+    /// The old code was safe here only by accident -- the id guards returned
+    /// before the tail, and `cancel()` nils `sessionID`. Making the cleanup
+    /// unconditional removed that accident; `!Task.isCancelled` restores it
+    /// deliberately, matching `PostRecordingCoordinator.sendToLLM`.
+    /// (Bugbot on #242, a86b392.)
+    func test_a_cancelled_tick_does_not_clobber_the_next_recordings_tick() async {
+        let gate = Gate()
+        gate.parkThrough = 2
+        defer { gate.releaseAll() }
+        let (session, calls) = makeSession(suite: "LiveAIDeletedLineSessionTests.clobber",
+                                           hold: gate)
+
+        session.feed(transcript: "[00:00] First meeting.", immediate: true)
+        XCTAssertTrue(await waitUntil { calls.value.count == 1 },
+                      "precondition: recording one's tick must be in flight")
+
+        // The recording stops and a new one starts before the LLM answers.
+        session.cancel()
+        session.start()
+        session.feed(transcript: "[00:00] Second meeting.", immediate: true)
+        XCTAssertTrue(await waitUntil { calls.value.count == 2 },
+                      "precondition: the new recording's tick must have started")
+
+        // Let the ABANDONED tick finish, underneath the live one.
+        gate.release(1)
+
+        // Asserted as a negative, because the harm is state being cleared that
+        // belongs to the tick still running.
+        let wentIdle = await waitUntil(timeout: 1) { !session.isThinking }
+        XCTAssertFalse(wentIdle,
+                       "the cancelled tick cleared `isThinking` while the new recording's tick was still running")
+
+        let startedAThird = await waitUntil(timeout: 1) { calls.value.count == 3 }
+        XCTAssertFalse(startedAThird,
+                       "`inFlight` was clobbered: a third call started while the second was still in flight")
+
+        // And the surviving tick still completes normally once released.
+        gate.release(2)
+        XCTAssertTrue(await waitUntil(timeout: 3) { !session.isThinking },
+                      "the new recording's tick must still finish and clear state on its own")
+    }
+
     // MARK: - Helpers
     //
     // Deliberately the same shape as `LiveAIMeetingContextTests`, which pins
@@ -197,10 +251,35 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         var value: [LiveAISession.LLMCall] = []
     }
 
-    /// Lets a test park the first `performCall` so a deletion can land while a
-    /// tick is genuinely in flight, rather than in the gap between ticks.
+    /// Lets a test park `performCall` so something can land while a tick is
+    /// genuinely in flight, rather than in the gap between ticks.
+    ///
+    /// Calls numbered up to `parkThrough` suspend until `release(_:)` names
+    /// their own index, so a test can let an EARLIER tick finish while a later
+    /// one is still parked -- the only way to reproduce an abandoned tick
+    /// completing underneath its replacement.
     private final class Gate {
-        var isOpen = false
+        var parkThrough = 1
+        private var parked: [Int: CheckedContinuation<Void, Never>] = [:]
+
+        func park(_ index: Int) async {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                parked[index] = c
+            }
+        }
+
+        /// Let one parked call proceed. Deliberately a continuation rather
+        /// than a polled flag: a cancelled task's `Task.sleep` returns
+        /// immediately, so a polling loop would spin the main actor hot for
+        /// exactly the tick this suite needs to keep suspended.
+        func release(_ index: Int) { parked.removeValue(forKey: index)?.resume() }
+
+        /// Drain anything still parked, so a failed assertion leaves no
+        /// suspended task behind.
+        func releaseAll() {
+            for (_, c) in parked { c.resume() }
+            parked.removeAll()
+        }
     }
 
     private func kind(_ session: LLMSession) -> String {
@@ -233,12 +312,11 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         let session = LiveAISession(llmSettings: llm, liveAISettings: live)
         session.performCall = { call in
             calls.value.append(call)
-            // Park the FIRST call only, so the test can act while the tick is
+            // Park early calls so the test can act while a tick is
             // demonstrably inside the runner.
-            if let hold, calls.value.count == 1 {
-                while !hold.isOpen {
-                    try? await Task.sleep(nanoseconds: 500_000)
-                }
+            if let hold {
+                let index = calls.value.count   // 1-based: appended just above
+                if index <= hold.parkThrough { await hold.park(index) }
             }
             return #"{"summary":"ok","items":[]}"#
         }

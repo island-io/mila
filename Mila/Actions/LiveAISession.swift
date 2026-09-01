@@ -568,15 +568,39 @@ TRANSCRIPT SO FAR:
             // flight, so the dropped tick is immediately replaced by one on
             // the new session carrying the post-deletion text.
             // (CodeRabbit on #242.)
+            //
+            // Gated on cancellation, and the two cases it separates are
+            // opposites. `cancel()` cancels this task AND clears `inFlight`
+            // itself, then `start()` can put the NEXT recording's first tick
+            // in that slot -- stopRecording frees the record button without
+            // waiting for the LLM, so the overlap is ordinary, not exotic. A
+            // cancelled tick that cleared the slot from here would clobber
+            // that newer handle, leaving Live AI running with `inFlight ==
+            // nil`: a second concurrent `claude` on the same session id, or a
+            // drain loop that thinks it is finished. Same rule and same
+            // reasoning as `PostRecordingCoordinator.sendToLLM`'s defer.
+            //
+            // A deletion is the opposite: it swaps `sessionID` WITHOUT
+            // cancelling, so the tick is not cancelled, the slot IS released,
+            // and the coalesced re-kick fires on the new session. Cancellation
+            // is exactly what tells the two apart.
+            //
+            // (The old tail happened to be safe here only by accident: the
+            // guards below return before it, and `cancel()` nils `sessionID`,
+            // so a cancelled tick always failed the id check and never reached
+            // it. Making the cleanup unconditional removed that accident,
+            // which Bugbot caught on a86b392.)
             defer {
-                self?.isThinking = false
-                self?.inFlight = nil
-                if let self, self.coalesced {
-                    self.coalesced = false
-                    // Route through the throttle: honours the min-interval
-                    // floor during normal operation, fires immediately while
-                    // finalizing.
-                    self.scheduleKick()
+                if !Task.isCancelled {
+                    self?.isThinking = false
+                    self?.inFlight = nil
+                    if let self, self.coalesced {
+                        self.coalesced = false
+                        // Route through the throttle: honours the min-interval
+                        // floor during normal operation, fires immediately
+                        // while finalizing.
+                        self.scheduleKick()
+                    }
                 }
             }
             let llmStart = Date()
