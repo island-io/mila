@@ -20,15 +20,23 @@
 # into the HF cache and picks up where it left off, so a retry after a
 # partial transfer does not re-fetch the ~1.6 GB from the start.
 #
-# The download call itself is left EXACTLY as it was. An earlier revision of
-# this script also passed `max_retries=3`, on the theory that the per-file
-# HTTP layer should retry too; the `huggingface_hub` pinned in the speaches
-# base image has no such parameter, so every attempt died instantly with
-# `TypeError: snapshot_download() got an unexpected keyword argument
-# 'max_retries'` and the loop faithfully retried a call that could never
-# work. The retry is the only thing this script adds — the invocation is the
-# one the image has always used, and download-model-test.sh pins it, because
-# nothing here can verify the real library's signature.
+# The call keeps the same huggingface_hub API the image has always used. An
+# earlier revision of this script also passed `max_retries=3`, on the theory
+# that the per-file HTTP layer should retry too; the `huggingface_hub` in the
+# speaches base image has no such parameter, so every attempt died instantly
+# with `TypeError: snapshot_download() got an unexpected keyword argument
+# 'max_retries'` and the loop faithfully retried a call that could never work.
+# The retry is the only thing this script adds. download-model-test.sh pins
+# the exact invocation, because nothing runnable here can check the real
+# library's signature.
+#
+# MODEL_ID is handed to Python as an ARGUMENT, never interpolated into the
+# source. It is a build arg (`--build-arg MODEL_ID=...`), so splicing it into
+# `-c` source made it executable Python: a value like
+# `x'); __import__('os').system('...'); ('` runs during the image build. The
+# blast radius is small — anyone who can set a build arg can already edit this
+# Dockerfile — but a repo id is data, and passing data as data costs nothing.
+# (CodeRabbit on #242.)
 #
 # Usage: download-model.sh <hf-model-id>
 set -eu
@@ -45,7 +53,7 @@ attempt=1
 while :; do
     # `if` suppresses errexit for the condition, so a failure lands below
     # rather than aborting the script.
-    if python -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='${MODEL_ID}')"; then
+    if python -c "import sys; from huggingface_hub import snapshot_download; snapshot_download(repo_id=sys.argv[1])" "$MODEL_ID"; then
         exit 0
     fi
     if [ "$attempt" -ge "$ATTEMPTS" ]; then

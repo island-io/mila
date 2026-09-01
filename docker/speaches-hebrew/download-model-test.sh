@@ -67,16 +67,28 @@ set -e
 check "permanent failure -> non-zero exit" 1 "$rc"
 check "permanent failure -> bounded at MODEL_DOWNLOAD_ATTEMPTS" 4 "$(calls_made "$stub")"
 
-# 4. The model id must reach the download call — a retry loop around the wrong
-#    repo would still "pass" tests 1-3.
+# 4. The model id must reach the download call -- a retry loop around the wrong
+#    repo would still "pass" tests 1-3. It must arrive as a trailing ARGUMENT
+#    and must not appear in the Python source at all; see test 6 for why.
 stub="$(make_stub 0)"
 PATH="$stub:$PATH" MODEL_DOWNLOAD_BACKOFF_SECONDS=0 sh "$SCRIPT" ivrit-ai/whisper-large-v3-turbo-ct2
-if grep -q "repo_id='ivrit-ai/whisper-large-v3-turbo-ct2'" "$stub/calls"; then
-    echo "  ok: model id is passed through to snapshot_download"
-else
-    echo "  FAIL: model id missing from the python invocation" >&2
-    failures=$((failures + 1))
-fi
+recorded="$(cat "$stub/calls")"
+case "$recorded" in
+    *" ivrit-ai/whisper-large-v3-turbo-ct2")
+        echo "  ok: model id is passed to python as a trailing argument" ;;
+    *)
+        echo "  FAIL: model id is not the final argument: $recorded" >&2
+        failures=$((failures + 1)) ;;
+esac
+# The source half must be free of it -- otherwise it is being interpolated.
+source_part="${recorded% ivrit-ai/whisper-large-v3-turbo-ct2}"
+case "$source_part" in
+    *ivrit-ai*)
+        echo "  FAIL: model id is interpolated into the python source" >&2
+        failures=$((failures + 1)) ;;
+    *)
+        echo "  ok: model id does not appear in the python source" ;;
+esac
 
 # 5. The exact invocation is pinned. A stub interpreter accepts ANY arguments,
 #    so tests 1-4 pass just as happily against a call the real
@@ -90,11 +102,44 @@ fi
 #    because this test cannot.
 stub="$(make_stub 0)"
 PATH="$stub:$PATH" MODEL_DOWNLOAD_BACKOFF_SECONDS=0 sh "$SCRIPT" some/model
-expected="-c from huggingface_hub import snapshot_download; snapshot_download(repo_id='some/model')"
+expected="-c import sys; from huggingface_hub import snapshot_download; snapshot_download(repo_id=sys.argv[1]) some/model"
 check "the download call is exactly the one the base image accepts" \
     "$expected" "$(cat "$stub/calls")"
 
-# 6. A missing model id is a usage error, not a silent five-attempt no-op.
+# 6. MODEL_ID must reach Python as DATA, never as source. This one runs a real
+#    interpreter against a stub `huggingface_hub` module, because a fake
+#    `python` cannot show whether a payload would have executed. MODEL_ID is a
+#    build arg, so interpolating it into `-c` source made it runnable Python.
+real_dir="$(mktemp -d)"
+cat > "$real_dir/huggingface_hub.py" <<'STUBMOD'
+import os
+def snapshot_download(repo_id, **kwargs):
+    with open(os.environ["PROBE_REPO_ID"], "w") as fh:
+        fh.write(repo_id)
+STUBMOD
+cat > "$real_dir/python" <<PYWRAP
+#!/bin/sh
+PYTHONPATH="$real_dir" exec python3 "\$@"
+PYWRAP
+chmod +x "$real_dir/python"
+
+inject_marker="$real_dir/INJECTED"
+repo_id_seen="$real_dir/repo_id"
+payload="x'); __import__('os').system('touch $inject_marker'); ('"
+
+PATH="$real_dir:$PATH" PROBE_REPO_ID="$repo_id_seen" MODEL_DOWNLOAD_BACKOFF_SECONDS=0 \
+    sh "$SCRIPT" "$payload" >/dev/null 2>&1 || true
+
+if [ -e "$inject_marker" ]; then
+    echo "  FAIL: a crafted MODEL_ID executed code during the download" >&2
+    failures=$((failures + 1))
+else
+    echo "  ok: a crafted MODEL_ID does not execute code"
+fi
+check "the crafted model id arrives verbatim as data" \
+    "$payload" "$(cat "$repo_id_seen" 2>/dev/null)"
+
+# 7. A missing model id is a usage error, not a silent five-attempt no-op.
 set +e
 sh "$SCRIPT" >/dev/null 2>&1
 rc=$?
