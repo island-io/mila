@@ -213,14 +213,16 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
                                            hold: gate)
 
         session.feed(transcript: "[00:00] First meeting.", immediate: true)
-        XCTAssertTrue(await waitUntil { calls.value.count == 1 },
+        let firstStarted = await waitUntil { calls.value.count == 1 }
+        XCTAssertTrue(firstStarted,
                       "precondition: recording one's tick must be in flight")
 
         // The recording stops and a new one starts before the LLM answers.
         session.cancel()
         session.start()
         session.feed(transcript: "[00:00] Second meeting.", immediate: true)
-        XCTAssertTrue(await waitUntil { calls.value.count == 2 },
+        let secondStarted = await waitUntil { calls.value.count == 2 }
+        XCTAssertTrue(secondStarted,
                       "precondition: the new recording's tick must have started")
 
         // Let the ABANDONED tick finish, underneath the live one.
@@ -238,7 +240,8 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
 
         // And the surviving tick still completes normally once released.
         gate.release(2)
-        XCTAssertTrue(await waitUntil(timeout: 3) { !session.isThinking },
+        let drained = await waitUntil(timeout: 3) { !session.isThinking }
+        XCTAssertTrue(drained,
                       "the new recording's tick must still finish and clear state on its own")
     }
 
