@@ -47,10 +47,38 @@ final class MilaStoreReaderTests: XCTestCase {
         }
     }
 
+    /// Every transcript one reader rendered, in order.
+    ///
+    /// The waste #241 is about is invisible for the same reason #201's was:
+    /// a transcript that is rendered, scanned and discarded produces exactly
+    /// the results a returned one does. Counting the renders is the only way
+    /// an assertion can tell "scored every candidate" from "rendered every
+    /// candidate".
+    private final class RenderLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var titles: [String] = []
+
+        var count: Int { read { $0.count } }
+        var recordingTitles: [String] { read { $0 } }
+
+        func record(_ title: String) {
+            lock.lock()
+            defer { lock.unlock() }
+            titles.append(title)
+        }
+
+        private func read<T>(_ body: ([String]) -> T) -> T {
+            lock.lock()
+            defer { lock.unlock() }
+            return body(titles)
+        }
+    }
+
     private func writeStore(_ recordings: [StoredRecording],
                             recordingsDir: URL? = nil,
                             storeFile: URL? = nil,
-                            sidecarReads log: SidecarReadLog? = nil) throws -> MilaStoreReader {
+                            sidecarReads log: SidecarReadLog? = nil,
+                            renders renderLog: RenderLog? = nil) throws -> MilaStoreReader {
         let recsDir = recordingsDir ?? root.appendingPathComponent("Recordings", isDirectory: true)
         let store = storeFile ?? root.appendingPathComponent("recordings.json")
         try FileManager.default.createDirectory(at: recsDir, withIntermediateDirectories: true)
@@ -58,16 +86,21 @@ final class MilaStoreReaderTests: XCTestCase {
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try encoder.encode(recordings).write(to: store)
-        guard let log else {
+        guard log != nil || renderLog != nil else {
             return MilaStoreReader(recordingsDirectory: recsDir, storeFileURL: store)
         }
-        // Counts, then reads for real — the reader under test still sees
-        // exactly what production sees.
-        return MilaStoreReader(recordingsDirectory: recsDir, storeFileURL: store,
-                               readSidecar: { url in
-                                   log.record(url)
-                                   return MilaStoreReader.readSidecarFromDisk(url)
-                               })
+        // Counts, then does the real thing — the reader under test still
+        // sees exactly what production sees.
+        return MilaStoreReader(
+            recordingsDirectory: recsDir, storeFileURL: store,
+            readSidecar: { url in
+                log?.record(url)
+                return MilaStoreReader.readSidecarFromDisk(url)
+            },
+            renderTranscript: { recording, reader in
+                renderLog?.record(recording.title)
+                return MilaStoreReader.renderNamedTranscript(recording, reader)
+            })
     }
 
     /// Writes the `.txt` sidecar the app keeps beside the audio file.
@@ -541,5 +574,198 @@ final class MilaStoreReaderTests: XCTestCase {
         }
         XCTAssertEqual(log.fileNames, ["Live.txt", "Live.txt"],
                        "a trashed recording's transcript is never opened, let alone returned")
+    }
+
+    // MARK: - What relevance ranking costs (#241)
+
+    /// Relevance has to SCORE every candidate. It never had to RENDER every
+    /// candidate: a diarized recording's rendered transcript is built out of
+    /// segment strings `recordings.json` already handed over, and the query
+    /// can be counted against those directly.
+    ///
+    /// Against the unfixed reader this asserts two renders and gets 23.
+    func test_relevance_renders_only_the_transcripts_it_returns() throws {
+        let renders = RenderLog()
+        let quiet = (0..<20).map { i in
+            rec("Sync \(i)", daysAgo: Double(i + 10), segments: [
+                .init(start: 0, end: 1, text: "nothing to report", speaker: "SPEAKER_00"),
+            ])
+        }
+        let loud = [
+            rec("A", daysAgo: 3, segments: [
+                .init(start: 0, end: 1, text: "kafka kafka kafka", speaker: "SPEAKER_00"),
+            ]),
+            rec("B", daysAgo: 2, segments: [
+                .init(start: 0, end: 1, text: "kafka kafka", speaker: "SPEAKER_00"),
+            ]),
+            rec("C", daysAgo: 1, segments: [
+                .init(start: 0, end: 1, text: "kafka", speaker: "SPEAKER_00"),
+            ]),
+        ]
+        let reader = try writeStore(quiet + loud, renders: renders)
+
+        let hits = try reader.searchTranscripts(query: "kafka", limit: 2)
+        XCTAssertEqual(hits.map(\.recording.title), ["A", "B"])
+        XCTAssertEqual(hits.map(\.matchCount), [3, 2])
+        XCTAssertEqual(hits.map(\.snippets), [
+            ["SPEAKER_00: kafka kafka kafka"],
+            ["SPEAKER_00: kafka kafka"],
+        ], "the snippets a rendering is for are still exactly what they were")
+        XCTAssertEqual(renders.recordingTitles, ["A", "B"],
+                       "23 candidates scored, two returned, two rendered")
+    }
+
+    /// The guard against the fix that would have been a regression. Making
+    /// relevance cheap by capping the candidate set — scoring the newest few
+    /// and stopping — silently loses the best hit in a large store, which is
+    /// a worse answer rather than a cheaper one. Here the best hit is the
+    /// OLDEST recording, so it is the last thing the traversal reaches: a
+    /// cap of any size below the whole store misses it.
+    func test_relevance_finds_the_best_hit_when_it_sorts_last_in_traversal() throws {
+        let renders = RenderLog()
+        var recordings = (0..<40).map { i in
+            rec("Note \(i)", daysAgo: Double(i), segments: [
+                .init(start: 0, end: 1, text: "budget", speaker: "SPEAKER_00"),
+            ])
+        }
+        recordings.append(rec("Oldest", daysAgo: 99, segments: [
+            .init(start: 0, end: 1, text: "budget budget budget budget", speaker: "SPEAKER_00"),
+        ]))
+        let reader = try writeStore(recordings, renders: renders)
+
+        let hits = try reader.searchTranscripts(query: "budget", limit: 1)
+        XCTAssertEqual(hits.map(\.recording.title), ["Oldest"],
+                       "every candidate is still scored — the cheap score is over the whole "
+                       + "store, not over a prefix of it")
+        XCTAssertEqual(hits.first?.matchCount, 4)
+        XCTAssertEqual(renders.recordingTitles, ["Oldest"],
+                       "and only the winner is rendered")
+    }
+
+    /// The count scored from raw segments has to be the count the rendered
+    /// transcript would have produced — not close to it. This compares the
+    /// two directly over a store built to hit every case the raw scan
+    /// reasons about: a turn collapsed out of two segments, an untrimmed
+    /// segment, a renamed speaker, a raw `SPEAKER_NN` label, an empty
+    /// segment inside a turn, a segment with no speaker, a recording that
+    /// lives only in its sidecar, and one whose segments carry no labels at
+    /// all.
+    func test_scoring_from_raw_segments_agrees_with_the_rendered_count() throws {
+        let store: [StoredRecording] = [
+            rec("Kickoff", daysAgo: 5, segments: [
+                .init(start: 0, end: 1, text: " the quarterly ", speaker: "SPEAKER_00"),
+                .init(start: 1, end: 2, text: "budget review ran long", speaker: "SPEAKER_00"),
+                .init(start: 2, end: 3, text: "Budget again, and BUDGET", speaker: "SPEAKER_01"),
+            ], speakerNames: ["SPEAKER_00": "Daniel"]),
+            rec("Budget sync", daysAgo: 4, segments: [
+                .init(start: 0, end: 1, text: "café résumé", speaker: "SPEAKER_01"),
+                .init(start: 1, end: 2, text: "", speaker: "SPEAKER_01"),
+                .init(start: 2, end: 3, text: "nothing else", speaker: nil),
+            ]),
+            rec("Plain", daysAgo: 3),
+            rec("Legacy", daysAgo: 2, segments: [
+                .init(start: 0, end: 1, text: "no speaker here"),
+            ]),
+        ]
+        let reader = try writeStore(store)
+        try writeSidecar("the budget\nline two mentions budget", for: store[2], in: reader)
+
+        let queries = ["budget", "BUDGET", "quarterly budget", "budget review",
+                       "Daniel", "Daniel:", "SPEAKER_01", "cafe", "resume",
+                       "the quarterly budget review", "  ", "zzz"]
+        for query in queries {
+            var expected: [String: Int] = [:]
+            for recording in store {
+                let count = renderedMatchCount(of: query, for: recording, in: reader)
+                if count > 0 { expected[recording.title] = count }
+            }
+            let hits = try reader.searchTranscripts(query: query, limit: Int.max)
+            var actual: [String: Int] = [:]
+            for hit in hits { actual[hit.recording.title] = hit.matchCount }
+            XCTAssertEqual(actual, expected, "query \(query.debugDescription)")
+        }
+    }
+
+    /// The raw segment scan may rule a recording IN but never OUT by
+    /// mistake. A phrase can exist only across the space the renderer puts
+    /// between two segments of one turn, so a query containing whitespace
+    /// gets no exact count from the raw scan — the longest whitespace-free
+    /// run of it is used to rule out, and here that run is present, so the
+    /// transcript is rendered and counted as before.
+    func test_a_phrase_query_straddling_two_segments_is_still_found() throws {
+        let renders = RenderLog()
+        let recording = rec("Sync", daysAgo: 0, segments: [
+            .init(start: 0, end: 1, text: "we agreed the quarterly", speaker: "SPEAKER_00"),
+            .init(start: 1, end: 2, text: "budget is frozen", speaker: "SPEAKER_00"),
+        ])
+        let reader = try writeStore([recording], renders: renders)
+        XCTAssertEqual(reader.namedTranscript(for: recording),
+                       "SPEAKER_00: we agreed the quarterly budget is frozen",
+                       "precondition: the two segments collapse into one line")
+
+        let hits = try reader.searchTranscripts(query: "quarterly budget")
+        XCTAssertEqual(hits.map(\.matchCount), [1],
+                       "the phrase exists nowhere in the segments, only in the rendering")
+        XCTAssertEqual(renders.count, 1)
+    }
+
+    /// The other thing the raw segments cannot count: a speaker label is
+    /// part of every line of that speaker's turns, so it is counted once per
+    /// TURN, and the flat segment list does not describe turns. A query that
+    /// a label carries is handed back to the renderer.
+    func test_a_query_matching_a_speaker_label_is_still_counted_per_turn() throws {
+        let renders = RenderLog()
+        let recording = rec("Standup", daysAgo: 0, segments: [
+            .init(start: 0, end: 1, text: "morning", speaker: "SPEAKER_00"),
+            .init(start: 1, end: 2, text: "morning", speaker: "SPEAKER_01"),
+            .init(start: 2, end: 3, text: "anything blocking?", speaker: "SPEAKER_00"),
+        ], speakerNames: ["SPEAKER_00": "Daniel"])
+        let reader = try writeStore([recording], renders: renders)
+        XCTAssertEqual(reader.namedTranscript(for: recording),
+                       "Daniel: morning\nSPEAKER_01: morning\nDaniel: anything blocking?",
+                       "precondition: Daniel speaks two of the three turns")
+
+        XCTAssertEqual(try reader.searchTranscripts(query: "Daniel").map(\.matchCount), [2])
+        XCTAssertEqual(renders.count, 1)
+    }
+
+    /// A title-only match needs no transcript: the raw scan already proved
+    /// nothing in the text matches, so there is no snippet to build and
+    /// nothing to render — not even for a hit that IS returned.
+    func test_a_title_only_match_renders_nothing() throws {
+        let renders = RenderLog()
+        let recording = rec("Kafka migration", daysAgo: 0, segments: [
+            .init(start: 0, end: 1, text: "nothing to report", speaker: "SPEAKER_00"),
+        ])
+        let reader = try writeStore([recording], renders: renders)
+
+        let hits = try reader.searchTranscripts(query: "kafka")
+        XCTAssertEqual(hits.map(\.matchCount), [1])
+        XCTAssertEqual(hits.map(\.snippets), [[]])
+        XCTAssertEqual(renders.count, 0)
+    }
+
+    /// Independent oracle for `test_scoring_from_raw_segments_agrees_…`: the
+    /// count `searchTranscripts` produced before #241 — per line, over the
+    /// rendered transcript, plus the title.
+    private func renderedMatchCount(of query: String, for recording: StoredRecording,
+                                    in reader: MilaStoreReader) -> Int {
+        func count(_ needle: String, _ haystack: String) -> Int {
+            guard !needle.isEmpty else { return 0 }
+            var found = 0
+            var range = haystack.startIndex..<haystack.endIndex
+            while let match = haystack.range(of: needle,
+                                             options: [.caseInsensitive, .diacriticInsensitive],
+                                             range: range) {
+                found += 1
+                range = match.upperBound..<haystack.endIndex
+            }
+            return found
+        }
+        var total = count(query, recording.title)
+        for line in reader.namedTranscript(for: recording).components(separatedBy: .newlines) {
+            total += count(query, line)
+        }
+        return total
     }
 }

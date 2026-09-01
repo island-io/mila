@@ -84,9 +84,13 @@ work a `search_transcripts` call does is worth knowing:
   relies on comes from it — so what `limit` bounds here is the per-recording
   transcript work, not the metadata read.
 - `sort: "relevance"` (the default) ranks by match count, and that means
-  scoring every recording before it can pick the top few. Its cost grows
-  with the size of your library. Recordings with speaker labels are scored
-  from `recordings.json` alone; the rest cost one transcript file read each.
+  scoring every recording before it can pick the top few — it never gives up
+  on part of your library to go faster, so the best match is always found.
+  Its cost grows with the size of that library. Recordings with speaker
+  labels are scored straight out of `recordings.json`, without opening or
+  formatting anything; the rest cost one transcript file read each, because
+  that file *is* the transcript. Only the results that come back are
+  formatted, at most `limit` of them.
 
 If you only want the most recent mentions, `sort: "created_at"` with a small
 `limit` is both cheaper and usually the better question.

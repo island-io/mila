@@ -11,7 +11,7 @@ import Foundation
 /// anything between calls, so the only way to make a call cheaper is to make
 /// it do less work, not to reuse work from an earlier one. `searchTranscripts`
 /// is where that matters — see its own note for what one call costs, what
-/// `limit` bounds, and what it deliberately does not (#201).
+/// `limit` bounds, and what it deliberately does not (#201, #241).
 public struct MilaStoreReader: Sendable {
 
     public let recordingsDirectory: URL
@@ -36,20 +36,44 @@ public struct MilaStoreReader: Sendable {
         try? String(contentsOf: $0, encoding: .utf8)
     }
 
+    /// How a recording's transcript is rendered during a search.
+    ///
+    /// Injectable for exactly the same reason as `SidecarReader`, and to pin
+    /// the same kind of invisible work: a transcript that is rendered,
+    /// scanned for a query and thrown away changes nothing an assertion over
+    /// the RESULTS can see. Rendering one for every candidate on the
+    /// relevance path was #241, so the tests count renders the way they
+    /// count sidecar reads. Production always gets `renderNamedTranscript`.
+    ///
+    /// The reader arrives as a parameter rather than a captured `self`
+    /// because the default is a `static let`, evaluated before any instance
+    /// exists.
+    typealias TranscriptRenderer = @Sendable (StoredRecording, MilaStoreReader) -> String
+
+    static let renderNamedTranscript: TranscriptRenderer = { recording, reader in
+        reader.namedTranscript(for: recording)
+    }
+
     private let readSidecar: SidecarReader
+    private let renderTranscript: TranscriptRenderer
 
     public init(recordingsDirectory: URL, storeFileURL: URL) {
         self.init(recordingsDirectory: recordingsDirectory,
                   storeFileURL: storeFileURL,
-                  readSidecar: Self.readSidecarFromDisk)
+                  readSidecar: Self.readSidecarFromDisk,
+                  renderTranscript: Self.renderNamedTranscript)
     }
 
-    /// Test seam — see `SidecarReader`.
+    /// Test seams — see `SidecarReader` and `TranscriptRenderer`. Both are
+    /// required rather than defaulted, so this initialiser can never be
+    /// confused with the public two-argument one above.
     init(recordingsDirectory: URL, storeFileURL: URL,
-         readSidecar: @escaping SidecarReader) {
+         readSidecar: @escaping SidecarReader,
+         renderTranscript: @escaping TranscriptRenderer) {
         self.recordingsDirectory = recordingsDirectory
         self.storeFileURL = storeFileURL
         self.readSidecar = readSidecar
+        self.renderTranscript = renderTranscript
     }
 
     /// The store paths an external reader ends up on.
@@ -291,14 +315,17 @@ public struct MilaStoreReader: Sendable {
     ///   * one `recordings.json` decode, which is also where the trashed
     ///     filter is applied — candidates come from `listRecordings`, so
     ///     nothing below can reach a row the listing hides;
-    ///   * per candidate, the rendered transcript: free for a diarized
-    ///     recording (its segments are already decoded and its sidecar is
-    ///     never part of the rendering), one file read for a recording with
-    ///     no speaker labels, whose sidecar IS its transcript;
-    ///   * per candidate whose transcript contains the query at all, a
-    ///     second per-line pass to count matches and build snippets. A
-    ///     non-matching recording — the common case for a specific query —
-    ///     never pays for the line split or the per-line scans.
+    ///   * per candidate, one scan for the query. A diarized recording is
+    ///     scanned where it already sits — the raw segment strings the
+    ///     decode produced — and nothing is built, copied or opened for it
+    ///     (`rawScore`). A recording with no speaker labels costs one file
+    ///     read, because its `.txt` sidecar IS its transcript;
+    ///   * per candidate whose text contains the query at all, a per-line
+    ///     pass to count matches. A non-matching recording — the common
+    ///     case for a specific query — never pays for the line split or the
+    ///     per-line scans;
+    ///   * per RETURNED hit that carries a snippet, one rendered transcript.
+    ///     At most `limit` of them, whichever way the results are sorted.
     ///
     /// **What `limit` bounds.** `sort: .createdAt` is bounded by it: date
     /// order is the traversal order, so the scan stops at the `limit`-th hit
@@ -307,17 +334,25 @@ public struct MilaStoreReader: Sendable {
     /// sorted whole by `listRecordings`, because that metadata is where the
     /// traversal order the early stop depends on comes from.
     ///
-    /// `sort: .relevance` (the default) is NOT, and cannot be: ranking by
-    /// match count has to score every candidate before it knows which few
-    /// are the top ones. Capping the candidate set instead — title matches
-    /// first, then a few transcripts — would drop the best hit in a large
-    /// store silently, which is a worse answer rather than a cheaper one.
-    /// So the ceiling on the default path stays linear in the store: one
-    /// transcript render per non-trashed recording, plus one sidecar read
-    /// per undiarized one. #201 reduced the constant (it used to be one read
-    /// per recording unconditionally, diarized or not); it did not remove
-    /// the linear term, and a store in the tens of thousands would want the
-    /// on-disk index that issue also weighs.
+    /// `sort: .relevance` (the default) is NOT bounded by it, and cannot be:
+    /// ranking by match count has to score every candidate before it knows
+    /// which few are the top ones, and it still does. Capping the candidate
+    /// set instead — title matches first, then a few transcripts — would
+    /// drop the best hit in a large store silently, which is a worse answer
+    /// rather than a cheaper one. Every non-trashed recording is scored.
+    ///
+    /// What `limit` DOES bound on the relevance path is the rendering
+    /// (#241). Scoring a diarized recording never needed the rendered
+    /// transcript: see `rawScore`, which counts the query against the raw
+    /// segment text `recordings.json` already decoded and gets the identical
+    /// number. So the transcript is rendered only for the hits that come
+    /// back — at most `limit` of them, and only those that carry a snippet —
+    /// where before it was rendered once per candidate and thrown away.
+    ///
+    /// What stays linear is the scan itself, and the sidecar read for a
+    /// recording with no speaker labels, whose transcript exists nowhere
+    /// else: those ARE the text, so no rearrangement avoids them. A store in
+    /// the tens of thousands still wants the on-disk index #201 weighs.
     public func searchTranscripts(query: String,
                                   speaker: String? = nil,
                                   sort: SearchSortKey = .relevance,
@@ -347,17 +382,17 @@ public struct MilaStoreReader: Sendable {
                                             sort: .createdAt,
                                             order: sortedByRecency ? order : .desc,
                                             limit: Int.max)
-        var hits: [SearchHit] = []
+        var scored: [ScoredCandidate] = []
         for rec in candidates {
-            guard let hit = searchHit(for: rec, query: query) else { continue }
-            hits.append(hit)
+            guard let candidate = score(rec, for: query) else { continue }
+            scored.append(candidate)
             // Already in output order, so the first `cap` hits ARE the
             // answer: everything after this point in the store can only be
             // older (or newer, ascending) than results that are already in.
-            if sortedByRecency, hits.count >= cap { break }
+            if sortedByRecency, scored.count >= cap { break }
         }
         if !sortedByRecency {
-            hits.sort { a, b in
+            scored.sort { a, b in
                 let comparison: ComparisonResult
                 if a.matchCount != b.matchCount {
                     comparison = compare(a.matchCount, b.matchCount)
@@ -367,42 +402,181 @@ public struct MilaStoreReader: Sendable {
                 return isOrdered(comparison, order)
             }
         }
-        return Array(hits.prefix(cap))
+        // Only now — with the answer known — does anything get rendered.
+        return scored.prefix(cap).map { hit(for: $0, query: query) }
     }
 
-    /// One recording's hit, or nil when it does not match.
+    /// A candidate that matched, before it is known to be in the answer.
     ///
-    /// Ordered cheapest-first: the title is already in memory, the
-    /// transcript may cost a file read, and the per-line pass allocates a
-    /// string per line and re-scans each one.
-    private func searchHit(for recording: StoredRecording, query: String) -> SearchHit? {
+    /// `snippets` is `nil` when the count came from `rawScore` and no
+    /// transcript was rendered: snippets are the one part of a hit that
+    /// needs the rendering, so they wait until the candidate has survived
+    /// the ranking. Candidates that do not survive are never rendered at
+    /// all, which is the whole of #241.
+    private struct ScoredCandidate {
+        let recording: StoredRecording
+        let matchCount: Int
+        let snippets: [String]?
+    }
+
+    /// One recording's score, or nil when it does not match.
+    ///
+    /// Ordered cheapest-first: the title is already in memory, the raw
+    /// segments are already decoded, and only failing both of those costs a
+    /// rendered transcript — which for a recording with no speaker labels
+    /// costs a file read.
+    private func score(_ recording: StoredRecording, for query: String) -> ScoredCandidate? {
         let titleMatches = matchCount(of: query, in: recording.title)
-        let transcript = namedTranscript(for: recording)
-        var textMatches = 0
-        var snippets: [String] = []
+        switch rawScore(of: query, for: recording) {
+        case .exact(let textMatches):
+            let total = titleMatches + textMatches
+            guard total > 0 else { return nil }
+            // Nothing in the transcript matched, so there is nothing to
+            // snip: the rendering has no answer to contribute even if this
+            // candidate is returned.
+            return ScoredCandidate(recording: recording, matchCount: total,
+                                   snippets: textMatches == 0 ? [] : nil)
+        case .noMatch:
+            guard titleMatches > 0 else { return nil }
+            return ScoredCandidate(recording: recording, matchCount: titleMatches, snippets: [])
+        case .unknown:
+            let transcript = renderTranscript(recording, self)
+            let (textMatches, snippets) = countAndSnippets(of: query, in: transcript)
+            let total = titleMatches + textMatches
+            guard total > 0 else { return nil }
+            return ScoredCandidate(recording: recording, matchCount: total, snippets: snippets)
+        }
+    }
+
+    /// Fills in the snippets a returned hit needs, rendering the transcript
+    /// if that was deferred. The match count is the one the ranking used —
+    /// `rawScore`'s count and the rendered count are the same number (see
+    /// its note), and reporting the other one would let a payload disagree
+    /// with the order it arrived in.
+    private func hit(for candidate: ScoredCandidate, query: String) -> SearchHit {
+        if let snippets = candidate.snippets {
+            return SearchHit(recording: candidate.recording,
+                             matchCount: candidate.matchCount, snippets: snippets)
+        }
+        let transcript = renderTranscript(candidate.recording, self)
+        return SearchHit(recording: candidate.recording,
+                         matchCount: candidate.matchCount,
+                         snippets: countAndSnippets(of: query, in: transcript).snippets)
+    }
+
+    /// Per-line match count and up to three context snippets over a rendered
+    /// transcript.
+    private func countAndSnippets(of query: String,
+                                  in transcript: String) -> (count: Int, snippets: [String]) {
         // Every line is a contiguous substring of the transcript, so if the
         // whole transcript does not contain the query, no line can either —
-        // one scan rules out the per-line pass for a non-matching recording.
+        // one scan rules out the per-line pass.
         //
         // This is a gate, not a replacement: counting over the whole string
         // would NOT be equivalent, because a query containing a newline
         // matches the joined transcript while matching no single line. The
         // counts a caller sees stay per-line; only the work is skipped.
-        if contains(query, in: transcript) {
-            let lines = transcript.components(separatedBy: .newlines)
-            for (i, line) in lines.enumerated() {
-                let n = matchCount(of: query, in: line)
-                guard n > 0 else { continue }
-                textMatches += n
-                if snippets.count < 3 {
-                    let context = lines[max(0, i - 1)...min(lines.count - 1, i + 1)]
-                    snippets.append(context.joined(separator: "\n"))
-                }
+        guard contains(query, in: transcript) else { return (0, []) }
+        var textMatches = 0
+        var snippets: [String] = []
+        let lines = transcript.components(separatedBy: .newlines)
+        for (i, line) in lines.enumerated() {
+            let n = matchCount(of: query, in: line)
+            guard n > 0 else { continue }
+            textMatches += n
+            if snippets.count < 3 {
+                let context = lines[max(0, i - 1)...min(lines.count - 1, i + 1)]
+                snippets.append(context.joined(separator: "\n"))
             }
         }
-        let total = titleMatches + textMatches
-        guard total > 0 else { return nil }
-        return SearchHit(recording: recording, matchCount: total, snippets: snippets)
+        return (textMatches, snippets)
+    }
+
+    /// What the raw material of a recording says about `query`, without
+    /// rendering its transcript.
+    private enum RawScore {
+        /// Exactly the count `countAndSnippets` would report — not an
+        /// estimate, not a lower bound.
+        case exact(Int)
+        /// Proof that no line of the rendered transcript matches.
+        case noMatch
+        /// Nothing proved; the transcript has to be rendered.
+        case unknown
+    }
+
+    /// Score `query` against the pieces `TranscriptFormatter.plainText`
+    /// builds a transcript OUT of, instead of against the transcript.
+    ///
+    /// The rendering inserts exactly three separators: `": "` after a
+    /// speaker label, `" "` between segments of one turn, and `"\n"`
+    /// between turns. **Every one of them contains whitespace**, and
+    /// case/diacritic folding neither deletes a character nor turns a
+    /// non-whitespace one into whitespace. So a run of the query with no
+    /// whitespace in it cannot span two pieces: wherever it occurs in the
+    /// rendered text it occurs inside a single `"<label>:"` or inside a
+    /// single segment's text. And a segment's text is trimmed of whitespace
+    /// before it goes in, so an occurrence in the trimmed text is an
+    /// occurrence in the raw text and vice versa — the raw string
+    /// `recordings.json` already handed over can be scanned instead, with
+    /// nothing built and nothing copied.
+    ///
+    /// That gives two answers for the price of a scan:
+    ///
+    ///   * when the whole query is whitespace-free, its occurrences are
+    ///     partitioned across the segments, so summing the per-segment
+    ///     counts IS the per-line count — `.exact`;
+    ///   * otherwise the longest whitespace-free run of the query is a
+    ///     substring of it, so every occurrence of the query contains one of
+    ///     that run. No run anywhere means no match anywhere — `.noMatch` —
+    ///     which is what rules out the overwhelming majority of a store for
+    ///     a phrase query.
+    ///
+    /// Two cases hand back `.unknown` rather than guess. A recording with no
+    /// speaker labels renders to its `.txt` sidecar, and reading that file
+    /// is precisely the work this would have to do to answer — so it is left
+    /// to the rendering path, which reads it once. And a query that occurs
+    /// in a speaker label is counted once per TURN, which the flat segment
+    /// list does not describe; that is rare enough to pay for a rendering.
+    private func rawScore(of query: String, for recording: StoredRecording) -> RawScore {
+        // `matchCount` and `contains` both report nothing for an empty
+        // needle, so an empty query matches nothing, anywhere, for free.
+        guard !query.isEmpty else { return .noMatch }
+        guard recording.segments.contains(where: { $0.speaker != nil }) else { return .unknown }
+        guard let probe = longestWhitespaceFreeRun(in: query) else { return .unknown }
+
+        var seenSpeakers = Set<String>()
+        for segment in recording.segments {
+            guard let raw = segment.speaker, seenSpeakers.insert(raw).inserted else { continue }
+            // The colon belongs to the piece: `"Daniel:"` is a
+            // whitespace-free query that matches the rendered line while
+            // matching neither the label nor any segment on its own.
+            if contains(probe, in: (recording.speakerNames[raw] ?? raw) + ":") {
+                return .unknown
+            }
+        }
+
+        // No label carries the probe, so every occurrence is inside one
+        // segment — countable when the probe is the whole query, and merely
+        // rulable-out when it is one word of a phrase.
+        let exact = probe.count == query.count
+        var total = 0
+        for segment in recording.segments {
+            if exact {
+                total += matchCount(of: query, in: segment.text)
+            } else if contains(probe, in: segment.text) {
+                return .unknown
+            }
+        }
+        return exact ? .exact(total) : .noMatch
+    }
+
+    /// The longest stretch of `query` with no whitespace in it, or nil when
+    /// the query is nothing but whitespace (which no piece of the rendering
+    /// can be scanned for — the separators are made of it).
+    private func longestWhitespaceFreeRun(in query: String) -> String? {
+        query.split(whereSeparator: { $0.isWhitespace })
+            .max(by: { $0.count < $1.count })
+            .map { String($0) }
     }
 
     /// Three-way comparison for any `Comparable`.
