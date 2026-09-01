@@ -110,8 +110,8 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
                                          embedding: observed.observedCentroid,
                                          sampleCount: observed.observedCount)
         }
-        store.onSpeakerIDRetired = { recordingID, rawID in
-            snapshots.forget(speaker: rawID, in: recordingID)
+        store.onSpeakerIDAbsorbed = { recordingID, sourceRawID, targetRawID in
+            snapshots.absorb(speaker: sourceRawID, into: targetRawID, in: recordingID)
         }
 
         return World(store: store, profiles: profiles, snapshots: snapshots,
@@ -220,7 +220,9 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
     }
 
     /// An unnamed source still retires its id, so a later split cannot be
-    /// handed a number whose embedding is somebody else's.
+    /// handed a number whose embedding is somebody else's. Its observation
+    /// moves onto the target rather than being dropped — the audio is the
+    /// target's now.
     func test_merging_retires_the_source_ids_observation() {
         let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
                                      segment("SPEAKER_01", 2, "two")],
@@ -231,7 +233,46 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
 
         XCTAssertNil(w.snapshots.observation(forSpeaker: "SPEAKER_01", in: w.recordingID),
                      "the retired id must not keep an embedding a reused number could find")
-        XCTAssertNotNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID))
+        XCTAssertEqual(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID)?
+                        .observedCount, 2,
+                       "the target's observation accounts for both speakers now")
+    }
+
+    /// **The invariant, end to end: what a merge adds to a profile, an
+    /// un-name takes back.**
+    ///
+    /// This is the one that catches the whole family of bugs where the
+    /// snapshot ledger and the profile store drift apart. `mergeSpeakers`
+    /// moves the source's contribution onto the target's profile; if the
+    /// target's *snapshot* is not extended to match, un-naming the target
+    /// subtracts only its original sample and leaves the absorbed voice in
+    /// the profile with no way to reach it.
+    func test_a_merge_then_un_naming_the_target_leaves_no_residue() throws {
+        let aliceVoice: [Float] = [1, 0, 0, 0]
+        let bobVoice: [Float] = [0, 1, 0, 0]
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_01", 2, "two")],
+                          snapshotEntries: [("SPEAKER_00", aliceVoice, 1),
+                                            ("SPEAKER_01", bobVoice, 1)])
+        // Both speakers named, so both observations are in Alice's profile
+        // the way the app would have put them there.
+        w.store.setSpeakerName("Alice", forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+        w.store.setSpeakerName("Bob", forSpeaker: "SPEAKER_01", recordingID: w.recordingID)
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 1)
+        XCTAssertEqual(w.profiles.profile(named: "Bob")?.sampleCount, 1)
+
+        // The diarizer split one person in two; the user merges them.
+        w.store.mergeSpeakers(from: "SPEAKER_01", into: "SPEAKER_00", recordingID: w.recordingID)
+        XCTAssertNil(w.profiles.profile(named: "Bob"),
+                     "Bob's only observation was not his — his profile goes with it")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 2,
+                       "Alice absorbed it")
+
+        // …and now the user decides Alice was wrong too.
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+
+        XCTAssertNil(w.profiles.profile(named: "Alice"),
+                     "both observations came back out; nothing of this recording is left behind")
     }
 
     func test_merging_a_speaker_into_itself_is_a_no_op() {

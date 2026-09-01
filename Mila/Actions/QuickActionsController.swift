@@ -197,14 +197,15 @@ final class QuickActionsController: ObservableObject {
     var onRecordingFinalized: ((_ recordingID: UUID, _ liveSpeakerNames: [String: String]) -> Void)?
 
     /// Called when the offline re-diarize pass has re-keyed a recording's raw
-    /// `SPEAKER_NN` ids. `SpeakerNameRemapper` carries the *names* across that
-    /// boundary; nothing carried the observed *embeddings*, which stayed
-    /// keyed to the ids the pass just retired. MilaApp wires this to
-    /// `ObservedVoiceSnapshots.invalidate` — an embedding under a re-keyed id
-    /// may belong to a different person, and no snapshot at all is the honest
-    /// answer (the on-demand extractor can produce a fresh one when a speaker
-    /// is next named).
-    var onSpeakerIDsRekeyed: ((_ recordingID: UUID) -> Void)?
+    /// `SPEAKER_NN` ids, carrying the new→old mapping the names were remapped
+    /// on. MilaApp wires it to `ObservedVoiceSnapshots.remapSpeakerIDs`.
+    ///
+    /// The observed embeddings have to cross this boundary on **the same**
+    /// evidence as the names, or the two disagree: the names (and so the
+    /// profile contributions they justified) survive while the observations
+    /// that would reverse them do not, and un-naming a speaker after a
+    /// re-diarize silently corrects nothing.
+    var onSpeakerIDsRekeyed: ((_ recordingID: UUID, _ newToOldSpeakerIDs: [String: String]) -> Void)?
 
     /// Late-bound by MilaApp. When the live-transcript path saves a
     /// recording directly (skipping `transcription.enqueue` because the
@@ -1276,11 +1277,15 @@ final class QuickActionsController: ObservableObject {
                                 to: rediarized)
                             self.store.update(current)
                             updated = current
-                            // The names followed the utterances; the observed
-                            // embeddings could not — they are keyed to the ids
-                            // this pass just retired. Drop them rather than let
-                            // a reused `SPEAKER_NN` resolve to another voice.
-                            self.onSpeakerIDsRekeyed?(id)
+                            // The observed embeddings follow the utterances
+                            // onto the new ids, on the same dominance mapping
+                            // the names just used. Anything else leaves the
+                            // profile contributions those names justified
+                            // impossible to reverse.
+                            self.onSpeakerIDsRekeyed?(
+                                id,
+                                SpeakerNameRemapper.dominantOldIDs(from: preRediarize,
+                                                                   to: rediarized))
                         }
                     }
                 }

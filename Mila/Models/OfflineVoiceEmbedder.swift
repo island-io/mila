@@ -102,6 +102,12 @@ final class OfflineVoiceEmbedder {
         guard settings.isConfigured, let store else { return }
         guard let rec = store.recordings.first(where: { $0.id == recordingID }),
               let span = Self.longestSpan(for: rawID, in: rec) else { return }
+        // Whether this name already had a profile, so the write below can
+        // tell "create the profile this hand-naming is for" from "recreate
+        // one the user deleted while Python was running". `updateProfile`
+        // creates on a missing name — that is how hand-naming makes a
+        // profile at all — so the create path cannot simply be closed.
+        let profileExistedAtStart = profiles.profileExists(name: name)
         spawn { [self] in
             let embeddings = await extract(spans: [span], for: recordingID)
             guard let centroid = embeddings[rawID], !centroid.isEmpty else { return }
@@ -112,6 +118,16 @@ final class OfflineVoiceEmbedder {
                       !live.isTrashed,
                       live.speakerNames[rawID] == name else {
                     embedLog.log("on-demand embedding discarded: \(rawID, privacy: .public) is no longer that name")
+                    return
+                }
+                // Deleting a voice profile is the strongest statement the user
+                // can make about it, and this write would silently undo it —
+                // recreating the file with a centroid matching the erased one
+                // to better than 0.999 cosine. Same hazard, and the same
+                // answer, as `RecognisedSpeakerAssigner`'s `profileStillStored`
+                // gate.
+                if profileExistedAtStart, !self.profiles.profileExists(name: name) {
+                    embedLog.log("on-demand embedding discarded: the profile was deleted while extracting")
                     return
                 }
                 // `merge`, never `record`: naming a second speaker on the

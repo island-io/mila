@@ -164,6 +164,96 @@ final class ObservedVoiceSnapshots {
         snapshotLog.log("snapshot: dropped a retired speaker id")
     }
 
+    /// Move one speaker's observation onto another within a recording: the
+    /// source id has stopped existing and its audio is now the target's.
+    ///
+    /// **This is the snapshot half of a merge, and it is not optional.** The
+    /// store's merge also moves the source's *profile* contribution to the
+    /// target (subtract from the old name, add to the new). If the snapshot
+    /// did not follow, the target would carry two observations' worth of
+    /// profile weight while its snapshot still described one — and
+    /// `subtractObservation` is only an inverse of `updateProfile` while the
+    /// two agree. Un-naming the target afterwards would take back half of
+    /// what this recording contributed and leave the rest in the profile
+    /// with no way to reach it.
+    ///
+    /// Combined with the same weighted fold `updateProfile` uses, which is
+    /// what makes "add A then add B" and "add mean(A, B) with the summed
+    /// count" interchangeable.
+    func absorb(speaker sourceRawID: String, into targetRawID: String, in recordingID: UUID) {
+        guard sourceRawID != targetRawID else { return }
+        guard var observations = byRecording[recordingID],
+              let source = observations.removeValue(forKey: sourceRawID) else { return }
+        if let target = observations[targetRawID] {
+            if let combined = Self.combining(target, source) {
+                observations[targetRawID] = combined
+            } else {
+                // Dimension mismatch (a model change between the two
+                // extractions). Keep the target's own and drop the source's
+                // rather than persist a centroid of two different spaces.
+                snapshotLog.log("snapshot: cannot absorb across embedding dimensions — source dropped")
+            }
+        } else {
+            observations[targetRawID] = source
+        }
+        byRecording[recordingID] = observations
+    }
+
+    /// Weighted mean of two observations, weighting by their sample counts.
+    private static func combining(_ a: Observation, _ b: Observation) -> Observation? {
+        guard a.observedCentroid.count == b.observedCentroid.count,
+              !a.observedCentroid.isEmpty else { return nil }
+        let total = a.observedCount + b.observedCount
+        guard total > 0 else { return nil }
+        var merged = [Float](repeating: 0, count: a.observedCentroid.count)
+        for i in merged.indices {
+            merged[i] = (a.observedCentroid[i] * Float(a.observedCount)
+                       + b.observedCentroid[i] * Float(b.observedCount)) / Float(total)
+        }
+        guard merged.allSatisfy({ $0.isFinite }) else { return nil }
+        return Observation(observedCentroid: merged,
+                           observedCount: total,
+                           profileName: a.profileName)
+    }
+
+    /// Carry a recording's observations across a pass that re-keyed its
+    /// `SPEAKER_NN` ids, using the same new→old mapping
+    /// `SpeakerNameRemapper` uses to carry the *names*.
+    ///
+    /// **Why remap rather than invalidate.** Dropping everything was the
+    /// first answer here, and it was wrong in a way that only shows up one
+    /// step later: the offline re-diarize keeps the names (so the profile
+    /// contributions those names justified are still on disk) while the
+    /// observations that would reverse them are gone. Un-naming a speaker
+    /// after a re-diarize then silently corrects nothing — the whole point
+    /// of island-io/mila#237 — on every VAD recording with enough speakers
+    /// to trigger the pass. Remapping keeps the two sides agreeing, on
+    /// exactly the evidence the name remap already trusts: `rediarizeSegments`
+    /// reassigns `.speaker` on the *same* segment array, so per-index pairs
+    /// say which old speaker each new one was.
+    ///
+    /// An old id that dominates **more than one** new id is dropped rather
+    /// than copied to both. Duplicating a name across a split is harmless;
+    /// duplicating an embedding is not, because un-naming both halves would
+    /// subtract the same observation twice.
+    func remapSpeakerIDs(_ newToOld: [String: String], in recordingID: UUID) {
+        guard let existing = byRecording[recordingID] else { return }
+        var timesUsed: [String: Int] = [:]
+        for oldID in newToOld.values { timesUsed[oldID, default: 0] += 1 }
+
+        var remapped: [String: Observation] = [:]
+        for (newID, oldID) in newToOld {
+            guard timesUsed[oldID] == 1, let observation = existing[oldID] else { continue }
+            remapped[newID] = observation
+        }
+        guard !remapped.isEmpty else {
+            invalidate(recordingID)
+            return
+        }
+        byRecording[recordingID] = remapped
+        snapshotLog.log("snapshot: carried \(remapped.count, privacy: .public) of \(existing.count, privacy: .public) observations across a re-key")
+    }
+
     /// The observation for `rawID` **in that specific recording**, or nil
     /// when this recording was never snapshotted (or has been evicted) — in
     /// which case the caller must persist nothing rather than fall back to

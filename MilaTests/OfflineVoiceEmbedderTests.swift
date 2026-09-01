@@ -301,6 +301,48 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
                      "…and nothing was written to disk to be re-loaded on opt-in")
     }
 
+    /// **Finding: an in-flight extraction resurrected a profile the user
+    /// deleted while it ran.** `updateProfile` creates on a missing name —
+    /// that is how hand-naming makes a profile at all — so the write cannot
+    /// simply refuse to create. It has to tell "the profile this naming is
+    /// for" from "the profile the user just erased", and the erased one comes
+    /// back with a centroid matching it to better than 0.999 cosine. Same
+    /// hazard `RecognisedSpeakerAssigner`'s `profileStillStored` gate exists
+    /// for.
+    func test_a_profile_deleted_during_the_embed_is_not_resurrected() async throws {
+        let w = try makeWorld()
+        w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 10)
+        w.probe.returns(["SPEAKER_00": aliceSpeaking])
+        w.store.setSpeakerName("Alice", forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+        w.probe.onFirstEmbed {
+            // Settings → Speakers → delete Alice's voice profile.
+            w.profiles.deleteProfile(name: "Alice")
+        }
+
+        w.embedder.learnNamedSpeaker(recordingID: w.recordingID,
+                                     rawID: "SPEAKER_00", name: "Alice")
+        await w.embedder.awaitPending()
+
+        XCTAssertNil(w.profiles.profile(named: "Alice"),
+                     "the deletion was the user's last word on that profile")
+    }
+
+    /// The negative control for the guard above: hand-naming a speaker whose
+    /// name has no profile yet is exactly how profiles get created, and must
+    /// keep working.
+    func test_naming_a_speaker_with_no_existing_profile_still_creates_one() async throws {
+        let w = try makeWorld()
+        w.probe.returns(["SPEAKER_00": aliceSpeaking])
+        w.store.setSpeakerName("Alice", forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+        XCTAssertNil(w.profiles.profile(named: "Alice"), "precondition: no profile yet")
+
+        w.embedder.learnNamedSpeaker(recordingID: w.recordingID,
+                                     rawID: "SPEAKER_00", name: "Alice")
+        await w.embedder.awaitPending()
+
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.embedding, aliceSpeaking)
+    }
+
     // MARK: - Post-pass matching
 
     func test_a_recognised_speaker_is_named_automatically_after_a_pass() async throws {

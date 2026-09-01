@@ -222,6 +222,142 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
         XCTAssertEqual(snapshots.heldRecordingCount, 1)
     }
 
+    // MARK: - Absorbing a retired id
+
+    /// A merge moves the source's *profile* contribution onto the target, so
+    /// the target's snapshot has to account for both — otherwise un-naming
+    /// the target subtracts one observation from a profile that received two
+    /// and strands the rest with no way to reach it.
+    func test_absorbing_combines_both_observations_under_the_target() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil),
+                                  ("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
+
+        snapshots.absorb(speaker: "SPEAKER_01", into: "SPEAKER_00", in: rec)
+
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec))
+        let merged = snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)
+        XCTAssertEqual(merged?.observedCount, 2, "the target now accounts for both")
+        // Weighted mean of [1,0] x1 and [0,1] x1.
+        XCTAssertEqual(merged?.observedCentroid.first ?? 0, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(merged?.observedCentroid.last ?? 0, 0.5, accuracy: 0.0001)
+    }
+
+    /// The weighting has to match `updateProfile`'s fold, which is what makes
+    /// "add A then add B" and "add mean(A, B) at the summed count"
+    /// interchangeable — and so makes `subtractObservation` an exact inverse
+    /// of the pair.
+    func test_absorbing_weights_by_sample_count() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 3, nil),
+                                  ("SPEAKER_01", [0, 1], 1, nil)]), for: rec)
+
+        snapshots.absorb(speaker: "SPEAKER_01", into: "SPEAKER_00", in: rec)
+
+        let merged = snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)
+        XCTAssertEqual(merged?.observedCount, 4)
+        XCTAssertEqual(merged?.observedCentroid.first ?? 0, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(merged?.observedCentroid.last ?? 0, 0.25, accuracy: 0.0001)
+    }
+
+    /// The target may have no observation of its own — a speaker nobody named
+    /// on a recording with a partial snapshot. The source's simply becomes
+    /// the target's.
+    func test_absorbing_into_a_speaker_with_no_observation_moves_it_across() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_01", [0, 1], 2, "Bob")]), for: rec)
+
+        snapshots.absorb(speaker: "SPEAKER_01", into: "SPEAKER_00", in: rec)
+
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec))
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCount, 2)
+    }
+
+    func test_absorbing_an_unknown_source_or_into_itself_is_a_no_op() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+
+        snapshots.absorb(speaker: "SPEAKER_09", into: "SPEAKER_00", in: rec)
+        snapshots.absorb(speaker: "SPEAKER_00", into: "SPEAKER_00", in: rec)
+
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCount, 1,
+                       "absorbing a speaker into itself must not double its count")
+    }
+
+    /// Two extractions from different embedding models cannot be averaged.
+    /// Keep the target's own rather than persist a centroid spanning two
+    /// spaces.
+    func test_absorbing_across_embedding_dimensions_keeps_the_target() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil),
+                                  ("SPEAKER_01", [0, 1, 0], 1, nil)]), for: rec)
+
+        snapshots.absorb(speaker: "SPEAKER_01", into: "SPEAKER_00", in: rec)
+
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec)?.observedCentroid,
+                       [1, 0])
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec))
+    }
+
+    // MARK: - Carrying observations across a re-key
+
+    /// The offline re-diarize keeps the names, so the observations that back
+    /// them have to survive too — on the same mapping. Dropping them left
+    /// every re-diarized recording unable to correct a profile, which is the
+    /// whole of island-io/mila#237.
+    func test_remapping_carries_observations_onto_the_new_ids() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 2, "Alice"),
+                                  ("SPEAKER_01", [0, 1], 3, nil)]), for: rec)
+
+        // The pass renumbered them the other way round.
+        snapshots.remapSpeakerIDs(["SPEAKER_01": "SPEAKER_00",
+                                   "SPEAKER_00": "SPEAKER_01"], in: rec)
+
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec),
+                       .init(observedCentroid: [1, 0], observedCount: 2, profileName: "Alice"))
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
+                       .init(observedCentroid: [0, 1], observedCount: 3, profileName: nil))
+    }
+
+    /// An old speaker the pass SPLIT in two must not hand the same embedding
+    /// to both halves: un-naming both would subtract one observation twice.
+    /// Names can be duplicated across a split harmlessly; embeddings cannot.
+    func test_remapping_drops_an_observation_a_split_would_duplicate() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 2, nil),
+                                  ("SPEAKER_01", [0, 1], 2, nil)]), for: rec)
+
+        snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00",
+                                   "SPEAKER_02": "SPEAKER_00",
+                                   "SPEAKER_01": "SPEAKER_01"], in: rec)
+
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_00", in: rec),
+                     "SPEAKER_00 was split across two new ids — neither may claim its voice")
+        XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec))
+        XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec)?.observedCentroid,
+                       [0, 1], "the speaker that mapped one-to-one is unaffected")
+    }
+
+    /// A mapping that carries nothing is an invalidation, eviction slot and
+    /// all — an empty entry would hold a slot for a recording with no voices.
+    func test_remapping_that_carries_nothing_releases_the_recording() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil)]), for: rec)
+
+        snapshots.remapSpeakerIDs(["SPEAKER_07": "SPEAKER_09"], in: rec)
+
+        XCTAssertEqual(snapshots.heldRecordingCount, 0)
+    }
+
     // MARK: - Bounded retention
 
     /// Held snapshots are capped, oldest evicted first, so embeddings don't

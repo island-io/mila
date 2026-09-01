@@ -708,12 +708,13 @@ struct MilaApp: App {
             assigner.finish(recording: recordingID, liveSpeakerNames: liveSpeakerNames)
         }
         // The offline re-diarize pass re-keys every `SPEAKER_NN`, so the
-        // snapshot `finish` just took above is keyed to ids that no longer
-        // mean the same voices. `SpeakerNameRemapper` moves the names; the
-        // embeddings cannot follow (a merged cluster's centroid is only
-        // partly the right person), so they are dropped instead.
-        actions.onSpeakerIDsRekeyed = { recordingID in
-            voiceSnapshots.invalidate(recordingID)
+        // snapshot `finish` just took is keyed to ids that no longer mean the
+        // same voices. The observations move with the names, on the same
+        // dominance mapping — dropping them instead would leave every
+        // re-diarized recording's profile contributions impossible to
+        // un-name away, which is the correction #237 exists for.
+        actions.onSpeakerIDsRekeyed = { recordingID, newToOld in
+            voiceSnapshots.remapSpeakerIDs(newToOld, in: recordingID)
         }
         // Save a voice profile when a speaker is named — if the live
         // diarizer observed that speaker *in that recording*, persist it.
@@ -777,12 +778,15 @@ struct MilaApp: App {
             }
         }
 
-        // A raw `SPEAKER_NN` that no longer exists in the recording must not
-        // leave its embedding behind: `splitSegmentSpeaker` hands the lowest
-        // free number to the next split, so the id comes back — and would
-        // resolve against the previous speaker's voice.
-        store.onSpeakerIDRetired = { recordingID, rawID in
-            voiceSnapshots.forget(speaker: rawID, in: recordingID)
+        // A raw `SPEAKER_NN` whose audio became another speaker's hands its
+        // observation over with it. Two things depend on this: the id comes
+        // back (`splitSegmentSpeaker` mints the lowest free number) and would
+        // otherwise resolve to the previous speaker's voice, and the store
+        // has just moved the source's profile contribution to the target, so
+        // the target's snapshot has to account for it or a later un-name
+        // cannot reverse the whole thing.
+        store.onSpeakerIDAbsorbed = { recordingID, sourceRawID, targetRawID in
+            voiceSnapshots.absorb(speaker: sourceRawID, into: targetRawID, in: recordingID)
         }
 
         // Reverse a profile merge when a speaker is un-named or renamed.

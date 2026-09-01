@@ -34,16 +34,22 @@ final class RecordingStore: ObservableObject {
     /// observed embedding from the old profile.
     var onSpeakerUnnamed: ((_ recordingID: UUID, _ rawID: String, _ previousName: String) -> Void)?
 
-    /// Called when a raw `SPEAKER_NN` id stops existing in a recording — the
-    /// source of a merge, or a speaker whose last segment was reassigned
-    /// away. Used by voice recognition to drop that id's observed embedding.
+    /// Called when a raw `SPEAKER_NN` id stops existing because its audio
+    /// became another speaker's — the source of a merge, or a speaker whose
+    /// last segment was reassigned away.
     ///
     /// Separate from `onSpeakerUnnamed`, which is about a *name*: a retired
-    /// id may never have had one, and its embedding is the thing that
-    /// outlives it. `splitSegmentSpeaker` hands the lowest free number to the
-    /// next split, so a retired id comes back — pointing, without this, at
-    /// the previous speaker's voice.
-    var onSpeakerIDRetired: ((_ recordingID: UUID, _ rawID: String) -> Void)?
+    /// id may never have had one, and its observed embedding is the thing
+    /// that outlives it. Two reasons voice recognition needs to hear about
+    /// it. The id comes *back* — `splitSegmentSpeaker` hands out the lowest
+    /// free number — and would otherwise resolve to the previous speaker's
+    /// voice. And the observation has to follow the audio onto the target,
+    /// because this store also moves the source's profile contribution
+    /// there; leaving the snapshot behind would make the target's profile
+    /// weight unreconstructible from its snapshot, and
+    /// `subtractObservation` is only an inverse of `updateProfile` while
+    /// those two agree.
+    var onSpeakerIDAbsorbed: ((_ recordingID: UUID, _ sourceRawID: String, _ targetRawID: String) -> Void)?
 
     private let fileManager = FileManager.default
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
@@ -577,25 +583,7 @@ final class RecordingStore: ObservableObject {
                 recordings[idx].segments[i].speaker = targetRawID
             }
         }
-        let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID)
-        let targetName = recordings[idx].speakerNames[targetRawID]
-        // Same name on both sides (the shape the old auto-merge always had):
-        // subtracting and re-adding the identical observation is a no-op on
-        // the centroid but not on `sampleCount` — a profile sitting at one
-        // sample would be *deleted* by the subtraction and then recreated,
-        // losing its id and its history. Skip both halves instead.
-        if previousName != targetName {
-            if let previousName {
-                onSpeakerUnnamed?(recordingID, sourceRawID, previousName)
-            }
-            if let targetName {
-                onSpeakerNamed?(recordingID, sourceRawID, targetName)
-            }
-        }
-        // Last: the id is gone from the transcript, so its embedding must go
-        // too — `splitSegmentSpeaker` will hand this number out again. Fired
-        // after the hooks above, which still need to resolve through it.
-        onSpeakerIDRetired?(recordingID, sourceRawID)
+        retireSpeaker(sourceRawID, into: targetRawID, at: idx, recordingID: recordingID)
         persist()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
@@ -618,15 +606,53 @@ final class RecordingStore: ObservableObject {
         recordings[recIdx].segments[segIdx].speaker = targetRawID
         if let prev = previousSpeaker,
            !recordings[recIdx].segments.contains(where: { $0.speaker == prev }) {
-            if let previousName = recordings[recIdx].speakerNames.removeValue(forKey: prev) {
-                onSpeakerUnnamed?(recordingID, prev, previousName)
-            }
-            onSpeakerIDRetired?(recordingID, prev)
+            // That was `prev`'s last line, so everything that was `prev` is
+            // now the target — the same thing a merge does, and it gets the
+            // same bookkeeping.
+            retireSpeaker(prev, into: targetRawID, at: recIdx, recordingID: recordingID)
         }
         persist()
         if recordings[recIdx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
         }
+    }
+
+    /// One raw speaker id's audio has become another's. Move the name, the
+    /// profile contribution and the observed embedding together.
+    ///
+    /// **The three have to move as one operation.** A profile's accumulated
+    /// weight is only reversible while it stays reconstructible from the
+    /// snapshots backing it — `subtractObservation` is an exact inverse of
+    /// `updateProfile`'s weighted fold, and nothing else. Moving the profile
+    /// contribution without the snapshot leaves the target holding weight its
+    /// snapshot cannot account for, so a later un-name takes back only part
+    /// of what this recording added and strands the rest. Moving the snapshot
+    /// without the contribution strands it the other way. Both bugs were
+    /// reachable when the merge and reassign paths each did their own half.
+    private func retireSpeaker(_ sourceRawID: String,
+                               into targetRawID: String,
+                               at idx: Int,
+                               recordingID: UUID) {
+        let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID)
+        let targetName = recordings[idx].speakerNames[targetRawID]
+        // Same name on both sides (the shape the old auto-merge always had):
+        // subtracting and re-adding the identical observation is a no-op on
+        // the centroid but not on `sampleCount` — a profile sitting at one
+        // sample would be *deleted* by the subtraction and then recreated,
+        // losing its id and its history. Skip both halves; the snapshot
+        // absorb below still runs, and it is what keeps the ledger matching
+        // the two contributions the profile already received.
+        if previousName != targetName {
+            if let previousName {
+                onSpeakerUnnamed?(recordingID, sourceRawID, previousName)
+            }
+            if let targetName {
+                onSpeakerNamed?(recordingID, sourceRawID, targetName)
+            }
+        }
+        // Last, because both hooks above still resolve through the source's
+        // own snapshot entry.
+        onSpeakerIDAbsorbed?(recordingID, sourceRawID, targetRawID)
     }
 
     /// Split a single segment out into a new, unnamed speaker: the diarizer
@@ -640,7 +666,7 @@ final class RecordingStore: ObservableObject {
     /// `SPEAKER_01` carries no segment while `speakerNames["SPEAKER_01"]`
     /// still says Bob — hand that number to the next split and the new line
     /// renders as Bob, in the transcript and in the regenerated `.srt`.
-    /// Embeddings are kept out of the same trap by `onSpeakerIDRetired`,
+    /// Embeddings are kept out of the same trap by `onSpeakerIDAbsorbed`,
     /// which drops a retired id's observation rather than leaving it for a
     /// reused number to resolve against.
     func splitSegmentSpeaker(segmentID: UUID, recordingID: UUID) {
