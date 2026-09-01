@@ -1389,20 +1389,30 @@ enum LLMRunner {
         // surprises users whose claude/cursor wrappers source nvm/asdf/etc.
         process.environment = childEnvironment(for: executable)
 
-        // CRITICAL: spawn in an empty directory Mila owns — never $HOME, `/`,
-        // or a user folder. macOS attributes any file access by the child
-        // process to *our* bundle ID, so if claude / cursor-agent walks the
-        // cwd looking for project files (which both do — particularly
+        // CRITICAL: spawn in a directory Mila owns that holds nothing — never
+        // $HOME, `/`, or a user folder. macOS attributes any file access by the
+        // child process to *our* bundle ID, so if claude / cursor-agent walks
+        // the cwd looking for project files (which both do — particularly
         // cursor-agent in `-f` mode), the user sees scary TCC prompts saying
         // "Mila would like to access Desktop / Downloads". Launching from an
-        // isolated, empty directory guarantees there's nothing for the LLM
-        // CLI to discover and reach for, so no permission prompts fire.
+        // isolated directory with nothing in it guarantees there's nothing for
+        // the LLM CLI to discover and reach for, so no permission prompts fire.
         //
         // The directory is SHARED and STABLE across every invocation — see
         // `sandboxDirectory()` for why (issue #181: claude derives its
         // `~/.claude/projects/<slug-of-cwd>` project directory from the cwd,
         // so a per-run cwd leaked a per-run project directory forever).
-        process.currentDirectoryURL = sandboxDirectory()
+        //
+        // Because it is shared, it is NOT empty by construction: a CLI that
+        // writes into its cwd leaves the file there for whoever comes next
+        // (issue #190). `acquireSandbox()` takes a reference-counted lease and
+        // empties the directory on the idle transitions, so a child that starts
+        // while nothing else is running still starts in an empty directory. The
+        // `defer` must span the child's whole life — the lease is what stops a
+        // concurrent invocation's sweep from deleting a file this one is using.
+        let sandbox = acquireSandbox()
+        defer { releaseSandbox(sandbox) }
+        process.currentDirectoryURL = sandbox
 
         // Close stdin immediately. Some CLIs (claude) read both stdin AND
         // argv; some (cursor-agent) ignore stdin entirely. We standardised
@@ -1540,9 +1550,10 @@ enum LLMRunner {
     /// Two requirements meet here, and a single stable directory is the only
     /// shape that satisfies both:
     ///
-    /// 1. **TCC isolation.** The child must start in an empty directory Mila
-    ///    owns, so a CLI that scans its cwd for project context finds nothing
-    ///    and no "Mila would like to access Desktop" prompts fire.
+    /// 1. **TCC isolation.** The child must start in a directory Mila owns
+    ///    that holds nothing, so a CLI that scans its cwd for project context
+    ///    finds nothing and no "Mila would like to access Desktop" prompts
+    ///    fire.
     /// 2. **One Claude Code project, not one per run** (issue #181). claude
     ///    stores its conversation transcripts in
     ///    `~/.claude/projects/<slug-of-cwd>/<session-uuid>.jsonl` — the
@@ -1568,8 +1579,45 @@ enum LLMRunner {
     /// temp directory and periodically purges it — either would fragment the
     /// project directory again over time.
     ///
-    /// The directory is created on demand and never removed: `Process.run()`
-    /// fails outright if `currentDirectoryURL` doesn't exist.
+    /// ## What "holds nothing" is worth, exactly (issue #190)
+    ///
+    /// Sharing the directory is what costs it emptiness: any CLI that writes a
+    /// regular file into its cwd leaves it there. So emptiness is not a
+    /// property of the path — it is maintained by `acquireSandbox()` /
+    /// `releaseSandbox(_:)`, which reference-count the invocations currently
+    /// inside and empty the directory on **both** idle transitions: before the
+    /// first child enters, and after the last one leaves. The guarantee that
+    /// buys, stated so a future reader doesn't have to infer it:
+    ///
+    ///   * A child that starts while no other invocation is running always
+    ///     starts in an empty directory. The entry sweep does not trust the
+    ///     exit sweep to have happened, so this holds for the first run after a
+    ///     crash or a force-quit too.
+    ///   * An artifact an invocation writes here is therefore visible only to
+    ///     invocations whose lifetime **overlaps** it. A later, non-overlapping
+    ///     call — a different recording's summary, a Settings → AI Provider
+    ///     test — never sees it.
+    ///
+    /// What it is **not**: a private directory per invocation. Concurrent
+    /// invocations (a Live AI tick and a one-shot Send) deliberately share this
+    /// one cwd, and no sweep may run while any of them is inside — deleting a
+    /// file a live child is using is the worse bug — so overlapping runs can
+    /// see each other's files for as long as they overlap. Giving each run its
+    /// own directory is not available as a fix: claude's project slug is a slug
+    /// of the **full** cwd path, so even a subdirectory of a stable parent
+    /// mints a fresh `~/.claude/projects/<slug>` per run, which is precisely
+    /// the leak #181 removed.
+    ///
+    /// Nothing durable lives here, so sweeping costs nothing: conversations are
+    /// in `~/.claude/projects/<slug>` (never touched, so `--resume` still
+    /// works) and workspace trust is granted per-invocation in argv
+    /// (`cursor-agent -f`, `gemini --skip-trust`), not by state in the cwd.
+    ///
+    /// The directory itself is created on demand and never removed — only its
+    /// contents are swept. `Process.run()` fails outright if
+    /// `currentDirectoryURL` doesn't exist, and the path *is* the claude
+    /// project identity, so remove-and-recreate would race a launching child
+    /// for no benefit.
     static func sandboxDirectory() -> URL {
         let url = sandboxDirectory(appSupportRoot: applicationSupportRoot())
         do {
@@ -1603,6 +1651,103 @@ enum LLMRunner {
         appSupportRoot
             .appendingPathComponent("Mila", isDirectory: true)
             .appendingPathComponent("llm-sandbox", isDirectory: true)
+    }
+
+    // MARK: - Shared-sandbox lifecycle (issue #190)
+
+    /// How many child processes are currently chdir'd into the shared sandbox.
+    /// Guarded by `sandboxLock`.
+    private static var sandboxTenants = 0
+
+    /// Guards `sandboxTenants` **and** the sweep, in one critical section: a
+    /// sweep that ran outside the lock could start while the count still read
+    /// zero and finish after a child had already been counted in and launched,
+    /// deleting a file from under it. `NSLock` rather than
+    /// `OSAllocatedUnfairLock` (used elsewhere in this file for the pipe
+    /// buffers) precisely because this one is held across file I/O, which
+    /// `os_unfair_lock` is documented not to be for; the held region is a
+    /// `contentsOfDirectory` plus a handful of `removeItem`s over a directory
+    /// that is empty in the common case. `ProcessHandle` at the bottom of this
+    /// file uses `NSLock` for the same reason.
+    private static let sandboxLock = NSLock()
+
+    /// Claim the shared working directory for one child process and return the
+    /// directory to chdir into. **Must** be paired with `releaseSandbox(_:)` —
+    /// use `defer`, and keep the lease open for the whole life of the child,
+    /// not just its launch.
+    ///
+    /// The sweep on the idle→busy transition is the one that carries the
+    /// guarantee in `sandboxDirectory()`'s doc comment: when nobody is inside,
+    /// anything in there is a leftover — from this session's last run, or from
+    /// a run whose release never happened because Mila was force-quit. Doing it
+    /// here rather than once at app launch is also what keeps the guarantee
+    /// keyed to the directory the child is *about to enter*, which matters
+    /// because `sandboxDirectory()` can resolve to the temp fallback.
+    static func acquireSandbox() -> URL {
+        let url = sandboxDirectory()
+        sandboxLock.lock()
+        defer { sandboxLock.unlock() }
+        if sandboxTenants == 0 { emptySandbox(at: url) }
+        sandboxTenants += 1
+        return url
+    }
+
+    /// Release the lease `acquireSandbox()` returned, sweeping if this was the
+    /// last invocation inside. Pass back the URL that acquire handed out rather
+    /// than re-resolving: on the temp-fallback path the two can differ, and the
+    /// directory worth emptying is the one the child actually ran in.
+    ///
+    /// Note the sweep can fire while a *grandchild* the CLI spawned and Mila
+    /// killed is still winding down (see the SIGTERM/SIGKILL grace in
+    /// `executeProcess`). That is the intended order: its output is already
+    /// being discarded, and leaving its scratch behind is the outcome this
+    /// issue is about.
+    static func releaseSandbox(_ url: URL) {
+        sandboxLock.lock()
+        defer { sandboxLock.unlock() }
+        // `max` rather than a precondition: an unbalanced release is a bug in
+        // this file, not a reason to abort a running app — and clamping keeps
+        // the count able to return to a state where sweeps still happen.
+        sandboxTenants = max(0, sandboxTenants - 1)
+        if sandboxTenants == 0 { emptySandbox(at: url) }
+    }
+
+    /// Delete the *contents* of the sandbox. Caller must hold `sandboxLock`
+    /// and must have established that no invocation is inside.
+    ///
+    /// Hidden entries included — `contentsOfDirectory` returns them unless
+    /// `.skipsHiddenFiles` is passed, and it deliberately is not. A CLI's own
+    /// dot-directory (`.claude/`, `.cursor/`) is exactly where a cached answer
+    /// about the user's meeting would sit, and sparing it would leave the fix
+    /// covering only the naive case.
+    ///
+    /// Best-effort by design: a single undeletable entry must not stop the
+    /// rest, and there is no caller that could usefully handle a throw here —
+    /// refusing to launch the LLM because a stale file wouldn't unlink would
+    /// trade a small privacy regression for a broken feature.
+    private static func emptySandbox(at url: URL) {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(at: url,
+                                                        includingPropertiesForKeys: nil,
+                                                        options: []) else { return }
+        guard !entries.isEmpty else { return }
+        var failed = 0
+        for entry in entries {
+            do { try fm.removeItem(at: entry) } catch { failed += 1 }
+        }
+        // Counts only, never names: a file an LLM CLI wrote here is named after
+        // whatever it was asked about, and Mila derives those prompts from
+        // recordings. `error` when something survived — the guarantee above
+        // silently stops holding for that entry, and that must not need
+        // `--debug` to notice.
+        if failed > 0 {
+            llmRunnerLog.error("""
+                llm sandbox sweep incomplete entries=\(entries.count, privacy: .public) \
+                failed=\(failed, privacy: .public) — leftovers stay visible to the next invocation
+                """)
+        } else {
+            llmRunnerLog.debug("llm sandbox swept entries=\(entries.count, privacy: .public)")
+        }
     }
 
     /// `~/Library/Application Support`, with a temp-directory fallback so a
