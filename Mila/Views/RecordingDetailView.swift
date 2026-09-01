@@ -685,8 +685,10 @@ private struct SegmentRow: View {
                     onSplit: onSplit,
                     otherSpeakers: otherSpeakers(besides: raw),
                     onMoveLine: onMoveLine,
-                    onRequestMerge: onRequestMerge.map { request in
-                        { target in request(raw, target) }
+                    // Bind this row's speaker as the merge SOURCE; the picker
+                    // only supplies the target.
+                    onRequestMerge: onRequestMerge == nil ? nil : { target in
+                        onRequestMerge?(raw, target)
                     }
                 )
                 .fixedSize(horizontal: true, vertical: false)

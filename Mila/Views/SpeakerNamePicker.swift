@@ -201,7 +201,11 @@ struct SpeakerNamePicker: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
         }
-        .menuStyle(.borderlessButton)
+        // `.borderlessButton` is the obvious spelling and is deprecated as of
+        // macOS 13 in favour of exactly this pair.
+        .menuStyle(.button)
+        .buttonStyle(.borderless)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
     }
