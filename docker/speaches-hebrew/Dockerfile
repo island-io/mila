@@ -38,8 +38,17 @@ LABEL io.island.mila.model="${MODEL_ID}"
 # ~/.cache/huggingface/hub, so the download lands exactly where faster-whisper
 # looks for it at run time — no network needed once the image is built.
 ENV HF_HUB_DISABLE_TELEMETRY=1
-RUN python -c "from huggingface_hub import snapshot_download; \
-    snapshot_download(repo_id='${MODEL_ID}')"
+# Retried rather than one-shot: a single unlucky HEAD call to huggingface.co
+# used to fail the whole 10-minute build (issue #240). The loop lives in a
+# script instead of inline here so its behaviour can actually be tested —
+# see download-model-test.sh, which stubs the interpreter and asserts that a
+# transient failure recovers while a permanent one still fails, bounded.
+#
+# The script is left in the image rather than removed: it is under 2 KB, and
+# the base image runs as non-root `ubuntu`, which cannot delete a root-owned
+# file from sticky /tmp.
+COPY download-model.sh /tmp/download-model.sh
+RUN sh /tmp/download-model.sh "${MODEL_ID}"
 
 # Server config (speaches reads these env vars; see src/speaches/config.py).
 #   - PRELOAD_MODELS: a JSON list. Load the model into memory at startup so the

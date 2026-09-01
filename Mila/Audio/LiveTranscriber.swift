@@ -150,6 +150,7 @@ final class LiveTranscriber: ObservableObject {
         self.buffer.removeAll(keepingCapacity: true)
         self.samplesDropped = 0
         self.deletedRanges = []
+        self.deletionCount = 0
         self.fullText = ""
         self.segments = []
         self.speakerNames = [:]
@@ -262,10 +263,30 @@ final class LiveTranscriber: ObservableObject {
         guard let idx = segments.firstIndex(where: { $0.id == id }) else { return }
         let seg = segments[idx]
         deletedRanges.append((start: seg.startSeconds, end: seg.endSeconds))
+        // Bumped BEFORE `segments` is published: the Live AI feed loop wakes on
+        // `$segments`, and it must already see the new count on the tick that
+        // carries the shortened transcript. The other order would feed the
+        // post-deletion text to a session still resuming the history that
+        // contains it (issue #239).
+        deletionCount += 1
         segments.remove(at: idx)
         fullText = segments.map(\.text).joined(separator: " ")
         liveLog.log("LiveTranscriber.removeSegment start=\(seg.startSeconds, privacy: .public) end=\(seg.endSeconds, privacy: .public) remaining=\(self.segments.count, privacy: .public)")
     }
+
+    /// How many lines the user has deleted from THIS recording's live
+    /// transcript (reset by `start()` along with `deletedRanges`).
+    ///
+    /// Published, and a monotonically increasing count rather than a Bool,
+    /// because the Live AI feed loop needs to spot *each* deletion — not just
+    /// "has there ever been one" — to tell `LiveAISession` that text it has
+    /// already shipped to the model is gone. See issue #239: the LLM runs in
+    /// session mode, so a `--resume` tick carries every earlier turn and the
+    /// deleted line survives in the model's history unless the session is
+    /// restarted. A count also coalesces naturally: several deletions between
+    /// two ticks are one restart, because the loop compares counts rather than
+    /// reacting to events.
+    @Published private(set) var deletionCount: Int = 0
 
     /// Whether the user deleted at least one line from THIS recording's live
     /// transcript (reset by `start()` along with `deletedRanges`).

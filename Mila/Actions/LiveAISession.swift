@@ -293,6 +293,47 @@ final class LiveAISession: ObservableObject {
         scheduleKick(immediate: immediate)
     }
 
+    /// Tell the session that text it may ALREADY have shipped to the model has
+    /// been removed from the transcript — today only via
+    /// `LiveTranscriber.removeSegment(id:)`, the per-line delete.
+    ///
+    /// This exists because in session mode the prompt is only half the story
+    /// (issue #239). Every tick after the first is `claude --resume <uuid>`,
+    /// which carries the whole earlier conversation, so a line already sent
+    /// stays in the model's history however the next prompt is worded. The
+    /// per-line delete otherwise reached everywhere the user can see — the
+    /// pane, the sidecar, the SRT, the saved transcript — and nowhere the
+    /// model can, and kept informing every later summary and action item.
+    /// `bugbot-rules/deleted-data-stays-deleted.md` treats this as a privacy
+    /// action, not a cache eviction.
+    ///
+    /// The remedy is the one the notes path already uses: abandon the
+    /// conversation and open a fresh one. Two deliberate choices:
+    ///
+    ///  * **Eager, not deferred to the next tick.** The stale session id is
+    ///    dropped the instant the user deletes, so nothing can `--resume` it
+    ///    even if no further tick ever happens — which is exactly what a
+    ///    delete of the LAST remaining line produces, since an empty
+    ///    transcript never reaches `kick()`.
+    ///  * **Coalescing is free.** A restart mints a UUID and clears
+    ///    `sessionEstablished`; until a tick actually succeeds, no call has
+    ///    been made, so a second deletion just replaces an unused id. Deleting
+    ///    five lines in a row costs one new session, not five.
+    ///
+    /// A no-op for stateless tools (`sessionID == nil`, e.g. cursor-agent):
+    /// each of their ticks is independent and already carries only the current
+    /// transcript, so there is no history to abandon.
+    func noteTranscriptEdited() {
+        guard let stale = sessionID else { return }
+        liveAILog.log("transcript edited — restarting session (was \(stale.uuidString.prefix(8), privacy: .public))")
+        sessionID = UUID()
+        sessionEstablished = false
+        // The new session has been told nothing, so the next tick must ship
+        // the whole (post-deletion) transcript rather than a delta against
+        // what the ABANDONED session was sent.
+        lastTranscriptSent = ""
+    }
+
     /// The single funnel all feed paths go through, so the throttle is
     /// applied uniformly. Decides: start now, defer until the interval
     /// elapses, or fold into the running call.
@@ -426,10 +467,19 @@ final class LiveAISession: ObservableObject {
         let augmentedTranscript: String
         if useSession {
             // Compute the delta. If the snapshot doesn't extend the
-            // previously-sent prefix (e.g. transcript was reset), fall
-            // back to sending the whole snapshot — the session will
-            // have it twice, harmless, and the model just sees a re-
-            // statement.
+            // previously-sent prefix, fall back to sending the whole
+            // snapshot — the session will have it twice, harmless, and
+            // the model just sees a re-statement. In practice that is the
+            // fixed-window path revising its last line (`merge` replaces
+            // the tail utterance as whisper hears more of it), which is a
+            // re-statement and nothing more.
+            //
+            // It is NOT how a deleted line is handled: re-sending a
+            // shortened transcript would leave the removed text sitting in
+            // the resumed conversation regardless. Deletions restart the
+            // session outright — see `noteTranscriptEdited()` (issue #239) —
+            // which also clears `lastTranscriptSent`, so by the time a tick
+            // gets here after a delete the prefix check passes trivially.
             let delta: String
             if snapshot.hasPrefix(lastTranscriptSent) {
                 delta = String(snapshot.dropFirst(lastTranscriptSent.count))

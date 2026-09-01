@@ -1610,6 +1610,10 @@ struct MilaApp: App {
                 feedTask?.cancel()
                 feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
                     var lastFed = ""
+                    // Mirrors `LiveTranscriber.deletionCount`, which resets to
+                    // 0 in `start()` — and this task is rebuilt per recording,
+                    // so both sides start from 0 together.
+                    var lastDeletionCount = 0
                     guard let transcriber else { return }
                     for await _ in transcriber.$segments.values {
                         if Task.isCancelled { break }
@@ -1637,9 +1641,34 @@ struct MilaApp: App {
                         }
                         sidecarWriter?.update(segments: liveSegments,
                                               speakerNames: transcriber.speakerNames)
+                        // A per-line delete removes text the LLM session may
+                        // already have been sent, and every tick after the
+                        // first is `claude --resume`, which carries the whole
+                        // earlier conversation — so the session has to be
+                        // ABANDONED, not merely re-prompted (issue #239).
+                        //
+                        // Checked outside the `aiActive` gate on purpose: a
+                        // deletion made while Live AI is toggled off must still
+                        // invalidate the session that produced the summary the
+                        // user is looking at, because toggling back on resumes
+                        // that same conversation.
+                        let deletions = transcriber.deletionCount
+                        if deletions != lastDeletionCount {
+                            lastDeletionCount = deletions
+                            aiSession?.noteTranscriptEdited()
+                        }
                         if aiActive {
                             let text = transcriber.formattedTranscript
-                            if text != lastFed, !text.isEmpty {
+                            // Deliberately no `!text.isEmpty` guard. `lastFed`
+                            // starts empty too, so the only way to reach
+                            // `feed("")` is a transition from non-empty to
+                            // empty — the user deleting the last remaining
+                            // line. That has to land, or `latestTranscript`
+                            // keeps the pre-deletion text and the stop-time
+                            // final tick summarises what was just removed.
+                            // Past that point it costs nothing: `scheduleKick`
+                            // returns early on an empty transcript.
+                            if text != lastFed {
                                 lastFed = text
                                 aiSession?.feed(transcript: text)
                             }

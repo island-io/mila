@@ -197,6 +197,50 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
 
     // MARK: -
 
+    /// The signal the Live AI feed loop watches to know a deletion happened
+    /// (issue #239). It has to be a COUNT, not a Bool: the loop compares it
+    /// against the value it last saw, so a second deletion after the session
+    /// has already been restarted once still registers. `hasUserDeletedSegments`
+    /// cannot do that job — it latches true on the first delete and never
+    /// changes again.
+    func test_deletionCount_tracks_each_delete_and_resets_per_recording() async throws {
+        let url = store.freshAudioURL(suggestedName: "DeletionCount")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.6)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+
+        await stub.setDefaultCanned([
+            TranscriptSegment(start: 0, end: 1, text: "one"),
+            TranscriptSegment(start: 2, end: 3, text: "two"),
+            TranscriptSegment(start: 4, end: 5, text: "three"),
+        ])
+        transcriber.start(language: "en")
+        XCTAssertEqual(transcriber.deletionCount, 0, "a fresh recording starts at zero")
+
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.count, 3, "precondition")
+        XCTAssertEqual(transcriber.deletionCount, 0, "transcribing must not look like a deletion")
+
+        transcriber.removeSegment(id: try XCTUnwrap(transcriber.segments.first).id)
+        XCTAssertEqual(transcriber.deletionCount, 1)
+
+        transcriber.removeSegment(id: try XCTUnwrap(transcriber.segments.first).id)
+        XCTAssertEqual(transcriber.deletionCount, 2,
+                       "a second delete has to be distinguishable from the first")
+
+        // A no-op delete is not a deletion: the loop would otherwise abandon a
+        // perfectly good LLM session for an id that matched nothing.
+        transcriber.removeSegment(id: UUID())
+        XCTAssertEqual(transcriber.deletionCount, 2,
+                       "removing an unknown id must not bump the count")
+
+        // Per-recording, like `deletedRanges` — otherwise the next recording's
+        // feed loop starts out of step and restarts its session on tick one.
+        transcriber.start(language: "en")
+        XCTAssertEqual(transcriber.deletionCount, 0)
+        XCTAssertFalse(transcriber.hasUserDeletedSegments)
+    }
+
     /// The load-bearing test. Delete a line, stop the recording, then check
     /// every artifact the transcript is copied into.
     func test_a_deleted_line_is_absent_from_everything_the_stop_writes() async throws {
