@@ -42,6 +42,15 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
     /// the last unbounded subprocess wait in the bundle.
     private static let gitCommandTimeout: TimeInterval = 60
 
+    /// How long to wait for the output pipes to reach EOF once `git` has
+    /// exited. Separate from `gitCommandTimeout` because it bounds a different
+    /// hazard: not a wedged `git`, but a reader work item that has not been
+    /// scheduled yet. `executeProcess` documents 10-15s of dispatch latency on
+    /// the macos-26 CI image and each `runGit` parks three blocking items on
+    /// the global queue, so this has to clear that comfortably — 5s did not,
+    /// and cost this suite a deterministic failure.
+    private static let pipeDrainTimeout: TimeInterval = 30
+
     override func setUpWithError() throws {
         try super.setUpWithError()
         guard let git = ProcessGitCommandRunner.gitExecutable() else {
@@ -213,10 +222,26 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
         for (pipe, isStdout) in [(out, true), (err, false)] {
             drain.enter()
             DispatchQueue.global().async {
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
-                lock.lock()
-                if isStdout { outData = data } else { errData = data }
-                lock.unlock()
+                // Append chunk-by-chunk rather than one `readDataToEndOfFile()`
+                // — the same shape as `ProcessGitCommandRunner.runSync`, and
+                // load-bearing now that the drain below is bounded.
+                //
+                // `readDataToEndOfFile()` assigns only once it has read
+                // EVERYTHING. Pair that with a bounded wait and an expiry
+                // leaves `outData` as the empty `Data()` it was initialised
+                // with, so a SUCCESSFUL git reports empty stdout: exit code 0,
+                // no output, no error. Callers assert on that stdout
+                // (`ls-tree`, `log --oneline`, `show`), so it is an invisible
+                // way to fail a test for a reason unrelated to what it tests.
+                // Appending as chunks arrive means whatever was read survives.
+                let handle = pipe.fileHandleForReading
+                while true {
+                    let chunk = handle.availableData   // blocks until data or EOF
+                    if chunk.isEmpty { break }
+                    lock.lock()
+                    if isStdout { outData.append(chunk) } else { errData.append(chunk) }
+                    lock.unlock()
+                }
                 drain.leave()
             }
         }
@@ -243,20 +268,43 @@ final class ObsidianGitSyncerIntegrationTests: XCTestCase {
             }
         }
         // Bounded too: EOF is not guaranteed even after exit, because a helper
-        // `git` spawned can inherit the pipes and outlive it. The readers are
-        // abandoned rather than waited out; they exit when the pipes close.
-        _ = drain.wait(timeout: .now() + 5)
-        // Take the lock: unlike the old unbounded `drain.wait()`, the readers
-        // are not guaranteed to be finished here.
+        // `git` spawned can inherit the pipes and outlive it.
+        //
+        // The bound is generous on purpose. 5s was too tight and it regressed
+        // this suite: `executeProcess` documents 10-15s of dispatch latency on
+        // this CI image, and each `runGit` now parks three blocking work items
+        // on the global queue, so a reader simply not being SCHEDULED inside 5s
+        // is ordinary here, not pathological.
+        let drained = drain.wait(timeout: .now() + .seconds(Int(Self.pipeDrainTimeout))) != .timedOut
+        // Take the lock: unlike an unbounded `drain.wait()`, the readers are
+        // not guaranteed to be finished here.
         lock.lock()
         let stdout = String(data: outData, encoding: .utf8) ?? ""
         let stderr = String(data: errData, encoding: .utf8) ?? ""
+        // Byte counts for the diagnostic below, snapshotted here: on the
+        // timed-out path the readers may still be appending, so reading
+        // `outData.count` outside the lock would itself be a data race.
+        let stdoutBytes = outData.count, stderrBytes = errData.count
         lock.unlock()
         if timedOut {
             throw NSError(domain: "git", code: -1, userInfo: [
                 NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) "
                     + "did not exit within \(Int(Self.gitCommandTimeout))s and was killed"
                     + " (stderr so far: \(stderr))"
+            ])
+        }
+        // A drain that expired means `stdout` may be TRUNCATED. Returning it
+        // would hand the caller a short answer that looks like a real one —
+        // `files.contains("a.md")` would simply be false — which is the
+        // silently-wrong outcome this whole branch exists to remove. Fail
+        // loudly instead, and say how much did arrive.
+        guard drained else {
+            throw NSError(domain: "git", code: -2, userInfo: [
+                NSLocalizedDescriptionKey: "git \(arguments.joined(separator: " ")) "
+                    + "exited but its pipes did not reach EOF within "
+                    + "\(Int(Self.pipeDrainTimeout))s — refusing to report "
+                    + "possibly-truncated output (\(stdoutBytes) bytes stdout, "
+                    + "\(stderrBytes) bytes stderr so far)"
             ])
         }
         if process.terminationStatus != 0 {

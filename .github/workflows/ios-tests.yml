@@ -127,6 +127,15 @@ jobs:
           # `|| true`: grep exits 1 when it matches nothing, which is the
           # good case here and must not fail the step.
           executions=$(grep -c "^Test Case .* failed (" "$log" || true)
+          # Print to STDOUT as well as the step summary. The summary is nice to
+          # look at but has no API, so it cannot be read back by anything but a
+          # human with a browser — which is how a whole CI round was spent on
+          # this PR unable to see an assertion message that had been captured.
+          # The job log IS retrievable, and this step's output is short enough
+          # to survive being at the end of it.
+          echo "===== failure lines from $log ====="
+          grep -E "^Test Case .* failed \(|: error: |^Failing tests:" "$log" | head -60 || true
+          echo "===== end failure lines ====="
           {
             echo "### Unit tests"
             echo
