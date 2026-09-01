@@ -114,7 +114,7 @@ final class SeedAnchorWeightTests: XCTestCase {
     /// Discriminating by construction. After one fold of `sessionVoice`, the
     /// matching centroid sits at 18.43° when the entry anchored at 1 and at
     /// 8.97° when it anchored at 3. `backProbe` is 33° the *other* side of
-    /// `stored`, so it is 51.43° from the first and 42.44° away from the
+    /// `stored`, so it is 51.44° from the first and 41.97° from the
     /// second — cosine 0.623 versus 0.744, which straddles the 0.7 threshold.
     /// The weakly-anchored entry therefore only *attaches* the probe, while
     /// the fully-anchored one folds it in.
