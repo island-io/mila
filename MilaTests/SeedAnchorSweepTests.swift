@@ -8,9 +8,12 @@ import XCTest
 /// ## How to run the sweep
 ///
 /// ```
+/// make project
 /// MILA_SEED_ANCHOR_CORPUS=/path/to/corpus.json \
-///   xcodebuild test -scheme Mila \
-///   -only-testing:MilaTests/SeedAnchorSweepTests/test_sweep_a_provided_corpus
+///   xcodebuild -project Mila.xcodeproj -scheme Mila -configuration Debug \
+///     -derivedDataPath build -destination 'platform=macOS' \
+///     -only-testing:MilaTests/SeedAnchorSweepTests/test_sweep_a_provided_corpus \
+///     test
 /// ```
 ///
 /// Optional:

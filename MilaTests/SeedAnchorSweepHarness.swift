@@ -86,7 +86,13 @@ struct SeedAnchorCorpus: Decodable {
 
 /// Why a corpus was refused. Every case is something that would otherwise
 /// produce a grid of plausible-looking numbers that measure nothing.
-enum SeedAnchorCorpusError: Error, CustomStringConvertible {
+///
+/// `LocalizedError` as well as `CustomStringConvertible` so the explanation
+/// survives whichever of the two XCTest reaches for: a bare `Error` enum's
+/// `localizedDescription` is the useless generic "operation couldn't be
+/// completed", and someone whose corpus was rejected mid-run needs the reason,
+/// not the case name.
+enum SeedAnchorCorpusError: Error, LocalizedError, CustomStringConvertible {
     case noEnrolments
     case noRecordings
     case duplicateEnrolment(speaker: String)
@@ -119,6 +125,8 @@ enum SeedAnchorCorpusError: Error, CustomStringConvertible {
             return "utterance by \(speaker) in \(recording) ends before it starts"
         }
     }
+
+    var errorDescription: String? { description }
 }
 
 extension SeedAnchorCorpus {

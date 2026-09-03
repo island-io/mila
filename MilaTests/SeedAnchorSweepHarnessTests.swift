@@ -333,7 +333,8 @@ final class SeedAnchorSweepHarnessTests: XCTestCase {
         XCTAssertEqual(pooled.utterancesTotal, 100)
         XCTAssertEqual(try XCTUnwrap(pooled.falseAttachRate), 0.45, accuracy: 1e-12,
                        "0.45, not the 0.30 that averaging the two rates would give")
-        XCTAssertEqual(pooled.perSpeaker["alice"], .init(total: 100, hits: 54))
+        XCTAssertEqual(pooled.perSpeaker["alice"],
+                       SeedAnchorTally.SpeakerCounts(total: 100, hits: 54))
         XCTAssertEqual(pooled.recordings, 2)
     }
 

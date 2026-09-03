@@ -97,11 +97,25 @@ nobody needs the audio again.
 ## Step 2 — run the sweep
 
 ```
+make project        # project.yml is the source of truth; regenerate first
+
 MILA_SEED_ANCHOR_CORPUS=$PWD/corpus.json \
 MILA_SEED_ANCHOR_REPORT=$PWD/grid.json \
-  xcodebuild test -scheme Mila -destination 'platform=macOS' \
-  -only-testing:MilaTests/SeedAnchorSweepTests/test_sweep_a_provided_corpus
+  xcodebuild -project Mila.xcodeproj -scheme Mila -configuration Debug \
+    -derivedDataPath build -destination 'platform=macOS' \
+    -only-testing:MilaTests/SeedAnchorSweepTests/test_sweep_a_provided_corpus \
+    test
 ```
+
+The grid is printed to stdout, so it lands in xcodebuild's output; pipe through
+`tee` if you want it in a file. `MILA_SEED_ANCHOR_REPORT` is the dependable
+route — a machine-readable grid you can attach to the issue or diff against a
+later run.
+
+If the environment variables do not reach the test process on your setup, set
+them in the scheme's **Test** action instead (Product → Scheme → Edit Scheme →
+Test → Arguments → Environment Variables). The test reads them through
+`ProcessInfo`, so either route works.
 
 It replays the corpus through the **real** `seedPool` / `assign` — not a model
 of them — once per cell of
