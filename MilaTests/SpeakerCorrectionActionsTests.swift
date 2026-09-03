@@ -289,56 +289,286 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
         XCTAssertEqual(speakers(w), ["SPEAKER_00"])
     }
 
-    /// The same round trip across the **offline re-diarize**, pinning the one
-    /// place this PR deliberately does NOT come out clean.
+    // MARK: - The offline re-diarize round trip (island-io/mila#254)
+
+    /// A real `QuickActionsController`, so the re-diarize tests drive the
+    /// sequence that ships (`applyRediarizedSpeakers`) instead of a
+    /// re-implementation of it here — which is how the half this fixes went
+    /// unnoticed: the test simulated the store write and the observation
+    /// re-key, and simulating them is exactly what hid the missing notify.
+    /// `rediarizeSegments` needs a pyannote subprocess, so only the pass's
+    /// OUTPUT is supplied by hand; everything after it is production code.
+    private func makeController(for w: World) -> QuickActionsController {
+        let suite = "SpeakerCorrectionActionsTests.\(UUID())"
+        for sub in ["diarization", "language", "llm"] { suiteNames.append("\(suite).\(sub)") }
+        let service = TranscriptionService(
+            store: w.store,
+            modelManager: ModelManager(
+                modelsDirectory: tempRoot.appendingPathComponent("Models-\(UUID().uuidString)")),
+            diarizationSettings: DiarizationSettings(
+                defaults: UserDefaults(suiteName: "\(suite).diarization")!),
+            remoteSettings: TestSupport.isolatedRemoteSettings(label: suite),
+            engine: StubWhisperEngine())
+        let controller = QuickActionsController(
+            session: RecordingSession(),
+            store: w.store,
+            transcription: service,
+            languageSettings: RecordingLanguageSettings(
+                defaults: UserDefaults(suiteName: "\(suite).language")!),
+            postRecording: PostRecordingCoordinator(
+                store: w.store,
+                transcription: service,
+                llm: LLMSettings(defaults: UserDefaults(suiteName: "\(suite).llm")!)))
+        // The other half of `MilaApp.init`'s wiring, verbatim.
+        let snapshots = w.snapshots
+        controller.onSpeakerIDsRekeyed = { recordingID, newToOld in
+            snapshots.remapSpeakerIDs(newToOld, in: recordingID)
+        }
+        return controller
+    }
+
+    /// The re-key's output for a recording whose speakers all collapse into
+    /// one, or are renumbered: `rediarizeSegments` reassigns `.speaker` on
+    /// the SAME array, so this is what the pass is allowed to return.
+    private func rekeyed(_ segments: [TranscriptSegment], to speakers: [String]) -> [TranscriptSegment] {
+        var out = segments
+        for i in out.indices { out[i].speaker = speakers[i] }
+        return out
+    }
+
+    /// **The bug this closes.** The live diarizer over-segmented Alice into
+    /// `SPEAKER_00` and `SPEAKER_02`, both were named at stop, so her profile
+    /// received two contributions from this recording. The offline pass
+    /// merges them into one cluster dominated by `SPEAKER_00`, and `remap`
+    /// drops `SPEAKER_02`'s name — the label is gone from the recording, so
+    /// there is nothing left for the user to un-name and #237's correction
+    /// could never reach that contribution. The re-diarize write now retires
+    /// it.
     ///
-    /// A collapse carries only the dominant fragment's observation, so
-    /// un-naming reverses that fragment exactly and leaves the other
-    /// fragments' contributions in the profile as residue. That is chosen
-    /// over folding them all in, because `finish` names only *some* fragments
-    /// — a fold then claims more than the profile ever received, and
-    /// un-naming subtracts the difference out of the profile's OTHER
-    /// recordings, deleting it outright when its stored count is small.
-    /// Residue can be undone by deleting the profile and letting it re-learn;
-    /// a deleted profile cannot. See `ObservedVoiceSnapshots.remapSpeakerIDs`
-    /// and island-io/mila#254.
+    /// **Discriminating in both directions.** Alice arrives carrying 3
+    /// samples from earlier recordings and leaves this one at 5:
     ///
-    /// Discriminating in both directions: folding deletes Alice, carrying
-    /// nothing leaves her at 2.
-    func test_a_collapsed_speaker_leaves_residue_rather_than_over_subtracting() throws {
+    /// * retire the dropped fragment → 4, and un-naming the survivor returns
+    ///   her to exactly 3 — her weight before this recording, nothing left
+    ///   behind and nothing taken twice;
+    /// * retire nothing (`main`) → 5, and the un-name leaves 4: one
+    ///   contribution stranded under a label that no longer exists;
+    /// * fold both fragments onto the survivor instead (the shape #253
+    ///   refused) → the un-name subtracts 2 in one go from a profile that
+    ///   received them under two different labels, and at `S == 1` deletes it.
+    func test_a_name_dropped_by_the_rediarize_pass_gives_its_observation_back() throws {
         let voice: [Float] = [1, 0, 0, 0]
         let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
-                                     segment("SPEAKER_03", 2, "two")],
+                                     segment("SPEAKER_02", 2, "two"),
+                                     segment("SPEAKER_00", 4, "three")],
                           snapshotEntries: [("SPEAKER_00", voice, 1),
-                                            ("SPEAKER_03", voice, 1)])
-        // Both fragments named, so the profile received both.
-        for raw in ["SPEAKER_00", "SPEAKER_03"] {
+                                            ("SPEAKER_02", voice, 1)])
+        // Alice as she stands from earlier recordings…
+        w.profiles.updateProfile(name: "Alice", embedding: voice, sampleCount: 3)
+        // …then `RecognisedSpeakerAssigner.finish` names both fragments at stop.
+        for raw in ["SPEAKER_00", "SPEAKER_02"] {
             w.store.setSpeakerName("Alice", forSpeaker: raw, recordingID: w.recordingID)
         }
-        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 2,
-                       "precondition: two fragments, two contributions")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 5,
+                       "precondition: two named fragments, two contributions")
 
-        // What `finalizeTail` does when the offline pass collapses them into
-        // one speaker: swap the segments, remap the names, and carry the
-        // observations on the same new-to-old mapping the names used.
-        var rediarized = row(w)
-        rediarized.segments = rediarized.segments.map {
-            var seg = $0
-            seg.speaker = "SPEAKER_00"
-            return seg
-        }
-        rediarized.speakerNames = ["SPEAKER_00": "Alice"]
-        w.store.update(rediarized)
-        w.snapshots.remapSpeakerIDs(["SPEAKER_00": "SPEAKER_00"], in: w.recordingID)
+        let controller = makeController(for: w)
+        let before = row(w).segments
+        // The offline pass puts all three utterances under one id. Old
+        // SPEAKER_00 dominates it (4s against 2s), so its name survives.
+        let after = rekeyed(before, to: ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"])
+
+        controller.applyRediarizedSpeakers(after, replacing: before, recordingID: w.recordingID)
+
+        XCTAssertEqual(row(w).speakerNames, ["SPEAKER_00": "Alice"],
+                       "the collapsed fragment's label is gone — that part is pre-existing")
+        XCTAssertNil(w.snapshots.observation(forSpeaker: "SPEAKER_02", in: w.recordingID),
+                     "and so is its observation")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 4,
+                       "so its contribution came back out, while the survivor's stayed")
 
         w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
 
-        let alice = try XCTUnwrap(
-            w.profiles.profile(named: "Alice"),
-            "Alice must survive — folding both fragments into the snapshot would "
-            + "subtract 2 from 2 and delete her, which is the failure this shape avoids")
-        XCTAssertEqual(alice.sampleCount, 1,
-                       "the dominant fragment came back out exactly; the other is residue")
+        let alice = try XCTUnwrap(w.profiles.profile(named: "Alice"),
+                                  "Alice's earlier recordings are untouched")
+        XCTAssertEqual(alice.sampleCount, 3,
+                       "un-naming the survivor returns her to exactly her pre-recording weight")
+        XCTAssertEqual(alice.embedding, voice)
+    }
+
+    /// The shape that rules out diffing `speakerNames` inside
+    /// `RecordingStore.update(_:)`, and the reason the retired set is computed
+    /// from the dominance mapping instead: a re-key changes what the KEYS
+    /// mean. Bob and Alice swap ids here, so a key-by-key diff sees
+    /// `SPEAKER_00` change "Bob" → "Alice" and would fire
+    /// `onSpeakerNamed(SPEAKER_00, "Alice")` — folding Bob's voice, still
+    /// keyed to `SPEAKER_00` at that moment, into Alice's profile — plus
+    /// `onSpeakerUnnamed(SPEAKER_01, "Alice")`, taking back a contribution
+    /// Alice legitimately still holds. Both names survive here with their own
+    /// observations, so nothing may fire at all.
+    func test_a_rekey_that_renumbers_two_named_speakers_moves_no_weight() throws {
+        let aliceVoice: [Float] = [1, 0, 0, 0]
+        let bobVoice: [Float] = [0, 1, 0, 0]
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "bob"),
+                                     segment("SPEAKER_01", 2, "alice")],
+                          speakerNames: ["SPEAKER_00": "Bob", "SPEAKER_01": "Alice"],
+                          snapshotEntries: [("SPEAKER_00", bobVoice, 1),
+                                            ("SPEAKER_01", aliceVoice, 1)])
+        // Both profiles as they stand having been named — each already holds
+        // this recording's observation.
+        w.profiles.updateProfile(name: "Bob", embedding: bobVoice, sampleCount: 3)
+        w.profiles.updateProfile(name: "Alice", embedding: aliceVoice, sampleCount: 3)
+
+        let controller = makeController(for: w)
+        let before = row(w).segments
+        // Same two people, same utterances; the offline pass just numbered
+        // them the other way round.
+        let after = rekeyed(before, to: ["SPEAKER_01", "SPEAKER_00"])
+
+        controller.applyRediarizedSpeakers(after, replacing: before, recordingID: w.recordingID)
+
+        XCTAssertEqual(row(w).speakerNames, ["SPEAKER_01": "Bob", "SPEAKER_00": "Alice"],
+                       "each name followed its person onto the new id")
+        XCTAssertEqual(w.profiles.profile(named: "Bob")?.sampleCount, 3,
+                       "a pure renumber moves no weight at all")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 3)
+
+        // And the observations followed the people, not the numbers: un-naming
+        // the speaker now called Alice must take ALICE's voice out of Alice.
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+
+        let alice = try XCTUnwrap(w.profiles.profile(named: "Alice"))
+        XCTAssertEqual(alice.sampleCount, 2)
+        XCTAssertEqual(alice.embedding, aliceVoice,
+                       "subtracting Bob's observation instead would leave [1.5, -0.5, 0, 0]")
+        XCTAssertEqual(w.profiles.profile(named: "Bob")?.sampleCount, 3,
+                       "Bob is not touched by un-naming somebody else")
+    }
+
+    /// A split hands the name to both halves while
+    /// `ObservedVoiceSnapshots.remapSpeakerIDs` refuses to hand the
+    /// observation to either (un-naming both would subtract it twice) and
+    /// drops it. The label therefore survives with nothing backing it, so the
+    /// contribution comes out now — exactly once — and un-naming the halves
+    /// afterwards must subtract nothing at all.
+    func test_a_split_speaker_gives_its_observation_back_exactly_once() throws {
+        let voice: [Float] = [1, 0, 0, 0]
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_00", 2, "two")],
+                          speakerNames: ["SPEAKER_00": "Alice"],
+                          snapshotEntries: [("SPEAKER_00", voice, 1)])
+        w.profiles.updateProfile(name: "Alice", embedding: voice, sampleCount: 3)
+
+        let controller = makeController(for: w)
+        let before = row(w).segments
+        let after = rekeyed(before, to: ["SPEAKER_00", "SPEAKER_01"])
+
+        controller.applyRediarizedSpeakers(after, replacing: before, recordingID: w.recordingID)
+
+        XCTAssertEqual(row(w).speakerNames, ["SPEAKER_00": "Alice", "SPEAKER_01": "Alice"],
+                       "the label follows both halves — better than dropping it from one")
+        XCTAssertNil(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID),
+                     "the observation is not duplicated onto them")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 2,
+                       "so the contribution it justified is subtracted once, here")
+
+        for raw in ["SPEAKER_00", "SPEAKER_01"] {
+            w.store.setSpeakerName(nil, forSpeaker: raw, recordingID: w.recordingID)
+        }
+
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 2,
+                       "and un-naming the halves subtracts nothing more — a second subtraction "
+                       + "would come out of Alice's other recordings")
+    }
+
+    /// The one destructive case, pinned on purpose rather than left to be
+    /// discovered: a profile whose ENTIRE content is the retired contribution
+    /// is removed, because the subtraction is exact rather than clamped.
+    ///
+    /// Reachable, and this is the route — the user hand-names a speaker in
+    /// the live pane, which CREATES that profile from this recording's one
+    /// observation, and the offline pass then folds that fragment into a
+    /// cluster another speaker dominates, dropping the name. `1 − 1 = 0`, and
+    /// `SpeakerProfileStore` removes a profile at zero, exactly as it does
+    /// when the user un-names that speaker by hand.
+    ///
+    /// The argument for leaving it exact is that it is bounded: a profile
+    /// holding weight from any OTHER recording keeps that weight (`remaining
+    /// > 0`), so nothing outside this recording is ever touched — every
+    /// profile seeded from a stored one survives by construction, since it
+    /// had weight before this recording could add any. Clamping would instead
+    /// keep a name→voice mapping the pass has just contradicted (that
+    /// fragment's audio is now the dominant speaker's) and would need a
+    /// second correction policy beside the hook. See island-io/mila#254.
+    func test_retiring_the_only_contribution_a_profile_ever_had_removes_it() {
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_02", 2, "two"),
+                                     segment("SPEAKER_00", 4, "three")],
+                          snapshotEntries: [("SPEAKER_00", [1, 0, 0, 0], 1),
+                                            ("SPEAKER_02", [0, 1, 0, 0], 1)])
+        // Naming a brand-new speaker is how profiles get created at all.
+        w.store.setSpeakerName("Bob", forSpeaker: "SPEAKER_02", recordingID: w.recordingID)
+        XCTAssertEqual(w.profiles.profile(named: "Bob")?.sampleCount, 1,
+                       "precondition: Bob exists only because of this fragment")
+
+        let controller = makeController(for: w)
+        let before = row(w).segments
+        controller.applyRediarizedSpeakers(
+            rekeyed(before, to: ["SPEAKER_00", "SPEAKER_00", "SPEAKER_00"]),
+            replacing: before,
+            recordingID: w.recordingID)
+
+        XCTAssertTrue(row(w).speakerNames.isEmpty,
+                      "the pass folded Bob's fragment into the dominant, unnamed speaker")
+        XCTAssertNil(w.profiles.profile(named: "Bob"),
+                     "his profile held nothing but that fragment, so it goes with it")
+    }
+
+    /// The pass runs on a recording nobody named. Nothing to retire, nothing
+    /// to subtract, and in particular no `onSpeakerNamed` for the ids the
+    /// remap creates — the naming hook is what WRITES a profile, and a
+    /// re-diarize is not a user naming anybody.
+    func test_a_rekey_with_no_names_writes_no_profiles() {
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_01", 2, "two")],
+                          snapshotEntries: [("SPEAKER_00", [1, 0, 0, 0], 1),
+                                            ("SPEAKER_01", [0, 1, 0, 0], 1)])
+
+        let controller = makeController(for: w)
+        let before = row(w).segments
+        controller.applyRediarizedSpeakers(rekeyed(before, to: ["SPEAKER_00", "SPEAKER_00"]),
+                                           replacing: before,
+                                           recordingID: w.recordingID)
+
+        XCTAssertTrue(row(w).speakerNames.isEmpty)
+        XCTAssertTrue(w.profiles.profiles.isEmpty,
+                      "a re-diarize must never create a voice profile")
+    }
+
+    /// The recording was hard-deleted while the pass ran. Nothing is written
+    /// and — the part that matters — nothing is subtracted from a profile for
+    /// a change that never landed.
+    func test_a_rekey_for_a_vanished_recording_touches_nothing() {
+        let voice: [Float] = [1, 0, 0, 0]
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_02", 2, "two")],
+                          speakerNames: ["SPEAKER_00": "Alice", "SPEAKER_02": "Alice"],
+                          snapshotEntries: [("SPEAKER_00", voice, 1),
+                                            ("SPEAKER_02", voice, 1)])
+        w.profiles.updateProfile(name: "Alice", embedding: voice, sampleCount: 5)
+
+        let controller = makeController(for: w)
+        let before = row(w).segments
+        w.store.permanentlyDelete(row(w))
+
+        let written = controller.applyRediarizedSpeakers(
+            rekeyed(before, to: ["SPEAKER_00", "SPEAKER_00"]),
+            replacing: before,
+            recordingID: w.recordingID)
+
+        XCTAssertNil(written)
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 5,
+                       "no row, no re-key, no correction")
     }
 
     // MARK: - Move one line
