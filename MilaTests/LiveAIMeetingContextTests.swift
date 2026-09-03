@@ -211,14 +211,30 @@ final class LiveAIMeetingContextTests: XCTestCase {
         return (session, live, calls)
     }
 
-    /// Spin until the in-flight tick clears. The stub returns instantly, so
-    /// this resolves in a few hops; the timeout only guards a hang.
-    private func waitUntilIdle(_ session: LiveAISession,
-                               timeout: TimeInterval = 2) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while session.isThinking && Date() < deadline {
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 1_000_000)
+    /// Settle whatever tick the preceding `feed` started, by awaiting the
+    /// task itself rather than polling `isThinking` against a clock.
+    ///
+    /// This was a 2s deadline that "only guards a hang" — the same wall-clock
+    /// bet that failed at 5s and then at 30s in the sibling suite
+    /// (`LiveAIDeletedLineSessionTests`, issues #242 / #251 / #256). A bound
+    /// on a positive wait cannot tell a hang from a loaded runner, so there is
+    /// no value to pick; awaiting the task removes the question. A hang now
+    /// belongs to the tick, where XCTest's own per-test limit reports it,
+    /// rather than being silently swallowed by a `while` that just stops.
+    ///
+    /// `makeSession` sets `llmMinIntervalSeconds = 0`, so every `feed` here
+    /// either launches a tick synchronously or declines to (an empty delta) —
+    /// there is never a `pendingKickTask` sleeping out a throttle floor with
+    /// the slot empty, which is the one case where "no task" would not mean
+    /// "settled". The loop drains a coalesced follow-up too, and stops as soon
+    /// as the slot stops changing, so a stranded slot returns immediately and
+    /// lets the assertions report it instead of spinning hot.
+    private func waitUntilIdle(_ session: LiveAISession) async {
+        var previous: Task<Void, Never>?
+        while let tick = session.inFlightTickForTesting {
+            if let previous, previous == tick { break }
+            _ = await tick.value
+            previous = tick
         }
     }
 }

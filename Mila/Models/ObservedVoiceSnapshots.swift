@@ -250,11 +250,23 @@ final class ObservedVoiceSnapshots {
     ///
     /// **What is deliberately given up.** When the pass collapses several old
     /// ids into one — which is the main reason it runs — the non-dominant
-    /// fragments' observations are dropped rather than folded in. If such a
-    /// fragment had been named, its contribution stays in that profile and
-    /// un-naming will not remove it: residue.
+    /// fragments' observations are dropped rather than folded in, so that
+    /// audio stops contributing to any profile. That is an accuracy loss, and
+    /// it is the one taken on purpose.
     ///
-    /// **Why residue is the right side to err on, with the arithmetic.** An
+    /// **What is no longer given up.** A non-dominant fragment that had been
+    /// NAMED used to leave its contribution behind as residue: the re-key
+    /// dropped its name through a wholesale `speakerNames` write, so nothing
+    /// fired `onSpeakerUnnamed` and there was no label left to un-name. The
+    /// caller now retires such a name in the same operation and BEFORE this
+    /// runs — `SpeakerNameRemapper.retiredNames` decides which ones, and
+    /// `RecordingStore.update(_:retiringSpeakerNames:)` fires the hook while
+    /// the observation is still keyed to the old id, so the subtraction takes
+    /// back exactly what naming that id added. Same for the split case below.
+    /// What this type carries and what the profiles hold therefore stay
+    /// reconstructible from each other across a re-key (island-io/mila#254).
+    ///
+    /// **Why folding every fragment in is still wrong, with the arithmetic.** An
     /// earlier revision folded every fragment onto the survivor, reasoning
     /// that `finish` had folded them all into the profile. It has not:
     /// `finish` snapshots *every* pool entry but names only the ones seeded
@@ -268,23 +280,29 @@ final class ObservedVoiceSnapshots {
     /// through the on-demand path) and otherwise writes back a centroid
     /// dragged toward a voice the profile never received.
     ///
-    /// Residue is recoverable — the user can delete the profile and let it
-    /// re-learn. A deleted profile is not, and a quietly corrupted centroid
-    /// is worse than either, because it degrades recognition invisibly, which
-    /// is the failure this whole feature exists to remove. `main` under-
-    /// corrects on every path (it has no subtraction at all), so this is a
-    /// limitation the codebase already lives with rather than a new one.
+    /// Under-correcting is recoverable — the user can delete the profile and
+    /// let it re-learn. A deleted profile is not, and a quietly corrupted
+    /// centroid is worse than either, because it degrades recognition
+    /// invisibly, which is the failure this whole feature exists to remove.
     ///
     /// **Do not "fix" this by folding again without also knowing which
     /// fragments the profile actually received.** That information is not in
     /// this type — it holds what was *observed*, which stops being the same
-    /// thing the moment a fragment goes unnamed. See island-io/mila#254 for
-    /// the exact rule and the structural fix.
+    /// thing the moment a fragment goes unnamed. The retire pass above needs
+    /// no such knowledge: it only ever reverses a name that a hook already
+    /// applied, one fragment at a time.
     ///
     /// A split is the other direction: one old id dominating two new ids
     /// would hand its observation to both, and un-naming both would subtract
     /// it twice. Such an id is dropped rather than duplicated — again the
     /// under-correcting side.
+    ///
+    /// **The survival rule below — `timesDominant[oldID] == 1` — is mirrored
+    /// by `SpeakerNameRemapper.retiredNames`**, which retires exactly the
+    /// names whose old id does NOT survive it. Change one and change the
+    /// other: retiring a name whose observation is carried over subtracts the
+    /// same contribution twice, and not retiring one whose observation is
+    /// dropped is the residue this pair exists to remove.
     func remapSpeakerIDs(_ newToOld: [String: String], in recordingID: UUID) {
         guard let existing = byRecording[recordingID] else { return }
         var timesDominant: [String: Int] = [:]

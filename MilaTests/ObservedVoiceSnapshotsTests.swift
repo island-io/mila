@@ -1,4 +1,5 @@
 import XCTest
+import TranscriptionCore
 @testable import Mila
 
 /// Unit tests for the per-recording snapshot store that keeps one recording's
@@ -338,10 +339,17 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
     /// difference out of the profile's other recordings — deleting it
     /// outright once `S ≤ n_B`. Carrying only the dominant fragment — the one
     /// whose NAME the new id also inherited — keeps un-naming an exact
-    /// inverse of that fragment's naming and leaves the rest as residue.
+    /// inverse of that fragment's naming.
+    ///
+    /// What the dropped fragments leave behind is no longer residue in the
+    /// profile: a dropped fragment that HAD a name is retired by the caller
+    /// before this runs (`SpeakerNameRemapper.retiredNames` →
+    /// `RecordingStore.update(_:retiringSpeakerNames:)`), and one that had no
+    /// name contributed nothing to begin with. What is given up is their
+    /// audio, which stops informing any profile. See island-io/mila#254.
     ///
     /// The `6` this asserted before is the bug; `2` is the dominant
-    /// fragment's own count. See island-io/mila#254.
+    /// fragment's own count.
     func test_a_collapse_carries_only_the_dominant_fragment() {
         let snapshots = ObservedVoiceSnapshots()
         let rec = UUID()
@@ -382,6 +390,40 @@ final class ObservedVoiceSnapshotsTests: XCTestCase {
         XCTAssertNil(snapshots.observation(forSpeaker: "SPEAKER_02", in: rec))
         XCTAssertEqual(snapshots.observation(forSpeaker: "SPEAKER_01", in: rec)?.observedCentroid,
                        [0, 1], "the speaker that mapped one-to-one is unaffected")
+    }
+
+    /// `SpeakerNameRemapper.retiredNames` and `remapSpeakerIDs` implement the
+    /// same survival rule from opposite ends, and they have to stay mirrored:
+    /// the names whose contribution must be subtracted are exactly the ones
+    /// whose observation this type does not carry across. Disagreement is
+    /// silent either way — a contribution subtracted twice (retired AND
+    /// carried) or never (kept AND dropped), which is island-io/mila#254.
+    func test_retiring_a_name_mirrors_which_observations_survive() {
+        let snapshots = ObservedVoiceSnapshots()
+        let rec = UUID()
+        snapshots.record(entries([("SPEAKER_00", [1, 0], 1, nil),
+                                  ("SPEAKER_01", [0, 1], 1, nil),
+                                  ("SPEAKER_02", [1, 1], 1, nil)]), for: rec)
+        let names = ["SPEAKER_00": "Alice", "SPEAKER_01": "Bob", "SPEAKER_02": "Carol"]
+        // new -> old, as `SpeakerNameRemapper.dominantOldIDs` reports it: old
+        // 00 keeps one id of its own, old 01 was split across two new ids, and
+        // old 02 was absorbed into a cluster it does not dominate.
+        let newToOld = ["SPEAKER_00": "SPEAKER_00",
+                        "SPEAKER_01": "SPEAKER_01",
+                        "SPEAKER_02": "SPEAKER_01"]
+
+        let retired = SpeakerNameRemapper.retiredNames(names: names, dominantOldIDs: newToOld)
+        snapshots.remapSpeakerIDs(newToOld, in: rec)
+
+        XCTAssertEqual(Set(retired.keys), Set(["SPEAKER_01", "SPEAKER_02"]),
+                       "Bob's observation is dropped (a split) and Carol's is dropped (she "
+                       + "dominates nothing), so both names lose their backing")
+        let stillReachable = Set(["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"].compactMap {
+            snapshots.observation(forSpeaker: $0, in: rec)?.observedCentroid
+        })
+        XCTAssertEqual(stillReachable, Set([[1, 0] as [Float]]),
+                       "exactly the one name that was NOT retired still has an observation "
+                       + "reachable under a new id")
     }
 
     /// A mapping that carries nothing is an invalidation, eviction slot and

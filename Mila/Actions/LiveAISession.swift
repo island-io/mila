@@ -32,6 +32,26 @@ final class LiveAISession: ObservableObject {
     private let liveAISettings: LiveAISettings
 
     private var inFlight: Task<Void, Never>?
+
+    /// Test seam: the task currently occupying the serialization slot above.
+    /// Read-only, and it exposes the one piece of state the suites pinning
+    /// this class otherwise have no way to see.
+    ///
+    /// The failure they exist to catch is a *stranded* slot — a tick task that
+    /// has finished while `inFlight` still points at it, after which
+    /// `scheduleKick` coalesces every later tick behind a task that will never
+    /// clear and Live AI is silently dead for the rest of the meeting. From
+    /// outside, a strand and a slow machine look identical: both are just "the
+    /// next call hasn't happened yet". So the tests had to bet a wall-clock
+    /// number on the difference, and the bet was wrong twice — 5s in #242, and
+    /// 30s in #251, which is the one a loaded CI runner tripped as issue #256.
+    ///
+    /// With the handle visible a test can `await` the exact tick it is
+    /// reasoning about and then read the slot: still the same handle means
+    /// stranded, and it means it *now*, with no waiting and no guess. Nothing
+    /// in the app reads this.
+    var inFlightTickForTesting: Task<Void, Never>? { inFlight }
+
     /// Set when a tick fires while a call is in flight — the next idle
     /// moment will fire one more pass against the latest transcript so
     /// late chunks are never dropped.
