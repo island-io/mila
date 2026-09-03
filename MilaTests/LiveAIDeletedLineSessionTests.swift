@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import Mila
 
@@ -158,8 +159,16 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
     /// behind a task that will never clear -- Live AI silently stops for the
     /// rest of the meeting.
     ///
-    /// Revert the `defer` and this hangs at the second wait. (CodeRabbit
-    /// raised the mechanism on #242; verified against the code before fixing.)
+    /// Revert the `defer` and this fails at the strand check below.
+    /// (CodeRabbit raised the mechanism on #242; verified against the code
+    /// before fixing.)
+    ///
+    /// There is deliberately no wall-clock bound left in here. The chain this
+    /// used to wait on -- gate release -> the in-flight task finishes -> its
+    /// `defer` runs -> `coalesced` is observed -> `scheduleKick` fires -> the
+    /// new tick records its call -- is awaited one link at a time instead, so
+    /// a wedge is read off the state rather than inferred from elapsed time.
+    /// See `waitUntil` for why the bound had to go rather than be re-tuned.
     func test_deleting_during_an_in_flight_tick_recovers_on_a_new_session() async {
         let gate = Gate()
         defer { gate.releaseAll() }
@@ -167,8 +176,20 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
                                            hold: gate)
 
         session.feed(transcript: "[00:00] One.\n[00:05] Two.", immediate: true)
-        let started = await waitUntil { calls.value.count == 1 }
-        XCTAssertTrue(started, "precondition: the first tick must actually be in flight")
+        // `kick()` fills the slot synchronously, so "a tick launched at all"
+        // is a fact the instant `feed` returns -- assert it here, where a
+        // failure is immediate, rather than folding it into a wait.
+        guard let dropped = session.inFlightTickForTesting else {
+            XCTFail("precondition: the first tick must occupy the in-flight slot")
+            return
+        }
+        // Then let the gate say when that tick is inside the runner; its only
+        // suspension point is the park, so it must arrive. Inferring this from
+        // `calls.value.count` instead left a window in which `release(1)`
+        // below ran before the park had recorded its continuation -- a lost
+        // wakeup, which strands the tick and is indistinguishable from the
+        // product wedge this test is about. See `Gate`.
+        await gate.awaitPark(1)
 
         // The user deletes "Two." while that call is still running, and the
         // feed loop follows with the shortened transcript -- which coalesces,
@@ -177,19 +198,37 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         session.feed(transcript: "[00:00] One.", immediate: true)
 
         gate.release(1)
+        // Await the dropped tick itself. It has to end -- the gate just
+        // released its only suspension point -- and everything under test
+        // happens in its `defer`, which runs before the task completes.
+        _ = await dropped.value
 
-        // `mustHappen`, not a hand-picked 5s: this waits on a chain of six
-        // hops (gate release -> the in-flight task finishes -> its `defer`
-        // runs -> `coalesced` is observed -> `scheduleKick` fires -> the new
-        // tick records its call), and a wedge never completes it however long
-        // we wait. See `mustHappen`.
-        let recovered = await waitUntil { calls.value.count == 2 }
-        XCTAssertTrue(recovered,
-                      "the replacement tick never ran within \(Int(Self.mustHappen))s. "
-                      + "The behaviour under test is that a dropped tick must not "
-                      + "strand `inFlight` — if it did, every later tick coalesces "
-                      + "behind a task that never clears and Live AI is silently "
-                      + "dead for the rest of the meeting")
+        // The wedge is now a fact rather than a deadline: the tick has
+        // finished, so if the slot still holds it, it is stranded, and it is
+        // stranded *now*. No amount of extra waiting would change the answer,
+        // which is exactly what made a bound the wrong instrument here.
+        //
+        // The replacement is created inside that same `defer`, so if one was
+        // scheduled it is in the slot by now -- but nothing parks it (only
+        // call 1 parks), so it may equally have run to completion already, in
+        // which case the slot is empty and the call count below is what
+        // reports success.
+        if let replacement = session.inFlightTickForTesting {
+            if replacement == dropped {
+                XCTFail("Live AI wedged: the dropped tick left `inFlight` set, so every "
+                        + "later tick coalesces behind a task that never clears and Live "
+                        + "AI is silently dead for the rest of the meeting")
+                return
+            }
+            _ = await replacement.value
+        }
+
+        guard calls.value.count == 2 else {
+            XCTFail("the slot was released but the coalesced re-kick the deletion "
+                    + "queued never ran, so the post-deletion transcript never "
+                    + "reaches the model (recorded \(calls.value.count) call(s))")
+            return
+        }
         XCTAssertEqual(kind(calls.value[1].session), "new",
                        "the replacement tick must open a new session, not resume the abandoned one")
         XCTAssertTrue(calls.value[1].transcript.contains("One."))
@@ -215,37 +254,47 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
     /// deliberately, matching `PostRecordingCoordinator.sendToLLM`.
     /// (Bugbot on #242, a86b392.)
     func test_a_cancelled_tick_does_not_clobber_the_next_recordings_tick() async {
-        let gate = Gate()
-        gate.parkThrough = 2
+        let gate = Gate(parkThrough: 2)
         defer { gate.releaseAll() }
         let (session, calls) = makeSession(suite: "LiveAIDeletedLineSessionTests.clobber",
                                            hold: gate)
 
         session.feed(transcript: "[00:00] First meeting.", immediate: true)
-        let firstStarted = await waitUntil { calls.value.count == 1 }
-        XCTAssertTrue(firstStarted,
-                      "precondition: recording one's tick must be in flight")
+        guard let abandoned = session.inFlightTickForTesting else {
+            XCTFail("precondition: recording one's tick must be in flight")
+            return
+        }
+        await gate.awaitPark(1)
 
         // The recording stops and a new one starts before the LLM answers.
         session.cancel()
         session.start()
         session.feed(transcript: "[00:00] Second meeting.", immediate: true)
-        let secondStarted = await waitUntil { calls.value.count == 2 }
-        XCTAssertTrue(secondStarted,
-                      "precondition: the new recording's tick must have started")
+        guard let live = session.inFlightTickForTesting, live != abandoned else {
+            XCTFail("precondition: the new recording's tick must have started and "
+                    + "must own the in-flight slot")
+            return
+        }
+        await gate.awaitPark(2)
 
-        // Let the ABANDONED tick finish, underneath the live one.
+        // Let the ABANDONED tick finish, underneath the live one, and wait for
+        // it to actually be finished before opening the quiet windows below.
+        // Polling for its side effects instead meant the windows also had to
+        // cover it finishing at all, which weakens exactly the assertions that
+        // depend on the window being quiet for a reason.
         gate.release(1)
+        _ = await abandoned.value
 
         // Asserted as a negative, because the harm is state being cleared that
         // belongs to the tick still running.
         //
-        // `quietWindow`, deliberately NOT `mustHappen`: these two are watching
-        // for something that must never happen, so the timeout is a window of
-        // required quiet rather than a deadline. `waitUntil` returns the moment
-        // its condition holds, so the full budget is spent only when the
-        // assertion PASSES — widening it would slow every green run and would
-        // make a spurious pass more likely, not less. See `quietWindow`.
+        // `quietWindow`, and these two are the only waits in the suite that
+        // still take a clock at all: they are watching for something that must
+        // never happen, so the timeout is a window of required quiet rather
+        // than a deadline. `waitUntil` returns the moment its condition holds,
+        // so the full budget is spent only when the assertion PASSES —
+        // widening it would slow every green run and would make a spurious
+        // pass more likely, not less. See `quietWindow`.
         let wentIdle = await waitUntil(timeout: Self.quietWindow) { !session.isThinking }
         XCTAssertFalse(wentIdle,
                        "the cancelled tick cleared `isThinking` while the new recording's tick was still running")
@@ -256,9 +305,12 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
 
         // And the surviving tick still completes normally once released.
         gate.release(2)
-        let drained = await waitUntil { !session.isThinking }
-        XCTAssertTrue(drained,
-                      "the new recording's tick must still finish and clear state on its own")
+        _ = await live.value
+        XCTAssertFalse(session.isThinking,
+                       "the new recording's tick must still finish and clear state on its own")
+        XCTAssertEqual(calls.value.count, 2,
+                       "no further call may have started: nothing fed the session after "
+                       + "recording two's first tick")
     }
 
     // MARK: - Helpers
@@ -277,27 +329,110 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
     /// their own index, so a test can let an EARLIER tick finish while a later
     /// one is still parked -- the only way to reproduce an abandoned tick
     /// completing underneath its replacement.
+    ///
+    /// **Order-independent by construction, which is the whole point.** The
+    /// two halves of the handshake do not necessarily run in the same place:
+    /// `park` records its continuation inside `withCheckedContinuation`, whose
+    /// body only stays on the caller's executor on a toolchain carrying
+    /// SE-0420's `isolation:` parameter, while `release` is called straight
+    /// from the @MainActor test body. If the store lands after the release,
+    /// the wakeup is lost, the parked call never resumes, and `inFlight` is
+    /// never cleared -- a symptom identical to the product wedge these tests
+    /// exist to catch, permanent in the same way ("a wedge never completes it
+    /// however long we wait"), and machine-sensitive in exactly the way a
+    /// loaded CI runner is. That is issue #256's failure, and the version of
+    /// this gate that had `release(_:)` drop an unmatched wakeup on the floor
+    /// was the only one of the four gates in these suites that could lose it
+    /// (`ConcurrencyProbe.released` and `TestGate.isOpen` both guard the same
+    /// ordering; `OpenAICompatibleTests`' stub takes a lock).
+    ///
+    /// So: a `release(i)` that arrives before call `i` parks is remembered and
+    /// the park returns immediately, `awaitPark(_:)` lets a test wait for a
+    /// call to be genuinely parked instead of inferring it from the recorded
+    /// call count, and a lock makes both hold wherever the continuation body
+    /// runs. Deliberately a lock rather than an actor annotation: assuming
+    /// isolation would serialise the handshake is the assumption that broke,
+    /// and it is not one a reader should have to re-derive from the nesting.
     private final class Gate {
-        var parkThrough = 1
+        /// Calls with an index at or below this park; later ones run straight
+        /// through. `let`, so it cannot be mutated once a call might read it.
+        let parkThrough: Int
+
+        /// Guards every field below. See the type comment: the
+        /// `withCheckedContinuation` body and `release(_:)` are not reliably
+        /// on the same executor, so the ordering is enforced here rather than
+        /// assumed.
+        private let lock = NSLock()
         private var parked: [Int: CheckedContinuation<Void, Never>] = [:]
+        /// `release(i)` calls that arrived before call `i` parked.
+        private var releasedEarly: Set<Int> = []
+        /// Indices that have reached `park`, plus anyone waiting to hear it.
+        private var arrived: Set<Int> = []
+        private var arrivalWaiters: [(index: Int, cont: CheckedContinuation<Void, Never>)] = []
+        /// Set by `releaseAll()`: after the drain nothing may park again.
+        private var draining = false
+
+        init(parkThrough: Int = 1) { self.parkThrough = parkThrough }
 
         func park(_ index: Int) async {
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-                parked[index] = c
+                lock.lock()
+                arrived.insert(index)
+                let waking = arrivalWaiters.filter { $0.index == index }
+                arrivalWaiters.removeAll { $0.index == index }
+                // A release that beat this park still counts.
+                let straightThrough = draining || releasedEarly.remove(index) != nil
+                if !straightThrough { parked[index] = c }
+                lock.unlock()
+                for w in waking { w.cont.resume() }
+                if straightThrough { c.resume() }
             }
         }
 
-        /// Let one parked call proceed. Deliberately a continuation rather
-        /// than a polled flag: a cancelled task's `Task.sleep` returns
-        /// immediately, so a polling loop would spin the main actor hot for
-        /// exactly the tick this suite needs to keep suspended.
-        func release(_ index: Int) { parked.removeValue(forKey: index)?.resume() }
+        /// Let one call proceed, whether or not it has parked yet.
+        /// Deliberately a continuation rather than a polled flag: a cancelled
+        /// task's `Task.sleep` returns immediately, so a polling loop would
+        /// spin the main actor hot for exactly the tick this suite needs to
+        /// keep suspended.
+        func release(_ index: Int) {
+            lock.lock()
+            let parkedCall = parked.removeValue(forKey: index)
+            if parkedCall == nil { releasedEarly.insert(index) }
+            lock.unlock()
+            parkedCall?.resume()
+        }
 
-        /// Drain anything still parked, so a failed assertion leaves no
-        /// suspended task behind.
+        /// Suspend until call `index` is parked inside the stub, so a test can
+        /// act while a tick is demonstrably inside the runner without polling
+        /// a clock for it. Returns immediately if it already parked. Same
+        /// shape as `ConcurrencyProbe.waitUntilCurrent` in
+        /// `RecordingSummarizerBackfillTests`.
+        func awaitPark(_ index: Int) async {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                lock.lock()
+                if arrived.contains(index) || draining {
+                    lock.unlock()
+                    c.resume()
+                } else {
+                    arrivalWaiters.append((index: index, cont: c))
+                    lock.unlock()
+                }
+            }
+        }
+
+        /// Drain anything still parked or still waiting, so a failed assertion
+        /// leaves no suspended task behind.
         func releaseAll() {
-            for (_, c) in parked { c.resume() }
+            lock.lock()
+            draining = true
+            let stillParked = parked
+            let stillWaiting = arrivalWaiters
             parked.removeAll()
+            arrivalWaiters.removeAll()
+            releasedEarly.removeAll()
+            lock.unlock()
+            for (_, c) in stillParked { c.resume() }
+            for w in stillWaiting { w.cont.resume() }
         }
     }
 
@@ -329,38 +464,24 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
 
         let calls = Calls()
         let session = LiveAISession(llmSettings: llm, liveAISettings: live)
+        // Snapshot the gate's threshold here, on the main actor, rather than
+        // reading it back off `hold` from inside the stub -- the stub's own
+        // isolation is whatever the closure inherits, and this keeps a plain
+        // `Int` in the capture list either way.
+        let parkThrough = hold?.parkThrough ?? 0
         session.performCall = { call in
             calls.value.append(call)
             // Park early calls so the test can act while a tick is
             // demonstrably inside the runner.
             if let hold {
                 let index = calls.value.count   // 1-based: appended just above
-                if index <= hold.parkThrough { await hold.park(index) }
+                if index <= parkThrough { await hold.park(index) }
             }
             return #"{"summary":"ok","items":[]}"#
         }
         session.start()
         return (session, calls)
     }
-
-    /// Bound for a wait on something that MUST happen (the caller asserts the
-    /// result is `true`).
-    ///
-    /// Chosen on the principle that **the only way to exceed it is the failure
-    /// mode under test**. Every such wait here is for state that a genuine bug
-    /// leaves wrong *forever* — a wedged `inFlight` is never cleared, however
-    /// long you wait — so a generous bound removes contention-induced failures
-    /// without costing one bit of discriminating power. It is also free on a
-    /// passing run: the condition holds in milliseconds, so this budget is
-    /// spent only when the test is failing anyway.
-    ///
-    /// These were 2-5s, and the 5s one is what failed on a loaded CI runner
-    /// while reporting "Live AI wedged" — a diagnosis that was simply false;
-    /// the machine was slow (issue #250). Same mistake as the 5s pipe-drain
-    /// bound #245 had to widen. **Do not re-tighten them.** 30s still fails
-    /// fast against CI's 240s per-test allowance, and no test here makes more
-    /// than three of these waits, so the worst case stays well inside it.
-    private static let mustHappen: TimeInterval = 30
 
     /// Window for watching that something must NOT happen (the caller asserts
     /// the result is `false`).
@@ -374,12 +495,22 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
     /// scale these transitions happen on.
     private static let quietWindow: TimeInterval = 1
 
-    /// Spin until `condition` holds, or the timeout expires. Returns whether
+    /// Spin until `condition` holds, or the window expires. Returns whether
     /// it held -- callers assert on that rather than hanging the suite.
     ///
-    /// Defaults to `mustHappen` because that is the common case; a caller
-    /// asserting the result is `false` must pass `quietWindow` explicitly.
-    private func waitUntil(timeout: TimeInterval = LiveAIDeletedLineSessionTests.mustHappen,
+    /// **For negative assertions only**, which is why `timeout` is now
+    /// required rather than defaulted. It used to default to a `mustHappen`
+    /// bound of 30s for the positive waits; that constant is deliberately
+    /// deleted rather than re-tuned. A bound on a positive wait cannot tell a
+    /// wedge from a loaded runner -- both look like "it hasn't happened yet"
+    /// -- so no value is correct, and picking one was wrong at 5s (#242) and
+    /// wrong again at 30s (#251, tripped by #256). Every positive wait in this
+    /// suite now awaits the task it is actually reasoning about
+    /// (`LiveAISession.inFlightTickForTesting`, `Gate.awaitPark`,
+    /// `waitUntilIdle`), so a wedge is read off the state at the moment it
+    /// becomes true and a slow machine simply takes longer. Requiring the
+    /// argument keeps a future positive wait from quietly inheriting a number.
+    private func waitUntil(timeout: TimeInterval,
                            _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
@@ -390,15 +521,27 @@ final class LiveAIDeletedLineSessionTests: XCTestCase {
         return condition()
     }
 
-    /// Settle an in-flight tick. Same `mustHappen` reasoning: a session that
-    /// never goes idle is broken, and the assertions after the call are what
-    /// report it — this wait only has to avoid expiring on a slow runner.
-    private func waitUntilIdle(_ session: LiveAISession,
-                               timeout: TimeInterval = LiveAIDeletedLineSessionTests.mustHappen) async {
-        let deadline = Date().addingTimeInterval(timeout)
-        while session.isThinking && Date() < deadline {
-            await Task.yield()
-            try? await Task.sleep(nanoseconds: 1_000_000)
+    /// Settle whatever tick the preceding `feed` started, by awaiting the task
+    /// itself rather than polling `isThinking` against a clock.
+    ///
+    /// `makeSession` sets `llmMinIntervalSeconds = 0`, so every `feed` here
+    /// either launches a tick synchronously or declines to (an empty delta) --
+    /// there is never a `pendingKickTask` sleeping out a throttle floor with
+    /// the slot empty, which is the one case where "no task" would not mean
+    /// "settled". `nil` therefore means already settled.
+    ///
+    /// The loop drains a coalesced follow-up too, and stops as soon as the
+    /// slot stops changing. That last part matters: a STRANDED slot -- the
+    /// wedge this suite pins, a finished task still occupying `inFlight` --
+    /// returns immediately and lets the assertions report it, rather than
+    /// spinning hot the way `LiveAISession.awaitFinalTick`'s
+    /// `while let handle = inFlight` would.
+    private func waitUntilIdle(_ session: LiveAISession) async {
+        var previous: Task<Void, Never>?
+        while let tick = session.inFlightTickForTesting {
+            if let previous, previous == tick { break }
+            _ = await tick.value
+            previous = tick
         }
     }
 }
