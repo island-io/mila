@@ -24,10 +24,12 @@ import XCTest
 /// These tests do not show 3 is optimal. The arithmetic pins the ends, not
 /// the interior — n₀ ∈ {2, 3, 4} are all well-formed and none of these
 /// assertions distinguishes them. That question needs multi-recording audio
-/// of the same speakers across different capture setups; #206 holds the
-/// replay protocol. What is pinned here is that the anchor exists, that it is
-/// a ceiling and not a floor, and that it stays inside the band where neither
-/// end-failure occurs.
+/// of the same speakers across different capture setups. The harness that
+/// would answer it lives in `SeedAnchorSweepHarness` /
+/// `SeedAnchorSweepTests`, with the procedure in `docs/seed-anchor-sweep.md`;
+/// it skips until someone points it at a corpus. What is pinned *here* is
+/// that the anchor exists, that it is a ceiling and not a floor, and that it
+/// stays inside the band where neither end-failure occurs.
 ///
 /// ## Fixture
 ///

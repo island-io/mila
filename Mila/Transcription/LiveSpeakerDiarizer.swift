@@ -97,13 +97,66 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// always a proper convex combination — so there is no degenerate value
     /// in that range and no discontinuity at the cap boundary. Picking among
     /// them is empirical, and needs multi-recording audio of the same
-    /// speakers across different capture setups. #206 records the replay
-    /// protocol (embed once, cache, sweep n₀ × `similarityThreshold`) and the
-    /// decision rule; until someone runs it, changing 3 to another unmeasured
-    /// number would only move the guess.
+    /// speakers across different capture setups. The replay that would settle
+    /// it now exists — `SeedAnchorSweepHarness` in the test target replays a
+    /// cached corpus through this very code across n₀ × `similarityThreshold`,
+    /// driven by `seedAnchorWeightOverride` below, and
+    /// `docs/seed-anchor-sweep.md` is the procedure. Nobody has the corpus
+    /// yet, so until someone runs it, changing 3 to another unmeasured number
+    /// would only move the guess.
     ///
     /// `SeedAnchorWeightTests` pins this value and the behaviour it buys.
     static let seedAnchorWeight = 3
+
+    /// Sweep hook: replaces `seedAnchorWeight` **for this instance only**.
+    /// `nil` — the only value anything in the app ever leaves here — means
+    /// "use the constant", so the shipped behaviour is exactly what it was.
+    ///
+    /// It exists because the replay protocol in #206 sweeps n₀ over
+    /// {1, 2, 3, 4, 6, 8, 12, uncapped}, and the upper half of that grid is
+    /// otherwise unreachable. `seedPool` applies the weight as a **ceiling**
+    /// (`min(stored, n₀)`), so a harness can simulate a *lighter* anchor just
+    /// by seeding a smaller `sampleCount` — but no input it can pass raises
+    /// the anchor above the constant. Without this the sweep could measure
+    /// only the light end, and the heavy end is the one whose failure mode is
+    /// documented above and has never been observed on real audio.
+    ///
+    /// Pass `Int.max` for the uncapped configuration: `min(stored, .max)` is
+    /// the profile's true stored count, which is precisely what deleting the
+    /// `min` in `seedPool` would do.
+    ///
+    /// See `SeedAnchorSweepHarness` for the replay that drives this, and
+    /// `docs/seed-anchor-sweep.md` for the procedure.
+    var seedAnchorWeightOverride: Int?
+
+    /// The weight `seedPool` actually applies — and the only reader of
+    /// `seedAnchorWeightOverride`, so a new code path cannot pick up the raw
+    /// constant and silently ignore a sweep configuration.
+    ///
+    /// Clamped to `>= 1`. That floor is arithmetic safety, not tidiness:
+    /// `assign`'s fold divides by `Float(n + 1)`, so
+    ///
+    ///   * `n₀ == 0` reproduces the provably-wrong end documented above —
+    ///     `(0·c₀ + e)/1 == e`, the stored voice discarded by its own first
+    ///     match;
+    ///   * `n₀ == -1` divides by zero, and any other negative divides by a
+    ///     negative, so the fold stops being a convex combination and writes
+    ///     an infinity, a NaN, or a centroid reflected through the origin.
+    ///
+    /// A NaN centroid is the worst of those and the reason this is a clamp
+    /// rather than a comment: `cosineSimilarity` returns NaN for it, and
+    /// `sim > best.sim` is false for NaN, so the entry can never be a
+    /// confident match again. It stops folding, stops accruing
+    /// `observedCount`, and therefore stops being auto-nameable, while
+    /// remaining able to absorb short utterances through the attach branch —
+    /// a silent, permanent break with no error anywhere. `VoiceProfile.unusableReason`
+    /// exists to keep exactly this off disk; this keeps it out of the pool.
+    ///
+    /// The sweep grid therefore starts at 1, not 0. `SeedAnchorWeightTests`
+    /// already pins why 0 would be wrong.
+    var effectiveSeedAnchorWeight: Int {
+        max(1, seedAnchorWeightOverride ?? Self.seedAnchorWeight)
+    }
 
     private var pool: [SpeakerProfile] = []
     private var process: Process?
@@ -299,7 +352,8 @@ final class LiveSpeakerDiarizer: ObservableObject {
     /// Pre-populate the pool with known speaker voice profiles so
     /// returning speakers are auto-recognised. Call after `reset()` at
     /// recording start. Each entry gets a fresh `SPEAKER_NN` ID and a
-    /// `sampleCount` capped at `seedAnchorWeight` so the centroid can adapt
+    /// `sampleCount` capped at `effectiveSeedAnchorWeight` — the constant
+    /// `seedAnchorWeight` unless a sweep overrode it — so the centroid can adapt
     /// to current-session acoustics on the first few matches — see that
     /// constant for what the cap buys and why it is 3.
     ///
@@ -319,7 +373,7 @@ final class LiveSpeakerDiarizer: ObservableObject {
             pool.append(SpeakerProfile(
                 id: id,
                 centroid: entry.centroid,
-                sampleCount: min(entry.sampleCount, Self.seedAnchorWeight),
+                sampleCount: min(entry.sampleCount, effectiveSeedAnchorWeight),
                 observedCentroid: [],
                 observedCount: 0,
                 profileName: entry.name
