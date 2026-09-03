@@ -86,4 +86,93 @@ final class SpeakerNameRemapperTests: XCTestCase {
                                                  from: old, to: new)
         XCTAssertEqual(remapped, ["SPEAKER_01": "Daniel"])
     }
+
+    // MARK: - Retired names (island-io/mila#254)
+
+    /// The headline case. The live diarizer over-segmented one person into a
+    /// long fragment and a short one, the user named BOTH (or a recogniser
+    /// did), and the offline pass merges them: the short fragment's name is
+    /// dropped from the recording entirely. Its voice-profile contribution
+    /// has to come back out, because there is no longer a label to un-name.
+    func test_a_collapsed_fragment_retires_the_name_the_remap_drops() {
+        let old = [seg(0, 8, "SPEAKER_00"), seg(8, 10, "SPEAKER_01")]
+        let new = rekeyed(old, to: ["SPEAKER_00", "SPEAKER_00"])
+        let names = ["SPEAKER_00": "Daniel", "SPEAKER_01": "Noa"]
+
+        XCTAssertEqual(SpeakerNameRemapper.remap(names: names, from: old, to: new),
+                       ["SPEAKER_00": "Daniel"],
+                       "precondition: the dominant fragment's name is the one that survives")
+        XCTAssertEqual(SpeakerNameRemapper.retiredNames(names: names, from: old, to: new),
+                       ["SPEAKER_01": "Noa"],
+                       "Noa's label is gone from the recording, so her profile must give "
+                       + "this recording's observation back — Daniel's must not")
+    }
+
+    /// A name that MOVES is not a name that is retired. This is the case a
+    /// key-by-key diff of `speakerNames` gets wrong in both directions: the
+    /// keys are renumbered, so `SPEAKER_00` losing "Daniel" looks like a drop
+    /// while the pair is in fact intact on `SPEAKER_01`.
+    func test_a_name_that_moves_to_another_id_is_not_retired() {
+        let old = [seg(0, 5, "SPEAKER_00"), seg(5, 10, "SPEAKER_01")]
+        let new = rekeyed(old, to: ["SPEAKER_01", "SPEAKER_00"])
+        let names = ["SPEAKER_00": "Daniel"]
+
+        XCTAssertEqual(SpeakerNameRemapper.remap(names: names, from: old, to: new),
+                       ["SPEAKER_01": "Daniel"])
+        XCTAssertTrue(SpeakerNameRemapper.retiredNames(names: names, from: old, to: new).isEmpty,
+                      "the name and its observation both land on SPEAKER_01, so retiring it "
+                      + "would subtract a contribution the profile still backs — twice, once "
+                      + "the user un-names it for real")
+    }
+
+    /// A split duplicates the name onto both halves, but
+    /// `ObservedVoiceSnapshots.remapSpeakerIDs` refuses to duplicate the
+    /// observation (un-naming both halves would subtract it twice) and drops
+    /// it. The label survives with nothing backing it, so the contribution is
+    /// retired even though the string is still on the row.
+    func test_a_split_retires_the_name_it_duplicates() {
+        let old = [seg(0, 5, "SPEAKER_00"), seg(5, 10, "SPEAKER_00")]
+        let new = rekeyed(old, to: ["SPEAKER_00", "SPEAKER_01"])
+        let names = ["SPEAKER_00": "Daniel"]
+
+        XCTAssertEqual(SpeakerNameRemapper.remap(names: names, from: old, to: new),
+                       ["SPEAKER_00": "Daniel", "SPEAKER_01": "Daniel"])
+        XCTAssertEqual(SpeakerNameRemapper.retiredNames(names: names, from: old, to: new),
+                       ["SPEAKER_00": "Daniel"])
+    }
+
+    func test_retiring_ignores_ids_that_were_never_named() {
+        let old = [seg(0, 8, "SPEAKER_00"), seg(8, 10, "SPEAKER_01")]
+        let new = rekeyed(old, to: ["SPEAKER_00", "SPEAKER_00"])
+
+        XCTAssertTrue(SpeakerNameRemapper.retiredNames(names: [:], from: old, to: new).isEmpty)
+        XCTAssertTrue(
+            SpeakerNameRemapper.retiredNames(names: ["SPEAKER_00": "Daniel"],
+                                             from: old, to: new).isEmpty,
+            "the collapsed fragment was never named, so it contributed nothing to subtract")
+    }
+
+    /// An old id that the pass left with no labelled utterances at all
+    /// dominates nothing, so its name — and its contribution — are retired.
+    func test_an_id_the_pass_stopped_labelling_is_retired() {
+        let old = [seg(0, 5, "SPEAKER_00"), seg(5, 10, "SPEAKER_01")]
+        let new = rekeyed(old, to: ["SPEAKER_00", nil])
+        let names = ["SPEAKER_00": "Daniel", "SPEAKER_01": "Noa"]
+
+        XCTAssertEqual(SpeakerNameRemapper.remap(names: names, from: old, to: new),
+                       ["SPEAKER_00": "Daniel"])
+        XCTAssertEqual(SpeakerNameRemapper.retiredNames(names: names, from: old, to: new),
+                       ["SPEAKER_01": "Noa"])
+    }
+
+    func test_retiring_on_an_identity_rekey_notifies_nothing() {
+        let old = [seg(0, 5, "SPEAKER_00"), seg(5, 10, "SPEAKER_01")]
+        let new = rekeyed(old, to: ["SPEAKER_00", "SPEAKER_01"])
+
+        XCTAssertTrue(
+            SpeakerNameRemapper.retiredNames(names: ["SPEAKER_00": "Daniel",
+                                                     "SPEAKER_01": "Noa"],
+                                             from: old, to: new).isEmpty,
+            "nothing changed hands, so nothing may be subtracted")
+    }
 }

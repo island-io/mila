@@ -468,6 +468,97 @@ final class RecordingStore: ObservableObject {
         return transcriptWritten && persisted
     }
 
+    /// `update(_:)` plus the one piece of bookkeeping a caller owes when it
+    /// replaces a recording's **whole** `speakerNames` map because a pass
+    /// re-keyed its `SPEAKER_NN` ids: `onSpeakerUnnamed` fires for every
+    /// `[oldID: previousName]` pair in `retired`, so the voice-profile
+    /// contribution each of those names justified is subtracted back out.
+    ///
+    /// Without it, a name the re-key drops takes its label away and leaves
+    /// its observation folded into that profile with nothing left to un-name
+    /// — #237's correction is unreachable for it, permanently
+    /// (island-io/mila#254).
+    ///
+    /// **One caller, deliberately.** Two paths replace the map wholesale. The
+    /// offline re-diarize remap
+    /// (`QuickActionsController.applyRediarizedSpeakers`) comes through here.
+    /// The batch pass's clear (`TranscriptionService.mergePassResult`) does
+    /// NOT, and it is not an oversight: `OfflineVoiceEmbedder.matchAfterPass`
+    /// runs immediately after that write, re-embeds every speaker and
+    /// re-matches them against the stored profiles — so a retire there would
+    /// subtract the weight the re-match is about to look the speaker up by,
+    /// and a profile whose only content came from that recording would be
+    /// deleted before the pass could restore its name. That path needs the
+    /// retire and the re-match designed together (see #254); the re-diarize
+    /// path has no re-match behind it, since it carries the names rather than
+    /// re-deriving them.
+    ///
+    /// **The one destructive case, and why it is left exact.** A retire
+    /// subtracts exactly what naming that id added, so a profile holding
+    /// nothing else reaches zero and `SpeakerProfileStore` removes it — which
+    /// is also precisely what un-naming that speaker by hand does today. It
+    /// is bounded to that: a profile carrying weight from any other recording
+    /// keeps it, so no other recording's contribution is ever touched, and
+    /// every profile seeded from a stored one survives by construction (it
+    /// had weight before this recording could add any). Clamping instead
+    /// would keep a name→voice mapping the pass has just contradicted — the
+    /// retired fragment's audio is now another speaker's — and would need a
+    /// second, quieter correction policy beside this hook.
+    /// `SpeakerCorrectionActionsTests.test_retiring_the_only_contribution_a_profile_ever_had_removes_it`
+    /// pins it so the trade is reviewable rather than incidental.
+    ///
+    /// **Call this BEFORE the observations are re-keyed.** The hook resolves
+    /// `rawID` through `ObservedVoiceSnapshots`, which is still keyed to the
+    /// ids these names were attached to; after the re-key `SPEAKER_00` is a
+    /// different voice and the subtraction would take the wrong embedding out
+    /// of the profile.
+    ///
+    /// **Why `retired` is caller-supplied instead of `update(_:)` diffing the
+    /// map.** Because a re-key changes what the KEYS mean, so no key-by-key
+    /// diff can be right. Take old `{00: Bob, 01: Alice}` becoming
+    /// `{00: Alice}` — new 00 is old 01's voice. A diff sees `00` change
+    /// `Bob → Alice` and `01` disappear, so it would fire
+    /// `onSpeakerNamed(00, "Alice")`, folding old 00's embedding (Bob's, since
+    /// the snapshot has not been re-keyed yet) into Alice's profile, and
+    /// `onSpeakerUnnamed(01, "Alice")`, taking back a contribution Alice
+    /// legitimately still holds — which then gets subtracted a second time
+    /// when the user un-names her, out of her other recordings. The pairing
+    /// of a name with the observation backing it, not the key it happens to
+    /// sit under, is the identity that matters; `SpeakerNameRemapper` is where
+    /// the mapping that establishes it lives, so that is where the retired
+    /// set is computed (`retiredNames`).
+    ///
+    /// **Only the retiring direction fires.** A re-key never *adds* a name: a
+    /// carried name is the same string its dominant old id already had, and
+    /// the observation moves onto the same new id, so the pair arrives intact
+    /// and firing `onSpeakerNamed` for it would double-count. Every genuinely
+    /// new name still comes through `setSpeakerName`, which fires the hooks
+    /// itself and does not route through `update(_:)` — so nothing here can
+    /// double-fire against it.
+    ///
+    /// The hooks run after the write, and nothing is read out of `recordings`
+    /// afterwards: a hook is caller-supplied code and may mutate the store,
+    /// which would invalidate an index held across it (the trap
+    /// `mergeSpeakers` documents). They run whether or not the write reached
+    /// disk, because `update(_:)` has already replaced the in-memory row —
+    /// skipping them would leave the profiles describing names the app no
+    /// longer shows.
+    @discardableResult
+    func update(_ recording: Recording,
+                retiringSpeakerNames retired: [String: String]) -> Bool {
+        // No row means the recording left the store mid-pass (hard-deleted,
+        // trash emptied). `update` writes nothing in that case, so this must
+        // not correct profiles for a change that did not happen.
+        guard recordings.contains(where: { $0.id == recording.id }) else { return false }
+        let persisted = update(recording)
+        // Sorted: `Dictionary` iteration order is unspecified per process and
+        // each of these can rewrite a profile on disk.
+        for (rawID, previousName) in retired.sorted(by: { $0.key < $1.key }) {
+            onSpeakerUnnamed?(recording.id, rawID, previousName)
+        }
+        return persisted
+    }
+
     /// Replace several stored records in one pass with a SINGLE persist, vs.
     /// `update(_:)`'s one full-file rewrite per call. Used by the launch
     /// crash-recovery sweep, which can flip many stale rows at once (a large
@@ -475,6 +566,14 @@ final class RecordingStore: ObservableObject {
     /// status/metadata bulk update — transcript/summary sidecars are left
     /// as-is (recovery doesn't change their content). Unknown ids are skipped;
     /// persists only if something actually changed.
+    ///
+    /// Deliberately fires no speaker hooks, unlike
+    /// `update(_:retiringSpeakerNames:)`: its callers copy live rows and
+    /// change `status`, and the launch sweep in particular runs before any
+    /// recording has been observed, so a name arriving through it has no
+    /// observation to reconcile — while `onSpeakerNamed` there would kick off
+    /// an on-demand embedding subprocess per row. A caller that ever needs to
+    /// move `speakerNames` in bulk must use the single-row method instead.
     func updateAll(_ updated: [Recording]) {
         var touched = false
         for recording in updated {

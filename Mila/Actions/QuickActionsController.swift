@@ -1262,37 +1262,24 @@ final class QuickActionsController: ObservableObject {
                 // the decision a waiting send is gated on and the work
                 // actually done here can never disagree.
                 if willRediarize {
-                    // Re-fetch before writing: the user may have renamed the
-                    // recording (rename sheet) while this tail was running, so
-                    // we update only the segments rather than clobbering the row.
+                    // The write itself re-fetches the row and touches only the
+                    // segments and the speaker names, rather than clobbering a
+                    // rename the user made while this tail ran — see
+                    // `applyRediarizedSpeakers`.
                     if let rediarized = await self.transcription.rediarizeSegments(
                         wavURL: self.store.audioURL(for: updated),
                         segments: updated.segments,
                         recordingID: id) {
                         let preRediarize = updated.segments
                         updated.segments = rediarized
-                        if var current = self.store.recordings.first(where: { $0.id == id }) {
-                            current.segments = rediarized
-                            // The offline pass re-keyed every SPEAKER_NN, so
-                            // names assigned mid-recording (or in the detail
-                            // view while this pass ran — hence the re-fetched
-                            // row's map, not the snapshot's) must follow the
-                            // utterances they labeled onto the new IDs.
-                            current.speakerNames = SpeakerNameRemapper.remap(
-                                names: current.speakerNames,
-                                from: preRediarize,
-                                to: rediarized)
-                            self.store.update(current)
+                        // Names, retired names and observations all move
+                        // together — see `applyRediarizedSpeakers`. `nil`
+                        // means the row left the store mid-pass; the local
+                        // copy still carries the new segments so the `.srt`
+                        // below is written from them.
+                        if let current = self.applyRediarizedSpeakers(
+                            rediarized, replacing: preRediarize, recordingID: id) {
                             updated = current
-                            // The observed embeddings follow the utterances
-                            // onto the new ids, on the same dominance mapping
-                            // the names just used. Anything else leaves the
-                            // profile contributions those names justified
-                            // impossible to reverse.
-                            self.onSpeakerIDsRekeyed?(
-                                id,
-                                SpeakerNameRemapper.dominantOldIDs(from: preRediarize,
-                                                                   to: rediarized))
                         }
                     }
                 }
@@ -1341,6 +1328,63 @@ final class QuickActionsController: ObservableObject {
                 self.transcription.enqueue(updated)
             }
         }
+    }
+
+    /// Land the offline re-diarize pass's re-keyed labels on the STORED row,
+    /// keeping the voice-profile bookkeeping straight. Returns the row as
+    /// written, or nil if the recording left the store mid-pass.
+    ///
+    /// The row is re-fetched rather than taken from `finalizeTail`'s local
+    /// copy: the user may have renamed the recording (rename sheet), or named
+    /// a speaker in the detail view, while the pass was running, so only the
+    /// segments and the speaker names are written.
+    ///
+    /// **Three things happen, and the order is the whole point.**
+    ///
+    /// 1. The names follow the utterances onto the new ids
+    ///    (`SpeakerNameRemapper.remap`) — the offline pass re-keys every
+    ///    `SPEAKER_NN`, so a name left on its old key would label whoever
+    ///    that number now denotes.
+    /// 2. Every name the re-key does NOT carry over is retired through
+    ///    `RecordingStore.update(_:retiringSpeakerNames:)`, which fires
+    ///    `onSpeakerUnnamed` for it. That subtracts exactly what naming that
+    ///    old id added: the observation backing it is still keyed to that id
+    ///    at this moment. Before island-io/mila#254 nothing fired here at
+    ///    all — the map was replaced wholesale, and the hooks fire only from
+    ///    `setSpeakerName` and friends — so a dropped name left its
+    ///    contribution in the profile with no label left to un-name.
+    /// 3. Only THEN are the surviving observations re-keyed
+    ///    (`onSpeakerIDsRekeyed` → `ObservedVoiceSnapshots.remapSpeakerIDs`).
+    ///
+    /// Step 2 strictly before step 3, because step 2 resolves through the
+    /// snapshot: after the re-key `SPEAKER_00` holds a different voice, so a
+    /// retire would subtract the wrong embedding — the cross-recording
+    /// confusion `ObservedVoiceSnapshots` exists to prevent, reintroduced
+    /// across a re-clustering boundary.
+    ///
+    /// All three read ONE `dominantOldIDs` mapping. That is a correctness
+    /// requirement, not a saving: the name, the retire decision and the
+    /// observation must agree about which old fragment each new id came from,
+    /// or a contribution gets subtracted from a profile it was never added to.
+    ///
+    /// `internal`, and split out of `finalizeTail`, so a test can drive this
+    /// sequence: `rediarizeSegments` needs a pyannote subprocess, so the
+    /// ordering is otherwise unreachable from CI.
+    @discardableResult
+    func applyRediarizedSpeakers(_ rediarized: [TranscriptSegment],
+                                 replacing preRediarize: [TranscriptSegment],
+                                 recordingID id: UUID) -> Recording? {
+        guard var current = store.recordings.first(where: { $0.id == id }) else { return nil }
+        let namesBeforeRekey = current.speakerNames
+        let newToOld = SpeakerNameRemapper.dominantOldIDs(from: preRediarize, to: rediarized)
+        current.segments = rediarized
+        current.speakerNames = SpeakerNameRemapper.remap(names: namesBeforeRekey,
+                                                         dominantOldIDs: newToOld)
+        store.update(current,
+                     retiringSpeakerNames: SpeakerNameRemapper.retiredNames(
+                        names: namesBeforeRekey, dominantOldIDs: newToOld))
+        onSpeakerIDsRekeyed?(id, newToOld)
+        return current
     }
 
     /// Await every in-flight background finalize tail. Test seam so a test
