@@ -2044,7 +2044,9 @@ struct MilaApp: App {
         guard !remoteTranscriptionSettings.isActive else { return }
         modelManager.setSelected(WhisperModel.ivritLarge)
         for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {
-            if !modelManager.isInstalled(model) && modelManager.downloads[model.name] == nil {
+            if !modelManager.isInstalled(model)
+                && !modelManager.isDeclined(model)
+                && modelManager.downloads[model.name] == nil {
                 modelManager.download(model)
             }
         }
