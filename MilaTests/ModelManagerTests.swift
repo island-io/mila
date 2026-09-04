@@ -6,36 +6,31 @@ import CryptoKit
 final class ModelManagerTests: XCTestCase {
 
     private var tempRoot: URL!
-
-    private var savedSelection: String?
-    private var savedDeclined: [String]?
+    private var defaults: UserDefaults!
+    private let suite = "ModelManagerTests"
 
     override func setUp() {
         super.setUp()
         tempRoot = FileManager.default.temporaryDirectory
             .appendingPathComponent("ModelManagerTests-\(UUID())", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
-        savedDeclined = UserDefaults.standard.array(forKey: "model.declinedNames") as? [String]
+        UserDefaults().removePersistentDomain(forName: suite)
+        defaults = UserDefaults(suiteName: suite)
     }
 
     override func tearDown() {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
-        if let savedDeclined {
-            UserDefaults.standard.set(savedDeclined, forKey: "model.declinedNames")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "model.declinedNames")
-        }
+        defaults.removePersistentDomain(forName: suite)
         super.tearDown()
     }
 
+    private func makeManager(sessionProtocolClasses: [AnyClass]? = nil) -> ModelManager {
+        ModelManager(modelsDirectory: tempRoot, defaults: defaults,
+                     sessionProtocolClasses: sessionProtocolClasses)
+    }
+
     func test_catalog_contains_ivrit_large_as_default_selected_model() {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         XCTAssertNotNil(mgr.selectedModel())
         XCTAssertEqual(mgr.selectedModelName, WhisperModel.ivritLarge.name,
                        "Default selection should be the ivrit.ai large-v3 Hebrew model")
@@ -96,14 +91,14 @@ final class ModelManagerTests: XCTestCase {
     }
 
     func test_url_for_model_lives_under_models_directory() {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         let url = mgr.url(for: WhisperModel.ivritLarge)
         XCTAssertEqual(url.deletingLastPathComponent().path, tempRoot.path)
         XCTAssertEqual(url.lastPathComponent, "ivrit-ai-whisper-large-v3.bin")
     }
 
     func test_install_state_reflects_files_in_directory() throws {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         XCTAssertFalse(mgr.isInstalled(.ivritLarge))
 
         let path = mgr.url(for: .ivritLarge)
@@ -116,11 +111,11 @@ final class ModelManagerTests: XCTestCase {
     }
 
     func test_set_selected_persists_choice() {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         mgr.setSelected(.openaiTurbo)
         XCTAssertEqual(mgr.selectedModelName, WhisperModel.openaiTurbo.name)
 
-        let reloaded = ModelManager(modelsDirectory: tempRoot)
+        let reloaded = makeManager()
         XCTAssertEqual(reloaded.selectedModelName, WhisperModel.openaiTurbo.name)
     }
 
@@ -132,7 +127,7 @@ final class ModelManagerTests: XCTestCase {
     }
 
     func test_model_for_language_falls_back_to_selected_when_best_not_installed() throws {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         // Install only the OpenAI turbo, then ask for the Hebrew best model.
         let openaiPath = mgr.url(for: .openaiTurbo)
         try Data("not-a-real-model".utf8).write(to: openaiPath)
@@ -145,7 +140,7 @@ final class ModelManagerTests: XCTestCase {
     }
 
     func test_delete_marks_model_declined() throws {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         let path = mgr.url(for: .ivritLarge)
         try Data("not-a-real-model".utf8).write(to: path)
         mgr.refreshInstalled()
@@ -158,20 +153,20 @@ final class ModelManagerTests: XCTestCase {
     }
 
     func test_declined_status_persists_across_reload() throws {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         let path = mgr.url(for: .ivritLarge)
         try Data("not-a-real-model".utf8).write(to: path)
         mgr.refreshInstalled()
         try mgr.delete(.ivritLarge)
 
-        let reloaded = ModelManager(modelsDirectory: tempRoot)
+        let reloaded = makeManager()
 
         XCTAssertTrue(reloaded.isDeclined(.ivritLarge),
                       "Declined status must survive process relaunch, same as selectedModelName")
     }
 
     func test_download_clears_declined_status() throws {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager(sessionProtocolClasses: [StubModelDownloadURLProtocol.self])
         let path = mgr.url(for: .ivritLarge)
         try Data("not-a-real-model".utf8).write(to: path)
         mgr.refreshInstalled()
@@ -179,14 +174,14 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertTrue(mgr.isDeclined(.ivritLarge))
 
         mgr.download(.ivritLarge)
-        mgr.shutdown() // cancel the in-flight network task; we only care about the declined-set side effect
+        mgr.shutdown() // stop the stubbed task; we only care about the declined-set side effect
 
         XCTAssertFalse(mgr.isDeclined(.ivritLarge),
                        "An explicit download request means the user wants the model again")
     }
 
     func test_declining_one_model_does_not_affect_another() throws {
-        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let mgr = makeManager()
         let path = mgr.url(for: .ivritLarge)
         try Data("not-a-real-model".utf8).write(to: path)
         mgr.refreshInstalled()
@@ -196,4 +191,19 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertTrue(mgr.isDeclined(.ivritLarge))
         XCTAssertFalse(mgr.isDeclined(.openaiTurbo))
     }
+}
+
+/// Returns a tiny 200 response for any request — lets `ModelManager.download(_:)`
+/// exercise its declined-status side effect without a real network fetch.
+private final class StubModelDownloadURLProtocol: URLProtocol {
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: 200,
+                                       httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Data("stub-model-bytes".utf8))
+        client?.urlProtocolDidFinishLoading(self)
+    }
+    override func stopLoading() {}
 }
