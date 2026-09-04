@@ -10,8 +10,7 @@ final class TranscriptionServiceTests: XCTestCase {
     private var manager: ModelManager!
     private var stub: StubWhisperEngine!
     private var service: TranscriptionService!
-
-    private var savedSelection: String?
+    private var modelDefaults: UserDefaults!
 
     override func setUp() async throws {
         try await super.setUp()
@@ -19,8 +18,9 @@ final class TranscriptionServiceTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
 
         store = RecordingStore(rootDirectory: tempRoot)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        UserDefaults().removePersistentDomain(forName: "TranscriptionServiceTests.models")
+        modelDefaults = UserDefaults(suiteName: "TranscriptionServiceTests.models")
+        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"), defaults: modelDefaults)
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
@@ -37,11 +37,7 @@ final class TranscriptionServiceTests: XCTestCase {
 
     override func tearDown() async throws {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
+        modelDefaults.removePersistentDomain(forName: "TranscriptionServiceTests.models")
         try await super.tearDown()
     }
 

@@ -99,6 +99,7 @@ final class ModelManager: NSObject, ObservableObject {
     @Published var lastDownloadErrors: [String: String] = [:]
 
     private let modelsDirectory: URL
+    private let defaults: UserDefaults
     private static let declinedModelsKey = "model.declinedNames"
 
     /// Names of models the user explicitly deleted via Settings. Consulted
@@ -109,19 +110,29 @@ final class ModelManager: NSObject, ObservableObject {
     /// model, since that's an explicit request for it.
     @Published private(set) var declinedModelNames: Set<String>
 
+    /// Test-only hook: stub `URLProtocol` classes to install on the download
+    /// session's configuration, so tests can exercise `download(_:)` without
+    /// making a real network request. `nil` in production.
+    private let sessionProtocolClasses: [AnyClass]?
+
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 60 * 60
+        if let sessionProtocolClasses {
+            config.protocolClasses = sessionProtocolClasses
+        }
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
     private var observers: [Int: WhisperModel] = [:]
     private var didShutDownSession = false
 
-    init(modelsDirectory: URL) {
+    init(modelsDirectory: URL, defaults: UserDefaults = .standard, sessionProtocolClasses: [AnyClass]? = nil) {
         self.modelsDirectory = modelsDirectory
-        let lastUsed = UserDefaults.standard.string(forKey: "selectedModelName")
+        self.defaults = defaults
+        self.sessionProtocolClasses = sessionProtocolClasses
+        let lastUsed = defaults.string(forKey: "selectedModelName")
         self.selectedModelName = lastUsed ?? WhisperModel.ivritLarge.name
-        let declined = UserDefaults.standard.array(forKey: Self.declinedModelsKey) as? [String] ?? []
+        let declined = defaults.array(forKey: Self.declinedModelsKey) as? [String] ?? []
         self.declinedModelNames = Set(declined)
         super.init()
         try? FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
@@ -134,7 +145,7 @@ final class ModelManager: NSObject, ObservableObject {
 
     func setSelected(_ model: WhisperModel) {
         selectedModelName = model.name
-        UserDefaults.standard.set(model.name, forKey: "selectedModelName")
+        defaults.set(model.name, forKey: "selectedModelName")
     }
 
     /// The model the app should use when transcribing audio in `languageCode`.
@@ -211,7 +222,7 @@ final class ModelManager: NSObject, ObservableObject {
         } else {
             declinedModelNames.remove(model.name)
         }
-        UserDefaults.standard.set(Array(declinedModelNames), forKey: Self.declinedModelsKey)
+        defaults.set(Array(declinedModelNames), forKey: Self.declinedModelsKey)
     }
 
     func delete(_ model: WhisperModel) throws {
