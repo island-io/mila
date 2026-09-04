@@ -99,6 +99,16 @@ final class ModelManager: NSObject, ObservableObject {
     @Published var lastDownloadErrors: [String: String] = [:]
 
     private let modelsDirectory: URL
+    private static let declinedModelsKey = "model.declinedNames"
+
+    /// Names of models the user explicitly deleted via Settings. Consulted
+    /// by `MilaApp.ensureDefaultModelsInstalled()` so a deliberate delete
+    /// doesn't come back on the next launch — `isInstalled` alone can't
+    /// distinguish "never downloaded" from "downloaded, then removed on
+    /// purpose." Cleared the moment `download(_:)` is called again for that
+    /// model, since that's an explicit request for it.
+    @Published private(set) var declinedModelNames: Set<String>
+
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 60 * 60
@@ -111,6 +121,8 @@ final class ModelManager: NSObject, ObservableObject {
         self.modelsDirectory = modelsDirectory
         let lastUsed = UserDefaults.standard.string(forKey: "selectedModelName")
         self.selectedModelName = lastUsed ?? WhisperModel.ivritLarge.name
+        let declined = UserDefaults.standard.array(forKey: Self.declinedModelsKey) as? [String] ?? []
+        self.declinedModelNames = Set(declined)
         super.init()
         try? FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         refreshInstalled()
@@ -179,6 +191,10 @@ final class ModelManager: NSObject, ObservableObject {
         return installed.contains(model.name)
     }
 
+    func isDeclined(_ model: WhisperModel) -> Bool {
+        declinedModelNames.contains(model.name)
+    }
+
     func refreshInstalled() {
         let fm = FileManager.default
         var found: Set<String> = []
@@ -189,14 +205,25 @@ final class ModelManager: NSObject, ObservableObject {
         modelLogger.log("refreshInstalled: dir=\(self.modelsDirectory.path, privacy: .public) found=\(found, privacy: .public)")
     }
 
+    private func setDeclined(_ declined: Bool, for model: WhisperModel) {
+        if declined {
+            declinedModelNames.insert(model.name)
+        } else {
+            declinedModelNames.remove(model.name)
+        }
+        UserDefaults.standard.set(Array(declinedModelNames), forKey: Self.declinedModelsKey)
+    }
+
     func delete(_ model: WhisperModel) throws {
         try FileManager.default.removeItem(at: url(for: model))
         refreshInstalled()
+        setDeclined(true, for: model)
     }
 
     func download(_ model: WhisperModel) {
         guard downloads[model.name] == nil else { return }
         guard !didShutDownSession else { return }
+        setDeclined(false, for: model)
         // A fresh attempt supersedes the previous failure report for THIS
         // model only — a concurrent sibling download's error must survive.
         lastDownloadErrors[model.name] = nil
