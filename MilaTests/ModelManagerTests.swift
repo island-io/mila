@@ -8,6 +8,7 @@ final class ModelManagerTests: XCTestCase {
     private var tempRoot: URL!
 
     private var savedSelection: String?
+    private var savedDeclined: [String]?
 
     override func setUp() {
         super.setUp()
@@ -15,6 +16,7 @@ final class ModelManagerTests: XCTestCase {
             .appendingPathComponent("ModelManagerTests-\(UUID())", isDirectory: true)
         try? FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        savedDeclined = UserDefaults.standard.array(forKey: "model.declinedNames") as? [String]
     }
 
     override func tearDown() {
@@ -23,6 +25,11 @@ final class ModelManagerTests: XCTestCase {
             UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
         } else {
             UserDefaults.standard.removeObject(forKey: "selectedModelName")
+        }
+        if let savedDeclined {
+            UserDefaults.standard.set(savedDeclined, forKey: "model.declinedNames")
+        } else {
+            UserDefaults.standard.removeObject(forKey: "model.declinedNames")
         }
         super.tearDown()
     }
@@ -135,5 +142,58 @@ final class ModelManagerTests: XCTestCase {
         // Hebrew best is ivritLarge (not installed) so we should fall back.
         let resolved = mgr.model(for: "he")
         XCTAssertEqual(resolved, .openaiTurbo)
+    }
+
+    func test_delete_marks_model_declined() throws {
+        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let path = mgr.url(for: .ivritLarge)
+        try Data("not-a-real-model".utf8).write(to: path)
+        mgr.refreshInstalled()
+        XCTAssertFalse(mgr.isDeclined(.ivritLarge))
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertTrue(mgr.isDeclined(.ivritLarge),
+                      "Deleting a model must mark it declined so launch-time auto-download skips it")
+    }
+
+    func test_declined_status_persists_across_reload() throws {
+        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let path = mgr.url(for: .ivritLarge)
+        try Data("not-a-real-model".utf8).write(to: path)
+        mgr.refreshInstalled()
+        try mgr.delete(.ivritLarge)
+
+        let reloaded = ModelManager(modelsDirectory: tempRoot)
+
+        XCTAssertTrue(reloaded.isDeclined(.ivritLarge),
+                      "Declined status must survive process relaunch, same as selectedModelName")
+    }
+
+    func test_download_clears_declined_status() throws {
+        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let path = mgr.url(for: .ivritLarge)
+        try Data("not-a-real-model".utf8).write(to: path)
+        mgr.refreshInstalled()
+        try mgr.delete(.ivritLarge)
+        XCTAssertTrue(mgr.isDeclined(.ivritLarge))
+
+        mgr.download(.ivritLarge)
+        mgr.shutdown() // cancel the in-flight network task; we only care about the declined-set side effect
+
+        XCTAssertFalse(mgr.isDeclined(.ivritLarge),
+                       "An explicit download request means the user wants the model again")
+    }
+
+    func test_declining_one_model_does_not_affect_another() throws {
+        let mgr = ModelManager(modelsDirectory: tempRoot)
+        let path = mgr.url(for: .ivritLarge)
+        try Data("not-a-real-model".utf8).write(to: path)
+        mgr.refreshInstalled()
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertTrue(mgr.isDeclined(.ivritLarge))
+        XCTAssertFalse(mgr.isDeclined(.openaiTurbo))
     }
 }
