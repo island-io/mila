@@ -2025,23 +2025,36 @@ struct MilaApp: App {
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
     private func prewarmDefaultModel() {
-        // Skip prewarm under UI tests. No UI test relies on a launch-time
-        // warm — the transcription E2E tests pass `--ui-test-tiny-model-path=`
-        // and load on demand — so warming the (potentially multi-GB) default
-        // model here just burns CPU/IO on every UI-test launch and creates a
-        // whisper/Metal context that XCTest never frees (it exits via
-        // `exit()`, bypassing `gracefulShutdown()`), which is what prints the
-        // ggml-metal teardown backtrace at process exit.
-        guard !isRunningUITests else { return }
+        // Skip prewarm under any XCTest hosting (UI or unit tests). No test
+        // relies on a launch-time warm — the transcription E2E tests pass
+        // `--ui-test-tiny-model-path=` and load on demand — so warming the
+        // (potentially multi-GB) default model here just burns CPU/IO on
+        // every test launch and creates a whisper/Metal context that XCTest
+        // never frees (it exits via `exit()`, bypassing `gracefulShutdown()`),
+        // which is what prints the ggml-metal teardown backtrace at process
+        // exit. This used to be guarded by `--uitests` alone, which covers
+        // XCUITest, but `MilaTests` is an app-hosted unit test bundle
+        // (`TEST_HOST` = Mila.app in project.yml) — SwiftUI's `.task`
+        // modifiers, prewarm included, run there too, just without that flag.
+        guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
     }
 
-    /// True when the process was launched by an XCUITest run. Keyed off the
-    /// `--uitests` / `--ui-test-*` launch arguments the UI test targets pass.
-    private var isRunningUITests: Bool {
+    /// True when the process is hosting an XCTest run — either an XCUITest
+    /// (keyed off the `--uitests` / `--ui-test-*` launch arguments the UI
+    /// test targets pass) or an app-hosted unit test bundle (`MilaTests`),
+    /// which loads `XCTestCase` directly into this process via
+    /// `BUNDLE_LOADER`/`TEST_HOST` — no launch argument marks that case, so
+    /// `XCTestCase`'s presence is the only reliable signal.
+    /// `XCTestConfigurationFilePath`, the usual env-var check for "is this
+    /// process under XCTest," is present but empty for app-hosted unit
+    /// tests on this toolchain — verified empirically, not a documented
+    /// contract — so it can't be used here.
+    private var isRunningUnderXCTest: Bool {
         CommandLine.arguments.contains { $0 == "--uitests" || $0.hasPrefix("--ui-test") }
+            || NSClassFromString("XCTestCase") != nil
     }
 
     /// Pre-download the two default models on first launch:
@@ -2056,7 +2069,12 @@ struct MilaApp: App {
         // local weights. (The Models tab still offers manual downloads, and
         // switching back to local re-triggers this on next launch.)
         guard !remoteTranscriptionSettings.isActive else { return }
-        modelManager.setSelected(WhisperModel.ivritLarge)
+        // Don't re-select a model the user explicitly deleted — that would
+        // silently revert their delete every launch, same as skipping its
+        // auto-download below.
+        if !modelManager.isDeclined(WhisperModel.ivritLarge) {
+            modelManager.setSelected(WhisperModel.ivritLarge)
+        }
         for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {
             if !modelManager.isInstalled(model)
                 && !modelManager.isDeclined(model)
