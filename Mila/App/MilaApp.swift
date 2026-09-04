@@ -2064,6 +2064,15 @@ struct MilaApp: App {
     /// same `URLSession` so they don't actually saturate the network, and
     /// the in-app banner shows whichever is currently selected.
     private func ensureDefaultModelsInstalled() {
+        // Skip entirely under XCTest hosting (unit or UI) — same rationale
+        // as `prewarmDefaultModel()`: `MilaTests` is app-hosted, so this
+        // `.task` runs for real during ordinary unit test runs too. Without
+        // this guard it calls `setSelected`/`download` on the production
+        // `ModelManager`, which is backed by `UserDefaults.standard` (see
+        // `MilaApp.body`'s `ModelManager(modelsDirectory:)` call) — every
+        // `xcodebuild test` invocation would mutate the real app's declined
+        // models / selected model and could kick off real network downloads.
+        guard !isRunningUnderXCTest else { return }
         // Skip the multi-GB local model downloads + CoreML prep entirely for
         // users who've opted into the remote backend — they don't need any
         // local weights. (The Models tab still offers manual downloads, and
