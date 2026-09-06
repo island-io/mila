@@ -110,6 +110,15 @@ final class ModelManager: NSObject, ObservableObject {
     /// model, since that's an explicit request for it.
     @Published private(set) var declinedModelNames: Set<String>
 
+    /// True when `selectedModelName` was restored from a choice the user
+    /// actually persisted via `setSelected(_:)`, rather than defaulted to the
+    /// catalog's `ivritLarge`. Launch-time bootstrap consults this so it only
+    /// ever *establishes* a default selection on a fresh install: re-asserting
+    /// one on every launch is what silently reverted the user's Settings →
+    /// Models choice, and — once deletion started sticking — kept re-selecting
+    /// a model that is no longer on disk (#264, #266).
+    private(set) var hasPersistedSelection: Bool
+
     /// Test-only hook: stub `URLProtocol` classes to install on the download
     /// session's configuration, so tests can exercise `download(_:)` without
     /// making a real network request. `nil` in production.
@@ -118,8 +127,11 @@ final class ModelManager: NSObject, ObservableObject {
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 60 * 60
-        if let sessionProtocolClasses {
-            config.protocolClasses = sessionProtocolClasses
+        // Explicit `self.` — the same closure already needs it for
+        // `delegate: self`, and implicit `self` in a `lazy var` initializer
+        // is not something to rely on.
+        if let stubs = self.sessionProtocolClasses {
+            config.protocolClasses = stubs
         }
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
@@ -132,6 +144,7 @@ final class ModelManager: NSObject, ObservableObject {
         self.sessionProtocolClasses = sessionProtocolClasses
         let lastUsed = defaults.string(forKey: "selectedModelName")
         self.selectedModelName = lastUsed ?? WhisperModel.ivritLarge.name
+        self.hasPersistedSelection = lastUsed != nil
         let declined = defaults.array(forKey: Self.declinedModelsKey) as? [String] ?? []
         self.declinedModelNames = Set(declined)
         super.init()
@@ -145,6 +158,7 @@ final class ModelManager: NSObject, ObservableObject {
 
     func setSelected(_ model: WhisperModel) {
         selectedModelName = model.name
+        hasPersistedSelection = true
         defaults.set(model.name, forKey: "selectedModelName")
     }
 
@@ -225,10 +239,26 @@ final class ModelManager: NSObject, ObservableObject {
         defaults.set(Array(declinedModelNames), forKey: Self.declinedModelsKey)
     }
 
+    /// Remove a model's weights from disk and record that the removal was
+    /// deliberate.
+    ///
+    /// The `.bin` and its sibling `<name>-encoder.mlmodelc` are one install,
+    /// so they are one delete: leaving the ~1.1 GB CoreML encoder behind meant
+    /// the user reclaimed far less disk than the confirmation dialog promised,
+    /// with no UI anywhere that could see or remove the orphan (#265).
+    ///
+    /// Ordering matters. `refreshInstalled()` and `setDeclined(true,…)` run as
+    /// soon as the `.bin` is gone and *before* the encoder removal that can
+    /// throw — otherwise a failure there would leave the app believing the
+    /// model is still installed and was never declined, which is exactly the
+    /// state that silently re-downloads it on the next launch (#263).
     func delete(_ model: WhisperModel) throws {
         try FileManager.default.removeItem(at: url(for: model))
         refreshInstalled()
         setDeclined(true, for: model)
+        if isCoreMLInstalled(model), let coreML = coreMLDirectory(for: model) {
+            try FileManager.default.removeItem(at: coreML)
+        }
     }
 
     func download(_ model: WhisperModel) {

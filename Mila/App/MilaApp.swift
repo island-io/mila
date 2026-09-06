@@ -2078,10 +2078,17 @@ struct MilaApp: App {
         // local weights. (The Models tab still offers manual downloads, and
         // switching back to local re-triggers this on next launch.)
         guard !remoteTranscriptionSettings.isActive else { return }
-        // Don't re-select a model the user explicitly deleted — that would
-        // silently revert their delete every launch, same as skipping its
-        // auto-download below.
-        if !modelManager.isDeclined(WhisperModel.ivritLarge) {
+        // Establish the default selection only on a fresh install. Re-asserting
+        // it on every launch overwrote whatever the user picked in Settings →
+        // Models (#266); once deletion started sticking (#263) it also kept
+        // re-selecting a model that is no longer on disk, which is the first
+        // step into the dead end in #264. `ModelManager.init` already restores
+        // a persisted selection on its own, so there is nothing to do here
+        // once the user has made one. The declined check still guards the
+        // fresh-install case — a user can delete a model without ever having
+        // explicitly chosen one.
+        if !modelManager.hasPersistedSelection,
+           !modelManager.isDeclined(WhisperModel.ivritLarge) {
             modelManager.setSelected(WhisperModel.ivritLarge)
         }
         for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {

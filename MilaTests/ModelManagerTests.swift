@@ -191,6 +191,97 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertTrue(mgr.isDeclined(.ivritLarge))
         XCTAssertFalse(mgr.isDeclined(.openaiTurbo))
     }
+
+    // MARK: - CoreML encoder is deleted with the model (#265)
+
+    /// Installs a stand-in `<name>-encoder.mlmodelc` next to the `.bin`, the
+    /// way a finished CoreML download would.
+    private func installFakeCoreMLEncoder(_ mgr: ModelManager,
+                                          for model: WhisperModel) throws -> URL {
+        let dir = try XCTUnwrap(mgr.coreMLDirectory(for: model))
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data("not-a-real-encoder".utf8)
+            .write(to: dir.appendingPathComponent("model.espresso.net"))
+        XCTAssertTrue(mgr.isCoreMLInstalled(model))
+        return dir
+    }
+
+    func test_delete_also_removes_the_coreml_encoder() throws {
+        let mgr = makeManager()
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .ivritLarge))
+        mgr.refreshInstalled()
+        let encoder = try installFakeCoreMLEncoder(mgr, for: .ivritLarge)
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: encoder.path),
+                       "Deleting a model must reclaim its ~1.1GB CoreML encoder too — "
+                       + "the confirmation dialog quotes the size of both")
+        XCTAssertFalse(mgr.isCoreMLInstalled(.ivritLarge))
+        XCTAssertFalse(mgr.isInstalled(.ivritLarge))
+        XCTAssertTrue(mgr.isDeclined(.ivritLarge))
+    }
+
+    func test_delete_leaves_another_models_coreml_encoder_alone() throws {
+        let mgr = makeManager()
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .ivritLarge))
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .openaiTurbo))
+        mgr.refreshInstalled()
+        let deleted = try installFakeCoreMLEncoder(mgr, for: .ivritLarge)
+        let kept = try installFakeCoreMLEncoder(mgr, for: .openaiTurbo)
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deleted.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: kept.path),
+                      "Deleting one model must not touch the other's encoder")
+        XCTAssertTrue(mgr.isCoreMLInstalled(.openaiTurbo))
+    }
+
+    func test_delete_succeeds_when_the_model_has_no_coreml_encoder_on_disk() throws {
+        let mgr = makeManager()
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .ivritLarge))
+        mgr.refreshInstalled()
+        XCTAssertFalse(mgr.isCoreMLInstalled(.ivritLarge))
+
+        XCTAssertNoThrow(try mgr.delete(.ivritLarge))
+        XCTAssertTrue(mgr.isDeclined(.ivritLarge))
+    }
+
+    // MARK: - Default selection is established once, not re-asserted (#264, #266)
+
+    func test_fresh_install_has_no_persisted_selection() {
+        let mgr = makeManager()
+        XCTAssertFalse(mgr.hasPersistedSelection,
+                       "A catalog default is not a user choice — launch-time bootstrap "
+                       + "uses this to tell 'never picked' from 'picked this'")
+        XCTAssertEqual(mgr.selectedModelName, WhisperModel.ivritLarge.name)
+    }
+
+    func test_persisted_selection_is_remembered_across_reload() {
+        let mgr = makeManager()
+        mgr.setSelected(.openaiTurbo)
+        XCTAssertTrue(mgr.hasPersistedSelection)
+
+        let reloaded = makeManager()
+
+        XCTAssertTrue(reloaded.hasPersistedSelection,
+                      "Once the user has chosen a model, every later launch must see "
+                      + "that choice rather than re-establishing the default over it")
+        XCTAssertEqual(reloaded.selectedModelName, WhisperModel.openaiTurbo.name)
+    }
+
+    func test_deleting_a_model_does_not_invent_a_persisted_selection() throws {
+        let mgr = makeManager()
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .ivritLarge))
+        mgr.refreshInstalled()
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertFalse(mgr.hasPersistedSelection,
+                       "Deleting is not choosing — a user who never picked a model "
+                       + "must still get the fresh-install default path")
+    }
 }
 
 /// Returns a tiny 200 response for any request — lets `ModelManager.download(_:)`
