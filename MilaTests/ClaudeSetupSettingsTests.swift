@@ -64,13 +64,18 @@ final class ClaudeSetupSettingsTests: XCTestCase {
     }
 
     private func makeSettings(tokenStore: ClaudeTokenStoring,
-                              testResult: LLMTestResult = LLMTestResult(succeeded: true))
+                              testResult: LLMTestResult = LLMTestResult(succeeded: true),
+                              systemCLI: URL? = nil)
     -> ClaudeSetupSettings {
         ClaudeSetupSettings(defaults: defaults,
                             tokenStore: tokenStore,
                             appSupportRoot: root,
                             openURL: { _ in XCTFail("no browser should open in a test") },
-                            runTest: { _, _ in testResult })
+                            runTest: { _, _ in testResult },
+                            // Explicit even when nil: the production default
+                            // searches the real machine, and a claude on the
+                            // test host's PATH must not leak into these tests.
+                            systemCLILookup: { systemCLI })
     }
 
     // MARK: - Status
@@ -79,6 +84,73 @@ final class ClaudeSetupSettingsTests: XCTestCase {
         let settings = makeSettings(tokenStore: InMemoryTokenStore())
         XCTAssertEqual(settings.status, .notSetUp)
         XCTAssertFalse(settings.status.isReady)
+    }
+
+    /// A claude the user installed themselves is a complete setup: the row
+    /// must show it as good (and ready), not as "Not set up".
+    func test_a_system_cli_shows_as_using_your_cli_not_as_not_set_up() {
+        let settings = makeSettings(tokenStore: InMemoryTokenStore(),
+                                    systemCLI: URL(fileURLWithPath: "/opt/somewhere/claude"))
+        XCTAssertEqual(settings.status, .usingSystemCLI(verified: false))
+        XCTAssertTrue(settings.status.isReady)
+        XCTAssertEqual(settings.systemCLIPath, "/opt/somewhere/claude")
+    }
+
+    /// The managed copy is what `LLMRunner` prefers, so once it exists the row
+    /// must describe IT — even when a system claude is also present.
+    func test_a_managed_install_takes_precedence_over_a_system_cli() throws {
+        try installFakeBinary()
+        let settings = makeSettings(tokenStore: InMemoryTokenStore(),
+                                    systemCLI: URL(fileURLWithPath: "/opt/somewhere/claude"))
+        XCTAssertEqual(settings.status, .installedNotSignedIn)
+    }
+
+    /// Test against the system CLI: verifies, persists, and restores — but
+    /// only for the same binary path the proof was recorded against.
+    func test_a_passing_test_verifies_the_system_cli_and_survives_relaunch() async {
+        let cli = URL(fileURLWithPath: "/opt/somewhere/claude")
+        var testedPath: String?
+        let settings = ClaudeSetupSettings(defaults: defaults,
+                                           tokenStore: InMemoryTokenStore(),
+                                           appSupportRoot: root,
+                                           openURL: { _ in XCTFail("no browser in tests") },
+                                           runTest: { binary, _ in
+                                               testedPath = binary.path
+                                               return LLMTestResult(succeeded: true)
+                                           },
+                                           systemCLILookup: { cli })
+
+        await settings.test()
+
+        XCTAssertEqual(testedPath, cli.path, "the Test must run the system CLI when no managed copy exists")
+        XCTAssertEqual(settings.status, .usingSystemCLI(verified: true))
+
+        let relaunched = makeSettings(tokenStore: InMemoryTokenStore(), systemCLI: cli)
+        XCTAssertEqual(relaunched.status, .usingSystemCLI(verified: true),
+                       "verification recorded for the system CLI must restore on relaunch")
+
+        let differentCLI = makeSettings(tokenStore: InMemoryTokenStore(),
+                                        systemCLI: URL(fileURLWithPath: "/usr/other/claude"))
+        XCTAssertEqual(differentCLI.status, .usingSystemCLI(verified: false),
+                       "a proof about one binary must not transfer to a different one")
+    }
+
+    /// With neither binary present, Test must be a no-op rather than a run
+    /// against a path that does not exist.
+    func test_test_does_nothing_with_no_binary_anywhere() async {
+        var ran = false
+        let settings = ClaudeSetupSettings(defaults: defaults,
+                                           tokenStore: InMemoryTokenStore(),
+                                           appSupportRoot: root,
+                                           openURL: { _ in XCTFail("no browser in tests") },
+                                           runTest: { _, _ in
+                                               ran = true
+                                               return LLMTestResult(succeeded: true)
+                                           },
+                                           systemCLILookup: { nil })
+        await settings.test()
+        XCTAssertFalse(ran)
+        XCTAssertNil(settings.lastTestResult)
     }
 
     func test_status_is_installed_but_not_signed_in_without_a_token() throws {

@@ -88,6 +88,10 @@ struct ClaudeSetupSection: View {
     private var statusColor: Color {
         switch setup.status {
         case .signedIn(let verified): return verified ? .green : .secondary
+        // Green even before a Test run: the user's own CLI being found IS the
+        // good state — rendering it grey made a working setup read as a chore
+        // still to do.
+        case .usingSystemCLI:         return .green
         case .problem:                return .orange
         case .working:                return .secondary
         case .notSetUp,
@@ -136,9 +140,25 @@ struct ClaudeSetupSection: View {
                 Button("Sign out…") { showRemoveConfirmation = true }
                     .accessibilityIdentifier("ai.provider.claudeSetup.signOut")
 
+            case .usingSystemCLI:
+                // Nothing to fix here, so no prominent button: Test to prove
+                // the login, and the managed install as an opt-in extra (it
+                // takes precedence once installed).
+                testButton
+                Button("Install Mila's own copy…") { setup.setUp() }
+                    .accessibilityIdentifier("ai.provider.claudeSetup.installManaged")
+
             case .working:
-                Button("Cancel") { setup.cancelSignIn() }
-                    .accessibilityIdentifier("ai.provider.claudeSetup.cancel")
+                if setup.isTesting {
+                    // A Test run is bounded (90s) and has no cancel path, so
+                    // showing a Cancel here would be a button that does
+                    // nothing. The spinner-labelled test button is the honest
+                    // rendering of this state.
+                    testButton
+                } else {
+                    Button("Cancel") { setup.cancelSignIn() }
+                        .accessibilityIdentifier("ai.provider.claudeSetup.cancel")
+                }
 
             case .problem:
                 // A failure is the one state where "try the whole thing again"
@@ -180,7 +200,14 @@ struct ClaudeSetupSection: View {
 
     private var caption: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Text("Mila downloads Anthropic's official Claude CLI, checks its Apple code signature before running it, and keeps it in its own folder. Your Claude subscription signs in through your browser.")
+            if case .usingSystemCLI = setup.status, let path = setup.systemCLIPath {
+                Text("Mila found the Claude CLI you already installed and uses it as-is. Installing Mila's own copy is optional; it would take over from this one.")
+                Text(verbatim: path)
+                    .font(.caption2.monospaced())
+                    .textSelection(.enabled)
+            } else {
+                Text("Mila downloads Anthropic's official Claude CLI, checks its Apple code signature before running it, and keeps it in its own folder. Your Claude subscription signs in through your browser.")
+            }
             if setup.isInstalled {
                 Text(verbatim: setup.managedBinaryPath)
                     .font(.caption2.monospaced())

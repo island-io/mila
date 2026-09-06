@@ -18,6 +18,11 @@ enum ClaudeSetupStatus: Equatable {
     /// this exact binary and credential — see `ClaudeSetupSettings.status` for
     /// why that is not the same as "we have a token".
     case signedIn(verified: Bool)
+    /// The user already has their own `claude` (npm, the official installer,
+    /// anything `LLMRunner`'s search finds) and no managed copy is installed.
+    /// That setup is complete as far as Mila is concerned — it must not read
+    /// as "Not set up" just because *this* button didn't produce it.
+    case usingSystemCLI(verified: Bool)
     case working(String)
     case problem(String)
 
@@ -26,6 +31,8 @@ enum ClaudeSetupStatus: Equatable {
         case .notSetUp:              return "Not set up"
         case .installedNotSignedIn:  return "Installed, not signed in"
         case .signedIn(let verified): return verified ? "Signed in and working" : "Signed in"
+        case .usingSystemCLI(let verified):
+            return verified ? "Using your Claude CLI — working" : "Using your Claude CLI"
         case .working(let what):     return what
         case .problem(let message):  return message
         }
@@ -36,15 +43,18 @@ enum ClaudeSetupStatus: Equatable {
         case .notSetUp:             return "circle.dashed"
         case .installedNotSignedIn: return "person.crop.circle.badge.questionmark"
         case .signedIn(let verified): return verified ? "checkmark.circle.fill" : "checkmark.circle"
+        case .usingSystemCLI(let verified): return verified ? "checkmark.circle.fill" : "checkmark.circle"
         case .working:              return "arrow.triangle.2.circlepath"
         case .problem:              return "exclamationmark.triangle.fill"
         }
     }
 
-    /// True when Mila can run the managed CLI right now.
+    /// True when Mila can run a Claude CLI right now (managed or the user's own).
     var isReady: Bool {
-        if case .signedIn = self { return true }
-        return false
+        switch self {
+        case .signedIn, .usingSystemCLI: return true
+        default: return false
+        }
     }
 }
 
@@ -70,6 +80,11 @@ final class ClaudeSetupSettings: ObservableObject {
     @Published private(set) var isInstalled: Bool = false
     @Published private(set) var installedVersion: String?
     @Published private(set) var hasToken: Bool = false
+
+    /// Where a non-managed `claude` was found, if anywhere — the same search
+    /// `LLMRunner` performs minus the managed copy. Drives `.usingSystemCLI`,
+    /// and shown as the caption path so the user knows which binary Mila runs.
+    @Published private(set) var systemCLIPath: String?
 
     /// Outcome of the most recent Test run, kept for the row's detail text.
     /// Not persisted — `verified` below is the durable half.
@@ -105,6 +120,11 @@ final class ClaudeSetupSettings: ObservableObject {
     private let openURL: (URL) -> Void
     /// Injected so the Test button can be exercised without running a CLI.
     private let runTest: (URL, TimeInterval) async -> LLMTestResult
+    /// Injected so tests control whether a "system" claude exists. The default
+    /// is `LLMRunner`'s own search with the managed copy excluded, so this
+    /// answers exactly one question: what would Mila run if we hadn't
+    /// installed anything?
+    private let systemCLILookup: () -> URL?
 
     private var installTask: Task<Void, Never>?
 
@@ -114,13 +134,17 @@ final class ClaudeSetupSettings: ObservableObject {
          appSupportRoot: URL = ClaudeManagedInstall.applicationSupportRoot(),
          fileManager: FileManager = .default,
          openURL: @escaping (URL) -> Void = { _ in },
-         runTest: ((URL, TimeInterval) async -> LLMTestResult)? = nil) {
+         runTest: ((URL, TimeInterval) async -> LLMTestResult)? = nil,
+         systemCLILookup: (() -> URL?)? = nil) {
         self.defaults = defaults
         self.tokenStore = tokenStore
         self.appSupportRoot = appSupportRoot
         self.fileManager = fileManager
         self.installer = installer ?? ClaudeBinaryInstaller(appSupportRoot: appSupportRoot)
         self.openURL = openURL
+        self.systemCLILookup = systemCLILookup ?? {
+            try? LLMRunner.resolveExecutable(tool: .claude, override: nil, managedBinary: nil)
+        }
         self.runTest = runTest ?? { binary, timeout in
             // The real probe: the smallest useful thing the CLI can do. It goes
             // through `LLMRunner`, so it exercises the same executable
@@ -160,7 +184,13 @@ final class ClaudeSetupSettings: ObservableObject {
         case .idle, .ready:  break
         }
         if isTesting { return .working("Testing…") }
-        guard isInstalled else { return .notSetUp }
+        guard isInstalled else {
+            // No managed copy — but a claude the user installed themselves is
+            // a complete setup, not an absent one. The managed flow stays
+            // available as an optional extra in that state.
+            if systemCLIPath != nil { return .usingSystemCLI(verified: verified) }
+            return .notSetUp
+        }
         guard hasToken else { return .installedNotSignedIn }
         if verified { return .signedIn(verified: true) }
         if let result = lastTestResult, result.succeeded { return .signedIn(verified: true) }
@@ -226,6 +256,13 @@ final class ClaudeSetupSettings: ObservableObject {
             state = .idle
             return false
         } catch {
+            // A cancelled URLSession task surfaces as `URLError.cancelled`,
+            // not `CancellationError` — either way the user asked for it, so
+            // it must not render as a failure.
+            if Task.isCancelled {
+                state = .idle
+                return false
+            }
             let message = (error as? LocalizedError)?.errorDescription
                 ?? error.localizedDescription
             state = .failed(message)
@@ -246,7 +283,17 @@ final class ClaudeSetupSettings: ObservableObject {
         let session = ClaudeSetupTokenSession.managed(binary: binary)
         session.onStateChange = { [weak self] newState in
             guard let self else { return }
-            self.state = newState
+            // The session reports `.ready` right after delivering the token —
+            // but `onToken` runs first, and `store(_:)` may have just recorded
+            // a Keychain failure there. That failure is the truer state: the
+            // session only knows the CLI handed a token over, not whether it
+            // could be kept. Copying `.ready` over it would silently bury the
+            // one error the user has to act on.
+            if case .ready = newState, case .failed = self.state {
+                // keep the failure; fall through so the session is still released
+            } else {
+                self.state = newState
+            }
             switch newState {
             case .ready, .failed, .idle:
                 // Released on the NEXT main-actor turn, not here. This property
@@ -284,13 +331,20 @@ final class ClaudeSetupSettings: ObservableObject {
         session?.submit(code: code)
     }
 
-    /// Abandon an in-progress sign-in.
+    /// Abandon whatever the Cancel button is looking at: an in-progress
+    /// download, a sign-in, or an install that would chain into one.
+    ///
+    /// Cancelling `installTask` matters even mid-download: without it the
+    /// transfer keeps running, and `setUp()`'s task would then proceed to
+    /// `startSignIn()` and open a browser the user has already walked away
+    /// from.
     func cancelSignIn() {
+        installTask?.cancel()
         session?.cancel()
         session = nil
         switch state {
-        case .signingIn, .awaitingCode, .verifying: state = .idle
-        case .idle, .installing, .ready, .failed: break
+        case .signingIn, .awaitingCode, .verifying, .installing: state = .idle
+        case .idle, .ready, .failed: break
         }
     }
 
@@ -342,14 +396,21 @@ final class ClaudeSetupSettings: ObservableObject {
 
     // MARK: - Test
 
-    /// Run one trivial prompt through the managed binary and record whether it
-    /// worked. Bounded — a hung CLI must not leave the row spinning.
+    /// The binary a Test run (and `LLMRunner` itself) would use: the managed
+    /// copy when installed, otherwise the user's own CLI if one was found.
+    var effectiveBinaryPath: String? {
+        if isInstalled { return managedBinaryPath }
+        return systemCLIPath
+    }
+
+    /// Run one trivial prompt through the effective binary and record whether
+    /// it worked. Bounded — a hung CLI must not leave the row spinning.
     func test() async {
-        guard !isTesting, isInstalled else { return }
+        guard !isTesting, let binaryPath = effectiveBinaryPath else { return }
         isTesting = true
         lastTestResult = nil
         defer { isTesting = false }
-        let binary = ClaudeManagedInstall.binaryURL(appSupportRoot: appSupportRoot)
+        let binary = URL(fileURLWithPath: binaryPath)
         let result = await runTest(binary, Self.testTimeout)
         lastTestResult = result
         if result.succeeded {
@@ -372,6 +433,7 @@ final class ClaudeSetupSettings: ObservableObject {
             installedVersion = defaults.string(forKey: Keys.installedVersion)
         }
         hasToken = tokenStore.load() != nil
+        systemCLIPath = systemCLILookup()?.path
     }
 
     /// Restore the persisted "this setup was proven to work" flag — but only if
@@ -385,18 +447,33 @@ final class ClaudeSetupSettings: ObservableObject {
     /// persisted Python path still equals the configured one.
     private func restoreVerification() {
         guard defaults.bool(forKey: Keys.verified) else { return }
-        guard isInstalled, hasToken else { return }
-        guard defaults.string(forKey: Keys.verifiedBinaryPath) == managedBinaryPath else { return }
-        let recordedVersion = defaults.string(forKey: Keys.verifiedVersion)
-        guard recordedVersion == installedVersion else { return }
-        verified = true
+        let recordedPath = defaults.string(forKey: Keys.verifiedBinaryPath)
+        if isInstalled {
+            guard hasToken else { return }
+            guard recordedPath == managedBinaryPath else { return }
+            let recordedVersion = defaults.string(forKey: Keys.verifiedVersion)
+            guard recordedVersion == installedVersion else { return }
+            verified = true
+        } else if let systemCLIPath {
+            // The user's own CLI carries its own login (`~/.claude`), so there
+            // is no token requirement here. The proof is only about identity:
+            // the binary that passed the Test is still the one Mila would run.
+            guard recordedPath == systemCLIPath else { return }
+            verified = true
+        }
     }
 
     private func recordVerification() {
         verified = true
         defaults.set(true, forKey: Keys.verified)
-        defaults.set(managedBinaryPath, forKey: Keys.verifiedBinaryPath)
-        defaults.set(installedVersion, forKey: Keys.verifiedVersion)
+        defaults.set(effectiveBinaryPath, forKey: Keys.verifiedBinaryPath)
+        if isInstalled {
+            defaults.set(installedVersion, forKey: Keys.verifiedVersion)
+        } else {
+            // A system CLI has no managed version to pin the proof to; leaving
+            // a stale managed version here would block the restore above.
+            defaults.removeObject(forKey: Keys.verifiedVersion)
+        }
     }
 
     private func clearVerification() {
