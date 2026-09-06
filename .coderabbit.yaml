@@ -1,0 +1,10 @@
+# yaml-language-server: $schema=https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
+#
+# Cursor Bugbot is this repo's automated reviewer (see .cursor/BUGBOT.md,
+# introduced in #221). The CodeRabbit GitHub App is still installed at the
+# org level, and with no config file present it auto-reviews every PR with
+# its defaults. This file turns automatic reviews off; on-demand reviews
+# (`@coderabbitai review`) remain available.
+reviews:
+  auto_review:
+    enabled: false
