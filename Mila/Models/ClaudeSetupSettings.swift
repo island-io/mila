@@ -127,6 +127,12 @@ final class ClaudeSetupSettings: ObservableObject {
     private let systemCLILookup: () -> URL?
 
     private var installTask: Task<Void, Never>?
+    /// Which install currently owns the published state. A cancelled install
+    /// can outlive its cancellation (blocked in `installer.install` until the
+    /// transfer notices), and its terminal writes must not level a replacement
+    /// install the user started in the meantime. Bumped by every new install
+    /// and by every cancel; a task whose generation is stale writes nothing.
+    private var installGeneration = 0
 
     init(defaults: UserDefaults = .standard,
          tokenStore: ClaudeTokenStoring = KeychainClaudeTokenStore(),
@@ -210,11 +216,14 @@ final class ClaudeSetupSettings: ObservableObject {
     func setUp() {
         guard !state.isBusy else { return }
         installTask?.cancel()
+        installGeneration += 1
+        let generation = installGeneration
         installTask = Task { @MainActor [weak self] in
             guard let self else { return }
             if !self.isInstalled {
-                guard await self.performInstall() else { return }
+                guard await self.performInstall(generation: generation) else { return }
             }
+            guard generation == self.installGeneration else { return }
             self.startSignIn()
         }
     }
@@ -228,20 +237,25 @@ final class ClaudeSetupSettings: ObservableObject {
     func reinstall() {
         guard !state.isBusy else { return }
         installTask?.cancel()
+        installGeneration += 1
+        let generation = installGeneration
         installTask = Task { @MainActor [weak self] in
-            _ = await self?.performInstall()
+            _ = await self?.performInstall(generation: generation)
         }
     }
 
-    private func performInstall() async -> Bool {
+    private func performInstall(generation: Int) async -> Bool {
+        guard generation == installGeneration else { return false }
         state = .installing(progress: -1)
         do {
             let result = try await installer.install { progress in
                 Task { @MainActor [weak self] in
-                    guard let self, case .installing = self.state else { return }
+                    guard let self, generation == self.installGeneration,
+                          case .installing = self.state else { return }
                     self.state = .installing(progress: progress)
                 }
             }
+            guard generation == installGeneration else { return false }
             installedVersion = result.version
             defaults.set(result.version, forKey: Keys.installedVersion)
             refreshInstalledState()
@@ -253,9 +267,10 @@ final class ClaudeSetupSettings: ObservableObject {
             state = .idle
             return true
         } catch is CancellationError {
-            state = .idle
+            if generation == installGeneration { state = .idle }
             return false
         } catch {
+            guard generation == installGeneration else { return false }
             // A cancelled URLSession task surfaces as `URLError.cancelled`,
             // not `CancellationError` — either way the user asked for it, so
             // it must not render as a failure.
@@ -340,6 +355,10 @@ final class ClaudeSetupSettings: ObservableObject {
     /// from.
     func cancelSignIn() {
         installTask?.cancel()
+        // Disown the cancelled task's future writes as well as cancelling it:
+        // it may be parked inside `installer.install` past the cancel, and its
+        // eventual terminal state belongs to nobody now.
+        installGeneration += 1
         session?.cancel()
         session = nil
         switch state {

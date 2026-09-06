@@ -117,14 +117,24 @@ struct ClaudeSetupTokenParser {
     mutating func consume(_ chunk: String) -> [Event] {
         buffer += chunk
         if buffer.count > Self.bufferLimit {
-            buffer = String(buffer.suffix(Self.bufferLimit))
             // Truncation can evict already-reported rejections from the
             // window; `rejectionsSeen` must shrink with them or the count
             // stays ahead of what is visible and the NEXT rejection gets
             // swallowed (`rejections.count > rejectionsSeen` never fires).
-            let retained = Self.rejectionMessages(
+            //
+            // Shrink by the number EVICTED — the difference across the
+            // truncation — not by clamping to what is retained: a clamp
+            // counts a brand-new rejection that arrived in this very chunk
+            // as if it had been reported already, and swallows it. Eviction
+            // takes the oldest text first, and the oldest rejections are
+            // exactly the first-reported ones, so the subtraction and the
+            // count stay aligned.
+            let before = Self.rejectionMessages(
                 in: Self.dewrap(Self.sanitize(buffer), width: width)).count
-            rejectionsSeen = min(rejectionsSeen, retained)
+            buffer = String(buffer.suffix(Self.bufferLimit))
+            let after = Self.rejectionMessages(
+                in: Self.dewrap(Self.sanitize(buffer), width: width)).count
+            rejectionsSeen = max(0, rejectionsSeen - max(0, before - after))
         }
         let text = Self.dewrap(Self.sanitize(buffer), width: width)
         let flat = Self.normalized(text)

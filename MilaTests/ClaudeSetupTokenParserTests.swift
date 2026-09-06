@@ -226,6 +226,25 @@ final class ClaudeSetupTokenParserTests: XCTestCase {
                        "only the NEW rejection is re-emitted")
     }
 
+    /// The Bugbot scenario from PR #272: one rejection is reported, then a
+    /// long quiet stretch of output overflows the 64 KiB window, and the
+    /// user's SECOND bad paste arrives in the same chunk that triggers the
+    /// truncation. The eviction of the first rejection must not be confused
+    /// with the arrival of the second — the new rejection has to be emitted,
+    /// or the sheet sits on "verifying" until the timeout.
+    func test_a_rejection_arriving_with_the_truncation_is_still_reported() {
+        var parser = ClaudeSetupTokenParser()
+        let first = parser.consume("OAuth error: Invalid code. One\n")
+        XCTAssertEqual(first.filter { if case .codeRejected = $0 { return true } else { return false } }.count, 1)
+
+        // Enough filler to push the first rejection out of the window, with
+        // the second rejection riding in the SAME chunk.
+        let filler = String(repeating: "x", count: 70 * 1024)
+        let events = parser.consume(filler + "\nOAuth error: Invalid code. Two\n")
+        XCTAssertEqual(events.filter { if case .codeRejected = $0 { return true } else { return false } }.count, 1,
+                       "a rejection that arrives in the chunk that overflows the buffer must still be emitted")
+    }
+
     // MARK: - Full transcript
 
     /// The whole observed shape at once, with escapes and a spinner redraw, fed
