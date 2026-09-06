@@ -36,14 +36,22 @@ struct ClearedSpeakerNames: Sendable {
     }
 
     let recordingID: UUID
-    /// EVERY name the row carried before the pass — including the ones whose
-    /// observation is no longer held. Membership is what says "this
-    /// recording has already contributed to that profile", which is the fact
-    /// that must suppress a second fold; being able to re-point the
-    /// observation is a further, optional improvement on top.
-    let names: Set<String>
-    /// The subset whose observation survived, ready to be re-pointed at
-    /// whichever new id the re-match resolves the name to.
+    /// **Only the names whose observation is still held**, keyed by name.
+    ///
+    /// A name the row carried whose observation is gone is deliberately
+    /// absent, not listed separately. Knowing "this recording already
+    /// contributed to that profile" is not enough to act on: suppressing the
+    /// re-match's fold without also re-pointing the snapshot at the
+    /// observation the profile actually received would leave the snapshot
+    /// claiming an observation the profile never got, and a later un-name
+    /// would subtract a vector that was never added — a drifted centroid,
+    /// which is worse than the residue it was avoiding. So the carry exists
+    /// exactly where it can be completed, and every other name takes the
+    /// ordinary path.
+    ///
+    /// That is not a rare gap. `ObservedVoiceSnapshots` is in-memory only, so
+    /// **after any relaunch this map is empty** while the row's names (which
+    /// are persisted) are not.
     let contributions: [String: Contribution]
 }
 
@@ -222,6 +230,14 @@ final class OfflineVoiceEmbedder {
     /// the first is kept and the second dropped: under-correcting, the same
     /// choice `absorb` makes.
     ///
+    /// **A name with no observation left is simply not carried.** The whole
+    /// point of the carry is to keep the profile and the snapshot describing
+    /// the same contribution; with nothing to re-point, suppressing the
+    /// re-match's fold would break exactly that agreement. Those names fall
+    /// through to `setSpeakerName` and behave as they did before this
+    /// existed. It is the common case, not the corner: the snapshots do not
+    /// survive a relaunch and the names do.
+    ///
     /// Nothing is written here. The worst this call can do is leave a stale
     /// value in one slot, which the next `matchAfterPass` discards.
     func notePassClearedSpeakerNames(_ previousNames: [String: String], for recordingID: UUID) {
@@ -248,7 +264,6 @@ final class OfflineVoiceEmbedder {
                                              profileName: $0.profileName)
         }
         clearedByPass = ClearedSpeakerNames(recordingID: recordingID,
-                                            names: Set(previousNames.values),
                                             contributions: contributions)
     }
 
@@ -288,19 +303,30 @@ final class OfflineVoiceEmbedder {
     /// again folds a fresh observation in beside a stranded one that nothing
     /// can ever take back out (island-io/mila#260).
     ///
-    /// So a name that was on the row before the pass is not treated as a new
-    /// name at all. `notePassClearedSpeakerNames` hands those names over —
-    /// with the observation each one folded in, resolved before the
-    /// invalidation above — and when the re-match resolves a speaker to one
-    /// of them, this **re-attaches the label to the contribution the profile
-    /// already holds**: the snapshot entry for the new id is re-pointed at
-    /// that observation, and the name goes on through
+    /// So a name that was on the row before the pass — and whose observation
+    /// is still held — is not treated as a new name at all.
+    /// `notePassClearedSpeakerNames` hands those pairs over, resolved before
+    /// the invalidation above, and when the re-match resolves a speaker to
+    /// one of them this **re-attaches the label to the contribution the
+    /// profile already holds**: the snapshot entry for the new id is
+    /// re-pointed at that observation, and the name goes on through
     /// `RecordingStore.reattachSpeakerName`, which fires no
     /// `onSpeakerNamed`. Un-naming that speaker afterwards then subtracts
     /// exactly what naming it added, once — the invariant #253 and #237 are
     /// about. Each cleared name can be claimed by at most ONE new id; a
     /// second id matching the same profile is a genuinely new contribution
     /// and folds normally.
+    ///
+    /// **Suppressing the fold and re-pointing the snapshot are one act, never
+    /// one without the other.** The pair is what makes the correction
+    /// reversible; half of it is worse than neither. A cleared name whose
+    /// observation is NOT held therefore takes the ordinary path and folds,
+    /// which is what `main` does — the profile ends up carrying this
+    /// recording twice and the older contribution is residue. That is the
+    /// common case rather than a corner: `ObservedVoiceSnapshots` is
+    /// in-memory only, so every re-transcribe after a relaunch arrives with
+    /// the names (persisted, on the row) and none of the observations. See
+    /// the note at the fold below for the arithmetic of getting this wrong.
     ///
     /// **Nothing here subtracts, and nothing here deletes.** The retire that
     /// `RecordingStore.update(_:retiringSpeakerNames:)` performs for the
@@ -350,12 +376,13 @@ final class OfflineVoiceEmbedder {
                                                  profileName: nil as String?) }
                 self.snapshots.merge(observed, for: recordingID)
                 let threshold = self.matchThreshold()
-                // The names this recording had already folded into profiles,
-                // before the pass cleared the labels that accounted for them.
-                // Claimed at most once each: the second speaker to match one
-                // of these profiles is a new contribution, not the old one
-                // coming back.
-                var unclaimed = cleared?.names ?? []
+                // The contributions this recording made under names the pass
+                // cleared, still available to be re-pointed. Claimed at most
+                // once each — the second speaker to match one of these
+                // profiles is a new contribution, not the old one coming
+                // back — and a name that is not in here takes the ordinary
+                // path below.
+                var carryable = cleared?.contributions ?? [:]
                 // Sorted: `Dictionary` order is unspecified per process, and
                 // this drives `.srt` rewrites, log lines, and which id claims
                 // a cleared name when two of them match it.
@@ -369,38 +396,49 @@ final class OfflineVoiceEmbedder {
                     guard let centroid = embeddings[rawID],
                           let profile = self.profiles.match(embedding: centroid,
                                                             threshold: threshold) else { continue }
-                    guard unclaimed.remove(profile.name) != nil else {
+                    // **The suppression and the re-point are one act.**
+                    // Naming without folding is only correct while the
+                    // snapshot is simultaneously pointed at the observation
+                    // the profile DID receive: that pair is what a later
+                    // un-name reverses. With no contribution to point it at
+                    // — the state after every relaunch, since the snapshots
+                    // are in-memory and the names are not — suppressing the
+                    // fold would leave the snapshot claiming this pass's
+                    // fresh observation while the profile holds the old one,
+                    // and un-naming would subtract a vector that was never
+                    // added: a centroid drifted by
+                    // `n·(c_old − c_fresh)/(S − n)`, which is the invisible
+                    // corruption this whole feature exists to prevent, and
+                    // strictly worse than the duplicate fold it was trying to
+                    // avoid. So without the evidence to do better, this
+                    // degrades to what `main` does: fold, stay reconcilable,
+                    // leave the older contribution as residue.
+                    guard let contribution = carryable.removeValue(forKey: profile.name) else {
                         store.setSpeakerName(profile.name, forSpeaker: rawID,
                                              recordingID: recordingID)
                         continue
                     }
-                    // A name from before the pass, back on a new id. The
-                    // profile already carries this recording's contribution
-                    // under it, so the snapshot is re-pointed at THAT
-                    // observation — what the profile actually received, which
-                    // is what a later un-name has to subtract — and the label
-                    // is written without firing the fold. When the
-                    // observation is no longer held (evicted, or never
-                    // taken), the fresh one stays in the snapshot: its count
-                    // matches what the profile received, so the un-name still
-                    // reverses the right amount.
-                    if let contribution = cleared?.contributions[profile.name] {
-                        self.snapshots.merge([(id: rawID,
-                                               observedCentroid: contribution.centroid,
-                                               observedCount: contribution.count,
-                                               profileName: contribution.profileName)],
-                                             for: recordingID)
-                    }
+                    // A name from before the pass, back on a new id, with the
+                    // contribution it accounted for still in hand. The
+                    // snapshot is re-pointed at THAT observation — what the
+                    // profile actually received, and so what a later un-name
+                    // has to subtract — and the label is written without
+                    // firing the fold.
+                    self.snapshots.merge([(id: rawID,
+                                           observedCentroid: contribution.centroid,
+                                           observedCount: contribution.count,
+                                           profileName: contribution.profileName)],
+                                         for: recordingID)
                     store.reattachSpeakerName(profile.name, toSpeaker: rawID,
                                               recordingID: recordingID)
                     embedLog.log("a name cleared by the pass came back on \(rawID, privacy: .public) — re-attached to the contribution already in the profile")
                 }
-                if !unclaimed.isEmpty {
+                if !carryable.isEmpty {
                     // Their contributions stay where they are. Subtracting
                     // them here would delete a profile this recording is the
                     // only evidence for, on the strength of a voice match
                     // that came up short — see the note on this method.
-                    embedLog.log("\(unclaimed.count, privacy: .public) name(s) cleared by the pass did not come back — their profile contributions are left in place")
+                    embedLog.log("\(carryable.count, privacy: .public) carried contribution(s) went unclaimed — the pass did not bring those names back, and they are left in place")
                 }
             }
         }

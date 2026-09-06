@@ -791,14 +791,66 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
         w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 3)
         w.probe.returns(["SPEAKER_00": aliceSpeaking])
 
-        // A pass on some other recording cleared "Alice", and its match never
+        // A pass on some other recording cleared "Alice" there, backed by an
+        // observation of a completely different voice, and its match never
         // reached the embedder.
-        w.embedder.notePassClearedSpeakerNames(["SPEAKER_00": "Alice"], for: UUID())
+        let elsewhere = UUID()
+        w.snapshots.record([(id: "SPEAKER_00", observedCentroid: strangerSpeaking,
+                             observedCount: 1, profileName: nil)], for: elsewhere)
+        w.embedder.notePassClearedSpeakerNames(["SPEAKER_00": "Alice"], for: elsewhere)
         w.embedder.matchAfterPass(recordingID: w.recordingID)
         await w.embedder.awaitPending()
 
         XCTAssertEqual(row(w).speakerNames["SPEAKER_00"], "Alice")
         XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 4,
                        "this recording has contributed nothing to her yet, so its observation folds in")
+        assertCentroid(w.snapshots.observation(forSpeaker: "SPEAKER_00", in: w.recordingID)?.observedCentroid,
+                       aliceSpeaking,
+                       "and the snapshot holds THIS recording's voice — applying the other "
+                       + "recording's carry would have put a stranger's under her name")
+    }
+
+    /// **The state after every relaunch.** `ObservedVoiceSnapshots` lives
+    /// only in memory, while `speakerNames` and the profiles are on disk — so
+    /// a re-transcribe following a restart arrives with the name and with no
+    /// observation to re-point. This is the ordinary path, not an eviction
+    /// corner, which is why the branch matters.
+    ///
+    /// **Discriminating.** Suppressing the fold here would leave the snapshot
+    /// holding this pass's FRESH observation while the profile still holds
+    /// the old one, so un-naming would subtract a vector the profile never
+    /// received: `[1.03, -0.13, 0, 0]` at 3 samples, a centroid that is no
+    /// longer the mean of anything. Folding instead keeps the two sides
+    /// describing the same observation — the profile carries this recording
+    /// twice, which is what `main` does and is recoverable, and every
+    /// subtraction stays exact.
+    func test_a_cleared_name_with_no_held_observation_folds_instead() async throws {
+        let w = try makeWorld(speakerNames: ["SPEAKER_00": "Alice"], threshold: 0.7)
+        // Her profile as it comes back off disk: her earlier recordings, plus
+        // this recording's contribution from before the relaunch…
+        w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 3)
+        w.profiles.updateProfile(name: "Alice", embedding: aliceSpeaking, sampleCount: 1)
+        // …and no observations at all, because nothing repopulates them.
+        XCTAssertEqual(w.snapshots.heldRecordingCount, 0,
+                       "precondition: the snapshots did not survive the relaunch")
+        let beforePass = try XCTUnwrap(w.profiles.profile(named: "Alice")).embedding
+
+        w.probe.returns(["SPEAKER_01": aliceSpeakingAgain])
+        await runPass(w, producing: [segment("SPEAKER_01", 0, 5),
+                                     segment("SPEAKER_01", 5, 20)])
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_01"], "Alice")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 5,
+                       "with nothing to re-point, the fold must happen: the profile and the "
+                       + "snapshot have to describe the same observation")
+
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_01", recordingID: w.recordingID)
+
+        let alice = try XCTUnwrap(w.profiles.profile(named: "Alice"))
+        XCTAssertEqual(alice.sampleCount, 4,
+                       "the un-name takes back exactly the observation that was just folded in")
+        assertCentroid(alice.embedding, beforePass,
+                       "…and her centroid returns to where the pass found it, rather than drifting "
+                       + "by a vector she never received")
     }
 }

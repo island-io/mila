@@ -691,10 +691,16 @@ final class RecordingStore: ObservableObject {
     /// **Not a general "quiet setter".** It refuses to touch an id that
     /// already carries a name, so it can never silently replace one — a
     /// replacement is a profile correction and belongs on `setSpeakerName`,
-    /// which fires both hooks. And it is only ever correct where the caller
-    /// has established that the profile already carries this recording's
-    /// contribution under `name`. There is exactly one such caller;
-    /// `OfflineVoiceEmbedderTests` pins both halves.
+    /// which fires both hooks. And it is only correct where the caller has
+    /// both established that the profile already carries this recording's
+    /// contribution under `name` **and** pointed the snapshot for `rawID` at
+    /// that same contribution. Suppressing the fold without re-pointing
+    /// leaves the snapshot describing an observation the profile never
+    /// received, and the un-name then subtracts a vector that was never
+    /// added — a drifted centroid, worse than the duplicate fold it avoids.
+    /// A caller that cannot do both must use `setSpeakerName`. There is
+    /// exactly one such caller; `OfflineVoiceEmbedderTests` pins both halves,
+    /// including the fall-through.
     ///
     /// The **other** direction — a name a re-key drops for good — is
     /// `update(_:retiringSpeakerNames:)`, which fires `onSpeakerUnnamed` so
