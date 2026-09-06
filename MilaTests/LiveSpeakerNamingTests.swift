@@ -350,7 +350,6 @@ final class LiveSpeakerNamingStopRecordingTests: XCTestCase {
     private var fires: [Fire] = []
 
     private let suitePrefix = "LiveSpeakerNamingStopRecordingTests"
-    private var savedSelection: String?
 
     /// A voice no stored profile matches, so the only way its name can reach
     /// a profile is the live-naming path under test.
@@ -364,8 +363,9 @@ final class LiveSpeakerNamingStopRecordingTests: XCTestCase {
         store = RecordingStore(rootDirectory: tempRoot)
         try FileManager.default.createDirectory(at: store.recordingsDirectory,
                                                 withIntermediateDirectories: true)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        manager = TestSupport.isolatedModelManager(
+            modelsDirectory: tempRoot.appendingPathComponent("Models"),
+            label: suitePrefix)
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
@@ -444,11 +444,6 @@ final class LiveSpeakerNamingStopRecordingTests: XCTestCase {
         controller?.onRecordingFinalized = nil
         store?.onSpeakerNamed = nil
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
         for suffix in ["diarization", "language", "llm", "voice"] {
             UserDefaults().removePersistentDomain(forName: "\(suitePrefix).\(suffix)")
         }

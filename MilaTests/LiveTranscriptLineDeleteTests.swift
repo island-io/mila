@@ -50,7 +50,6 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
     private var controller: QuickActionsController!
 
     private let suitePrefix = "LiveTranscriptLineDeleteTests"
-    private var savedSelection: String?
 
     override func setUp() async throws {
         try await super.setUp()
@@ -64,8 +63,9 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         store = RecordingStore(rootDirectory: tempRoot)
         try FileManager.default.createDirectory(at: store.recordingsDirectory,
                                                 withIntermediateDirectories: true)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        manager = TestSupport.isolatedModelManager(
+            modelsDirectory: tempRoot.appendingPathComponent("Models"),
+            label: suitePrefix)
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
@@ -116,11 +116,6 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
 
     override func tearDown() async throws {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
         for suffix in ["diarization", "language", "llm", "liveAI"] {
             UserDefaults().removePersistentDomain(forName: "\(suitePrefix).\(suffix)")
         }

@@ -124,6 +124,22 @@ enum TestSupport {
     /// a clean suite (which has no `transcription.backend` key, so it defaults
     /// to `.local`) makes the stub authoritative regardless of host state.
     @MainActor
+    /// A `ModelManager` whose `selectedModelName` and `model.declinedNames`
+    /// live in a per-`label` suite rather than `UserDefaults.standard`.
+    ///
+    /// `installFakeModel(into:)` calls `setSelected(_:)`, so every suite that
+    /// uses it writes model preferences — and a manager built with the
+    /// production default writes them into the real
+    /// `io.island.whisper.IslandWhisper` domain, the same one the installed
+    /// Mila.app reads (#268).
+    @MainActor
+    static func isolatedModelManager(modelsDirectory: URL, label: String) -> ModelManager {
+        let suiteName = "\(label).models"
+        let suite = UserDefaults(suiteName: suiteName)!
+        suite.removePersistentDomain(forName: suiteName)
+        return ModelManager(modelsDirectory: modelsDirectory, defaults: suite)
+    }
+
     static func isolatedRemoteSettings(label: String) -> RemoteTranscriptionSettings {
         let suiteName = "\(label).remote"
         let suite = UserDefaults(suiteName: suiteName)!
