@@ -219,6 +219,11 @@ final class ClaudeSetupSettings: ObservableObject {
         previous?.cancel()
         installGeneration += 1
         let generation = installGeneration
+        // Go busy SYNCHRONOUSLY, before the queued task gets a turn: while it
+        // waits out its predecessor the row must show work in progress, not an
+        // idle state whose buttons (another retry, Sign out, Sign in) would
+        // race the queued install and be overwritten when the wait ends.
+        state = isInstalled ? .signingIn : .installing(progress: -1)
         installTask = Task { @MainActor [weak self] in
             // Serialize on the predecessor: a cancelled install can slip past
             // its final cancellation check and still be writing the binary and
@@ -231,6 +236,9 @@ final class ClaudeSetupSettings: ObservableObject {
                 guard await self.performInstall(generation: generation) else { return }
             }
             guard generation == self.installGeneration else { return }
+            // Release the placeholder set above — `startSignIn`'s own busy
+            // guard would otherwise see it and refuse the flow it announces.
+            if case .signingIn = self.state { self.state = .idle }
             self.startSignIn()
         }
     }
@@ -247,6 +255,8 @@ final class ClaudeSetupSettings: ObservableObject {
         previous?.cancel()
         installGeneration += 1
         let generation = installGeneration
+        // Synchronously busy for the same reason as `setUp()`.
+        state = .installing(progress: -1)
         installTask = Task { @MainActor [weak self] in
             // Same serialization as `setUp()` — see the comment there.
             await previous?.value
@@ -412,6 +422,11 @@ final class ClaudeSetupSettings: ObservableObject {
     /// credential still in the keychain would be a lie the user cannot see
     /// through.
     func signOut(removeBinary: Bool = false) {
+        // Signing out is an unambiguous "stop": disown and cancel any queued
+        // or running install so it cannot put back a binary (or a busy state)
+        // the user is in the middle of removing.
+        installTask?.cancel()
+        installGeneration += 1
         let removed = tokenStore.delete()
         guard removed else {
             signOutFailed = true
