@@ -279,6 +279,12 @@ final class ClaudeBinaryInstallerTests: XCTestCase {
 
         let contents = try Data(contentsOf: installedBinary)
         XCTAssertEqual(contents, downloader.payload)
+        // The old file above was written 0644. `replaceItemAt` preserves the
+        // DESTINATION's permissions by default, so without the re-chmod in
+        // `moveIntoPlace` this reinstall would produce a non-executable binary
+        // that `isInstalled` and `resolveExecutable` both refuse.
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: installedBinary.path),
+                      "a reinstall over a non-executable leftover must still produce an executable binary")
     }
 
     func test_removal_reports_whether_the_binary_is_actually_gone() throws {

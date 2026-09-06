@@ -62,6 +62,8 @@ struct KeychainClaudeTokenStore: ClaudeTokenStoring {
     @discardableResult
     func delete() -> Bool {
         KeychainHelper.delete(key: key)
-        return load() == nil
+        // `load() == nil` is NOT the check: it treats a read error as absence.
+        // Deletion of a credential succeeds only on positive proof of absence.
+        return KeychainHelper.isAbsent(key: key)
     }
 }

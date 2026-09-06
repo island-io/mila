@@ -224,6 +224,11 @@ struct ClaudeBinaryInstaller {
         } catch {
             throw ClaudeInstallError.installFailed(error.localizedDescription)
         }
+        // Re-assert 0o755 on the FINAL path: `replaceItemAt` preserves the
+        // *destination's* metadata by default, so a reinstall over a
+        // non-executable leftover would inherit its permissions — and a
+        // non-executable managed binary reads as "not installed" everywhere.
+        try makeExecutable(destination)
         // Best effort: the attribute is usually absent (URLSession does not
         // quarantine on behalf of a non-sandboxed app), and its absence is
         // reported as an error we deliberately ignore.
@@ -335,11 +340,11 @@ final class URLSessionClaudeDownloader: NSObject, ClaudeBinaryDownloading {
                             error.localizedDescription))
                     }
                 }
-                box.task = task
+                box.adopt(task)
                 task.resume()
             }
         } onCancel: {
-            box.task?.cancel()
+            box.cancel()
         }
 
         do {
@@ -380,7 +385,29 @@ final class URLSessionClaudeDownloader: NSObject, ClaudeBinaryDownloading {
     /// Holds the in-flight task so `onCancel` can reach it. A class because the
     /// cancellation handler runs outside the continuation's closure.
     private final class TaskBox: @unchecked Sendable {
-        var task: URLSessionTask?
+        private let lock = NSLock()
+        private var task: URLSessionTask?
+        private var isCancelled = false
+
+        /// Adopt the task, cancelling it immediately if cancellation already
+        /// won the race. The unsynchronized version dropped exactly that
+        /// cancel: `onCancel` could read `task` as nil an instant before the
+        /// assignment, leaving the download running with nobody awaiting it.
+        func adopt(_ task: URLSessionTask) {
+            lock.lock()
+            let cancelNow = isCancelled
+            self.task = task
+            lock.unlock()
+            if cancelNow { task.cancel() }
+        }
+
+        func cancel() {
+            lock.lock()
+            isCancelled = true
+            let task = self.task
+            lock.unlock()
+            task?.cancel()
+        }
     }
 
     /// Session delegate: refuses off-host redirects and reports progress.

@@ -118,6 +118,13 @@ struct ClaudeSetupTokenParser {
         buffer += chunk
         if buffer.count > Self.bufferLimit {
             buffer = String(buffer.suffix(Self.bufferLimit))
+            // Truncation can evict already-reported rejections from the
+            // window; `rejectionsSeen` must shrink with them or the count
+            // stays ahead of what is visible and the NEXT rejection gets
+            // swallowed (`rejections.count > rejectionsSeen` never fires).
+            let retained = Self.rejectionMessages(
+                in: Self.dewrap(Self.sanitize(buffer), width: width)).count
+            rejectionsSeen = min(rejectionsSeen, retained)
         }
         let text = Self.dewrap(Self.sanitize(buffer), width: width)
         let flat = Self.normalized(text)
