@@ -828,6 +828,18 @@ struct MilaApp: App {
             }
         }
 
+        // A pass that produced segments re-keyed every `SPEAKER_NN`, so the
+        // service clears `speakerNames` wholesale — and that clear fires no
+        // hook, leaving every name's voice-profile contribution with no label
+        // left to un-name. This hands those pairs to the matcher wired just
+        // below, which runs immediately after it: a name that comes back by
+        // voice is then re-attached to the contribution the profile already
+        // holds, instead of folding a second observation of the same
+        // recording in beside a stranded one (island-io/mila#260).
+        svc.onPassClearedSpeakerNames = { [offlineEmbedder] recordingID, previousNames in
+            offlineEmbedder.notePassClearedSpeakerNames(previousNames, for: recordingID)
+        }
+
         // Batch voice matching: after any transcription completes, embed
         // each speaker's longest segment and match against stored voice
         // profiles. Uses embedSpeakers (embedding model only, ~0.5s)
