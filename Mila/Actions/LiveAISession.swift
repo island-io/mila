@@ -262,7 +262,45 @@ final class LiveAISession: ObservableObject {
         // task clears `inFlight` from its `defer` before potentially
         // scheduling another (immediate, since isFinalizing) kick, so
         // looping until `inFlight` is nil drains everything.
+        //
+        // `drained` is what makes that loop terminate rather than spin
+        // (issue #259). `await handle.value` on a task that has ALREADY
+        // finished returns without suspending, so a slot left pointing at a
+        // finished task does not hang this loop -- it makes it re-read the
+        // same handle and burn a core at full tilt, on the main actor, for
+        // as long as the caller lets it. A stall would at least look like a
+        // stall; this looks like a fan.
+        //
+        // Awaiting a handle proves it has finished, so finding that SAME
+        // handle still in the slot on the next read means nothing will ever
+        // clear it: the tick's `defer` skipped its clearing branch, i.e. the
+        // invariant #242 established is broken. That is the fact worth
+        // knowing, so it is logged rather than quietly swallowed -- ending
+        // the drain is damage control, not a fix. It is a log and not an
+        // `assertionFailure` on purpose: the state is recoverable, and
+        // trapping would turn a survivable strand into a debug-build crash.
+        //
+        // Clearing the slot rather than only breaking is what unwedges the
+        // session: `scheduleKick` coalesces every later tick behind a
+        // non-nil `inFlight`, so leaving the dead handle in place would keep
+        // Live AI silently dead. Only the identity just awaited is cleared,
+        // so a fresh tick that took the slot while we were suspended is a
+        // different handle -- awaited on the next turn of the loop, never
+        // clobbered. Same rule as the tick's own `defer`. `isThinking` is
+        // deliberately left alone: it belongs to the tick, the next one sets
+        // and clears it, and `cancel()` (which stop time runs) resets it.
+        var drained: Task<Void, Never>?
         while let handle = inFlight {
+            if handle == drained {
+                liveAILog.error("""
+                    awaitFinalTick: tick slot still holds a finished task \
+                    (issue #259) -- the tick defer's invariant is broken. \
+                    Clearing the slot to end the drain.
+                    """)
+                inFlight = nil
+                break
+            }
+            drained = handle
             _ = await handle.value
         }
     }
