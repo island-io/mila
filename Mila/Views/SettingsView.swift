@@ -1439,6 +1439,16 @@ private struct AIProviderSettingsTab: View {
 
                 if settings.tool != .none {
                     Divider()
+                    // The managed install belongs above the manual fields: for
+                    // a user who takes this path the Executable box below is
+                    // something they should never have to touch, and putting
+                    // the button underneath it implies the opposite order.
+                    // Claude-only — it is the only CLI Anthropic publishes a
+                    // signed, checksummed release feed for (issue #271).
+                    if settings.tool == .claude {
+                        ClaudeSetupSection()
+                        Divider()
+                    }
                     if settings.isOpenAICompatible { endpointFields } else { cliFields }
                     timeoutRow
                     Divider()
