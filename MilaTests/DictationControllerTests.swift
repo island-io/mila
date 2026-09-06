@@ -12,32 +12,24 @@ final class DictationControllerTests: XCTestCase {
     private var service: TranscriptionService!
     private var hotkeys: HotkeySettings!
     private var defaultsSuite: UserDefaults!
-    private var savedSelection: String?
 
     override func setUp() async throws {
         try await super.setUp()
         tempRoot = TestSupport.makeTempRoot(label: "DictationControllerTests")
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         store = RecordingStore(rootDirectory: tempRoot)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        UserDefaults().removePersistentDomain(forName: "DictationControllerTests")
+        defaultsSuite = UserDefaults(suiteName: "DictationControllerTests")
+        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"), defaults: defaultsSuite)
         try TestSupport.installFakeModel(into: manager, model: .ivritLarge)
         try TestSupport.installFakeModel(into: manager, model: .openaiTurbo)
         stub = StubWhisperEngine()
         service = TranscriptionService(store: store, modelManager: manager, diarizationSettings: DiarizationSettings(defaults: .init(suiteName: "DictationControllerTests.diarization")!), remoteSettings: TestSupport.isolatedRemoteSettings(label: "DictationControllerTests"), engine: stub)
-
-        UserDefaults().removePersistentDomain(forName: "DictationControllerTests")
-        defaultsSuite = UserDefaults(suiteName: "DictationControllerTests")
         hotkeys = HotkeySettings(defaults: defaultsSuite)
     }
 
     override func tearDown() async throws {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
         defaultsSuite.removePersistentDomain(forName: "DictationControllerTests")
         try await super.tearDown()
     }

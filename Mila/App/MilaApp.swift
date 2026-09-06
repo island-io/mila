@@ -2025,23 +2025,36 @@ struct MilaApp: App {
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
     private func prewarmDefaultModel() {
-        // Skip prewarm under UI tests. No UI test relies on a launch-time
-        // warm — the transcription E2E tests pass `--ui-test-tiny-model-path=`
-        // and load on demand — so warming the (potentially multi-GB) default
-        // model here just burns CPU/IO on every UI-test launch and creates a
-        // whisper/Metal context that XCTest never frees (it exits via
-        // `exit()`, bypassing `gracefulShutdown()`), which is what prints the
-        // ggml-metal teardown backtrace at process exit.
-        guard !isRunningUITests else { return }
+        // Skip prewarm under any XCTest hosting (UI or unit tests). No test
+        // relies on a launch-time warm — the transcription E2E tests pass
+        // `--ui-test-tiny-model-path=` and load on demand — so warming the
+        // (potentially multi-GB) default model here just burns CPU/IO on
+        // every test launch and creates a whisper/Metal context that XCTest
+        // never frees (it exits via `exit()`, bypassing `gracefulShutdown()`),
+        // which is what prints the ggml-metal teardown backtrace at process
+        // exit. This used to be guarded by `--uitests` alone, which covers
+        // XCUITest, but `MilaTests` is an app-hosted unit test bundle
+        // (`TEST_HOST` = Mila.app in project.yml) — SwiftUI's `.task`
+        // modifiers, prewarm included, run there too, just without that flag.
+        guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
     }
 
-    /// True when the process was launched by an XCUITest run. Keyed off the
-    /// `--uitests` / `--ui-test-*` launch arguments the UI test targets pass.
-    private var isRunningUITests: Bool {
+    /// True when the process is hosting an XCTest run — either an XCUITest
+    /// (keyed off the `--uitests` / `--ui-test-*` launch arguments the UI
+    /// test targets pass) or an app-hosted unit test bundle (`MilaTests`),
+    /// which loads `XCTestCase` directly into this process via
+    /// `BUNDLE_LOADER`/`TEST_HOST` — no launch argument marks that case, so
+    /// `XCTestCase`'s presence is the only reliable signal.
+    /// `XCTestConfigurationFilePath`, the usual env-var check for "is this
+    /// process under XCTest," is present but empty for app-hosted unit
+    /// tests on this toolchain — verified empirically, not a documented
+    /// contract — so it can't be used here.
+    private var isRunningUnderXCTest: Bool {
         CommandLine.arguments.contains { $0 == "--uitests" || $0.hasPrefix("--ui-test") }
+            || NSClassFromString("XCTestCase") != nil
     }
 
     /// Pre-download the two default models on first launch:
@@ -2051,14 +2064,37 @@ struct MilaApp: App {
     /// same `URLSession` so they don't actually saturate the network, and
     /// the in-app banner shows whichever is currently selected.
     private func ensureDefaultModelsInstalled() {
+        // Skip entirely under XCTest hosting (unit or UI) — same rationale
+        // as `prewarmDefaultModel()`: `MilaTests` is app-hosted, so this
+        // `.task` runs for real during ordinary unit test runs too. Without
+        // this guard it calls `setSelected`/`download` on the production
+        // `ModelManager`, which is backed by `UserDefaults.standard` (see
+        // `MilaApp.body`'s `ModelManager(modelsDirectory:)` call) — every
+        // `xcodebuild test` invocation would mutate the real app's declined
+        // models / selected model and could kick off real network downloads.
+        guard !isRunningUnderXCTest else { return }
         // Skip the multi-GB local model downloads + CoreML prep entirely for
         // users who've opted into the remote backend — they don't need any
         // local weights. (The Models tab still offers manual downloads, and
         // switching back to local re-triggers this on next launch.)
         guard !remoteTranscriptionSettings.isActive else { return }
-        modelManager.setSelected(WhisperModel.ivritLarge)
+        // Establish the default selection only on a fresh install. Re-asserting
+        // it on every launch overwrote whatever the user picked in Settings →
+        // Models (#266); once deletion started sticking (#263) it also kept
+        // re-selecting a model that is no longer on disk, which is the first
+        // step into the dead end in #264. `ModelManager.init` already restores
+        // a persisted selection on its own, so there is nothing to do here
+        // once the user has made one. The declined check still guards the
+        // fresh-install case — a user can delete a model without ever having
+        // explicitly chosen one.
+        if !modelManager.hasPersistedSelection,
+           !modelManager.isDeclined(WhisperModel.ivritLarge) {
+            modelManager.setSelected(WhisperModel.ivritLarge)
+        }
         for model in [WhisperModel.ivritLarge, WhisperModel.openaiTurbo] {
-            if !modelManager.isInstalled(model) && modelManager.downloads[model.name] == nil {
+            if !modelManager.isInstalled(model)
+                && !modelManager.isDeclined(model)
+                && modelManager.downloads[model.name] == nil {
                 modelManager.download(model)
             }
         }

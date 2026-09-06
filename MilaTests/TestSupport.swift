@@ -130,6 +130,22 @@ enum TestSupport {
         suite.removePersistentDomain(forName: suiteName)
         return RemoteTranscriptionSettings(defaults: suite)
     }
+
+    /// A `ModelManager` whose `selectedModelName` and `model.declinedNames`
+    /// live in a per-`label` suite rather than `UserDefaults.standard`.
+    ///
+    /// `installFakeModel(into:)` calls `setSelected(_:)`, so every suite that
+    /// uses it writes model preferences — and a manager built with the
+    /// production default writes them into the real
+    /// `io.island.whisper.IslandWhisper` domain, the same one the installed
+    /// Mila.app reads (#268).
+    @MainActor
+    static func isolatedModelManager(modelsDirectory: URL, label: String) -> ModelManager {
+        let suiteName = "\(label).models"
+        let suite = UserDefaults(suiteName: suiteName)!
+        suite.removePersistentDomain(forName: suiteName)
+        return ModelManager(modelsDirectory: modelsDirectory, defaults: suite)
+    }
 }
 
 /// A `Recording` constructed for tests, paired with its on-disk audio file.

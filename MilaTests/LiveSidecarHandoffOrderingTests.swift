@@ -47,7 +47,6 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
     private var cancellables: Set<AnyCancellable> = []
 
     private let suitePrefix = "LiveSidecarHandoffOrderingTests"
-    private var savedSelection: String?
 
     override func setUp() async throws {
         try await super.setUp()
@@ -59,8 +58,9 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
         store = RecordingStore(rootDirectory: tempRoot)
         try FileManager.default.createDirectory(at: store.recordingsDirectory,
                                                 withIntermediateDirectories: true)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        manager = TestSupport.isolatedModelManager(
+            modelsDirectory: tempRoot.appendingPathComponent("Models"),
+            label: suitePrefix)
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
@@ -96,11 +96,6 @@ final class LiveSidecarHandoffOrderingTests: XCTestCase {
         // Always restore write permission, or the temp tree can't be removed.
         setRecordingsDirWritable(true)
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
         for suffix in ["diarization", "language", "llm"] {
             UserDefaults().removePersistentDomain(forName: "\(suitePrefix).\(suffix)")
         }

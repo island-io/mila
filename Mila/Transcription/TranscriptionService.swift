@@ -689,8 +689,16 @@ final class TranscriptionService: ObservableObject {
                 return
             }
             guard modelManager.isInstalled(model) else {
-                lastError = "Whisper model is still downloading. Try again once it's ready."
-                serviceLog.log("skipped: model \(model.name, privacy: .public) not installed yet")
+                // "Still downloading" is only true while the model is on its
+                // way in. Once deletion sticks (#263), a model the user
+                // deleted is never coming back on its own, so that message
+                // would promise a wait that never ends and would hide the one
+                // recovery there is (#264).
+                let declined = modelManager.isDeclined(model)
+                lastError = declined
+                    ? "\(model.displayName) was deleted. Download it again in Settings → Models."
+                    : "Whisper model is still downloading. Try again once it's ready."
+                serviceLog.log("skipped: model \(model.name, privacy: .public) not installed yet (declined=\(declined, privacy: .public))")
                 markFailed(recording)
                 return
             }

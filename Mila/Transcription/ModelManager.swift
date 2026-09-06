@@ -99,18 +99,54 @@ final class ModelManager: NSObject, ObservableObject {
     @Published var lastDownloadErrors: [String: String] = [:]
 
     private let modelsDirectory: URL
+    private let defaults: UserDefaults
+    private static let declinedModelsKey = "model.declinedNames"
+
+    /// Names of models the user explicitly deleted via Settings. Consulted
+    /// by `MilaApp.ensureDefaultModelsInstalled()` so a deliberate delete
+    /// doesn't come back on the next launch — `isInstalled` alone can't
+    /// distinguish "never downloaded" from "downloaded, then removed on
+    /// purpose." Cleared the moment `download(_:)` is called again for that
+    /// model, since that's an explicit request for it.
+    @Published private(set) var declinedModelNames: Set<String>
+
+    /// True when `selectedModelName` was restored from a choice the user
+    /// actually persisted via `setSelected(_:)`, rather than defaulted to the
+    /// catalog's `ivritLarge`. Launch-time bootstrap consults this so it only
+    /// ever *establishes* a default selection on a fresh install: re-asserting
+    /// one on every launch is what silently reverted the user's Settings →
+    /// Models choice, and — once deletion started sticking — kept re-selecting
+    /// a model that is no longer on disk (#264, #266).
+    private(set) var hasPersistedSelection: Bool
+
+    /// Test-only hook: stub `URLProtocol` classes to install on the download
+    /// session's configuration, so tests can exercise `download(_:)` without
+    /// making a real network request. `nil` in production.
+    private let sessionProtocolClasses: [AnyClass]?
+
     private lazy var session: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForResource = 60 * 60
+        // Explicit `self.` — the same closure already needs it for
+        // `delegate: self`, and implicit `self` in a `lazy var` initializer
+        // is not something to rely on.
+        if let stubs = self.sessionProtocolClasses {
+            config.protocolClasses = stubs
+        }
         return URLSession(configuration: config, delegate: self, delegateQueue: nil)
     }()
     private var observers: [Int: WhisperModel] = [:]
     private var didShutDownSession = false
 
-    init(modelsDirectory: URL) {
+    init(modelsDirectory: URL, defaults: UserDefaults = .standard, sessionProtocolClasses: [AnyClass]? = nil) {
         self.modelsDirectory = modelsDirectory
-        let lastUsed = UserDefaults.standard.string(forKey: "selectedModelName")
+        self.defaults = defaults
+        self.sessionProtocolClasses = sessionProtocolClasses
+        let lastUsed = defaults.string(forKey: "selectedModelName")
         self.selectedModelName = lastUsed ?? WhisperModel.ivritLarge.name
+        self.hasPersistedSelection = lastUsed != nil
+        let declined = defaults.array(forKey: Self.declinedModelsKey) as? [String] ?? []
+        self.declinedModelNames = Set(declined)
         super.init()
         try? FileManager.default.createDirectory(at: modelsDirectory, withIntermediateDirectories: true)
         refreshInstalled()
@@ -122,7 +158,8 @@ final class ModelManager: NSObject, ObservableObject {
 
     func setSelected(_ model: WhisperModel) {
         selectedModelName = model.name
-        UserDefaults.standard.set(model.name, forKey: "selectedModelName")
+        hasPersistedSelection = true
+        defaults.set(model.name, forKey: "selectedModelName")
     }
 
     /// The model the app should use when transcribing audio in `languageCode`.
@@ -179,6 +216,10 @@ final class ModelManager: NSObject, ObservableObject {
         return installed.contains(model.name)
     }
 
+    func isDeclined(_ model: WhisperModel) -> Bool {
+        declinedModelNames.contains(model.name)
+    }
+
     func refreshInstalled() {
         let fm = FileManager.default
         var found: Set<String> = []
@@ -189,14 +230,73 @@ final class ModelManager: NSObject, ObservableObject {
         modelLogger.log("refreshInstalled: dir=\(self.modelsDirectory.path, privacy: .public) found=\(found, privacy: .public)")
     }
 
+    private func setDeclined(_ declined: Bool, for model: WhisperModel) {
+        if declined {
+            declinedModelNames.insert(model.name)
+        } else {
+            declinedModelNames.remove(model.name)
+        }
+        defaults.set(Array(declinedModelNames), forKey: Self.declinedModelsKey)
+    }
+
+    /// Remove a model's weights from disk and record that the removal was
+    /// deliberate.
+    ///
+    /// The `.bin` and its sibling `<name>-encoder.mlmodelc` are one install,
+    /// so they are one delete: leaving the ~1.1 GB CoreML encoder behind meant
+    /// the user reclaimed far less disk than the confirmation dialog promised,
+    /// with no UI anywhere that could see or remove the orphan (#265).
+    ///
+    /// Ordering matters. `refreshInstalled()` and `setDeclined(true,…)` run as
+    /// soon as the `.bin` is gone and *before* the encoder removal that can
+    /// throw — otherwise a failure there would leave the app believing the
+    /// model is still installed and was never declined, which is exactly the
+    /// state that silently re-downloads it on the next launch (#263).
     func delete(_ model: WhisperModel) throws {
         try FileManager.default.removeItem(at: url(for: model))
         refreshInstalled()
+        setDeclined(true, for: model)
+        // A CoreML fetch for this model may be in flight right now: Settings
+        // offers Delete the moment the `.bin` lands, which is exactly when
+        // `ensureCoreMLInstalled()`/the post-install hook has started the
+        // ~1.1 GB encoder download. Left running it would finish and move the
+        // encoder into place *after* the delete — recreating the very orphan
+        // #265 exists to remove, except now permanent, because the model is
+        // declined so nothing re-checks the pair and no UI can see it.
+        cancelCoreMLDownload(model)
+        if isCoreMLInstalled(model), let coreML = coreMLDirectory(for: model) {
+            try FileManager.default.removeItem(at: coreML)
+        }
+    }
+
+    /// Stop an in-flight CoreML encoder fetch for `model` and forget the UI
+    /// state that went with it, so a deleted model can't keep showing
+    /// download progress.
+    private func cancelCoreMLDownload(_ model: WhisperModel) {
+        guard let task = coreMLTasks.removeValue(forKey: model.name) else { return }
+        task.cancel()
+        coreMLObservers.removeValue(forKey: task.taskIdentifier)
+        coreMLDownloads.removeValue(forKey: model.name)
+    }
+
+    /// Whether an encoder download that has just finished should still be
+    /// installed.
+    ///
+    /// Cancellation alone cannot answer this: by the time `delete(_:)` runs,
+    /// the fetch may already be past its last cancellation point, with the
+    /// bytes on disk and only the final move left. Every step of
+    /// `finishCoreMLDownload` is an `await` that hands the main actor back,
+    /// so the state it read on entry can be stale by the time it commits.
+    /// An encoder is worth installing only next to weights that are still
+    /// there and still wanted.
+    func shouldInstallCoreML(for model: WhisperModel) -> Bool {
+        !isDeclined(model) && isInstalled(model)
     }
 
     func download(_ model: WhisperModel) {
         guard downloads[model.name] == nil else { return }
         guard !didShutDownSession else { return }
+        setDeclined(false, for: model)
         // A fresh attempt supersedes the previous failure report for THIS
         // model only — a concurrent sibling download's error must survive.
         lastDownloadErrors[model.name] = nil
@@ -213,6 +313,11 @@ final class ModelManager: NSObject, ObservableObject {
     private var coreMLObservers: [Int: WhisperModel] = [:]
     @Published private(set) var coreMLDownloads: [String: Double] = [:]
 
+    /// The in-flight CoreML fetch per model, kept so `delete(_:)` can stop
+    /// one. Keyed by name rather than task id because the caller that needs
+    /// to cancel knows the model, not the task.
+    private var coreMLTasks: [String: URLSessionDownloadTask] = [:]
+
     /// Download + extract the `<model>-encoder.mlmodelc.zip` from
     /// `model.coreMLURL` and place the resulting `.mlmodelc` directory
     /// next to the `.bin`. No-op if the model has no CoreML build or
@@ -226,6 +331,7 @@ final class ModelManager: NSObject, ObservableObject {
         coreMLDownloads[model.name] = 0
         let task = session.downloadTask(with: coreMLURL)
         coreMLObservers[task.taskIdentifier] = model
+        coreMLTasks[model.name] = task
         task.resume()
     }
 
@@ -250,6 +356,7 @@ final class ModelManager: NSObject, ObservableObject {
         didShutDownSession = true
         observers.removeAll()
         downloads.removeAll()
+        coreMLTasks.removeAll()
         session.invalidateAndCancel()
     }
 
@@ -320,7 +427,10 @@ extension ModelManager: URLSessionDownloadDelegate {
         Task { @MainActor in
             // Demultiplex: is this the .bin or the CoreML zip?
             if let model = self.coreMLObservers.removeValue(forKey: id) {
-                defer { self.coreMLDownloads.removeValue(forKey: model.name) }
+                defer {
+                    self.coreMLDownloads.removeValue(forKey: model.name)
+                    self.coreMLTasks.removeValue(forKey: model.name)
+                }
                 await self.finishCoreMLDownload(model: model, tempCopy: tempCopy, moveErr: moveErr)
                 return
             }
@@ -392,6 +502,7 @@ extension ModelManager: URLSessionDownloadDelegate {
                 self.lastDownloadErrors[model.name] = "\(model.displayName): download failed (\(error.localizedDescription))"
             } else if let model = self.coreMLObservers.removeValue(forKey: id) {
                 self.coreMLDownloads.removeValue(forKey: model.name)
+                self.coreMLTasks.removeValue(forKey: model.name)
                 modelLogger.error("CoreML download \(model.name, privacy: .public): network/task failure: \(error.localizedDescription, privacy: .public)")
             }
         }
@@ -464,6 +575,16 @@ extension ModelManager: URLSessionDownloadDelegate {
         // ggerganov and our HF repo use the flat layout, but be defensive).
         guard let mlmodelc = ModelManager.findMLModelcDirectory(in: extractRoot) else {
             modelLogger.error("CoreML download \(model.name, privacy: .public): no .mlmodelc directory inside the zip")
+            return
+        }
+
+        // Re-check before committing: `delete(_:)` may have run during any of
+        // the awaits above. `extractRoot` is cleaned up by the `defer`, so
+        // returning here leaves nothing behind. This guard has to come before
+        // the removal below — bailing out after clearing `destDir` would
+        // destroy an encoder we were not asked to touch.
+        guard shouldInstallCoreML(for: model) else {
+            modelLogger.notice("CoreML download \(model.name, privacy: .public): discarding finished encoder — the model was deleted while it downloaded")
             return
         }
 

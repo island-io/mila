@@ -23,7 +23,9 @@ final class TranscriptionServicePrewarmTests: XCTestCase {
         tempRoot = TestSupport.makeTempRoot(label: "TranscriptionServicePrewarmTests")
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
         store = RecordingStore(rootDirectory: tempRoot)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
+        manager = TestSupport.isolatedModelManager(
+            modelsDirectory: tempRoot.appendingPathComponent("Models"),
+            label: "TranscriptionServicePrewarmTests")
         try TestSupport.installFakeModel(into: manager)
         stub = StubWhisperEngine()
         service = TranscriptionService(

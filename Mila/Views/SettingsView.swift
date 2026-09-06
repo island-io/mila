@@ -1185,7 +1185,7 @@ private struct ModelRow: View {
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Using this model again will require re-downloading it (\(byteCountString(model.sizeBytes))).")
+            Text(deleteConfirmationMessage)
         }
         .alert(
             "Couldn't delete model",
@@ -1196,6 +1196,18 @@ private struct ModelRow: View {
             actions: { Button("OK") { deleteError = nil } },
             message: { Text(deleteError ?? "") }
         )
+    }
+
+    /// Deleting takes the `.bin` *and* its sibling `-encoder.mlmodelc` — they
+    /// are installed as a pair and reclaimed as a pair (#265) — so the figure
+    /// quoted here has to be both, not just the `.bin`. For `ivritLarge`
+    /// that's the difference between promising ~2.9 GB and the ~4.0 GB a
+    /// re-download actually costs.
+    private var deleteConfirmationMessage: String {
+        var total = model.sizeBytes
+        if model.coreMLURL != nil { total += model.coreMLSizeBytes }
+        return "This also removes the model's CoreML encoder. Using it again "
+            + "will require re-downloading both (\(byteCountString(total)))."
     }
 
     private func byteCountString(_ bytes: Int64) -> String {

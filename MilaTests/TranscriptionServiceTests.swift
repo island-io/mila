@@ -10,8 +10,7 @@ final class TranscriptionServiceTests: XCTestCase {
     private var manager: ModelManager!
     private var stub: StubWhisperEngine!
     private var service: TranscriptionService!
-
-    private var savedSelection: String?
+    private var modelDefaults: UserDefaults!
 
     override func setUp() async throws {
         try await super.setUp()
@@ -19,8 +18,9 @@ final class TranscriptionServiceTests: XCTestCase {
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
 
         store = RecordingStore(rootDirectory: tempRoot)
-        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"))
-        savedSelection = UserDefaults.standard.string(forKey: "selectedModelName")
+        UserDefaults().removePersistentDomain(forName: "TranscriptionServiceTests.models")
+        modelDefaults = UserDefaults(suiteName: "TranscriptionServiceTests.models")
+        manager = ModelManager(modelsDirectory: tempRoot.appendingPathComponent("Models"), defaults: modelDefaults)
         try TestSupport.installFakeModel(into: manager)
 
         stub = StubWhisperEngine()
@@ -37,11 +37,7 @@ final class TranscriptionServiceTests: XCTestCase {
 
     override func tearDown() async throws {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        if let savedSelection {
-            UserDefaults.standard.set(savedSelection, forKey: "selectedModelName")
-        } else {
-            UserDefaults.standard.removeObject(forKey: "selectedModelName")
-        }
+        modelDefaults.removePersistentDomain(forName: "TranscriptionServiceTests.models")
         try await super.tearDown()
     }
 
@@ -654,6 +650,44 @@ final class TranscriptionServiceTests: XCTestCase {
 
         let calls = await stub.transcribeCalls
         XCTAssertTrue(calls.isEmpty)
+    }
+
+    /// A model the user deleted is never coming back on its own now that
+    /// deletion sticks (#263), so the error must name the one recovery there
+    /// is instead of promising a download that will never finish (#264).
+    func test_deleted_model_error_points_at_settings_not_a_download() async throws {
+        try manager.delete(.ivritLarge)
+        XCTAssertTrue(manager.isDeclined(.ivritLarge))
+
+        let fixture = try TestRecordingFixture.make(in: store, title: "Deleted model")
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let message = try XCTUnwrap(service.lastError)
+        XCTAssertTrue(message.contains("Settings"),
+                      "The dead end is only escapable via Settings → Models, so say so: \(message)")
+        XCTAssertFalse(message.lowercased().contains("downloading"),
+                       "Nothing is downloading — the user deleted it: \(message)")
+    }
+
+    /// The other branch: weights that are genuinely missing rather than
+    /// deliberately deleted still get the "it's on its way" message, which is
+    /// what a first launch mid-download actually looks like.
+    func test_missing_but_undeleted_model_still_reports_a_download_in_flight() async throws {
+        // Remove the file behind the manager's back — nothing records a
+        // deliberate delete, so this is the not-declined case.
+        try FileManager.default.removeItem(at: manager.url(for: .ivritLarge))
+        manager.refreshInstalled()
+        XCTAssertFalse(manager.isInstalled(.ivritLarge))
+        XCTAssertFalse(manager.isDeclined(.ivritLarge))
+
+        let fixture = try TestRecordingFixture.make(in: store, title: "Mid-download")
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let message = try XCTUnwrap(service.lastError)
+        XCTAssertTrue(message.contains("still downloading"),
+                      "A model that was never deleted is still on its way in: \(message)")
     }
 
     // MARK: - transcribeOnce (dictation path)
