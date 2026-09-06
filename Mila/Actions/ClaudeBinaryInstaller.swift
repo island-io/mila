@@ -105,11 +105,18 @@ struct ClaudeBinaryInstaller {
         // outside the resolution path.
         do {
             try await downloader.downloadFile(from: binaryURL, to: staged, progress: progress)
+            // A cancel that arrives during (or right after) the download must
+            // not proceed to change what is on disk: past `moveIntoPlace`
+            // there is no undo, and the caller that cancelled has already
+            // stopped listening. Checked twice — once before the (slow) hash
+            // and signature work, once right before the irreversible move.
+            try Task.checkCancellation()
             try verifyDownload(at: staged,
                                expectedChecksum: expectedChecksum,
                                expectedSize: expectedSize)
             try makeExecutable(staged)
             try verifySignature(at: staged)
+            try Task.checkCancellation()
             let installed = try moveIntoPlace(staged)
             installLog.notice("""
                 claude install ok version=\(version, privacy: .public) \

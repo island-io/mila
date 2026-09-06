@@ -255,7 +255,13 @@ final class ClaudeSetupSettings: ObservableObject {
                     self.state = .installing(progress: progress)
                 }
             }
-            guard generation == installGeneration else { return false }
+            // The disk has changed no matter who owns the flow now: a cancel
+            // that raced the last stretch of the install cannot un-write
+            // `moveIntoPlace`. Everything that MIRRORS disk — the version
+            // default, the installed flags, the now-invalid verification —
+            // must therefore be recorded even for a superseded generation, or
+            // Settings describes a machine that no longer exists (and keeps a
+            // "verified" claim about bytes that were just replaced).
             installedVersion = result.version
             defaults.set(result.version, forKey: Keys.installedVersion)
             refreshInstalledState()
@@ -264,6 +270,9 @@ final class ClaudeSetupSettings: ObservableObject {
             // check would catch this on the next launch anyway; clearing it now
             // means the UI doesn't claim a verification it no longer has.
             clearVerification()
+            // Only the flow-owned writes stay generation-guarded: the spinner
+            // state and the chained sign-in belong to whoever runs NOW.
+            guard generation == installGeneration else { return false }
             state = .idle
             return true
         } catch is CancellationError {
