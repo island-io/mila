@@ -125,15 +125,45 @@ final class ClaudeSetupTokenParserTests: XCTestCase {
     }
 
     /// A pty hands out arbitrary reads, so a token routinely straddles two
-    /// chunks. The parser accumulates for exactly this reason.
-    func test_a_token_split_across_two_chunks_is_still_captured() {
+    /// chunks. The parser accumulates for exactly this reason — and must not
+    /// report the half that has arrived.
+    ///
+    /// This is the case that makes the rule necessary: a PREFIX of a token is
+    /// itself token-shaped, so a naive match returns a truncated credential,
+    /// the flow reports success, and the token fails on first use far from
+    /// here. Caught by CI on the first run of this suite.
+    func test_a_token_split_across_two_chunks_is_never_reported_truncated() {
         var parser = ClaudeSetupTokenParser()
         let half = Self.token.count / 2
         let first = String(Self.token.prefix(half))
         let second = String(Self.token.dropFirst(half))
 
-        XCTAssertTrue(parser.consume("Token: " + first).isEmpty, "no token yet")
-        XCTAssertTrue(parser.consume(second + "\n").contains(.token(Self.token)))
+        let early = parser.consume("Token: " + first)
+        XCTAssertFalse(early.contains { if case .token = $0 { return true } else { return false } },
+                       "half a credential is not a credential")
+
+        XCTAssertTrue(parser.consume(second + "\n").contains(.token(Self.token)),
+                      "the WHOLE token is reported once it has all arrived")
+    }
+
+    /// The flip side of the rule: a token that is genuinely the last thing the
+    /// CLI printed, with no trailing newline, must still be recoverable once
+    /// the stream has ended — otherwise the boundary rule would turn a real
+    /// success into "didn't print a token".
+    func test_a_trailing_token_is_recovered_by_the_end_of_stream_scan() {
+        var parser = ClaudeSetupTokenParser()
+        XCTAssertNil(parser.consume("Your token: \(Self.token)")
+            .first { if case .token = $0 { return true } else { return false } },
+                     "refused while more bytes could still arrive")
+
+        XCTAssertEqual(parser.finalToken(), Self.token,
+                       "accepted once the stream is known to be over")
+    }
+
+    func test_the_end_of_stream_scan_will_not_deliver_the_same_token_twice() {
+        var parser = ClaudeSetupTokenParser()
+        XCTAssertTrue(parser.consume("Your token: \(Self.token)\n").contains(.token(Self.token)))
+        XCTAssertNil(parser.finalToken(), "already reported during streaming")
     }
 
     /// The prefix appearing in prose — a help string describing the format —

@@ -147,6 +147,23 @@ struct ClaudeSetupTokenParser {
         return events
     }
 
+    /// Last-chance scan, for use once the child has exited.
+    ///
+    /// The stream is over, so the buffer is everything the CLI ever printed and
+    /// a match at its end can no longer be a half-arrived read. This is what
+    /// keeps the boundary rule in `token(in:)` from costing a legitimate
+    /// success when the CLI's very last bytes are the token itself, with no
+    /// trailing newline.
+    ///
+    /// Returns nil if a token was already reported, so a caller cannot deliver
+    /// the same credential twice.
+    mutating func finalToken() -> String? {
+        let text = Self.dewrap(Self.sanitize(buffer), width: width)
+        guard let token = Self.token(in: text, allowUnterminated: true),
+              emitted.insert("token").inserted else { return nil }
+        return token
+    }
+
     // MARK: - Text handling
 
     /// Strip ANSI escape sequences and control characters, and fold carriage
@@ -260,12 +277,34 @@ struct ClaudeSetupTokenParser {
     private static let tokenPattern = try? NSRegularExpression(
         pattern: "sk-ant-[A-Za-z0-9_-]{16,}")
 
-    static func token(in text: String) -> String? {
+    /// The first token in `text`, or nil.
+    ///
+    /// **A match that runs to the very end of the buffer is refused** unless
+    /// `allowUnterminated` is set, and that rule is the whole point of this
+    /// function. A pty hands out arbitrary reads, so a chunk boundary can fall
+    /// in the middle of a token — and because a *prefix* of a token is itself
+    /// token-shaped (`sk-ant-` plus at least 16 more characters), the naive
+    /// match happily returns the half that has arrived. That is the worst
+    /// possible outcome: the flow reports success and stores a truncated
+    /// credential which fails on first use, far from here.
+    ///
+    /// The match is greedy, so an end position *before* `endIndex` proves the
+    /// next character cannot be part of the token — the value is complete. Any
+    /// real token is followed by a newline, so this costs at most one more read
+    /// before it fires.
+    ///
+    /// `allowUnterminated` exists for exactly one caller: the last-chance scan
+    /// once the child has exited (`finalToken`). At EOF the buffer is complete,
+    /// so a match at the end can no longer be a partial read.
+    static func token(in text: String, allowUnterminated: Bool = false) -> String? {
         guard let tokenPattern else { return nil }
         let range = NSRange(text.startIndex..., in: text)
-        guard let match = tokenPattern.firstMatch(in: text, range: range),
-              let matchRange = Range(match.range, in: text) else { return nil }
-        return String(text[matchRange])
+        for match in tokenPattern.matches(in: text, range: range) {
+            guard let matchRange = Range(match.range, in: text) else { continue }
+            if matchRange.upperBound == text.endIndex && !allowUnterminated { continue }
+            return String(text[matchRange])
+        }
+        return nil
     }
 
     /// Replace anything token-shaped with a description of it.

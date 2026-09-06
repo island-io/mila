@@ -160,6 +160,31 @@ final class ClaudeSetupTokenSessionTests: XCTestCase {
         XCTAssertTrue(captured.isEmpty)
     }
 
+    /// A token printed as the CLI's very last bytes, with no trailing newline,
+    /// is held back while the stream is live (it could be half a read) and
+    /// taken once the child exits. Without the end-of-stream scan this exact
+    /// run would be reported as "finished but printed no token".
+    func test_a_token_in_the_final_bytes_is_captured_when_the_child_exits() async {
+        let (session, fake) = makeSession()
+        var captured: [String] = []
+        session.onToken = { captured.append($0) }
+
+        session.start()
+        fake.emit("\(Self.authURL)\n")
+        await settle()
+        session.submit(code: "the-code")
+
+        fake.emit("\nYour token: \(Self.token)")   // no trailing newline
+        await settle()
+        XCTAssertEqual(session.state, .verifying, "held back while more bytes could arrive")
+
+        fake.exit(0)
+        await settle()
+
+        XCTAssertEqual(session.state, .ready)
+        XCTAssertEqual(captured, [Self.token], "the whole token, exactly once")
+    }
+
     func test_a_nonzero_exit_fails_with_the_status() async {
         let (session, fake) = makeSession()
         session.start()

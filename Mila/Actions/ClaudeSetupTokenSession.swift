@@ -319,6 +319,17 @@ final class ClaudeSetupTokenSession {
 
     private func childExited(status: Int32) {
         guard !finished else { return }
+        // Last chance before this counts as a failure. While output was
+        // streaming, the parser refused any token sitting at the very end of
+        // the buffer, because a chunk boundary there could mean half a
+        // credential. The stream is over now, so that ambiguity is gone and a
+        // trailing token is safe to take.
+        if let token = parser.finalToken() {
+            onToken?(token)
+            finish()
+            state = .ready
+            return
+        }
         // Reaching here means the CLI ended without a token. Exit 0 is the
         // interesting case: it says the CLI thinks it succeeded while Mila
         // found nothing token-shaped in what it printed — the one scenario the
