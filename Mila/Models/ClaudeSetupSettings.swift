@@ -215,10 +215,17 @@ final class ClaudeSetupSettings: ObservableObject {
     /// The one button. Installs if needed, then starts the guided login.
     func setUp() {
         guard !state.isBusy else { return }
-        installTask?.cancel()
+        let previous = installTask
+        previous?.cancel()
         installGeneration += 1
         let generation = installGeneration
         installTask = Task { @MainActor [weak self] in
+            // Serialize on the predecessor: a cancelled install can slip past
+            // its final cancellation check and still be writing the binary and
+            // its bookkeeping. Starting the next install only after the old
+            // one fully unwinds removes every reverse-completion interleaving
+            // — the generation alone orders state ownership, not disk writes.
+            await previous?.value
             guard let self else { return }
             if !self.isInstalled {
                 guard await self.performInstall(generation: generation) else { return }
@@ -236,10 +243,13 @@ final class ClaudeSetupSettings: ObservableObject {
     /// failure presses this and gets the current release.
     func reinstall() {
         guard !state.isBusy else { return }
-        installTask?.cancel()
+        let previous = installTask
+        previous?.cancel()
         installGeneration += 1
         let generation = installGeneration
         installTask = Task { @MainActor [weak self] in
+            // Same serialization as `setUp()` — see the comment there.
+            await previous?.value
             _ = await self?.performInstall(generation: generation)
         }
     }
