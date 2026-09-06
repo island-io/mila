@@ -124,6 +124,13 @@ enum TestSupport {
     /// a clean suite (which has no `transcription.backend` key, so it defaults
     /// to `.local`) makes the stub authoritative regardless of host state.
     @MainActor
+    static func isolatedRemoteSettings(label: String) -> RemoteTranscriptionSettings {
+        let suiteName = "\(label).remote"
+        let suite = UserDefaults(suiteName: suiteName)!
+        suite.removePersistentDomain(forName: suiteName)
+        return RemoteTranscriptionSettings(defaults: suite)
+    }
+
     /// A `ModelManager` whose `selectedModelName` and `model.declinedNames`
     /// live in a per-`label` suite rather than `UserDefaults.standard`.
     ///
@@ -138,13 +145,6 @@ enum TestSupport {
         let suite = UserDefaults(suiteName: suiteName)!
         suite.removePersistentDomain(forName: suiteName)
         return ModelManager(modelsDirectory: modelsDirectory, defaults: suite)
-    }
-
-    static func isolatedRemoteSettings(label: String) -> RemoteTranscriptionSettings {
-        let suiteName = "\(label).remote"
-        let suite = UserDefaults(suiteName: suiteName)!
-        suite.removePersistentDomain(forName: suiteName)
-        return RemoteTranscriptionSettings(defaults: suite)
     }
 }
 
