@@ -256,9 +256,41 @@ final class ModelManager: NSObject, ObservableObject {
         try FileManager.default.removeItem(at: url(for: model))
         refreshInstalled()
         setDeclined(true, for: model)
+        // A CoreML fetch for this model may be in flight right now: Settings
+        // offers Delete the moment the `.bin` lands, which is exactly when
+        // `ensureCoreMLInstalled()`/the post-install hook has started the
+        // ~1.1 GB encoder download. Left running it would finish and move the
+        // encoder into place *after* the delete — recreating the very orphan
+        // #265 exists to remove, except now permanent, because the model is
+        // declined so nothing re-checks the pair and no UI can see it.
+        cancelCoreMLDownload(model)
         if isCoreMLInstalled(model), let coreML = coreMLDirectory(for: model) {
             try FileManager.default.removeItem(at: coreML)
         }
+    }
+
+    /// Stop an in-flight CoreML encoder fetch for `model` and forget the UI
+    /// state that went with it, so a deleted model can't keep showing
+    /// download progress.
+    private func cancelCoreMLDownload(_ model: WhisperModel) {
+        guard let task = coreMLTasks.removeValue(forKey: model.name) else { return }
+        task.cancel()
+        coreMLObservers.removeValue(forKey: task.taskIdentifier)
+        coreMLDownloads.removeValue(forKey: model.name)
+    }
+
+    /// Whether an encoder download that has just finished should still be
+    /// installed.
+    ///
+    /// Cancellation alone cannot answer this: by the time `delete(_:)` runs,
+    /// the fetch may already be past its last cancellation point, with the
+    /// bytes on disk and only the final move left. Every step of
+    /// `finishCoreMLDownload` is an `await` that hands the main actor back,
+    /// so the state it read on entry can be stale by the time it commits.
+    /// An encoder is worth installing only next to weights that are still
+    /// there and still wanted.
+    func shouldInstallCoreML(for model: WhisperModel) -> Bool {
+        !isDeclined(model) && isInstalled(model)
     }
 
     func download(_ model: WhisperModel) {
@@ -281,6 +313,11 @@ final class ModelManager: NSObject, ObservableObject {
     private var coreMLObservers: [Int: WhisperModel] = [:]
     @Published private(set) var coreMLDownloads: [String: Double] = [:]
 
+    /// The in-flight CoreML fetch per model, kept so `delete(_:)` can stop
+    /// one. Keyed by name rather than task id because the caller that needs
+    /// to cancel knows the model, not the task.
+    private var coreMLTasks: [String: URLSessionDownloadTask] = [:]
+
     /// Download + extract the `<model>-encoder.mlmodelc.zip` from
     /// `model.coreMLURL` and place the resulting `.mlmodelc` directory
     /// next to the `.bin`. No-op if the model has no CoreML build or
@@ -294,6 +331,7 @@ final class ModelManager: NSObject, ObservableObject {
         coreMLDownloads[model.name] = 0
         let task = session.downloadTask(with: coreMLURL)
         coreMLObservers[task.taskIdentifier] = model
+        coreMLTasks[model.name] = task
         task.resume()
     }
 
@@ -318,6 +356,7 @@ final class ModelManager: NSObject, ObservableObject {
         didShutDownSession = true
         observers.removeAll()
         downloads.removeAll()
+        coreMLTasks.removeAll()
         session.invalidateAndCancel()
     }
 
@@ -388,7 +427,10 @@ extension ModelManager: URLSessionDownloadDelegate {
         Task { @MainActor in
             // Demultiplex: is this the .bin or the CoreML zip?
             if let model = self.coreMLObservers.removeValue(forKey: id) {
-                defer { self.coreMLDownloads.removeValue(forKey: model.name) }
+                defer {
+                    self.coreMLDownloads.removeValue(forKey: model.name)
+                    self.coreMLTasks.removeValue(forKey: model.name)
+                }
                 await self.finishCoreMLDownload(model: model, tempCopy: tempCopy, moveErr: moveErr)
                 return
             }
@@ -460,6 +502,7 @@ extension ModelManager: URLSessionDownloadDelegate {
                 self.lastDownloadErrors[model.name] = "\(model.displayName): download failed (\(error.localizedDescription))"
             } else if let model = self.coreMLObservers.removeValue(forKey: id) {
                 self.coreMLDownloads.removeValue(forKey: model.name)
+                self.coreMLTasks.removeValue(forKey: model.name)
                 modelLogger.error("CoreML download \(model.name, privacy: .public): network/task failure: \(error.localizedDescription, privacy: .public)")
             }
         }
@@ -532,6 +575,16 @@ extension ModelManager: URLSessionDownloadDelegate {
         // ggerganov and our HF repo use the flat layout, but be defensive).
         guard let mlmodelc = ModelManager.findMLModelcDirectory(in: extractRoot) else {
             modelLogger.error("CoreML download \(model.name, privacy: .public): no .mlmodelc directory inside the zip")
+            return
+        }
+
+        // Re-check before committing: `delete(_:)` may have run during any of
+        // the awaits above. `extractRoot` is cleaned up by the `defer`, so
+        // returning here leaves nothing behind. This guard has to come before
+        // the removal below — bailing out after clearing `destDir` would
+        // destroy an encoder we were not asked to touch.
+        guard shouldInstallCoreML(for: model) else {
+            modelLogger.notice("CoreML download \(model.name, privacy: .public): discarding finished encoder — the model was deleted while it downloaded")
             return
         }
 

@@ -248,6 +248,53 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertTrue(mgr.isDeclined(.ivritLarge))
     }
 
+    // MARK: - A finished encoder download can't resurrect a deleted model
+
+    /// Settings offers Delete the moment the `.bin` lands — which is exactly
+    /// when the encoder auto-download is running. If that fetch is left alone
+    /// it finishes and reinstates the ~1.1GB encoder after the delete.
+    func test_delete_cancels_an_in_flight_coreml_download() throws {
+        let mgr = makeManager(sessionProtocolClasses: [StubModelDownloadURLProtocol.self])
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .ivritLarge))
+        mgr.refreshInstalled()
+
+        mgr.downloadCoreML(.ivritLarge)
+        XCTAssertNotNil(mgr.coreMLDownloads[WhisperModel.ivritLarge.name],
+                        "precondition: an encoder fetch is in flight")
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertNil(mgr.coreMLDownloads[WhisperModel.ivritLarge.name],
+                     "Deleting a model must stop its encoder fetch — otherwise it completes "
+                     + "and moves the encoder into place behind the delete, and the model is "
+                     + "declined so nothing ever re-checks the pair")
+        mgr.shutdown()
+    }
+
+    /// The half cancellation cannot cover: by the time `delete(_:)` runs the
+    /// fetch may already be past its last cancellation point, with only the
+    /// final move left. `finishCoreMLDownload` re-reads this before committing.
+    func test_finished_encoder_is_discarded_when_the_model_was_deleted() throws {
+        let mgr = makeManager()
+        try Data("not-a-real-model".utf8).write(to: mgr.url(for: .ivritLarge))
+        mgr.refreshInstalled()
+        XCTAssertTrue(mgr.shouldInstallCoreML(for: .ivritLarge),
+                      "precondition: weights present and wanted")
+
+        try mgr.delete(.ivritLarge)
+
+        XCTAssertFalse(mgr.shouldInstallCoreML(for: .ivritLarge),
+                       "An encoder that finishes after the delete must be dropped, not moved "
+                       + "into place — that is the #265 orphan recreated through a race")
+    }
+
+    func test_encoder_is_not_installed_without_its_weights() {
+        let mgr = makeManager()
+        XCTAssertFalse(mgr.isInstalled(.ivritLarge))
+        XCTAssertFalse(mgr.shouldInstallCoreML(for: .ivritLarge),
+                       "An encoder with no .bin beside it is ~1.1GB of unusable disk")
+    }
+
     // MARK: - Default selection is established once, not re-asserted (#264, #266)
 
     func test_fresh_install_has_no_persisted_selection() {
