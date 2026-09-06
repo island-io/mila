@@ -68,6 +68,12 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
     private let aliceStored: [Float] = [1, 0, 0, 0]
     private let aliceSpeaking: [Float] = [0.99, 0.01, 0, 0]
     private let strangerSpeaking: [Float] = [0, 1, 0, 0]
+    /// The same person, extracted again from a re-clustered segmentation:
+    /// close enough to match her profile, far enough from `aliceSpeaking`
+    /// that carrying the wrong one of the two is visible in the centroid.
+    private let aliceSpeakingAgain: [Float] = [0.9, 0.4, 0, 0]
+    /// A second cluster of hers in the same pass — also over the threshold.
+    private let aliceSpeakingThird: [Float] = [0.95, 0.2, 0, 0]
 
     override func setUp() async throws {
         try await super.setUp()
@@ -92,6 +98,9 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
         let embedder: OfflineVoiceEmbedder
         let probe: EmbedProbe
         let recordingID: UUID
+        /// Only its hooks are used: `announceCompletion` is what fires them,
+        /// in the order the production pass fires them. No whisper runs here.
+        let service: TranscriptionService
     }
 
     private func makeSettings() -> VoiceRecognitionSettings {
@@ -154,10 +163,84 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
                                    embedding: observed.observedCentroid,
                                    sampleCount: observed.observedCount)
         }
+        // …and the `onSpeakerUnnamed` half, verbatim too. Every claim this
+        // suite makes about a contribution being reversible is checked by
+        // actually reversing it, through the same hook the popover uses.
+        store.onSpeakerUnnamed = { recordingID, rawID, previousName in
+            guard settings.isConfigured else { return }
+            guard let observed = snapshots.observation(forSpeaker: rawID, in: recordingID) else { return }
+            profiles.subtractObservation(name: previousName,
+                                         embedding: observed.observedCentroid,
+                                         sampleCount: observed.observedCount)
+        }
+
+        // A real `TranscriptionService`, for its completion announcement
+        // only: `runPass` drives the two hooks through it rather than calling
+        // the embedder in an order this test picked, which is the ordering
+        // island-io/mila#260 turns on.
+        let suite = "OfflineVoiceEmbedderTests.\(UUID())"
+        suiteNames.append("\(suite).diarization")
+        suiteNames.append("\(suite).remote")
+        let service = TranscriptionService(
+            store: store,
+            modelManager: ModelManager(modelsDirectory: root.appendingPathComponent("Models")),
+            diarizationSettings: DiarizationSettings(
+                defaults: UserDefaults(suiteName: "\(suite).diarization")!),
+            remoteSettings: TestSupport.isolatedRemoteSettings(label: suite),
+            engine: StubWhisperEngine())
+        // `MilaApp.init`'s wiring of the two pass hooks, verbatim.
+        service.onPassClearedSpeakerNames = { [embedder] recordingID, previousNames in
+            embedder.notePassClearedSpeakerNames(previousNames, for: recordingID)
+        }
+        service.onTranscriptionCompleted = { [embedder] rec, _ in
+            embedder.matchAfterPass(recordingID: rec.id)
+        }
 
         return World(store: store, profiles: profiles, snapshots: snapshots,
                      settings: settings, embedder: embedder, probe: probe,
-                     recordingID: rec.id)
+                     recordingID: rec.id, service: service)
+    }
+
+    /// Everything a batch pass does *after* whisper returns, in production
+    /// order: the store write that puts the pass's segments on the row and
+    /// clears the speaker names it re-keyed, then
+    /// `TranscriptionService.announceCompletion` — the function that fires
+    /// the cleared-names hook and the completion hook, in that order.
+    ///
+    /// Only the pass OUTPUT is supplied by hand. The half simulated here (the
+    /// service capturing the names as it clears them, and announcing them
+    /// before the completion) is driven through a real pass, with a real
+    /// store write, in `TranscriptionServiceSpeakerCarryTests` — simulating
+    /// both halves in one place is how the missing hook in island-io/mila#254
+    /// stayed hidden.
+    private func runPass(_ w: World, producing segments: [TranscriptSegment]) async {
+        var updated = row(w)
+        let cleared = updated.speakerNames
+        updated.segments = segments
+        updated.speakerNames = [:]
+        updated.status = .completed
+        w.store.update(updated)
+        w.service.announceCompletion(updated,
+                                     clearedSpeakerNames: cleared,
+                                     wasRetranscription: true)
+        await w.embedder.awaitPending()
+    }
+
+    /// Component-wise, with room for the float error of a fold followed by
+    /// its subtraction.
+    private func assertCentroid(_ actual: [Float]?, _ expected: [Float],
+                                _ message: String,
+                                file: StaticString = #filePath, line: UInt = #line) {
+        guard let actual else {
+            XCTFail("no centroid: \(message)", file: file, line: line)
+            return
+        }
+        XCTAssertEqual(actual.count, expected.count, message, file: file, line: line)
+        guard actual.count == expected.count else { return }
+        for i in actual.indices {
+            XCTAssertEqual(actual[i], expected[i], accuracy: 1e-4,
+                           "\(message) — component \(i)", file: file, line: line)
+        }
     }
 
     private func writeAudio(named name: String, in store: RecordingStore) throws {
@@ -505,5 +588,217 @@ final class OfflineVoiceEmbedderTests: XCTestCase {
 
         XCTAssertEqual(w.probe.callCount, 0)
         XCTAssertNil(row(w).speakerNames["SPEAKER_00"])
+    }
+
+    // MARK: - A re-transcribe swaps a contribution, it does not add one
+    //
+    // The pass clears `speakerNames` wholesale and fires no hook, so every
+    // name's voice-profile contribution is left with no label to un-name;
+    // the re-match then names the speaker again and folds a SECOND
+    // observation of the same recording into the same profile
+    // (island-io/mila#260). These pin the repair, and — just as importantly —
+    // pin that the repair never subtracts and never deletes.
+
+    /// Alice as she stands from earlier recordings, plus this recording's own
+    /// contribution: named by hand, learned on demand, which is how a profile
+    /// comes to hold one observation of one recording.
+    private func nameAliceHere(_ w: World, priorSamples: Int) async {
+        if priorSamples > 0 {
+            w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: priorSamples)
+        }
+        w.probe.returns(["SPEAKER_00": aliceSpeaking])
+        w.store.setSpeakerName("Alice", forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+        w.embedder.learnNamedSpeaker(recordingID: w.recordingID,
+                                     rawID: "SPEAKER_00", name: "Alice")
+        await w.embedder.awaitPending()
+    }
+
+    /// **The bug this closes.** Alice arrives carrying 3 samples from earlier
+    /// recordings and this recording takes her to 4. A re-transcribe clears
+    /// her label, strands that 4th contribution — nothing left to un-name —
+    /// and then hands her a 5th by matching her voice and naming her again.
+    ///
+    /// **Discriminating in both directions.**
+    ///
+    /// * `main` → 5 after the pass, and un-naming leaves 4: one contribution
+    ///   stranded under a label that no longer exists.
+    /// * Suppress the second fold but leave the fresh observation in the
+    ///   snapshot → 4, but the un-name subtracts an embedding the profile
+    ///   never received, so her centroid lands at `[1.03, -0.13, 0, 0]`
+    ///   instead of back on `[1, 0, 0, 0]`.
+    /// * This fix → 4, and the un-name returns her to exactly her
+    ///   pre-recording weight *and* her pre-recording centroid.
+    func test_a_name_the_pass_cleared_comes_back_without_a_second_contribution() async throws {
+        let w = try makeWorld(threshold: 0.7)
+        await nameAliceHere(w, priorSamples: 3)
+        let named = try XCTUnwrap(w.profiles.profile(named: "Alice"))
+        XCTAssertEqual(named.sampleCount, 4,
+                       "precondition: her 3 earlier samples plus this recording's one")
+
+        // The re-transcribe: a new clustering, new ids, names cleared, and a
+        // fresh extraction of the same voice.
+        w.probe.returns(["SPEAKER_01": aliceSpeakingAgain])
+        await runPass(w, producing: [segment("SPEAKER_01", 0, 5),
+                                     segment("SPEAKER_01", 5, 20)])
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_01"], "Alice",
+                       "her name comes back on the id the re-match resolved it to")
+        let afterPass = try XCTUnwrap(w.profiles.profile(named: "Alice"))
+        XCTAssertEqual(afterPass.sampleCount, 4,
+                       "and brings no second contribution with it")
+        assertCentroid(afterPass.embedding, named.embedding,
+                       "her centroid is untouched by a pass that told us nothing new")
+
+        // The whole point: the correction #237 exists for can now reach it.
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_01", recordingID: w.recordingID)
+
+        let afterUnname = try XCTUnwrap(w.profiles.profile(named: "Alice"),
+                                        "her earlier recordings are untouched")
+        XCTAssertEqual(afterUnname.sampleCount, 3,
+                       "un-naming returns her to exactly her pre-recording weight")
+        assertCentroid(afterUnname.embedding, aliceStored,
+                       "…and to her pre-recording centroid, which only holds if what came "
+                       + "back out is the observation that actually went in")
+    }
+
+    /// The deliberate under-correction, and the reason this path does not use
+    /// `RecordingStore.update(_:retiringSpeakerNames:)`: a cleared name whose
+    /// voice the re-match cannot find keeps its contribution. Retiring it
+    /// would subtract the only weight Alice's profile has and delete her —
+    /// on the evidence of a similarity score, not of a user saying "that
+    /// isn't her". Residue is recoverable; a deleted voice is not.
+    func test_a_cleared_name_the_rematch_cannot_find_keeps_its_contribution() async throws {
+        let w = try makeWorld(threshold: 0.7)
+        // Her profile's ONLY evidence is this recording — the ordinary state
+        // of one created by naming a speaker once.
+        await nameAliceHere(w, priorSamples: 0)
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 1,
+                       "precondition: one sample, from here")
+
+        // The re-clustered pass produces a speaker who sounds nothing like her.
+        w.probe.returns(["SPEAKER_01": strangerSpeaking])
+        await runPass(w, producing: [segment("SPEAKER_01", 0, 5),
+                                     segment("SPEAKER_01", 5, 20)])
+
+        XCTAssertNil(row(w).speakerNames["SPEAKER_01"],
+                     "a voice that does not match is not handed her name")
+        let alice = try XCTUnwrap(w.profiles.profile(named: "Alice"),
+                                  "her profile must survive a re-transcribe that failed to "
+                                  + "recognise her — deleting it here is the destructive fix #260 rejects")
+        XCTAssertEqual(alice.sampleCount, 1)
+        assertCentroid(alice.embedding, aliceSpeaking, "and it still holds her voice")
+    }
+
+    /// The negative control. A pass with no names to clear must go on folding
+    /// what it learns — this is how a batch-transcribed recording contributes
+    /// to a profile at all, and suppressing it unconditionally would silently
+    /// stop voice recognition improving.
+    func test_a_pass_with_no_cleared_names_still_folds_what_it_learns() async throws {
+        let w = try makeWorld(threshold: 0.7)
+        w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 3)
+        w.probe.returns(["SPEAKER_00": aliceSpeaking])
+
+        await runPass(w, producing: [segment("SPEAKER_00", 0, 5),
+                                     segment("SPEAKER_00", 5, 20)])
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_00"], "Alice")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 4,
+                       "a recording that had contributed nothing to her profile must still add to it")
+    }
+
+    /// A cleared name is claimed by at most ONE new speaker. Two clusters can
+    /// legitimately match one profile (`SpeakerCorrectionActionsTests`'
+    /// `test_auto_naming_two_clusters_after_one_profile_keeps_them_separate`),
+    /// and the second one is a genuinely new contribution: it folds, and it
+    /// is reversible on its own.
+    ///
+    /// Discriminating: treat the claim as a set membership test rather than a
+    /// claim and both speakers re-attach — the profile stays at 4 and both
+    /// snapshot entries point at the SAME observation, so un-naming the two
+    /// of them subtracts it twice and lands on 2.
+    func test_only_one_new_speaker_claims_a_cleared_name() async throws {
+        let w = try makeWorld(threshold: 0.7)
+        await nameAliceHere(w, priorSamples: 3)
+
+        w.probe.returns(["SPEAKER_01": aliceSpeakingAgain,
+                         "SPEAKER_02": aliceSpeakingThird])
+        await runPass(w, producing: [segment("SPEAKER_01", 0, 5),
+                                     segment("SPEAKER_02", 5, 20)])
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_01"], "Alice")
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_02"], "Alice")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 5,
+                       "the claim covers one of them; the other is a new observation and folds")
+
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_02", recordingID: w.recordingID)
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_01", recordingID: w.recordingID)
+
+        let alice = try XCTUnwrap(w.profiles.profile(named: "Alice"))
+        XCTAssertEqual(alice.sampleCount, 3,
+                       "un-naming both takes back exactly the two contributions this recording made")
+        assertCentroid(alice.embedding, aliceStored, "and nothing else")
+    }
+
+    /// Two ids named Alice folded twice into one profile, so what the pass
+    /// carries across for her is the combined observation — the single entry
+    /// whose subtraction reverses both. Carrying only one of them (or none)
+    /// leaves her at 4 after the un-name instead of 3.
+    func test_two_ids_that_shared_a_name_carry_one_combined_contribution() async throws {
+        let w = try makeWorld(segments: [segment("SPEAKER_00", 0, 5),
+                                         segment("SPEAKER_02", 5, 12),
+                                         segment("SPEAKER_00", 12, 30)],
+                              threshold: 0.7)
+        w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 3)
+        // The live pool over-segmented her; both fragments were named at stop.
+        w.snapshots.record([(id: "SPEAKER_00", observedCentroid: aliceSpeaking,
+                             observedCount: 1, profileName: nil),
+                            (id: "SPEAKER_02", observedCentroid: aliceSpeaking,
+                             observedCount: 1, profileName: nil)], for: w.recordingID)
+        for raw in ["SPEAKER_00", "SPEAKER_02"] {
+            w.store.setSpeakerName("Alice", forSpeaker: raw, recordingID: w.recordingID)
+        }
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 5,
+                       "precondition: two named fragments, two contributions")
+
+        // The pass puts her in one cluster.
+        w.probe.returns(["SPEAKER_01": aliceSpeakingAgain])
+        await runPass(w, producing: [segment("SPEAKER_01", 0, 5),
+                                     segment("SPEAKER_01", 5, 20)])
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_01"], "Alice")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 5,
+                       "no third contribution")
+
+        w.store.setSpeakerName(nil, forSpeaker: "SPEAKER_01", recordingID: w.recordingID)
+
+        let alice = try XCTUnwrap(w.profiles.profile(named: "Alice"))
+        XCTAssertEqual(alice.sampleCount, 3,
+                       "one un-name gives back BOTH of this recording's contributions")
+        assertCentroid(alice.embedding, aliceStored, "exactly")
+    }
+
+    /// The carry is scoped to the recording it was announced for. A note left
+    /// behind by a pass whose match never ran must not suppress a fold on the
+    /// next recording — that would credit one recording's contribution to a
+    /// speaker in another, and leave the first one's stranded anyway.
+    ///
+    /// Driven through the embedder directly rather than `runPass`, because
+    /// the point is the slot surviving into a *different* recording's match:
+    /// `announceCompletion` always notes before it matches, so the pairing is
+    /// what has to be checked, not the ordering.
+    func test_a_carry_left_by_another_recording_is_not_applied_here() async throws {
+        let w = try makeWorld(threshold: 0.7)
+        w.profiles.updateProfile(name: "Alice", embedding: aliceStored, sampleCount: 3)
+        w.probe.returns(["SPEAKER_00": aliceSpeaking])
+
+        // A pass on some other recording cleared "Alice", and its match never
+        // reached the embedder.
+        w.embedder.notePassClearedSpeakerNames(["SPEAKER_00": "Alice"], for: UUID())
+        w.embedder.matchAfterPass(recordingID: w.recordingID)
+        await w.embedder.awaitPending()
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_00"], "Alice")
+        XCTAssertEqual(w.profiles.profile(named: "Alice")?.sampleCount, 4,
+                       "this recording has contributed nothing to her yet, so its observation folds in")
     }
 }

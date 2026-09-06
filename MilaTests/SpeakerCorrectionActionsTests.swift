@@ -571,6 +571,62 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
                        "no row, no re-key, no correction")
     }
 
+    // MARK: - Re-attaching a name a pass cleared (island-io/mila#260)
+
+    /// `reattachSpeakerName` is the label half of the re-transcribe repair:
+    /// the profile it names ALREADY holds this recording's contribution (the
+    /// pass cleared the label that accounted for it), so writing the name
+    /// must not fold a second observation in. Going through `setSpeakerName`
+    /// here would do exactly that — which is the assertion that makes this
+    /// discriminating, since the snapshot below would resolve and create a
+    /// profile.
+    func test_reattaching_a_name_writes_no_profile() {
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one"),
+                                     segment("SPEAKER_01", 2, "two")],
+                          snapshotEntries: [("SPEAKER_00", [1, 0, 0, 0], 1),
+                                            ("SPEAKER_01", [0, 1, 0, 0], 1)])
+
+        w.store.reattachSpeakerName("Carol", toSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_00"], "Carol", "the label is written")
+        XCTAssertTrue(w.profiles.profiles.isEmpty,
+                      "…and no `onSpeakerNamed` fired: naming through the ordinary setter "
+                      + "would have created Carol from this recording's observation")
+    }
+
+    /// It reaches disk. A name that survives only in memory comes back as
+    /// "Speaker A" on the next launch, with the contribution it accounts for
+    /// still in the profile — the same stranding, one relaunch later.
+    func test_a_reattached_name_is_persisted() throws {
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one")])
+
+        w.store.reattachSpeakerName("Carol", toSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+
+        let onDisk = String(decoding: try Data(contentsOf: w.store.storeURL), as: UTF8.self)
+        XCTAssertTrue(onDisk.contains("Carol"), "recordings.json still has no Carol in it")
+    }
+
+    /// It never replaces a name. An id that already carries one carries it
+    /// because something else set it — the user typing while the pass ran,
+    /// most likely — and dropping that name here would fire no
+    /// `onSpeakerUnnamed`, stranding the contribution it stands for. A
+    /// replacement is a profile correction and belongs on `setSpeakerName`.
+    func test_reattaching_over_an_existing_name_is_refused() {
+        let voice: [Float] = [1, 0, 0, 0]
+        let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one")],
+                          snapshotEntries: [("SPEAKER_00", voice, 1)])
+        w.store.setSpeakerName("Dana", forSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+        XCTAssertEqual(w.profiles.profile(named: "Dana")?.sampleCount, 1,
+                       "precondition: Dana's profile holds this recording's observation")
+
+        w.store.reattachSpeakerName("Carol", toSpeaker: "SPEAKER_00", recordingID: w.recordingID)
+
+        XCTAssertEqual(row(w).speakerNames["SPEAKER_00"], "Dana", "the user's label stands")
+        XCTAssertNil(w.profiles.profile(named: "Carol"))
+        XCTAssertEqual(w.profiles.profile(named: "Dana")?.sampleCount, 1,
+                       "and Dana keeps what she was given")
+    }
+
     // MARK: - Move one line
 
     func test_reassigning_moves_only_the_named_segment() {

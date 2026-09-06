@@ -194,7 +194,7 @@ final class ObservedVoiceSnapshots {
         guard var observations = byRecording[recordingID],
               let source = observations.removeValue(forKey: sourceRawID) else { return }
         if let target = observations[targetRawID] {
-            if let combined = Self.combining(target, source) {
+            if let combined = Self.combined(target, source) {
                 observations[targetRawID] = combined
             } else {
                 // Dimension mismatch (a model change between the two
@@ -209,7 +209,18 @@ final class ObservedVoiceSnapshots {
     }
 
     /// Weighted mean of two observations, weighting by their sample counts.
-    private static func combining(_ a: Observation, _ b: Observation) -> Observation? {
+    /// `nil` when they cannot be combined (different embedding dimensions, an
+    /// empty centroid, or a non-finite result) — a caller must then keep one
+    /// and drop the other rather than persist a centroid of two spaces.
+    ///
+    /// The fold matches `SpeakerProfileStore.updateProfile`'s, which is what
+    /// makes "add A then add B" and "add mean(A, B) with the summed count"
+    /// interchangeable — so a caller holding several observations that went
+    /// into ONE profile under ONE name can combine them into the single entry
+    /// whose subtraction reverses all of them exactly. `absorb` uses it for a
+    /// merge; `OfflineVoiceEmbedder` uses it to carry a name's contribution
+    /// across a re-transcribe (island-io/mila#260).
+    static func combined(_ a: Observation, _ b: Observation) -> Observation? {
         guard a.observedCentroid.count == b.observedCentroid.count,
               !a.observedCentroid.isEmpty else { return nil }
         let total = a.observedCount + b.observedCount

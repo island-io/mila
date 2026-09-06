@@ -488,10 +488,19 @@ final class RecordingStore: ObservableObject {
     /// re-matches them against the stored profiles — so a retire there would
     /// subtract the weight the re-match is about to look the speaker up by,
     /// and a profile whose only content came from that recording would be
-    /// deleted before the pass could restore its name. That path needs the
-    /// retire and the re-match designed together (see #254); the re-diarize
-    /// path has no re-match behind it, since it carries the names rather than
+    /// deleted before the pass could restore its name. The re-diarize path
+    /// has no re-match behind it, since it carries the names rather than
     /// re-deriving them.
+    ///
+    /// **That still holds after island-io/mila#260 closed the other half.**
+    /// The re-transcribe path fixes its stranding from the *naming* side
+    /// instead: when the re-match brings a pre-pass name back,
+    /// `matchAfterPass` re-attaches the label to the contribution the profile
+    /// already holds (`reattachSpeakerName`) rather than folding a second one
+    /// in, and it subtracts nothing at any point. A name the re-match does
+    /// NOT bring back is left as residue, on purpose — retiring it here would
+    /// delete a profile whose only weight came from this recording, on the
+    /// evidence of a failed voice match rather than a user's correction.
     ///
     /// **The one destructive case, and why it is left exact.** A retire
     /// subtracts exactly what naming that id added, so a profile holding
@@ -653,6 +662,54 @@ final class RecordingStore: ObservableObject {
             recordings[idx].speakerNames.removeValue(forKey: rawID)
             onSpeakerUnnamed?(recordingID, rawID, previousName)
         }
+        persist()
+        if recordings[idx].status == .completed {
+            TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
+        }
+    }
+
+    /// Put a name back on a raw id a pass re-keyed, **without firing
+    /// `onSpeakerNamed`** — because the profile named here already holds this
+    /// recording's contribution, and folding a second one in is the bug this
+    /// exists to stop (island-io/mila#260).
+    ///
+    /// **The situation.** A batch pass re-keys every `SPEAKER_NN`, so
+    /// `TranscriptionService` clears `speakerNames` wholesale. The profile
+    /// contributions those names justified stay on disk, keyed to nothing.
+    /// `OfflineVoiceEmbedder.matchAfterPass` then re-embeds every speaker and
+    /// re-matches them against the stored profiles *by voice*; when a name
+    /// this recording carried BEFORE the pass comes back that way, the right
+    /// answer is to re-attach the label to the contribution that is already
+    /// there — not to add another one beside it. Going through
+    /// `setSpeakerName` would fold the fresh observation in on top, leaving
+    /// the profile holding two observations of one recording, one of them
+    /// permanently unreachable. So this is the label half only; the embedder
+    /// owns the observation half (it re-points the snapshot entry at the
+    /// contribution the profile actually received) and the two are called
+    /// together.
+    ///
+    /// **Not a general "quiet setter".** It refuses to touch an id that
+    /// already carries a name, so it can never silently replace one — a
+    /// replacement is a profile correction and belongs on `setSpeakerName`,
+    /// which fires both hooks. And it is only ever correct where the caller
+    /// has established that the profile already carries this recording's
+    /// contribution under `name`. There is exactly one such caller;
+    /// `OfflineVoiceEmbedderTests` pins both halves.
+    ///
+    /// The **other** direction — a name a re-key drops for good — is
+    /// `update(_:retiringSpeakerNames:)`, which fires `onSpeakerUnnamed` so
+    /// the contribution comes back out. Deliberately not used on the
+    /// re-transcribe path: see that method's note and #260.
+    func reattachSpeakerName(_ name: String, toSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        // Never over-write. An id that already has a name has one because
+        // something else set it — the user typing while the pass ran, most
+        // likely — and replacing it here would drop that name with no
+        // `onSpeakerUnnamed` to correct the profile it went into.
+        guard recordings[idx].speakerNames[rawID] == nil else { return }
+        recordings[idx].speakerNames[rawID] = trimmed
         persist()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)

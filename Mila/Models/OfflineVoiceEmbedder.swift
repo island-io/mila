@@ -16,6 +16,37 @@ struct SpeakerAudioSpan: Equatable, Sendable {
     let end: Double
 }
 
+/// The `speakerNames` a batch pass cleared off one recording, paired with the
+/// voice-profile contribution each of those names had already made.
+///
+/// File scope rather than nested in `OfflineVoiceEmbedder`, for the same
+/// reason as `SpeakerAudioSpan`: a global actor propagates to nested types,
+/// and this value is captured by the extraction task, which is not
+/// main-actor isolated. It therefore holds plain data rather than
+/// `ObservedVoiceSnapshots.Observation` — the conversion happens on the main
+/// actor at both ends.
+struct ClearedSpeakerNames: Sendable {
+    /// One name's contribution to its profile from this recording: what
+    /// `onSpeakerNamed` folded in, and so exactly what un-naming would take
+    /// back out.
+    struct Contribution: Sendable, Equatable {
+        let centroid: [Float]
+        let count: Int
+        let profileName: String?
+    }
+
+    let recordingID: UUID
+    /// EVERY name the row carried before the pass — including the ones whose
+    /// observation is no longer held. Membership is what says "this
+    /// recording has already contributed to that profile", which is the fact
+    /// that must suppress a second fold; being able to re-point the
+    /// observation is a further, optional improvement on top.
+    let names: Set<String>
+    /// The subset whose observation survived, ready to be re-pointed at
+    /// whichever new id the re-match resolves the name to.
+    let contributions: [String: Contribution]
+}
+
 /// Voice recognition for recordings the **live** diarizer pool never covered:
 /// imports, batch-transcribed files, and anything recorded before the feature
 /// was switched on.
@@ -34,6 +65,11 @@ struct SpeakerAudioSpan: Equatable, Sendable {
 ///  * `matchAfterPass` — a batch transcription finished. Extract every
 ///    speaker, snapshot them, and auto-name the ones that match a stored
 ///    profile.
+///  * `notePassClearedSpeakerNames` — the same pass, one step earlier: the
+///    names it dropped off the row. Fed straight back into the `matchAfterPass`
+///    that follows it, so a name coming back by voice re-attaches to the
+///    contribution the profile already holds instead of adding another
+///    (island-io/mila#260).
 ///
 /// **Extracted from `MilaApp.init` for the same reason as
 /// `RecognisedSpeakerAssigner`: closures in an `App`'s initializer are
@@ -71,6 +107,18 @@ final class OfflineVoiceEmbedder {
     /// In-flight extractions, keyed by a token so each clears its own entry.
     /// Exists for `awaitPending()` — see there.
     private var pending: [UUID: Task<Void, Never>] = [:]
+
+    /// What the pass whose completion is being announced right now took off
+    /// the row, waiting for the `matchAfterPass` that follows it.
+    ///
+    /// **One slot, and it is not a cache.** `TranscriptionService`
+    /// announces the cleared names and the completion back to back with
+    /// nothing between them (`announceCompletion`), and `matchAfterPass`
+    /// consumes this unconditionally before doing anything else — so it is
+    /// written and read inside one synchronous span. A value still sitting
+    /// here when the next pass reports in belongs to a pass whose match never
+    /// ran, and is dropped rather than applied to a different recording.
+    private var clearedByPass: ClearedSpeakerNames?
 
     init(store: RecordingStore,
          snapshots: ObservedVoiceSnapshots,
@@ -144,6 +192,76 @@ final class OfflineVoiceEmbedder {
         }
     }
 
+    // MARK: - Carrying a pass's cleared names into the re-match
+
+    /// Wire to `TranscriptionService.onPassClearedSpeakerNames`.
+    ///
+    /// **What is being repaired.** A pass that produced segments re-keys every
+    /// `SPEAKER_NN`, so the service clears `speakerNames` wholesale. Each of
+    /// those names had folded an observation into a voice profile
+    /// (`onSpeakerNamed`), and clearing the label fires nothing — so that
+    /// contribution sits in the profile with nothing left to un-name, and
+    /// #237's correction can never reach it. `matchAfterPass` then re-embeds
+    /// every speaker, matches them against the same profiles and names them
+    /// again, folding a SECOND observation of the same recording into the
+    /// same profile. This method is what lets the second step recognise the
+    /// first one's leftovers as its own (island-io/mila#260).
+    ///
+    /// **It resolves the observations now, not later.** They are keyed to the
+    /// ids the names were attached to, and `matchAfterPass` drops every one
+    /// of them (`snapshots.invalidate`) before it does anything else. This
+    /// call runs while they are all still there.
+    ///
+    /// **Several ids under one name are combined, not listed.** Naming two
+    /// clusters "Alice" — which the auto-match itself can do, two ids over
+    /// one profile — folded twice into one profile, and the weighted mean
+    /// carrying the summed count is the single entry whose subtraction
+    /// reverses both. That is the same equivalence `ObservedVoiceSnapshots`
+    /// relies on for a merge. When two observations cannot be combined at all
+    /// (different embedding dimensions, i.e. a model change mid-recording),
+    /// the first is kept and the second dropped: under-correcting, the same
+    /// choice `absorb` makes.
+    ///
+    /// Nothing is written here. The worst this call can do is leave a stale
+    /// value in one slot, which the next `matchAfterPass` discards.
+    func notePassClearedSpeakerNames(_ previousNames: [String: String], for recordingID: UUID) {
+        clearedByPass = nil
+        guard settings.isConfigured, !previousNames.isEmpty else { return }
+        var observations: [String: ObservedVoiceSnapshots.Observation] = [:]
+        // Sorted: `Dictionary` order is unspecified per process, and which
+        // observation "goes first" decides which survives a dimension clash.
+        for (rawID, name) in previousNames.sorted(by: { $0.key < $1.key }) {
+            guard let observed = snapshots.observation(forSpeaker: rawID, in: recordingID) else { continue }
+            guard let existing = observations[name] else {
+                observations[name] = observed
+                continue
+            }
+            if let combined = ObservedVoiceSnapshots.combined(existing, observed) {
+                observations[name] = combined
+            } else {
+                embedLog.log("cleared-name carry: cannot combine two observations of one name — the second is dropped")
+            }
+        }
+        let contributions = observations.mapValues {
+            ClearedSpeakerNames.Contribution(centroid: $0.observedCentroid,
+                                             count: $0.observedCount,
+                                             profileName: $0.profileName)
+        }
+        clearedByPass = ClearedSpeakerNames(recordingID: recordingID,
+                                            names: Set(previousNames.values),
+                                            contributions: contributions)
+    }
+
+    /// Consume the slot. Unconditional: a value for a different recording is
+    /// a pass whose match never ran, and applying it here would credit one
+    /// recording's contribution to another's speakers.
+    private func takeClearedNames(for recordingID: UUID) -> ClearedSpeakerNames? {
+        let held = clearedByPass
+        clearedByPass = nil
+        guard let held, held.recordingID == recordingID else { return nil }
+        return held
+    }
+
     // MARK: - Auto-matching after a batch pass
 
     /// Wire to `TranscriptionService.onTranscriptionCompleted`.
@@ -162,20 +280,52 @@ final class OfflineVoiceEmbedder {
     /// never be replaced). Dropping it and re-extracting is the fix; the
     /// skip guard is gone.
     ///
-    /// **What removing that guard costs, and why it is worth it.** The guard
-    /// also happened to prevent a second fold into a profile for one
-    /// recording. That is now reachable by exactly one route: an explicit
-    /// re-transcribe of a live VAD recording, whose speakers `finish` already
-    /// learned from the pool. Chunk mode does not reach it (its live diarizer
-    /// never runs, so the snapshot `finish` takes is empty) and a VAD
-    /// recording that is not re-transcribed never runs a batch pass at all.
-    /// On that one route the second observation is a genuinely different
-    /// extract from a re-clustered segmentation, folded at `sampleCount: 1`
-    /// — not the #204 pathology, which re-folded the *identical* centroid on
-    /// every recording and inflated `sampleCount` without adding
-    /// information. A stale embedding resolving to the wrong person is the
-    /// worse failure, so this is the trade taken deliberately.
+    /// **The second fold, and how it is avoided.** Removing that guard also
+    /// removed the thing that prevented a profile receiving two observations
+    /// of one recording, and the pass's own `speakerNames` clear is what
+    /// makes them two: the label that accounted for the first one is gone by
+    /// the time this runs, so re-matching by voice and naming the speaker
+    /// again folds a fresh observation in beside a stranded one that nothing
+    /// can ever take back out (island-io/mila#260).
+    ///
+    /// So a name that was on the row before the pass is not treated as a new
+    /// name at all. `notePassClearedSpeakerNames` hands those names over —
+    /// with the observation each one folded in, resolved before the
+    /// invalidation above — and when the re-match resolves a speaker to one
+    /// of them, this **re-attaches the label to the contribution the profile
+    /// already holds**: the snapshot entry for the new id is re-pointed at
+    /// that observation, and the name goes on through
+    /// `RecordingStore.reattachSpeakerName`, which fires no
+    /// `onSpeakerNamed`. Un-naming that speaker afterwards then subtracts
+    /// exactly what naming it added, once — the invariant #253 and #237 are
+    /// about. Each cleared name can be claimed by at most ONE new id; a
+    /// second id matching the same profile is a genuinely new contribution
+    /// and folds normally.
+    ///
+    /// **Nothing here subtracts, and nothing here deletes.** The retire that
+    /// `RecordingStore.update(_:retiringSpeakerNames:)` performs for the
+    /// re-diarize path is deliberately not used on this one, in either
+    /// direction: before the re-match it would take away the weight — and
+    /// shift the centroid — that the lookup is about to resolve through, and
+    /// delete outright any profile whose only content came from this
+    /// recording; after it there is nothing left to subtract, since the
+    /// snapshot has been invalidated and refilled. A cleared name the
+    /// re-match does NOT bring back therefore keeps its contribution as
+    /// residue, exactly as on `main`. That is the under-correcting side, on
+    /// purpose: residue is recoverable (delete the profile and let it
+    /// re-learn), a profile deleted because a voice match came up short is
+    /// not, and this is a batch write the user is not watching.
+    ///
+    /// **The `speakerNames.isEmpty` guard still means what it says**: only a
+    /// recording the pass left unlabelled is auto-named. The carry does not
+    /// change that — it travels beside the row rather than on it, precisely
+    /// so the pass can go on clearing names it has re-keyed. A future change
+    /// that preserves names ON the row has to revisit both together.
     func matchAfterPass(recordingID: UUID) {
+        // Taken first: the contributions it names resolve through
+        // observations that are still keyed to the pre-pass ids, and the very
+        // next line drops all of them.
+        let cleared = takeClearedNames(for: recordingID)
         snapshots.invalidate(recordingID)
         guard settings.isConfigured, !profiles.profiles.isEmpty, let store else { return }
         guard let rec = store.recordings.first(where: { $0.id == recordingID }),
@@ -200,8 +350,15 @@ final class OfflineVoiceEmbedder {
                                                  profileName: nil as String?) }
                 self.snapshots.merge(observed, for: recordingID)
                 let threshold = self.matchThreshold()
+                // The names this recording had already folded into profiles,
+                // before the pass cleared the labels that accounted for them.
+                // Claimed at most once each: the second speaker to match one
+                // of these profiles is a new contribution, not the old one
+                // coming back.
+                var unclaimed = cleared?.names ?? []
                 // Sorted: `Dictionary` order is unspecified per process, and
-                // this drives `.srt` rewrites and log lines.
+                // this drives `.srt` rewrites, log lines, and which id claims
+                // a cleared name when two of them match it.
                 for rawID in embeddings.keys.sorted() {
                     // A label the user typed while the embed was in flight
                     // wins over a recogniser's guess. Overwriting it would
@@ -212,8 +369,38 @@ final class OfflineVoiceEmbedder {
                     guard let centroid = embeddings[rawID],
                           let profile = self.profiles.match(embedding: centroid,
                                                             threshold: threshold) else { continue }
-                    store.setSpeakerName(profile.name, forSpeaker: rawID,
-                                         recordingID: recordingID)
+                    guard unclaimed.remove(profile.name) != nil else {
+                        store.setSpeakerName(profile.name, forSpeaker: rawID,
+                                             recordingID: recordingID)
+                        continue
+                    }
+                    // A name from before the pass, back on a new id. The
+                    // profile already carries this recording's contribution
+                    // under it, so the snapshot is re-pointed at THAT
+                    // observation — what the profile actually received, which
+                    // is what a later un-name has to subtract — and the label
+                    // is written without firing the fold. When the
+                    // observation is no longer held (evicted, or never
+                    // taken), the fresh one stays in the snapshot: its count
+                    // matches what the profile received, so the un-name still
+                    // reverses the right amount.
+                    if let contribution = cleared?.contributions[profile.name] {
+                        self.snapshots.merge([(id: rawID,
+                                               observedCentroid: contribution.centroid,
+                                               observedCount: contribution.count,
+                                               profileName: contribution.profileName)],
+                                             for: recordingID)
+                    }
+                    store.reattachSpeakerName(profile.name, toSpeaker: rawID,
+                                              recordingID: recordingID)
+                    embedLog.log("a name cleared by the pass came back on \(rawID, privacy: .public) — re-attached to the contribution already in the profile")
+                }
+                if !unclaimed.isEmpty {
+                    // Their contributions stay where they are. Subtracting
+                    // them here would delete a profile this recording is the
+                    // only evidence for, on the strength of a voice match
+                    // that came up short — see the note on this method.
+                    embedLog.log("\(unclaimed.count, privacy: .public) name(s) cleared by the pass did not come back — their profile contributions are left in place")
                 }
             }
         }

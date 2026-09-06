@@ -145,6 +145,33 @@ final class TranscriptionService: ObservableObject {
     /// exists). For first-time transcription it's `false`.
     var onTranscriptionCompleted: ((Recording, _ wasRetranscription: Bool) -> Void)?
 
+    /// Hook fired for the same recordings as `onTranscriptionCompleted`, and
+    /// immediately BEFORE it, carrying the `speakerNames` map the pass just
+    /// cleared off the row (empty when the pass had none to clear).
+    ///
+    /// **Why it exists.** A pass that produced segments re-keyed every
+    /// `SPEAKER_NN`, so the names bound to the old ids are dropped wholesale
+    /// (see `mergePassResult`). Each of those names had folded an observation
+    /// into a voice profile, and once the label is gone there is nothing left
+    /// to un-name: the contribution is stranded in that profile permanently
+    /// (island-io/mila#260). Whoever repairs that needs the pairs the row is
+    /// about to lose, and this is the only moment they still exist —
+    /// `onTranscriptionCompleted` carries the row as written, names already
+    /// gone.
+    ///
+    /// **Ordering is the contract.** `MilaApp` wires this to
+    /// `OfflineVoiceEmbedder`, whose `matchAfterPass` — driven off
+    /// `onTranscriptionCompleted` — invalidates the recording's observations
+    /// as its first act. The pairs must therefore arrive before that hook
+    /// runs, while the observations backing them are still keyed to the old
+    /// ids. Both fire from `announceCompletion`, which is the whole reason it
+    /// exists as one function rather than two call sites that can drift.
+    ///
+    /// Nothing here is required for correctness of the pass itself: an
+    /// unwired hook (tests, or a build that never installs it) leaves the
+    /// behaviour exactly as it was before #260.
+    var onPassClearedSpeakerNames: ((_ recordingID: UUID, _ previousNames: [String: String]) -> Void)?
+
     /// Auto-drop gate for accidental short+empty captures (issue #61). Wired
     /// by `MilaApp` to the user's `recordings.minDuration` threshold. Given a
     /// just-finished recording's duration + transcript, returns `true` when
@@ -989,6 +1016,16 @@ final class TranscriptionService: ObservableObject {
             // `mergePassResult` for the full field-ownership table. `nil` means
             // the row is gone (hard-deleted / trash emptied / just auto-dropped
             // above); there is nothing to write and nothing to follow up on.
+            //
+            // What the LIVE row's `speakerNames` held at the instant the
+            // clear below dropped them — captured inside the merge closure so
+            // it is provably the same row that was written, not a re-read that
+            // could have moved. Each pair had folded an observation into a
+            // voice profile; announcing them is what lets
+            // `OfflineVoiceEmbedder` re-attach the label to that contribution
+            // instead of leaving it stranded (island-io/mila#260). Stays empty
+            // for a pass that cleared nothing.
+            var clearedSpeakerNames: [String: String] = [:]
             guard let persisted = mergePassResult(id: recording.id, {
                 $0.status = working.status
                 $0.segments = working.segments
@@ -1002,6 +1039,7 @@ final class TranscriptionService: ObservableObject {
                 // so the user's speaker names must survive it untouched (they're
                 // hand-typed work, and the next successful pass re-keys anyway).
                 if !enrichedSegments.isEmpty {
+                    clearedSpeakerNames = $0.speakerNames
                     $0.speakerNames = working.speakerNames
                 }
             }) else {
@@ -1026,7 +1064,9 @@ final class TranscriptionService: ObservableObject {
                         """)
                 } else {
                     TranscriptExporter.writeSRT(for: persisted, in: store.recordingsDirectory)
-                    onTranscriptionCompleted?(persisted, hadSummaryBeforeRun)
+                    announceCompletion(persisted,
+                                       clearedSpeakerNames: clearedSpeakerNames,
+                                       wasRetranscription: hadSummaryBeforeRun)
                 }
                 // Shrink storage: transcode the WAV to m4a now that
                 // transcription + diarization are done reading it. Runs in
@@ -1099,6 +1139,28 @@ final class TranscriptionService: ObservableObject {
 
     private func markFailed(_ recording: Recording) {
         mergePassResult(id: recording.id) { $0.status = .failed }
+    }
+
+    /// Tell the app a pass finished: the names it cleared first, the
+    /// completion second.
+    ///
+    /// **One function so the order cannot drift.** `MilaApp` wires
+    /// `onTranscriptionCompleted` to `OfflineVoiceEmbedder.matchAfterPass`,
+    /// which invalidates the recording's observed embeddings as its first act
+    /// — so the pairs `onPassClearedSpeakerNames` carries have to arrive
+    /// while those observations are still keyed to the ids the names were
+    /// attached to. Swapping these two lines does not fail loudly: the carry
+    /// is simply missed and every named speaker's profile contribution is
+    /// stranded again, silently, which is island-io/mila#260. Both hooks run
+    /// synchronously, so nothing interleaves between them.
+    ///
+    /// `TranscriptionServiceSpeakerCarryTests` pins the order and the payload
+    /// through a real pass.
+    func announceCompletion(_ persisted: Recording,
+                            clearedSpeakerNames: [String: String],
+                            wasRetranscription: Bool) {
+        onPassClearedSpeakerNames?(persisted.id, clearedSpeakerNames)
+        onTranscriptionCompleted?(persisted, wasRetranscription)
     }
 
     /// Persist the result of a transcription pass by merging it onto the row
