@@ -360,6 +360,10 @@ struct MilaApp: App {
     /// weakly.
     @StateObject private var obsidianVaultSettings: ObsidianVaultSettings
     @StateObject private var mcpAccessSettings: MCPAccessSettings
+    /// Managed Claude CLI install + guided login (issue #271). App-wide because
+    /// the Settings scene renders it and `LLMRunner` runs against what it
+    /// installed; a second instance would mean two views of one install.
+    @StateObject private var claudeSetupSettings: ClaudeSetupSettings
     @StateObject private var obsidianExporter: ObsidianExporter
     @StateObject private var voiceMemosSettings: VoiceMemosSettings
     @StateObject private var voiceMemosImporter: VoiceMemosImporter
@@ -572,6 +576,13 @@ struct MilaApp: App {
         store.onStoreLocationDiscoverabilityChanged = { [weak mcpAccess] in
             mcpAccess?.refreshMirror()
         }
+        // Settings → AI Provider → "Set up Claude" (issue #271). `openURL` is
+        // injected rather than reached for inside the model: that keeps AppKit
+        // out of the settings layer, and it is the seam the tests use to prove
+        // the guided login never opens a browser under test.
+        let claudeSetup = ClaudeSetupSettings(openURL: { url in
+            NSWorkspace.shared.open(url)
+        })
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
@@ -897,6 +908,7 @@ struct MilaApp: App {
         _recordingSummarizer = StateObject(wrappedValue: summarizer)
         _obsidianVaultSettings = StateObject(wrappedValue: obsidianSettings)
         _mcpAccessSettings = StateObject(wrappedValue: mcpAccess)
+        _claudeSetupSettings = StateObject(wrappedValue: claudeSetup)
         _obsidianExporter = StateObject(wrappedValue: obsidian)
         // Voice Memos (iPhone) folder integration. Settings are opt-in and
         // default-off; the importer wires up its FSEvents watcher + initial
@@ -990,6 +1002,7 @@ struct MilaApp: App {
                 }
                 .environmentObject(obsidianVaultSettings)
                 .environmentObject(mcpAccessSettings)
+                .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
         }
         .commands {
@@ -1055,6 +1068,7 @@ struct MilaApp: App {
                 .environmentObject(updater)
                 .environmentObject(obsidianVaultSettings)
                 .environmentObject(mcpAccessSettings)
+                .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside

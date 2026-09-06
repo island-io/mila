@@ -1790,18 +1790,51 @@ enum LLMRunner {
         return FileManager.default.temporaryDirectory
     }
 
-    private static func resolveExecutable(tool: LLMTool,
-                                          override: String?) throws -> URL {
+    /// Which binary a run actually launches.
+    ///
+    /// Order: **explicit override → Mila's managed install → `$PATH` and the
+    /// well-known directories.**
+    ///
+    /// The managed install (issue #271) goes ahead of the search because it is
+    /// the one binary Mila can make promises about: it verified the publisher's
+    /// signature before installing it, and it holds a credential minted for it
+    /// specifically. A user who pressed "Set up Claude" and *also* happens to
+    /// have a stale `claude` earlier on `PATH` should get the one Mila set up,
+    /// or the button did nothing they can see.
+    ///
+    /// The explicit override still wins over both, and that is deliberate. It
+    /// is a path the user typed into Settings → AI Provider → Executable,
+    /// which is Mila's own "run this one instead" control; a managed install
+    /// that silently overrode it would make that field impossible to use and
+    /// would break the documented escape hatch for custom installs and shims.
+    /// Nothing is lost by honouring it — an override that points *at* the
+    /// managed binary resolves to the same file, and
+    /// `ClaudeManagedInstall.environmentAdditions` compares resolved paths, so
+    /// that case still gets the token.
+    ///
+    /// `managedBinary` and `lookup` are parameters with production defaults so
+    /// the ordering is unit-testable without a real install or a real `$PATH`.
+    static func resolveExecutable(tool: LLMTool,
+                                  override: String?,
+                                  managedBinary: URL? = ClaudeManagedInstall.binaryURL(),
+                                  fileManager: FileManager = .default,
+                                  lookup: (String) -> URL? = { lookupOnPath($0) }) throws -> URL {
         // Absolute path override wins — handy for users with custom installs
         // or who want to point at a wrapper script (e.g. an asdf shim).
         if let override, !override.isEmpty {
             let url = URL(fileURLWithPath: (override as NSString).expandingTildeInPath)
-            guard FileManager.default.isExecutableFile(atPath: url.path) else {
+            guard fileManager.isExecutableFile(atPath: url.path) else {
                 throw LLMRunnerError.executableNotFound(override)
             }
             return url
         }
-        if let resolved = lookupOnPath(tool.executableName) {
+        // Only `.claude` has a managed install; the other CLIs are still
+        // whatever the user installed themselves.
+        if tool == .claude, let managedBinary,
+           fileManager.isExecutableFile(atPath: managedBinary.path) {
+            return managedBinary
+        }
+        if let resolved = lookup(tool.executableName) {
             return resolved
         }
         throw LLMRunnerError.executableNotFound(tool.executableName)
@@ -1832,9 +1865,25 @@ enum LLMRunner {
     /// directory`. We prepend the resolved executable's own directory (its
     /// sibling `node` lives there for nvm/npm installs) plus the well-known
     /// version-manager bins, then the inherited PATH — de-duped, order kept.
+    ///
+    /// It is also the ONE place Mila's managed Claude credential is handed to a
+    /// child (issue #271), and the only place it should ever be. Putting it
+    /// here rather than at each call site means every invocation route — the
+    /// auto-title, the summary, a Send action, a Live AI tick, the Settings
+    /// test — gets the same rule for free, and a route added later cannot
+    /// forget to apply it or apply it too widely. The rule itself
+    /// (`ClaudeManagedInstall.environmentAdditions`) is: inject only when the
+    /// executable being launched *is* the managed binary, so a user's own
+    /// `claude` with its own login is left exactly as it was.
+    ///
+    /// `managedToken` is a closure, not a value, so the Keychain is read only
+    /// when the paths match — a run of `cursor-agent` or a system `claude`
+    /// touches the Keychain not at all.
     static func childEnvironment(
         for executable: URL,
-        base: [String: String] = ProcessInfo.processInfo.environment
+        base: [String: String] = ProcessInfo.processInfo.environment,
+        managedBinary: URL? = ClaudeManagedInstall.binaryURL(),
+        managedToken: () -> String? = { KeychainClaudeTokenStore().load() }
     ) -> [String: String] {
         var env = base
         let inherited = base["PATH"]?.split(separator: ":").map(String.init) ?? []
@@ -1844,6 +1893,15 @@ enum LLMRunner {
         var seen = Set<String>()
         let merged = ordered.filter { !$0.isEmpty && seen.insert($0).inserted }
         env["PATH"] = merged.joined(separator: ":")
+        if let managedBinary,
+           executable.standardizedFileURL.path == managedBinary.standardizedFileURL.path {
+            for (key, value) in ClaudeManagedInstall.environmentAdditions(
+                executable: executable,
+                managedBinary: managedBinary,
+                token: managedToken()) {
+                env[key] = value
+            }
+        }
         return env
     }
 

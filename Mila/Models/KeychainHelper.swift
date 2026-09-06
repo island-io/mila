@@ -39,4 +39,21 @@ enum KeychainHelper {
         ]
         SecItemDelete(query as CFDictionary)
     }
+
+    /// True only when the keychain positively reports the item absent.
+    ///
+    /// Not the same question as `load(key:) == nil`: `load` collapses every
+    /// non-success status to nil, so a read *error* (a locked keychain, say)
+    /// looks identical to "not there". A deletion verified through `load`
+    /// could therefore claim success over a credential still sitting in the
+    /// keychain. Only `errSecItemNotFound` is proof of absence.
+    static func isAbsent(key: String) -> Bool {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "io.island.mila.Mila",
+            kSecAttrAccount as String: key,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        return SecItemCopyMatching(query as CFDictionary, nil) == errSecItemNotFound
+    }
 }
