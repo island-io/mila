@@ -19,8 +19,9 @@ import OSLog
 ///   - `recordings.json`         — metadata (titles, durations, statuses)
 ///                                  but NOT transcript text or audio
 ///   - `folders.json`            — folder list (already metadata-only)
-///   - `settings.json`           — UserDefaults keys under "diarization.",
-///                                 "audio.", "llm.", "hotkeys.", etc.
+///   - `settings.json`           — every Mila-namespaced UserDefaults key
+///                                 (`exportedSettingsPrefixes`); credentials
+///                                 redacted, prompt text as lengths only
 ///   - `diarization-health.txt`  — the last health-check result
 ///   - `crash-reports/`          — the 5 most recent .ips files matching
 ///                                 Mila / IslandWhisper / IvritWhisper
@@ -29,6 +30,8 @@ import OSLog
 /// Things deliberately **NOT** included:
 ///   - Audio files (too big + sensitive)
 ///   - Transcript sidecar `.txt` files (sensitive)
+///   - The text of the user's AI prompts (only their length — people paste
+///     meeting agendas into them)
 ///   - LLM CLI executables, model weights, etc.
 @MainActor
 enum DiagnosticReporter {
@@ -99,7 +102,7 @@ enum DiagnosticReporter {
           logs/process.log       Recent OSLog entries from this run
           recordings.json        Recording metadata (no audio, no transcripts)
           folders.json           User-created folder list
-          settings.json          App preferences (no auth tokens)
+          settings.json          App preferences (no auth tokens; prompt text as lengths)
           diarization-health.txt Speaker-detection pipeline status
           crash-reports/         Up to 5 most recent .ips files
 
@@ -107,7 +110,8 @@ enum DiagnosticReporter {
           - Audio files (.wav)
           - Transcript text (.txt sidecars)
           - LLM CLI executables or output
-          - HuggingFace / cloud auth tokens
+          - HuggingFace / cloud auth tokens, API keys
+          - The text of your AI prompts (only their length)
 
         Send this zip to whoever is helping you diagnose the issue.
         """
@@ -188,31 +192,72 @@ enum DiagnosticReporter {
     }
 
     private static func writeSettings(at dir: URL) throws {
-        // Whitelist of UserDefaults key prefixes we know are Mila-owned.
-        // Avoids leaking unrelated app or system defaults into the zip.
-        // "recording." covers `recording.language` — the key the language
-        // picker actually persists (RecordingLanguageSettings). The old
-        // entry here was "recordingLanguage", which matches no real key,
-        // so the one setting most language-related support reports need
-        // was silently missing from settings.json.
-        let prefixes = ["diarization.", "audio.", "llm.", "hotkeys.",
-                        "home.", "rename.", "recording.", "selectedModelName"]
-        let defaults = UserDefaults.standard.dictionaryRepresentation()
+        let scoped = scopedSettings(from: UserDefaults.standard.dictionaryRepresentation())
+        let data = try JSONSerialization.data(withJSONObject: scoped,
+                                              options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: dir.appendingPathComponent("settings.json"))
+    }
+
+    /// UserDefaults key prefixes exported to `settings.json` — every
+    /// namespace Mila writes, so a support bundle answers "which backend,
+    /// which Live AI mode, which toggles" on its own. It used to be eight
+    /// prefixes, and the omissions were the ones support needs most: a
+    /// "100% CPU although remote transcription is on" report (#281) carried
+    /// `selectedModelName` (a local model — misleading) but neither
+    /// `transcription.backend` nor `liveAI.backgroundMode`, which decides
+    /// whether the user was even looking at the live pane. The allowlist is
+    /// against *unrelated* defaults (Apple's, other apps') leaking into the
+    /// zip, not against Mila's own settings; what is sensitive in Mila's
+    /// settings is handled per value in `scopedSettings`.
+    ///
+    /// `speakers.` matches only `speakers.voiceRecognition.enabled` —
+    /// `speakers.known.*` are accessibility identifiers, not defaults keys.
+    /// `coreml.` is `coreml.compiled.<model>`, written by the whisper engine.
+    static let exportedSettingsPrefixes: [String] = [
+        "audio.", "audioInput.", "bundle.", "claudeSetup.", "coreml.",
+        "diarization.", "downloads.", "home.", "hotkeys.", "liveAI.", "llm.",
+        "mcp.", "meetingDetection.", "model.", "obsidian.", "recording.",
+        "recordings.", "remote.", "rename.", "speakers.", "storage.",
+        "transcription.", "updates.", "voiceMemos.", "whatsNew.",
+        "selectedModelName"
+    ]
+
+    /// The `settings.json` payload for a defaults dictionary. Pure, so the
+    /// tests can feed it a synthetic dictionary instead of the real
+    /// `UserDefaults.standard`.
+    ///
+    /// Per-value rules, in order:
+    ///   - anything credential-shaped by key name (`token`, `secret`,
+    ///     `apikey`, `password`) is `<redacted>` — the remote bearer token and
+    ///     the OpenAI key live in the Keychain anyway, but a future key that
+    ///     did not would still be covered;
+    ///   - any `…prompt…` key is reported as `<N chars>`: prompts are
+    ///     user-authored text, and people paste meeting agendas into them
+    ///     (that is how "the summary mentions last week's call" reports
+    ///     usually resolve). The length still shows whether one is set and
+    ///     whether it is the default's size;
+    ///   - `obsidian.writtenIndex` maps recording ids to vault paths derived
+    ///     from recording titles — reported as an entry count;
+    ///   - everything else goes through `sanitizedValue` (Data, i.e.
+    ///     security-scoped bookmarks, becomes a byte count).
+    static func scopedSettings(from defaults: [String: Any]) -> [String: Any] {
         var scoped: [String: Any] = [:]
         for (key, value) in defaults {
-            guard prefixes.contains(where: { key.hasPrefix($0) }) else { continue }
-            // Don't leak anything that looks like a secret. There aren't
-            // supposed to be any, but a future change might add one.
-            if key.lowercased().contains("token") || key.lowercased().contains("secret")
-                || key.lowercased().contains("apikey") || key.lowercased().contains("password") {
+            guard exportedSettingsPrefixes.contains(where: { key.hasPrefix($0) }) else { continue }
+            let lower = key.lowercased()
+            if lower.contains("token") || lower.contains("secret")
+                || lower.contains("apikey") || lower.contains("password") {
                 scoped[key] = "<redacted>"
+            } else if lower.contains("prompt"), let text = value as? String {
+                scoped[key] = "<\(text.count) chars>"
+            } else if key == "obsidian.writtenIndex" {
+                let count = (value as? [String: Any])?.count ?? (value as? [Any])?.count ?? 0
+                scoped[key] = "<\(count) entries>"
             } else {
                 scoped[key] = sanitizedValue(value)
             }
         }
-        let data = try JSONSerialization.data(withJSONObject: scoped,
-                                              options: [.prettyPrinted, .sortedKeys])
-        try data.write(to: dir.appendingPathComponent("settings.json"))
+        return scoped
     }
 
     /// JSON only encodes specific types — translate the catch-alls we get
