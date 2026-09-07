@@ -954,10 +954,14 @@ struct MilaApp: App {
                 .environmentObject(dictation)
                 .environmentObject(actions)
                 .environmentObject(session)
+                // The session's live readouts ride on their own object so a
+                // per-buffer meter tick never re-publishes `session` (#280).
+                .environmentObject(session.meters)
                 .environmentObject(hotkeySettings)
                 .environmentObject(languageSettings)
                 .environmentObject(audioInputSettings)
                 .environmentObject(inputLevelMonitor)
+                .environmentObject(inputLevelMonitor.meter)
                 .environmentObject(llmSettings)
                 .environmentObject(postRecording)
                 .environmentObject(diarizationSettings)
@@ -1061,6 +1065,7 @@ struct MilaApp: App {
                 .environmentObject(transcription)
                 .environmentObject(audioInputSettings)
                 .environmentObject(inputLevelMonitor)
+                .environmentObject(inputLevelMonitor.meter)
                 .environmentObject(actions)
                 .environmentObject(llmSettings)
                 .environmentObject(diarizationSettings)

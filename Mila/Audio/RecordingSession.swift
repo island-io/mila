@@ -12,9 +12,30 @@ private let recLog = Logger(subsystem: "io.island.whisper.IslandWhisper", catego
 final class RecordingSession: ObservableObject {
     enum State { case idle, recording, paused, stopping }
     @Published private(set) var state: State = .idle
-    @Published private(set) var elapsed: TimeInterval = 0
-    @Published private(set) var micLevel: Float = 0
-    @Published private(set) var systemLevel: Float = 0
+
+    /// The live readouts — elapsed clock and the two level meters — on their
+    /// own `ObservableObject`, deliberately NOT `@Published` here.
+    ///
+    /// They change at audio-buffer cadence: `micLevel` per mic tap buffer
+    /// (~12 Hz), `systemLevel` per ScreenCaptureKit buffer (up to ~50 Hz),
+    /// `elapsed` at 5 Hz. When they were `@Published` on this object every
+    /// one of those ticks re-published `RecordingSession` — and this object
+    /// is a `@StateObject` on `MilaApp`, so each publish re-evaluated the
+    /// App's `body` and re-diffed the whole scene: the window root view, the
+    /// sidebar outline view, even the main menu. A `sample` of a recording
+    /// put 81% of main-thread time inside that SwiftUI update, i.e. 60–75%
+    /// CPU for the recording alone, on the remote backend with nothing local
+    /// to transcribe (#280).
+    ///
+    /// Views that show the clock or a meter observe `meters` directly (it is
+    /// injected as its own environment object). The passthroughs below keep
+    /// the synchronous readers — the silence watchdog, `stopRecording`'s
+    /// duration snapshot, the tests — working unchanged; reading them does
+    /// not subscribe to anything.
+    let meters = RecordingMeters()
+    var elapsed: TimeInterval { meters.elapsed }
+    var micLevel: Float { meters.micLevel }
+    var systemLevel: Float { meters.systemLevel }
 
     let mic = MicrophoneRecorder()
     let system = SystemAudioRecorder()
@@ -203,8 +224,8 @@ final class RecordingSession: ObservableObject {
         timerTask = Task { @MainActor [weak self] in
             while let self, self.state == .recording || self.state == .paused {
                 if self.state == .recording, let start = self.startTime {
-                    self.elapsed = Self.elapsed(now: Date(), startTime: start,
-                                                totalPaused: self.totalPaused)
+                    self.meters.elapsed = Self.elapsed(now: Date(), startTime: start,
+                                                       totalPaused: self.totalPaused)
                 }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
@@ -259,8 +280,8 @@ final class RecordingSession: ObservableObject {
         // The meters are driven from `consumeMic` / `consumeSystem`, which
         // stop running now — without this they'd sit frozen at their last
         // pre-pause reading and read as "still listening".
-        micLevel = 0
-        systemLevel = 0
+        meters.micLevel = 0
+        meters.systemLevel = 0
         recLog.log("pause: source=\(self.source.rawValue, privacy: .public) elapsed=\(self.elapsed, privacy: .public)")
     }
 
@@ -336,7 +357,7 @@ final class RecordingSession: ObservableObject {
         startTime = nil
         pausedAt = nil
         totalPaused = 0
-        elapsed = 0
+        meters.elapsed = 0
         isFakeForTesting = false
         state = .idle
         return url
@@ -358,7 +379,7 @@ final class RecordingSession: ObservableObject {
         startTime = nil
         pausedAt = nil
         totalPaused = 0
-        elapsed = 0
+        meters.elapsed = 0
         isFakeForTesting = false
         pendingSystem.removeAll(keepingCapacity: false)
         state = .idle
@@ -366,7 +387,10 @@ final class RecordingSession: ObservableObject {
 
     // MARK: - Mixing
 
-    private func consumeMic(_ buffer: AVAudioPCMBuffer) async {
+    /// Internal rather than private so `RecordingSessionMetersTests` can push
+    /// buffers through the REAL mic path of a fake session and count who
+    /// publishes; nothing in the app calls it from outside this file.
+    func consumeMic(_ buffer: AVAudioPCMBuffer) async {
         // Paused: discard the buffer entirely so nothing reaches the WAV or
         // the live transcriber. The engine keeps running; we just drop its
         // output until `resume()`.
@@ -377,7 +401,7 @@ final class RecordingSession: ObservableObject {
         // cost a suspension point — one a `pause()` could land inside, which
         // would leave the meter lit at a live-looking level for the rest of
         // the pause with nothing still running to clear it.
-        micLevel = AudioMeter.level(from: buffer)
+        meters.micLevel = AudioMeter.level(from: buffer)
         if source == .microphone {
             // Mic-only: the live feed and the saved file are both just the
             // mic, so drive the live transcriber here and write directly.
@@ -405,7 +429,7 @@ final class RecordingSession: ObservableObject {
         guard state == .recording else { return }
         let samples = AudioConvert.samples(from: buffer)
         // Direct assignment for the same reason as `consumeMic` — see there.
-        systemLevel = AudioMeter.level(from: buffer)
+        meters.systemLevel = AudioMeter.level(from: buffer)
         if source == .systemAudio {
             // No mic to clock against — system audio IS the recording.
             // write() drives the live feed for `.systemAudio`.
@@ -527,4 +551,25 @@ final class RecordingSession: ObservableObject {
             onLive(samples[0..<samples.count])
         }
     }
+}
+
+/// The high-frequency readouts of a `RecordingSession`: the elapsed clock and
+/// the mic / system level meters.
+///
+/// A separate object so that the session itself only publishes on state
+/// transitions. Anything that wants the live numbers observes THIS object —
+/// and it should be a small leaf view (`RecordingElapsedLabel`,
+/// `RecordingChip`), because whatever observes it re-renders at audio-buffer
+/// cadence. Nothing at the `App` level may hold it as a `@StateObject`; see
+/// `RecordingSession.meters` for the storm that caused.
+///
+/// Only `RecordingSession` writes these (`fileprivate(set)`): the values are
+/// derived from its capture pipeline and its state machine, and letting a
+/// view or controller poke them would decouple the meter from the audio it
+/// claims to describe.
+@MainActor
+final class RecordingMeters: ObservableObject {
+    @Published fileprivate(set) var elapsed: TimeInterval = 0
+    @Published fileprivate(set) var micLevel: Float = 0
+    @Published fileprivate(set) var systemLevel: Float = 0
 }
