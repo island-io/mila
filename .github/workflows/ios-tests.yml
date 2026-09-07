@@ -84,8 +84,14 @@ jobs:
           # publish budget per App-level object (the #280 class of bug — a
           # @StateObject on MilaApp publishing per audio buffer). CI-only
           # because on a developer's machine the same run would boot their
-          # diarization runtime and fire their configured LLM.
+          # diarization runtime and fire their configured LLM. Set in both
+          # forms: xcodebuild forwards `TEST_RUNNER_`-prefixed vars into the
+          # test process with the prefix stripped, and the plain form is what
+          # the audio-loopback job relies on for the same bundle — the step
+          # after the run checks the test actually PASSED rather than skipped,
+          # so a delivery regression cannot hide behind a green job.
           MILA_APP_CHURN_E2E: "1"
+          TEST_RUNNER_MILA_APP_CHURN_E2E: "1"
         run: |
           set -o pipefail
           # `-retry-tests-on-failure -test-iterations 3`: the subprocess-spawning
@@ -120,6 +126,32 @@ jobs:
             -default-test-execution-time-allowance 240 \
             -maximum-test-execution-time-allowance 480 \
             test 2>&1 | tee build/unit-tests.log | tail -200
+
+      # The App-scene churn budget (#283) is gated on an env var, and a gated
+      # test that XCTSkips leaves the job green — which is exactly how a
+      # per-buffer @StateObject publish (#280) would ship again. Require the
+      # test to have PASSED, and surface its one-line report (per-object
+      # publish counts + main-thread CPU fraction) so the budgets can be read
+      # against a real runner without downloading the log.
+      - name: Verify the App-scene churn test ran
+        run: |
+          log=build/unit-tests.log
+          line=$(grep -E "^Test Case '-\[MilaTests\.AppSceneChurnTests test_live_recording_stays_within_the_app_scene_publish_budget\]' (passed|failed|skipped)" "$log" | tail -1 || true)
+          report=$(grep -E "^AppSceneChurn: " "$log" | tail -1 || true)
+          echo "result: ${line:-<not found>}"
+          echo "report: ${report:-<none>}"
+          {
+            echo "### App-scene churn budget (#283)"
+            echo
+            echo '```'
+            echo "${line:-test case line not found in log}"
+            echo "${report:-no AppSceneChurn: report line}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          case "$line" in
+            *"' passed"*) ;;
+            *) echo "::error::AppSceneChurnTests did not pass (skipped or missing) — is MILA_APP_CHURN_E2E reaching the test host?"; exit 1 ;;
+          esac
 
       # Issue #208: with `-retry-tests-on-failure`, a green job can sit on top
       # of a pile of failed executions — one run logged

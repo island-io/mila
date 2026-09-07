@@ -411,6 +411,13 @@ final class QuickActionsController: ObservableObject {
     /// teardown: it drains and stops the live transcriber, diarizer and Live
     /// AI session itself, so nothing is left running against a recording that
     /// no longer exists.
+    ///
+    /// Returns only once that teardown has run: `cancelAll()` merely publishes
+    /// `.idle`, and the `$state` observer then `await`s `transcribeNow()` and
+    /// the diarizer drain on the same main-actor objects. Returning earlier
+    /// would hand the next test a transcriber still mid-tick. The observer's
+    /// last act is clearing `session.onLiveSamples`, so that is what is
+    /// waited for (bounded — the observer is not installed in every host).
     func discardFakeRecordingForTesting() async {
         guard case .recording = activeJob else { return }
         silenceWatchTask?.cancel()
@@ -419,6 +426,9 @@ final class QuickActionsController: ObservableObject {
         remoteProbeTask = nil
         await session.cancelAll()
         activeJob = .none
+        for _ in 0..<200 where session.onLiveSamples != nil {   // ≤ 10 s
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
     }
 
     private func startRecording(withSystemAudio: Bool) async {

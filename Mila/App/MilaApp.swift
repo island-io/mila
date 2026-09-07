@@ -454,9 +454,18 @@ struct MilaApp: App {
         // untouched in real launches. Centralising the bypass here is
         // simpler and less error-prone than sprinkling
         // `CommandLine.arguments` checks at every gate.
+        //
+        // App-hosted unit tests (`MilaTests`, TEST_HOST = Mila.app) get the
+        // same override: `AppSceneChurnTests` drives this App's real
+        // recording pipeline, and `wireLiveAIPipeline`'s `.recording` branch
+        // gates on `isLiveAIAvailable` — on a runner that reports as an Air
+        // the pipeline would silently not wire and the test would skip. The
+        // app process of an XCUITest run does not load `XCTestCase`, so UI
+        // tests are unaffected by this clause; they keep the arg-based one.
         let uiTestForcesLiveAI =
             CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
             || CommandLine.arguments.contains(where: { $0.hasPrefix("--ui-test-inject-fixture-wav=") })
+            || NSClassFromString("XCTestCase") != nil
         let liveAICapabilities: SystemCapabilities = uiTestForcesLiveAI
             ? SystemCapabilities(
                 modelIdentifier: SystemCapabilities.live.modelIdentifier,
