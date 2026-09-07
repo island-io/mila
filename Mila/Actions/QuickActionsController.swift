@@ -400,6 +400,27 @@ final class QuickActionsController: ObservableObject {
         activeJob = .recording(withSystemAudio: false)
     }
 
+    /// Test seam, the pair of `startFakeRecordingForTesting`: end the fake
+    /// recording WITHOUT the finalize tail — no saved `Recording`, no rename
+    /// sheet, no batch transcription, summary or transcode. For tests that
+    /// only need the live pipeline to have been running (`AppSceneChurnTests`
+    /// drives the host app's real controller and must leave its store alone).
+    ///
+    /// `session.cancelAll()` takes the session straight to `.idle`, which
+    /// `wireLiveAIPipeline` already treats as the sleep / lock / quit
+    /// teardown: it drains and stops the live transcriber, diarizer and Live
+    /// AI session itself, so nothing is left running against a recording that
+    /// no longer exists.
+    func discardFakeRecordingForTesting() async {
+        guard case .recording = activeJob else { return }
+        silenceWatchTask?.cancel()
+        silenceWatchTask = nil
+        remoteProbeTask?.cancel()
+        remoteProbeTask = nil
+        await session.cancelAll()
+        activeJob = .none
+    }
+
     private func startRecording(withSystemAudio: Bool) async {
         // Controller-side counterpart to HomeView's
         // `.disabled(... transcription.isPreparingModel)`. The button

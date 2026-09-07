@@ -78,6 +78,14 @@ jobs:
             -resolvePackageDependencies
 
       - name: Run unit tests
+        env:
+          # Opts in MilaTests/AppSceneChurnTests: it drives the HOST APP's real
+          # recording controller for ~12 s of fixture audio and asserts a
+          # publish budget per App-level object (the #280 class of bug — a
+          # @StateObject on MilaApp publishing per audio buffer). CI-only
+          # because on a developer's machine the same run would boot their
+          # diarization runtime and fire their configured LLM.
+          MILA_APP_CHURN_E2E: "1"
         run: |
           set -o pipefail
           # `-retry-tests-on-failure -test-iterations 3`: the subprocess-spawning

@@ -942,9 +942,60 @@ struct MilaApp: App {
                                                       liveTranscriber: dictationTrans)
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
+
+        #if DEBUG
+        // Hand every App-level object to the churn probe by property name,
+        // so `AppSceneChurnTests` can say WHICH object re-evaluated this App
+        // body too often. `SpeakerDirectory` and `UpdaterViewModel` are built
+        // inline above and are not listed; neither publishes during a
+        // recording.
+        AppSceneChurnProbe.shared.registerAppLevelObjects(
+            session: session,
+            actions: actions,
+            [
+                .of("voiceRecognitionSettings", voiceSettings),
+                .of("speakerProfileStore", profileStoreRef),
+                .of("store", store),
+                .of("storageSettings", storage),
+                .of("modelManager", mgr),
+                .of("transcription", svc),
+                .of("diarizationSettings", diarSettings),
+                .of("remoteTranscriptionSettings", remoteSettings),
+                .of("session", session),
+                .of("actions", actions),
+                .of("hotkeySettings", hotkeys),
+                .of("languageSettings", langSettings),
+                .of("audioInputSettings", audioSettings),
+                .of("inputLevelMonitor", inputMonitor),
+                .of("llmSettings", llm),
+                .of("postRecording", coordinator),
+                .of("meetingDetectionSettings", meetingSettings),
+                .of("meetingDetector", detector),
+                .of("meetingPrompt", promptCoordinator),
+                .of("liveAISettings", liveAI),
+                .of("liveTranscriber", liveTrans),
+                .of("liveSpeakerDiarizer", liveDiar),
+                .of("liveAISession", liveSession),
+                .of("recordingSummarizer", summarizer),
+                .of("obsidianVaultSettings", obsidianSettings),
+                .of("mcpAccessSettings", mcpAccess),
+                .of("claudeSetupSettings", claudeSetup),
+                .of("obsidianExporter", obsidian),
+                .of("voiceMemosSettings", vmSettings),
+                .of("voiceMemosImporter", vmImporter),
+                .of("configImporter", configImporter),
+                .of("liveSidecarWriter", sidecarWriter),
+                .of("dictation", dictationController)
+            ])
+        #endif
     }
 
     var body: some Scene {
+        // Counts this evaluation for `AppSceneChurnTests` (DEBUG only; a
+        // no-op call in release). Every `@StateObject` above re-evaluates
+        // this body when it publishes, and each evaluation re-diffs every
+        // scene below — see `AppSceneChurnProbe` for why that is counted.
+        let _ = AppSceneChurnProbe.noteBodyEvaluation()
         WindowGroup("Mila") {
             ContentView()
                 .environmentObject(store)
