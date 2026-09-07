@@ -454,9 +454,18 @@ struct MilaApp: App {
         // untouched in real launches. Centralising the bypass here is
         // simpler and less error-prone than sprinkling
         // `CommandLine.arguments` checks at every gate.
+        //
+        // App-hosted unit tests (`MilaTests`, TEST_HOST = Mila.app) get the
+        // same override: `AppSceneChurnTests` drives this App's real
+        // recording pipeline, and `wireLiveAIPipeline`'s `.recording` branch
+        // gates on `isLiveAIAvailable` — on a runner that reports as an Air
+        // the pipeline would silently not wire and the test would skip. The
+        // app process of an XCUITest run does not load `XCTestCase`, so UI
+        // tests are unaffected by this clause; they keep the arg-based one.
         let uiTestForcesLiveAI =
             CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
             || CommandLine.arguments.contains(where: { $0.hasPrefix("--ui-test-inject-fixture-wav=") })
+            || NSClassFromString("XCTestCase") != nil
         let liveAICapabilities: SystemCapabilities = uiTestForcesLiveAI
             ? SystemCapabilities(
                 modelIdentifier: SystemCapabilities.live.modelIdentifier,
@@ -942,9 +951,60 @@ struct MilaApp: App {
                                                       liveTranscriber: dictationTrans)
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
+
+        #if DEBUG
+        // Hand every App-level object to the churn probe by property name,
+        // so `AppSceneChurnTests` can say WHICH object re-evaluated this App
+        // body too often. `SpeakerDirectory` and `UpdaterViewModel` are built
+        // inline above and are not listed; neither publishes during a
+        // recording.
+        AppSceneChurnProbe.shared.registerAppLevelObjects(
+            session: session,
+            actions: actions,
+            [
+                .of("voiceRecognitionSettings", voiceSettings),
+                .of("speakerProfileStore", profileStoreRef),
+                .of("store", store),
+                .of("storageSettings", storage),
+                .of("modelManager", mgr),
+                .of("transcription", svc),
+                .of("diarizationSettings", diarSettings),
+                .of("remoteTranscriptionSettings", remoteSettings),
+                .of("session", session),
+                .of("actions", actions),
+                .of("hotkeySettings", hotkeys),
+                .of("languageSettings", langSettings),
+                .of("audioInputSettings", audioSettings),
+                .of("inputLevelMonitor", inputMonitor),
+                .of("llmSettings", llm),
+                .of("postRecording", coordinator),
+                .of("meetingDetectionSettings", meetingSettings),
+                .of("meetingDetector", detector),
+                .of("meetingPrompt", promptCoordinator),
+                .of("liveAISettings", liveAI),
+                .of("liveTranscriber", liveTrans),
+                .of("liveSpeakerDiarizer", liveDiar),
+                .of("liveAISession", liveSession),
+                .of("recordingSummarizer", summarizer),
+                .of("obsidianVaultSettings", obsidianSettings),
+                .of("mcpAccessSettings", mcpAccess),
+                .of("claudeSetupSettings", claudeSetup),
+                .of("obsidianExporter", obsidian),
+                .of("voiceMemosSettings", vmSettings),
+                .of("voiceMemosImporter", vmImporter),
+                .of("configImporter", configImporter),
+                .of("liveSidecarWriter", sidecarWriter),
+                .of("dictation", dictationController)
+            ])
+        #endif
     }
 
     var body: some Scene {
+        // Counts this evaluation for `AppSceneChurnTests` (DEBUG only; a
+        // no-op call in release). Every `@StateObject` above re-evaluates
+        // this body when it publishes, and each evaluation re-diffs every
+        // scene below — see `AppSceneChurnProbe` for why that is counted.
+        let _ = AppSceneChurnProbe.noteBodyEvaluation()
         WindowGroup("Mila") {
             ContentView()
                 .environmentObject(store)

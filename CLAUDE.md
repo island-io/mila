@@ -69,6 +69,7 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 
 - `TranscriptionService` now requires a `diarizationSettings:` parameter. In tests, always pass `DiarizationSettings(defaults: .init(suiteName: "TestClassName.diarization")!)` to isolate from user defaults.
 - Run tests with `make test` or via Xcode. Package tests: `make package-test` (TranscriptionCore + MilaKit).
+- `AppSceneChurnTests` (CI-only, `MILA_APP_CHURN_E2E=1`) pumps 12 s of fixture audio through the HOST app's real `RecordingSession` and asserts a publish budget per App-level `@StateObject`, via `AppSceneChurnProbe` (DEBUG-only: counts `MilaApp.body` evaluations and registers every App-level object by name). It exists because the #280 class of regression — one object publishing per audio buffer, the App scene re-diffing each time — is invisible in logs and only shows up in Activity Monitor. Keep it count-based: publish counts are deterministic on a loaded runner, a CPU threshold is not (the CPU fraction is asserted only as a wide backstop). Adding a new App-level `@StateObject` needs no change here — `MilaApp.init` registers them by pattern.
 
 ## Release Process
 - **Release notes are REQUIRED, first.** Every release must add
