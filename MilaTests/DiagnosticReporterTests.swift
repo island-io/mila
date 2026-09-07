@@ -90,6 +90,97 @@ final class DiagnosticReporterTests: XCTestCase {
         XCTAssertEqual(body, "STUB_HEALTH_OUTPUT_42")
     }
 
+    // MARK: - settings.json scoping (#281)
+
+    /// The report's `settings.json` has to say which backend and which Live
+    /// AI mode the user is in without a follow-up email — a CPU report whose
+    /// remote backend had to be inferred from log lines is what #281 was.
+    /// Every Mila namespace is exported; unrelated defaults are not.
+    func test_scopedSettings_exports_every_mila_namespace_and_drops_the_rest() throws {
+        let defaults: [String: Any] = [
+            "transcription.backend": "remote",
+            "remote.endpoint": "https://asr.example.internal/v1",
+            "remote.model": "ivrit-ai/whisper-large-v3-turbo-ct2",
+            "liveAI.enabled": true,
+            "liveAI.backgroundMode": true,
+            "meetingDetection.enabled": true,
+            "voiceMemos.folderBookmark": Data([1, 2, 3]),
+            "mcp.enabled": false,
+            "updates.betaChannel": true,
+            "audioInput.adaptiveGainEnabled": true,
+            "coreml.compiled.openai-whisper-large-v3-turbo": true,
+            "speakers.voiceRecognition.enabled": false,
+            "model.declinedNames": ["ivrit-ai-whisper-large-v3"],
+            "selectedModelName": "openai-whisper-large-v3-turbo",
+            // Not Mila's — must not leak into the zip.
+            "NSNavLastRootDirectory": "~/Desktop",
+            "com.apple.trackpad.scaling": 1.5,
+            "AppleLanguages": ["en"],
+        ]
+        let scoped = DiagnosticReporter.scopedSettings(from: defaults)
+
+        XCTAssertEqual(scoped["transcription.backend"] as? String, "remote")
+        XCTAssertEqual(scoped["remote.endpoint"] as? String, "https://asr.example.internal/v1")
+        XCTAssertEqual(scoped["remote.model"] as? String, "ivrit-ai/whisper-large-v3-turbo-ct2")
+        XCTAssertEqual(scoped["liveAI.backgroundMode"] as? Bool, true)
+        XCTAssertEqual(scoped["meetingDetection.enabled"] as? Bool, true)
+        XCTAssertEqual(scoped["voiceMemos.folderBookmark"] as? String, "<3 bytes>",
+                       "security-scoped bookmarks are opaque Data — a byte count is all the report needs")
+        XCTAssertEqual(scoped["mcp.enabled"] as? Bool, false)
+        XCTAssertEqual(scoped["updates.betaChannel"] as? Bool, true)
+        XCTAssertEqual(scoped["audioInput.adaptiveGainEnabled"] as? Bool, true)
+        XCTAssertEqual(scoped["coreml.compiled.openai-whisper-large-v3-turbo"] as? Bool, true)
+        XCTAssertEqual(scoped["speakers.voiceRecognition.enabled"] as? Bool, false)
+        XCTAssertEqual(scoped["model.declinedNames"] as? [String], ["ivrit-ai-whisper-large-v3"])
+        XCTAssertEqual(scoped["selectedModelName"] as? String, "openai-whisper-large-v3-turbo")
+
+        XCTAssertNil(scoped["NSNavLastRootDirectory"])
+        XCTAssertNil(scoped["com.apple.trackpad.scaling"])
+        XCTAssertNil(scoped["AppleLanguages"])
+        XCTAssertEqual(scoped.count, 14, "exactly the Mila keys, nothing else")
+
+        // What comes out must be what `writeSettings` can serialise.
+        XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: scoped, options: [.sortedKeys]))
+    }
+
+    /// Widening the allowlist to every Mila namespace pulls in keys that
+    /// carry credentials and user-authored text. Credentials are redacted
+    /// by key name; prompts are reported as a length — people paste meeting
+    /// agendas into them; the Obsidian written-index is a count, because its
+    /// vault paths are derived from recording titles.
+    func test_scopedSettings_redacts_credentials_and_reports_prompts_as_lengths() throws {
+        let agenda = "Q3 planning: budget cuts in the Berlin office, layoffs to be discussed Thursday"
+        let defaults: [String: Any] = [
+            "remote.apiKey": "sk-live-abc123",
+            "llm.openai.apiKey": "sk-proj-xyz",
+            "claudeSetup.oauthToken": "oat-secret",
+            "liveAI.prompt": agenda,
+            "liveAI.summaryPrompt": "Summarise the meeting.",
+            "llm.action.prompt": agenda,
+            "llm.name.prompt": "",
+            "obsidian.writtenIndex": ["id-1": "Meetings/Berlin layoffs.md", "id-2": "Notes/x.md"],
+            "llm.tool": "claude",
+        ]
+        let scoped = DiagnosticReporter.scopedSettings(from: defaults)
+
+        for key in ["remote.apiKey", "llm.openai.apiKey", "claudeSetup.oauthToken"] {
+            XCTAssertEqual(scoped[key] as? String, "<redacted>", key)
+        }
+        XCTAssertEqual(scoped["liveAI.prompt"] as? String, "<\(agenda.count) chars>")
+        XCTAssertEqual(scoped["llm.action.prompt"] as? String, "<\(agenda.count) chars>")
+        XCTAssertEqual(scoped["liveAI.summaryPrompt"] as? String, "<22 chars>")
+        XCTAssertEqual(scoped["llm.name.prompt"] as? String, "<0 chars>",
+                       "an empty prompt is still worth knowing about — as a length")
+        XCTAssertEqual(scoped["obsidian.writtenIndex"] as? String, "<2 entries>")
+        XCTAssertEqual(scoped["llm.tool"] as? String, "claude", "plain settings pass through")
+
+        let json = String(decoding: try JSONSerialization.data(withJSONObject: scoped, options: [.sortedKeys]),
+                          as: UTF8.self)
+        XCTAssertFalse(json.contains("Berlin"), "prompt text and vault paths must not reach the zip")
+        XCTAssertFalse(json.contains("sk-live"), "credentials must not reach the zip")
+        XCTAssertFalse(json.contains("oat-secret"))
+    }
+
     // MARK: - Test helpers
 
     /// Extract `zip` into a fresh temp directory and return its URL.
