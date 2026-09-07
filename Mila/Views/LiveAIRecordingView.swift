@@ -12,12 +12,14 @@ import TranscriptionCore
 /// vs. transcript volumes can drag the divider to fit their preference.
 struct LiveAIRecordingView: View {
     @EnvironmentObject private var actions: QuickActionsController
-    // NOTE: `session` is deliberately NOT observed here. RecordingSession
-    // is a fat ObservableObject that also @Publishes micLevel/systemLevel
-    // at ~50 Hz; holding it here re-evaluated this whole body (including
-    // the growing transcript ForEach) on every mic-level tick. The
-    // elapsed clock now lives in the `RecordingElapsedLabel` leaf so only
-    // that tiny Text re-renders at audio cadence — not the transcript.
+    // NOTE: neither `session` nor `RecordingMeters` is observed here. The
+    // meters publish elapsed / micLevel / systemLevel at audio-buffer
+    // cadence; holding them here re-evaluated this whole body (including
+    // the growing transcript ForEach) on every tick. The elapsed clock
+    // lives in the `RecordingElapsedLabel` leaf so only that tiny Text
+    // re-renders at audio cadence — not the transcript. (The same storm at
+    // the App level — `RecordingSession` is a `@StateObject` on `MilaApp` —
+    // is why the readouts moved onto `RecordingMeters` at all; see #280.)
     @EnvironmentObject private var transcriber: LiveTranscriber
     @EnvironmentObject private var diarizer: LiveSpeakerDiarizer
     @EnvironmentObject private var aiSession: LiveAISession
@@ -727,17 +729,19 @@ private struct ActionItemRow: View {
     }
 }
 
-/// Leaf that owns the only dependency on `RecordingSession`, so the
-/// session's high-frequency @Published updates (elapsed at 5 Hz,
-/// micLevel/systemLevel at ~50 Hz) re-render ONLY this small Text rather
-/// than the whole `LiveAIRecordingView` body (which holds the growing
-/// transcript). The mm:ss display rounds to whole seconds, so the extra
-/// audio-cadence updates here are cheap and invisible.
+/// Leaf that owns the only dependency on `RecordingMeters`, so the meters'
+/// high-frequency @Published updates (elapsed at 5 Hz, micLevel/systemLevel
+/// at up to ~50 Hz) re-render ONLY this small Text rather than the whole
+/// `LiveAIRecordingView` body (which holds the growing transcript). The
+/// mm:ss display rounds to whole seconds, so the extra audio-cadence updates
+/// here are cheap and invisible. `session` is still observed for the paused
+/// state, which changes only on user action.
 private struct RecordingElapsedLabel: View {
     @EnvironmentObject private var session: RecordingSession
+    @EnvironmentObject private var meters: RecordingMeters
 
     var body: some View {
-        let t = Int(session.elapsed.rounded())
+        let t = Int(meters.elapsed.rounded())
         let clock = String(format: "%02d:%02d", t / 60, t % 60)
         // Show "Paused" alongside the (frozen) clock so the user gets clear
         // feedback that capture is suspended. This leaf already observes the

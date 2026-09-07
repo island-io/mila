@@ -323,6 +323,18 @@ private struct SettingsWindowTitle: NSViewRepresentable {
 
 // MARK: - Audio
 
+/// Leaf that owns the only dependency on `InputLevelMeter`, so the ~47 Hz
+/// level ticks re-render this bar alone rather than the whole Audio tab.
+private struct LiveInputLevelMeter: View {
+    @EnvironmentObject private var inputLevel: InputLevelMeter
+    let isLive: Bool
+
+    var body: some View {
+        LevelMeterView(level: inputLevel.level, isLive: isLive)
+            .frame(maxWidth: 360)
+    }
+}
+
 private struct AudioSettingsTab: View {
     @EnvironmentObject private var settings: AudioInputSettings
     @EnvironmentObject private var monitor: InputLevelMonitor
@@ -393,9 +405,9 @@ private struct AudioSettingsTab: View {
                         // have no input device.
                         .accessibilityIdentifier("audio.meter.status")
                 }
-                LevelMeterView(level: monitor.level,
-                               isLive: monitor.isRunning && !actions.isRecording)
-                    .frame(maxWidth: 360)
+                // The ~47 Hz level is observed by the leaf below, not by
+                // this tab — see `InputLevelMonitor.meter`.
+                LiveInputLevelMeter(isLive: monitor.isRunning && !actions.isRecording)
             }
 
             Divider().padding(.vertical, 4)

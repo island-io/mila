@@ -485,6 +485,10 @@ private struct LanguagePickerToolbarItem: View {
 private struct RecordingChip: View {
     @EnvironmentObject private var actions: QuickActionsController
     @EnvironmentObject private var session: RecordingSession
+    /// The clock comes from `meters`, not `session`: the session publishes
+    /// only on state transitions now, and this chip is a leaf, so it is the
+    /// right place to absorb the 5 Hz elapsed ticks.
+    @EnvironmentObject private var meters: RecordingMeters
 
     var body: some View {
         // One read of the paused state for the whole chip — the dot, the
@@ -495,7 +499,7 @@ private struct RecordingChip: View {
             Circle()
                 .fill(paused ? Color.orange : Color.red)
                 .frame(width: 8, height: 8)
-            Text(formatDuration(session.elapsed))
+            Text(formatDuration(meters.elapsed))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(paused ? .orange : .primary)
             // `RecordingPauseButton` applies its own `.buttonStyle(.plain)`

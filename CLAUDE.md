@@ -27,6 +27,8 @@ New app-wide settings (like `DiarizationSettings`) must be:
 2. Injected via `.environmentObject()` on both the main window and the Settings scene
 3. Accepted in tests via a custom `UserDefaults` suite (not `.standard`) to avoid polluting state
 
+**An App-level `@StateObject` must not carry a high-frequency `@Published`.** A `@StateObject` subscribes its owner to `objectWillChange`, and the owner here is `MilaApp` — so every publish re-evaluates the App `body` and re-diffs every scene (window root view, sidebar outline view, `.commands` → main menu), ~10–20 ms each, whatever the body reads. `RecordingSession`'s per-audio-buffer `micLevel`/`systemLevel` and 5 Hz `elapsed` did exactly that and pinned the main thread at 60–75% for whole recordings (#280). Anything that changes at audio or timer cadence goes on its own small `ObservableObject` (`RecordingMeters`, `InputLevelMeter`) that is injected separately and observed only by the leaf view that displays it; the parent keeps read-only passthroughs for one-shot readers. `RecordingSessionMetersTests` counts `objectWillChange` on both objects to pin the split — a round-trip test cannot, because the values read the same whichever object publishes them.
+
 ### Python Subprocess Integration
 When calling Python ML pipelines from Swift via `Process`:
 - Use inline Python scripts via `-c` argument (not bundled .py files) for the main pipeline -- this avoids path-resolution issues with app bundles

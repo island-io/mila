@@ -18,7 +18,15 @@ import Combine
 ///     `restart()`; switching the device on a running engine is fragile.
 @MainActor
 final class InputLevelMonitor: ObservableObject {
-    @Published private(set) var level: Float = 0
+    /// The level itself lives on its own `ObservableObject` — see
+    /// `RecordingMeters` for the reasoning. This monitor is a `@StateObject`
+    /// on `MilaApp`, and the tap publishes ~47 times a second while the
+    /// Settings → Audio meter is open; as a `@Published` property here each
+    /// tick re-evaluated the App `body` and re-diffed every scene. The
+    /// `LevelMeterView` observes `meter`; the passthrough is for one-shot
+    /// reads and does not subscribe.
+    let meter = InputLevelMeter()
+    var level: Float { meter.level }
     @Published private(set) var isRunning = false
 
     /// kAudioDevicePropertyDeviceUID of the input we should monitor, or nil to
@@ -52,7 +60,7 @@ final class InputLevelMonitor: ObservableObject {
                 // its teardown lands — its queued updates must not repaint
                 // the meter after stop() zeroed it.
                 guard let self, self.generation == myGeneration else { return }
-                self.level = lvl
+                self.meter.level = lvl
             }
         }
         let built: AVAudioEngine? = await Task.detached(priority: .utility) {
@@ -76,7 +84,7 @@ final class InputLevelMonitor: ObservableObject {
             }
         }.value
         guard let built else {
-            if generation == myGeneration { self.level = 0 }
+            if generation == myGeneration { self.meter.level = 0 }
             return
         }
         guard generation == myGeneration, engine == nil else {
@@ -95,7 +103,7 @@ final class InputLevelMonitor: ObservableObject {
         let toTeardown = engine
         engine = nil
         isRunning = false
-        level = 0
+        meter.level = 0
         guard let toTeardown else { return }
         await Self.teardown(toTeardown)
     }
@@ -114,4 +122,12 @@ final class InputLevelMonitor: ObservableObject {
         await stop()
         await start()
     }
+}
+
+/// The 0…1 input level published by `InputLevelMonitor`, on its own object so
+/// only the meter view re-renders per tap buffer. Written by the monitor
+/// alone (`fileprivate(set)`).
+@MainActor
+final class InputLevelMeter: ObservableObject {
+    @Published fileprivate(set) var level: Float = 0
 }
