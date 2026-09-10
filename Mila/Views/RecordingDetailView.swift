@@ -16,6 +16,20 @@ struct RecordingDetailView: View {
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
     @State private var timeObserver: Any?
+    /// Persisted so a chosen speed carries across recordings and app launches
+    /// (the menu in `playbackBar`). Stored as a plain `Double`; the menu reads
+    /// it back through `PlaybackSpeed.nearest(to:)`, which snaps anything that
+    /// isn't a supported rate.
+    @AppStorage("detail.playback.speed") private var playbackSpeed: Double = 1.0
+    /// Whether the transcript auto-scrolls to keep the highlighted segment in
+    /// view. Deliberately NOT persisted: ContentView applies `.id(rec.id)`, so
+    /// every recording opens following, and a manual scroll only disengages it
+    /// for that visit.
+    @State private var isFollowing = true
+    /// Reference type on purpose. The scroll probe and the active-row preference
+    /// both write here on every scrolled frame; holding this in `@State` would
+    /// re-lay out the whole transcript each time.
+    @State private var follow = FollowCoordinator()
     @State private var isEditingTitle = false
     @State private var titleDraft = ""
     /// Set when the user picks a merge target in the speaker popover; drives
@@ -73,6 +87,16 @@ struct RecordingDetailView: View {
         // need a separate onChange handler to reconfigure the player.
         .onAppear { configurePlayer() }
         .onDisappear { teardownPlayer() }
+        .onChange(of: playbackSpeed) { _, newValue in
+            let rate = Float(PlaybackSpeed.nearest(to: newValue).rawValue)
+            player?.defaultRate = rate
+            // Only touch `rate` while playback is actually running: assigning a
+            // non-zero rate to a paused player STARTS it, so without this guard
+            // picking a speed from the menu would begin playing on its own.
+            if player?.timeControlStatus == .playing {
+                player?.rate = rate
+            }
+        }
     }
 
     private var header: some View {
@@ -343,84 +367,135 @@ struct RecordingDetailView: View {
                 }
                 .padding(.horizontal)
                 .padding(.top, 8)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 4) {
-                        // Show the speaker column whenever ANY segment has a
-                        // speaker label — that's how the user knows
-                        // diarization actually ran for this recording.
-                        // Dictation segments have nil speakers, so they
-                        // naturally hide the column; a meeting where
-                        // pyannote found only 1 speaker still shows
-                        // "Speaker A" so the user gets feedback that the
-                        // detection ran (vs. silently failing to detect).
-                        let hasSpeakers = recording.segments.contains { $0.speaker != nil }
-                        // Only color speaker labels once there's more than
-                        // one distinct speaker to tell apart — a single-
-                        // speaker recording keeps the plain tint color.
-                        let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
-                        // Distinct raw ids in transcript order — the targets
-                        // offered for "move this line" and "merge into".
-                        // Hoisted out of the row so it is computed once, not
-                        // once per segment.
-                        let distinctSpeakers = distinctSpeakerIDs
-                        let lineCounts = lineCountsBySpeaker
-                        ForEach(recording.segments) { seg in
-                            SegmentRow(segment: seg,
-                                       isActive: currentTime >= seg.start && currentTime < seg.end,
-                                       showSpeaker: hasSpeakers,
-                                       useSpeakerColor: hasMultipleSpeakers,
-                                       language: recording.language,
-                                       speakerNames: recording.speakerNames,
-                                       allSpeakers: distinctSpeakers,
-                                       onTap: { seek(to: seg.start) },
-                                       onAssignName: { raw, name in
-                                           store.setSpeakerName(name, forSpeaker: raw,
-                                                                recordingID: recording.id)
-                                       },
-                                       // Only when the speaker has another
-                                       // line to keep — see `lineCountsBySpeaker`.
-                                       onSplit: (seg.speaker.map { lineCounts[$0] ?? 0 } ?? 0) > 1
-                                           ? {
-                                               store.splitSegmentSpeaker(segmentID: seg.id,
-                                                                         recordingID: recording.id)
-                                           }
-                                           : nil,
-                                       onMoveLine: { target in
-                                           store.reassignSegmentSpeaker(segmentID: seg.id,
-                                                                        toSpeaker: target,
-                                                                        recordingID: recording.id)
-                                       },
-                                       onRequestMerge: { source, target in
-                                           pendingMerge = PendingSpeakerMerge(
-                                               source: source,
-                                               target: target,
-                                               sourceName: source.displaySpeakerName(
-                                                   names: recording.speakerNames,
-                                                   language: recording.language),
-                                               targetName: target.displaySpeakerName(
-                                                   names: recording.speakerNames,
-                                                   language: recording.language))
-                                       })
+                ScrollViewReader { proxy in
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 4) {
+                            // Show the speaker column whenever ANY segment has a
+                            // speaker label — that's how the user knows
+                            // diarization actually ran for this recording.
+                            // Dictation segments have nil speakers, so they
+                            // naturally hide the column; a meeting where
+                            // pyannote found only 1 speaker still shows
+                            // "Speaker A" so the user gets feedback that the
+                            // detection ran (vs. silently failing to detect).
+                            let hasSpeakers = recording.segments.contains { $0.speaker != nil }
+                            // Only color speaker labels once there's more than
+                            // one distinct speaker to tell apart — a single-
+                            // speaker recording keeps the plain tint color.
+                            let hasMultipleSpeakers = recording.segments.hasMultipleSpeakers
+                            // Distinct raw ids in transcript order — the targets
+                            // offered for "move this line" and "merge into".
+                            // Hoisted out of the row so it is computed once, not
+                            // once per segment.
+                            let distinctSpeakers = distinctSpeakerIDs
+                            let lineCounts = lineCountsBySpeaker
+                            // One active id per render drives BOTH the highlight and
+                            // the scroll target, so they can never disagree.
+                            let activeID = activeSegmentID
+                            ForEach(recording.segments) { seg in
+                                SegmentRow(segment: seg,
+                                           isActive: seg.id == activeID,
+                                           showSpeaker: hasSpeakers,
+                                           useSpeakerColor: hasMultipleSpeakers,
+                                           language: recording.language,
+                                           speakerNames: recording.speakerNames,
+                                           allSpeakers: distinctSpeakers,
+                                           onTap: {
+                                               // Tapping a line is an explicit "go
+                                               // here", so it re-engages following.
+                                               isFollowing = true
+                                               seek(to: seg.start)
+                                           },
+                                           onAssignName: { raw, name in
+                                               store.setSpeakerName(name, forSpeaker: raw,
+                                                                    recordingID: recording.id)
+                                           },
+                                           // Only when the speaker has another
+                                           // line to keep — see `lineCountsBySpeaker`.
+                                           onSplit: (seg.speaker.map { lineCounts[$0] ?? 0 } ?? 0) > 1
+                                               ? {
+                                                   store.splitSegmentSpeaker(segmentID: seg.id,
+                                                                             recordingID: recording.id)
+                                               }
+                                               : nil,
+                                           onMoveLine: { target in
+                                               store.reassignSegmentSpeaker(segmentID: seg.id,
+                                                                            toSpeaker: target,
+                                                                            recordingID: recording.id)
+                                           },
+                                           onRequestMerge: { source, target in
+                                               pendingMerge = PendingSpeakerMerge(
+                                                   source: source,
+                                                   target: target,
+                                                   sourceName: source.displaySpeakerName(
+                                                       names: recording.speakerNames,
+                                                       language: recording.language),
+                                                   targetName: target.displaySpeakerName(
+                                                       names: recording.speakerNames,
+                                                       language: recording.language))
+                                           })
+                                .background {
+                                    // Only the ACTIVE row publishes its frame: one
+                                    // GeometryReader for the whole transcript rather
+                                    // than one per segment. Used to decide whether a
+                                    // manual scroll ended with the highlight back on
+                                    // screen. A row the LazyVStack has unloaded
+                                    // publishes nothing -- correctly "not visible".
+                                    if seg.id == activeID {
+                                        GeometryReader { geo in
+                                            Color.clear.preference(
+                                                key: ActiveRowFrameKey.self,
+                                                value: geo.frame(in: .named(Self.transcriptSpace)))
+                                        }
+                                    }
+                                }
+                            }
                         }
+                        .padding()
+                        .background {
+                            // Must live INSIDE the ScrollView: the probe locates its
+                            // NSScrollView via `enclosingScrollView`, which only
+                            // resolves from a descendant of the clip view.
+                            ScrollActivityProbe(onUserScroll: userDidScroll,
+                                                onScrollEnded: userScrollEnded,
+                                                follow: follow)
+                                .frame(width: 0, height: 0)
+                                .allowsHitTesting(false)
+                        }
+                        // RTL from the actual transcript text, not just the
+                        // language field: a recording made on "auto"/English
+                        // while the speaker talked Hebrew still has `language`
+                        // != "he", which left Hebrew transcripts LEFT-aligned.
+                        // SegmentRow uses `.leading`, so layoutDirection mirrors
+                        // it to the right exactly once.
+                        .environment(\.layoutDirection,
+                                     (recording.language == "he" || recording.fullText.isPredominantlyHebrew)
+                                     ? .rightToLeft : .leftToRight)
                     }
-                    .padding()
-                    // RTL from the actual transcript text, not just the
-                    // language field: a recording made on "auto"/English
-                    // while the speaker talked Hebrew still has `language`
-                    // != "he", which left Hebrew transcripts LEFT-aligned.
-                    // SegmentRow uses `.leading`, so layoutDirection mirrors
-                    // it to the right exactly once.
-                    .environment(\.layoutDirection,
-                                 (recording.language == "he" || recording.fullText.isPredominantlyHebrew)
-                                 ? .rightToLeft : .leftToRight)
-                }
-                .contextMenu {
-                    let other = RecordingLanguage.fromCode(recording.language).other
-                    Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
-                        retranscribe(in: other)
+                    .contextMenu {
+                        let other = RecordingLanguage.fromCode(recording.language).other
+                        Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
+                            retranscribe(in: other)
+                        }
+                        Button("Copy transcript") { copyTranscript() }
+                            .disabled(recording.fullText.isEmpty)
                     }
-                    Button("Copy transcript") { copyTranscript() }
-                        .disabled(recording.fullText.isEmpty)
+                    .coordinateSpace(name: Self.transcriptSpace)
+                    .onPreferenceChange(ActiveRowFrameKey.self) { rect in
+                        // Written to the coordinator, not @State: this fires on
+                        // every scrolled frame and a @State write would re-lay out
+                        // the transcript each time.
+                        follow.activeRowFrame = rect
+                    }
+                    // Keyed on the segment ID, NOT on currentTime: the periodic
+                    // time observer ticks 30x/sec, so keying on time would start
+                    // 30 scroll animations a second.
+                    .onChange(of: activeSegmentID) { _, id in
+                        guard isFollowing, let id else { return }
+                        scrollToActive(proxy, id: id)
+                    }
+                    .overlay(alignment: .bottom) { followPill(proxy) }
+                    .animation(.easeOut(duration: 0.2), value: isFollowing)
                 }
             }
             // Presented HERE, not inside the speaker popover: the tap that
@@ -465,8 +540,99 @@ struct RecordingDetailView: View {
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                     .frame(width: 60, alignment: .trailing)
+                speedMenu
             }
             .padding()
+        }
+    }
+
+    /// Playback speed picker. Borderless menu labelled with the current rate,
+    /// matching `LanguagePickerToolbarItem` in ContentView.
+    private var speedMenu: some View {
+        Menu {
+            Picker("Playback speed", selection: $playbackSpeed) {
+                ForEach(PlaybackSpeed.allCases) { speed in
+                    Text(speed.label).tag(speed.rawValue)
+                }
+            }
+            .pickerStyle(.inline)
+            .labelsHidden()
+        } label: {
+            // Fixed width so switching between "1×" and "1.25×" doesn't resize
+            // the seek slider next to it.
+            Text(PlaybackSpeed.nearest(to: playbackSpeed).label)
+                .monospacedDigit()
+                .frame(width: 46, alignment: .trailing)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Playback speed")
+        .accessibilityIdentifier("detail.playback.speed")
+    }
+
+    /// Active line sits 35% down the viewport — close enough to centre to feel
+    /// stable, high enough that most of the screen shows what's coming next.
+    private static let followAnchor = UnitPoint(x: 0.5, y: 0.35)
+    private static let transcriptSpace = "detail.transcript.scroll"
+
+    /// The segment covering `time`, as a pure function so TranscriptFollowTests
+    /// can pin the boundary and silence-gap cases without building the view.
+    /// Intervals are half-open — `start` inclusive, `end` exclusive — so a pause
+    /// between segments correctly yields nil.
+    static func activeSegmentID(segments: [TranscriptSegment],
+                                at time: Double) -> TranscriptSegment.ID? {
+        segments.first { time >= $0.start && time < $0.end }?.id
+    }
+
+    private var activeSegmentID: TranscriptSegment.ID? {
+        Self.activeSegmentID(segments: recording.segments, at: currentTime)
+    }
+
+    private func scrollToActive(_ proxy: ScrollViewProxy, id: TranscriptSegment.ID) {
+        follow.suppress()
+        withAnimation(.easeOut(duration: 0.25)) {
+            proxy.scrollTo(id, anchor: Self.followAnchor)
+        }
+    }
+
+    private func userDidScroll() {
+        guard !follow.isSuppressed, isFollowing else { return }
+        isFollowing = false
+    }
+
+    private func userScrollEnded() {
+        guard !follow.isSuppressed, !isFollowing else { return }
+        // A small nudge that left the highlight on screen resumes following;
+        // scrolling properly away leaves the pill up. No scroll is issued here —
+        // letting the next segment change re-centre is gentler than yanking the
+        // view the instant the user lets go.
+        if follow.activeRowIsVisible { isFollowing = true }
+    }
+
+    /// Floating "Follow playback" affordance, shown only while following is off
+    /// AND playback has actually moved. Without the `currentTime` gate, scrolling
+    /// a transcript you never played would pop a button with nothing to follow.
+    @ViewBuilder
+    private func followPill(_ proxy: ScrollViewProxy) -> some View {
+        if !isFollowing, currentTime > 0 {
+            Button {
+                isFollowing = true
+                if let id = activeSegmentID { scrollToActive(proxy, id: id) }
+            } label: {
+                Label("Follow playback", systemImage: "arrow.down.circle.fill")
+                    .font(.callout)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.regularMaterial, in: Capsule())
+                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08),
+                                                    lineWidth: 1))
+                    .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            }
+            .buttonStyle(.plain)
+            .padding(.bottom, 16)
+            .help("Resume following playback in the transcript")
+            .accessibilityIdentifier("detail.transcript.followPlayback")
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 
@@ -474,7 +640,14 @@ struct RecordingDetailView: View {
         teardownPlayer()
         let url = store.audioURL(for: recording)
         let item = AVPlayerItem(url: url)
+        // `.timeDomain` is Apple's recommended algorithm for voice — it keeps
+        // pitch natural at 0.5×/2× and costs less than AVPlayer's `.spectral`
+        // default, which smears speech at the higher rates.
+        item.audioTimePitchAlgorithm = .timeDomain
         let p = AVPlayer(playerItem: item)
+        // `defaultRate` (macOS 13+) is what a bare `play()` resumes at, so
+        // PlayPauseButton needs no knowledge of the speed setting.
+        p.defaultRate = Float(PlaybackSpeed.nearest(to: playbackSpeed).rawValue)
         timeObserver = p.addPeriodicTimeObserver(forInterval: CMTime(value: 1, timescale: 30),
                                                   queue: .main) { time in
             currentTime = time.seconds.isFinite ? time.seconds : 0
@@ -724,5 +897,190 @@ private struct SegmentRow: View {
                     in: RoundedRectangle(cornerRadius: 6))
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
+    }
+}
+
+/// Mutable scroll-following state that must NOT drive view updates.
+///
+/// The scroll probe and the active-row preference write here on every scrolled
+/// frame; routing that through `@State` would re-lay out the whole transcript
+/// each time. All access is on the main thread, hence `@unchecked Sendable`.
+private final class FollowCoordinator: @unchecked Sendable {
+    /// Frame of the highlighted row in the ScrollView's own coordinate space,
+    /// or nil when no segment is active or the LazyVStack has unloaded it.
+    var activeRowFrame: CGRect?
+    var viewportHeight: CGFloat = 0
+
+    private var suppressUntil = Date.distantPast
+
+    /// True while a scroll WE started may still be moving the clip view, so its
+    /// bounds changes aren't mistaken for the user scrolling.
+    var isSuppressed: Bool { Date() < suppressUntil }
+
+    /// Slightly longer than the 0.25s scroll animation.
+    func suppress(for interval: TimeInterval = 0.45) {
+        suppressUntil = Date().addingTimeInterval(interval)
+    }
+
+    /// Frames are relative to the viewport, so a row scrolled off the top has a
+    /// negative maxY and one below the fold has minY past the viewport height.
+    var activeRowIsVisible: Bool {
+        guard let frame = activeRowFrame, viewportHeight > 0 else { return false }
+        return frame.maxY > 0 && frame.minY < viewportHeight
+    }
+}
+
+/// Carries the highlighted row's frame out of the transcript. Only the active
+/// row ever publishes a value, so `reduce` just keeps the non-nil one.
+private struct ActiveRowFrameKey: PreferenceKey {
+    static let defaultValue: CGRect? = nil
+    static func reduce(value: inout CGRect?, nextValue: () -> CGRect?) {
+        value = nextValue() ?? value
+    }
+}
+
+/// Whether a raw clip-bounds change should be reported as a complete manual
+/// scroll gesture.
+///
+/// The live-scroll notifications are the real signal and they bracket a gesture
+/// properly: `didLiveScroll` while it moves, `didEndLiveScroll` once, at the end.
+/// This fallback exists only for the paths that post NEITHER — Page Up/Down and
+/// the arrow keys — and it reports a start AND an end together, because those
+/// paths move the view in one jump.
+///
+/// That is exactly why it has to stay silent during a live scroll. Firing it
+/// mid-flick calls `onScrollEnded` while the user is still scrolling, which
+/// re-engages following the moment any part of the highlighted row is on screen;
+/// the programmatic scroll that the next segment change then issues fights the
+/// gesture, and its 0.45s suppression window swallows the user's continuing
+/// scroll on top of that.
+enum ScrollGesturePolicy {
+    /// - Parameters:
+    ///   - isLiveScrolling: whether the scroll view is between
+    ///     `willStart`/`didLiveScroll` and `didEndLiveScroll`.
+    ///   - event: `NSApp.currentEvent?.type`, used to tell a user-driven bounds
+    ///     change from a layout-driven one (window resize, the LazyVStack
+    ///     loading more rows).
+    ///
+    /// `.scrollWheel` is deliberately absent from the accepted types: a wheel or
+    /// trackpad scroll that moves the clip view always goes through the
+    /// live-scroll path, so accepting it here only re-opens the window this
+    /// guard exists to close — including for the trailing bounds change that
+    /// lands just after `didEndLiveScroll`.
+    static func shouldSynthesizeGesture(isLiveScrolling: Bool,
+                                        event: NSEvent.EventType?) -> Bool {
+        guard !isLiveScrolling, let event else { return false }
+        switch event {
+        case .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+             .otherMouseDragged, .keyDown:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
+/// Detects user-driven scrolling in the enclosing `NSScrollView`.
+///
+/// macOS 14 is the deployment target, so `onScrollGeometryChange` (macOS 15+)
+/// is unavailable, and SwiftUI on 14 gives no way to tell our own animated
+/// `scrollTo` from a trackpad flick. AppKit does: live-scroll notifications are
+/// posted only for user gestures, never for programmatic scrolls.
+private struct ScrollActivityProbe: NSViewRepresentable {
+    let onUserScroll: () -> Void
+    let onScrollEnded: () -> Void
+    let follow: FollowCoordinator
+
+    func makeNSView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.configure(onUserScroll: onUserScroll, onScrollEnded: onScrollEnded, follow: follow)
+        return view
+    }
+
+    func updateNSView(_ nsView: ProbeView, context: Context) {
+        nsView.configure(onUserScroll: onUserScroll, onScrollEnded: onScrollEnded, follow: follow)
+    }
+
+    final class ProbeView: NSView {
+        private var onUserScroll: (() -> Void)?
+        private var onScrollEnded: (() -> Void)?
+        private var follow: FollowCoordinator?
+        private var observers: [NSObjectProtocol] = []
+        private var lastOriginY: CGFloat = .nan
+        /// True between the start and end of a user's live scroll, so the
+        /// bounds fallback can stay out of the way while one is running.
+        private var isLiveScrolling = false
+
+        func configure(onUserScroll: @escaping () -> Void,
+                       onScrollEnded: @escaping () -> Void,
+                       follow: FollowCoordinator) {
+            self.onUserScroll = onUserScroll
+            self.onScrollEnded = onScrollEnded
+            self.follow = follow
+        }
+
+        /// Zero-sized and transparent to clicks — it must never intercept a tap
+        /// meant for a transcript row.
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            attach()
+        }
+
+        deinit {
+            observers.forEach { NotificationCenter.default.removeObserver($0) }
+        }
+
+        private func attach() {
+            guard observers.isEmpty else { return }
+            guard let scrollView = enclosingScrollView else {
+                // The NSScrollView isn't in the hierarchy on the first pass;
+                // retry once SwiftUI has finished mounting.
+                if window != nil {
+                    DispatchQueue.main.async { [weak self] in self?.attach() }
+                }
+                return
+            }
+            let center = NotificationCenter.default
+            let clip = scrollView.contentView
+            clip.postsBoundsChangedNotifications = true
+            follow?.viewportHeight = clip.bounds.height
+            lastOriginY = clip.bounds.origin.y
+
+            observers.append(center.addObserver(forName: NSScrollView.willStartLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                self?.isLiveScrolling = true
+            })
+            observers.append(center.addObserver(forName: NSScrollView.didLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                // Momentum phases can post this without a preceding
+                // willStart, so set the flag here too rather than assuming
+                // the pair always arrives in order.
+                self?.isLiveScrolling = true
+                self?.onUserScroll?()
+            })
+            observers.append(center.addObserver(forName: NSScrollView.didEndLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                self?.isLiveScrolling = false
+                self?.onScrollEnded?()
+            })
+            observers.append(center.addObserver(forName: NSView.boundsDidChangeNotification,
+                                                object: clip, queue: .main) { [weak self] _ in
+                self?.boundsChanged(clip)
+            })
+        }
+
+        private func boundsChanged(_ clip: NSClipView) {
+            follow?.viewportHeight = clip.bounds.height
+            let originY = clip.bounds.origin.y
+            defer { lastOriginY = originY }
+            guard abs(originY - lastOriginY) > 0.5 else { return }
+            guard ScrollGesturePolicy.shouldSynthesizeGesture(
+                    isLiveScrolling: isLiveScrolling,
+                    event: NSApp?.currentEvent?.type) else { return }
+            onUserScroll?()
+            onScrollEnded?()
+        }
     }
 }
