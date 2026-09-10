@@ -939,6 +939,47 @@ private struct ActiveRowFrameKey: PreferenceKey {
     }
 }
 
+/// Whether a raw clip-bounds change should be reported as a complete manual
+/// scroll gesture.
+///
+/// The live-scroll notifications are the real signal and they bracket a gesture
+/// properly: `didLiveScroll` while it moves, `didEndLiveScroll` once, at the end.
+/// This fallback exists only for the paths that post NEITHER — Page Up/Down and
+/// the arrow keys — and it reports a start AND an end together, because those
+/// paths move the view in one jump.
+///
+/// That is exactly why it has to stay silent during a live scroll. Firing it
+/// mid-flick calls `onScrollEnded` while the user is still scrolling, which
+/// re-engages following the moment any part of the highlighted row is on screen;
+/// the programmatic scroll that the next segment change then issues fights the
+/// gesture, and its 0.45s suppression window swallows the user's continuing
+/// scroll on top of that.
+enum ScrollGesturePolicy {
+    /// - Parameters:
+    ///   - isLiveScrolling: whether the scroll view is between
+    ///     `willStart`/`didLiveScroll` and `didEndLiveScroll`.
+    ///   - event: `NSApp.currentEvent?.type`, used to tell a user-driven bounds
+    ///     change from a layout-driven one (window resize, the LazyVStack
+    ///     loading more rows).
+    ///
+    /// `.scrollWheel` is deliberately absent from the accepted types: a wheel or
+    /// trackpad scroll that moves the clip view always goes through the
+    /// live-scroll path, so accepting it here only re-opens the window this
+    /// guard exists to close — including for the trailing bounds change that
+    /// lands just after `didEndLiveScroll`.
+    static func shouldSynthesizeGesture(isLiveScrolling: Bool,
+                                        event: NSEvent.EventType?) -> Bool {
+        guard !isLiveScrolling, let event else { return false }
+        switch event {
+        case .leftMouseDown, .leftMouseDragged, .leftMouseUp,
+             .otherMouseDragged, .keyDown:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 /// Detects user-driven scrolling in the enclosing `NSScrollView`.
 ///
 /// macOS 14 is the deployment target, so `onScrollGeometryChange` (macOS 15+)
@@ -966,6 +1007,9 @@ private struct ScrollActivityProbe: NSViewRepresentable {
         private var follow: FollowCoordinator?
         private var observers: [NSObjectProtocol] = []
         private var lastOriginY: CGFloat = .nan
+        /// True between the start and end of a user's live scroll, so the
+        /// bounds fallback can stay out of the way while one is running.
+        private var isLiveScrolling = false
 
         func configure(onUserScroll: @escaping () -> Void,
                        onScrollEnded: @escaping () -> Void,
@@ -1004,12 +1048,21 @@ private struct ScrollActivityProbe: NSViewRepresentable {
             follow?.viewportHeight = clip.bounds.height
             lastOriginY = clip.bounds.origin.y
 
+            observers.append(center.addObserver(forName: NSScrollView.willStartLiveScrollNotification,
+                                                object: scrollView, queue: .main) { [weak self] _ in
+                self?.isLiveScrolling = true
+            })
             observers.append(center.addObserver(forName: NSScrollView.didLiveScrollNotification,
                                                 object: scrollView, queue: .main) { [weak self] _ in
+                // Momentum phases can post this without a preceding
+                // willStart, so set the flag here too rather than assuming
+                // the pair always arrives in order.
+                self?.isLiveScrolling = true
                 self?.onUserScroll?()
             })
             observers.append(center.addObserver(forName: NSScrollView.didEndLiveScrollNotification,
                                                 object: scrollView, queue: .main) { [weak self] _ in
+                self?.isLiveScrolling = false
                 self?.onScrollEnded?()
             })
             observers.append(center.addObserver(forName: NSView.boundsDidChangeNotification,
@@ -1023,24 +1076,11 @@ private struct ScrollActivityProbe: NSViewRepresentable {
             let originY = clip.bounds.origin.y
             defer { lastOriginY = originY }
             guard abs(originY - lastOriginY) > 0.5 else { return }
-            // Fallback for the paths that post no live-scroll notification —
-            // scroller drags, Page Up/Down. Gated on a user input event being in
-            // flight so layout-driven bounds changes (window resize, the
-            // LazyVStack loading more rows) don't read as a manual scroll.
-            guard Self.isUserInputInFlight else { return }
+            guard ScrollGesturePolicy.shouldSynthesizeGesture(
+                    isLiveScrolling: isLiveScrolling,
+                    event: NSApp?.currentEvent?.type) else { return }
             onUserScroll?()
             onScrollEnded?()
-        }
-
-        private static var isUserInputInFlight: Bool {
-            guard let type = NSApp?.currentEvent?.type else { return false }
-            switch type {
-            case .scrollWheel, .leftMouseDown, .leftMouseDragged, .leftMouseUp,
-                 .otherMouseDragged, .keyDown:
-                return true
-            default:
-                return false
-            }
         }
     }
 }
