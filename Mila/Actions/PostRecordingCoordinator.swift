@@ -159,6 +159,13 @@ final class PostRecordingCoordinator: ObservableObject {
         armAutoSuggestTitle(for: recording)
     }
 
+    /// Run the background auto-suggest title without opening the rename
+    /// sheet. Used when batch-only mode is on: the recording saves
+    /// immediately but the LLM title still upgrades it in the background.
+    func autoSuggestOnly(for recording: Recording) {
+        armAutoSuggestTitle(for: recording)
+    }
+
     // MARK: - Background auto-suggest title
 
     /// Kick off background title suggestion for a freshly-added recording.

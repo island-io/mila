@@ -2692,6 +2692,7 @@ private struct VoiceRecognitionSection: View {
 /// hunting through UserDefaults.
 private struct MeetingsSettingsTab: View {
     @EnvironmentObject private var settings: MeetingDetectionSettings
+    @EnvironmentObject private var postRecordingSettings: PostRecordingSettings
 
     var body: some View {
         ScrollView {
@@ -2711,6 +2712,21 @@ private struct MeetingsSettingsTab: View {
                 .controlSize(.regular)
                 // Meetings' per-section probe for `DetailLayoutUITests`.
                 .accessibilityIdentifier("meetings.enable.toggle")
+
+                Divider()
+
+                Toggle(isOn: $postRecordingSettings.batchOnly) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Batch transcription only")
+                            .font(.body)
+                        Text("Record audio without live transcription. After recording stops, transcription, speaker identification, and AI summary run in the background. Saves recordings automatically without the rename window.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+                .controlSize(.regular)
 
                 Divider()
 
