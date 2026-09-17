@@ -215,7 +215,7 @@ enum DiagnosticReporter {
     /// `coreml.` is `coreml.compiled.<model>`, written by the whisper engine.
     static let exportedSettingsPrefixes: [String] = [
         "audio.", "audioInput.", "bundle.", "claudeSetup.", "coreml.",
-        "diarization.", "downloads.", "home.", "hotkeys.", "liveAI.", "llm.",
+        "detail.", "diarization.", "downloads.", "home.", "hotkeys.", "liveAI.", "llm.",
         "mcp.", "meetingDetection.", "model.", "obsidian.", "recording.",
         "recordings.", "remote.", "rename.", "speakers.", "storage.",
         "transcription.", "updates.", "voiceMemos.", "whatsNew.",

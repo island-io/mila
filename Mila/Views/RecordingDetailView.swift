@@ -458,6 +458,7 @@ struct RecordingDetailView: View {
                             // resolves from a descendant of the clip view.
                             ScrollActivityProbe(onUserScroll: userDidScroll,
                                                 onScrollEnded: userScrollEnded,
+                                                onSynthesizedScroll: synthesizedScroll,
                                                 follow: follow)
                                 .frame(width: 0, height: 0)
                                 .allowsHitTesting(false)
@@ -549,8 +550,16 @@ struct RecordingDetailView: View {
     /// Playback speed picker. Borderless menu labelled with the current rate,
     /// matching `LanguagePickerToolbarItem` in ContentView.
     private var speedMenu: some View {
-        Menu {
-            Picker("Playback speed", selection: $playbackSpeed) {
+        // The selection goes through `nearest(to:)` for the same reason the
+        // label does: the stored default is a plain `Double`, and one that
+        // doesn't match a case exactly matches no `tag` either — leaving the
+        // menu with NO row checked while the label and the player both read
+        // the snapped rate. Writing back through the raw binding normalises
+        // the stored value the first time the user picks a speed.
+        let selection = Binding(get: { PlaybackSpeed.nearest(to: playbackSpeed).rawValue },
+                                set: { playbackSpeed = $0 })
+        return Menu {
+            Picker("Playback speed", selection: selection) {
                 ForEach(PlaybackSpeed.allCases) { speed in
                     Text(speed.label).tag(speed.rawValue)
                 }
@@ -595,18 +604,33 @@ struct RecordingDetailView: View {
         }
     }
 
+    /// Reached from the live-scroll notifications, which AppKit posts ONLY for
+    /// user gestures — never for our own `scrollTo`. So no suppression check
+    /// here: swallowing these was discarding real scrolls that happened to
+    /// start inside the 0.45s window an auto-scroll had just opened (a
+    /// mouse-wheel scroll posts no trailing momentum events to recover with,
+    /// so the next segment change simply yanked the view back).
     private func userDidScroll() {
-        guard !follow.isSuppressed, isFollowing else { return }
+        guard isFollowing else { return }
         isFollowing = false
     }
 
     private func userScrollEnded() {
-        guard !follow.isSuppressed, !isFollowing else { return }
+        guard !isFollowing else { return }
         // A small nudge that left the highlight on screen resumes following;
         // scrolling properly away leaves the pill up. No scroll is issued here —
         // letting the next segment change re-centre is gentler than yanking the
         // view the instant the user lets go.
         if follow.activeRowIsVisible { isFollowing = true }
+    }
+
+    /// The bounds fallback's start-and-end-together report. This one CAN fire
+    /// for a scroll we started ourselves, so it is the one that consults the
+    /// suppression window.
+    private func synthesizedScroll() {
+        guard !follow.isSuppressed else { return }
+        userDidScroll()
+        userScrollEnded()
     }
 
     /// Floating "Follow playback" affordance, shown only while following is off
@@ -961,18 +985,32 @@ enum ScrollGesturePolicy {
     ///   - event: `NSApp.currentEvent?.type`, used to tell a user-driven bounds
     ///     change from a layout-driven one (window resize, the LazyVStack
     ///     loading more rows).
+    ///   - eventIsOverScrollView: whether that event's location is inside the
+    ///     scroll view. Only consulted for the mouse cases — see below.
     ///
     /// `.scrollWheel` is deliberately absent from the accepted types: a wheel or
     /// trackpad scroll that moves the clip view always goes through the
     /// live-scroll path, so accepting it here only re-opens the window this
     /// guard exists to close — including for the trailing bounds change that
     /// lands just after `didEndLiveScroll`.
+    ///
+    /// The mouse cases additionally need `eventIsOverScrollView`. A scroller
+    /// drag is a `.leftMouseDragged` INSIDE the scroll view; dragging the
+    /// window's edge or the split-view divider is the very same event type
+    /// OUTSIDE it, and also moves the clip view — AppKit clamps
+    /// `bounds.origin.y` as the content re-flows. Accepting those would
+    /// disengage following on a window resize, which is precisely the
+    /// layout-driven change this guard is meant to ignore. Keyboard scrolling
+    /// (Page Up/Down, the arrow keys) has no meaningful location, so it is
+    /// judged on the event type alone.
     static func shouldSynthesizeGesture(isLiveScrolling: Bool,
-                                        event: NSEvent.EventType?) -> Bool {
+                                        event: NSEvent.EventType?,
+                                        eventIsOverScrollView: Bool) -> Bool {
         guard !isLiveScrolling, let event else { return false }
         switch event {
-        case .leftMouseDown, .leftMouseDragged, .leftMouseUp,
-             .otherMouseDragged, .keyDown:
+        case .leftMouseDown, .leftMouseDragged, .leftMouseUp, .otherMouseDragged:
+            return eventIsOverScrollView
+        case .keyDown:
             return true
         default:
             return false
@@ -989,33 +1027,55 @@ enum ScrollGesturePolicy {
 private struct ScrollActivityProbe: NSViewRepresentable {
     let onUserScroll: () -> Void
     let onScrollEnded: () -> Void
+    /// The bounds fallback's start-and-end-together report. Separate from the
+    /// live-scroll pair because only this one can fire for a scroll WE started,
+    /// so only this one is subject to the suppression window.
+    let onSynthesizedScroll: () -> Void
     let follow: FollowCoordinator
 
     func makeNSView(context: Context) -> ProbeView {
         let view = ProbeView()
-        view.configure(onUserScroll: onUserScroll, onScrollEnded: onScrollEnded, follow: follow)
+        configure(view)
         return view
     }
 
     func updateNSView(_ nsView: ProbeView, context: Context) {
-        nsView.configure(onUserScroll: onUserScroll, onScrollEnded: onScrollEnded, follow: follow)
+        configure(nsView)
+    }
+
+    private func configure(_ view: ProbeView) {
+        view.configure(onUserScroll: onUserScroll,
+                       onScrollEnded: onScrollEnded,
+                       onSynthesizedScroll: onSynthesizedScroll,
+                       follow: follow)
     }
 
     final class ProbeView: NSView {
         private var onUserScroll: (() -> Void)?
         private var onScrollEnded: (() -> Void)?
+        private var onSynthesizedScroll: (() -> Void)?
         private var follow: FollowCoordinator?
         private var observers: [NSObjectProtocol] = []
         private var lastOriginY: CGFloat = .nan
         /// True between the start and end of a user's live scroll, so the
         /// bounds fallback can stay out of the way while one is running.
         private var isLiveScrolling = false
+        /// The scroll view we attached to, kept so `boundsChanged` can ask
+        /// whether the current event happened over it.
+        private weak var scrollView: NSScrollView?
+        private var attachAttempts = 0
+        /// ~1s of retries in total: mounting takes a run loop pass or two, so
+        /// anything still unresolved after this is not going to resolve.
+        private static let maxAttachAttempts = 20
+        private static let attachRetryDelay: TimeInterval = 0.05
 
         func configure(onUserScroll: @escaping () -> Void,
                        onScrollEnded: @escaping () -> Void,
+                       onSynthesizedScroll: @escaping () -> Void,
                        follow: FollowCoordinator) {
             self.onUserScroll = onUserScroll
             self.onScrollEnded = onScrollEnded
+            self.onSynthesizedScroll = onSynthesizedScroll
             self.follow = follow
         }
 
@@ -1037,11 +1097,23 @@ private struct ScrollActivityProbe: NSViewRepresentable {
             guard let scrollView = enclosingScrollView else {
                 // The NSScrollView isn't in the hierarchy on the first pass;
                 // retry once SwiftUI has finished mounting.
-                if window != nil {
-                    DispatchQueue.main.async { [weak self] in self?.attach() }
+                //
+                // Bounded on purpose. A bare `DispatchQueue.main.async` that
+                // re-enqueues itself is a main-thread SPIN, not a poll: if the
+                // scroll view never resolves — a SwiftUI ScrollView that isn't
+                // NSScrollView-backed on some future macOS, or a probe laid out
+                // outside the clip view — it would pin the main thread at 100%
+                // for as long as the detail screen is open, with nothing in the
+                // logs (the #280 class of regression). Giving up instead costs
+                // only follow-on-manual-scroll detection.
+                guard window != nil, attachAttempts < Self.maxAttachAttempts else { return }
+                attachAttempts += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + Self.attachRetryDelay) {
+                    [weak self] in self?.attach()
                 }
                 return
             }
+            self.scrollView = scrollView
             let center = NotificationCenter.default
             let clip = scrollView.contentView
             clip.postsBoundsChangedNotifications = true
@@ -1076,11 +1148,23 @@ private struct ScrollActivityProbe: NSViewRepresentable {
             let originY = clip.bounds.origin.y
             defer { lastOriginY = originY }
             guard abs(originY - lastOriginY) > 0.5 else { return }
+            let event = NSApp?.currentEvent
             guard ScrollGesturePolicy.shouldSynthesizeGesture(
                     isLiveScrolling: isLiveScrolling,
-                    event: NSApp?.currentEvent?.type) else { return }
-            onUserScroll?()
-            onScrollEnded?()
+                    event: event?.type,
+                    eventIsOverScrollView: isOverScrollView(event)) else { return }
+            onSynthesizedScroll?()
+        }
+
+        /// Whether `event` happened over the scroll view itself — true for a
+        /// scroller drag, false for a window-edge or split-view divider drag,
+        /// which carry the same event types but move the clip view purely by
+        /// re-layout.
+        private func isOverScrollView(_ event: NSEvent?) -> Bool {
+            guard let event, let scrollView,
+                  let window = scrollView.window, event.window === window
+            else { return false }
+            return scrollView.bounds.contains(scrollView.convert(event.locationInWindow, from: nil))
         }
     }
 }

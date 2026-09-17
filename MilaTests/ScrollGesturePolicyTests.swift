@@ -13,13 +13,19 @@ import XCTest
 /// its 0.45s suppression window swallowing the user's continuing scroll too.
 final class ScrollGesturePolicyTests: XCTestCase {
 
+    /// The mouse event types the fallback accepts when they land on the scroll
+    /// view. Deliberately spelled out rather than derived from the policy.
+    private let mouseEvents: [NSEvent.EventType] = [
+        .leftMouseDown, .leftMouseDragged, .leftMouseUp, .otherMouseDragged,
+    ]
+
     func test_silentDuringALiveScroll() {
         // Every event type that would otherwise qualify, while a live scroll is
         // running: the live-scroll notifications own the gesture, not us.
-        for event in [NSEvent.EventType.leftMouseDown, .leftMouseDragged,
-                      .leftMouseUp, .otherMouseDragged, .keyDown] {
+        for event in mouseEvents + [.keyDown] {
             XCTAssertFalse(
-                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: true, event: event),
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: true, event: event,
+                                                            eventIsOverScrollView: true),
                 "\(event) must not synthesize a gesture mid-live-scroll")
         }
     }
@@ -30,34 +36,57 @@ final class ScrollGesturePolicyTests: XCTestCase {
         // including the trailing bounds change just after didEndLiveScroll,
         // when isLiveScrolling has already been cleared.
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: true,
-                                                                   event: .scrollWheel))
+                                                                   event: .scrollWheel,
+                                                                   eventIsOverScrollView: true))
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
-                                                                   event: .scrollWheel))
+                                                                   event: .scrollWheel,
+                                                                   eventIsOverScrollView: true))
     }
 
     func test_keyboardScrollingStillSynthesizes() {
         // Page Up/Down and the arrow keys post no live-scroll notification at
-        // all — this fallback is the only thing that sees them.
-        XCTAssertTrue(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
-                                                                  event: .keyDown))
+        // all — this fallback is the only thing that sees them. A key event has
+        // no meaningful location, so it is judged on the type alone.
+        for overScrollView in [true, false] {
+            XCTAssertTrue(
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: .keyDown,
+                                                            eventIsOverScrollView: overScrollView),
+                "keyboard scrolling must not depend on the pointer's location")
+        }
     }
 
     func test_scrollerInteractionStillSynthesizes() {
-        for event in [NSEvent.EventType.leftMouseDown, .leftMouseDragged,
-                      .leftMouseUp, .otherMouseDragged] {
+        for event in mouseEvents {
             XCTAssertTrue(
-                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: event),
-                "\(event) outside a live scroll should still count as manual")
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: event,
+                                                            eventIsOverScrollView: true),
+                "\(event) over the scroll view should still count as manual")
+        }
+    }
+
+    /// Dragging the window's edge or the split-view divider carries the SAME
+    /// event types as a scroller drag and also moves the clip view — AppKit
+    /// clamps `bounds.origin.y` as the content re-flows. Accepting those
+    /// disengaged following on a window resize, which is the layout-driven
+    /// change this guard exists to ignore.
+    func test_mouseDragOutsideTheScrollViewIsNotAScroll() {
+        for event in mouseEvents {
+            XCTAssertFalse(
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: event,
+                                                            eventIsOverScrollView: false),
+                "\(event) away from the scroll view is a resize, not a scroll")
         }
     }
 
     func test_layoutDrivenChangesAreIgnored() {
-        // No current event: a window resize or the LazyVStack loading more rows
-        // moves the clip view without the user touching anything.
+        // No current event: the LazyVStack loading more rows moves the clip
+        // view without the user touching anything.
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
-                                                                   event: nil))
+                                                                   event: nil,
+                                                                   eventIsOverScrollView: true))
         // An unrelated event being current is not a scroll either.
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
-                                                                   event: .mouseMoved))
+                                                                   event: .mouseMoved,
+                                                                   eventIsOverScrollView: true))
     }
 }
