@@ -24,7 +24,8 @@ final class ScrollGesturePolicyTests: XCTestCase {
         // running: the live-scroll notifications own the gesture, not us.
         for event in mouseEvents + [.keyDown] {
             XCTAssertFalse(
-                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: true, event: event,
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: true,
+                                                            isLiveResizing: false, event: event,
                                                             eventIsOverScrollView: true),
                 "\(event) must not synthesize a gesture mid-live-scroll")
         }
@@ -36,9 +37,11 @@ final class ScrollGesturePolicyTests: XCTestCase {
         // including the trailing bounds change just after didEndLiveScroll,
         // when isLiveScrolling has already been cleared.
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: true,
+                                                                   isLiveResizing: false,
                                                                    event: .scrollWheel,
                                                                    eventIsOverScrollView: true))
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                                   isLiveResizing: false,
                                                                    event: .scrollWheel,
                                                                    eventIsOverScrollView: true))
     }
@@ -49,7 +52,8 @@ final class ScrollGesturePolicyTests: XCTestCase {
         // no meaningful location, so it is judged on the type alone.
         for overScrollView in [true, false] {
             XCTAssertTrue(
-                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: .keyDown,
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                            isLiveResizing: false, event: .keyDown,
                                                             eventIsOverScrollView: overScrollView),
                 "keyboard scrolling must not depend on the pointer's location")
         }
@@ -58,7 +62,8 @@ final class ScrollGesturePolicyTests: XCTestCase {
     func test_scrollerInteractionStillSynthesizes() {
         for event in mouseEvents {
             XCTAssertTrue(
-                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: event,
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                            isLiveResizing: false, event: event,
                                                             eventIsOverScrollView: true),
                 "\(event) over the scroll view should still count as manual")
         }
@@ -72,9 +77,25 @@ final class ScrollGesturePolicyTests: XCTestCase {
     func test_mouseDragOutsideTheScrollViewIsNotAScroll() {
         for event in mouseEvents {
             XCTAssertFalse(
-                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false, event: event,
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                            isLiveResizing: false, event: event,
                                                             eventIsOverScrollView: false),
                 "\(event) away from the scroll view is a resize, not a scroll")
+        }
+    }
+
+    /// The location test alone is not enough for a RIGHT-edge window resize:
+    /// the transcript runs to the window's right edge, so the pointer can be
+    /// inside the scroll view's bounds while the drag is a resize. AppKit's own
+    /// live-resize flag covers that case, and the location test covers the
+    /// divider drag that may not raise it — so neither may fire.
+    func test_liveResizeIsNeverAScroll() {
+        for event in mouseEvents + [.keyDown] {
+            XCTAssertFalse(
+                ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                            isLiveResizing: true, event: event,
+                                                            eventIsOverScrollView: true),
+                "\(event) during a live resize is the window changing size, not a scroll")
         }
     }
 
@@ -82,10 +103,12 @@ final class ScrollGesturePolicyTests: XCTestCase {
         // No current event: the LazyVStack loading more rows moves the clip
         // view without the user touching anything.
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                                   isLiveResizing: false,
                                                                    event: nil,
                                                                    eventIsOverScrollView: true))
         // An unrelated event being current is not a scroll either.
         XCTAssertFalse(ScrollGesturePolicy.shouldSynthesizeGesture(isLiveScrolling: false,
+                                                                   isLiveResizing: false,
                                                                    event: .mouseMoved,
                                                                    eventIsOverScrollView: true))
     }

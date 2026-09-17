@@ -982,6 +982,9 @@ enum ScrollGesturePolicy {
     /// - Parameters:
     ///   - isLiveScrolling: whether the scroll view is between
     ///     `willStart`/`didLiveScroll` and `didEndLiveScroll`.
+    ///   - isLiveResizing: whether the scroll view is inside a live resize —
+    ///     AppKit's own signal for "this bounds change is the window or the
+    ///     split-view divider being dragged, not the content being scrolled".
     ///   - event: `NSApp.currentEvent?.type`, used to tell a user-driven bounds
     ///     change from a layout-driven one (window resize, the LazyVStack
     ///     loading more rows).
@@ -1003,10 +1006,18 @@ enum ScrollGesturePolicy {
     /// layout-driven change this guard is meant to ignore. Keyboard scrolling
     /// (Page Up/Down, the arrow keys) has no meaningful location, so it is
     /// judged on the event type alone.
+    ///
+    /// `isLiveResizing` backs the location test up rather than duplicating it,
+    /// because the two have different blind spots. The transcript runs to the
+    /// window's right edge, so a right-edge resize CAN put the pointer inside
+    /// the scroll view's bounds; conversely a divider drag is comfortably
+    /// outside it but may not always raise live resize. Either signal alone
+    /// leaves a gap, so a bounds change is a scroll only if neither fires.
     static func shouldSynthesizeGesture(isLiveScrolling: Bool,
+                                        isLiveResizing: Bool,
                                         event: NSEvent.EventType?,
                                         eventIsOverScrollView: Bool) -> Bool {
-        guard !isLiveScrolling, let event else { return false }
+        guard !isLiveScrolling, !isLiveResizing, let event else { return false }
         switch event {
         case .leftMouseDown, .leftMouseDragged, .leftMouseUp, .otherMouseDragged:
             return eventIsOverScrollView
@@ -1151,6 +1162,7 @@ private struct ScrollActivityProbe: NSViewRepresentable {
             let event = NSApp?.currentEvent
             guard ScrollGesturePolicy.shouldSynthesizeGesture(
                     isLiveScrolling: isLiveScrolling,
+                    isLiveResizing: scrollView?.inLiveResize ?? false,
                     event: event?.type,
                     eventIsOverScrollView: isOverScrollView(event)) else { return }
             onSynthesizedScroll?()
