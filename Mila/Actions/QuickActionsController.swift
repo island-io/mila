@@ -41,6 +41,9 @@ final class QuickActionsController: ObservableObject {
         /// checkbox).
         case recording(withSystemAudio: Bool)
         case recordingApp(processID: pid_t?, includeMic: Bool)
+        /// Held only while nothing else owns the job — an import that lands
+        /// during a recording (or a start) leaves `activeJob` alone. See
+        /// `transcribeFile`.
         case importingFile(URL)
     }
 
@@ -1605,17 +1608,33 @@ final class QuickActionsController: ObservableObject {
         // Storage cap applies to imports too — they copy a new audio file
         // into the library, same as a recording.
         if storageCapReached() { return }
-        activeJob = .importingFile(url)
+        // An import is legitimately concurrent with a recording (⌘O during a
+        // meeting, a drop onto the More page), and `activeJob` is what backs
+        // `isRecording`. Claim it only when nothing else owns it, and hand
+        // back only what was claimed. Assigning unconditionally — as this did
+        // until #294 — let an import stamp `.importingFile` over a live
+        // `.recording`, or over a `.starting` whose success then wrote
+        // `.recording` back; either way the import finishing wrote `.none`
+        // while the mic was hot: the UI read idle, the chip and the sleep /
+        // lock guards went away, and the next Record click ran a second
+        // bring-up. (Cursor Bugbot on #294.) Nothing reads `.importingFile`
+        // itself; it exists to hold the job while the app is otherwise idle.
+        let claimed = activeJob == .none
+        if claimed { activeJob = .importingFile(url) }
+        defer {
+            // Release only what this import holds. A claimed import cannot
+            // lose the job — every start path refuses while it is held — but
+            // the check keeps the release honest if that ever changes.
+            if claimed, activeJob == .importingFile(url) { activeJob = .none }
+        }
         do {
             let recording = try await FileTranscriber.importFile(
                 at: url,
                 into: store,
                 language: languageSettings.current
             )
-            activeJob = .none
             transcription.enqueue(recording)
         } catch {
-            activeJob = .none
             transcription.lastError = "Could not import \(url.lastPathComponent): \(error.localizedDescription)"
         }
     }

@@ -227,6 +227,45 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertEqual(controller.activeJob, .none)
     }
 
+    // MARK: - Imports do not own the record job
+
+    /// ⌘O (or a drop onto the More page) is legitimately concurrent with a
+    /// recording, and `activeJob` is what backs `isRecording`. `transcribeFile`
+    /// used to claim it unconditionally and release it to `.none` when the
+    /// import finished. During `.starting` that replaced the start in flight,
+    /// whose success then wrote `.recording` back — and the import finishing
+    /// stamped `.none` over a live recording: the UI read idle with the mic
+    /// hot, and the next Record click ran a second bring-up. (Cursor Bugbot on
+    /// #294; `QuickActionsControllerTests` pins the same clobber against an
+    /// already-running recording.)
+    func test_a_file_import_during_starting_does_not_steal_the_job() async throws {
+        let gate = BringUpGate()
+        session.mic.bringUpOverride = { await gate.wait() }
+
+        let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting }
+        XCTAssertTrue(reachedStarting)
+
+        // ⌘O lands while capture is still coming up.
+        let imported = tempRoot.appendingPathComponent("import-during-start.wav")
+        try TestSupport.writeStereo48kSineWav(at: imported, durationSeconds: 0.4)
+        await controller.transcribeFile(imported)
+        XCTAssertEqual(controller.activeJob, .starting,
+                       "an import must neither take activeJob away from a start in flight nor release it to .none afterwards")
+        XCTAssertNotNil(store.recordings.first { $0.title == "import-during-start" },
+                        "the import itself still goes through")
+
+        await gate.open()
+        await start.value
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false))
+        XCTAssertTrue(controller.isRecording)
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+        XCTAssertEqual(controller.activeJob, .none)
+    }
+
     // MARK: - Helpers
 
     /// Poll `condition` on the main actor until it holds or `timeout` passes.
