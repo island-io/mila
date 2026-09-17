@@ -29,7 +29,10 @@ final class MicrophoneRecorderTests: XCTestCase {
             try await mic.start()
             XCTFail("Expected MicrophoneError.bringUpTimedOut; start() returned successfully")
         } catch let error as MicrophoneError {
-            XCTAssertEqual(error, .bringUpTimedOut)
+            guard case .bringUpTimedOut(_, let timeout) = error else {
+                return XCTFail("Expected .bringUpTimedOut, got \(error)")
+            }
+            XCTAssertEqual(timeout, 0.15, "the error should carry the budget it was thrown against")
             let elapsed = Date().timeIntervalSince(started)
             // Bound is generous for macos-26 GH VM jitter — same
             // flake class as the LLMRunner timeout test. The point
@@ -68,7 +71,9 @@ final class MicrophoneRecorderTests: XCTestCase {
             try await mic.start()
             XCTFail("Expected MicrophoneError.bringUpTimedOut; start() returned successfully")
         } catch let error as MicrophoneError {
-            XCTAssertEqual(error, .bringUpTimedOut)
+            guard case .bringUpTimedOut = error else {
+                return XCTFail("Expected .bringUpTimedOut, got \(error)")
+            }
             let elapsed = Date().timeIntervalSince(started)
             // Must return near the 0.15s deadline — NOT after the 3s stall.
             // 2.0s bound = generous CI jitter margin while still strictly
@@ -77,6 +82,40 @@ final class MicrophoneRecorderTests: XCTestCase {
                               "start() must throw at the timeout deadline, not wait out the stalled bring-up; took \(elapsed)s")
         }
         await mic.stop()
+    }
+
+    // MARK: - #291: the bring-up budget, and the error users read
+
+    /// Pins the production default against #291. On macOS 27.0 an AirPods
+    /// bring-up costs two ~3 s Bluetooth format waits, so the engine needs
+    /// ~6 s; a budget at or under that turns every recording attempt on such
+    /// a setup into a deterministic failure — the engine comes up a second
+    /// after the timeout has already torn the session down. Lowering this
+    /// again needs a reason written next to `bringUpTimeout`.
+    func test_default_bring_up_timeout_covers_two_bluetooth_format_waits() {
+        XCTAssertGreaterThanOrEqual(MicrophoneRecorder().bringUpTimeout, 12.0)
+    }
+
+    /// The banner shows `localizedDescription` verbatim, so the error has to
+    /// say which microphone stalled, for how long, and where to change it —
+    /// not Foundation's "(Mila.MicrophoneError error 1.)".
+    func test_timeout_error_names_the_device_and_the_budget() {
+        let text = MicrophoneError.bringUpTimedOut(device: "AirPods 4", timeout: 12).localizedDescription
+        XCTAssertTrue(text.contains("“AirPods 4”"), text)
+        XCTAssertTrue(text.contains("12 seconds"), text)
+        XCTAssertTrue(text.contains("Settings → Audio"), text)
+        XCTAssertFalse(text.contains("MicrophoneError"), "fell back to Foundation's generic text: \(text)")
+    }
+
+    func test_timeout_error_without_a_chosen_device_still_reads_as_a_sentence() {
+        let text = MicrophoneError.bringUpTimedOut(device: nil, timeout: 12).localizedDescription
+        XCTAssertTrue(text.hasPrefix("The microphone didn't start within 12 seconds."), text)
+    }
+
+    func test_no_input_device_error_is_user_readable() {
+        let text = MicrophoneError.noInputDevice.localizedDescription
+        XCTAssertFalse(text.contains("MicrophoneError"), text)
+        XCTAssertTrue(text.contains("Settings → Audio"), text)
     }
 
     /// The bug being prevented: even if the bring-up *thread* is wedged on
