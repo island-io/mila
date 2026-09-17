@@ -147,7 +147,7 @@ final class RecordStartingStateTests: XCTestCase {
         session.mic.bringUpOverride = {
             await gate.wait()
             // The error #291 produced: the engine outlived `bringUpTimeout`.
-            throw MicrophoneError.bringUpTimedOut
+            throw MicrophoneError.bringUpTimedOut(device: "AirPods 4", timeout: 12)
         }
         let published = PublishedJobs(controller)
 
