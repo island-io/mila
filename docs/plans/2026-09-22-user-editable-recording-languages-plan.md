@@ -15,15 +15,6 @@ before it is additive, and everything after it changes one behavior at a time.
 
 ---
 
-## Task 0 — GitHub issue
-
-Open the issue with `gh issue create` before any PR, as
-`.claude/rules/pull-requests.md` requires. Use the design doc's Goal and the
-Background table as its body. The PR description later says `Closes #<n>`.
-Confirm with the user before creating it.
-
----
-
 ## Task 1 — whisper's language list (TranscriptionCore)
 
 **Files:** `Packages/TranscriptionCore/Sources/TranscriptionCore/WhisperEngine.swift`,
@@ -356,7 +347,12 @@ section in `SettingsView.swift`, `MilaTests/RemoteTranscriptionTests.swift`
   so check the PR run.
 - Mark the design doc status "implemented". Don't add release notes here;
   they belong to the release commit.
-- Push and open a PR with `Closes #<issue>`, but only when the user asks.
+- **GitHub issue, then PR.** The issue is deferred until the tasks are
+  implemented and fully tested. `.claude/rules/pull-requests.md` needs it only
+  before the PR, because CI's "Linked issue" check fails a PR without one.
+  Once the user says to go ahead: `gh issue create`, with the design doc's
+  Goal and Background table as the body. Then push and open the PR with
+  `Closes #<issue>`.
 
 ---
 
