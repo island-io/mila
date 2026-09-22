@@ -1,11 +1,11 @@
 # User-Editable Recording Languages — Design
 
-**Status:** approved design, not yet implemented
+**Status:** approved design (rev 2), not yet implemented
 **Date:** 2026-09-22
 
 **Goal:** Replace the hardcoded two-case `RecordingLanguage` enum with a
-user-editable list. The user can add a language (name, ISO code, flag, script
-direction, transcription model), edit one, and remove one — while every
+user-editable list. The user can add a language (picked from what whisper
+supports), set its flag and transcription model, and remove one — while every
 recording already on disk keeps displaying and re-transcribing correctly,
 including in a language that has since been removed from the list.
 
@@ -14,23 +14,44 @@ including in a language that has since been removed from the list.
 engine blocks this. The limit is purely that the language set is a two-case
 enum.
 
+### Rev 2 changes (review against the code)
+
+1. **Remove = hide, not delete.** Rev 1 deleted the record and fell back to a
+   compiled-in table that only knew Hebrew and English — so deleting a
+   user-added Arabic turned its old recordings LTR with 🏳️, and deleting
+   English lost its remote model id. A hidden record keeps everything; the
+   built-in fallback table and its statics are gone.
+2. **Add picks from whisper's own language list** instead of free-text code.
+   The stored code is handed to whisper verbatim (`WhisperEngine.languageParams`
+   only rewrites `""`), so a typed `ru-RU` or `rus` would reach
+   `whisper_lang_id` and not match. Picking also removes code validation and
+   the add-time variant-collision rule.
+3. **`displayName` and `isRTL` are derived from `Locale`**, not stored or typed.
+4. **Legacy `"auto"` keeps displaying as Hebrew** (today's `fromCode` contract)
+   while still routing to the multilingual model — rev 1 turned it into
+   "AUTO 🏳️".
+5. **Per-language remote model ids are cut** (non-goal). Rev 1 would have sent
+   a new language with no id to the primary — the Hebrew ivrit fine-tune on a
+   two-model endpoint. The existing two slots already express the right rule;
+   no remote migration is needed.
+
 ---
 
 ## Non-goals
 
-These are deliberately excluded. Each is additive later and none of them
-changes the design below.
+Each is additive later and none changes the design below.
 
 - **User-supplied model URLs.** A language picks from the built-in catalog.
   Pasting an arbitrary ggml URL collides with the SHA-256 pinning in
   `WhisperModel` (`ModelManager.swift:14`), which exists so a compromised
-  HuggingFace repo is rejected before bytes reach the GGML loader. Supporting
-  it needs a trust-on-first-use flow (download → compute hash → show it → user
-  confirms → pin) and its own security review. Because the language record
-  stores a model *name* referencing the catalog, that feature only grows the
-  catalog; the language→model join is unaffected.
+  HuggingFace repo is rejected before bytes reach the GGML loader. It needs a
+  trust-on-first-use flow and its own security review. Because the language
+  record stores a model *name*, that feature only grows the catalog.
+- **Per-language remote model ids.** See *Model routing → Remote*. Adding an
+  optional `remoteModelID` override to the record later is purely additive.
 - **Reordering the list.** Order is insertion order; seeds are `[Hebrew,
   English]`.
+- **Languages whisper does not know.** Nothing can transcribe them.
 - **Localizing Mila's own UI chrome.** This is the language spoken *into* the
   app, not the language the app's buttons are written in.
 
@@ -39,21 +60,21 @@ changes the design below.
 ## Background: where "exactly two" is currently encoded
 
 `RecordingLanguage` (`Mila/Models/RecordingLanguageSettings.swift:18`) is a
-two-case `String` enum. Five separate facts hang off it:
+two-case `String` enum. Five facts hang off it:
 
 | Fact | Today |
 |---|---|
 | Display name + flag | `displayName` / `flagEmoji` switches |
-| Script direction | implicit — `.hebrew` is the only RTL case |
+| Script direction | literal `language == "he"` at eight view sites |
 | Local model | `WhisperModel.bestModel(for:)` switch (`ModelManager.swift:74`) |
-| Remote model id | `RemoteTranscriptionSettings.model` + `englishModel` — a two-slot **storage** shape, not just a switch |
+| Remote model id | `fromCode` switch over `model` / `englishModel` (`RemoteTranscriptionSettings.swift:394`) |
 | Dictation hotkey | `HotkeyAction.dictateHebrew` / `.dictateEnglish`, `CaseIterable` |
 
-**The one thing that is already dynamic:** `Recording.language` is stored as a
-`String` ISO code, not as the enum. recordings.json, MilaKit's
-`StoredRecording`, and the `StoredRecordingDriftTests` tripwire are therefore
-**untouched by this change**. The enum was only ever a UI and routing layer.
-This is what makes the work a type swap rather than a schema migration.
+**Already dynamic:** `Recording.language` is stored as a `String` ISO code, not
+as the enum. recordings.json, MilaKit's `StoredRecording`, and the
+`StoredRecordingDriftTests` tripwire are **untouched by this change**. The enum
+was only ever a UI and routing layer, which makes this a type swap rather than
+a schema migration.
 
 ---
 
@@ -61,34 +82,42 @@ This is what makes the work a type swap rather than a schema migration.
 
 ```swift
 struct RecordingLanguage: Identifiable, Hashable, Codable {
-    var code: String           // "he" — the id; normalized to lowercase
-    var displayName: String    // "Hebrew"
-    var flagEmoji: String      // "🇮🇱"
-    var isRTL: Bool
-    var modelName: String?     // → WhisperModel.name; nil = multilingual default
-    var remoteModelID: String? // per-language model id for a remote endpoint
+    var code: String        // a whisper language code: "he", "ru" — the id
+    var flagEmoji: String   // "🇮🇱"; "" = none (UI shows the code as a badge)
+    var modelName: String?  // → WhisperModel.name; nil = multilingual default
+    var isHidden: Bool      // removed by the user; kept so old rows still resolve
     var id: String { code }
+
+    var displayName: String // Locale(identifier: "en").localizedString(forLanguageCode: code) ?? code.uppercased()
+    var isRTL: Bool         // Locale.Language(identifier: code).characterDirection == .rightToLeft
 }
 ```
 
-`isRTL` becomes explicit data instead of "is it the Hebrew case". `modelName`
-is a catalog reference, not an inline model definition — see Non-goals.
+- **Derived, not stored:** `displayName` uses the English locale to match
+  Mila's English-only chrome; `isRTL` comes from CLDR, so Arabic, Farsi, Urdu
+  and Yiddish are right without the user knowing to tick a box. Both APIs were
+  checked on the macOS 14 target (`"ar"` → RTL, `"ru"` → "Russian").
+- **Flag stays user-editable** because a language is not a country (English →
+  🇬🇧 or 🇺🇸 is a preference, as the current code comment says).
+- `modelName` is a catalog reference, not an inline model definition.
 
 ---
 
 ## Storage and seeding
 
-- New namespaced key **`recording.languages`**, a JSON array of the struct.
-- The existing **`recording.language`** key keeps its exact current meaning:
-  the active code. Nothing to migrate.
-- **Seeding triggers on the key being absent**, not on the list being empty
-  (empty is forbidden — see Invariants — so "empty" can only mean corruption,
-  which should not silently re-seed over a user's edits). Seeds:
+- New namespaced key **`recording.languages`**, a JSON array of the struct
+  (including hidden entries).
+- The existing **`recording.language`** key keeps its exact meaning: the active
+  code. Nothing to migrate.
+- **Seeding triggers on the key being absent**, not on the list being empty.
+  If the stored bytes fail to decode, the seeds are used in memory and the
+  stored value is left alone until the user's next edit, so a decode bug never
+  silently overwrites a user's list.
 
-  | code | name | flag | RTL | model | remote id |
-  |---|---|---|---|---|---|
-  | `he` | Hebrew | 🇮🇱 | yes | `ivrit-ai-whisper-large-v3` | `nil` — falls through to `remote.model` |
-  | `en` | English | 🇬🇧 | no | `openai-whisper-large-v3-turbo` | migrated from `remote.englishModel` |
+  | code | flag | model | hidden |
+  |---|---|---|---|
+  | `he` | 🇮🇱 | `ivrit-ai-whisper-large-v3` | no |
+  | `en` | 🇬🇧 | `openai-whisper-large-v3-turbo` | no |
 
 Existing users see no behavioral change on first launch of the new build.
 
@@ -99,39 +128,43 @@ Existing users see no behavioral change on first launch of the new build.
 This is the core of the design and the part most easily got wrong.
 
 ```swift
-func configured(_ code: String) -> RecordingLanguage?  // the list — drives every picker
-                                                       // exact-or-variant match, like `resolve`
-func resolve(_ code: String) -> RecordingLanguage      // never nil — for displaying
-                                                       // and re-transcribing stored rows
+func configured(_ code: String) -> RecordingLanguage?  // visible entries only — every picker
+func resolve(_ code: String) -> RecordingLanguage      // never nil — displaying and
+                                                       // re-transcribing stored rows
 ```
 
 **Why the split.** "Remove Hebrew" cannot mean purge. Every recording already
-on disk stores `language: "he"`, and Hebrew is additionally today's `fromCode`
-fallback for every unrecognised code. Removal must therefore mean *stop
-offering it for new recordings* while stored codes stay resolvable **forever**.
+on disk stores `language: "he"`. Removal means *stop offering it for new
+recordings*, while stored codes stay resolvable **forever**.
 
-`resolve` order:
+`resolve` order (all steps lowercase first):
 
-1. exact match in the configured list (lowercased)
-2. variant match in the list — `he-IL`, `he_IL`, `iw` → `he`. The existing
-   `isVariant` guard is kept verbatim: a bare `hasPrefix` would route
-   `"enochian"` to English, so `"enochian"` must miss.
-3. **compiled-in built-in table** — the same two seed entries above
-4. synthesized display-only entry: `displayName` = code uppercased, flag 🏳️,
-   `isRTL` = false, `modelName` = nil
+1. **legacy aliases** → `he`: `iw` (Locale does not canonicalize it — checked)
+   and `auto` (the retired auto-detect; `fromCode` documents that those
+   recordings are read as Hebrew). Model routing overrides `auto` separately —
+   see below.
+2. exact match in the list, **hidden entries included**
+3. variant match — `he-IL`, `he_IL` → `he`. The existing `isVariant` guard is
+   kept verbatim: a bare `hasPrefix` would route `"enochian"` to English.
+4. synthesized, not stored: the code with `Locale`-derived name and direction,
+   no flag, `modelName` nil. Reachable only by a code that was never in the
+   list — a hand-edited file, or a config import that was skipped.
 
-Step 3 is what makes deletion *correct* rather than merely non-crashing:
-after deleting Hebrew, `resolve("he")` still returns "Hebrew 🇮🇱 RTL" for old
-recordings instead of a bare `HE 🏳️`.
+Step 2 including hidden entries is what makes removal *correct* rather than
+merely non-crashing: after removing Hebrew, `resolve("he")` still returns
+Hebrew with its flag and its ivrit.ai model.
 
-**Every existing `RecordingLanguage.fromCode(recording.language)` call site
-becomes `resolve`:** `RecordingContextMenu.swift:123`,
-`RecordingDetailView.swift:179` and `:477`,
+**Behavior change, stated:** today an unrecognised code (say `"fr"`) displays as
+Hebrew. After this change it displays as French. Only `auto` and `iw` keep the
+Hebrew fallback; that is what the legacy contract was for.
+
+**Every `RecordingLanguage.fromCode(…)` call site becomes `resolve`:**
+`RecordingContextMenu.swift:123`, `RecordingDetailView.swift:179` and `:477`,
 `RemoteTranscriptionSettings.swift:399`, `MilaConfigImporter.swift:152` and
-`:191`. Pickers iterate the configured list instead.
+`:191`. Pickers iterate the visible list instead.
 
 > **Regression note for reviewers.** If the list is built but this split is
-> not, deleting Hebrew silently breaks display and re-transcription of every
+> not, removing Hebrew silently breaks display and re-transcription of every
 > pre-existing Hebrew recording — and the current `fromCode` tests pass the
 > whole way, because they exercise the code path being replaced.
 
@@ -139,28 +172,41 @@ becomes `resolve`:** `RecordingContextMenu.swift:123`,
 
 ## Invariants
 
-1. **The list is never empty.** Remove is disabled at one entry.
-2. **Codes are unique, case-insensitively, and stored lowercased.** A new
-   code is also rejected when it *variant-matches* an existing entry —
-   adding `he-IL` alongside `he` would make `resolve` order-dependent.
-3. **Deleting the active language re-points `recording.language`** at the
-   first surviving entry.
-4. Deleting a language never touches any stored recording.
+1. **At least one visible entry.** Remove is disabled at one visible entry.
+2. **Codes are unique across the whole list, hidden included.** Adding a code
+   that exists as hidden **un-hides it** with its previous flag, model and
+   hotkey, so remove-then-add is a lossless round-trip. Because codes come
+   from whisper's list, which has only base codes, a variant can never be
+   added.
+3. **The active code is always visible.** Removing the active language
+   re-points `recording.language` at the first visible entry.
+4. Removing a language never touches any stored recording.
 
 ---
 
 ## Model routing
 
+### The `auto` exception, in one place
+
+Legacy `auto` *displays* as Hebrew (resolve step 1) but has always
+*transcribed* on the multilingual model: locally `bestModel("auto")` falls to
+the turbo's `default:` branch, and remotely `model(for: "auto")` returns the
+English slot (`RemoteTranscriptionTests:101`). Only a multilingual model can
+serve a detect-the-language request. Both routers therefore check
+`code == "auto"` **before** calling `resolve`, and route it as multilingual.
+Routing through `resolve("auto")` would send it to ivrit.ai.
+
 ### Local
 
-`ModelManager` must not learn about `RecordingLanguageSettings` — wrong
-dependency direction, and it would tangle two App-level objects. Instead:
+`ModelManager` must not learn about `RecordingLanguageSettings`. That would be
+the wrong dependency direction and would tangle two App-level objects.
+Instead:
 
 ```swift
 var languageModelResolver: (String) -> String?   // code → WhisperModel.name
 ```
 
-defaulting to the compiled-in behavior and wired to the settings object in
+It defaults to the compiled-in behavior and is wired to the settings object in
 `MilaApp.init`. Consequences:
 
 - All four call sites keep calling `model(for: code)` unchanged:
@@ -171,129 +217,100 @@ defaulting to the compiled-in behavior and wired to the settings object in
 - Tests inject a stub resolver rather than standing up settings.
 - `WhisperModel.bestModel(for:)` loses its Hebrew branch and returns the
   multilingual turbo. The he → ivrit.ai join then lives in exactly one place:
-  the seed table.
+  the seed.
 - **`WhisperModel.languageHint` is deleted.** It is set on both models and
-  read nowhere; the language→model join replaces it.
+  read nowhere.
 
 ### Remote
 
-`RemoteTranscriptionSettings` is the only place where **storage**, not just
-logic, encodes exactly two languages (`model` + `englishModel`).
+`RemoteTranscriptionSettings` keeps its two slots and both storage keys
+unchanged. `model` holds the primary (the ivrit.ai fine-tune in the tested
+setup) and `englishModel` holds the multilingual one. The only change is in
+`model(for:)`:
 
-- The per-language id moves onto the language record as `remoteModelID`.
-- `model` remains the primary/default for any language without one.
-- `model(for:)` becomes `resolve(code).remoteModelID ?? Self.resolve(model)`,
-  **except** that the explicit legacy `"auto"` branch is preserved: `auto`
-  resolves as if it were the English entry. This is deliberate and already
-  tested (`RemoteTranscriptionTests:101`) — only a multilingual model can
-  serve a detect-the-language request, and English is seeded to the
-  multilingual turbo. Dropping the branch would silently reroute
-  re-transcription of pre-`auto`-retirement recordings to the Hebrew-only
-  primary.
-- Migration: the existing `remote.englishModel` value is written into the
-  English entry's `remoteModelID` on first launch of the new build **only
-  when it is non-empty after trimming; otherwise `nil`**. Today `model(for:)`
-  short-circuits on `guard !english.isEmpty else { return primary }`, so a
-  single-model endpoint puts every language on the primary. Migrating `""`
-  verbatim would make `remoteModelID ?? primary` yield `""` instead of
-  falling through — sending an empty model id to the endpoint.
-  `remoteModelID` is trimmed-and-nilled on every write for the same reason.
-- `MilaConfig` keeps accepting its `englishModel` field for backward
-  compatibility, applying it to the English entry.
+```
+englishModel empty           → primary        (single-model endpoint, unchanged)
+code == "auto"               → englishModel   (unchanged)
+resolve(code).code == "he"   → primary        (unchanged)
+anything else                → englishModel   (was: fromCode → Hebrew → primary)
+```
 
-**Decision — importing a config naming an unconfigured language is ignored,
-not auto-added.** `MilaConfigImporter.apply` currently does
+That last row is the fix. Russian goes to the multilingual model, not to the
+Hebrew fine-tune. The Settings label for `englishModel` changes to
+"Multilingual model (all languages except Hebrew)". The storage key and the
+`MilaConfig` field keep their names for compatibility.
+
+**Why not per-language ids (rev 1):** two problems. A new language with no id
+would fall to the primary, which is Hebrew-only. And migrating an empty
+`englishModel` into a per-language slot needed special-casing to avoid sending
+`""` as a model id. The two-slot rule already describes the real split:
+Hebrew specialist vs everyone else. A per-language override is a non-goal and
+stays additive.
+
+**Known asymmetry.** Remote pins Hebrew to the primary even if the user sets
+Hebrew's *local* model to the turbo. The two settings are independent today
+too.
+
+### Config import
+
+**Decision: a config naming a language that is not visible is ignored, not
+auto-added.** `MilaConfigImporter.apply` currently does
 `language.current = fromCode(langCode)` (`:191`). Setting the active code to a
-language that is not in the list would violate invariant 3 by a different
-door. Since the list is user-owned, a config file should not silently grow it.
-The preview row (`:152`) uses `resolve` for its label and says the language
-will be skipped; `apply` leaves the active language untouched. Flip this to
-auto-add from the built-in table if configs should be able to provision
-languages.
+language that is not visible would violate invariant 3 by another route. The
+list belongs to the user, so a config file should not silently grow it. The
+preview row (`:152`) uses `resolve` for its label and says the language will
+be skipped. `apply` leaves the active language untouched. Flip this to
+auto-add (or auto-un-hide) if configs should be able to provision languages.
 
 ---
 
 ## Hotkeys
 
 `HotkeyAction` stops being a `CaseIterable` enum and becomes a struct with a
-stable string `id` (`"dictate.he"`), used as both the dictionary key and the
+stable string `id` (`"dictate.he"`). That id is both the dictionary key and the
 UserDefaults key suffix (`hotkey.dictate.he`).
 
 - **Legacy keys migrate:** `hotkey.dictateHebrew` / `hotkey.dictateEnglish`
   are read once and rewritten, so nobody loses ⌘3 / ⌘2.
 - **`carbonID` is allocated per registration pass** from list position. It
-  only needs uniqueness among currently-live registrations, which avoids any
-  hash-collision scheme for user-supplied codes.
+  only needs to be unique among the registrations currently live.
+- **Hidden languages are not registered**, but their binding stays in
+  UserDefaults and comes back on un-hide (invariant 2).
 - **New languages default to unbound.** Auto-assigning ⌘4, ⌘5… invites
-  `eventHotKeyExistsErr` and quietly stomps other apps' shortcuts. An explicit
-  "Set shortcut" is the honest default.
+  `eventHotKeyExistsErr` and quietly takes over other apps' shortcuts.
 - `binding(for:)` therefore returns an **optional**. The dictation rows in
   `MilaApp.swift:1102` and `HomeView.swift:223` become a `ForEach` over the
-  configured list, rendering "Set shortcut" where unbound.
+  visible list, rendering "Set shortcut" where unbound.
 
 ---
 
 ## Live AI output language
 
-`LiveAISettings.OutputLanguage` is a **second, independent** enum
-(`auto`/`en`/`he`). On `auto` — the default — both
-`RecordingSummarizer.swift:368` and `LiveAISession.swift:467` resolve via
-`isPredominantlyHebrew ? "Hebrew" : "English"`. Left alone, the first Russian
+`LiveAISettings.OutputLanguage` (`auto`/`en`/`he`) is a **second, independent**
+enum. On `auto`, the default, both `RecordingSummarizer.swift:369` and
+`LiveAISession.swift:467` fill `{{LANGUAGE}}` with
+`isPredominantlyHebrew ? "Hebrew" : "English"`. That is deliberate, because
+LLMs follow "Output in Hebrew" more reliably than "match the transcript"
+(comment at `LiveAISession.swift:459`). It also means the first Russian
 recording gets an **English** summary and action items.
 
-- `OutputLanguage` becomes a stored `String`: `"auto"` or a language code.
-- The picker offers `Auto` + the configured list.
-- `auto` resolves to **the recording's own language code** —
-  `resolve(recording.language).displayName` — which is both more accurate and
-  more predictable than inspecting the text.
-- The `isPredominantlyHebrew` heuristic survives **only** as the last resort,
-  for a recording whose code resolves to a synthesized unknown.
-- `LiveAIRecordingView.aiOutputIsRTL` reads the resolved `isRTL` instead of
-  switching on the enum.
-
----
-
-## UI
-
-**Settings → Languages** (new `SettingsTab` case at `SettingsView.swift:23`,
-switch arm at `:284`):
-
-- rows showing flag / name / code / model / shortcut
-- add-and-edit sheet: Name, Code, Flag, Script (RTL/LTR), Model (catalog
-  picker), optional remote model id, optional shortcut
-- remove, disabled at one entry; confirm when removing the active language
-
-**Re-transcribe becomes a submenu.** `RecordingLanguage.other` assumed a pair
-and is deleted. `RecordingDetailView.swift:477` and
-`RecordingContextMenu.swift:123` become "Re-transcribe in ▸" over the
-configured list minus the recording's current language.
-
-**Decision — the submenu also offers the recording's own language when it is
-no longer configured.** Otherwise: delete Hebrew, open a `he` recording,
-re-transcribe it in English by accident, and there is no way back to Hebrew —
-whereas today's `.other` always round-trips. `resolve` already returns the
-built-in Hebrew entry with its model, so this costs nothing but an explicit
-union. Flip this only if you would rather a removed language be truly gone
-from every menu, accepting the one-way trip.
-
-**Toolbar picker** (`ContentView.swift:461`) iterates the configured list
-instead of `allCases`; otherwise unchanged.
-
-**Built-in constants.** The built-in table is exposed as
-`RecordingLanguage.builtInHebrew` / `.builtInEnglish` statics, because a
-struct has no `.hebrew` case and `FileTranscriber.importFile`
-(`FileTranscriber.swift:13`) takes `language: RecordingLanguage = .hebrew` as
-a **default argument**. That default becomes `.builtInHebrew`, preserving
-today's behavior exactly — every real caller passes
-`languageSettings.current`, so the default is only a compile-time
-placeholder.
+- `OutputLanguage` becomes a stored `String`: `"auto"` or a language code. The
+  raw values are already `auto`/`en`/`he`, so **no migration**.
+- The picker offers `Auto` + the visible list. If the selected code is later
+  hidden, it keeps working through `resolve`, and the picker shows it until
+  the user changes it.
+- `auto` resolves to `resolve(code).displayName` for the recording's (or live
+  session's) own code. The result is still a concrete language name.
+- The heuristic survives for two codes where the declared language says
+  nothing: legacy `auto`, and a synthesized unknown (resolve step 4).
+- `LiveAIRecordingView.aiOutputIsRTL` reads the resolved `isRTL`.
 
 ---
 
 ## Script direction: `isRTL` replaces eight hardcoded checks
 
-RTL is not currently a property of anything — it is the literal comparison
-`language == "he"`, repeated across the views, sometimes OR'd with the
+RTL is not currently a property of anything. It is the literal comparison
+`language == "he"`, repeated across the views and sometimes OR'd with the
 `isPredominantlyHebrew` text heuristic:
 
 - `DictationOverlayWindow.swift:122`
@@ -302,14 +319,52 @@ RTL is not currently a property of anything — it is the literal comparison
 - `AIOverviewSection.swift:55`
 - `LiveAIRecordingView.aiOutputIsRTL` (`:101`, covered above)
 
-All become `resolve(code).isRTL`. Without this the new `isRTL` field is
-decorative: adding Arabic or Farsi would store `isRTL = true` and still render
-left-to-right everywhere. Russian is LTR, so the motivating case would not
-have exposed it.
+All become `resolve(code).isRTL`. Without this, a derived `isRTL` would do
+nothing: Arabic would still render left-to-right everywhere. Russian is LTR,
+so the motivating case would not have caught it.
 
-The `isPredominantlyHebrew` heuristic is **kept** where it currently OR's with
-the code — it catches a recording whose declared language is wrong, and
-`HebrewDetection.swift` is unaffected by this change.
+Where the code currently OR's in the `isPredominantlyHebrew` heuristic, the
+heuristic is **kept**. It catches a recording whose declared language is
+wrong, and `HebrewDetection.swift` is unaffected.
+
+---
+
+## UI
+
+**Settings → Languages** (new `SettingsTab` case at `SettingsView.swift:23`,
+switch arm at `:284`):
+
+- rows for the visible entries, showing flag / name / code / model / shortcut
+- **Add** sheet: a searchable picker over whisper's supported languages,
+  excluding those already visible. The list comes from a new
+  `WhisperEngine.supportedLanguageCodes` in TranscriptionCore, which wraps
+  `whisper_lang_max_id` / `whisper_lang_str`. MilaKit is not involved. Then
+  Flag (optional), Model (catalog picker, defaulting to the multilingual
+  turbo), and Shortcut (optional).
+- **Edit** sheet: the same fields, with the language itself fixed.
+- **Remove**: disabled at one visible entry. Confirm before removing the
+  active language. The confirmation text says existing recordings are kept
+  and re-adding the language restores its settings.
+
+**Re-transcribe becomes a submenu.** `RecordingLanguage.other` assumed a pair
+and is deleted. `RecordingDetailView.swift:477` and
+`RecordingContextMenu.swift:123` become "Re-transcribe in ▸" over the visible
+list minus the recording's current language.
+
+**Decision: the submenu also offers the recording's own language when that
+language is hidden.** Otherwise a user could remove Hebrew, re-transcribe an
+old `he` recording in English by accident, and have no way back, whereas
+today's `.other` always round-trips. `resolve` returns the hidden record with
+its model, so this costs one explicit union.
+
+**Toolbar picker** (`ContentView.swift:461`) iterates the visible list instead
+of `allCases`. Otherwise it is unchanged.
+
+**`FileTranscriber.importFile`'s default argument is deleted.** Its
+`language: RecordingLanguage = .hebrew` (`FileTranscriber.swift:13`) has no
+case to name on a struct. Both callers already pass `languageSettings.current`
+(`VoiceMemosImporter.swift:283`, `QuickActionsController.swift:1502`), so the
+default was never used.
 
 ---
 
@@ -317,55 +372,65 @@ the code — it catches a recording whose declared language is wrong, and
 
 `RecordingLanguageSettings` remains an App-level `@StateObject`
 (`MilaApp.swift:338`). Adding a mutable `languages` array is safe under the
-#280 rule in CLAUDE.md: it publishes on user edits, not at audio or timer
-cadence, so the `AppSceneChurnTests` publish budget is unaffected. Stated here
-so a reviewer does not have to re-derive it.
+#280 rule in CLAUDE.md. It publishes on user edits, not at audio or timer
+cadence, so the `AppSceneChurnTests` publish budget is unaffected.
+`displayName` and `isRTL` are computed on each read. Both are cheap `Locale`
+lookups done at view-render rate, not per audio buffer.
 
 ---
 
 ## Testing
 
-**Replaced contracts** (these fail by design; one is a semantic replacement,
-not an update):
+**Replaced contracts.** These fail by design. The first one replaces a
+behavior rather than updating it.
 
-- `test_unknown_language_code_falls_back_to_hebrew` → **replaced** by
-  "unknown code resolves to a display-only synthesized entry"
+- `test_unknown_language_code_falls_back_to_hebrew`: **replaced** by two tests.
+  "`auto` and `iw` resolve to `he`", and "an unknown code such as `fr`
+  resolves to a synthesized French entry".
 - `test_only_hebrew_and_english_are_offered` → seeded-list assertion
-- `test_persisted_auto_migrates_to_hebrew` → legacy `"auto"` still resolves
+- `test_persisted_auto_migrates_to_hebrew` → the active code `auto` loads as
+  `he`, and `resolve("auto").code == "he"`
 - `.other` pair assertions → deleted with the property
 - `ModelManagerTests.test_best_model_for_language_routes_hebrew_to_ivrit` →
-  moves to the seed table / resolver
-- `RemoteTranscriptionTests:72-109` → per-language `remoteModelID`
+  moves to the seed and resolver. Add "`auto` routes to the turbo even though
+  it resolves to Hebrew".
+- `RemoteTranscriptionTests:72-109` → kept as is. Add a row: `ru` on a
+  two-model endpoint routes to `englishModel`, not the primary.
 - `MilaConfigTests:221` → language round-trip
 
 **New coverage:**
 
-- seeding happens on absent key, and not over an existing list
-- adding a language: code normalization, duplicate rejection
-- deleting the active language re-points `recording.language`
-- **deleting Hebrew while `he` recordings exist** — they still resolve, still
-  display RTL, still re-transcribe
-- hotkey legacy-key migration preserves ⌘2 / ⌘3; a new language is unbound
-- `remote.englishModel` migrates into the English entry
-- Live AI `auto` follows the recording's code, with the heuristic only for
-  unknown codes
-- an RTL language added by the user renders right-to-left — asserted on
-  `resolve(code).isRTL`, since the eight call sites are view code
+- seeding happens when the key is absent, and never over an existing or
+  undecodable value
+- removing hides. Re-adding the same code un-hides it with its flag, model and
+  hotkey intact.
+- removing the active language re-points `recording.language` to a visible
+  entry
+- **removing Hebrew while `he` recordings exist**: they still resolve, still
+  display RTL, and still re-transcribe on ivrit.ai. The same holds for a
+  user-added RTL language (`ar`), which is the case rev 1 got wrong.
+- `isRTL` is derived: `ar`, `fa`, `he` are RTL; `ru`, `en` are not
+- the add picker offers only whisper-supported codes and excludes visible ones
+- hotkey legacy-key migration preserves ⌘2 / ⌘3. A new language is unbound. A
+  hidden language is not registered.
+- Live AI `auto` follows the recording's code, and uses the heuristic only
+  for `auto` and synthesized codes
 - the re-transcribe submenu still offers the recording's own language after
-  that language is removed from the list (the round-trip guarantee)
-- an imported config naming an unconfigured language leaves the active
+  that language is hidden
+- an imported config naming a language that is not visible leaves the active
   language untouched
-- a remote endpoint with an empty `englishModel` migrates to `nil`, and every
-  language still resolves to the primary
 
 ---
 
 ## Risks
 
 - **Silent breakage of old recordings** if `resolve` is skipped in favor of a
-  single lookup. Mitigated by the dedicated "delete Hebrew, old rows survive"
+  single lookup. Mitigated by the dedicated "remove Hebrew, old rows survive"
   test.
+- **`auto` routed through `resolve`** would move legacy re-transcription onto
+  ivrit.ai. Mitigated by routing it before resolve, and pinned by a test on
+  each side (local and remote).
 - **Hotkey registration failures** if new languages were auto-bound. Mitigated
   by defaulting to unbound.
-- **Scope creep into custom model URLs.** Explicitly deferred; the catalog
-  reference keeps it additive.
+- **Scope creep** into custom model URLs or per-language remote ids. Both are
+  explicitly deferred and both are additive.
