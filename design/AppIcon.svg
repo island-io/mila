@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Mila app icon. Master artwork: edit this file, then regenerate the
+       AppIcon.appiconset PNGs (see design/README.md).
+       The mark is drawn in a 256-unit space and placed on Apple's macOS icon
+       grid: an 824x824 tile centred in a 1024 canvas, so Mila sits at the
+       same visual size as other apps in the Dock. -->
+  <defs>
+    <linearGradient id="gMain" gradientUnits="userSpaceOnUse" x1="0" y1="18.539" x2="0" y2="237.461"><stop offset="0" stop-color="#157260"/><stop offset="1" stop-color="#0B332C"/></linearGradient>
+    <linearGradient id="gCap" gradientUnits="userSpaceOnUse" x1="0" y1="139.473" x2="0" y2="199.087"><stop offset="0" stop-color="#157260"/><stop offset="1" stop-color="#0B332C"/></linearGradient>
+    <linearGradient id="gArc" gradientUnits="userSpaceOnUse" x1="0" y1="178.515" x2="0" y2="222.937"><stop offset="0" stop-color="#157260"/><stop offset="1" stop-color="#0B332C"/></linearGradient>
+    <clipPath id="tile"><circle cx="128.0" cy="128.0" r="128.0"/></clipPath>
+    <filter id="sh" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="3.469" stdDeviation="2.188" flood-color="#000" flood-opacity="0.297"/>
+    </filter>
+  </defs>
+  <g transform="translate(100 100) scale(3.218750000)">
+    <circle cx="128.0" cy="128.0" r="128.0" fill="#FFFFFF"/>
+    <path clip-path="url(#tile)" fill-rule="evenodd" fill="url(#gMain)"
+      d="M 18.539 128.0 a 109.461 109.461 0 1 0 218.922 0 a 109.461 109.461 0 1 0 -218.922 0 Z M 46.050 111.948 C 45.146 116.835 53.886 128.102 64.184 128.102 L 191.816 128.102 C 202.114 128.102 210.854 116.835 209.950 111.948 A 83.341 83.341 0 0 0 46.050 111.948 Z"/>
+    <g filter="url(#sh)"><circle cx="179.202" cy="179.173" r="70.370" fill="#FFFFFF"/></g>
+    <rect x="161.279" y="139.473" width="35.848" height="59.614" rx="17.924" fill="url(#gCap)"/>
+    <path d="M 152.883 181.423 A 26.324 26.324 0 1 0 205.522 181.423" fill="none"
+      stroke="url(#gArc)" stroke-width="5.815" stroke-linecap="round"/>
+    <line x1="179.202" y1="207.836" x2="179.202" y2="220.005"
+      stroke="url(#gArc)" stroke-width="5.863" stroke-linecap="round"/>
+  </g>
+</svg>
