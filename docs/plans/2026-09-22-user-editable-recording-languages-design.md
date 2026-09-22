@@ -272,8 +272,10 @@ UserDefaults key suffix (`hotkey.dictate.he`).
 
 - **Legacy keys migrate:** `hotkey.dictateHebrew` / `hotkey.dictateEnglish`
   are read once and rewritten, so nobody loses ⌘3 / ⌘2.
-- **`carbonID` is allocated per registration pass** from list position. It
-  only needs to be unique among the registrations currently live.
+- **`carbonID` comes from a monotonic counter** stored on each registration
+  (not from the action). It only needs to be unique among the registrations
+  currently live, and a counter never hands out a live id twice, including
+  across rebinds and `suspendAll`/`resumeAll`.
 - **Hidden languages are not registered**, but their binding stays in
   UserDefaults and comes back on un-hide (invariant 2).
 - **New languages default to unbound.** Auto-assigning ⌘4, ⌘5… invites
