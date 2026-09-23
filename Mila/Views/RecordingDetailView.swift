@@ -12,6 +12,7 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var modelManager: ModelManager
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -176,7 +177,8 @@ struct RecordingDetailView: View {
     }
 
     private var actionButtons: some View {
-        let currentLang = RecordingLanguage.fromCode(recording.language)
+        let currentLang = languageSettings.resolve(recording.language)
+        let otherLang = languageSettings.visible.first { $0.code != currentLang.code }
         let busy = transcription.activeRecordingID == recording.id
                    || transcription.pendingIDs.contains(recording.id)
         // Icon-only buttons with hover tooltips. Labeled buttons here
@@ -196,11 +198,13 @@ struct RecordingDetailView: View {
                     Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
                           systemImage: "arrow.clockwise")
                 }
-                Button {
-                    retranscribe(in: currentLang.other)
-                } label: {
-                    Label("\(currentLang.other.flagEmoji) \(currentLang.other.displayName)",
-                          systemImage: "arrow.triangle.2.circlepath")
+                if let otherLang {
+                    Button {
+                        retranscribe(in: otherLang)
+                    } label: {
+                        Label("\(otherLang.flagEmoji) \(otherLang.displayName)",
+                              systemImage: "arrow.triangle.2.circlepath")
+                    }
                 }
             } label: {
                 Image(systemName: "text.badge.checkmark")
@@ -255,7 +259,7 @@ struct RecordingDetailView: View {
         // Mutate only language+status on the LIVE record so we don't clobber a
         // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
         guard let prepared = store.prepareForRetranscription(id: recording.id,
-                                                             language: language.rawValue)
+                                                             language: language.code)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
     }
@@ -474,9 +478,11 @@ struct RecordingDetailView: View {
                                      ? .rightToLeft : .leftToRight)
                     }
                     .contextMenu {
-                        let other = RecordingLanguage.fromCode(recording.language).other
-                        Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
-                            retranscribe(in: other)
+                        let current = languageSettings.resolve(recording.language)
+                        if let other = languageSettings.visible.first(where: { $0.code != current.code }) {
+                            Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
+                                retranscribe(in: other)
+                            }
                         }
                         Button("Copy transcript") { copyTranscript() }
                             .disabled(recording.fullText.isEmpty)

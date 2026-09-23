@@ -60,7 +60,7 @@ struct LiveAIRecordingView: View {
 
     /// Recording's current language. Drives RTL handling for the
     /// transcript pane + friendly speaker labels.
-    private var language: String { languageSettings.current.rawValue }
+    private var language: String { languageSettings.current.code }
     private var isRTL: Bool { language == "he" }
     private var aiActive: Bool {
         liveAISettings.enabled && llmSettings.isConfigured

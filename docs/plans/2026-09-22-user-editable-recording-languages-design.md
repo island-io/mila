@@ -139,14 +139,17 @@ recordings*, while stored codes stay resolvable **forever**.
 
 `resolve` order (all steps lowercase first):
 
-1. **legacy aliases** → `he`: `iw` (Locale does not canonicalize it — checked)
-   and `auto` (the retired auto-detect; `fromCode` documents that those
-   recordings are read as Hebrew). Model routing overrides `auto` separately —
-   see below.
+1. **legacy aliases** → `he`: `iw` (Locale does not canonicalize it — checked),
+   `auto` (the retired auto-detect; `fromCode` documents that those
+   recordings are read as Hebrew) and `""` (pinned by the existing
+   `fromCode("")` test). Model routing overrides `auto` separately — see
+   below.
 2. exact match in the list, **hidden entries included**
 3. variant match — `he-IL`, `he_IL` → `he`. The existing `isVariant` guard is
    kept verbatim: a bare `hasPrefix` would route `"enochian"` to English.
-4. synthesized, not stored: the code with `Locale`-derived name and direction,
+4. a seed with that code — only reachable when a hand-edited list dropped it
+   entirely, and keeps old `he` rows on ivrit.ai even then
+5. synthesized, not stored: the code with `Locale`-derived name and direction,
    no flag, `modelName` nil. Reachable only by a code that was never in the
    list — a hand-edited file, or a config import that was skipped.
 
@@ -155,7 +158,7 @@ merely non-crashing: after removing Hebrew, `resolve("he")` still returns
 Hebrew with its flag and its ivrit.ai model.
 
 **Behavior change, stated:** today an unrecognised code (say `"fr"`) displays as
-Hebrew. After this change it displays as French. Only `auto` and `iw` keep the
+Hebrew. After this change it displays as French. Only `auto`, `iw` and `""` keep the
 Hebrew fallback; that is what the legacy contract was for.
 
 **Every `RecordingLanguage.fromCode(…)` call site becomes `resolve`:**
@@ -304,7 +307,7 @@ recording gets an **English** summary and action items.
 - `auto` resolves to `resolve(code).displayName` for the recording's (or live
   session's) own code. The result is still a concrete language name.
 - The heuristic survives for two codes where the declared language says
-  nothing: legacy `auto`, and a synthesized unknown (resolve step 4).
+  nothing: legacy `auto`, and a synthesized unknown (resolve step 5).
 - `LiveAIRecordingView.aiOutputIsRTL` reads the resolved `isRTL`.
 
 ---
@@ -364,9 +367,10 @@ of `allCases`. Otherwise it is unchanged.
 
 **`FileTranscriber.importFile`'s default argument is deleted.** Its
 `language: RecordingLanguage = .hebrew` (`FileTranscriber.swift:13`) has no
-case to name on a struct. Both callers already pass `languageSettings.current`
-(`VoiceMemosImporter.swift:283`, `QuickActionsController.swift:1502`), so the
-default was never used.
+case to name on a struct. Both production callers already pass
+`languageSettings.current` (`VoiceMemosImporter.swift:283`,
+`QuickActionsController.swift:1502`); only `FileTranscriberTests` relied on
+the default, and now passes `.hebrew` (a seed constant) explicitly.
 
 ---
 

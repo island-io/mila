@@ -396,10 +396,8 @@ final class RemoteTranscriptionSettings: ObservableObject {
         let english = englishModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !english.isEmpty else { return primary }
         if languageCode.lowercased() == "auto" { return english }
-        switch RecordingLanguage.fromCode(languageCode) {
-        case .hebrew:   return primary
-        case .english:  return english
-        }
+        let resolved = RecordingLanguage.resolve(languageCode, in: RecordingLanguage.seeds)
+        return resolved.code == "en" ? english : primary
     }
 
     /// Trim a user-entered model id, falling back to the default when blank.

@@ -149,8 +149,8 @@ final class MilaConfigImporter: ObservableObject {
             }
         }
         if let langCode = config.recordingLanguage {
-            let target = RecordingLanguage.fromCode(langCode)
-            if target != language.current {
+            let target = language.resolve(langCode)
+            if target.code != language.current.code {
                 out.append(.init(label: "Recording language", value: target.displayName))
             }
         }
@@ -188,7 +188,7 @@ final class MilaConfigImporter: ObservableObject {
             if let enabled = r.enabled { remote.backend = enabled ? .remote : .local }
         }
         if let langCode = config.recordingLanguage {
-            language.current = RecordingLanguage.fromCode(langCode)
+            language.current = language.resolve(langCode)
         }
         if let live = config.liveAI {
             if let enabled = live.enabled { liveAI.enabled = enabled }

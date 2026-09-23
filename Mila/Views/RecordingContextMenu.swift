@@ -30,6 +30,7 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var llm: LLMSettings
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     @State private var renameRequest: String?
     @State private var promptForNewFolder = false
@@ -120,7 +121,8 @@ private struct RecordingContextMenu: ViewModifier {
                 }
             }
             Divider()
-            let currentLang = RecordingLanguage.fromCode(recording.language)
+            let currentLang = languageSettings.resolve(recording.language)
+            let otherLang = languageSettings.visible.first { $0.code != currentLang.code }
             // Busy = this recording is already transcribing or queued. We gate
             // BEFORE mutating the store: `enqueue` drops active/queued ids, but
             // `prepareForRetranscription` persists `.pending`/language first, so
@@ -138,10 +140,12 @@ private struct RecordingContextMenu: ViewModifier {
                 transcription.enqueue(prepared, isRetranscription: true)
             }
             .disabled(isBusy)
-            Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
-                retranscribe(recording, in: currentLang.other)
+            if let otherLang {
+                Button("Re-transcribe in \(otherLang.flagEmoji) \(otherLang.displayName)") {
+                    retranscribe(recording, in: otherLang)
+                }
+                .disabled(isBusy)
             }
-            .disabled(isBusy)
             if llm.isConfigured {
                 Divider()
                 Button("Send to \(llm.tool.displayName)…") {
@@ -181,7 +185,7 @@ private struct RecordingContextMenu: ViewModifier {
         // Mutate only language+status on the LIVE record so we don't clobber a
         // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
         guard let prepared = store.prepareForRetranscription(id: recording.id,
-                                                             language: language.rawValue)
+                                                             language: language.code)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
     }

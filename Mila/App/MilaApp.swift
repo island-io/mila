@@ -1736,7 +1736,7 @@ struct MilaApp: App {
                     // is saved.
                     diarizer?.submit(samples: samples, startSeconds: start, endSeconds: end)
                 }
-                transcriber.start(language: langSettings.current.rawValue)
+                transcriber.start(language: langSettings.current.code)
                 print("wireLiveAIPipeline: .recording — installing onLiveSamples → liveTranscriber.ingest")
                 sessionRef.onLiveSamples = { [weak transcriber] samples in
                     // The callback is invoked synchronously from
@@ -2116,7 +2116,7 @@ struct MilaApp: App {
         guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
-        transcription.prewarm(language: languageSettings.current.rawValue)
+        transcription.prewarm(language: languageSettings.current.code)
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest

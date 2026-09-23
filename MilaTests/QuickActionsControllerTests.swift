@@ -620,7 +620,7 @@ final class QuickActionsControllerTests: XCTestCase {
             source: .microphone,
             audioFileName: url.lastPathComponent,
             status: .pending,
-            language: languageSettings.current.rawValue
+            language: languageSettings.current.code
         )
         store.add(recording)
 
@@ -689,7 +689,7 @@ final class QuickActionsControllerTests: XCTestCase {
             source: .microphone,
             audioFileName: url.lastPathComponent,
             status: .completed,
-            language: languageSettings.current.rawValue,
+            language: languageSettings.current.code,
             segments: [TranscriptSegment(start: 0, end: 0.6,
                                          text: "the whole conversation including the tail")],
             fullText: "the whole conversation including the tail"
@@ -787,7 +787,7 @@ final class QuickActionsControllerTests: XCTestCase {
             source: .microphone,
             audioFileName: url.lastPathComponent,
             status: .completed,
-            language: languageSettings.current.rawValue,
+            language: languageSettings.current.code,
             // Over-segmented enough that `shouldRediarize` alone would say yes.
             segments: [TranscriptSegment(start: 0, end: 1, text: "a", speaker: "SPEAKER_00"),
                        TranscriptSegment(start: 1, end: 2, text: "b", speaker: "SPEAKER_01"),

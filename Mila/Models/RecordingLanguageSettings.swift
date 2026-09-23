@@ -1,100 +1,188 @@
 import Foundation
 import Combine
 
-/// The language a freshly-started voice memo / app-audio recording will be
-/// transcribed in. Surfaced in the toolbar as a flag dropdown so users can
-/// flip between Hebrew (ivrit.ai model) and English (OpenAI model) without
-/// digging into Settings.
+/// One language a recording can be transcribed in: an entry in the user's
+/// editable list (Settings → Languages), seeded with Hebrew and English.
 ///
-/// Persisted to `UserDefaults` so the choice sticks across launches.
 /// The language is always an explicit choice — there is deliberately no
 /// auto-detect option. Detection sounds free but isn't: it can only be as good
 /// as the model behind it, and the model itself is picked *from* this setting
-/// (Hebrew → the ivrit.ai finetune, English → the multilingual one, and the
-/// same split for a remote endpoint's two model ids). "Let the model decide"
-/// therefore meant "guess which specialist to ask before knowing the
+/// (Hebrew → the ivrit.ai finetune, everything else → the multilingual one,
+/// and the same split for a remote endpoint's two model ids). "Let the model
+/// decide" therefore meant "guess which specialist to ask before knowing the
 /// language", which produced worse transcripts than simply saying which
 /// language you're about to speak. Legacy `"auto"` values are read as Hebrew.
-enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
-    case hebrew = "he"
-    case english = "en"
+///
+/// `Recording.language` stores only the code, so this type is a UI and
+/// routing layer over that string — never part of recordings.json.
+struct RecordingLanguage: Identifiable, Hashable, Codable {
+    /// A whisper language code (`"he"`, `"ru"`), lowercased. The id.
+    var code: String
+    /// Regional flag shown in pickers. Empty means none — a language is not a
+    /// country, so there is no flag to derive (English → 🇬🇧 or 🇺🇸 is a
+    /// preference).
+    var flagEmoji: String
+    /// `WhisperModel.name` to transcribe with locally; nil = the multilingual
+    /// default.
+    var modelName: String?
+    /// Removed by the user. Kept rather than deleted so recordings already in
+    /// this language still resolve to its flag, direction and model — and so
+    /// adding it back restores its settings.
+    var isHidden: Bool
 
-    var id: String { rawValue }
+    var id: String { code }
 
+    init(code: String, flagEmoji: String = "", modelName: String? = nil, isHidden: Bool = false) {
+        self.code = code.lowercased()
+        self.flagEmoji = flagEmoji
+        self.modelName = modelName
+        self.isHidden = isHidden
+    }
+
+    /// English name from CLDR, matching Mila's English-only chrome.
     var displayName: String {
-        switch self {
-        case .hebrew:  return "Hebrew"
-        case .english: return "English"
-        }
+        Locale(identifier: "en").localizedString(forLanguageCode: code) ?? code.uppercased()
     }
 
-    /// Regional flag emoji used in the toolbar picker. Hebrew shows the
-    /// Israeli flag; English shows the British flag (matches the user's
-    /// "Israel and UK" mental model).
-    var flagEmoji: String {
-        switch self {
-        case .hebrew:  return "🇮🇱"
-        case .english: return "🇬🇧"
-        }
+    /// Script direction from CLDR, so Arabic, Farsi, Urdu and Yiddish lay out
+    /// right-to-left without anyone having to know to tick a box.
+    var isRTL: Bool {
+        Locale.Language(identifier: code).characterDirection == .rightToLeft
     }
 
-    /// The opposite-language pair, used by the right-click "Re-transcribe in
-    /// the other language" menu item on a recording.
-    var other: RecordingLanguage {
-        switch self {
-        case .hebrew:  return .english
-        case .english: return .hebrew
-        }
+    // Lenient decode: a list written by a newer build may lack or add fields,
+    // and a failed decode would throw away the user's whole list.
+    private enum CodingKeys: String, CodingKey { case code, flagEmoji, modelName, isHidden }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(code: try c.decode(String.self, forKey: .code),
+                  flagEmoji: try c.decodeIfPresent(String.self, forKey: .flagEmoji) ?? "",
+                  modelName: try c.decodeIfPresent(String.self, forKey: .modelName),
+                  isHidden: try c.decodeIfPresent(Bool.self, forKey: .isHidden) ?? false)
     }
 
-    /// Best-effort decode of an ISO-style language string (`"he"`, `"he-IL"`,
-    /// `"iw"`, `"en"`, `"en-US"`, …). Falls back to Hebrew for legacy
-    /// recordings that pre-date the per-language UX (those were always Hebrew
-    /// before the rename) and for the retired `"auto"`.
-    static func fromCode(_ code: String) -> RecordingLanguage {
-        let normalized = code.lowercased()
-        if normalized == "iw" || isVariant(normalized, of: "he") { return .hebrew }
-        if isVariant(normalized, of: "en") { return .english }
-        return .hebrew
+    // MARK: - Seeds
+
+    static let hebrew = RecordingLanguage(code: "he", flagEmoji: "🇮🇱",
+                                          modelName: "ivrit-ai-whisper-large-v3")
+    /// British flag matches the user's "Israel and UK" mental model.
+    static let english = RecordingLanguage(code: "en", flagEmoji: "🇬🇧",
+                                           modelName: "openai-whisper-large-v3-turbo")
+
+    /// The list a fresh install starts with, in picker order.
+    static let seeds: [RecordingLanguage] = [.hebrew, .english]
+
+    // MARK: - Resolution
+
+    /// The entry a stored code means — for displaying and re-transcribing a
+    /// recording. Never nil, and deliberately looks at HIDDEN entries too:
+    /// removing a language only stops offering it, while every recording
+    /// already made in it must keep resolving forever.
+    ///
+    /// Order:
+    /// 1. legacy aliases → `he`: `iw` (Locale doesn't canonicalize it), the
+    ///    retired `auto`, and `""` — recordings from before per-language UX
+    ///    were always Hebrew. Model routing handles `auto` separately.
+    /// 2. exact match in `list`
+    /// 3. regional variant in `list` (`he-IL`, `en_GB`)
+    /// 4. a seed with that code (a hand-edited list that dropped it)
+    /// 5. synthesized: Locale-derived name/direction, no flag, default model
+    nonisolated static func resolve(_ code: String, in list: [RecordingLanguage]) -> RecordingLanguage {
+        var normalized = code.lowercased()
+        if ["iw", "auto", ""].contains(normalized) { normalized = "he" }
+        if let exact = list.first(where: { $0.code == normalized }) { return exact }
+        if let variant = list.first(where: { isVariant(normalized, of: $0.code) }) { return variant }
+        if let seed = seeds.first(where: { isVariant(normalized, of: $0.code) }) { return seed }
+        return RecordingLanguage(code: normalized)
     }
 
     /// Whether `code` is `base` or a regional form of it (`en-US`, `en_GB`).
     /// A bare `hasPrefix` would also swallow unrelated codes that merely start
-    /// with those letters — `"enochian"` must fall back to Hebrew like any
-    /// other unrecognised value, not pick the English model.
-    private static func isVariant(_ code: String, of base: String) -> Bool {
+    /// with those letters — `"enochian"` must not pick the English model.
+    nonisolated static func isVariant(_ code: String, of base: String) -> Bool {
         code == base || code.hasPrefix("\(base)-") || code.hasPrefix("\(base)_")
     }
 }
 
+/// The user's language list and the language the next recording uses.
 @MainActor
 final class RecordingLanguageSettings: ObservableObject {
-    /// Language to use for the next voice memo / app-audio recording.
-    @Published var current: RecordingLanguage {
+    /// Every entry, hidden ones included (they back `resolve`). Publishes only
+    /// on user edits — never at audio cadence — so it is safe on this
+    /// App-level `@StateObject` (#280).
+    @Published private(set) var languages: [RecordingLanguage]
+
+    /// Code of the language for the next voice memo / app-audio recording.
+    /// Always a visible entry.
+    @Published private(set) var currentCode: String {
         didSet {
-            guard current != oldValue else { return }
-            defaults.set(current.rawValue, forKey: Self.key)
+            guard currentCode != oldValue else { return }
+            defaults.set(currentCode, forKey: Self.key)
         }
     }
 
+    /// The active language. Setting an entry that isn't visible is ignored —
+    /// the active language must always be one the pickers offer.
+    var current: RecordingLanguage {
+        get { resolve(currentCode) }
+        set {
+            guard let entry = configured(newValue.code) else { return }
+            currentCode = entry.code
+        }
+    }
+
+    /// Entries the pickers offer, in list order.
+    var visible: [RecordingLanguage] { languages.filter { !$0.isHidden } }
+
     private let defaults: UserDefaults
     private static let key = "recording.language"
+    private static let listKey = "recording.languages"
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        let raw = defaults.string(forKey: Self.key)
-        if let raw, let stored = RecordingLanguage(rawValue: raw) {
-            self.current = stored
+
+        // Seed only when the key is ABSENT. Undecodable bytes (or a list with
+        // nothing visible) fall back to the seeds in memory but are left on
+        // disk untouched, so a decode bug never overwrites the user's list.
+        let loaded: [RecordingLanguage]
+        if let data = defaults.data(forKey: Self.listKey) {
+            let decoded = try? JSONDecoder().decode([RecordingLanguage].self, from: data)
+            loaded = (decoded?.contains { !$0.isHidden } == true) ? decoded! : RecordingLanguage.seeds
         } else {
-            // Unrecognised — a fresh install, or the retired `"auto"` left in
-            // defaults by an older build. Fall back to Hebrew and rewrite the
-            // key: `current`'s `didSet` doesn't fire from `init`, so without
-            // this the stale value would sit in the plist until the user
-            // touched the picker.
-            self.current = .hebrew
-            if raw != nil {
-                defaults.set(RecordingLanguage.hebrew.rawValue, forKey: Self.key)
+            loaded = RecordingLanguage.seeds
+            if let data = try? JSONEncoder().encode(loaded) {
+                defaults.set(data, forKey: Self.listKey)
             }
         }
+        self.languages = loaded
+
+        // Stored code → the visible entry it means; anything else (a fresh
+        // install, the retired "auto", a since-removed language) lands on the
+        // first visible entry. Rewrite a stored value that changed — `didSet`
+        // doesn't fire from `init`, so a stale value would otherwise sit in
+        // the plist until the user touched the picker. A fresh install writes
+        // nothing: "never chosen" stays distinguishable from "chose Hebrew".
+        let raw = defaults.string(forKey: Self.key)
+        let firstVisible = loaded.first { !$0.isHidden }!.code
+        let resolved = raw.map { RecordingLanguage.resolve($0, in: loaded) }
+        let active = resolved.flatMap { r in loaded.first { $0.code == r.code && !$0.isHidden } }?.code
+            ?? firstVisible
+        self.currentCode = active
+        if let raw, raw != active {
+            defaults.set(active, forKey: Self.key)
+        }
+    }
+
+    /// The visible entry for `code` (exact or regional variant), or nil.
+    /// Drives every picker: a hidden or unknown language is not offered.
+    func configured(_ code: String) -> RecordingLanguage? {
+        let r = RecordingLanguage.resolve(code, in: languages)
+        return visible.first { $0.code == r.code }
+    }
+
+    /// What a stored code means, hidden entries included. Never nil.
+    func resolve(_ code: String) -> RecordingLanguage {
+        RecordingLanguage.resolve(code, in: languages)
     }
 }

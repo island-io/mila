@@ -24,7 +24,7 @@ final class FileTranscriberTests: XCTestCase {
         let source = tempRoot.appendingPathComponent("source.wav")
         try TestSupport.writeStereo48kSineWav(at: source, durationSeconds: 1.0)
 
-        let recording = try await FileTranscriber.importFile(at: source, into: store)
+        let recording = try await FileTranscriber.importFile(at: source, into: store, language: .hebrew)
 
         XCTAssertEqual(recording.title, "source")
         XCTAssertEqual(recording.source, .systemAudio)
@@ -45,7 +45,7 @@ final class FileTranscriberTests: XCTestCase {
         let source = tempRoot.appendingPathComponent("native.wav")
         try TestSupport.writeSineWav(at: source, durationSeconds: 0.5)
 
-        let recording = try await FileTranscriber.importFile(at: source, into: store)
+        let recording = try await FileTranscriber.importFile(at: source, into: store, language: .hebrew)
         XCTAssertEqual(recording.duration, 0.5, accuracy: 0.05)
 
         let outFile = try AVAudioFile(forReading: store.audioURL(for: recording))
@@ -56,7 +56,7 @@ final class FileTranscriberTests: XCTestCase {
     func test_import_error_throws_for_missing_file() async {
         let bogus = tempRoot.appendingPathComponent("missing.wav")
         do {
-            _ = try await FileTranscriber.importFile(at: bogus, into: store)
+            _ = try await FileTranscriber.importFile(at: bogus, into: store, language: .hebrew)
             XCTFail("Expected importing a missing file to throw")
         } catch {
             // expected

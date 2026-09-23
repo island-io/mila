@@ -792,7 +792,7 @@ final class QuickActionsController: ObservableObject {
             source: source,
             audioFileName: outputURL.lastPathComponent,
             status: initialStatus,
-            language: languageSettings.current.rawValue,
+            language: languageSettings.current.code,
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
             folder: chosenFolder,

@@ -458,7 +458,7 @@ private struct LanguagePickerToolbarItem: View {
     var body: some View {
         Menu {
             Picker("Recording language", selection: $languageSettings.current) {
-                ForEach(RecordingLanguage.allCases) { lang in
+                ForEach(languageSettings.visible) { lang in
                     Text("\(lang.flagEmoji)  \(lang.displayName)")
                         .tag(lang)
                 }
