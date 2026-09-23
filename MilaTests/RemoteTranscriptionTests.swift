@@ -101,6 +101,32 @@ final class RemoteTranscriptionSettingsTests: XCTestCase {
         XCTAssertEqual(settings.model(for: "auto"), "deepdml/faster-whisper-large-v3-turbo-ct2")
     }
 
+    /// The primary is the Hebrew specialist (ivrit.ai) in the two-model setup,
+    /// so a user-added language must go to the multilingual slot — same reason
+    /// legacy `auto` does. Before the language list existed, every non-English
+    /// code fell to the primary, which would have sent Russian to a
+    /// Hebrew-only finetune.
+    func test_non_hebrew_language_routes_to_the_multilingual_model() {
+        let settings = makeSettings()
+        settings.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
+        settings.englishModel = "deepdml/faster-whisper-large-v3-turbo-ct2"
+        for code in ["ru", "ar", "fr", "ru-RU"] {
+            XCTAssertEqual(settings.model(for: code), "deepdml/faster-whisper-large-v3-turbo-ct2",
+                           "\(code) must not land on the Hebrew-only primary")
+        }
+        XCTAssertEqual(settings.model(for: ""), "ivrit-ai/whisper-large-v3-turbo-ct2",
+                       "a code-less legacy recording is Hebrew, like `iw`")
+    }
+
+    /// A single-model endpoint is unchanged: with no multilingual id, every
+    /// language — new ones included — goes to the one model there is.
+    func test_non_hebrew_language_uses_primary_on_a_single_model_endpoint() {
+        let settings = makeSettings()
+        settings.model = "Systran/faster-whisper-large-v3"
+        XCTAssertEqual(settings.englishModel, "")
+        XCTAssertEqual(settings.model(for: "ru"), "Systran/faster-whisper-large-v3")
+    }
+
     func test_modelForLanguage_trimsWhitespace() {
         let settings = makeSettings()
         settings.model = "  primary  "
