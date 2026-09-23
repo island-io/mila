@@ -36,4 +36,31 @@ final class LanguageParamsTests: XCTestCase {
             XCTAssertFalse(p.detectLanguage)
         }
     }
+
+    // MARK: - supportedLanguageCodes
+
+    /// The Languages settings tab offers exactly this list, and whatever the
+    /// user picks is handed to `whisper_lang_id` verbatim — so every entry
+    /// must be a code whisper itself resolves.
+    func test_supported_language_codes_include_the_ones_mila_relies_on() {
+        let codes = WhisperEngine.supportedLanguageCodes
+        for code in ["he", "en", "ru", "ar"] {
+            XCTAssertTrue(codes.contains(code), "\(code) missing from whisper's language table")
+        }
+    }
+
+    func test_supported_language_codes_are_unique_base_codes() {
+        let codes = WhisperEngine.supportedLanguageCodes
+        XCTAssertEqual(Set(codes).count, codes.count, "duplicate language codes")
+        for code in codes {
+            XCTAssertEqual(code, code.lowercased())
+            XCTAssertFalse(code.contains("-") || code.contains("_"),
+                           "\(code) is a regional variant; whisper's table has base codes only")
+        }
+    }
+
+    func test_supported_language_codes_exclude_auto() {
+        XCTAssertFalse(WhisperEngine.supportedLanguageCodes.contains("auto"),
+                       "auto is a detect-the-language request, not a language")
+    }
 }
