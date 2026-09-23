@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import Mila
 
 @MainActor
@@ -169,5 +170,161 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         let json = Data(#"[{"code":"RU"}]"#.utf8)
         let decoded = try JSONDecoder().decode([RecordingLanguage].self, from: json)
         XCTAssertEqual(decoded, [RecordingLanguage(code: "ru")])
+    }
+
+    // MARK: - Editing
+
+    func test_add_appends_a_visible_entry_with_defaults() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        let added = settings.add(code: "ru")
+        XCTAssertEqual(added, RecordingLanguage(code: "ru"))
+        XCTAssertEqual(settings.visible.map(\.code), ["he", "en", "ru"])
+        XCTAssertEqual(settings.configured("ru")?.flagEmoji, "")
+        XCTAssertNil(settings.configured("ru")?.modelName, "multilingual default")
+    }
+
+    func test_add_normalizes_case() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "RU")
+        XCTAssertEqual(settings.visible.last?.code, "ru")
+    }
+
+    /// The stored code reaches whisper verbatim, so only codes whisper knows
+    /// can be added — a regional variant or a typo would not transcribe.
+    func test_add_rejects_codes_whisper_does_not_support() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        for code in ["ru-RU", "rus", "auto", "", "klingon"] {
+            XCTAssertNil(settings.add(code: code), "\(code) must be rejected")
+        }
+        XCTAssertEqual(settings.visible.map(\.code), ["he", "en"])
+    }
+
+    func test_add_of_a_visible_code_is_a_no_op() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(settings.add(code: "he"), .hebrew)
+        XCTAssertEqual(settings.languages.map(\.code), ["he", "en"], "no duplicate entry")
+    }
+
+    func test_remove_hides_and_keeps_the_record() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertTrue(settings.remove(code: "en"))
+        XCTAssertEqual(settings.visible.map(\.code), ["he"])
+        XCTAssertEqual(settings.languages.first { $0.code == "en" }?.isHidden, true)
+        XCTAssertNil(settings.configured("en"), "no longer offered")
+    }
+
+    /// Remove-then-add is a lossless round trip: the flag and model the user
+    /// set come back, and the entry keeps its place in the list.
+    func test_adding_a_hidden_code_unhides_it_with_its_settings() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ru")
+        settings.update(RecordingLanguage(code: "ru", flagEmoji: "🇷🇺",
+                                          modelName: WhisperModel.ivritLarge.name))
+        settings.remove(code: "ru")
+
+        let back = settings.add(code: "ru")
+        XCTAssertEqual(back?.flagEmoji, "🇷🇺")
+        XCTAssertEqual(back?.modelName, WhisperModel.ivritLarge.name)
+        XCTAssertEqual(settings.languages.map(\.code), ["he", "en", "ru"])
+        XCTAssertEqual(settings.visible.map(\.code), ["he", "en", "ru"])
+    }
+
+    func test_the_last_visible_language_cannot_be_removed() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertTrue(settings.remove(code: "en"))
+        XCTAssertFalse(settings.remove(code: "he"))
+        XCTAssertEqual(settings.visible.map(\.code), ["he"])
+    }
+
+    func test_removing_an_unknown_or_hidden_code_is_refused() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertFalse(settings.remove(code: "ru"))
+        settings.remove(code: "en")
+        XCTAssertFalse(settings.remove(code: "en"))
+    }
+
+    func test_removing_the_active_language_repoints_to_the_first_visible_entry() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.current = .english
+        settings.remove(code: "en")
+        XCTAssertEqual(settings.current.code, "he")
+        XCTAssertEqual(defaults.string(forKey: "recording.language"), "he")
+    }
+
+    func test_edits_persist_across_instances() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ru")
+        settings.update(RecordingLanguage(code: "ru", flagEmoji: "🇷🇺"))
+        settings.remove(code: "en")
+
+        let reloaded = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(reloaded.visible.map(\.code), ["he", "ru"])
+        XCTAssertEqual(reloaded.configured("ru")?.flagEmoji, "🇷🇺")
+        XCTAssertEqual(reloaded.resolve("en").isHidden, true)
+    }
+
+    /// `update` edits flag and model only — it is not a back door around
+    /// remove's last-visible guard or add's whisper check.
+    func test_update_changes_flag_and_model_but_not_visibility() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.update(RecordingLanguage(code: "he", flagEmoji: "✡️",
+                                          modelName: WhisperModel.openaiTurbo.name,
+                                          isHidden: true))
+        let he = settings.resolve("he")
+        XCTAssertEqual(he.flagEmoji, "✡️")
+        XCTAssertEqual(he.modelName, WhisperModel.openaiTurbo.name)
+        XCTAssertFalse(he.isHidden)
+        XCTAssertEqual(settings.current.flagEmoji, "✡️", "the active language reflects the edit")
+
+        settings.update(RecordingLanguage(code: "ru", flagEmoji: "🇷🇺"))
+        XCTAssertFalse(settings.languages.contains { $0.code == "ru" },
+                       "update does not add")
+    }
+
+    /// Each edit is ONE publish: the list is on an App-level @StateObject,
+    /// where every publish re-diffs every scene (#280).
+    func test_each_edit_publishes_once() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        var publishes = 0
+        let sub = settings.objectWillChange.sink { publishes += 1 }
+        settings.add(code: "ru")
+        XCTAssertEqual(publishes, 1)
+        settings.update(RecordingLanguage(code: "ru", flagEmoji: "🇷🇺"))
+        XCTAssertEqual(publishes, 2)
+        settings.remove(code: "ru")
+        XCTAssertEqual(publishes, 3)
+        sub.cancel()
+    }
+
+    // MARK: - Removing a language must not break its recordings
+
+    /// The regression this whole design exists to prevent: removing Hebrew
+    /// must leave every `he` recording displaying as Hebrew, right-to-left,
+    /// and re-transcribing on ivrit.ai.
+    func test_removing_hebrew_keeps_hebrew_recordings_resolving() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.remove(code: "he")
+
+        let he = settings.resolve("he")
+        XCTAssertEqual(he.displayName, "Hebrew")
+        XCTAssertEqual(he.flagEmoji, "🇮🇱")
+        XCTAssertTrue(he.isRTL)
+        XCTAssertEqual(he.modelName, WhisperModel.ivritLarge.name)
+        XCTAssertEqual(settings.resolve("iw").code, "he")
+        XCTAssertNil(settings.configured("he"), "but no longer offered for new recordings")
+    }
+
+    /// Same for a user-added RTL language — the case a fallback table of the
+    /// two seeds could never have covered.
+    func test_removing_a_user_added_rtl_language_keeps_its_recordings_rtl() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ar")
+        settings.update(RecordingLanguage(code: "ar", flagEmoji: "🇸🇦"))
+        settings.remove(code: "ar")
+
+        let ar = settings.resolve("ar")
+        XCTAssertTrue(ar.isRTL)
+        XCTAssertEqual(ar.flagEmoji, "🇸🇦")
+        XCTAssertEqual(ar.displayName, "Arabic")
     }
 }

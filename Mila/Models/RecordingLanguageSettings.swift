@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import TranscriptionCore
 
 /// One language a recording can be transcribed in: an entry in the user's
 /// editable list (Settings → Languages), seeded with Hebrew and English.
@@ -184,5 +185,72 @@ final class RecordingLanguageSettings: ObservableObject {
     /// What a stored code means, hidden entries included. Never nil.
     func resolve(_ code: String) -> RecordingLanguage {
         RecordingLanguage.resolve(code, in: languages)
+    }
+
+    // MARK: - Editing
+    //
+    // Each edit assigns `languages` once — one publish, one write.
+
+    /// Offer `code` in the pickers. Returns the entry, or nil when whisper
+    /// can't transcribe the code: it reaches `whisper_lang_id` verbatim, so a
+    /// regional variant or a typo would fail at transcription time instead.
+    ///
+    /// A hidden code is un-hidden with its previous flag and model, in its
+    /// original place — removal is a lossless round trip. A visible code is
+    /// returned unchanged.
+    @discardableResult
+    func add(code: String) -> RecordingLanguage? {
+        let code = code.lowercased()
+        guard WhisperEngine.supportedLanguageCodes.contains(code) else { return nil }
+        var list = languages
+        if let i = list.firstIndex(where: { $0.code == code }) {
+            guard list[i].isHidden else { return list[i] }
+            list[i].isHidden = false
+            commit(list)
+            return list[i]
+        }
+        let entry = RecordingLanguage(code: code)
+        list.append(entry)
+        commit(list)
+        return entry
+    }
+
+    /// Stop offering `code` for new recordings. The entry is hidden, never
+    /// deleted, so recordings already in it keep their flag, direction and
+    /// model. Refused (false) for the last visible entry and for a code that
+    /// isn't visible. Removing the active language re-points it at the first
+    /// entry still visible.
+    @discardableResult
+    func remove(code: String) -> Bool {
+        let code = code.lowercased()
+        var list = languages
+        guard let i = list.firstIndex(where: { $0.code == code && !$0.isHidden }),
+              list.filter({ !$0.isHidden }).count > 1
+        else { return false }
+        list[i].isHidden = true
+        commit(list)
+        if currentCode == code, let first = visible.first {
+            currentCode = first.code
+        }
+        return true
+    }
+
+    /// Change an existing entry's flag and model. Visibility is untouched —
+    /// that goes through `add`/`remove` and their guards — and an unknown
+    /// code is ignored rather than added.
+    func update(_ entry: RecordingLanguage) {
+        var list = languages
+        guard let i = list.firstIndex(where: { $0.code == entry.code.lowercased() }) else { return }
+        list[i].flagEmoji = entry.flagEmoji
+        list[i].modelName = entry.modelName
+        guard list[i] != languages[i] else { return }
+        commit(list)
+    }
+
+    private func commit(_ list: [RecordingLanguage]) {
+        languages = list
+        if let data = try? JSONEncoder().encode(list) {
+            defaults.set(data, forKey: Self.listKey)
+        }
     }
 }
