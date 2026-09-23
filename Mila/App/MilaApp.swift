@@ -433,6 +433,9 @@ struct MilaApp: App {
                                        remoteSettings: remoteSettings)
         let session = RecordingSession()
         let langSettings = RecordingLanguageSettings()
+        // Local model routing follows the user's language list (he → ivrit.ai
+        // by seed, a new language → whatever its entry names).
+        mgr.languageModelResolver = { [langSettings] in langSettings.resolve($0).modelName }
         let audioSettings = AudioInputSettings()
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID

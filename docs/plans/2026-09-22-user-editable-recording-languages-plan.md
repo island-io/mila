@@ -126,8 +126,10 @@ seeded list`.
      unknown → turbo
    - **`test_auto_routes_to_turbo_even_though_it_resolves_to_hebrew`**
    - the fallback chain is unchanged: best not installed → selected → best
-2. Add `var languageModelResolver: (String) -> String?`, defaulting to
-   `{ _ in nil }`.
+2. Add `var languageModelResolver: @MainActor (String) -> String?`, defaulting
+   to the seeds (`resolve($0, in: seeds).modelName`), not `{ _ in nil }`. A nil
+   default would put Hebrew on the turbo in any unwired manager, and the
+   existing fallback test would keep passing for the wrong reason.
 3. In `model(for:)`, handle `code == "auto"` first (turbo), then
    `resolver(code).flatMap(WhisperModel.named) ?? .openaiTurbo`, then the
    existing fallback chain, unchanged.

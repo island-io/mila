@@ -18,7 +18,6 @@ struct WhisperModel: Identifiable, Hashable, Codable {
     /// being fetched and our parser opening it) is rejected before the bytes
     /// ever reach whisper.cpp's GGML loader.
     var sha256: String
-    var languageHint: String
 
     /// URL of an `<name>-encoder.mlmodelc.zip` (CoreML encoder build of the
     /// same model). When present, ModelManager downloads + extracts it
@@ -39,7 +38,6 @@ struct WhisperModel: Identifiable, Hashable, Codable {
         url: URL(string: "https://huggingface.co/ivrit-ai/whisper-large-v3-ggml/resolve/main/ggml-model.bin")!,
         sizeBytes: 3_095_033_483,
         sha256: "09e66ec67b2e00c6933afab6684cbf78fe023e8ad153c1848f62000e4335a07f",
-        languageHint: "he",
         // CoreML encoder mlmodelc generated via whisper.cpp's
         // convert-h5-to-coreml.py against the ivrit-ai HuggingFace
         // checkpoint, hosted by us at uriharduf/whisper-large-v3-ivrit-coreml
@@ -59,7 +57,6 @@ struct WhisperModel: Identifiable, Hashable, Codable {
         url: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin")!,
         sizeBytes: 1_624_555_275,
         sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
-        languageHint: "en",
         // CoreML encoder published by ggerganov/whisper.cpp directly.
         coreMLURL: URL(string: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-encoder.mlmodelc.zip")!,
         coreMLSizeBytes: 1_173_393_014,
@@ -68,16 +65,9 @@ struct WhisperModel: Identifiable, Hashable, Codable {
 
     static let all: [WhisperModel] = [.ivritLarge, .openaiTurbo]
 
-    /// Pick the best model the catalog knows about for a given ISO language
-    /// code. Hebrew goes to ivrit.ai's large-v3 finetune; everything else
-    /// (including the dictation English path) goes to the OpenAI turbo.
-    static func bestModel(for languageCode: String) -> WhisperModel {
-        switch languageCode.lowercased() {
-        case "he", "he-il", "iw":
-            return .ivritLarge
-        default:
-            return .openaiTurbo
-        }
+    /// The catalog entry with this `name`, if any.
+    static func named(_ name: String) -> WhisperModel? {
+        all.first { $0.name == name }
     }
 }
 
@@ -87,6 +77,15 @@ final class ModelManager: NSObject, ObservableObject {
     @Published private(set) var installed: Set<String> = []
     @Published private(set) var downloads: [String: Double] = [:]
     @Published var selectedModelName: String
+
+    /// Language code → the `WhisperModel.name` its entry transcribes with, or
+    /// nil for the multilingual default. `MilaApp` wires this to
+    /// `RecordingLanguageSettings.resolve` — a closure rather than a
+    /// dependency, so this manager never learns about the settings object.
+    /// Unwired, it answers from the seeds: Hebrew → ivrit.ai, else turbo.
+    var languageModelResolver: @MainActor (String) -> String? = {
+        RecordingLanguage.resolve($0, in: RecordingLanguage.seeds).modelName
+    }
 
     /// Human-readable descriptions of failed model downloads, keyed by
     /// `WhisperModel.name`. Every failure path of a multi-GB fetch used to
@@ -153,7 +152,7 @@ final class ModelManager: NSObject, ObservableObject {
     }
 
     func selectedModel() -> WhisperModel? {
-        WhisperModel.all.first { $0.name == selectedModelName }
+        WhisperModel.named(selectedModelName)
     }
 
     func setSelected(_ model: WhisperModel) {
@@ -162,17 +161,25 @@ final class ModelManager: NSObject, ObservableObject {
         defaults.set(model.name, forKey: "selectedModelName")
     }
 
+    /// The model the language's entry asks for, installed or not. A missing or
+    /// unknown model name falls to the multilingual turbo.
+    ///
+    /// Legacy `"auto"` (the retired auto-detect option) is checked FIRST: it
+    /// displays as Hebrew, but only the multilingual model can serve a
+    /// detect-the-language pass, and that is what it has always transcribed
+    /// on. Only reachable by re-transcribing a recording made before
+    /// auto-detect was removed.
+    func bestModel(for languageCode: String) -> WhisperModel {
+        if languageCode.lowercased() == "auto" { return .openaiTurbo }
+        return languageModelResolver(languageCode).flatMap(WhisperModel.named) ?? .openaiTurbo
+    }
+
     /// The model the app should use when transcribing audio in `languageCode`.
     /// Falls back to `selectedModel()` if the language-best model isn't
     /// installed yet (so dictation can still work in offline-but-different
     /// language mode while a download is in flight).
     func model(for languageCode: String) -> WhisperModel? {
-        // Legacy `"auto"` (the retired auto-detect option — see
-        // `RecordingLanguage`) resolves through `bestModel` to the turbo, the
-        // explicitly multilingual one, which is the right engine for a
-        // detect-the-language pass. Only reachable by re-transcribing a
-        // recording made before auto-detect was removed.
-        let best = WhisperModel.bestModel(for: languageCode)
+        let best = bestModel(for: languageCode)
         if isInstalled(best) { return best }
         return selectedModel().flatMap { isInstalled($0) ? $0 : nil } ?? best
     }
