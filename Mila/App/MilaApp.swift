@@ -951,6 +951,7 @@ struct MilaApp: App {
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
+                                                      languageSettings: langSettings,
                                                       liveTranscriber: dictationTrans)
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
@@ -1102,11 +1103,14 @@ struct MilaApp: App {
                 .keyboardShortcut("o", modifiers: .command)
             }
             CommandMenu("Dictation") {
-                Button("English Dictation (\(hotkeySettings.binding(for: .dictateEnglish).displayName))") {
-                    Task { await dictation.toggle(action: .dictateEnglish) }
-                }
-                Button("Hebrew Dictation (\(hotkeySettings.binding(for: .dictateHebrew).displayName))") {
-                    Task { await dictation.toggle(action: .dictateHebrew) }
+                // One item per offered language. Works without a hotkey too —
+                // the combo in the title is only a reminder.
+                ForEach(languageSettings.visible) { language in
+                    let action = HotkeyAction(languageCode: language.code)
+                    let combo = hotkeySettings.binding(for: action).map { " (\($0.displayName))" } ?? ""
+                    Button("\(language.displayName) Dictation\(combo)") {
+                        Task { await dictation.toggle(action: action) }
+                    }
                 }
             }
             // Surface the diagnostic-report action under Help so a user
@@ -1125,6 +1129,7 @@ struct MilaApp: App {
                 .environmentObject(storageSettings)
                 .environmentObject(modelManager)
                 .environmentObject(hotkeySettings)
+                .environmentObject(languageSettings)
                 .environmentObject(transcription)
                 .environmentObject(audioInputSettings)
                 .environmentObject(inputLevelMonitor)

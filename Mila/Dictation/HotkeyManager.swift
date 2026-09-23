@@ -89,37 +89,29 @@ struct HotkeyBinding: Codable, Equatable, Hashable {
     }
 }
 
-/// Logical IDs for our two dictation hotkeys. Used as both the Carbon
-/// `EventHotKeyID.id` and the storage key in `UserDefaults`.
-enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
-    case dictateEnglish
-    case dictateHebrew
+/// One dictation hotkey: "start dictating in this language". There is one per
+/// configured language, so this is a value keyed by language code rather than
+/// an enum.
+struct HotkeyAction: Hashable, Identifiable {
+    let languageCode: String
 
-    var id: String { rawValue }
-
-    var languageCode: String {
-        switch self {
-        case .dictateEnglish: return "en"
-        case .dictateHebrew:  return "he"
-        }
+    init(languageCode: String) {
+        self.languageCode = languageCode.lowercased()
     }
+
+    /// Stable id, also the UserDefaults key suffix (`hotkey.dictate.he`).
+    var id: String { "dictate.\(languageCode)" }
 
     var displayLabel: String {
-        switch self {
-        case .dictateEnglish: return "English dictation"
-        case .dictateHebrew:  return "Hebrew dictation"
-        }
+        "\(RecordingLanguage(code: languageCode).displayName) dictation"
     }
 
-    /// Carbon `EventHotKeyID.id` — must be unique per registered hotkey.
-    var carbonID: UInt32 {
-        switch self {
-        case .dictateEnglish: return 1
-        case .dictateHebrew:  return 2
-        }
-    }
+    static let dictateEnglish = HotkeyAction(languageCode: "en")
+    static let dictateHebrew = HotkeyAction(languageCode: "he")
 
-    /// Default binding chosen because:
+    /// Default bindings — only the two seed languages have one. A language
+    /// the user adds starts unbound: auto-assigning ⌘4, ⌘5… would quietly
+    /// collide with other apps' global shortcuts. Chosen because:
     ///   - `⌘⇧Space` is reserved by macOS (input-source switching) and Carbon
     ///     refuses to register it.
     ///   - `⌘1` is taken by the Window menu's "Cycle Through Windows".
@@ -130,6 +122,25 @@ enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
         .dictateHebrew:  HotkeyBinding(keyCode: UInt32(kVK_ANSI_3),
                                        modifiers: UInt32(cmdKey))
     ]
+
+    /// UserDefaults key suffixes from when this was a two-case enum
+    /// (`hotkey.dictateEnglish`). Migrated once by `HotkeySettings`.
+    static let legacyStorageNames: [HotkeyAction: String] = [
+        .dictateEnglish: "dictateEnglish",
+        .dictateHebrew: "dictateHebrew"
+    ]
+}
+
+/// The registration surface `DictationHotkeyBinder` drives — `HotkeyManager`
+/// in the app, a recorder in tests (real Carbon registrations would grab
+/// system-wide combos from inside the test host).
+@MainActor
+protocol HotkeyRegistering: AnyObject {
+    var registeredActions: Set<HotkeyAction> { get }
+    @discardableResult
+    func register(_ action: HotkeyAction, binding: HotkeyBinding,
+                  onPressed: @escaping () -> Void) -> Bool
+    func unregister(_ action: HotkeyAction)
 }
 
 /// Registers global hotkeys via the legacy Carbon API (still supported on
@@ -139,12 +150,14 @@ enum HotkeyAction: String, CaseIterable, Hashable, Identifiable {
 /// with the same action transparently replaces the previous one, so the
 /// settings UI can rebind in place without leaking handlers.
 @MainActor
-final class HotkeyManager {
+final class HotkeyManager: HotkeyRegistering {
     static let shared = HotkeyManager()
 
     private struct RegisteredHotkey {
         let action: HotkeyAction
         let binding: HotkeyBinding
+        /// Carbon `EventHotKeyID.id` this registration was made under.
+        let carbonID: UInt32
         let ref: EventHotKeyRef
         var handler: () -> Void
     }
@@ -155,6 +168,12 @@ final class HotkeyManager {
     private var suspended: [HotkeyAction: (binding: HotkeyBinding, handler: () -> Void)] = [:]
     private var eventHandler: EventHandlerRef?
     private let signature: OSType = OSType(0x49575350) // 'IWSP'
+    /// Source of Carbon hotkey ids. Only needs uniqueness among LIVE
+    /// registrations, and a counter that never repeats guarantees that across
+    /// rebinds and suspend/resume without deriving ids from user-supplied
+    /// language codes. `canRegister` probes under `UInt32.max`, which this
+    /// never reaches.
+    private var nextCarbonID: UInt32 = 1
 
     private init() {
         installEventHandler()
@@ -171,7 +190,9 @@ final class HotkeyManager {
                   onPressed: @escaping () -> Void) -> Bool {
         unregister(action)
 
-        let id = EventHotKeyID(signature: signature, id: action.carbonID)
+        let carbonID = nextCarbonID
+        nextCarbonID += 1
+        let id = EventHotKeyID(signature: signature, id: carbonID)
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(binding.keyCode,
                                          binding.modifiers,
@@ -181,14 +202,15 @@ final class HotkeyManager {
                                          &ref)
         guard status == noErr, let validRef = ref else {
             // -9878 = eventHotKeyExistsErr — combo is already taken globally.
-            print("Hotkey: RegisterEventHotKey failed for \(action) status=\(status)")
+            print("Hotkey: RegisterEventHotKey failed for \(action.id) status=\(status)")
             return false
         }
         registrations[action] = RegisteredHotkey(action: action,
                                                  binding: binding,
+                                                 carbonID: carbonID,
                                                  ref: validRef,
                                                  handler: onPressed)
-        print("Hotkey: registered \(action) -> \(binding.displayName)")
+        print("Hotkey: registered \(action.id) -> \(binding.displayName)")
         return true
     }
 
@@ -205,6 +227,8 @@ final class HotkeyManager {
     func isRegistered(_ action: HotkeyAction) -> Bool {
         registrations[action] != nil
     }
+
+    var registeredActions: Set<HotkeyAction> { Set(registrations.keys) }
 
     /// Probe whether `binding` can be registered globally right now,
     /// without keeping the registration: registers a throwaway hotkey and
@@ -293,7 +317,7 @@ final class HotkeyManager {
     }
 
     private func dispatch(carbonID: UInt32) {
-        guard let entry = registrations.values.first(where: { $0.action.carbonID == carbonID }) else {
+        guard let entry = registrations.values.first(where: { $0.carbonID == carbonID }) else {
             return
         }
         entry.handler()

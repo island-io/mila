@@ -499,6 +499,7 @@ private struct AudioSettingsTab: View {
 /// in.
 private struct GeneralSettingsTab: View {
     @EnvironmentObject private var hotkeys: HotkeySettings
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     /// The action whose hotkey the user is currently re-recording. Nil when
     /// no row is in capture mode.
@@ -515,7 +516,7 @@ private struct GeneralSettingsTab: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             VStack(spacing: 8) {
-                ForEach(HotkeyAction.allCases) { action in
+                ForEach(languageSettings.visible.map { HotkeyAction(languageCode: $0.code) }) { action in
                     HotkeyRow(action: action,
                               isRecording: recordingAction == action,
                               // Live-registration warning: register() can fail
@@ -524,6 +525,7 @@ private struct GeneralSettingsTab: View {
                               // Suppressed mid-capture — suspendAll() has
                               // deliberately parked everything then.
                               showsInactiveWarning: recordingAction == nil
+                                  && hotkeys.binding(for: action) != nil
                                   && !HotkeyManager.shared.isRegistered(action),
                               onStartRecording: {
                                   recordingAction = action
@@ -577,11 +579,11 @@ private struct GeneralSettingsTab: View {
             return
         }
 
-        // Reject collisions with the *other* action so the user doesn't
-        // shoot themselves in the foot.
-        for other in HotkeyAction.allCases where other != action {
-            let existing = hotkeys.binding(for: other)
-            if existing == binding {
+        // Reject collisions with another offered language so the user
+        // doesn't shoot themselves in the foot.
+        for other in languageSettings.visible.map({ HotkeyAction(languageCode: $0.code) })
+            where other != action {
+            if hotkeys.binding(for: other) == binding {
                 lastError = "\(binding.displayName) is already used for \(other.displayLabel)."
                 return
             }
@@ -694,12 +696,12 @@ private struct HotkeyRow: View {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                     .help("This combo couldn't be registered — another app or macOS owns it globally. Pick a different one or hit Reset.")
-                    .accessibilityIdentifier("hotkeys.\(action.rawValue).inactive")
+                    .accessibilityIdentifier("hotkeys.\(action.id).inactive")
             }
 
             Spacer()
 
-            HotkeyCaptureField(currentDisplay: hotkeys.binding(for: action).displayName,
+            HotkeyCaptureField(currentDisplay: hotkeys.binding(for: action)?.displayName ?? "Set shortcut",
                                isRecording: isRecording,
                                onStartRecording: onStartRecording,
                                onCaptured: onCaptured,
