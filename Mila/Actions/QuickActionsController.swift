@@ -64,6 +64,10 @@ final class QuickActionsController: ObservableObject {
     /// new app and the user has to re-grant access.
     @Published var microphonePermissionMissing = false
 
+    /// Set by `stopRecording` in batch-only mode to navigate the sidebar
+    /// to the saved recording and bring Mila to the front.
+    @Published var revealRecordingID: UUID?
+
     /// Mila folder the *next* recording is filed into (nil = All Transcriptions).
     /// Always defaults to All Transcriptions on launch — the choice is
     /// per-session only and deliberately NOT persisted across launches, so a
@@ -145,6 +149,9 @@ final class QuickActionsController: ObservableObject {
     /// transcript — but only once that stored transcript is final. See the
     /// ordering note in `stopRecording` at `store.add`.
     var liveSidecarWriter: LiveTranscriptSidecarWriter?
+    /// When `batchOnly` is on, the live pipeline is skipped entirely and
+    /// the rename sheet is not shown after stop.
+    var postRecordingSettings: PostRecordingSettings?
 
     /// True only while `stopRecording` is running its inline LIVE-PIPELINE
     /// drain — the short, bounded window where it flushes the transcriber
@@ -855,8 +862,14 @@ final class QuickActionsController: ObservableObject {
                 wasOnBattery: !SleepGuard.isOnACPower()
             )
         }
-        if sleepReason == nil {
+        let batchOnly = postRecordingSettings?.batchOnly == true
+        if sleepReason == nil && !batchOnly {
             postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
+        } else if batchOnly {
+            if !titleWasUserProvided {
+                postRecording.autoSuggestOnly(for: recording)
+            }
+            revealRecordingID = recording.id
         }
 
         // ---- INLINE LIVE-PIPELINE DRAIN: finalize whatever was still

@@ -217,6 +217,13 @@ struct ContentView: View {
             // flicker.
             NotificationCenter.default.post(name: .milaSidebarVisibilityDidChange, object: nil)
         }
+        .onChange(of: actions.revealRecordingID) { _, id in
+            guard let id else { return }
+            selection = .recording(id)
+            actions.revealRecordingID = nil
+            // Bring Mila to the front so the user sees the recording.
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     /// True while the detail pane is showing the "Recently Deleted" list —

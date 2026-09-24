@@ -343,6 +343,7 @@ struct MilaApp: App {
     @StateObject private var diarizationSettings: DiarizationSettings
     @StateObject private var remoteTranscriptionSettings: RemoteTranscriptionSettings
     @StateObject private var meetingDetectionSettings: MeetingDetectionSettings
+    @StateObject private var postRecordingSettings: PostRecordingSettings
     @StateObject private var meetingDetector: MeetingDetector
     @StateObject private var meetingPrompt: MeetingPromptCoordinator
     @StateObject private var liveAISettings: LiveAISettings
@@ -889,6 +890,8 @@ struct MilaApp: App {
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
+        let postRecSettings = PostRecordingSettings()
+        actions.postRecordingSettings = postRecSettings
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -919,6 +922,7 @@ struct MilaApp: App {
         _inputLevelMonitor = StateObject(wrappedValue: inputMonitor)
         _llmSettings = StateObject(wrappedValue: llm)
         _postRecording = StateObject(wrappedValue: coordinator)
+        _postRecordingSettings = StateObject(wrappedValue: postRecSettings)
         _meetingDetectionSettings = StateObject(wrappedValue: meetingSettings)
         _meetingDetector = StateObject(wrappedValue: detector)
         _meetingPrompt = StateObject(wrappedValue: promptCoordinator)
@@ -1024,6 +1028,7 @@ struct MilaApp: App {
                 .environmentObject(inputLevelMonitor.meter)
                 .environmentObject(llmSettings)
                 .environmentObject(postRecording)
+                .environmentObject(postRecordingSettings)
                 .environmentObject(diarizationSettings)
                 .environmentObject(remoteTranscriptionSettings)
                 .environmentObject(liveAISettings)
@@ -1131,6 +1136,7 @@ struct MilaApp: App {
                 .environmentObject(diarizationSettings)
                 .environmentObject(remoteTranscriptionSettings)
                 .environmentObject(meetingDetectionSettings)
+                .environmentObject(postRecordingSettings)
                 .environmentObject(liveAISettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
@@ -1606,6 +1612,7 @@ struct MilaApp: App {
         let diarSettings = diarizationSettings
         let langSettings = languageSettings
         let sessionRef = session
+        let postRecSettings = postRecordingSettings
         // `actions` captured weakly so the .idle handler can read
         // its `isFinalizingRecording` flag to decide whether the
         // drain belongs here (sleep/lock/quit path) or to
@@ -1660,9 +1667,10 @@ struct MilaApp: App {
                 // `start()`, so it cannot be fooled that way.
                 if wiredCaptureEpoch == sessionRef.captureEpoch { break }
                 wiredCaptureEpoch = sessionRef.captureEpoch
-                guard aiSettings.isLiveAIAvailable else {
-                    // Hardware below the Live AI bar AND no override
-                    // flipped. Recording still runs via RecordingSession;
+                guard aiSettings.isLiveAIAvailable, !postRecSettings.batchOnly else {
+                    // Hardware below the Live AI bar, no override
+                    // flipped, OR batch-only mode is on. Recording
+                    // still runs via RecordingSession;
                     // QuickActionsController enqueues a post-record
                     // transcribe on stop. We just skip the live
                     // pipeline setup.

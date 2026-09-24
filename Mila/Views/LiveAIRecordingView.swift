@@ -26,6 +26,7 @@ struct LiveAIRecordingView: View {
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var llmSettings: LLMSettings
+    @EnvironmentObject private var postRecordingSettings: PostRecordingSettings
 
     /// Whether the per-meeting notes editor is open. Collapsed by
     /// default so the pane still leads with the AI's output; the toggle
@@ -40,11 +41,18 @@ struct LiveAIRecordingView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
-            // Action items pane is rendered only when Live AI is on +
-            // a CLI is configured. When AI is off the live transcript
-            // takes the whole detail pane so the user still sees what
-            // Mila is hearing in real time.
-            if aiActive {
+            if postRecordingSettings.batchOnly {
+                // Batch-only mode: no live transcription, just capture.
+                Spacer()
+                Text("Transcript will appear after recording")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            } else if aiActive {
+                // Action items pane is rendered only when Live AI is on +
+                // a CLI is configured. When AI is off the live transcript
+                // takes the whole detail pane so the user still sees what
+                // Mila is hearing in real time.
                 VSplitView {
                     actionItemsPane
                         .frame(minHeight: 140)
