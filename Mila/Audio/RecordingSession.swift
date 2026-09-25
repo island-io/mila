@@ -135,6 +135,7 @@ final class RecordingSession: ObservableObject {
         self.source = source
         self.fileURL = outputURL
         self.writesSinceStart = 0
+        self.systemBuffersSinceStart = 0
         self.overflowFlushesSinceStart = 0
         self.isFakeForTesting = false
         // Never inherit a stale system-audio tail from the previous
@@ -347,9 +348,15 @@ final class RecordingSession: ObservableObject {
         timerTask?.cancel(); timerTask = nil
 
         await flushPendingSystemTail()
-        recLog.log("stop: source=\(self.source.rawValue, privacy: .public) micFrames=\(micFrames, privacy: .public) writes=\(self.writesSinceStart, privacy: .public)")
+        recLog.log("stop: source=\(self.source.rawValue, privacy: .public) micFrames=\(micFrames, privacy: .public) systemBuffers=\(self.systemBuffersSinceStart, privacy: .public) writes=\(self.writesSinceStart, privacy: .public)")
         if (source == .microphone || source == .meeting) && micFrames == 0 {
             recLog.error("recording stopped with 0 microphone frames (source=\(self.source.rawValue, privacy: .public)) — dead/muted input device, wrong input selected, or failed format conversion")
+        }
+        // SCK delivers buffers even for silence, so a session with an app-audio
+        // leg that saw none never received app audio at all. In meeting mode
+        // `writes` is driven by the mic clock and looks normal regardless.
+        if (source == .systemAudio || source == .meeting) && systemBuffersSinceStart == 0 && !isFakeForTesting {
+            recLog.error("recording stopped with 0 system-audio buffers (source=\(self.source.rawValue, privacy: .public)) — the app-audio leg delivered nothing")
         }
         let url = fileURL
         audioFile = nil
@@ -427,6 +434,7 @@ final class RecordingSession: ObservableObject {
         // write and the `.meeting` jitter-buffer append) so the paused span
         // is absent from the recording.
         guard state == .recording else { return }
+        systemBuffersSinceStart += 1
         let samples = AudioConvert.samples(from: buffer)
         // Direct assignment for the same reason as `consumeMic` — see there.
         meters.systemLevel = AudioMeter.level(from: buffer)
@@ -508,7 +516,12 @@ final class RecordingSession: ObservableObject {
         await write(tail)
     }
 
-    private var writesSinceStart: Int = 0
+    private(set) var writesSinceStart: Int = 0
+
+    /// System-audio buffers consumed this session. Unlike `writesSinceStart`
+    /// this tells whether the app-audio leg delivered anything in meeting
+    /// mode too.
+    private(set) var systemBuffersSinceStart: Int = 0
 
     private func write(_ samples: [Float]) async {
         guard let file = audioFile, !samples.isEmpty else { return }
