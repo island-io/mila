@@ -46,8 +46,21 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     /// leg" apart from a normal stop.
     @Published private(set) var lastStreamError: String?
 
-    let audioStream: AsyncStream<AVAudioPCMBuffer>
-    private let audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+    /// The CURRENT session's buffers. Every `start()` installs a brand-new
+    /// stream, so read this after `start()` returns — the same contract as
+    /// `MicrophoneRecorder.audioStream`.
+    ///
+    /// It used to be a single `let` built in `init` and shared by every
+    /// recording for the life of the process. `RecordingSession.stop()`
+    /// cancels the task iterating it, and cancelling an `AsyncStream`'s
+    /// consumer TERMINATES the stream: from then on every `yield` returns
+    /// `.terminated` and every new `for await` ends at once. So only the
+    /// first app-audio or meeting recording after launch captured app audio;
+    /// each later one ran with a perfectly healthy SCStream whose buffers went
+    /// nowhere — an app-audio recording saved 0 samples ("too quiet to be real
+    /// speech"), and a meeting silently lost the other side of the call.
+    private(set) var audioStream: AsyncStream<AVAudioPCMBuffer>
+    private var audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
 
     private var stream: SCStream?
     private let audioOutput = AudioStreamOutput()
@@ -64,6 +77,12 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     private var restartAttempts = 0
     private let maxRestartAttempts = 5
     private(set) var restartCount = 0
+
+    /// Test seam: when set, replaces the ScreenCaptureKit bring-up so tests
+    /// can drive a session's stream lifecycle without a Screen Recording
+    /// grant or a display. Used for mid-session restarts too. Buffers are
+    /// then pushed in with `deliverForTesting(_:)`.
+    var bringUpOverride: (@MainActor () async throws -> Void)?
 
     /// Bumped by every `start()` and `stop()`. A restart loop captures the
     /// value it began with and abandons itself as soon as it no longer
@@ -98,6 +117,25 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         super.init()
         self.audioOutput.parent = self
         self.audioOutput.continuation = continuation
+    }
+
+    /// Finish the previous session's stream and install a fresh one — on the
+    /// sample queue, the only context the SCK callback reads `continuation`
+    /// from. Per SESSION, not per bring-up: a mid-session restart must keep
+    /// feeding the stream `RecordingSession` is already iterating.
+    private func installFreshStream() {
+        audioContinuation.finish()
+        var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation!
+        audioStream = AsyncStream { continuation = $0 }
+        audioContinuation = continuation
+        let fresh: AsyncStream<AVAudioPCMBuffer>.Continuation = continuation
+        sampleQueue.sync { audioOutput.continuation = fresh }
+    }
+
+    /// Test seam: push a buffer through the same convert-and-yield path an
+    /// SCK audio callback takes, on the same serial queue.
+    func deliverForTesting(_ buffer: AVAudioPCMBuffer) {
+        sampleQueue.sync { audioOutput.deliver(buffer) }
     }
 
     func refreshShareableContent() async {
@@ -150,6 +188,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         wantsCapture = true
         restartAttempts = 0
         restartCount = 0
+        installFreshStream()
         do {
             try await bringUpStream(epoch: epoch)
         } catch {
@@ -169,6 +208,14 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     /// released here rather than installed on top of a newer session's.
     @discardableResult
     private func bringUpStream(epoch: Int) async throws -> Bool {
+        if let override = bringUpOverride {
+            sampleQueue.sync { audioOutput.resetConverter() }
+            try await override()
+            guard epoch == captureEpoch else { return false }
+            self.isRunning = true
+            self.lastStreamError = nil
+            return true
+        }
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -240,11 +287,16 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         // even if a new recording sets `wantsCapture` back to true meanwhile.
         wantsCapture = false
         captureEpoch += 1
+        // End this session's stream so its consumer's `for await` returns on
+        // its own. The next `start()` builds a new one either way.
+        audioContinuation.finish()
         // Deliberately NOT gated on `isRunning`: when SCK killed the stream
         // itself (`didStopWithError` flips isRunning to false), the old
         // `guard isRunning` made this a no-op and the dead SCStream stayed
         // retained for the app's lifetime.
         guard let stream else {
+            // No SCStream: SCK killed it, or this is the `bringUpOverride`
+            // test path, which never builds one.
             isRunning = false
             level = 0
             return
@@ -412,6 +464,12 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
         guard type == .audio,
               CMSampleBufferIsValid(sampleBuffer),
               let buffer = sampleBuffer.toPCMBuffer() else { return }
+        deliver(buffer)
+    }
+
+    /// Convert to whisper format and yield. Only called on the recorder's
+    /// serial sample queue.
+    func deliver(_ buffer: AVAudioPCMBuffer) {
         do {
             if converter == nil || converter?.inputFormat != buffer.format {
                 converter = StreamingWhisperConverter(inputFormat: buffer.format)

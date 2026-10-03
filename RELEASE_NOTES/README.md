@@ -24,6 +24,13 @@ run it locally any time: `scripts/check-release-notes.sh 1.8.14`.
   `<li>` followed by one loose `<p>` per continuation line, and inline `*emphasis*`
   in those continuation lines comes through as literal asterisks. Long lines are
   correct here; v1.9.1 shipped a mangled "What's New" popup this way.
+- **Don't use single-asterisk `*italic*` — it is NOT converted.** `**bold**`
+  becomes `<strong>`, but `*emphasis*` reaches the "What's New" popup as
+  literal asterisks around the words. This is independent of the hard-wrap
+  problem above: it happens even on a correct one-line bullet. Shipped this
+  way in 1.9.3, 1.9.5-beta.2 and 1.9.5 — e.g. `the headset being the *output*`
+  renders with the asterisks visible. Use bold, quotes, or plain wording
+  instead.
 - Cover only the user-visible changes in this version.
 
 Example (`v1.8.14.md`):

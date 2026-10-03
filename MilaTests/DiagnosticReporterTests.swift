@@ -112,6 +112,7 @@ final class DiagnosticReporterTests: XCTestCase {
             "speakers.voiceRecognition.enabled": false,
             "model.declinedNames": ["ivrit-ai-whisper-large-v3"],
             "selectedModelName": "openai-whisper-large-v3-turbo",
+            "detail.playback.speed": 1.5,
             // Not Mila's — must not leak into the zip.
             "NSNavLastRootDirectory": "~/Desktop",
             "com.apple.trackpad.scaling": 1.5,
@@ -133,11 +134,13 @@ final class DiagnosticReporterTests: XCTestCase {
         XCTAssertEqual(scoped["speakers.voiceRecognition.enabled"] as? Bool, false)
         XCTAssertEqual(scoped["model.declinedNames"] as? [String], ["ivrit-ai-whisper-large-v3"])
         XCTAssertEqual(scoped["selectedModelName"] as? String, "openai-whisper-large-v3-turbo")
+        XCTAssertEqual(scoped["detail.playback.speed"] as? Double, 1.5,
+                       "a report about playback sounding wrong is unreadable without the rate")
 
         XCTAssertNil(scoped["NSNavLastRootDirectory"])
         XCTAssertNil(scoped["com.apple.trackpad.scaling"])
         XCTAssertNil(scoped["AppleLanguages"])
-        XCTAssertEqual(scoped.count, 14, "exactly the Mila keys, nothing else")
+        XCTAssertEqual(scoped.count, 15, "exactly the Mila keys, nothing else")
 
         // What comes out must be what `writeSettings` can serialise.
         XCTAssertNoThrow(try JSONSerialization.data(withJSONObject: scoped, options: [.sortedKeys]))

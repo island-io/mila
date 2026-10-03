@@ -7,7 +7,28 @@ private let micLog = Logger(subsystem: "io.island.whisper.IslandWhisper", catego
 
 enum MicrophoneError: Error, Equatable {
     case noInputDevice
-    case bringUpTimedOut
+    /// The `AVAudioEngine` bring-up did not finish within `timeout` seconds.
+    /// `device` is the input the bring-up had chosen by then — nil when it
+    /// stalled before choosing one — so the message can say which mic.
+    case bringUpTimedOut(device: String?, timeout: TimeInterval)
+}
+
+extension MicrophoneError: LocalizedError {
+    /// Shown verbatim in the "Could not start recording: …" banner, so it has
+    /// to carry the diagnosis on its own. Without this conformance Foundation
+    /// renders "The operation couldn't be completed. (Mila.MicrophoneError
+    /// error 1.)" — which is all a user had to go on in #291.
+    var errorDescription: String? {
+        switch self {
+        case .noInputDevice:
+            return "No usable microphone was found. Connect one, or choose a different input under Settings → Audio."
+        case .bringUpTimedOut(let device, let timeout):
+            let seconds = String(format: "%g", timeout)
+            let unit = seconds == "1" ? "second" : "seconds"
+            let which = device.map { "The microphone “\($0)”" } ?? "The microphone"
+            return "\(which) didn't start within \(seconds) \(unit). Try again, or choose a different input under Settings → Audio."
+        }
+    }
 }
 
 /// Per-session capture counters. The audio tap (a realtime thread) is the
@@ -198,9 +219,26 @@ final class MicrophoneRecorder: ObservableObject {
 
     /// How long we'll wait for the AVAudioEngine bring-up before giving up
     /// and throwing `MicrophoneError.bringUpTimedOut`. CoreAudio can stall
-    /// indefinitely on wireless mic profile switches; we'd rather throw
-    /// (caller beeps, user retries) than freeze the app.
-    var bringUpTimeout: TimeInterval = 5.0
+    /// indefinitely on wireless mic profile switches; we'd rather throw than
+    /// leave the recording hanging forever. The bring-up runs off the main
+    /// actor, so the app stays responsive however long this is — the only
+    /// cost of a longer value is a slower error on a truly dead device.
+    ///
+    /// 12 s, not 5: on macOS 27.0 with AirPods connected, AVFoundation's
+    /// `SetBluetoothAudioFormatAndWait` blocks ~3 s on a format change that
+    /// never comes (`SetBluetoothAudioFormat` fails with `'who?'`, unknown
+    /// property). It targets the engine's default I/O aggregate, which
+    /// includes the default OUTPUT — so it happens for the AirPods as output
+    /// even when the microphone being recorded is the built-in one, and
+    /// pinning a different input in Settings does not avoid it. It runs
+    /// twice per bring-up: once when `AVAudioEngine()` builds the aggregate,
+    /// once at `start()`, so the engine needs ~6 s. At 5 s we threw and tore
+    /// the session down, and the engine finished a second later only to be
+    /// discarded as abandoned. The delay is a fixed OS timeout, so that
+    /// happened on every attempt — six for six across two reports, built-in
+    /// mic and AirPods alike — and a retry could never help (#291). Twice
+    /// the observed bring-up leaves room for a third wait.
+    var bringUpTimeout: TimeInterval = 12.0
 
     /// Test seam: when set, replaces the real `AVAudioEngine` bring-up so
     /// `MicrophoneRecorderTests` can simulate slow / stalled / failing
@@ -409,8 +447,13 @@ final class MicrophoneRecorder: ObservableObject {
         let onLevel: @Sendable (Float) -> Void = { [weak self] lvl in
             Task { @MainActor in self?.level = lvl }
         }
+        // Filled by `realBringUp` the moment it has bound an input, so a
+        // timeout can say WHICH microphone did not come up (#291). Stays nil
+        // if the stall is earlier than device selection.
+        let chosenDevice = OSAllocatedUnfairLock<String?>(initialState: nil)
         return try await Self.withTimeout(
             seconds: bringUpTimeout,
+            deviceName: { chosenDevice.withLock { $0 } },
             onAbandoned: { box in
                 // The bring-up finished after the timeout already threw.
                 // Nobody owns this engine — tear it down (off-main, same as
@@ -423,7 +466,8 @@ final class MicrophoneRecorder: ObservableObject {
             try await Self.realBringUp(continuation: continuation,
                                        onLevel: onLevel,
                                        gain: gain,
-                                       stats: stats)
+                                       stats: stats,
+                                       chosenDevice: chosenDevice)
         }
     }
 
@@ -714,7 +758,8 @@ final class MicrophoneRecorder: ObservableObject {
         continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
         onLevel: @escaping @Sendable (Float) -> Void,
         gain: AdaptiveGainController,
-        stats: OSAllocatedUnfairLock<MicFrameStats>
+        stats: OSAllocatedUnfairLock<MicFrameStats>,
+        chosenDevice: OSAllocatedUnfairLock<String?>
     ) async throws -> EngineBox {
         // Read the user's pinned input UID off the main actor — UserDefaults
         // is thread-safe and Settings writes via a @MainActor object, so the
@@ -726,6 +771,7 @@ final class MicrophoneRecorder: ObservableObject {
             if let device = AudioDeviceManager.preferredInputDevice(preferredUID: preferredUID) {
                 do {
                     try AudioDeviceManager.setInputDevice(device, on: engine)
+                    chosenDevice.withLock { $0 = device.name }
                     micLog.log("input device: \(device.name, privacy: .public) [\(device.manufacturer, privacy: .public)] uid=\(device.uid, privacy: .public)")
                 } catch {
                     micLog.error("could not switch to \(device.name, privacy: .public): \(error.localizedDescription, privacy: .public) — falling back to AVAudioEngine default input")
@@ -846,6 +892,7 @@ final class MicrophoneRecorder: ObservableObject {
     /// hot forever). The main actor is never blocked either way.
     private static func withTimeout<T: Sendable>(
         seconds: TimeInterval,
+        deviceName: @escaping @Sendable () -> String? = { nil },
         onAbandoned: @escaping @Sendable (T) -> Void = { _ in },
         operation: @escaping @Sendable () async throws -> T
     ) async throws -> T {
@@ -871,7 +918,13 @@ final class MicrophoneRecorder: ObservableObject {
             }
             Task.detached {
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
-                _ = finish(.failure(MicrophoneError.bringUpTimedOut))
+                let device = deviceName()
+                if finish(.failure(MicrophoneError.bringUpTimedOut(device: device, timeout: seconds))) {
+                    // Public on purpose: a diagnostic report should show which
+                    // input stalled without needing the redacted description
+                    // `RecordingSession` logs (#213 keeps that one private).
+                    micLog.error("mic bring-up did not finish within \(seconds, privacy: .public)s (input: \(device ?? "not yet chosen", privacy: .public)) — giving up")
+                }
             }
         }
     }
