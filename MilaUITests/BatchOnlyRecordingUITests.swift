@@ -93,8 +93,11 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         row.click()
         XCTAssertTrue(element(app, "detail.title.label").waitForExistence(timeout: 10))
         XCTAssertFalse(app.staticTexts["Name this recording"].exists)
+        // macOS exposes SwiftUI transcript Text through AXValue on some
+        // versions, while other versions use AXLabel.
         let transcript = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS[c] 'staging' OR label CONTAINS[c] 'Friday'")).firstMatch
+            NSPredicate(format: "label CONTAINS[c] 'staging' OR label CONTAINS[c] 'Friday' "
+                        + "OR value CONTAINS[c] 'staging' OR value CONTAINS[c] 'Friday'")).firstMatch
         XCTAssertTrue(transcript.waitForExistence(timeout: 10),
                       "Reopening the recording must show the completed transcript")
         attach(app, "batch-transcript-reopened")
@@ -105,7 +108,7 @@ final class BatchOnlyRecordingUITests: XCTestCase {
     }
 
     private func attach(_ app: XCUIApplication, _ name: String) {
-        let attachment = XCTAttachment(screenshot: app.screenshot())
+        let attachment = XCTAttachment(screenshot: app.windows.firstMatch.screenshot())
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
