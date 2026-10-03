@@ -1327,6 +1327,9 @@ struct MilaApp: App {
             return
         }
         await actions.startFakeRecordingForTesting(outputURL: outputURL)
+        // Batch mode consumes the copied WAV after Stop; it has no live sample
+        // consumer and must not enter the live fixture decoder/pump.
+        guard !actions.capturedBatchOnly else { return }
         // Wait for wireLiveAIPipeline to install onLiveSamples (it
         // does so once the .recording case fires). Poll up to ~3s.
         for _ in 0..<60 {
