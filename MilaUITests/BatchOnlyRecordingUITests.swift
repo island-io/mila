@@ -26,26 +26,21 @@ final class BatchOnlyRecordingUITests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: model))
 
         let app = XCUIApplication()
-        // Argument-domain defaults avoid persisting these test preferences.
+        // The app installs these fixture preferences in the volatile argument
+        // domain; launch arguments contain only explicit test flags.
         app.launchArguments = [
             "--ui-test-clean-store",
+            "--ui-test-batch-recording",
             "--ui-test-inject-fixture-wav=\(fixture)",
-            "--ui-test-tiny-model-path=\(model)",
-            "-postRecording.batchOnly", "YES",
-            "-recording.language", "en",
-            "-transcription.backend", "local",
-            "-liveAI.enabled", "NO",
-            "-liveAI.backgroundMode", "NO",
-            "-liveAI.forceOnLowEndHardware", "NO",
-            "-diarization.enabled", "NO",
-            "-speakers.voiceRecognition.enabled", "NO",
-            "-llm.tool", "none"
+            "--ui-test-tiny-model-path=\(model)"
         ]
         if lowEndHardware {
             app.launchArguments.append("--ui-test-low-end-hardware")
         }
         app.launch()
         defer { app.terminate() }
+        XCTAssertTrue(app.windows.firstMatch.waitForExistence(timeout: 10),
+                      "Fixture startup must create the main window")
 
         let placeholder = element(app, "recording.batchOnly.placeholder")
         XCTAssertTrue(placeholder.waitForExistence(timeout: 30),

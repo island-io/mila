@@ -385,6 +385,25 @@ struct MilaApp: App {
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
+        // Configure fixture-test preferences in memory before constructing settings,
+        // independently of AppKit's interpretation of launch arguments.
+        if CommandLine.arguments.contains("--ui-test-clean-store"),
+           CommandLine.arguments.contains("--ui-test-batch-recording") {
+            let defaults = UserDefaults.standard
+            var arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+            arguments.merge([
+                "postRecording.batchOnly": true,
+                "recording.language": "en",
+                "transcription.backend": "local",
+                "liveAI.enabled": false,
+                "liveAI.backgroundMode": false,
+                "liveAI.forceOnLowEndHardware": false,
+                "diarization.enabled": false,
+                "speakers.voiceRecognition.enabled": false,
+                "llm.tool": "none"
+            ]) { _, testValue in testValue }
+            defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        }
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
         // storage-settings instance owns the security-scoped bookmark
