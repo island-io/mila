@@ -185,6 +185,8 @@ final class TranscriptionService: ObservableObject {
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var prewarmTasks: [UUID: Task<Void, Never>] = [:]
 
     /// Recordings the user asked to abandon mid-run. Held in a thread-safe
     /// box because whisper.cpp's `abort_callback` polls this from a
@@ -237,7 +239,7 @@ final class TranscriptionService: ObservableObject {
         self.observerSetupTask = Task { [engine] in
             await engine.setPreparationObserver { [weak serviceRef] preparing, status in
                 Task { @MainActor in
-                    guard let serviceRef else { return }
+                    guard let serviceRef, !serviceRef.cancellation.isStopped else { return }
                     serviceRef.isPreparingModel = preparing
                     serviceRef.preparationStatus = preparing ? status : nil
                 }
@@ -247,7 +249,7 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Prewarm
 
-    /// Pre-load the user's default model in a detached task. Called
+    /// Pre-load the user's default model on the engine actor. Called
     /// once at app launch so the first-ever CoreML compile (~13s on
     /// M-series) happens BEFORE the user taps Record. Without this,
     /// pressing Record during the compile window produces a recording
@@ -260,6 +262,7 @@ final class TranscriptionService: ObservableObject {
     /// callers pass in their `RecordingLanguageSettings.current` so we
     /// pick the model the next recording is most likely to want.
     func prewarm(language: String) {
+        guard !cancellation.isStopped else { return }
         guard let model = modelManager.model(for: language),
               modelManager.isInstalled(model) else {
             serviceLog.log("prewarm: skipping — no installed model for lang=\(language, privacy: .public)")
@@ -272,7 +275,9 @@ final class TranscriptionService: ObservableObject {
         // re-promote it to Optional inside the closure.
         let observerTask: Task<Void, Never> = observerSetupTask
         serviceLog.log("prewarm: kicking off load for \(displayName, privacy: .public)")
-        Task.detached(priority: .userInitiated) { [engine] in
+        let warmID = UUID()
+        prewarmTasks[warmID] = Task { [weak self, engine, cancellation] in
+            defer { self?.prewarmTasks[warmID] = nil }
             // Bugbot #3: ensure the preparation observer is registered
             // BEFORE the first CoreML compile starts — otherwise the
             // engine fires the "preparing" callback into a nil
@@ -282,6 +287,7 @@ final class TranscriptionService: ObservableObject {
             // engine actor, but await ordering between two independent
             // Tasks is undefined, so we make it explicit here.
             await observerTask.value
+            guard !cancellation.isStopped, !Task.isCancelled else { return }
             do {
                 try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
                 serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")
@@ -313,6 +319,7 @@ final class TranscriptionService: ObservableObject {
     /// `isRetranscription` marks a deliberate re-run of an existing recording so
     /// the auto-drop gate never discards it (see `retranscriptionIDs`).
     func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
+        guard !cancellation.isStopped else { return }
         if activeRecordingID == recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
         if isRetranscription { retranscriptionIDs.insert(recording.id) }
@@ -400,7 +407,7 @@ final class TranscriptionService: ObservableObject {
     /// audio is saved regardless — this only gets the user a fast, actionable
     /// error rather than a mystery blank pane.
     func probeRemoteBackendIfActive() async {
-        guard remoteSettings.isActive else { return }
+        guard !cancellation.isStopped, remoteSettings.isActive else { return }
         guard remoteSettings.isConfigured else {
             lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
             return
@@ -410,13 +417,14 @@ final class TranscriptionService: ObservableObject {
         // the recording stops or a newer recording starts, so a late, out-of-
         // order failure can't overwrite UI state for a recording the user has
         // already moved past.
-        if Task.isCancelled { return }
+        if cancellation.isStopped || Task.isCancelled { return }
         if case .failed(let message) = remoteSettings.testStatus {
             lastError = "Remote transcription server check failed: \(message) Your audio is still being recorded — fix the endpoint or API key in Settings → Models, then re-transcribe."
         }
     }
 
     func transcribeOnceSegments(samples: [Float], language: String, audioCtx: Int32?) async -> [TranscriptSegment] {
+        guard !cancellation.isStopped else { return [] }
         // Nothing was captured: don't hand it to any backend. The remote one
         // uploads a header-only file and gets back `HTTP 500: Failed to decode
         // audio.`, which the user reads as "the transcription server is down"
@@ -441,14 +449,17 @@ final class TranscriptionService: ObservableObject {
                 return []
             }
             await remoteEngine.configure(config)
+            guard !cancellation.isStopped else { return [] }
             do {
                 let segs = try await remoteEngine.transcribe(samples: samples,
                                                              language: language,
                                                              audioCtx: audioCtx,
                                                              progress: nil,
-                                                             isCancelled: nil)
+                                                             isCancelled: { [cancellation] in cancellation.isStopped })
+                guard !cancellation.isStopped else { return [] }
                 return segs
             } catch {
+                if cancellation.isStopped || error is CancellationError { return [] }
                 // Log at .error: a remote failure (401/transport/server) repeats
                 // on every utterance for the whole recording and silently empties
                 // the live pane. Error level so it's visible in `log show`
@@ -492,17 +503,21 @@ final class TranscriptionService: ObservableObject {
         // Bugbot #3: make sure the preparation observer is installed
         // before `loadIfNeeded` — see `init` for the race.
         await observerSetupTask.value
+        guard !cancellation.isStopped else { return [] }
         do {
             try await engine.loadIfNeeded(modelURL: modelURL,
                                           displayName: model.displayName)
+            guard !cancellation.isStopped else { return [] }
             let segs = try await engine.transcribe(samples: samples,
                                                    language: language,
                                                    audioCtx: audioCtx,
                                                    progress: nil,
-                                                   isCancelled: nil)
+                                                   isCancelled: { [cancellation] in cancellation.isStopped })
+            guard !cancellation.isStopped else { return [] }
             serviceLog.log("transcribeOnceSegments: model=\(model.name, privacy: .public) lang=\(language, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(Date().timeIntervalSince(startedAt), privacy: .public)s segs=\(segs.count, privacy: .public)")
             return segs
         } catch {
+            if cancellation.isStopped || error is CancellationError { return [] }
             serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
             return []
         }
@@ -560,13 +575,13 @@ final class TranscriptionService: ObservableObject {
     /// recording being re-diarized — the transcript text is already final
     /// here, so calling this "Transcribing" would mislead.
     func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment], recordingID: UUID? = nil) async -> [TranscriptSegment]? {
-        guard diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
+        guard !cancellation.isStopped, diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
         diarizingRecordingID = recordingID
         defer { diarizingRecordingID = nil }
         do {
             let turns = try await SpeakerDiarizer.diarize(wavURL: wavURL,
                                                           pythonPath: diarizationSettings.pythonPath)
-            guard !turns.isEmpty else { return nil }
+            guard !cancellation.isStopped, !turns.isEmpty else { return nil }
             var enriched = segments
             for i in enriched.indices {
                 enriched[i].speaker = SpeakerDiarizer.assignSpeaker(
@@ -594,8 +609,30 @@ final class TranscriptionService: ObservableObject {
     /// shutdown so the ggml-metal device tear-down happens before libc++
     /// global destructors run (which is what triggered SIGABRT on quit).
     func shutdown() async {
-        await engine.shutdown()
-        await remoteEngine.shutdown()
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+        // Close admission before yielding. Keep persisted pending/running rows
+        // and audio intact so the existing launch recovery sweep can retry them.
+        cancellation.stopAll()
+        worker?.cancel() // also cancels the structured diarization subprocess
+        queue.removeAll()
+        retranscriptionIDs.removeAll()
+        publishPending()
+        isPreparingModel = false
+        preparationStatus = nil
+        let warming = Array(prewarmTasks.values)
+        warming.forEach { $0.cancel() }
+        let task = Task { [remoteEngine, engine] in
+            await remoteEngine.shutdown()
+            // Drain already-started prewarms before freeing local resources;
+            // otherwise a late model load could recreate them after teardown.
+            for warm in warming { await warm.value }
+            await engine.shutdown()
+        }
+        shutdownTask = task
+        await task.value
     }
 
     /// Abandon the transcription of `recordingID`. If it's still in the queue
@@ -616,14 +653,14 @@ final class TranscriptionService: ObservableObject {
     // MARK: - Worker
 
     private func startWorkerIfNeeded() {
-        guard worker == nil else { return }
+        guard !cancellation.isStopped, worker == nil else { return }
         worker = Task { [weak self] in
             await self?.run()
         }
     }
 
     private func run() async {
-        while let next = popNext() {
+        while !cancellation.isStopped, !Task.isCancelled, let next = popNext() {
             await process(next)
         }
         worker = nil
@@ -641,6 +678,7 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func process(_ recording: Recording) async {
+        guard !cancellation.isStopped else { return }
         // The user may have hit Cancel between enqueue and now. Don't spin up
         // the model just to throw the result away.
         if cancellation.contains(recording.id) {
@@ -704,6 +742,7 @@ final class TranscriptionService: ObservableObject {
                 return
             }
             await remoteEngine.configure(config)
+            guard !cancellation.isStopped else { return }
             localModel = nil
             // Label from the captured config, not remoteSettings — a Settings
             // edit mid-run must not change what's persisted to this
@@ -779,6 +818,7 @@ final class TranscriptionService: ObservableObject {
         // Bugbot #3: make sure the preparation observer is installed
         // before `loadIfNeeded` — see `init` for the race.
         await observerSetupTask.value
+        guard !cancellation.isStopped else { return }
 
         do {
             // Local backend needs the whisper weights loaded (and the CoreML
@@ -788,6 +828,7 @@ final class TranscriptionService: ObservableObject {
                 try await engine.loadIfNeeded(modelURL: modelManager.url(for: localModel),
                                               displayName: localModel.displayName)
             }
+            guard !cancellation.isStopped else { return }
             // Resolve the audio URL from the freshly re-fetched `working`
             // record, NOT the stale `recording` snapshot captured at enqueue
             // time. A re-transcribe (right-click "Re-transcribe in …") enqueues
@@ -1098,6 +1139,7 @@ final class TranscriptionService: ObservableObject {
                 """)
             cancellation.remove(recording.id)
         } catch {
+            guard !cancellation.isStopped else { return }
             // The pass reads the recording's own audio and writes its
             // transcript, both under the (possibly user-chosen) recordings
             // directory with title-derived names — so a Cocoa error here
@@ -1305,6 +1347,17 @@ final class ProgressCoalescer: @unchecked Sendable {
 final class CancellationFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var ids: Set<UUID> = []
+    private var stopped = false
+
+    var isStopped: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopped
+    }
+
+    func stopAll() {
+        lock.lock(); defer { lock.unlock() }
+        stopped = true
+    }
 
     func insert(_ id: UUID) {
         lock.lock(); defer { lock.unlock() }
@@ -1318,6 +1371,6 @@ final class CancellationFlag: @unchecked Sendable {
 
     func contains(_ id: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return ids.contains(id)
+        return stopped || ids.contains(id)
     }
 }
