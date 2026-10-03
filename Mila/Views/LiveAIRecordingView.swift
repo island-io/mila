@@ -26,7 +26,6 @@ struct LiveAIRecordingView: View {
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var llmSettings: LLMSettings
-    @EnvironmentObject private var postRecordingSettings: PostRecordingSettings
 
     /// Whether the per-meeting notes editor is open. Collapsed by
     /// default so the pane still leads with the AI's output; the toggle
@@ -41,12 +40,19 @@ struct LiveAIRecordingView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
-            if postRecordingSettings.batchOnly {
+            if actions.capturedBatchOnly {
                 // Batch-only mode: no live transcription, just capture.
                 Spacer()
-                Text("Transcript will appear after recording")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                VStack(spacing: 8) {
+                    Text("Transcript will appear after recording")
+                        .font(.callout)
+                    Text("Audio is being recorded. Transcription starts after you stop.")
+                        .font(.caption)
+                }
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding()
+                .accessibilityIdentifier("recording.batchOnly.placeholder")
                 Spacer()
             } else if aiActive {
                 // Action items pane is rendered only when Live AI is on +
@@ -71,7 +77,7 @@ struct LiveAIRecordingView: View {
     private var language: String { languageSettings.current.rawValue }
     private var isRTL: Bool { language == "he" }
     private var aiActive: Bool {
-        liveAISettings.enabled && llmSettings.isConfigured
+        !actions.capturedBatchOnly && liveAISettings.enabled && llmSettings.isConfigured
             && !llmSettings.liveAIDisabledByRemoteOpenAI
     }
 

@@ -45,6 +45,10 @@ final class QuickActionsController: ObservableObject {
     static let maxLiveSpeakersToSkipRediarize = 3
 
     @Published private(set) var activeJob: ActiveJob = .none
+
+    /// Fixed before capture publishes state; preference changes affect the next recording.
+    @Published private(set) var capturedBatchOnly = false
+
     @Published private(set) var availableApps: [SCRunningApplication] = []
     @Published var isAppPickerShown = false
     /// Set when system-audio capture fails because the user hasn't granted
@@ -376,6 +380,22 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
+    /// Prepare before `session.start` publishes `.recording`, even if the async
+    /// pipeline observer misses that transition. Stop retains live text for
+    /// finalization, so a new capture needs an explicit reset and epoch change.
+    private func prepareForNewRecording() {
+        capturedBatchOnly = postRecordingSettings?.batchOnly == true
+        session.onLiveSamples = nil
+        liveTranscriber?.resetSession()
+        liveDiarizer?.stop()
+        liveDiarizer?.reset()
+        if capturedBatchOnly {
+            liveAISession?.cancel()
+        } else {
+            liveAISession?.start()
+        }
+    }
+
     /// UI-TEST SEAM. Starts a recording without AVAudioEngine / the mic
     /// permission gate, so the audio-loopback E2E can drive the REAL
     /// `stopRecording` (Phase A / Phase B split) without a physical mic.
@@ -403,6 +423,7 @@ final class QuickActionsController: ObservableObject {
             return
         }
         guard activeJob == .none else { return }
+        prepareForNewRecording()
         await session.startFakeForTesting(outputURL: outputURL)
         activeJob = .recording(withSystemAudio: false)
     }
@@ -472,16 +493,8 @@ final class QuickActionsController: ObservableObject {
             session.selectApp(nil)
         }
         do {
+            prepareForNewRecording()
             try await session.start(source: source, outputURL: url)
-            // Guarantee a fresh, isolated Live AI session for THIS recording
-            // (new Claude session UUID + cleared summary/action items) before
-            // any transcript can be fed. This is the single deterministic
-            // reset point — relying on the async `.recording` state observer
-            // (wireLiveAIPipeline) instead risked the transition being
-            // coalesced under load, leaving the previous recording's session
-            // live so its first tick `--resume`d the prior meeting →
-            // cross-recording summary/action-item bleed. See LiveAISession.start().
-            liveAISession?.start()
             activeJob = .recording(withSystemAudio: withSystemAudio)
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
@@ -568,10 +581,8 @@ final class QuickActionsController: ObservableObject {
         let url = store.freshAudioURL(suggestedName: titleBase)
         do {
             let source: RecordingSource = includeMic ? .meeting : .systemAudio
+            prepareForNewRecording()
             try await session.start(source: source, outputURL: url)
-            // Fresh, isolated per-recording Live AI session — see the matching
-            // call in startRecording() for the full rationale.
-            liveAISession?.start()
             activeJob = .recordingApp(processID: app?.processID, includeMic: includeMic)
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
@@ -622,6 +633,7 @@ final class QuickActionsController: ObservableObject {
 
     func stopRecording() async {
         let captured = activeJob
+        let batchOnly = capturedBatchOnly
         let durationBeforeStop = session.elapsed
         let sleepReason = pendingSleepStopReason
         pendingSleepStopReason = nil
@@ -767,10 +779,10 @@ final class QuickActionsController: ObservableObject {
         // live pane. Now the dialog pops up instantly; the
         // background drain below updates the Recording (and thus
         // the sheet, which observes the store) as more data lands.
-        let initialTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
-        let initialSummary = (liveAISession?.summary ?? "")
+        let initialTranscriptSegments = batchOnly ? [] : (liveTranscriber?.transcriptSegments ?? [])
+        let initialSummary = (batchOnly ? "" : (liveAISession?.summary ?? ""))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let initialItems = liveAISession?.actionItems ?? []
+        let initialItems = batchOnly ? [] : (liveAISession?.actionItems ?? [])
         // Use `.running` so the sheet shows the "transcribing in
         // progress" status icon while the background drain finishes
         // up. The flip to `.completed` (or `.pending` → `.enqueue`
@@ -862,7 +874,6 @@ final class QuickActionsController: ObservableObject {
                 wasOnBattery: !SleepGuard.isOnACPower()
             )
         }
-        let batchOnly = postRecordingSettings?.batchOnly == true
         if sleepReason == nil && !batchOnly {
             postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
         } else if batchOnly {
@@ -914,10 +925,12 @@ final class QuickActionsController: ObservableObject {
         // `isFinalizingRecording` was set above (before `session.stop()`)
         // so the `.idle` handler skips its own drain + cleanup. We own
         // the lifecycle in this codepath.
-        await liveTranscriber?.transcribeNow()
-        await liveDiarizer?.awaitPending()
-        if let diar = liveDiarizer {
-            liveTranscriber?.applySpeakerLabels(diar.intervals)
+        if !batchOnly {
+            await liveTranscriber?.transcribeNow()
+            await liveDiarizer?.awaitPending()
+            if let diar = liveDiarizer {
+                liveTranscriber?.applySpeakerLabels(diar.intervals)
+            }
         }
         // The final Live-AI summary tick is deliberately NOT awaited here.
         // It used to run inline (feed the post-drain transcript, then
@@ -935,15 +948,15 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
-        let finalTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
+        let finalTranscriptSegments = batchOnly ? [] : (liveTranscriber?.transcriptSegments ?? [])
         // Snapshotted here for the same reason as the segments themselves —
         // before `liveTranscriber?.stop()` below — because it is what tells an
         // emptied live transcript apart from one that never existed. See
         // `liveTranscriptIsAuthoritative`.
-        let userDeletedLiveLines = liveTranscriber?.hasUserDeletedSegments ?? false
-        let finalSummary = (liveAISession?.summary ?? "")
+        let userDeletedLiveLines = !batchOnly && (liveTranscriber?.hasUserDeletedSegments ?? false)
+        let finalSummary = (batchOnly ? "" : (liveAISession?.summary ?? ""))
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalItems = liveAISession?.actionItems ?? []
+        let finalItems = batchOnly ? [] : (liveAISession?.actionItems ?? [])
         // Whether the live pipeline ran in VAD mode (utterance-bounded
         // + speaker-diarized). Chunk mode produces segments too but
         // they lack speakers, so the batch pass still needs to run.
@@ -953,7 +966,7 @@ final class QuickActionsController: ObservableObject {
         // Cursor (PRRT_kwDOSY2m-s6GOIj4) caught this: gating on
         // `enabled` made VAD-with-LiveAI-off recordings unnecessarily
         // re-batch-transcribed.
-        let vadActive = (liveAISettings?.useVAD == true)
+        let vadActive = !batchOnly && (liveAISettings?.useVAD == true)
         // Meeting mode now feeds the mic+system MIX to the live
         // transcriber (RecordingSession.consumeMic clocks off the mic and
         // mixes in buffered system audio), so the live transcript is
@@ -1120,7 +1133,9 @@ final class QuickActionsController: ObservableObject {
         // (island-io/mila#209). Read from `liveTranscriber` here — before the
         // teardown below — and applied on the far side through
         // `store.setSpeakerName`, the single persistence trigger.
-        onRecordingFinalized?(recording.id, liveTranscriber?.speakerNames ?? [:])
+        if !batchOnly {
+            onRecordingFinalized?(recording.id, liveTranscriber?.speakerNames ?? [:])
+        }
         // Those names are written into the STORED row by `setSpeakerName`, not
         // into this local copy, so re-read it. Without this the tail below
         // carries a `speakerNames`-less snapshot and its

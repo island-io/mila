@@ -144,9 +144,11 @@ final class LiveTranscriber: ObservableObject {
         self.fullText = initial.map(\.text).joined(separator: " ")
     }
 
-    func start(language: String) {
+    /// Clear state for a new capture without starting live processing. Unlike
+    /// `stop()`, this invalidates delayed results and discards retained text.
+    /// `start()` preserves the live configuration installed by its caller.
+    func resetSession(clearVADConfiguration: Bool = true) {
         stop()
-        self.language = language
         self.buffer.removeAll(keepingCapacity: true)
         self.samplesDropped = 0
         self.deletedRanges = []
@@ -155,7 +157,19 @@ final class LiveTranscriber: ObservableObject {
         self.segments = []
         self.speakerNames = [:]
         self.lastError = nil
+        if clearVADConfiguration {
+            self.useVAD = false
+            self.speechGate = nil
+            self.onUtteranceCaptured = nil
+        }
         self.epoch &+= 1
+    }
+
+    func start(language: String) {
+        // Reset the session, but keep the VAD configuration the caller just
+        // installed (see `resetSession(clearVADConfiguration:)`).
+        resetSession(clearVADConfiguration: false)
+        self.language = language
         liveLog.log("LiveTranscriber.start lang=\(language, privacy: .public) chunk=\(self.chunkSeconds, privacy: .public)s window=\(self.windowSeconds, privacy: .public)s useVAD=\(self.useVAD, privacy: .public) epoch=\(self.epoch, privacy: .public)")
 
         if useVAD {
@@ -541,6 +555,7 @@ final class LiveTranscriber: ObservableObject {
     }
 
     private func runOnce() async {
+        let runEpoch = epoch
         let total = buffer.count
         // Need at least 1s of audio before whisper produces anything
         // useful — below that, segment timestamps are garbage and the
@@ -571,6 +586,11 @@ final class LiveTranscriber: ObservableObject {
         let elapsed = Date().timeIntervalSince(startedAt)
         liveLog.log("LiveTranscriber tick: samples=\(slice.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) lang=\(self.language, privacy: .public)")
         guard !whisperSegs.isEmpty else { return }
+        // A new capture may have started while the backend was suspended.
+        guard runEpoch == epoch else {
+            liveLog.log("LiveTranscriber tick dropped post-whisper — epoch changed (run=\(runEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
+            return
+        }
 
         let absoluteSegs: [LiveSegment] = whisperSegs.compactMap { s in
             let text = s.text.trimmingCharacters(in: .whitespacesAndNewlines)

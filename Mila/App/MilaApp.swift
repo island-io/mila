@@ -467,7 +467,11 @@ struct MilaApp: App {
             CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
             || CommandLine.arguments.contains(where: { $0.hasPrefix("--ui-test-inject-fixture-wav=") })
             || NSClassFromString("XCTestCase") != nil
-        let liveAICapabilities: SystemCapabilities = uiTestForcesLiveAI
+        let uiTestForcesLowEnd = CommandLine.arguments.contains("--ui-test-low-end-hardware")
+        let liveAICapabilities: SystemCapabilities = uiTestForcesLowEnd
+            ? SystemCapabilities(modelIdentifier: "MacBookAirTest", marketingName: "MacBook Air",
+                                 isMacBookAir: true, physicalRamGB: 8, performanceCoreCount: 4)
+            : uiTestForcesLiveAI
             ? SystemCapabilities(
                 modelIdentifier: SystemCapabilities.live.modelIdentifier,
                 marketingName: "MacBook Pro",
@@ -1286,8 +1290,7 @@ struct MilaApp: App {
         // .recording before there's a listener to react.
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         let sessionRef = session
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mila-fake-recording-\(UUID().uuidString).wav")
+        let outputURL = store.freshAudioURL(suggestedName: "Fixture Recording")
         // Start through QuickActionsController, NOT session directly. Routing
         // via `startFakeRecordingForTesting` sets `activeJob = .recording` so
         // `actions.isRecording` flips true — which is what
@@ -1299,6 +1302,11 @@ struct MilaApp: App {
         // elements never mount — the throughput/AGC E2Es then time out waiting
         // for a `liveTranscript.segment` that exists only in the (background)
         // pipeline, never in the view tree.
+        do {
+            try FileManager.default.copyItem(atPath: wavPath, toPath: outputURL.path)
+        } catch {
+            return
+        }
         await actions.startFakeRecordingForTesting(outputURL: outputURL)
         // Wait for wireLiveAIPipeline to install onLiveSamples (it
         // does so once the .recording case fires). Poll up to ~3s.
@@ -1612,7 +1620,6 @@ struct MilaApp: App {
         let diarSettings = diarizationSettings
         let langSettings = languageSettings
         let sessionRef = session
-        let postRecSettings = postRecordingSettings
         // `actions` captured weakly so the .idle handler can read
         // its `isFinalizingRecording` flag to decide whether the
         // drain belongs here (sleep/lock/quit path) or to
@@ -1667,32 +1674,11 @@ struct MilaApp: App {
                 // `start()`, so it cannot be fooled that way.
                 if wiredCaptureEpoch == sessionRef.captureEpoch { break }
                 wiredCaptureEpoch = sessionRef.captureEpoch
-                guard aiSettings.isLiveAIAvailable, !postRecSettings.batchOnly else {
-                    // Hardware below the Live AI bar, no override
-                    // flipped, OR batch-only mode is on. Recording
-                    // still runs via RecordingSession;
-                    // QuickActionsController enqueues a post-record
-                    // transcribe on stop. We just skip the live
-                    // pipeline setup.
-                    //
-                    // BUT: clear the transcriber's `segments` /
-                    // `useVAD` first. Without this, a stale live
-                    // transcript from a previous recording (when the
-                    // user had the override toggle on) would still be
-                    // sitting in memory; `stopRecording` would
-                    // snapshot it onto the new recording and could
-                    // mark it `.completed` without ever running batch
-                    // transcription. Cursor flagged on 62e1c3b.
+                guard aiSettings.isLiveAIAvailable, actionsRef?.capturedBatchOnly != true else {
+                    // Recording preparation already cleared the retained live state.
+                    // Keep the sidecar lifecycle even though no live pipeline runs.
                     _ = transcriber.stop()
                     sessionRef.onLiveSamples = nil
-                    // Also clear LiveAISession so its rolling `summary`
-                    // and `actionItems` from a previous override-enabled
-                    // recording don't leak onto this gated capture.
-                    // `stopRecording` reads aiSession.summary /
-                    // actionItems unconditionally; without this reset,
-                    // a previous Live AI session's output would attach
-                    // to a recording that never ran the LLM loop.
-                    // Cursor flagged on c95d2bb.
                     aiSession.cancel()
                     // Still surface the recording to external pollers
                     // (mila-mcp): they get an honest "recording, but no
@@ -1700,7 +1686,7 @@ struct MilaApp: App {
                     // silence.
                     sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                        .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
+                        .log("wireLiveAIPipeline: live processing skipped — batch-only or hardware gate (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
                 // Open the live-transcript sidecar for this recording so

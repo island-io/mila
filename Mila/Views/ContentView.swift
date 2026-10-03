@@ -265,7 +265,7 @@ struct ContentView: View {
         // whisper for CPU, this trades off live visibility for
         // throughput.
         if liveAISettings.backgroundMode { return false }
-        return actions.isRecording && liveAISettings.isLiveAIAvailable
+        return actions.isRecording && (actions.capturedBatchOnly || liveAISettings.isLiveAIAvailable)
     }
 
     /// Compose the wake-up alert body. Always shows the captured length so

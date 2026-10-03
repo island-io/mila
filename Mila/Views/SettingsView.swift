@@ -2719,7 +2719,7 @@ private struct MeetingsSettingsTab: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Batch transcription only")
                             .font(.body)
-                        Text("Record audio without live transcription. After recording stops, transcription, speaker identification, and AI summary run in the background. Saves recordings automatically without the rename window.")
+                        Text("Record audio now and transcribe it after you stop. Saves automatically without the rename window. Speaker labels and summaries are added when those features are enabled.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2727,6 +2727,11 @@ private struct MeetingsSettingsTab: View {
                 }
                 .toggleStyle(.switch)
                 .controlSize(.regular)
+                .accessibilityIdentifier("recording.batchOnly.toggle")
+                Text("Applies to the next recording.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("recording.batchOnly.nextRecording")
 
                 Divider()
 
