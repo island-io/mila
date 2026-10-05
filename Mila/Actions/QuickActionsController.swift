@@ -16,6 +16,23 @@ private let quickActionsLog = Logger(subsystem: "io.island.whisper.IslandWhisper
 final class QuickActionsController: ObservableObject {
     enum ActiveJob: Equatable {
         case none
+        /// A record-start path has passed its synchronous guards and is
+        /// bringing capture up: `RecordingSession.start` is in flight. On a
+        /// Bluetooth input that takes several seconds (two ~3 s AVFoundation
+        /// format waits on macOS 27 with AirPods, #291), and until this case
+        /// existed the Record button sat in its idle state for the whole
+        /// window — the user could not tell the click registered, and a
+        /// second click started a SECOND bring-up, because neither
+        /// `RecordingSession.state` nor `MicrophoneRecorder.isRunning` flips
+        /// until the first one finishes (#293).
+        ///
+        /// Published before the first `await` of every start path, replaced
+        /// by `.recording…` / `.recordingApp…` on success and by `.none` on
+        /// every failure exit. Deliberately NOT part of `isRecording`: there
+        /// is no session to stop yet, so nothing may route a Stop at it.
+        /// One flip per recording, so it is well inside the publish budget
+        /// an App-level `@StateObject` is allowed (`AppSceneChurnTests`).
+        case starting
         case recordingMic
         /// Unified "Record" job — mic + optionally the entire system's
         /// audio. Replaces the old separation between Voice Memo and
@@ -24,6 +41,9 @@ final class QuickActionsController: ObservableObject {
         /// checkbox).
         case recording(withSystemAudio: Bool)
         case recordingApp(processID: pid_t?, includeMic: Bool)
+        /// Held only while nothing else owns the job — an import that lands
+        /// during a recording (or a start) leaves `activeJob` alone. See
+        /// `transcribeFile`.
         case importingFile(URL)
     }
 
@@ -113,6 +133,16 @@ final class QuickActionsController: ObservableObject {
     /// something". 0.05 maps to roughly -57 dB after the meter's 60 dB
     /// normalisation — quiet enough that even a very soft "hello" trips it.
     var silenceWatchLevelThreshold: Float = 0.05
+
+    /// Test seam for `ensureMicrophonePermission`. Production leaves this nil
+    /// and asks AVFoundation. A test that drives the REAL `session.start`
+    /// (through `MicrophoneRecorder.bringUpOverride`) sets it, because the
+    /// hosted test bundle on a CI runner holds no microphone grant, and
+    /// `AVCaptureDevice.requestAccess` there either denies or never calls
+    /// back — either way the start the test is trying to observe never
+    /// reaches the bring-up. Returning false still trips
+    /// `microphonePermissionMissing`, so the denied path is testable too.
+    var microphonePermissionOverride: (() -> Bool)?
 
     let session: RecordingSession
     let store: RecordingStore
@@ -317,6 +347,13 @@ final class QuickActionsController: ObservableObject {
             // through this method, but covers a stale ActiveJob from an
             // in-flight session that started under an older code path.
             await stopRecording()
+        } else if activeJob == .starting {
+            // The previous click is still bringing capture up. Neither a
+            // second start (two concurrent bring-ups on one recorder) nor a
+            // stop (there is no session to stop yet) is right, so the click
+            // is dropped — the button is disabled and says "Starting…" for
+            // exactly this window, but ⌘N and AppleScript reach here directly.
+            quickActionsLog.log("toggleRecord ignored — recording is still starting")
         } else if activeJob == .none {
             await startRecording(withSystemAudio: withSystemAudio)
         }
@@ -344,7 +381,13 @@ final class QuickActionsController: ObservableObject {
             await stopRecording()
             return
         }
-        guard activeJob == .none else { return }
+        guard activeJob == .none else {
+            if activeJob == .starting {
+                // Same double-click window as in `toggleRecord(withSystemAudio:)`.
+                quickActionsLog.log("toggleRecord ignored — recording is still starting")
+            }
+            return
+        }
         guard microphone || appAudio else {
             quickActionsLog.log("toggleRecord ignored — both Microphone and App audio are off")
             return
@@ -446,11 +489,18 @@ final class QuickActionsController: ObservableObject {
         }
         // Storage cap: refuse to start if the library is already full.
         if storageCapReached() { return }
+        // From here on the click is accepted: publish `.starting` BEFORE the
+        // first `await`, so the button flips the instant the user lets go of
+        // it rather than whenever CoreAudio gets round to finishing (#293).
+        guard beginStarting() else { return }
         // Pre-flight the mic auth check — if denied we want to point the
         // user at System Settings (like we do for screen recording),
         // not surface a vague "operation couldn't be completed" error
         // from deep inside AVAudioEngine.
-        guard await ensureMicrophonePermission() else { return }
+        guard await ensureMicrophonePermission() else {
+            endStartingWithoutRecording()
+            return
+        }
         let prefix = withSystemAudio ? "Recording" : "Voice Memo"
         let url = store.freshAudioURL(suggestedName: prefix)
         // `.meeting` mixes mic + system audio; `.microphone` is mic only.
@@ -480,14 +530,47 @@ final class QuickActionsController: ObservableObject {
             startSilenceWatch(watching: source)
             armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
+            endStartingWithoutRecording()
             screenRecordingPermissionMissing = true
         } catch {
+            endStartingWithoutRecording()
             if withSystemAudio, SystemAudioRecorder.isPermissionError(error) {
                 screenRecordingPermissionMissing = true
             } else {
                 transcription.lastError = "Could not start recording: \(error.localizedDescription)"
             }
         }
+    }
+
+    /// Claim `activeJob` for a record-start path by publishing `.starting`.
+    /// Returns false — and starts nothing — when another job already holds it:
+    /// a recording, an import, or an earlier start that is still bringing
+    /// capture up.
+    ///
+    /// Called by every start path after its synchronous guards and BEFORE its
+    /// first `await`. That ordering is the whole feature: the UI reads
+    /// `activeJob`, and the first suspension is the one that can stall for
+    /// seconds (`RecordingSession.start` → `MicrophoneRecorder.start`, #291).
+    /// It is also the only re-entry guard the start paths have that holds
+    /// during the bring-up — `RecordingSession.start`'s `state == .idle` and
+    /// `MicrophoneRecorder.start`'s `!isRunning` both still pass until the
+    /// bring-up has finished, so without this a second click ran a second
+    /// bring-up against the same recorder (#293).
+    private func beginStarting() -> Bool {
+        guard activeJob == .none else {
+            quickActionsLog.log("record start ignored — another job already owns activeJob")
+            return false
+        }
+        activeJob = .starting
+        return true
+    }
+
+    /// Undo `beginStarting()` on a failure exit (permission denied, bring-up
+    /// threw). Guarded rather than a bare `activeJob = .none` so a start that
+    /// lost `activeJob` to something else during its awaits does not stamp
+    /// `.none` over that other job.
+    private func endStartingWithoutRecording() {
+        if activeJob == .starting { activeJob = .none }
     }
 
     // Back-compat shim so existing call sites + tests that toggle a
@@ -504,6 +587,11 @@ final class QuickActionsController: ObservableObject {
     /// should bail. Idempotent: calling this when already authorized is
     /// a cheap no-op.
     private func ensureMicrophonePermission() async -> Bool {
+        if let microphonePermissionOverride {
+            let granted = microphonePermissionOverride()
+            if !granted { microphonePermissionMissing = true }
+            return granted
+        }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             return true
@@ -550,10 +638,18 @@ final class QuickActionsController: ObservableObject {
         }
         // Storage cap: refuse to start if the library is already full.
         if storageCapReached() { return }
+        // Accept the click and say so before the first `await` — see
+        // `beginStarting`. This is also the first re-entry guard this path
+        // has had: the app picker's "Start recording" reaches here directly,
+        // and a pick landing on an active job used to fall through
+        // `session.start`'s silent `state == .idle` no-op and then overwrite
+        // `activeJob` with a `.recordingApp` that captured nothing.
+        guard beginStarting() else { return }
         // When the user opted into capturing their mic alongside system
         // audio, pre-flight the mic auth check too — otherwise the same
         // vague-error-after-rename trap as Voice Memo.
         if includeMic, !(await ensureMicrophonePermission()) {
+            endStartingWithoutRecording()
             return
         }
         session.selectApp(app)
@@ -570,8 +666,10 @@ final class QuickActionsController: ObservableObject {
             startSilenceWatch(watching: source)
             armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
+            endStartingWithoutRecording()
             screenRecordingPermissionMissing = true
         } catch {
+            endStartingWithoutRecording()
             if SystemAudioRecorder.isPermissionError(error) {
                 screenRecordingPermissionMissing = true
             } else {
@@ -614,6 +712,19 @@ final class QuickActionsController: ObservableObject {
     // MARK: - Stop & finalize any active recording
 
     func stopRecording() async {
+        // Nothing to stop yet: capture is still being brought up, and
+        // `session.state` is still `.idle` while that runs. Letting this
+        // through would be worse than a no-op — `session.stop()` returns the
+        // already-assigned `fileURL` without stopping anything, and the code
+        // below would then save a zero-length "recording", present the rename
+        // sheet, and stamp `.none` over `.starting` seconds before the
+        // bring-up lands and flips it back to `.recording`. Every UI stop
+        // affordance is hidden or disabled in this window; this covers the
+        // programmatic callers.
+        if activeJob == .starting {
+            quickActionsLog.log("stopRecording ignored — capture is still starting")
+            return
+        }
         let captured = activeJob
         let durationBeforeStop = session.elapsed
         let sleepReason = pendingSleepStopReason
@@ -1497,17 +1608,33 @@ final class QuickActionsController: ObservableObject {
         // Storage cap applies to imports too — they copy a new audio file
         // into the library, same as a recording.
         if storageCapReached() { return }
-        activeJob = .importingFile(url)
+        // An import is legitimately concurrent with a recording (⌘O during a
+        // meeting, a drop onto the More page), and `activeJob` is what backs
+        // `isRecording`. Claim it only when nothing else owns it, and hand
+        // back only what was claimed. Assigning unconditionally — as this did
+        // until #294 — let an import stamp `.importingFile` over a live
+        // `.recording`, or over a `.starting` whose success then wrote
+        // `.recording` back; either way the import finishing wrote `.none`
+        // while the mic was hot: the UI read idle, the chip and the sleep /
+        // lock guards went away, and the next Record click ran a second
+        // bring-up. (Cursor Bugbot on #294.) Nothing reads `.importingFile`
+        // itself; it exists to hold the job while the app is otherwise idle.
+        let claimed = activeJob == .none
+        if claimed { activeJob = .importingFile(url) }
+        defer {
+            // Release only what this import holds. A claimed import cannot
+            // lose the job — every start path refuses while it is held — but
+            // the check keeps the release honest if that ever changes.
+            if claimed, activeJob == .importingFile(url) { activeJob = .none }
+        }
         do {
             let recording = try await FileTranscriber.importFile(
                 at: url,
                 into: store,
                 language: languageSettings.current
             )
-            activeJob = .none
             transcription.enqueue(recording)
         } catch {
-            activeJob = .none
             transcription.lastError = "Could not import \(url.lastPathComponent): \(error.localizedDescription)"
         }
     }
@@ -1613,6 +1740,14 @@ final class QuickActionsController: ObservableObject {
             return false
         }
     }
+
+    /// True from the moment a record-start path accepts the click until
+    /// capture is up (→ `isRecording`) or the start fails (→ neither). The
+    /// Home Record button and the ⌘N menu command render this as
+    /// "Starting…" and disable themselves. Deliberately disjoint from
+    /// `isRecording`: while this is true there is no session to stop, pause,
+    /// or show a chip for. See `ActiveJob.starting`.
+    var isStartingRecording: Bool { activeJob == .starting }
 
     var elapsed: TimeInterval { session.elapsed }
     var micLevel: Float { session.micLevel }

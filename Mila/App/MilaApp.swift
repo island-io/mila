@@ -1089,10 +1089,18 @@ struct MilaApp: App {
                 .disabled(!updater.canCheckForUpdates)
             }
             CommandGroup(replacing: .newItem) {
-                Button("New Voice Memo") {
+                // While the previous ⌘N (or Record click) is still bringing
+                // capture up, say so and refuse a second press: the
+                // controller drops it anyway, but a greyed "Starting…" item
+                // is the only feedback a keyboard user gets that the first
+                // press registered (#293). `actions` is a `@StateObject` on
+                // this App, so its one-shot `.starting` publish re-evaluates
+                // this menu like any other job transition already does.
+                Button(actions.isStartingRecording ? "Starting Recording…" : "New Voice Memo") {
                     Task { await actions.toggleVoiceMemo() }
                 }
                 .keyboardShortcut("n", modifiers: .command)
+                .disabled(actions.isStartingRecording)
                 Button("Open Audio File…") {
                     Task { await actions.openFiles() }
                 }

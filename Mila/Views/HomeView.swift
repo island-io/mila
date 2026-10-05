@@ -97,6 +97,7 @@ struct HomeView: View {
     private var heroAction: some View {
         HeroRecordButton(
             isRecording: isRecording,
+            isStarting: actions.isStartingRecording,
             isFinalizing: actions.isFinalizingRecording,
             isPreparingModel: transcription.isPreparingModel,
             preparationStatus: transcription.preparationStatus,
@@ -118,7 +119,15 @@ struct HomeView: View {
         // during the compile window would start a recording the encoder
         // can't yet transcribe (segments=0). Block the button until the
         // engine reports ready.
-        .disabled(actions.isFinalizingRecording || transcription.isPreparingModel || !canRecord)
+        //
+        // And for the bring-up itself: on a Bluetooth mic `session.start`
+        // can take ~6 s (#291), during which this button used to look
+        // exactly as it did before the click. `isStartingRecording` is the
+        // controller's "click accepted, capture not up yet" — the button
+        // shows a spinner + "Starting…" and refuses the second click that
+        // used to run a second bring-up (#293).
+        .disabled(actions.isFinalizingRecording || actions.isStartingRecording
+                  || transcription.isPreparingModel || !canRecord)
     }
 
     /// The two independent source toggles below the Record button:
@@ -161,7 +170,11 @@ struct HomeView: View {
         }
         .toggleStyle(.switch)
         .controlSize(.small)
-        .disabled(isRecording)
+        // Frozen from the accepted click onwards, not just from `.recording`:
+        // the source was chosen when the click landed, and flipping a toggle
+        // mid-bring-up would show a caption for a source other than the one
+        // actually coming up.
+        .disabled(isRecording || actions.isStartingRecording)
         .frame(maxWidth: 280, alignment: .leading)
     }
 
@@ -252,6 +265,14 @@ struct HomeView: View {
 /// circle — once you're recording you want it loud and unmissable.
 private struct HeroRecordButton: View {
     let isRecording: Bool
+    /// True from the accepted Record click until capture is actually up
+    /// (`QuickActionsController.isStartingRecording`). The caller disables
+    /// the button in this state; here it gets a spinner in the icon circle
+    /// and a "Starting…" title so a slow microphone bring-up (#291) reads
+    /// as "working on it" rather than "the click did nothing" (#293).
+    /// Mutually exclusive with `isRecording` and `isFinalizing` — the
+    /// controller publishes exactly one job state at a time.
+    let isStarting: Bool
     /// True while `stopRecording`'s inline drain is running. The button
     /// is `.disabled` in this state (set by the caller) but we also want
     /// the visible title/caption to say "Finalizing…" so the user
@@ -298,6 +319,15 @@ private struct HeroRecordButton: View {
                             .progressViewStyle(.circular)
                             .controlSize(.small)
                             .accessibilityIdentifier("home.record.preparing.spinner")
+                    } else if isStarting {
+                        // Capture bring-up in flight (mic engine / system
+                        // audio stream). Same spinner, same footprint, its
+                        // own identifier so a UI test can tell the two
+                        // waits apart.
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .controlSize(.small)
+                            .accessibilityIdentifier("home.record.starting.spinner")
                     } else if isRecording {
                         Circle()
                             .stroke(Color.white.opacity(0.5), lineWidth: 2)
@@ -396,6 +426,7 @@ private struct HeroRecordButton: View {
     private var titleText: String {
         if isPreparingModel { return "Preparing AI…" }
         if isFinalizing { return "Finalizing…" }
+        if isStarting { return "Starting…" }
         if isRecording { return "Recording…" }
         return liveAIEnabled ? "Transcribe and Summarize" : "Transcribe"
     }
@@ -409,6 +440,11 @@ private struct HeroRecordButton: View {
         }
         if isFinalizing {
             return "Saving transcript…"
+        }
+        if isStarting {
+            // The slow leg is the microphone (Bluetooth format negotiation,
+            // #291); an app-only capture waits on ScreenCaptureKit instead.
+            return microphoneEnabled ? "Waiting for the microphone…" : "Setting up audio capture…"
         }
         if isRecording {
             return "Tap to stop"

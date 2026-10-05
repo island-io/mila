@@ -343,7 +343,13 @@ final class MicrophoneRecorder: ObservableObject {
     }
 
     func requestAccess() async -> Bool {
-        await withCheckedContinuation { cont in
+        // The test seam stands in for the whole device layer, and there is no
+        // device to ask about. This matters on CI: the hosted test bundle
+        // holds no microphone grant, so a real `requestAccess` there either
+        // denies or never calls back — and `RecordingSession.start` awaits
+        // this before the bring-up a test is trying to observe.
+        if bringUpOverride != nil { return true }
+        return await withCheckedContinuation { cont in
             AVCaptureDevice.requestAccess(for: .audio) { granted in
                 cont.resume(returning: granted)
             }
