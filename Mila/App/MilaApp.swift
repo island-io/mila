@@ -343,6 +343,7 @@ struct MilaApp: App {
     @StateObject private var diarizationSettings: DiarizationSettings
     @StateObject private var remoteTranscriptionSettings: RemoteTranscriptionSettings
     @StateObject private var meetingDetectionSettings: MeetingDetectionSettings
+    @StateObject private var postRecordingSettings: PostRecordingSettings
     @StateObject private var meetingDetector: MeetingDetector
     @StateObject private var meetingPrompt: MeetingPromptCoordinator
     @StateObject private var liveAISettings: LiveAISettings
@@ -384,6 +385,25 @@ struct MilaApp: App {
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
     init() {
+        // Configure fixture-test preferences in memory before constructing settings,
+        // independently of AppKit's interpretation of launch arguments.
+        if CommandLine.arguments.contains("--ui-test-clean-store"),
+           CommandLine.arguments.contains("--ui-test-batch-recording") {
+            let defaults = UserDefaults.standard
+            var arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+            arguments.merge([
+                "postRecording.batchOnly": true,
+                "recording.language": "en",
+                "transcription.backend": "local",
+                "liveAI.enabled": false,
+                "liveAI.backgroundMode": false,
+                "liveAI.forceOnLowEndHardware": false,
+                "diarization.enabled": false,
+                "speakers.voiceRecognition.enabled": false,
+                "llm.tool": "none"
+            ]) { _, testValue in testValue }
+            defaults.setVolatileDomain(arguments, forName: UserDefaults.argumentDomain)
+        }
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
         // storage-settings instance owns the security-scoped bookmark
@@ -466,7 +486,11 @@ struct MilaApp: App {
             CommandLine.arguments.contains("--ui-test-rtl-live-hebrew")
             || CommandLine.arguments.contains(where: { $0.hasPrefix("--ui-test-inject-fixture-wav=") })
             || NSClassFromString("XCTestCase") != nil
-        let liveAICapabilities: SystemCapabilities = uiTestForcesLiveAI
+        let uiTestForcesLowEnd = CommandLine.arguments.contains("--ui-test-low-end-hardware")
+        let liveAICapabilities: SystemCapabilities = uiTestForcesLowEnd
+            ? SystemCapabilities(modelIdentifier: "MacBookAirTest", marketingName: "MacBook Air",
+                                 isMacBookAir: true, physicalRamGB: 8, performanceCoreCount: 4)
+            : uiTestForcesLiveAI
             ? SystemCapabilities(
                 modelIdentifier: SystemCapabilities.live.modelIdentifier,
                 marketingName: "MacBook Pro",
@@ -889,6 +913,8 @@ struct MilaApp: App {
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
+        let postRecSettings = PostRecordingSettings()
+        actions.postRecordingSettings = postRecSettings
         let meetingSettings = MeetingDetectionSettings()
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
@@ -919,6 +945,7 @@ struct MilaApp: App {
         _inputLevelMonitor = StateObject(wrappedValue: inputMonitor)
         _llmSettings = StateObject(wrappedValue: llm)
         _postRecording = StateObject(wrappedValue: coordinator)
+        _postRecordingSettings = StateObject(wrappedValue: postRecSettings)
         _meetingDetectionSettings = StateObject(wrappedValue: meetingSettings)
         _meetingDetector = StateObject(wrappedValue: detector)
         _meetingPrompt = StateObject(wrappedValue: promptCoordinator)
@@ -1024,6 +1051,7 @@ struct MilaApp: App {
                 .environmentObject(inputLevelMonitor.meter)
                 .environmentObject(llmSettings)
                 .environmentObject(postRecording)
+                .environmentObject(postRecordingSettings)
                 .environmentObject(diarizationSettings)
                 .environmentObject(remoteTranscriptionSettings)
                 .environmentObject(liveAISettings)
@@ -1131,6 +1159,7 @@ struct MilaApp: App {
                 .environmentObject(diarizationSettings)
                 .environmentObject(remoteTranscriptionSettings)
                 .environmentObject(meetingDetectionSettings)
+                .environmentObject(postRecordingSettings)
                 .environmentObject(liveAISettings)
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
@@ -1280,8 +1309,7 @@ struct MilaApp: App {
         // .recording before there's a listener to react.
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         let sessionRef = session
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mila-fake-recording-\(UUID().uuidString).wav")
+        let outputURL = store.freshAudioURL(suggestedName: "Fixture Recording")
         // Start through QuickActionsController, NOT session directly. Routing
         // via `startFakeRecordingForTesting` sets `activeJob = .recording` so
         // `actions.isRecording` flips true — which is what
@@ -1293,7 +1321,15 @@ struct MilaApp: App {
         // elements never mount — the throughput/AGC E2Es then time out waiting
         // for a `liveTranscript.segment` that exists only in the (background)
         // pipeline, never in the view tree.
+        do {
+            try FileManager.default.copyItem(atPath: wavPath, toPath: outputURL.path)
+        } catch {
+            return
+        }
         await actions.startFakeRecordingForTesting(outputURL: outputURL)
+        // Batch mode consumes the copied WAV after Stop; it has no live sample
+        // consumer and must not enter the live fixture decoder/pump.
+        guard !actions.capturedBatchOnly else { return }
         // Wait for wireLiveAIPipeline to install onLiveSamples (it
         // does so once the .recording case fires). Poll up to ~3s.
         for _ in 0..<60 {
@@ -1660,31 +1696,11 @@ struct MilaApp: App {
                 // `start()`, so it cannot be fooled that way.
                 if wiredCaptureEpoch == sessionRef.captureEpoch { break }
                 wiredCaptureEpoch = sessionRef.captureEpoch
-                guard aiSettings.isLiveAIAvailable else {
-                    // Hardware below the Live AI bar AND no override
-                    // flipped. Recording still runs via RecordingSession;
-                    // QuickActionsController enqueues a post-record
-                    // transcribe on stop. We just skip the live
-                    // pipeline setup.
-                    //
-                    // BUT: clear the transcriber's `segments` /
-                    // `useVAD` first. Without this, a stale live
-                    // transcript from a previous recording (when the
-                    // user had the override toggle on) would still be
-                    // sitting in memory; `stopRecording` would
-                    // snapshot it onto the new recording and could
-                    // mark it `.completed` without ever running batch
-                    // transcription. Cursor flagged on 62e1c3b.
+                guard aiSettings.isLiveAIAvailable, actionsRef?.capturedBatchOnly != true else {
+                    // Recording preparation already cleared the retained live state.
+                    // Keep the sidecar lifecycle even though no live pipeline runs.
                     _ = transcriber.stop()
                     sessionRef.onLiveSamples = nil
-                    // Also clear LiveAISession so its rolling `summary`
-                    // and `actionItems` from a previous override-enabled
-                    // recording don't leak onto this gated capture.
-                    // `stopRecording` reads aiSession.summary /
-                    // actionItems unconditionally; without this reset,
-                    // a previous Live AI session's output would attach
-                    // to a recording that never ran the LLM loop.
-                    // Cursor flagged on c95d2bb.
                     aiSession.cancel()
                     // Still surface the recording to external pollers
                     // (mila-mcp): they get an honest "recording, but no
@@ -1692,7 +1708,7 @@ struct MilaApp: App {
                     // silence.
                     sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                        .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
+                        .log("wireLiveAIPipeline: live processing skipped — batch-only or hardware gate (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
                 // Open the live-transcript sidecar for this recording so

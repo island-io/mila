@@ -40,11 +40,25 @@ struct LiveAIRecordingView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
-            // Action items pane is rendered only when Live AI is on +
-            // a CLI is configured. When AI is off the live transcript
-            // takes the whole detail pane so the user still sees what
-            // Mila is hearing in real time.
-            if aiActive {
+            if actions.capturedBatchOnly {
+                // Batch-only mode: no live transcription, just capture.
+                Spacer()
+                VStack(spacing: 8) {
+                    Text("Transcript will appear after recording")
+                        .font(.callout)
+                    Text("Audio is being recorded. Transcription starts after you stop.")
+                        .font(.caption)
+                }
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding()
+                .accessibilityIdentifier("recording.batchOnly.placeholder")
+                Spacer()
+            } else if aiActive {
+                // Action items pane is rendered only when Live AI is on +
+                // a CLI is configured. When AI is off the live transcript
+                // takes the whole detail pane so the user still sees what
+                // Mila is hearing in real time.
                 VSplitView {
                     actionItemsPane
                         .frame(minHeight: 140)
@@ -63,7 +77,7 @@ struct LiveAIRecordingView: View {
     private var language: String { languageSettings.current.rawValue }
     private var isRTL: Bool { language == "he" }
     private var aiActive: Bool {
-        liveAISettings.enabled && llmSettings.isConfigured
+        !actions.capturedBatchOnly && liveAISettings.enabled && llmSettings.isConfigured
             && !llmSettings.liveAIDisabledByRemoteOpenAI
     }
 

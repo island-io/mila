@@ -217,6 +217,13 @@ struct ContentView: View {
             // flicker.
             NotificationCenter.default.post(name: .milaSidebarVisibilityDidChange, object: nil)
         }
+        .onChange(of: actions.revealRecordingID) { _, id in
+            guard let id else { return }
+            selection = .recording(id)
+            actions.revealRecordingID = nil
+            // Bring Mila to the front so the user sees the recording.
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     /// True while the detail pane is showing the "Recently Deleted" list —
@@ -258,7 +265,7 @@ struct ContentView: View {
         // whisper for CPU, this trades off live visibility for
         // throughput.
         if liveAISettings.backgroundMode { return false }
-        return actions.isRecording && liveAISettings.isLiveAIAvailable
+        return actions.isRecording && (actions.capturedBatchOnly || liveAISettings.isLiveAIAvailable)
     }
 
     /// Compose the wake-up alert body. Always shows the captured length so

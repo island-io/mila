@@ -218,9 +218,22 @@ distribution via the App Store you'd:
   `com.apple.security.network.client`, etc.)
 - Provide your team ID in `DEVELOPMENT_TEAM`.
 
+## Recording without live transcription
+
+Enable **Settings → Meetings → Batch transcription only** to record audio and
+transcribe it after you stop. The setting applies to the next recording. Mila
+saves without the rename window and brings the saved recording to the front;
+progress and retry controls use the existing transcription queue. Speaker labels,
+summaries and suggested titles still depend on their respective settings. A title
+you entered is preserved. Disable the toggle for subsequent live recordings.
+
 ## Changelog
 
 Newest first. Dates are release dates.
+
+- **Unreleased** — Optional batch-only recording defers live processing until
+  after Stop, saves without the rename window, and selects the saved recording.
+  Recording mode is fixed at start, and each new capture clears prior live state.
 
 - **1.9.0** (2026-07-22) — Remote transcription server support (OpenAI-compatible API), one-click `.milaconfig` setup files, iPhone Voice Memos sync, named speaker labels, opt-in beta updates, hallucination reduction via neural VAD, adaptive gain for quiet mics, auto-discard of empty clips, stop/remove queue items, no more stuck "Queued" items after relaunch, color-coded speakers, mid-recording SRT export, automatic summaries toggle with configurable timeout, record button no longer waits on the previous summary, collapsible "All Transcriptions" sidebar section, CodeQL security scanning added to CI, and a large sweep of reliability fixes across audio capture, diarization, and UI.
 - **1.8.5** (2026-06-09) — Independent mic / app-audio capture toggles, AAC (`.m4a`) recordings, and a configurable recording-storage cap.
