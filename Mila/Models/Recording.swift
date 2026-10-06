@@ -132,6 +132,16 @@ struct Recording: Identifiable, Codable, Hashable {
         summaryLanguage.flatMap(RecordingLanguage.init(rawValue:))
     }
 
+    /// Display name of the person who shared this recording, when it arrived
+    /// as a `.milashare` bundle rather than being recorded or imported here.
+    /// nil for everything Mila captured itself. Attribution only — it does
+    /// not change `source`, so a shared Zoom meeting is still a meeting.
+    var sharedBy: String?
+
+    /// When the bundle that brought this recording was exported (the
+    /// sender's clock). Set together with `sharedBy`, nil otherwise.
+    var sharedAt: Date?
+
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose
@@ -159,7 +169,9 @@ struct Recording: Identifiable, Codable, Hashable {
          voiceMemoUniqueID: String? = nil,
          voiceMemoFolderUUID: String? = nil,
          speakerNames: [String: String] = [:],
-         summaryLanguage: String? = nil) {
+         summaryLanguage: String? = nil,
+         sharedBy: String? = nil,
+         sharedAt: Date? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -181,9 +193,14 @@ struct Recording: Identifiable, Codable, Hashable {
         self.voiceMemoFolderUUID = voiceMemoFolderUUID
         self.speakerNames = speakerNames
         self.summaryLanguage = summaryLanguage
+        self.sharedBy = sharedBy
+        self.sharedAt = sharedAt
     }
 
     var isTrashed: Bool { deletedAt != nil }
+
+    /// Whether this recording arrived from another Mila user's `.milashare`.
+    var isShared: Bool { sharedBy != nil }
 
     /// File name (relative to recordings directory) of the sidecar `.txt`
     /// holding the plain-text transcript. Derived from `audioFileName` so a
@@ -217,7 +234,7 @@ struct Recording: Identifiable, Codable, Hashable {
              status, language, modelName, segments, deletedAt, folder, appName,
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames, summaryLanguage
+             speakerNames, summaryLanguage, sharedBy, sharedAt
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -245,6 +262,8 @@ struct Recording: Identifiable, Codable, Hashable {
         self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
         self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
         self.summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
+        self.sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
+        self.sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -276,6 +295,10 @@ struct Recording: Identifiable, Codable, Hashable {
         // Omitted when nil so a recordings.json nobody has set an override
         // in is byte-identical to what the previous release wrote.
         try c.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
+        // Omitted when nil so every recording Mila captured itself encodes
+        // byte-for-byte as before. Mirrored in MilaKit's `StoredRecording`.
+        try c.encodeIfPresent(sharedBy, forKey: .sharedBy)
+        try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

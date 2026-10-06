@@ -61,7 +61,9 @@ final class StoredRecordingDriftTests: XCTestCase {
             voiceMemoUniqueID: "VM-1",
             voiceMemoFolderUUID: "VMF-1",
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
-            summaryLanguage: "en"
+            summaryLanguage: "en",
+            sharedBy: "Ada Lovelace",
+            sharedAt: created
         )
     }
 
@@ -102,6 +104,8 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(s.actionItems?.first?.timestampSeconds, 3)
         XCTAssertEqual(s.speakerNames, ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"])
         XCTAssertEqual(s.summaryLanguage, "en")
+        XCTAssertEqual(s.sharedBy, "Ada Lovelace")
+        XCTAssertEqual(s.sharedAt, created)
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")

@@ -32,8 +32,13 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var llm: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
     @EnvironmentObject private var liveAI: LiveAISettings
+    @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
+    @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
 
     @State private var renameRequest: String?
+    /// Non-nil while the `.milashare` export sheet (voice-profile opt-in) is
+    /// up; nil goes straight to the save panel.
+    @State private var shareSelection: SharedSpeakersExportSelection?
     @State private var promptForNewFolder = false
     @State private var newFolderDraft = ""
     @State private var showingSendSheet = false
@@ -76,6 +81,7 @@ private struct RecordingContextMenu: ViewModifier {
             .sheet(isPresented: $showingSendSheet) {
                 SendToLLMSheet(recording: recording)
             }
+            .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
             .confirmationDialog("Delete “\(recording.title)” permanently?",
                                 isPresented: $confirmingPermanentDelete,
                                 titleVisibility: .visible) {
@@ -166,6 +172,10 @@ private struct RecordingContextMenu: ViewModifier {
                 )
             }
             Divider()
+            Button("Share Recording…") {
+                shareRecording()
+            }
+            .disabled(!RecordingShareExporter.canExport(recording))
             Button("Export Subtitles (.srt)…") {
                 exportSRT()
             }
@@ -200,6 +210,21 @@ private struct RecordingContextMenu: ViewModifier {
                                                              language: language.rawValue)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
+    }
+
+    /// Produce a `.milashare` for a colleague. When the recording's named
+    /// speakers have voice profiles, an opt-in sheet comes first; otherwise
+    /// the save panel opens directly.
+    private func shareRecording() {
+        if let selection = RecordingShareExporter.exportSelection(
+            for: recording, profiles: speakerProfileStore, voiceRecognition: voiceRecognition) {
+            shareSelection = selection
+        } else {
+            let recording = recording
+            Task { @MainActor in
+                await RecordingShareExporter.saveInteractively(recording, store: store, profiles: [])
+            }
+        }
     }
 
     /// Save the recording's SRT to a user-chosen location. NSSavePanel lets

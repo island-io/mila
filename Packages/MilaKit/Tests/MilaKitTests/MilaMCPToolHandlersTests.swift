@@ -150,6 +150,20 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertNil(first["app_bundle_id"])
     }
 
+    /// A recording that arrived as a `.milashare` bundle says who shared
+    /// it; one this Mac captured itself carries no `shared_by` key at all.
+    func test_shared_by_is_exposed_only_on_shared_recordings() throws {
+        var shared = meeting("Their sync", daysAgo: 1)
+        shared.sharedBy = "Ada Lovelace"
+        shared.sharedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        try seedStore([meeting("My memo", daysAgo: 0), shared])
+
+        let rows = try XCTUnwrap(try call("list_recordings")["recordings"] as? [[String: Any]])
+        let byTitle = Dictionary(uniqueKeysWithValues: rows.map { ($0["title"] as! String, $0) })
+        XCTAssertEqual(byTitle["Their sync"]?["shared_by"] as? String, "Ada Lovelace")
+        XCTAssertNil(byTitle["My memo"]?["shared_by"])
+    }
+
     /// The tool-layer half of the trashed-recording leak: a client holding a
     /// retained UUID must get a not-found, not the transcript.
     /// (CodeRabbit on #183, CWE-200.)

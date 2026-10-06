@@ -218,12 +218,31 @@ targets:
             UTTypeTagSpecification:
               public.filename-extension:
                 - milaconfig
+          # `.milashare` — a recording shared between Mila users: a zip of
+          # manifest.json + audio + transcript (see ShareManifest). Conforms
+          # to public.zip-archive so a Mac without Mila still opens it with
+          # Archive Utility. Routed through MilaAppDelegate.application(_:open:)
+          # -> RecordingShareImporter.
+          - UTTypeIdentifier: io.island.mila.share
+            UTTypeDescription: Mila Shared Recording
+            UTTypeConformsTo:
+              - public.zip-archive
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - milashare
+              public.mime-type:
+                - application/vnd.mila.share+zip
         CFBundleDocumentTypes:
           - CFBundleTypeName: Mila Configuration
             CFBundleTypeRole: Viewer
             LSHandlerRank: Owner
             LSItemContentTypes:
               - io.island.mila.config
+          - CFBundleTypeName: Mila Shared Recording
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Owner
+            LSItemContentTypes:
+              - io.island.mila.share
         # Sparkle auto-update feed. The appcast is a static file published to
         # GitHub Pages; release binaries are attached to GitHub Releases. Forks
         # that want their own update channel should point this at their own

@@ -468,6 +468,37 @@ final class RecordingStore: ObservableObject {
         return transcriptWritten && persisted
     }
 
+    /// Insert a recording that arrived from elsewhere (a `.milashare`
+    /// import), or replace the one that already carries its id.
+    ///
+    /// Neither `add` nor `update` fits on its own: `add` always inserts at
+    /// index 0 — right for a recording made just now, wrong for a three-week-
+    /// old meeting a colleague shared, which would sit at the top of the list
+    /// until the next relaunch re-sorted it — and cannot replace, while
+    /// `update` cannot insert. More importantly, `add` would happily insert a
+    /// SECOND record with the same id, and every lookup here is
+    /// `firstIndex(where: id ==)`, so the duplicate would shadow the original
+    /// for ever after. This is the one entry point that guarantees a given
+    /// UUID appears at most once.
+    ///
+    /// Same verdict as `update(_:)`: whether both the `.txt` sidecar and
+    /// `recordings.json` landed on disk.
+    @discardableResult
+    func upsertImported(_ recording: Recording) -> Bool {
+        if let idx = recordings.firstIndex(where: { $0.id == recording.id }) {
+            recordings[idx] = recording
+        } else {
+            // The list is kept newest-first (see `load`); slot the newcomer
+            // where its own creation date says it belongs.
+            let idx = recordings.firstIndex { $0.createdAt <= recording.createdAt } ?? recordings.count
+            recordings.insert(recording, at: idx)
+        }
+        let transcriptWritten = writeTranscript(for: recording)
+        writeSummary(for: recording)
+        let persisted = persist()
+        return transcriptWritten && persisted
+    }
+
     /// `update(_:)` plus the one piece of bookkeeping a caller owes when it
     /// replaces a recording's **whole** `speakerNames` map because a pass
     /// re-keyed its `SPEAKER_NN` ids: `onSpeakerUnnamed` fires for every

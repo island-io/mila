@@ -212,6 +212,11 @@ private struct HistoryRow: View {
                     Text(recording.createdAt, format: .dateTime.hour().minute())
                     Text("·")
                     Text(recording.detectedMeetingApp?.info.displayName ?? recording.source.displayName)
+                    if let sharedBy = recording.sharedBy {
+                        Text("·")
+                        Text("Shared by \(sharedBy)")
+                            .lineLimit(1)
+                    }
                     if transcription.activeRecordingID == recording.id {
                         Text("·")
                         ProgressView(value: transcription.progress)

@@ -6,9 +6,10 @@ private let profileLog = Logger(
 
 /// Persistent voice profile for cross-recording speaker recognition.
 /// Stores the speaker's name alongside a centroid embedding (256-dim
-/// vector from wespeaker ECAPA-TDNN via pyannote). The centroid is a
-/// running mean of all embeddings observed for this speaker — the more
-/// recordings, the tighter the distribution.
+/// vector from the bundled wespeaker ResNet34 model, loaded via pyannote —
+/// see `SpeakerEmbeddingModel.current`). The centroid is a running mean of
+/// all embeddings observed for this speaker — the more recordings, the
+/// tighter the distribution.
 struct VoiceProfile: Codable, Identifiable, Hashable {
     var id: UUID
     var name: String
@@ -18,6 +19,72 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
     var sampleCount: Int
     var createdAt: Date
     var lastSeenAt: Date
+    /// Which embedding model produced `embedding`. nil on rows written
+    /// before the stamp existed; read through `effectiveEmbeddingModel`.
+    /// Vectors from different models are incomparable, so every fold
+    /// (`updateProfile`, `mergeProfiles`, a `.milashare` import) refuses to
+    /// combine two profiles whose stamps differ.
+    var embeddingModel: String?
+    /// `.milashare` bundles whose copy of this speaker has already been
+    /// folded in, so importing the same file twice doesn't double-count.
+    /// Lives here, not in a side ledger, so deleting the profile forgets
+    /// them too (see `ImportedShareToken`).
+    var importedShares: [ImportedShareToken]
+
+    init(id: UUID, name: String, embedding: [Float], sampleCount: Int,
+         createdAt: Date, lastSeenAt: Date,
+         embeddingModel: String? = nil,
+         importedShares: [ImportedShareToken] = []) {
+        self.id = id
+        self.name = name
+        self.embedding = embedding
+        self.sampleCount = sampleCount
+        self.createdAt = createdAt
+        self.lastSeenAt = lastSeenAt
+        self.embeddingModel = embeddingModel
+        self.importedShares = importedShares
+    }
+
+    /// The stamp, with legacy rows resolved to the only model that has ever
+    /// shipped. Valid for exactly as long as that stays true — see
+    /// `SpeakerEmbeddingModel`.
+    var effectiveEmbeddingModel: String {
+        embeddingModel ?? SpeakerEmbeddingModel.current.id
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, embedding, sampleCount, createdAt, lastSeenAt, embeddingModel, importedShares
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(UUID.self, forKey: .id)
+        name = try c.decode(String.self, forKey: .name)
+        embedding = try c.decode([Float].self, forKey: .embedding)
+        sampleCount = try c.decode(Int.self, forKey: .sampleCount)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        lastSeenAt = try c.decode(Date.self, forKey: .lastSeenAt)
+        embeddingModel = try c.decodeIfPresent(String.self, forKey: .embeddingModel)
+        importedShares = try c.decodeIfPresent([ImportedShareToken].self, forKey: .importedShares) ?? []
+    }
+
+    /// The two new keys are written only when they carry something, so a
+    /// `speaker-profiles.json` nobody has imported into stays byte-identical
+    /// to what earlier builds wrote — and an earlier build reading a newer
+    /// file ignores the keys it doesn't know.
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(name, forKey: .name)
+        try c.encode(embedding, forKey: .embedding)
+        try c.encode(sampleCount, forKey: .sampleCount)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(lastSeenAt, forKey: .lastSeenAt)
+        try c.encodeIfPresent(embeddingModel, forKey: .embeddingModel)
+        if !importedShares.isEmpty {
+            try c.encode(importedShares, forKey: .importedShares)
+        }
+    }
 
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
     static func == (lhs: VoiceProfile, rhs: VoiceProfile) -> Bool { lhs.id == rhs.id }
@@ -247,7 +314,14 @@ final class SpeakerProfileStore: ObservableObject {
     /// Upsert a speaker profile by name. If a profile with the same name
     /// exists, merge the new embedding into its centroid via weighted
     /// average. Otherwise create a new profile.
-    func updateProfile(name: String, embedding: [Float], sampleCount: Int) {
+    ///
+    /// `embeddingModel` defaults to the model this build runs; a
+    /// `.milashare` import passes the sender's stamp instead, and the merge
+    /// below refuses when it differs from the stored one — the model-level
+    /// twin of the dimension guard, because two same-width vectors from
+    /// different models average into noise rather than into a voice.
+    func updateProfile(name: String, embedding: [Float], sampleCount: Int,
+                       embeddingModel: String = SpeakerEmbeddingModel.current.id) {
         // The write gate. Callers guard too (so an opted-out user's centroid
         // is never even read out of the diarizer pool), but the refusal that
         // actually matters is here: nothing reaches `save()` while off.
@@ -271,6 +345,10 @@ final class SpeakerProfileStore: ObservableObject {
                 profileLog.log("updateProfile: dimension mismatch (\(existing.embedding.count) vs \(embedding.count)) for \(trimmed, privacy: .private)")
                 return
             }
+            guard existing.effectiveEmbeddingModel == embeddingModel else {
+                profileLog.log("updateProfile: embedding model mismatch (\(existing.effectiveEmbeddingModel, privacy: .public) vs \(embeddingModel, privacy: .public)) for \(trimmed, privacy: .private)")
+                return
+            }
             // Safe to add: both operands are at most `maxSampleCount` — the
             // incoming one by the guard above, the stored one because every
             // route into `profiles` (this method, or `load`'s validation)
@@ -291,6 +369,8 @@ final class SpeakerProfileStore: ObservableObject {
             profiles[idx].embedding = merged
             profiles[idx].sampleCount = storedCount
             profiles[idx].lastSeenAt = Date()
+            // A legacy row gets its stamp the first time it is touched.
+            if profiles[idx].embeddingModel == nil { profiles[idx].embeddingModel = embeddingModel }
             profileLog.log("updateProfile: merged into \(trimmed, privacy: .private) (now \(storedCount) samples)")
             save()
         } else {
@@ -300,7 +380,8 @@ final class SpeakerProfileStore: ObservableObject {
                 embedding: embedding,
                 sampleCount: sampleCount,
                 createdAt: Date(),
-                lastSeenAt: Date()
+                lastSeenAt: Date(),
+                embeddingModel: embeddingModel
             )
             profiles.append(profile)
             profileLog.log("updateProfile: created \(trimmed, privacy: .private) (\(sampleCount) samples)")
@@ -421,6 +502,46 @@ final class SpeakerProfileStore: ObservableObject {
         profiles.first { $0.name == named }
     }
 
+    // MARK: - Sharing (.milashare)
+
+    /// The stored profiles for a set of speaker names (exact match after
+    /// trimming), in name order. What the export sheet offers to include.
+    ///
+    /// Gated on `isEnabled`, not `isConfigured`, deliberately: this is a
+    /// READ of data the user already consented to store, and serialising
+    /// floats into a file needs no diarization pipeline. (While off,
+    /// `profiles` is empty anyway — the file was never parsed.) Writes on
+    /// the import side still go through `updateProfile` and its
+    /// `isConfigured` gate; see `.claude/rules/feature-gates.md`.
+    func profiles(named names: Set<String>) -> [VoiceProfile] {
+        guard settings.isEnabled else { return [] }
+        let wanted = Set(names.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        return profiles
+            .filter { wanted.contains($0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Every `.milashare` import any stored profile remembers. The resolver
+    /// marks a matching incoming profile "already imported".
+    var importedShareTokens: Set<ImportedShareToken> {
+        Set(profiles.flatMap(\.importedShares))
+    }
+
+    /// Remember that `token` was folded into the profile called `name`.
+    /// Called by `SpeakerProfileImportApplier` right after the
+    /// `updateProfile` that did the folding. No-op if the profile is not
+    /// there (the fold was refused) or already carries the token.
+    ///
+    /// Persisted through `save()`'s `isEnabled` gate like the other
+    /// housekeeping writes: the fold it records could only have happened
+    /// behind `isConfigured`, so no new voice data reaches disk here.
+    func recordImport(token: ImportedShareToken, onProfileNamed name: String) {
+        guard let idx = profiles.firstIndex(where: { $0.name == name }),
+              !profiles[idx].importedShares.contains(token) else { return }
+        profiles[idx].importedShares.append(token)
+        save()
+    }
+
     /// Rename a profile.
     func renameProfile(from oldName: String, to newName: String) {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -449,6 +570,10 @@ final class SpeakerProfileStore: ObservableObject {
             profileLog.log("mergeProfiles: dimension mismatch (\(keep.embedding.count) vs \(absorb.embedding.count))")
             return nil
         }
+        guard keep.effectiveEmbeddingModel == absorb.effectiveEmbeddingModel else {
+            profileLog.log("mergeProfiles: embedding model mismatch (\(keep.effectiveEmbeddingModel, privacy: .public) vs \(absorb.effectiveEmbeddingModel, privacy: .public))")
+            return nil
+        }
         let dim = keep.embedding.count
         guard dim > 0 else { return nil }
         // Bounded and clamped exactly as in `updateProfile`, and for the same
@@ -465,6 +590,14 @@ final class SpeakerProfileStore: ObservableObject {
         profiles[keepIdx].embedding = merged
         profiles[keepIdx].sampleCount = storedCount
         profiles[keepIdx].lastSeenAt = max(keep.lastSeenAt, absorb.lastSeenAt)
+        if profiles[keepIdx].embeddingModel == nil {
+            profiles[keepIdx].embeddingModel = absorb.embeddingModel
+        }
+        // The absorbed profile's import history travels with its samples:
+        // a bundle already folded into either side is folded into the result.
+        for token in absorb.importedShares where !profiles[keepIdx].importedShares.contains(token) {
+            profiles[keepIdx].importedShares.append(token)
+        }
         profiles.removeAll { $0.id == absorb.id }
         profileLog.log("mergeProfiles: merged \(absorbName, privacy: .private) into \(keepName, privacy: .private)")
         save()
