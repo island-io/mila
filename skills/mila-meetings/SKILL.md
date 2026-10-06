@@ -32,6 +32,11 @@ the exact command with a Copy button)
   returns a stored `summary` when one exists — read it before deciding
   to re-summarize from the raw transcript. Transcripts may be in any
   language (often Hebrew); answer in the user's language.
+- "Subtitles" / "an .srt for this recording" → `get_transcript(id: …,
+  format: "srt")` and WRITE the result to a `.srt` file (next to the
+  user's video if they named one); do not paste cues into chat. It is the
+  same output as Mila's Export Subtitles. If the tool refuses because the
+  recording has no timed segments, say so and offer the text transcript.
 - Action items from `get_transcript` carry a `source`. `voice_command`
   means the speaker dictated the item out loud; `inferred` means Live AI
   derived it from the conversation. Do not report an inferred item as

@@ -20,7 +20,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     /// accepts a segment id. Mirroring it would advertise an addressability
     /// the app does not offer. Recorded in `StoredRecordingDriftTests`'
     /// nested allowlist so the tripwire stays armed for every OTHER field.
-    public struct Segment: Codable, Equatable, Sendable, SpeakerTextSegment {
+    public struct Segment: Codable, Equatable, Sendable, TimedSpeakerTextSegment {
         public var start: Double
         public var end: Double
         public var text: String

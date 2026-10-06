@@ -68,7 +68,7 @@ cp -R skills/mila-meetings ~/.claude/skills/
 | Tool | What it does |
 |---|---|
 | `list_recordings` | List/filter recordings — by speaker display name, title/app/folder text, source, date range; sortable by date/duration/title. |
-| `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. Trashed recordings are not reachable, by id or otherwise. Each action item carries a `source` — `voice_command` (the speaker dictated it out loud) or `inferred` (Live AI derived it from the conversation). Those are not the same claim, so a client should not present the second as the first. |
+| `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. Trashed recordings are not reachable, by id or otherwise. `format: "srt"` returns SubRip subtitles instead (one timed cue per segment, speaker names as cue prefixes — byte-identical to the app's **Export Subtitles (.srt)**); it is refused for recordings that have no timed segments, and `max_chars` then drops whole cues rather than cutting one. Each action item carries a `source` — `voice_command` (the speaker dictated it out loud) or `inferred` (Live AI derived it from the conversation). Those are not the same claim, so a client should not present the second as the first. |
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
 
@@ -104,6 +104,10 @@ Just ask, e.g.:
 Claude calls `list_recordings(speaker: "john doe", limit: 1)` and then
 `get_transcript(id: …)`. Speaker filters match the display names you
 assigned in Mila's rename popover — unnamed speakers stay `SPEAKER_NN`.
+
+For subtitles — "export my last meeting as an .srt next to the video" —
+Claude calls `get_transcript(id: …, format: "srt")` and writes the result
+to a file. The cues are the same ones the app's own export produces.
 
 ## Following a live meeting
 
