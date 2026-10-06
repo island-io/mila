@@ -258,7 +258,11 @@ public struct MilaMCPToolHandlers: Sendable {
         result["language"] = recording.language
         result["transcript"] = transcript
         result["transcript_truncated"] = truncated
-        if recording.status != "completed" {
+        if recording.isTranscriptionDeferred {
+            // Stored as `failed` (see `StoredRecording.transcriptionDeferredAt`),
+            // but nothing failed: the user chose to transcribe it later.
+            result["note"] = "The user stopped this recording's transcription in Mila to run it later, so it hasn't been fully transcribed — any text here is only a partial live draft."
+        } else if recording.status != "completed" {
             result["note"] = "Transcription status is \"\(recording.status)\" — the transcript may be partial."
         }
         if (args["include_summary"] as? Bool) ?? true {
@@ -346,11 +350,11 @@ public struct MilaMCPToolHandlers: Sendable {
                 // No id covers several cases the snapshot can't tell apart, and
                 // since the app stopped publishing an id for a not-yet-final
                 // transcript this is the ORDINARY outcome for chunk-mode,
-                // hardware-gated and empty-live recordings — not a failure. The
+                // live-off and empty-live recordings — not a failure. The
                 // wording has to be accurate for all of them, so it names the
                 // action and warns the row may still be transcribing rather
                 // than implying something went wrong.
-                result["note"] = "The recording ended without a transcript handoff; check list_recordings for the newest entry. Its transcript may still be processing — get_transcript reports status \"pending\" until it is done."
+                result["note"] = "The recording ended without a transcript handoff; check list_recordings for the newest entry. Its transcript may still be processing — get_transcript reports status \"pending\" until it is done, or says so if the user stopped the transcription to run it later."
             }
             return try json(result)
         }
@@ -359,7 +363,7 @@ public struct MilaMCPToolHandlers: Sendable {
         guard snapshot.liveTranscriptAvailable else {
             result["status"] = "recording_live_unavailable"
             result["elapsed_seconds"] = Int(now().timeIntervalSince(snapshot.recordingStartedAt))
-            result["note"] = "A recording is in progress, but live transcription is disabled on this hardware — no text will appear until it completes. Poll occasionally for status \"completed\" instead of expecting segments."
+            result["note"] = "A recording is in progress, but live transcription is off for it (turned off in Mila's settings, or not available on this Mac) — no text will appear until it completes. Poll occasionally for status \"completed\" instead of expecting segments."
             return try json(result)
         }
         let heartbeatAge = now().timeIntervalSince(snapshot.updatedAt)
@@ -446,6 +450,9 @@ public struct MilaMCPToolHandlers: Sendable {
         if let appName = recording.appName { obj["app_name"] = appName }
         // The stable companion to the localized `app_name`.
         if let bundleID = recording.appBundleID { obj["app_bundle_id"] = bundleID }
+        // Lets a client tell "the user chose to transcribe this later" from a
+        // genuine `failed` without fetching the transcript.
+        if recording.isTranscriptionDeferred { obj["transcription_stopped"] = true }
         return obj
     }
 

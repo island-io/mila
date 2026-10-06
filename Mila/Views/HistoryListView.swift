@@ -212,7 +212,14 @@ private struct HistoryRow: View {
                     Text(recording.createdAt, format: .dateTime.hour().minute())
                     Text("·")
                     Text(recording.detectedMeetingApp?.info.displayName ?? recording.source.displayName)
-                    if transcription.activeRecordingID == recording.id {
+                    // A stopped transcription leaves no preview text, so say
+                    // why the row is bare.
+                    if recording.isTranscriptionDeferred {
+                        Text("·")
+                        Text("Not transcribed")
+                    }
+                    if transcription.activeRecordingID == recording.id,
+                       transcription.stoppingRecordingID != recording.id {
                         Text("·")
                         ProgressView(value: transcription.progress)
                             .progressViewStyle(.linear)

@@ -87,6 +87,20 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(backgroundMode, forKey: Keys.backgroundMode) }
     }
 
+    /// Whether recordings are transcribed live, while they run. Default ON.
+    /// OFF is the low-CPU mode: a recording only captures audio — no live
+    /// whisper, no live speaker-diarization daemon (~1 GB of pyannote/torch),
+    /// no Live AI loop — and is transcribed by the ordinary batch pass after
+    /// Stop. Unlike `backgroundMode`, which only hides the live pane, this
+    /// actually takes the work off the CPU during the call.
+    ///
+    /// Read once per recording, at record start (see
+    /// `QuickActionsController.recordingRunsLivePipeline`); flipping it
+    /// mid-recording applies to the next one.
+    @Published var transcribeWhileRecording: Bool {
+        didSet { defaults.set(transcribeWhileRecording, forKey: Keys.transcribeWhileRecording) }
+    }
+
     /// Override that lets a user opt into Live AI on hardware the
     /// auto-detect rules excluded (MacBook Air etc.). Off by default —
     /// the auto-detect is right for most users. Surfaced as an
@@ -163,6 +177,15 @@ final class LiveAISettings: ObservableObject {
     /// state without surprises.
     var isLiveAIAvailable: Bool {
         capabilities.isLiveAIRecommended || forceLiveAIOnLowEndHardware
+    }
+
+    /// Whether the next recording runs the live pipeline: the hardware allows
+    /// it AND the user hasn't turned live transcription off. Kept separate
+    /// from `isLiveAIAvailable` on purpose — that one is purely "can this Mac
+    /// do it" and drives the "gated off on Air-class chips" notice, which a
+    /// user who simply switched live transcription off must not see.
+    var runsLivePipeline: Bool {
+        isLiveAIAvailable && transcribeWhileRecording
     }
 
     /// Whether Live AI is currently ready to actually run — i.e. the
@@ -251,6 +274,8 @@ final class LiveAISettings: ObservableObject {
         // is preserved for users who turned it off.
         self.useNeuralVAD = defaults.object(forKey: Keys.useNeuralVAD) as? Bool ?? true
         self.backgroundMode = defaults.bool(forKey: Keys.backgroundMode)
+        // Default ON — today's behaviour. Explicit false is preserved.
+        self.transcribeWhileRecording = defaults.object(forKey: Keys.transcribeWhileRecording) as? Bool ?? true
         self.forceLiveAIOnLowEndHardware = defaults.bool(forKey: Keys.forceLowEnd)
         let sim = defaults.double(forKey: Keys.simThreshold)
         if defaults.bool(forKey: Keys.simThresholdMigrated) {
@@ -392,6 +417,7 @@ the content.
         static let useVAD = "liveAI.useVAD"
         static let useNeuralVAD = "liveAI.useNeuralVAD"
         static let backgroundMode = "liveAI.backgroundMode"
+        static let transcribeWhileRecording = "liveAI.transcribeWhileRecording"
         static let forceLowEnd = "liveAI.forceOnLowEndHardware"
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
         static let simThresholdMigrated = "liveAI.speakerSimilarityThreshold.migrated"

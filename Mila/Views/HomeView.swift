@@ -104,7 +104,10 @@ struct HomeView: View {
             languageName: languageSettings.current.displayName,
             microphoneEnabled: recordMicrophone,
             withSystemAudio: withSystemAudio,
+            // "Pressing Record will also run the LLM loop" — which it won't
+            // when the next recording skips the live pipeline.
             liveAIEnabled: liveAISettings.enabled && llmSettings.isConfigured
+                && liveAISettings.runsLivePipeline
         ) {
             Task { await actions.toggleRecord(microphone: recordMicrophone, appAudio: withSystemAudio) }
         }

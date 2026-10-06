@@ -48,6 +48,15 @@ final class TranscriptionService: ObservableObject {
     @Published private(set) var activeRecordingID: UUID?
     @Published private(set) var pendingIDs: [UUID] = []
 
+    /// The in-flight run the user has asked to stop ("Stop Transcribing")
+    /// but that hasn't unwound yet. Usually a fraction of a second, but a
+    /// stop that lands in a step nothing can interrupt — the model load (a
+    /// first CoreML compile is ~13 s) — waits for it to finish. Until
+    /// `activeRecordingID` clears, the UI shows "Stopping…" instead of a
+    /// progress bar and a Stop button that would do nothing a second time.
+    /// Cleared by `run()` once `process` has returned.
+    @Published private(set) var stoppingRecordingID: UUID?
+
     /// Set to a recording's id while the OFFLINE speaker re-diarize pass is
     /// running for it (`rediarizeSegments`). This is NOT transcription —
     /// the transcript text is already final by this point; the pyannote
@@ -185,6 +194,12 @@ final class TranscriptionService: ObservableObject {
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
+    /// The recording `process(_:)` is working on, from the moment the worker
+    /// pops it until `process` returns. Wider than `activeRecordingID`, which
+    /// is only published once the row has been flipped to `.running` — there
+    /// is a suspension (`remoteEngine.configure`) before that, and a stop that
+    /// lands in it must still find the run. See `deferTranscription(of:)`.
+    private var processingID: UUID?
 
     /// Recordings the user asked to abandon mid-run. Held in a thread-safe
     /// box because whisper.cpp's `abort_callback` polls this from a
@@ -313,7 +328,10 @@ final class TranscriptionService: ObservableObject {
     /// `isRetranscription` marks a deliberate re-run of an existing recording so
     /// the auto-drop gate never discards it (see `retranscriptionIDs`).
     func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
-        if activeRecordingID == recording.id { return }
+        // `processingID` covers the moment between the worker popping the job
+        // and publishing `activeRecordingID`, which would otherwise let the
+        // same recording be queued behind its own in-flight run.
+        if activeRecordingID == recording.id || processingID == recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
         if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
@@ -601,16 +619,77 @@ final class TranscriptionService: ObservableObject {
     /// Abandon the transcription of `recordingID`. If it's still in the queue
     /// it's dropped; if it's the active job, the engine's abort_callback
     /// trips on the next poll and `whisper_full` unwinds in ~100ms instead
-    /// of running to the end. Idempotent — repeated calls are a no-op.
+    /// of running to the end (and the diarization subprocess is terminated —
+    /// see `withPolledCancellation`). Idempotent — repeated calls are a no-op.
+    ///
+    /// An id that is neither queued nor active is flagged ahead of time, so a
+    /// run enqueued after the cancel — the rename sheet's Discard can land
+    /// while `stopRecording` is still finalizing — is skipped. A QUEUED id is
+    /// not flagged: dropping it is the whole cancel, and a flag nothing
+    /// consumes would silently swallow the recording's next Transcribe (e.g.
+    /// after restoring it from Recently Deleted).
     ///
     /// We do NOT delete the recording from the store here. The caller (the
     /// rename-sheet's Cancel button) is the one that decides whether to
     /// discard the audio or keep it — keeping that policy out of the service
     /// means the service stays composable for other potential cancel paths.
     func cancel(recordingID: UUID) {
+        if queue.contains(where: { $0.id == recordingID }) {
+            queue.removeAll { $0.id == recordingID }
+            retranscriptionIDs.remove(recordingID)
+            publishPending()
+            return
+        }
         cancellation.insert(recordingID)
-        queue.removeAll { $0.id == recordingID }
-        publishPending()
+    }
+
+    /// "Stop Transcribing": the user wants this recording's transcription
+    /// off the CPU now and will start it again later. Stops the run — drops
+    /// it from the queue, or aborts it mid-pass, diarization subprocess
+    /// included — and parks the recording via
+    /// `RecordingStore.markTranscriptionDeferred`, which keeps it in the
+    /// library. Starting it again is the ordinary Transcribe action
+    /// (`prepareForRetranscription` + `enqueue`).
+    ///
+    /// Returns false, and changes nothing, when the recording is neither
+    /// queued nor being processed. Two reasons that matters:
+    ///  * Unlike `cancel`, this never flags an id ahead of time. A flag with
+    ///    no run to consume it outlives the click and silently swallows the
+    ///    user's NEXT Transcribe (`process` skips a flagged id) — fatal for an
+    ///    action whose whole point is "transcribe it later".
+    ///  * A row that is `.pending` but not yet enqueued is still being
+    ///    finalized (`QuickActionsController.stopRecording` enqueues it at the
+    ///    end), and that finalize would overwrite a deferral written now. The
+    ///    UI only offers Stop while `isQueuedOrActive` is true.
+    @discardableResult
+    func deferTranscription(of recordingID: UUID) -> Bool {
+        if queue.contains(where: { $0.id == recordingID }) {
+            // Never started: dropping it from the queue is the whole stop.
+            queue.removeAll { $0.id == recordingID }
+            retranscriptionIDs.remove(recordingID)
+            publishPending()
+        } else if processingID == recordingID {
+            // Mid-pass. whisper polls the flag through its abort callback and
+            // the diarization step polls it through `withPolledCancellation`;
+            // `process` then unwinds without writing a status, and `run()`
+            // clears the flag once it has.
+            cancellation.insert(recordingID)
+            stoppingRecordingID = recordingID
+        } else {
+            return false
+        }
+        serviceLog.log("deferred \(recordingID.uuidString.prefix(8), privacy: .public) — stopped by the user to transcribe later")
+        store.markTranscriptionDeferred(recordingID)
+        return true
+    }
+
+    /// Whether the recording is in the queue or being transcribed right now,
+    /// and not already stopping — i.e. whether Stop Transcribing has anything
+    /// left to do. The UI keys that control on this rather than on the row's
+    /// status: a `.pending` row that is still being finalized has no run yet.
+    func isQueuedOrActive(_ recordingID: UUID) -> Bool {
+        (activeRecordingID == recordingID || pendingIDs.contains(recordingID))
+            && stoppingRecordingID != recordingID
     }
 
     // MARK: - Worker
@@ -624,7 +703,15 @@ final class TranscriptionService: ObservableObject {
 
     private func run() async {
         while let next = popNext() {
+            processingID = next.id
             await process(next)
+            processingID = nil
+            if stoppingRecordingID == next.id { stoppingRecordingID = nil }
+            // A stop that landed during this run belongs to this run, and the
+            // run is over. Most exits already consumed it; this catches the
+            // rest, so a flag can never outlive its run and swallow the
+            // recording's next Transcribe.
+            cancellation.remove(next.id)
         }
         worker = nil
     }
@@ -750,11 +837,26 @@ final class TranscriptionService: ObservableObject {
         // user can rename/file/delete the row through. See `mergePassResult`.
         // (`working` is deliberately NOT re-seeded from the result: the pass must
         // keep transcribing the `language` it just resolved a model for.)
+        // A stop that landed during `remoteEngine.configure` must win: once
+        // the row reads `.running`, nothing would ever move it again (the
+        // cancelled pass writes no status by design). Checked right before
+        // the write, with no suspension in between, so it can't be missed.
+        if cancellation.contains(recording.id) {
+            serviceLog.log("""
+                skipped \(recording.id.uuidString.prefix(8), privacy: .public) \
+                (\(working.title, privacy: .private)): cancelled while preparing
+                """)
+            cancellation.remove(recording.id)
+            return
+        }
         working.status = .running
         working.modelName = modelDisplayName
         mergePassResult(id: recording.id) {
             $0.status = working.status
             $0.modelName = working.modelName
+            // A pass is starting, so an earlier "stopped, transcribe later"
+            // no longer describes this row.
+            $0.transcriptionDeferredAt = nil
         }
 
         let recordingID = recording.id
@@ -788,6 +890,12 @@ final class TranscriptionService: ObservableObject {
                 try await engine.loadIfNeeded(modelURL: modelManager.url(for: localModel),
                                               displayName: localModel.displayName)
             }
+            // The model load can take a while (the first CoreML compile is
+            // ~13 s) and is not itself interruptible. A stop that arrived
+            // during it must not go on to start whisper and pyannote — nor
+            // reach the too-short branch below, which writes `.failed` and can
+            // auto-drop the recording outright.
+            if cancellation.contains(recordingID) { throw CancellationError() }
             // Resolve the audio URL from the freshly re-fetched `working`
             // record, NOT the stale `recording` snapshot captured at enqueue
             // time. A re-transcribe (right-click "Re-transcribe in …") enqueues
@@ -863,16 +971,29 @@ final class TranscriptionService: ObservableObject {
                 guard shouldDiarize else { return [] }
                 serviceLog.log("running speaker diarization…")
                 do {
-                    let turns = try await SpeakerDiarizer.diarize(
-                        wavURL: audioURL,
-                        pythonPath: diarPythonPath
-                    )
+                    // whisper sees a stop through its abort callback; the
+                    // pyannote subprocess only dies on Swift task cancellation
+                    // (`SpeakerDiarizer.runPython`). Bridge the two, or a
+                    // stopped pass keeps pyannote — the heavier half — running
+                    // to the end of the file, with the serial queue stalled
+                    // behind it.
+                    let turns = try await Self.withPolledCancellation(
+                        isCancelled: { [cancellation] in cancellation.contains(recordingID) }
+                    ) {
+                        try await SpeakerDiarizer.diarize(
+                            wavURL: audioURL,
+                            pythonPath: diarPythonPath
+                        )
+                    }
                     let speakerCount = Set(turns.map(\.speaker)).count
                     serviceLog.log("""
                         diarization found \(speakerCount, privacy: .public) speakers \
                         across \(turns.count, privacy: .public) turns
                         """)
                     return turns
+                } catch is CancellationError {
+                    serviceLog.log("speaker diarization stopped")
+                    return []
                 } catch {
                     // `SpeakerDiarizer.Error.diarizationFailed` wraps the
                     // Python subprocess's stderr verbatim, and that stderr
@@ -1098,6 +1219,23 @@ final class TranscriptionService: ObservableObject {
                 """)
             cancellation.remove(recording.id)
         } catch {
+            // A run the user stopped can still fail for an unrelated reason
+            // before it notices the stop — the model load, the remote upload's
+            // response. It was stopped all the same: its status was settled
+            // when the user stopped it (`markTranscriptionDeferred`), so
+            // writing `.failed` here would undo that (demoting a re-run's
+            // intact transcript), and an error banner would report a failure
+            // of something the user chose to stop.
+            if cancellation.contains(recordingID) {
+                let ns = error as NSError
+                serviceLog.log("""
+                    cancelled mid-run \(recordingID.uuidString.prefix(8), privacy: .public) \
+                    (\(working.title, privacy: .private)); it then failed \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)] — not reported
+                    """)
+                cancellation.remove(recordingID)
+                return
+            }
             // The pass reads the recording's own audio and writes its
             // transcript, both under the (possibly user-chosen) recordings
             // directory with title-derived names — so a Cocoa error here
@@ -1127,6 +1265,43 @@ final class TranscriptionService: ObservableObject {
     /// for `verbose_json`/`json`, which have no speaker field at all.
     static func hasSpeakerLabels(_ segments: [TranscriptSegment]) -> Bool {
         segments.contains { $0.speaker?.isEmpty == false }
+    }
+
+    /// Run `operation`, cancelling it — as Swift task cancellation — once
+    /// `isCancelled` reports true. The bridge between this service's polled
+    /// stop flag and work that only listens for task cancellation, chiefly the
+    /// pyannote subprocess (`SpeakerDiarizer.runPython` terminates it from its
+    /// cancellation handler). Same shape as `RemoteWhisperEngine`'s upload
+    /// watchdog, but structured: cancelling the CALLER (e.g. the `async let`
+    /// being torn down) reaches `operation` too.
+    ///
+    /// Throws `CancellationError` when the flag stopped it; otherwise returns
+    /// or throws whatever `operation` did. A stop is noticed within one
+    /// `interval`.
+    nonisolated static func withPolledCancellation<T: Sendable>(
+        every interval: Duration = .milliseconds(200),
+        isCancelled: @escaping @Sendable () -> Bool,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T?.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                // Throws out of the sleep once `operation` has finished and
+                // the group cancels this child — that error is discarded.
+                while !isCancelled() {
+                    try await Task.sleep(for: interval)
+                }
+                throw CancellationError()
+            }
+            defer { group.cancelAll() }
+            // Whichever child finishes first decides: `operation`'s value, or
+            // the watchdog's CancellationError (which cancels `operation` and
+            // waits for it to wind down before rethrowing).
+            guard let first = try await group.next(), let value = first else {
+                throw CancellationError()
+            }
+            return value
+        }
     }
 
     /// Re-key speaker labels in transcript order so the SET of labels

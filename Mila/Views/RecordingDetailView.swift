@@ -297,20 +297,50 @@ struct RecordingDetailView: View {
         case waitingInQueue
         /// Idle: invite the user to start a transcription themselves.
         case clickTranscribe
+        /// Idle because the user stopped the transcription to run it later
+        /// (`Recording.transcriptionDeferredAt`). Same Transcribe invitation,
+        /// but it has to say "stopped": the row is stored as `.failed`, and
+        /// "No transcript yet" would leave the user wondering what happened.
+        case stopped
     }
 
     /// Decision for the empty-segments placeholder, split out as a pure
     /// function so RecordingDetailPlaceholderTests can pin the queued
     /// case without building the view.
     static func emptyTranscriptPlaceholder(isActive: Bool,
-                                           isQueued: Bool) -> EmptyTranscriptPlaceholder? {
+                                           isQueued: Bool,
+                                           isDeferred: Bool = false) -> EmptyTranscriptPlaceholder? {
         if isActive { return nil }
-        return isQueued ? .waitingInQueue : .clickTranscribe
+        if isQueued { return .waitingInQueue }
+        return isDeferred ? .stopped : .clickTranscribe
+    }
+
+    /// "Stop Transcribing" — take the run off the CPU now, keep the recording,
+    /// transcribe it later. Shown only while there is a run to stop (active or
+    /// queued); the service decides the rest.
+    private var stopTranscribingButton: some View {
+        Button("Stop Transcribing") {
+            transcription.deferTranscription(of: recording.id)
+        }
+        .help("Stop for now and keep the recording. Click Transcribe whenever you want to run it.")
+        .accessibilityIdentifier("recording.stopTranscribing")
     }
 
     @ViewBuilder
     private var transcriptArea: some View {
-        if transcription.activeRecordingID == recording.id {
+        if transcription.stoppingRecordingID == recording.id {
+            // Stop was clicked; the run is unwinding (possibly waiting out a
+            // model load nothing can interrupt). No percentage, no second Stop.
+            VStack(spacing: 12) {
+                Spacer()
+                ProgressView()
+                    .controlSize(.small)
+                Text("Stopping…")
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if transcription.activeRecordingID == recording.id {
             VStack(spacing: 12) {
                 Spacer()
                 ProgressView(value: transcription.progress) {
@@ -327,19 +357,30 @@ struct RecordingDetailView: View {
                 .frame(maxWidth: 360)
                 Text("\(Int(transcription.progress * 100))%")
                     .foregroundStyle(.secondary)
+                stopTranscribingButton
+                    .padding(.top, 4)
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if recording.segments.isEmpty {
             let placeholder = Self.emptyTranscriptPlaceholder(
                 isActive: transcription.activeRecordingID == recording.id,
-                isQueued: transcription.pendingIDs.contains(recording.id)
+                isQueued: transcription.pendingIDs.contains(recording.id),
+                isDeferred: recording.isTranscriptionDeferred
             )
             if placeholder == .waitingInQueue {
                 ContentUnavailableView {
                     Label("Waiting in queue", systemImage: "clock")
                 } description: {
                     Text("Transcription will start when the recording ahead of it finishes.")
+                } actions: {
+                    stopTranscribingButton
+                }
+            } else if placeholder == .stopped {
+                ContentUnavailableView {
+                    Label("Transcription stopped", systemImage: "pause.circle")
+                } description: {
+                    Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe when you're ready to run it.")
                 }
             } else {
                 ContentUnavailableView(
@@ -355,6 +396,17 @@ struct RecordingDetailView: View {
                 // copy model: this grabs the transcript; the header button
                 // grabs the summary + action items.
                 HStack {
+                    // A re-transcription (or a live draft's full pass) waiting
+                    // behind another job keeps showing the current text, so
+                    // say it is queued — and let it be stopped from here, as
+                    // the empty-transcript state does.
+                    if transcription.pendingIDs.contains(recording.id) {
+                        Label("Waiting in queue to transcribe", systemImage: "clock")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        stopTranscribingButton
+                            .controlSize(.small)
+                    }
                     Spacer()
                     Button {
                         copyTranscript()

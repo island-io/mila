@@ -339,6 +339,7 @@ private struct AudioSettingsTab: View {
     @EnvironmentObject private var settings: AudioInputSettings
     @EnvironmentObject private var monitor: InputLevelMonitor
     @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var liveAI: LiveAISettings
     @State private var devices: [AudioDeviceManager.Device] = []
 
     /// Sentinel UID that means "follow the system default input". Picker's
@@ -428,6 +429,25 @@ private struct AudioSettingsTab: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            Divider().padding(.vertical, 4)
+
+            // Live transcription. Here rather than under AI Features because
+            // it is about what a recording costs while it runs, not an LLM
+            // feature — and Live AI depends on it, not the other way round.
+            // Greyed out (not hidden) where the hardware gate already keeps
+            // live transcription off; the persisted value still round-trips.
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Transcribe while recording",
+                       isOn: $liveAI.transcribeWhileRecording)
+                    .toggleStyle(.switch)
+                    .disabled(!liveAI.isLiveAIAvailable)
+                    .accessibilityIdentifier("liveAI.transcribeWhileRecording.toggle")
+                Text(transcribeWhileRecordingCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -463,6 +483,13 @@ private struct AudioSettingsTab: View {
             return "Paused — recording in progress"
         }
         return monitor.isRunning ? "Live" : "Starting…"
+    }
+
+    private var transcribeWhileRecordingCaption: String {
+        if !liveAI.isLiveAIAvailable {
+            return "Not available on this Mac — recordings are transcribed after you stop. AI Features → Live AI mode has an override."
+        }
+        return "Shows the transcript live as people talk. Turn off to keep the CPU free during calls: Mila only records, then transcribes once you stop (no live transcript or Live AI). Takes effect from the next recording."
     }
 
     private var binding: Binding<String> {
@@ -1824,6 +1851,7 @@ private struct AIFeaturesSettingsTab: View {
                              // feature exists. The persisted value keeps
                              // round-tripping either way.
                              toggleDisabled: !liveAI.isLiveAIAvailable
+                                 || !liveAI.transcribeWhileRecording
                                  || settings.liveAIDisabledByRemoteOpenAI,
                              toggleIdentifier: "liveAI.enabled.toggle",
                              identifier: "ai.section.liveAI",
@@ -1891,6 +1919,10 @@ private struct AIFeaturesSettingsTab: View {
     private var liveAICaption: String {
         if !liveAI.isLiveAIAvailable {
             return "Not available on this Mac — expand for the override."
+        }
+        // Live AI reads the live transcript, so it can't run without one.
+        if !liveAI.transcribeWhileRecording {
+            return "Off while Transcribe while recording is off (Settings → Audio)."
         }
         if settings.liveAIDisabledByRemoteOpenAI {
             return "Off while the provider is a remote endpoint."
@@ -2097,7 +2129,7 @@ private struct LiveAISection: View {
                 advancedToggle("Background mode (hide live pane)",
                                isOn: $settings.backgroundMode,
                                caption: "Stay on Home while recording.",
-                               help: "Transcription, speaker labels and the Live AI summary still run in the background and are saved when you stop. Useful on lower-power Macs, where rendering the live pane competes with whisper for CPU.")
+                               help: "Transcription, speaker labels and the Live AI summary still run in the background and are saved when you stop. Useful on lower-power Macs, where rendering the live pane competes with whisper for CPU. To take transcription off the CPU during calls altogether, turn off Transcribe while recording in Settings → Audio.")
 
                 advancedSlider("Update every",
                                value: $settings.chunkSeconds,

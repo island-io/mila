@@ -337,12 +337,16 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         }
     }
 
-    /// Empty the transcript, then start the NEXT recording the way
-    /// `wireLiveAIPipeline`'s hardware-gated branch does — `transcriber.stop()`
-    /// and deliberately no `start()`. If the emptying leaked across that
-    /// boundary, this recording's genuinely-empty transcript would look
-    /// authoritative, its batch pass would never be enqueued, and it would
-    /// save with no transcript at all. (Cursor Bugbot on #229.)
+    /// Empty the transcript, then start the NEXT recording without the live
+    /// pipeline — the way a live-skipped recording (hardware gate, or
+    /// "Transcribe while recording" off) begins: no `start()`. Every record
+    /// start now runs `QuickActionsController.prepareLivePipeline()`, whose
+    /// `LiveTranscriber.reset()` is what clears the deletions here; `stop()`
+    /// clearing them too is pinned on its own in `LiveTranscriberTests`. If
+    /// the emptying leaked across this boundary, this recording's genuinely
+    /// empty transcript would look authoritative, its batch pass would never
+    /// be enqueued, and it would save with no transcript at all. (Cursor
+    /// Bugbot on #229.)
     func test_an_emptied_transcript_does_not_leak_into_the_next_recording() async throws {
         try await recordTwoLinesAndDeleteTheSecond()
         let survivor = try XCTUnwrap(transcriber.segments.first)
@@ -353,7 +357,8 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         await service.waitForIdle()
         XCTAssertEqual(store.recordings.count, 1, "precondition: the emptied recording saved")
 
-        // The gated path's exact moves: stop the transcriber, never start it.
+        // The teardown the previous recording ends with; the transcriber is
+        // never started again for this one.
         _ = transcriber.stop()
         let second = store.freshAudioURL(suggestedName: "SecondRecording")
         try TestSupport.writeStereo48kSineWav(at: second, durationSeconds: 0.6)

@@ -193,6 +193,32 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertEqual(result["transcript_truncated"] as? Bool, true)
     }
 
+    /// A recording whose transcription the user stopped to run later is
+    /// stored as `failed` — but nothing failed, and a client relaying "your
+    /// transcription failed" would be wrong. Both surfaces have to say so,
+    /// and a genuine failure must keep reading as one.
+    func test_a_stopped_transcription_is_reported_as_stopped_not_failed() throws {
+        var stopped = meeting("Stopped", daysAgo: 0)
+        stopped.status = "failed"
+        stopped.segments = []
+        stopped.transcriptionDeferredAt = Date(timeIntervalSince1970: 1_700_000_050)
+        var failed = meeting("Broken", daysAgo: 1)
+        failed.status = "failed"
+        failed.segments = []
+        try seedStore([stopped, failed])
+
+        let items = try XCTUnwrap(try call("list_recordings")["recordings"] as? [[String: Any]])
+        let listedStopped = try XCTUnwrap(items.first { $0["title"] as? String == "Stopped" })
+        let listedFailed = try XCTUnwrap(items.first { $0["title"] as? String == "Broken" })
+        XCTAssertEqual(listedStopped["transcription_stopped"] as? Bool, true)
+        XCTAssertNil(listedFailed["transcription_stopped"], "a real failure must not claim the user stopped it")
+
+        let stoppedNote = try call("get_transcript", ["id": stopped.id.uuidString])["note"] as? String
+        XCTAssertTrue(stoppedNote?.contains("stopped") == true, String(describing: stoppedNote))
+        let failedNote = try call("get_transcript", ["id": failed.id.uuidString])["note"] as? String
+        XCTAssertTrue(failedNote?.contains("\"failed\"") == true, String(describing: failedNote))
+    }
+
     func test_get_transcript_unknown_id_throws_not_found() throws {
         try seedStore([meeting("A", daysAgo: 0)])
         XCTAssertThrowsError(try call("get_transcript", ["id": UUID().uuidString]))

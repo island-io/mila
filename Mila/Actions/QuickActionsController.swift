@@ -146,6 +146,19 @@ final class QuickActionsController: ObservableObject {
     /// ordering note in `stopRecording` at `store.add`.
     var liveSidecarWriter: LiveTranscriptSidecarWriter?
 
+    /// Whether the recording in progress (or the last one) runs the live
+    /// pipeline — live whisper, live diarizer, Live AI. Decided ONCE per
+    /// recording by `prepareLivePipeline()`, synchronously and before capture
+    /// starts, from `LiveAISettings.runsLivePipeline` (hardware gate AND the
+    /// user's "Transcribe while recording" setting). `wireLiveAIPipeline` and
+    /// the recording UI both read this one answer instead of re-reading the
+    /// settings: re-reading would let a toggle flipped mid-call swap the
+    /// recording view under the user, or leave the view and the pipeline
+    /// disagreeing about a recording the async state observer wired a moment
+    /// after the settings changed. Published once per recording start, so it
+    /// stays well clear of the App-level churn rule.
+    @Published private(set) var recordingRunsLivePipeline = false
+
     /// True only while `stopRecording` is running its inline LIVE-PIPELINE
     /// drain — the short, bounded window where it flushes the transcriber
     /// tail, drains the diarizer queue, runs the final Live AI tick,
@@ -396,8 +409,28 @@ final class QuickActionsController: ObservableObject {
             return
         }
         guard activeJob == .none else { return }
+        prepareLivePipeline()
         await session.startFakeForTesting(outputURL: outputURL)
         activeJob = .recording(withSystemAudio: false)
+    }
+
+    /// Per-recording live-pipeline setup that has to happen synchronously at
+    /// record start, before capture flips `session.state` to `.recording`:
+    ///  1. Decide `recordingRunsLivePipeline` for this recording.
+    ///  2. Clear the live transcriber + diarizer of the PREVIOUS recording.
+    ///     `stopRecording` reads `liveTranscriber.segments` as this
+    ///     recording's live transcript, and nothing else clears them when the
+    ///     live pipeline is skipped — so a recording made right after a live
+    ///     one would be saved with the earlier meeting's transcript, marked
+    ///     final and never batch-transcribed (and its stale speaker pool
+    ///     snapshotted into voice recognition). Doing it here rather than only
+    ///     in `wireLiveAIPipeline` also covers a stop that beats that async
+    ///     observer. When the pipeline does run, the observer's own
+    ///     `transcriber.start()` / `diarizer.reset()` repeat this harmlessly.
+    private func prepareLivePipeline() {
+        recordingRunsLivePipeline = liveAISettings?.runsLivePipeline ?? false
+        liveTranscriber?.reset()
+        liveDiarizer?.reset()
     }
 
     /// Test seam, the pair of `startFakeRecordingForTesting`: end the fake
@@ -464,6 +497,7 @@ final class QuickActionsController: ObservableObject {
         if withSystemAudio {
             session.selectApp(nil)
         }
+        prepareLivePipeline()
         do {
             try await session.start(source: source, outputURL: url)
             // Guarantee a fresh, isolated Live AI session for THIS recording
@@ -559,6 +593,7 @@ final class QuickActionsController: ObservableObject {
         session.selectApp(app)
         let titleBase = app?.applicationName ?? "System Audio"
         let url = store.freshAudioURL(suggestedName: titleBase)
+        prepareLivePipeline()
         do {
             let source: RecordingSource = includeMic ? .meeting : .systemAudio
             try await session.start(source: source, outputURL: url)
@@ -971,8 +1006,9 @@ final class QuickActionsController: ObservableObject {
         //      them visible but enqueue for batch diarization, which
         //      overwrites them when done.
         //
-        // `vadActive` here is whatever was passed in by the caller —
-        // typically `liveAISettings.useVAD && liveAISettings.enabled`.
+        // `vadActive` is `liveAISettings.useVAD` alone (see above). A
+        // recording that skipped the live pipeline gets here with no segments
+        // (`prepareLivePipeline` cleared them), so it is never authoritative.
         let hasLiveSegments = !finalTranscriptSegments.isEmpty
         // A live transcript the user EMPTIED by deleting every line is not the
         // same thing as one that was never produced, and `hasLiveSegments`

@@ -65,9 +65,10 @@ assistant:
    one-line reason. Don't re-summarize the whole meeting every tick.
    Match the meeting's language.
 4. Special statuses:
-   - `recording_live_unavailable`: no live text will appear on this
-     hardware — say so and stop polling frequently; check occasionally
-     for `completed`.
+   - `recording_live_unavailable`: no live text will appear for this
+     recording (live transcription is off in Mila's settings, or not
+     available on this Mac) — say so and stop polling frequently; check
+     occasionally for `completed`.
    - `stale`: warn that Mila seems to have stopped updating (possible
      crash); the transcript won't grow.
    - `new_session: true`: a different recording started — confirm with

@@ -67,7 +67,7 @@ cp -R skills/mila-meetings ~/.claude/skills/
 
 | Tool | What it does |
 |---|---|
-| `list_recordings` | List/filter recordings — by speaker display name, title/app/folder text, source, date range; sortable by date/duration/title. |
+| `list_recordings` | List/filter recordings — by speaker display name, title/app/folder text, source, date range; sortable by date/duration/title. A row whose transcription the user stopped to run later carries `transcription_stopped: true` (its `status` reads `failed`, but nothing failed). |
 | `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. Trashed recordings are not reachable, by id or otherwise. Each action item carries a `source` — `voice_command` (the speaker dictated it out loud) or `inferred` (Live AI derived it from the conversation). Those are not the same claim, so a client should not present the second as the first. |
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
@@ -139,8 +139,8 @@ How the polling works under the hood:
   the line you removed.
 - `status` values: `recording` (keep polling), `stale` (the app stopped
   updating the snapshot — likely crashed), `recording_live_unavailable`
-  (recording on hardware where live transcription is gated off — wait
-  for completion), `completed` (stop polling; `final_recording_id`
+  (live transcription is off for this recording — turned off in
+  Settings, or gated off on this hardware — wait for completion), `completed` (stop polling; `final_recording_id`
   hands off to `get_transcript` **when present** — a recording can
   complete without one, and the reply says so and points at
   `list_recordings` instead), `not_recording`.
