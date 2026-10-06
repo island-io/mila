@@ -144,9 +144,17 @@ final class LiveTranscriber: ObservableObject {
         self.fullText = initial.map(\.text).joined(separator: " ")
     }
 
-    func start(language: String) {
+    /// Stop, and drop everything the previous recording left behind — its
+    /// transcript, speaker names, buffered audio and deletions — without
+    /// arming anything new. `start()` begins with this; a recording that does
+    /// NOT run the live pipeline needs it on its own, because `stop()` keeps
+    /// `segments` (stopRecording snapshots them first) and stopRecording would
+    /// otherwise save the previous meeting's live transcript as this one's —
+    /// marked final, so its batch pass would never run. Bumps `epoch` too, so
+    /// a whisper result still in flight from that meeting is dropped rather
+    /// than landing here.
+    func reset() {
         stop()
-        self.language = language
         self.buffer.removeAll(keepingCapacity: true)
         self.samplesDropped = 0
         self.deletedRanges = []
@@ -156,6 +164,11 @@ final class LiveTranscriber: ObservableObject {
         self.speakerNames = [:]
         self.lastError = nil
         self.epoch &+= 1
+    }
+
+    func start(language: String) {
+        reset()
+        self.language = language
         liveLog.log("LiveTranscriber.start lang=\(language, privacy: .public) chunk=\(self.chunkSeconds, privacy: .public)s window=\(self.windowSeconds, privacy: .public)s useVAD=\(self.useVAD, privacy: .public) epoch=\(self.epoch, privacy: .public)")
 
         if useVAD {
@@ -185,16 +198,16 @@ final class LiveTranscriber: ObservableObject {
         detector = nil
         lastUtteranceTask?.cancel()
         lastUtteranceTask = nil
-        // The deletions belong to the recording that just ended, and `start()`
-        // is NOT the only way the next one begins: `wireLiveAIPipeline`'s
-        // hardware-gated branch calls `stop()` and deliberately never calls
-        // `start()` (that is also where the sibling reset of `segments` is
-        // documented). Leaving them behind there would let a previous
-        // recording's emptying make the NEW recording's genuinely-empty
-        // transcript look authoritative, so its batch pass would never be
-        // enqueued and it would save with no transcript at all — a silent
-        // total loss, and a worse failure than the one the flag prevents.
-        // (Cursor Bugbot on #229.)
+        // The deletions belong to the recording that just ended. `start()` is
+        // NOT the only way the next one begins — a recording that skips the
+        // live pipeline gets `reset()` instead, which clears them as well — so
+        // this is the teardown-side half of the same guarantee, covering every
+        // path that ends with `stop()` (end of recording, failed stop,
+        // dictation). Leaving them behind would let a previous recording's
+        // emptying make the NEW recording's genuinely-empty transcript look
+        // authoritative, so its batch pass would never be enqueued and it
+        // would save with no transcript at all — a silent total loss, and a
+        // worse failure than the one the flag prevents. (Cursor Bugbot on #229.)
         //
         // Suppression is unaffected: every `stop()` call site is a teardown
         // (end of recording, failed stop, gated re-arm, dictation), and

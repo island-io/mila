@@ -235,14 +235,18 @@ struct ContentView: View {
             && actions.isRecording
             && liveAISettings.enabled
             && llmSettings.isConfigured
-            && liveAISettings.isLiveAIAvailable
+            && actions.recordingRunsLivePipeline
     }
 
     /// Whether the home pane should swap to `LiveAIRecordingView`.
-    /// The UI-test bypass for the hardware gate lives centrally in
-    /// `MilaApp.init()` (it injects a non-Air `SystemCapabilities`
-    /// into `LiveAISettings`), so checking `isLiveAIAvailable` here
-    /// works in both production and UI-test launches. The
+    /// Keyed on the controller's per-recording decision
+    /// (`recordingRunsLivePipeline`: hardware gate AND "Transcribe while
+    /// recording"), not on the settings, so a toggle flipped mid-call
+    /// neither strands the user in an empty live pane nor yanks away a
+    /// running one. The UI-test bypass for the hardware gate lives
+    /// centrally in `MilaApp.init()` (it injects a non-Air
+    /// `SystemCapabilities` into `LiveAISettings`), so this works in both
+    /// production and UI-test launches. The
     /// `--ui-test-rtl-live-hebrew` route additionally forces the
     /// view even when no recording is in progress so the layout
     /// regression test can assert without driving real audio.
@@ -258,7 +262,7 @@ struct ContentView: View {
         // whisper for CPU, this trades off live visibility for
         // throughput.
         if liveAISettings.backgroundMode { return false }
-        return actions.isRecording && liveAISettings.isLiveAIAvailable
+        return actions.isRecording && actions.recordingRunsLivePipeline
     }
 
     /// Compose the wake-up alert body. Always shows the captured length so
@@ -652,9 +656,22 @@ private struct QueueRow: View {
                 }
             }
 
-            // Stop (cancel + move to Recently Deleted) + Remove (cancel +
-            // permanently delete). Both trip the engine abort flag first so a
-            // `.running` item stops burning CPU immediately.
+            // Transcribe later (stop, keep the recording in the library),
+            // Stop (cancel + move to Recently Deleted) and Remove (cancel +
+            // permanently delete). All three take a `.running` item off the
+            // CPU immediately. "Later" is shown only while there is a run to
+            // stop: a row still being finalized after Stop isn't queued yet.
+            if transcription.isQueuedOrActive(recording.id) {
+                Button {
+                    transcription.deferTranscription(of: recording.id)
+                } label: {
+                    Image(systemName: "pause.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("Stop transcribing for now and keep the recording — transcribe it later from its page")
+                .accessibilityIdentifier("queue.row.later.\(recording.id)")
+            }
+
             Button {
                 cancel()
             } label: {

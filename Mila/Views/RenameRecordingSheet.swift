@@ -590,18 +590,36 @@ private struct RenameTranscriptionStatusRow: View {
         store.recordings.first(where: { $0.id == recordingID })?.status ?? .pending
     }
 
+    /// The user stopped this transcription to run it later — stored as
+    /// `.failed`, but nothing failed.
+    private var isDeferred: Bool {
+        store.recordings.first(where: { $0.id == recordingID })?.isTranscriptionDeferred ?? false
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             statusIcon
             Text(label)
                 .font(.callout)
                 .foregroundStyle(.secondary)
-            if transcription.activeRecordingID == recordingID {
+            if transcription.activeRecordingID == recordingID,
+               transcription.stoppingRecordingID != recordingID {
                 ProgressView(value: transcription.progress)
                     .progressViewStyle(.linear)
                     .frame(maxWidth: 140)
             }
             Spacer()
+            // Right where the user is looking when a call ends and the batch
+            // pass starts eating the CPU. Only while there is a run to stop;
+            // a row still being finalized isn't queued yet.
+            if transcription.isQueuedOrActive(recordingID) {
+                Button("Stop") {
+                    transcription.deferTranscription(of: recordingID)
+                }
+                .controlSize(.small)
+                .help("Stop transcribing for now and keep the recording. Transcribe it later from the recording's page.")
+                .accessibilityIdentifier("rename.stopTranscribing")
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -611,6 +629,9 @@ private struct RenameTranscriptionStatusRow: View {
     /// "Transcribing… NN%", "Identifying speakers…", "Transcript ready",
     /// "Transcription failed", "Waiting to transcribe…".
     private var label: String {
+        if transcription.stoppingRecordingID == recordingID {
+            return "Stopping…"
+        }
         if transcription.activeRecordingID == recordingID {
             let pct = Int(transcription.progress * 100)
             return "Transcribing… \(pct)%"
@@ -625,7 +646,7 @@ private struct RenameTranscriptionStatusRow: View {
         case .pending:   return "Waiting to transcribe…"
         case .running:   return "Transcribing…"
         case .completed: return "Transcript ready"
-        case .failed:    return "Transcription failed"
+        case .failed:    return isDeferred ? "Transcription stopped — transcribe it later" : "Transcription failed"
         }
     }
 
@@ -633,13 +654,17 @@ private struct RenameTranscriptionStatusRow: View {
     private var statusIcon: some View {
         // While the offline re-diarize is in flight the transcript is done
         // but speaker labels aren't — show a spinner, not the green check,
-        // to match the "Identifying speakers…" label.
-        if transcription.diarizingRecordingID == recordingID {
+        // to match the "Identifying speakers…" label. Same spinner while a
+        // stopped run is still unwinding ("Stopping…").
+        if transcription.diarizingRecordingID == recordingID
+            || transcription.stoppingRecordingID == recordingID {
             ProgressView().controlSize(.small)
         } else {
             switch status {
             case .completed:
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            case .failed where isDeferred:
+                Image(systemName: "pause.circle.fill").foregroundStyle(.secondary)
             case .failed:
                 Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.red)
             default:

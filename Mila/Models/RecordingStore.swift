@@ -320,6 +320,22 @@ final class RecordingStore: ObservableObject {
     /// `compressRecordingAudio` runs overlapping for the same id.
     private var compressingIDs: Set<UUID> = []
 
+    /// What a recording that already held a transcript looked like before
+    /// `prepareForRetranscription` set up a re-run of it — so a re-run the
+    /// user stops (`markTranscriptionDeferred`) is undone exactly: the kept
+    /// transcript goes back to the status, language and model that describe
+    /// it, not the ones of the run that never happened (a stopped
+    /// "Re-transcribe in Hebrew" must not leave English text labelled Hebrew).
+    /// In memory only — a re-run interrupted by a relaunch loses it and is
+    /// treated as an ordinary stopped transcription. A stale entry is
+    /// harmless: only a stop consumes it, and every run a user can stop on a
+    /// transcribed row starts with `prepareForRetranscription`, which
+    /// overwrites it.
+    private var stateBeforeRetranscription: [UUID: (status: TranscriptionStatus,
+                                                    language: String,
+                                                    modelName: String?,
+                                                    transcriptionDeferredAt: Date?)] = [:]
+
     /// Transcode a recording's WAV to AAC/.m4a, point the recording at the
     /// smaller file, and delete the WAV. The audio base name is unchanged
     /// (only `.wav`→`.m4a`), so the `.txt`/`.srt`/`.summary.txt` sidecars
@@ -611,8 +627,14 @@ final class RecordingStore: ObservableObject {
     /// gone.
     func prepareForRetranscription(id: UUID, language: String? = nil) -> Recording? {
         guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return nil }
+        let before = recordings[idx]
+        stateBeforeRetranscription[id] = Self.hasTranscript(before)
+            ? (before.status, before.language, before.modelName, before.transcriptionDeferredAt)
+            : nil
         if let language { recordings[idx].language = language }
         recordings[idx].status = .pending
+        // The user is starting the run they earlier put off.
+        recordings[idx].transcriptionDeferredAt = nil
         persist()
         return recordings[idx]
     }
@@ -987,6 +1009,61 @@ final class RecordingStore: ObservableObject {
         recordings[idx].status = .failed
         recordings[idx].deletedAt = Date()
         persist()
+    }
+
+    /// "Stop Transcribing": the user stopped a queued/active transcription to
+    /// run it later. Unlike `stopTranscription`, the recording stays in the
+    /// library — this is "not now", not "throw it away".
+    ///
+    /// The status has to leave `.pending`/`.running`, or the Queue keeps
+    /// listing the row and the launch recovery sweep restarts the run — the
+    /// exact CPU the user just declined. Where it lands:
+    ///  * **A re-run of a recording that already had a transcript** (Re-
+    ///    transcribe, in either language): the re-run is undone — status,
+    ///    language and model go back to what they were before
+    ///    `prepareForRetranscription` (`stateBeforeRetranscription`), and the
+    ///    transcript the pass never got to replace is still there. Demoting a
+    ///    finished transcript to `.failed` would switch off everything keyed
+    ///    on `.completed` (SRT rewrites, summaries, the MCP "latest recording").
+    ///  * **Anything else** — a first transcription, or a chunk-mode live
+    ///    draft still waiting on its first full pass: `.failed` plus
+    ///    `transcriptionDeferredAt`, so the UI says "stopped" rather than
+    ///    "failed" and offers Transcribe. `.failed` is the terminal state every
+    ///    status site and every older build already understands. A live draft
+    ///    keeps its text on screen; it just isn't passed off as finished —
+    ///    marking it `.completed` would skip the completion work (SRT,
+    ///    summary, compression) only a finished pass triggers.
+    ///
+    /// Applies to a row in Recently Deleted too: a pass keeps running after a
+    /// soft delete, and a stopped pass writes no status itself, so skipping
+    /// the row here would strand it at `.running` — and the launch sweep would
+    /// restart it every launch.
+    ///
+    /// No-op unless the row is still `.pending`/`.running`, so a click racing
+    /// a just-finished pass leaves the finished row alone. Pair with
+    /// `TranscriptionService.deferTranscription(of:)`, which is the only
+    /// caller — it decides whether there is a run to stop at all.
+    func markTranscriptionDeferred(_ id: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return }
+        let row = recordings[idx]
+        guard row.status == .pending || row.status == .running else { return }
+        let before = stateBeforeRetranscription.removeValue(forKey: id)
+        if let before, Self.hasTranscript(row),
+           before.status == .completed || before.status == .failed {
+            recordings[idx].status = before.status
+            recordings[idx].language = before.language
+            recordings[idx].modelName = before.modelName
+            recordings[idx].transcriptionDeferredAt = before.transcriptionDeferredAt
+        } else {
+            recordings[idx].status = .failed
+            recordings[idx].transcriptionDeferredAt = Date()
+        }
+        persist()
+    }
+
+    private static func hasTranscript(_ recording: Recording) -> Bool {
+        !recording.segments.isEmpty
+            || !recording.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.

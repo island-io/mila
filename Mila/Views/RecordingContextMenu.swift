@@ -128,6 +128,13 @@ private struct RecordingContextMenu: ViewModifier {
             // status even though the enqueue itself no-ops.
             let isBusy = transcription.activeRecordingID == recording.id
                 || transcription.pendingIDs.contains(recording.id)
+            if transcription.isQueuedOrActive(recording.id) {
+                // Take the run off the CPU now and keep the recording; the
+                // Re-transcribe items below start it again later.
+                Button("Stop Transcribing") {
+                    transcription.deferTranscription(of: recording.id)
+                }
+            }
             Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
                 // Route through the live-store chokepoint (same as the
                 // language-switch action) so we never enqueue a stale snapshot

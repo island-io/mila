@@ -109,6 +109,19 @@ struct Recording: Identifiable, Codable, Hashable {
     /// Empty for recordings whose speakers were never renamed.
     var speakerNames: [String: String]
 
+    /// When the user stopped this recording's transcription to run it later
+    /// ("Stop Transcribing"), before a full pass had finished — the row has no
+    /// transcript, or only a live draft. Set only
+    /// alongside `status == .failed`, which is what keeps the launch recovery
+    /// sweep from restarting the run; this marker is what lets the UI say
+    /// "stopped" instead of "failed". Cleared the moment a new pass starts.
+    ///
+    /// A field rather than a new `TranscriptionStatus` case on purpose: older
+    /// builds decode `status` strictly and load recordings.json all-or-nothing,
+    /// so one unknown status value would empty their whole library. An unknown
+    /// KEY is ignored instead — an older build just reads the row as `.failed`.
+    var transcriptionDeferredAt: Date?
+
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose
@@ -135,7 +148,8 @@ struct Recording: Identifiable, Codable, Hashable {
          actionItems: [ActionItem]? = nil,
          voiceMemoUniqueID: String? = nil,
          voiceMemoFolderUUID: String? = nil,
-         speakerNames: [String: String] = [:]) {
+         speakerNames: [String: String] = [:],
+         transcriptionDeferredAt: Date? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -156,9 +170,14 @@ struct Recording: Identifiable, Codable, Hashable {
         self.voiceMemoUniqueID = voiceMemoUniqueID
         self.voiceMemoFolderUUID = voiceMemoFolderUUID
         self.speakerNames = speakerNames
+        self.transcriptionDeferredAt = transcriptionDeferredAt
     }
 
     var isTrashed: Bool { deletedAt != nil }
+
+    /// The user stopped this recording's transcription and it has not run
+    /// since — see `transcriptionDeferredAt`.
+    var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
 
     /// File name (relative to recordings directory) of the sidecar `.txt`
     /// holding the plain-text transcript. Derived from `audioFileName` so a
@@ -192,7 +211,7 @@ struct Recording: Identifiable, Codable, Hashable {
              status, language, modelName, segments, deletedAt, folder, appName,
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames
+             speakerNames, transcriptionDeferredAt
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -219,6 +238,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
         self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
         self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        self.transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -247,6 +267,7 @@ struct Recording: Identifiable, Codable, Hashable {
         if !speakerNames.isEmpty {
             try c.encode(speakerNames, forKey: .speakerNames)
         }
+        try c.encodeIfPresent(transcriptionDeferredAt, forKey: .transcriptionDeferredAt)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

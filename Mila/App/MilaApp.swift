@@ -1636,7 +1636,10 @@ struct MilaApp: App {
         // never starts the session observer").
         //
         // The state observer below runs forever now; the `.recording`
-        // branch is where we gate on `aiSettings.isLiveAIAvailable`.
+        // branch is where we gate — on the per-recording decision
+        // `QuickActionsController.recordingRunsLivePipeline`, which folds in
+        // both this hardware gate and the user's "Transcribe while
+        // recording" setting.
 
         // Epoch of the capture this observer has already wired. `nil` until
         // the first recording.
@@ -1660,22 +1663,32 @@ struct MilaApp: App {
                 // `start()`, so it cannot be fooled that way.
                 if wiredCaptureEpoch == sessionRef.captureEpoch { break }
                 wiredCaptureEpoch = sessionRef.captureEpoch
-                guard aiSettings.isLiveAIAvailable else {
-                    // Hardware below the Live AI bar AND no override
-                    // flipped. Recording still runs via RecordingSession;
-                    // QuickActionsController enqueues a post-record
-                    // transcribe on stop. We just skip the live
+                // Decided once, at record start, by the controller (see
+                // `recordingRunsLivePipeline`) — re-reading the settings here
+                // could disagree with the recording view, which keys on the
+                // same decision. The fallback only covers a host with no
+                // controller.
+                let runsLive = actionsRef?.recordingRunsLivePipeline ?? aiSettings.runsLivePipeline
+                guard runsLive else {
+                    // No live pipeline for this recording: the hardware is
+                    // below the Live AI bar with no override, or the user
+                    // switched off "Transcribe while recording" to keep the
+                    // CPU free during the call. Recording still runs via
+                    // RecordingSession; QuickActionsController enqueues a
+                    // post-record transcribe on stop. We just skip the live
                     // pipeline setup.
                     //
-                    // BUT: clear the transcriber's `segments` /
-                    // `useVAD` first. Without this, a stale live
-                    // transcript from a previous recording (when the
-                    // user had the override toggle on) would still be
-                    // sitting in memory; `stopRecording` would
-                    // snapshot it onto the new recording and could
-                    // mark it `.completed` without ever running batch
-                    // transcription. Cursor flagged on 62e1c3b.
-                    _ = transcriber.stop()
+                    // BUT: clear the transcriber's `segments` and the
+                    // diarizer's pool first. Without this, a stale live
+                    // transcript from a previous recording would still be
+                    // sitting in memory; `stopRecording` would snapshot it
+                    // onto the new recording and could mark it `.completed`
+                    // without ever running batch transcription. Cursor
+                    // flagged on 62e1c3b. (`stop()` alone does NOT clear
+                    // `segments` — that is `reset()`. The controller already
+                    // did this at record start; repeating it is harmless.)
+                    transcriber.reset()
+                    diarizer.reset()
                     sessionRef.onLiveSamples = nil
                     // Also clear LiveAISession so its rolling `summary`
                     // and `actionItems` from a previous override-enabled
@@ -1688,11 +1701,10 @@ struct MilaApp: App {
                     aiSession.cancel()
                     // Still surface the recording to external pollers
                     // (mila-mcp): they get an honest "recording, but no
-                    // live text on this hardware" status instead of
-                    // silence.
+                    // live text" status instead of silence.
                     sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                        .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
+                        .log("wireLiveAIPipeline: .recording skipped — live pipeline off for this recording (hardwareAllows=\(aiSettings.isLiveAIAvailable, privacy: .public) transcribeWhileRecording=\(aiSettings.transcribeWhileRecording, privacy: .public) model=\(aiSettings.capabilities.marketingName, privacy: .public))")
                     continue
                 }
                 // Open the live-transcript sidecar for this recording so

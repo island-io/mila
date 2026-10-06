@@ -282,6 +282,25 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// Deletions are per-recording state, and `stop()` — the teardown every
+    /// path runs, including dictation and a failed stop, not only the
+    /// record-start `reset()` — drops them. Otherwise one recording's emptied
+    /// transcript makes the next one's empty transcript look deliberate
+    /// (authoritative), and its batch pass is never run. (Cursor Bugbot on #229.)
+    func test_stop_forgets_this_recordings_deletions() async throws {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "only line")])
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        await transcriber.transcribeNow()
+        let line = try XCTUnwrap(transcriber.segments.first)
+        transcriber.removeSegment(id: line.id)
+        XCTAssertTrue(transcriber.hasUserDeletedSegments, "precondition")
+
+        _ = transcriber.stop()
+
+        XCTAssertFalse(transcriber.hasUserDeletedSegments)
+    }
+
     /// A deleted line must not reappear when the fixed-window path
     /// re-transcribes its rolling buffer on the next tick — the deleted
     /// time range is suppressed.

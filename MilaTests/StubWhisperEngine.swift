@@ -29,6 +29,9 @@ actor StubWhisperEngine: TranscribingEngine {
     /// Status string surfaced through the preparation observer. Lets
     /// a test assert that the engine-supplied caption reaches the UI.
     var loadPreparationStatus: String? = "Preparing Neural Engine…"
+    /// If non-nil, the next `loadIfNeeded` throws it (after `loadDelay`) —
+    /// a model that fails to load, e.g. a corrupt or since-deleted file.
+    var loadError: Error?
 
     // MARK: - Recorded outputs
 
@@ -56,6 +59,10 @@ actor StubWhisperEngine: TranscribingEngine {
             preparationObserver?(true, loadPreparationStatus)
             try? await Task.sleep(nanoseconds: UInt64(loadDelay * 1_000_000_000))
             preparationObserver?(false, nil)
+        }
+        if let err = loadError {
+            loadError = nil
+            throw err
         }
     }
 
@@ -107,6 +114,7 @@ actor StubWhisperEngine: TranscribingEngine {
     func setDefaultDelay(_ d: Double) { defaultDelay = d }
     func setNextError(_ e: Error?) { nextError = e }
     func setLoadDelay(_ d: Double) { loadDelay = d }
+    func setLoadError(_ e: Error?) { loadError = e }
     func setLoadPreparationStatus(_ s: String?) { loadPreparationStatus = s }
     func resetRecording() {
         loadCallCount = 0
