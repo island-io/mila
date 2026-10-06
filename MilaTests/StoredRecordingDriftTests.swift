@@ -27,6 +27,7 @@ final class StoredRecordingDriftTests: XCTestCase {
     private let fixtureID = UUID()
     private let fixtureCreated = Date(timeIntervalSince1970: 1_700_000_000)
     private let fixtureDeleted = Date(timeIntervalSince1970: 1_700_000_500)
+    private let fixtureDeferred = Date(timeIntervalSince1970: 1_700_000_250)
 
     /// One `Recording` with **every** persisted field set. Shared by the
     /// field-by-field test and the key-set test so a newly added field only
@@ -63,7 +64,8 @@ final class StoredRecordingDriftTests: XCTestCase {
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
             summaryLanguage: "en",
             sharedBy: "Ada Lovelace",
-            sharedAt: created
+            sharedAt: created,
+            transcriptionDeferredAt: fixtureDeferred
         )
     }
 
@@ -106,6 +108,8 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(s.summaryLanguage, "en")
         XCTAssertEqual(s.sharedBy, "Ada Lovelace")
         XCTAssertEqual(s.sharedAt, created)
+        XCTAssertEqual(s.transcriptionDeferredAt, fixtureDeferred)
+        XCTAssertTrue(s.isTranscriptionDeferred)
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")

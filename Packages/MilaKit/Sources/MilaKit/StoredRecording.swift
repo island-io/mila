@@ -138,11 +138,17 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var sharedBy: String?
     /// When that bundle was exported (the sender's clock). Set with `sharedBy`.
     public var sharedAt: Date?
+    /// When the user stopped this recording's transcription to run it later.
+    /// Non-nil only on a `failed` row that hasn't been through a full pass —
+    /// no transcript, or only a live draft — and it is what tells "the user
+    /// chose not to transcribe this yet" apart from a genuine failure.
+    public var transcriptionDeferredAt: Date?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
 
     public var isTrashed: Bool { deletedAt != nil }
+    public var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
 
     /// Sidecar names, derived from `audioFileName` the same way the app does.
     public var transcriptFileName: String {
@@ -170,7 +176,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
              summary, actionItems, speakerNames, appBundleID, summaryLanguage,
-             sharedBy, sharedAt
+             sharedBy, sharedAt, transcriptionDeferredAt
         case legacyFullText = "fullText"
     }
 
@@ -196,6 +202,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
         sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
         sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
+        transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -207,6 +214,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 summary: String? = nil, actionItems: [ActionItem]? = nil,
                 speakerNames: [String: String] = [:], summaryLanguage: String? = nil,
                 sharedBy: String? = nil, sharedAt: Date? = nil,
+                transcriptionDeferredAt: Date? = nil,
                 legacyFullText: String? = nil) {
         self.id = id
         self.title = title
@@ -228,6 +236,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.summaryLanguage = summaryLanguage
         self.sharedBy = sharedBy
         self.sharedAt = sharedAt
+        self.transcriptionDeferredAt = transcriptionDeferredAt
         self.legacyFullText = legacyFullText
     }
 }

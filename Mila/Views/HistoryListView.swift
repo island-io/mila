@@ -217,7 +217,14 @@ private struct HistoryRow: View {
                         Text("Shared by \(sharedBy)")
                             .lineLimit(1)
                     }
-                    if transcription.activeRecordingID == recording.id {
+                    // A stopped transcription leaves no preview text, so say
+                    // why the row is bare.
+                    if recording.isTranscriptionDeferred {
+                        Text("·")
+                        Text("Not transcribed")
+                    }
+                    if transcription.activeRecordingID == recording.id,
+                       transcription.stoppingRecordingID != recording.id {
                         Text("·")
                         ProgressView(value: transcription.progress)
                             .progressViewStyle(.linear)

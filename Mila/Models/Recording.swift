@@ -141,6 +141,18 @@ struct Recording: Identifiable, Codable, Hashable {
     /// When the bundle that brought this recording was exported (the
     /// sender's clock). Set together with `sharedBy`, nil otherwise.
     var sharedAt: Date?
+    /// When the user stopped this recording's transcription to run it later
+    /// ("Stop Transcribing"), before a full pass had finished — the row has no
+    /// transcript, or only a live draft. Set only
+    /// alongside `status == .failed`, which is what keeps the launch recovery
+    /// sweep from restarting the run; this marker is what lets the UI say
+    /// "stopped" instead of "failed". Cleared the moment a new pass starts.
+    ///
+    /// A field rather than a new `TranscriptionStatus` case on purpose: older
+    /// builds decode `status` strictly and load recordings.json all-or-nothing,
+    /// so one unknown status value would empty their whole library. An unknown
+    /// KEY is ignored instead — an older build just reads the row as `.failed`.
+    var transcriptionDeferredAt: Date?
 
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
@@ -171,7 +183,8 @@ struct Recording: Identifiable, Codable, Hashable {
          speakerNames: [String: String] = [:],
          summaryLanguage: String? = nil,
          sharedBy: String? = nil,
-         sharedAt: Date? = nil) {
+         sharedAt: Date? = nil,
+         transcriptionDeferredAt: Date? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -195,12 +208,16 @@ struct Recording: Identifiable, Codable, Hashable {
         self.summaryLanguage = summaryLanguage
         self.sharedBy = sharedBy
         self.sharedAt = sharedAt
+        self.transcriptionDeferredAt = transcriptionDeferredAt
     }
 
     var isTrashed: Bool { deletedAt != nil }
 
     /// Whether this recording arrived from another Mila user's `.milashare`.
     var isShared: Bool { sharedBy != nil }
+    /// The user stopped this recording's transcription and it has not run
+    /// since — see `transcriptionDeferredAt`.
+    var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
 
     /// File name (relative to recordings directory) of the sidecar `.txt`
     /// holding the plain-text transcript. Derived from `audioFileName` so a
@@ -234,7 +251,7 @@ struct Recording: Identifiable, Codable, Hashable {
              status, language, modelName, segments, deletedAt, folder, appName,
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames, summaryLanguage, sharedBy, sharedAt
+             speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -264,6 +281,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
         self.sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
         self.sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
+        self.transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -299,6 +317,7 @@ struct Recording: Identifiable, Codable, Hashable {
         // byte-for-byte as before. Mirrored in MilaKit's `StoredRecording`.
         try c.encodeIfPresent(sharedBy, forKey: .sharedBy)
         try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
+        try c.encodeIfPresent(transcriptionDeferredAt, forKey: .transcriptionDeferredAt)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 
