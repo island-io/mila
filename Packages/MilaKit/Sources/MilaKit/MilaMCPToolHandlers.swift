@@ -24,6 +24,13 @@ public struct MilaMCPToolHandlers: Sendable {
         }
     }
 
+    /// `get_transcript`'s `format` argument. `text` is the default and the
+    /// pre-existing behaviour; `srt` renders `TranscriptFormatter.srt` from
+    /// the recording's timed segments.
+    enum TranscriptFormat: String, Sendable {
+        case text, srt
+    }
+
     /// One tool's transport-agnostic declaration. Deliberately NOT
     /// `Sendable`: `inputSchema` is a `[String: Any]` JSON tree, which
     /// cannot be. Specs are built on demand by `toolSpecs` and consumed
@@ -111,16 +118,22 @@ public struct MilaMCPToolHandlers: Sendable {
             Each action item carries "source": "voice_command" when the speaker dictated it \
             out loud, "inferred" when the model derived it from the conversation — do not \
             present an inferred item as something the speaker said.
+            Pass format "srt" for SubRip subtitles (one timed cue per segment, speaker \
+            names as cue prefixes) — the same bytes Mila's own Export Subtitles writes; \
+            save them to a .srt file rather than quoting them. With "srt", max_chars \
+            drops whole cues from the end so the result stays a valid file.
             """,
             inputSchema: [
                 "type": "object",
                 "properties": [
                     "id": ["type": "string",
                            "description": "Recording UUID. Omit for the latest completed recording."],
+                    "format": ["type": "string", "enum": ["text", "srt"],
+                               "description": "text (default): speaker-named transcript. srt: SubRip subtitles with one cue per segment, timestamps relative to the recording start, speaker names as cue prefixes. Unavailable for recordings without timed segments."],
                     "include_summary": ["type": "boolean",
                                         "description": "Include summary + action items (default true)."],
                     "max_chars": ["type": "integer",
-                                  "description": "Truncate the transcript to this many characters."],
+                                  "description": "Truncate the transcript to this many characters (whole cues only for srt)."],
                 ],
             ]
         ),
@@ -248,14 +261,54 @@ public struct MilaMCPToolHandlers: Sendable {
             throw ToolError.storeUnavailable(String(describing: error))
         }
 
-        var transcript = source.namedTranscript(for: recording)
+        let format = try enumArg(args, "format", TranscriptFormat.self) ?? .text
+        let maxChars = args["max_chars"] as? Int
+        var transcript: String
         var truncated = false
-        if let maxChars = args["max_chars"] as? Int, maxChars > 0, transcript.count > maxChars {
-            transcript = String(transcript.prefix(maxChars))
-            truncated = true
+        switch format {
+        case .text:
+            transcript = source.namedTranscript(for: recording)
+            if let maxChars, maxChars > 0, transcript.count > maxChars {
+                transcript = String(transcript.prefix(maxChars))
+                truncated = true
+            }
+        case .srt:
+            // Rendered straight from the segments, NOT via `namedTranscript`:
+            // SRT needs timings, which only the segments carry, and the
+            // `.txt` sidecar `namedTranscript` falls back to for unlabelled
+            // recordings has none. So a recording whose transcript exists
+            // only as text (legacy `fullText`, sidecar-only) has no SRT to
+            // give, and saying so beats returning an empty file.
+            let cues = TranscriptFormatter.srtCues(segments: recording.segments,
+                                                   names: recording.speakerNames)
+            guard !cues.isEmpty else {
+                throw ToolError.invalidArguments(
+                    "format \"srt\" is unavailable for recording \(recording.id.uuidString): "
+                    + "it has no timed segments (legacy or text-only transcript). Use format \"text\".")
+            }
+            // `max_chars` keeps whole cues: a cue cut mid-timestamp is not
+            // a subtitle file any player will load. Fewer characters than
+            // asked for is the right answer; an invalid file is not.
+            var kept: [String] = []
+            if let maxChars, maxChars > 0 {
+                var length = 0
+                for cue in cues {
+                    // Each kept cue costs its own text plus the "\n\n" that
+                    // follows it in the joined output.
+                    let cost = cue.count + 2
+                    guard length + cost <= maxChars else { break }
+                    kept.append(cue)
+                    length += cost
+                }
+                truncated = kept.count < cues.count
+            } else {
+                kept = cues
+            }
+            transcript = kept.isEmpty ? "" : kept.joined(separator: "\n\n") + "\n\n"
         }
         var result = summaryObject(for: recording)
         result["language"] = recording.language
+        result["format"] = format.rawValue
         result["transcript"] = transcript
         result["transcript_truncated"] = truncated
         if recording.status != "completed" {

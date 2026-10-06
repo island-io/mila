@@ -193,6 +193,108 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertEqual(result["transcript_truncated"] as? Bool, true)
     }
 
+    // MARK: get_transcript format
+
+    /// Omitting `format` is the pre-existing behaviour, now labelled.
+    /// Every existing client reads this shape, so the only permitted
+    /// difference is the added key.
+    func test_get_transcript_default_format_is_text_and_reports_it() throws {
+        try seedStore([meeting("Latest", daysAgo: 0,
+                               speakerNames: ["SPEAKER_00": "Dana", "SPEAKER_01": "John Doe"])])
+        let result = try call("get_transcript")
+        XCTAssertEqual(result["format"] as? String, "text")
+        XCTAssertEqual(result["transcript"] as? String,
+                       "Dana: shalom everyone\nJohn Doe: let's begin")
+        XCTAssertEqual(result["transcript_truncated"] as? Bool, false)
+    }
+
+    func test_get_transcript_format_srt_renders_named_cues() throws {
+        try seedStore([meeting("Subtitled", daysAgo: 0,
+                               speakerNames: ["SPEAKER_00": "Dana", "SPEAKER_01": "John Doe"],
+                               summary: "Quick sync.")])
+        let result = try call("get_transcript", ["format": "srt"])
+        XCTAssertEqual(result["format"] as? String, "srt")
+        XCTAssertEqual(result["transcript"] as? String,
+                       "1\n00:00:00,000 --> 00:00:03,000\nDana: shalom everyone\n\n"
+                       + "2\n00:00:03,000 --> 00:00:06,000\nJohn Doe: let's begin\n\n")
+        XCTAssertEqual(result["transcript_truncated"] as? Bool, false)
+        XCTAssertEqual(result["summary"] as? String, "Quick sync.",
+                       "format changes the transcript rendering only")
+    }
+
+    /// A cue cut in the middle is not a subtitle file, so `max_chars`
+    /// drops whole cues from the end instead — and when even the first
+    /// does not fit, returns nothing rather than a fragment.
+    func test_get_transcript_format_srt_max_chars_cuts_on_cue_boundary() throws {
+        try seedStore([meeting("Subtitled", daysAgo: 0)])
+        let full = try XCTUnwrap(try call("get_transcript", ["format": "srt"])["transcript"] as? String)
+        let firstCue = try XCTUnwrap(full.components(separatedBy: "\n\n").first)
+
+        let oneShort = try call("get_transcript", ["format": "srt", "max_chars": full.count - 1])
+        XCTAssertEqual(oneShort["transcript"] as? String, firstCue + "\n\n")
+        XCTAssertEqual(oneShort["transcript_truncated"] as? Bool, true)
+
+        let exact = try call("get_transcript", ["format": "srt", "max_chars": full.count])
+        XCTAssertEqual(exact["transcript"] as? String, full)
+        XCTAssertEqual(exact["transcript_truncated"] as? Bool, false)
+
+        let tiny = try call("get_transcript", ["format": "srt", "max_chars": 10])
+        XCTAssertEqual(tiny["transcript"] as? String, "")
+        XCTAssertEqual(tiny["transcript_truncated"] as? Bool, true)
+    }
+
+    /// For a recording with no speaker labels, text mode serves the `.txt`
+    /// sidecar (that file IS the transcript). SRT must not: the sidecar has
+    /// no timings, and the segments do.
+    func test_get_transcript_format_srt_ignores_the_txt_sidecar() throws {
+        let unlabelled = StoredRecording(
+            title: "Plain", createdAt: Date(timeIntervalSince1970: 1_700_000_000),
+            duration: 10, source: "mic", audioFileName: "Plain.wav", status: "completed",
+            segments: [
+                .init(start: 0, end: 2, text: "from the segments"),
+                .init(start: 2, end: 4, text: "with timings"),
+            ])
+        try seedStore([unlabelled])
+        try "SIDECAR TEXT".write(to: root.appendingPathComponent("Recordings/Plain.txt"),
+                                atomically: true, encoding: .utf8)
+
+        XCTAssertEqual(try call("get_transcript")["transcript"] as? String, "SIDECAR TEXT",
+                       "precondition: text mode does read the sidecar for an unlabelled recording")
+        let srt = try XCTUnwrap(try call("get_transcript", ["format": "srt"])["transcript"] as? String)
+        XCTAssertEqual(srt,
+                       "1\n00:00:00,000 --> 00:00:02,000\nfrom the segments\n\n"
+                       + "2\n00:00:02,000 --> 00:00:04,000\nwith timings\n\n")
+        XCTAssertFalse(srt.contains("SIDECAR"))
+    }
+
+    /// A legacy record whose transcript exists only as text has no SRT to
+    /// give; the error says so and points back at `text`.
+    func test_get_transcript_format_srt_without_segments_throws() throws {
+        let id = UUID()
+        let json = """
+        [{"id":"\(id.uuidString)","title":"Legacy",
+        "createdAt":"2023-11-14T22:13:20Z","duration":60,"source":"meeting",
+        "audioFileName":"Legacy.wav","status":"completed",
+        "fullText":"only ever stored as text"}]
+        """
+        try Data(json.utf8).write(to: root.appendingPathComponent("recordings.json"))
+
+        XCTAssertEqual(try call("get_transcript")["transcript"] as? String, "only ever stored as text",
+                       "precondition: text mode still answers")
+        XCTAssertThrowsError(try call("get_transcript", ["format": "srt"])) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("srt") && message.contains(id.uuidString), message)
+        }
+    }
+
+    func test_get_transcript_rejects_bad_format() throws {
+        try seedStore([meeting("A", daysAgo: 0)])
+        XCTAssertThrowsError(try call("get_transcript", ["format": "vtt"])) { error in
+            XCTAssertTrue(String(describing: error).contains("Invalid arguments"),
+                          String(describing: error))
+        }
+    }
+
     func test_get_transcript_unknown_id_throws_not_found() throws {
         try seedStore([meeting("A", daysAgo: 0)])
         XCTAssertThrowsError(try call("get_transcript", ["id": UUID().uuidString]))
