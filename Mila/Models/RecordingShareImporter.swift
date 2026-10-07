@@ -166,10 +166,23 @@ final class RecordingShareImporter: ObservableObject {
     func cancel() {
         if let pending {
             try? fileManager.removeItem(at: pending.stagingDirectory)
+            // Release the import slot NOW rather than when the abandoned
+            // copy's `confirm()` unwinds: the next queued bundle's sheet can
+            // appear immediately and must not show a disabled Import for
+            // the rest of a transfer nobody wants any more.
+            if inFlightTicket == pending.id {
+                inFlightTicket = nil
+                isImporting = false
+            }
         }
         pending = nil
         pumpQueue()
     }
+
+    /// The `PendingImport.id` whose `confirm()` is in flight, if any. The
+    /// flag the sheet reads is `isImporting`; this is what lets an abandoned
+    /// import tell whether the flag is still ITS to clear.
+    private var inFlightTicket: UUID?
 
     private func pumpQueue() {
         guard pending == nil, !isStaging, !queue.isEmpty else { return }
@@ -346,13 +359,25 @@ final class RecordingShareImporter: ObservableObject {
     // MARK: - Confirm
 
     func confirm() async {
-        guard let pending, !isImporting else { return }
+        // A second click on the same sheet while its import runs is a no-op.
+        // A DIFFERENT pending import (the user cancelled, the next bundle
+        // staged) may start even if the abandoned copy is still unwinding.
+        guard let pending, inFlightTicket != pending.id else { return }
+        let ticket = pending.id
+        inFlightTicket = ticket
         isImporting = true
-        defer { isImporting = false }
+        defer {
+            // Only the import that owns the slot clears it: a cancelled
+            // import finishing late must not re-enable the button under
+            // the import that replaced it.
+            if inFlightTicket == ticket {
+                inFlightTicket = nil
+                isImporting = false
+            }
+        }
         // `pending` is a value copy; the published slot can be cleared by
         // Cancel while the audio copy below is in flight. Every resumption
         // re-checks that THIS import is still the one on screen.
-        let ticket = pending.id
         let manifest = pending.manifest
         let existing: Recording? = {
             if case .update(let e) = pending.disposition { return e }

@@ -230,6 +230,8 @@ final class RecordingShareImporterTests: XCTestCase {
         // so the cancel below runs while it is in flight.
         let importTask = Task { @MainActor in await importer.confirm() }
         importer.cancel()
+        XCTAssertFalse(importer.isImporting,
+                       "cancel releases the import slot at once — a queued sheet must not inherit a disabled button")
         await importTask.value
 
         XCTAssertNil(importer.pending)
