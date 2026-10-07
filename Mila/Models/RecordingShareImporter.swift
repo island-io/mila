@@ -85,9 +85,20 @@ final class RecordingShareImporter: ObservableObject {
     @Published var errorMessage: String?
     /// True while a bundle is being extracted and hashed.
     @Published private(set) var isStaging = false
-    /// The id of the most recently imported recording, for the window to
-    /// select it.
-    @Published private(set) var lastImportedID: UUID?
+    /// True from the Import click until the library write finished or was
+    /// abandoned. The sheet disables its button on it, and `confirm()`
+    /// refuses to start twice — a second click during the audio copy would
+    /// otherwise fold the same voice profiles in twice.
+    @Published private(set) var isImporting = false
+
+    /// A completed import, for the window to select the recording. Carries
+    /// a fresh `token` so re-importing the SAME recording (the replace /
+    /// restore path, same UUID) still reads as a change to `onChange`.
+    struct Completion: Equatable {
+        let recordingID: UUID
+        let token = UUID()
+    }
+    @Published private(set) var lastImport: Completion?
 
     /// A bundle larger than this is refused before extraction.
     static let maxBundleBytes: Int64 = 4 << 30
@@ -335,7 +346,13 @@ final class RecordingShareImporter: ObservableObject {
     // MARK: - Confirm
 
     func confirm() async {
-        guard let pending else { return }
+        guard let pending, !isImporting else { return }
+        isImporting = true
+        defer { isImporting = false }
+        // `pending` is a value copy; the published slot can be cleared by
+        // Cancel while the audio copy below is in flight. Every resumption
+        // re-checks that THIS import is still the one on screen.
+        let ticket = pending.id
         let manifest = pending.manifest
         let existing: Recording? = {
             if case .update(let e) = pending.disposition { return e }
@@ -362,7 +379,17 @@ final class RecordingShareImporter: ObservableObject {
             }.value
         } catch {
             try? fileManager.removeItem(at: partial)
+            // If Cancel already dismissed this import, it also removed the
+            // staging directory — which is why the copy failed. Not an error.
+            guard self.pending?.id == ticket else { return }
             finish(pending, error: ShareManifest.LoadError.unreadable(error.localizedDescription))
+            return
+        }
+        guard self.pending?.id == ticket else {
+            // Cancelled while copying: the user dismissed this import, so
+            // nothing of it may reach the library or the voice profiles.
+            try? fileManager.removeItem(at: partial)
+            log.log("import of \(manifest.recording.id, privacy: .public) cancelled during the audio copy")
             return
         }
 
@@ -395,10 +422,19 @@ final class RecordingShareImporter: ObservableObject {
             speakerDirectory?.add(name)
         }
 
-        guard store.upsertImported(recording) else {
+        switch store.upsertImported(recording) {
+        case .notSaved:
+            // The store rolled itself back, so the audio is unreferenced
+            // and removing it leaves no trace of the attempt.
             try? fileManager.removeItem(at: destination)
             finish(pending, error: ImportError.saveFailed)
             return
+        case .savedWithoutTranscript:
+            // The row references the audio; the audio must stay. `load()`
+            // rebuilds the text from the segments.
+            log.error("imported \(recording.id, privacy: .public) but its .txt sidecar did not land")
+        case .saved:
+            break
         }
 
         if let existing, existing.audioFileName != recording.audioFileName {
@@ -415,7 +451,7 @@ final class RecordingShareImporter: ObservableObject {
             \(manifest.audio.byteCount, privacy: .public) audio bytes)
             """)
         finish(pending, error: nil)
-        lastImportedID = recording.id
+        lastImport = Completion(recordingID: recording.id)
 
         // A shared .wav gets the same storage treatment as a local one.
         if compressImportedWAV, manifest.audio.format == "wav" {

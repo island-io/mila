@@ -28,10 +28,10 @@ final class RecordingStoreUpsertTests: XCTestCase {
         store.add(recording("new", at: 300))
         XCTAssertEqual(store.recordings.map(\.title), ["new", "old"])
 
-        XCTAssertTrue(store.upsertImported(recording("middle", at: 200)))
+        XCTAssertEqual(store.upsertImported(recording("middle", at: 200)), .saved)
         XCTAssertEqual(store.recordings.map(\.title), ["new", "middle", "old"])
-        XCTAssertTrue(store.upsertImported(recording("newest", at: 400)))
-        XCTAssertTrue(store.upsertImported(recording("oldest", at: 50)))
+        XCTAssertEqual(store.upsertImported(recording("newest", at: 400)), .saved)
+        XCTAssertEqual(store.upsertImported(recording("oldest", at: 50)), .saved)
         XCTAssertEqual(store.recordings.map(\.title), ["newest", "new", "middle", "old", "oldest"])
     }
 
@@ -41,7 +41,7 @@ final class RecordingStoreUpsertTests: XCTestCase {
         store.add(recording("first", at: 100, id: id))
         store.add(recording("other", at: 200))
 
-        XCTAssertTrue(store.upsertImported(recording("replaced", at: 100, id: id)))
+        XCTAssertEqual(store.upsertImported(recording("replaced", at: 100, id: id)), .saved)
         XCTAssertEqual(store.recordings.filter { $0.id == id }.count, 1)
         XCTAssertEqual(store.recordings.map(\.title), ["other", "replaced"])
         XCTAssertEqual(try? String(contentsOf: store.transcriptURL(for: store.recordings[1]), encoding: .utf8),
@@ -51,12 +51,22 @@ final class RecordingStoreUpsertTests: XCTestCase {
         XCTAssertEqual(relaunched.recordings.map(\.title), ["other", "replaced"])
     }
 
-    func test_upsert_reports_failure_when_the_store_cannot_be_written() throws {
+    /// `recordings.json` is the commit point. When it cannot be written the
+    /// in-memory list and the sidecars are rolled back, so the caller can
+    /// safely treat `.notSaved` as "nothing happened" — and delete the audio
+    /// it copied without orphaning a row that references it.
+    func test_upsert_rolls_back_when_the_store_cannot_be_written() throws {
         let store = RecordingStore(rootDirectory: root)
+        store.add(recording("existing", at: 50))
         // Make recordings.json a directory so the atomic write cannot land.
         try? FileManager.default.removeItem(at: store.storeURL)
         try FileManager.default.createDirectory(at: store.storeURL, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: store.storeURL) }
-        XCTAssertFalse(store.upsertImported(recording("doomed", at: 100)))
+
+        let doomed = recording("doomed", at: 100)
+        XCTAssertEqual(store.upsertImported(doomed), .notSaved)
+        XCTAssertEqual(store.recordings.map(\.title), ["existing"], "in-memory list rolled back")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.transcriptURL(for: doomed).path),
+                       "the sidecar written before the failed persist is removed again")
     }
 }

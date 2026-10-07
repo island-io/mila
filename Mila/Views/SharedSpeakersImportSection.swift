@@ -31,8 +31,9 @@ struct SharedSpeakersImportSection: View {
                 }
                 .padding(12)
             }
+            // No `fixedSize` here: it would make the scroll view take its
+            // full content height and ignore the cap.
             .frame(maxWidth: .infinity, maxHeight: 240, alignment: .leading)
-            .fixedSize(horizontal: false, vertical: true)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(Color(nsColor: .quaternaryLabelColor).opacity(0.4))

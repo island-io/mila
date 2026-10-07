@@ -481,10 +481,29 @@ final class RecordingStore: ObservableObject {
     /// for ever after. This is the one entry point that guarantees a given
     /// UUID appears at most once.
     ///
-    /// Same verdict as `update(_:)`: whether both the `.txt` sidecar and
-    /// `recordings.json` landed on disk.
+    /// What `upsertImported` did. Unlike `update(_:)`'s Bool, this separates
+    /// "nothing changed" from "saved, but the transcript sidecar didn't
+    /// land", because the caller owns an audio file whose fate depends on
+    /// the difference: after `.notSaved` the file is unreferenced and should
+    /// go; after `.savedWithoutTranscript` the library points at it and
+    /// deleting it would leave a row with no audio.
+    enum UpsertOutcome: Equatable {
+        /// Row in `recordings.json`, `.txt` sidecar on disk.
+        case saved
+        /// Row in `recordings.json`, but the `.txt` write failed. `load()`
+        /// falls back to the segments' text, so the recording stays usable.
+        case savedWithoutTranscript
+        /// `recordings.json` could not be written. The in-memory list and
+        /// the sidecars are rolled back, so the store is exactly as before.
+        case notSaved
+    }
+
+    /// `recordings.json` is the commit point: the in-memory mutation and the
+    /// sidecars are rolled back when it cannot be written, so a `.notSaved`
+    /// outcome leaves no trace of the attempt.
     @discardableResult
-    func upsertImported(_ recording: Recording) -> Bool {
+    func upsertImported(_ recording: Recording) -> UpsertOutcome {
+        let before = recordings
         if let idx = recordings.firstIndex(where: { $0.id == recording.id }) {
             recordings[idx] = recording
         } else {
@@ -495,8 +514,16 @@ final class RecordingStore: ObservableObject {
         }
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        let persisted = persist()
-        return transcriptWritten && persisted
+        guard persist() else {
+            recordings = before
+            // The imported recording's sidecars derive from a freshly minted
+            // audio name, so they are new files and removing them cannot
+            // touch anything the previous row owned.
+            try? fileManager.removeItem(at: transcriptURL(for: recording))
+            try? fileManager.removeItem(at: summaryURL(for: recording))
+            return .notSaved
+        }
+        return transcriptWritten ? .saved : .savedWithoutTranscript
     }
 
     /// `update(_:)` plus the one piece of bookkeeping a caller owes when it

@@ -145,7 +145,7 @@ final class RecordingShareImporterTests: XCTestCase {
         await importer.confirm()
         XCTAssertNil(importer.pending)
         XCTAssertNil(importer.errorMessage)
-        XCTAssertEqual(importer.lastImportedID, original.id)
+        XCTAssertEqual(importer.lastImport?.recordingID, original.id)
 
         let imported = try XCTUnwrap(storeB.recordings.first { $0.id == original.id })
         XCTAssertEqual(imported.title, "Weekly sync")
@@ -198,6 +198,7 @@ final class RecordingShareImporterTests: XCTestCase {
         await stage(bundle, with: importer)
         await importer.confirm()
         XCTAssertEqual(storeB.recordings.count, 1)
+        let firstCompletion = try XCTUnwrap(importer.lastImport)
 
         await stage(bundle, with: importer)
         let second = try XCTUnwrap(importer.pending)
@@ -205,6 +206,37 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertEqual(existing.id, original.id)
         await importer.confirm()
         XCTAssertEqual(storeB.recordings.count, 1)
+
+        // Same recording id, but a NEW completion — so the window's
+        // `onChange` fires and re-selects the recording on a re-import too.
+        let secondCompletion = try XCTUnwrap(importer.lastImport)
+        XCTAssertEqual(secondCompletion.recordingID, original.id)
+        XCTAssertNotEqual(secondCompletion, firstCompletion)
+    }
+
+    /// Cancelling while the audio is being copied must leave the library,
+    /// the recordings folder and the voice profiles untouched: `confirm()`
+    /// holds a value copy of the pending import across that `await`, so it
+    /// has to re-check that the import is still the one on screen.
+    func test_cancel_during_the_audio_copy_imports_nothing() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        let importer = makeImporter()
+        await stage(bundle, with: importer)
+        XCTAssertNotNil(importer.pending)
+
+        // Start the import, then cancel before the copy can resume on the
+        // main actor. `confirm()`'s first suspension is the detached copy,
+        // so the cancel below runs while it is in flight.
+        let importTask = Task { @MainActor in await importer.confirm() }
+        importer.cancel()
+        await importTask.value
+
+        XCTAssertNil(importer.pending)
+        XCTAssertNil(importer.lastImport)
+        XCTAssertFalse(importer.isImporting)
+        XCTAssertTrue(storeB.recordings.isEmpty, "the dismissed import must not reach the library")
+        XCTAssertEqual(recordingsDirectoryNames(storeB), [], "no audio, no .partial left behind")
     }
 
     func test_update_takes_the_bundle_content_but_keeps_the_local_folder_and_removes_old_files() async throws {

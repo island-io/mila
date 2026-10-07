@@ -71,7 +71,7 @@ struct RecordingShareConfirmationView: View {
                 Button(pending.isUpdate ? "Replace" : "Import", action: onImport)
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
-                    .disabled(pending.wouldExceedStorageCap)
+                    .disabled(pending.wouldExceedStorageCap || importer.isImporting)
                     .accessibilityIdentifier("share.import.confirm")
             }
         }

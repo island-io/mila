@@ -211,8 +211,8 @@ struct ContentView: View {
         // A just-imported `.milashare` opens itself, the way a just-finished
         // recording does — the user double-clicked a file and expects to
         // see it, not to hunt for it in a list sorted by the SENDER's date.
-        .onChange(of: shareImporter.lastImportedID) { _, id in
-            if let id { selection = .recording(id) }
+        .onChange(of: shareImporter.lastImport) { _, completion in
+            if let completion { selection = .recording(completion.recordingID) }
         }
         .onChange(of: columnVisibility) { _, _ in
             // Sidebar visibility changed — ping the AppDelegate so it
