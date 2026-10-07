@@ -628,6 +628,28 @@ final class RecordingStore: ObservableObject {
         persist()
     }
 
+    /// Set (or clear, with nil) the per-recording summary language override
+    /// — see `Recording.summaryLanguage`. Mutates ONLY that field on the
+    /// LIVE row and returns it, ready to hand to
+    /// `RecordingSummarizer.regenerate`. Returns nil if the recording is gone.
+    ///
+    /// Same shape as `prepareForRetranscription`, for the same reason: the
+    /// `Recording` a context menu captured can be a stale snapshot whose
+    /// `audioFileName` still says `.wav` after the post-completion
+    /// compression renamed the file to `.m4a`. `store.update(copy)` from
+    /// such a snapshot would clobber the live `.m4a` name back to a deleted
+    /// file. Writing one field on the live row sidesteps that entirely.
+    ///
+    /// Persists even when the value is unchanged — the caller is about to
+    /// regenerate, and a persist here is cheap next to that LLM call.
+    @discardableResult
+    func setSummaryLanguage(_ code: String?, recordingID: UUID) -> Recording? {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return nil }
+        recordings[idx].summaryLanguage = code
+        persist()
+        return recordings[idx]
+    }
+
     /// Assign (or clear, with nil/empty) a display name for one raw
     /// diarizer speaker ID on a recording. Segments keep their raw
     /// `SPEAKER_NN` IDs — the name is a display overlay resolved at

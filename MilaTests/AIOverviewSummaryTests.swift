@@ -9,6 +9,36 @@ final class AIOverviewSummaryTests: XCTestCase {
 
     private func plain(_ a: AttributedString) -> String { String(a.characters) }
 
+    // MARK: - Text direction
+
+    /// The block's direction follows the AI's TEXT, not the transcription
+    /// language. A Hebrew recording summarised in English (the per-recording
+    /// summary language) must read left-to-right; the old rule OR'd in
+    /// `recordingLanguage == "he"` and pinned it to the right edge.
+    func test_direction_follows_the_summary_text_not_the_recording_language() {
+        let english = "The team agreed to ship next week and Dana owns the deck."
+        XCTAssertFalse(AIOverviewSection.isRTL(summary: english, items: [], recordingLanguage: "he"),
+                       "an English summary on a Hebrew recording reads LTR")
+        let hebrew = "הצוות הסכים לשחרר בשבוע הבא ודנה אחראית על המצגת."
+        XCTAssertTrue(AIOverviewSection.isRTL(summary: hebrew, items: [], recordingLanguage: "en"),
+                      "a Hebrew summary on an English recording reads RTL")
+
+        // Action items count toward the same single verdict for the block.
+        let item = ActionItem(id: "a", text: "לשלוח את המצגת", speaker: nil,
+                              timestampSeconds: 0, source: .llmInferred, addedAt: Date())
+        XCTAssertTrue(AIOverviewSection.isRTL(summary: nil, items: [item], recordingLanguage: "en"))
+    }
+
+    /// With nothing to read yet — the "Generating summary…" placeholder —
+    /// the recording language is still the fallback, so the placeholder sits
+    /// on the side the summary will most likely land on.
+    func test_direction_falls_back_to_recording_language_when_there_is_no_text() {
+        XCTAssertTrue(AIOverviewSection.isRTL(summary: nil, items: [], recordingLanguage: "he"))
+        XCTAssertFalse(AIOverviewSection.isRTL(summary: "", items: [], recordingLanguage: "en"))
+        XCTAssertTrue(AIOverviewSection.isRTL(summary: "12:30 — …", items: [], recordingLanguage: "he"),
+                      "digits and punctuation alone are not a verdict either")
+    }
+
     func test_multiSentence_paragraph_splits_into_lines_without_bullets() {
         let s = "We shipped the beta. Dana will send the deck. Yossi books the room."
         let out = plain(AIOverviewSection.summaryAttributed(s))

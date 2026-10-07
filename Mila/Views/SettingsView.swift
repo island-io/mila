@@ -1955,7 +1955,10 @@ private struct AIFeaturesSettingsTab: View {
                 Spacer(minLength: 0)
             }
             .font(.callout)
-            Text("Language the AI writes in, for every feature below. Auto follows what was spoken.")
+            // Names the features that actually substitute `{{LANGUAGE}}`
+            // (summary + action items, Live AI) — the name prompt and the
+            // Send action never did, so "every feature below" was wrong.
+            Text("Language of the summary, action items and Live AI output. Auto follows what was spoken. Right-click a recording to pick a different language for just that one.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
