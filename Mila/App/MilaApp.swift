@@ -372,6 +372,10 @@ struct MilaApp: App {
     @StateObject private var speakerDirectory: SpeakerDirectory
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
+    /// Imports double-clicked `.milashare` bundles — a recording another Mila
+    /// user shared — with a confirmation sheet. Publishes only on user
+    /// actions (open / confirm / cancel), never at audio or timer cadence.
+    @StateObject private var shareImporter: RecordingShareImporter
     /// Mirrors the live transcript to `live/current.json` for external
     /// tools (mila-mcp). Not observed by any view; held as a StateObject
     /// purely so it survives SwiftUI re-inits like the other singletons.
@@ -905,6 +909,23 @@ struct MilaApp: App {
             diarization: diarSettings,
             meetingDetection: meetingSettings
         )
+        let speakerDirectory = SpeakerDirectory()
+        // Imports `.milashare` bundles. Given the store it writes to, the
+        // storage cap, and the voice-profile objects the import sheet's
+        // per-speaker merge needs; `isRecordingBusy` keeps it from replacing
+        // a recording that is mid-transcription.
+        let shareImporter = RecordingShareImporter(
+            store: store,
+            storageSettings: storage,
+            profileStore: profileStoreRef,
+            voiceRecognition: voiceSettings,
+            similarityThreshold: { [weak liveAI] in liveAI?.speakerSimilarityThreshold ?? 0.55 },
+            speakerDirectory: speakerDirectory,
+            isRecordingBusy: { [weak svc] id in
+                guard let svc else { return false }
+                return svc.activeRecordingID == id || svc.pendingIDs.contains(id)
+            }
+        )
         _store = StateObject(wrappedValue: store)
         _storageSettings = StateObject(wrappedValue: storage)
         _modelManager = StateObject(wrappedValue: mgr)
@@ -942,8 +963,9 @@ struct MilaApp: App {
                                             languageSettings: langSettings)
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
-        _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
+        _speakerDirectory = StateObject(wrappedValue: speakerDirectory)
         _configImporter = StateObject(wrappedValue: configImporter)
+        _shareImporter = StateObject(wrappedValue: shareImporter)
         _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
@@ -993,6 +1015,7 @@ struct MilaApp: App {
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
                 .of("configImporter", configImporter),
+                .of("shareImporter", shareImporter),
                 .of("liveSidecarWriter", sidecarWriter),
                 .of("dictation", dictationController)
             ])
@@ -1076,6 +1099,29 @@ struct MilaApp: App {
                 } message: {
                     Text(configImporter.errorMessage ?? "")
                 }
+                .environmentObject(shareImporter)
+                .sheet(item: Binding(
+                    get: { shareImporter.pending },
+                    set: { if $0 == nil { shareImporter.cancel() } }
+                )) { pending in
+                    RecordingShareConfirmationView(
+                        importer: shareImporter,
+                        pending: pending,
+                        onImport: { Task { await shareImporter.confirm() } },
+                        onCancel: { shareImporter.cancel() }
+                    )
+                }
+                .alert(
+                    "Couldn't import shared recording",
+                    isPresented: Binding(
+                        get: { shareImporter.errorMessage != nil },
+                        set: { if !$0 { shareImporter.errorMessage = nil } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { }
+                } message: {
+                    Text(shareImporter.errorMessage ?? "")
+                }
                 .environmentObject(obsidianVaultSettings)
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
@@ -1097,6 +1143,12 @@ struct MilaApp: App {
                     Task { await actions.openFiles() }
                 }
                 .keyboardShortcut("o", modifiers: .command)
+                // Separate from "Open Audio File…" on purpose: that path
+                // re-transcribes whatever it is given, this one imports a
+                // colleague's transcript as-is.
+                Button("Import Shared Recording…") {
+                    shareImporter.openInteractively()
+                }
             }
             CommandMenu("Dictation") {
                 Button("English Dictation (\(hotkeySettings.binding(for: .dictateEnglish).displayName))") {
@@ -1138,6 +1190,7 @@ struct MilaApp: App {
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
+                .environmentObject(shareImporter)
                 // Settings ▸ General shows the Sparkle-backed
                 // "Automatically check for updates" toggle, so the Settings
                 // scene needs the same single updater instance the main window
@@ -1192,10 +1245,12 @@ struct MilaApp: App {
         appDelegate.dictation = dictation
         appDelegate.modelManager = modelManager
         appDelegate.actions = actions
-        // Route `.milaconfig` opens through the importer, and drain any that
-        // arrived during a cold launch (before this wiring ran).
+        // Route `.milaconfig` / `.milashare` opens through their importers,
+        // and drain any that arrived during a cold launch (before this
+        // wiring ran).
         appDelegate.configImporter = configImporter
-        appDelegate.flushBufferedConfigOpens()
+        appDelegate.shareImporter = shareImporter
+        appDelegate.flushBufferedOpens()
         appDelegate.startScreenLockObserversIfNeeded()
     }
 
@@ -2201,39 +2256,66 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var modelManager: ModelManager?
     weak var actions: QuickActionsController?
     weak var configImporter: MilaConfigImporter?
+    weak var shareImporter: RecordingShareImporter?
 
     private var didShutDown = false
     private var screenLockObserversInstalled = false
-    /// `.milaconfig` URLs delivered by a cold launch (double-click while Mila
-    /// was not running) before `wireDelegate()` connected the importer. Drained
-    /// by `flushBufferedConfigOpens()`.
-    private var bufferedConfigURLs: [URL] = []
+    /// `.milaconfig` / `.milashare` URLs delivered by a cold launch
+    /// (double-click while Mila was not running) before `wireDelegate()`
+    /// connected the importers. Drained by `flushBufferedOpens()`.
+    private var bufferedOpenURLs: [URL] = []
+
+    /// Split a batch of opened URLs by the document type Mila claims for
+    /// them. Anything else is dropped — Mila declares exactly these two in
+    /// `CFBundleDocumentTypes`. Pure, so it is unit-testable without AppKit.
+    nonisolated static func partition(_ urls: [URL]) -> (config: [URL], share: [URL]) {
+        var config: [URL] = []
+        var share: [URL] = []
+        for url in urls {
+            switch url.pathExtension.lowercased() {
+            case MilaConfig.fileExtension: config.append(url)
+            case ShareManifest.fileExtension: share.append(url)
+            default: continue
+            }
+        }
+        return (config, share)
+    }
 
     /// macOS calls this when the user double-clicks / drops a file the app
-    /// declares it opens (`CFBundleDocumentTypes` in Info.plist). We only claim
-    /// `.milaconfig`; anything else is ignored.
+    /// declares it opens (`CFBundleDocumentTypes` in Info.plist).
     func application(_ application: NSApplication, open urls: [URL]) {
-        let configURLs = urls.filter {
-            $0.pathExtension.lowercased() == MilaConfig.fileExtension
-        }
-        guard !configURLs.isEmpty else { return }
+        let (configURLs, shareURLs) = Self.partition(urls)
+        guard !configURLs.isEmpty || !shareURLs.isEmpty else { return }
         Task { @MainActor in
-            if let importer = self.configImporter {
-                configURLs.forEach { importer.handleOpen($0) }
-            } else {
-                // Cold launch: hold until the importer is wired in.
-                self.bufferedConfigURLs.append(contentsOf: configURLs)
-            }
+            self.route(configURLs: configURLs, shareURLs: shareURLs)
         }
     }
 
-    /// Deliver any config opens that arrived before the importer was wired.
+    /// Hand each URL to its importer, or buffer it until that importer is
+    /// wired (cold launch). Buffered URLs re-enter through `partition`, so
+    /// the two paths cannot disagree about who handles what.
     @MainActor
-    func flushBufferedConfigOpens() {
-        guard let importer = configImporter, !bufferedConfigURLs.isEmpty else { return }
-        let urls = bufferedConfigURLs
-        bufferedConfigURLs.removeAll()
-        urls.forEach { importer.handleOpen($0) }
+    private func route(configURLs: [URL], shareURLs: [URL]) {
+        if let importer = configImporter {
+            configURLs.forEach { importer.handleOpen($0) }
+        } else {
+            bufferedOpenURLs.append(contentsOf: configURLs)
+        }
+        if let importer = shareImporter {
+            shareURLs.forEach { importer.handleOpen($0) }
+        } else {
+            bufferedOpenURLs.append(contentsOf: shareURLs)
+        }
+    }
+
+    /// Deliver any opens that arrived before the importers were wired.
+    @MainActor
+    func flushBufferedOpens() {
+        guard !bufferedOpenURLs.isEmpty else { return }
+        let urls = bufferedOpenURLs
+        bufferedOpenURLs.removeAll()
+        let (configURLs, shareURLs) = Self.partition(urls)
+        route(configURLs: configURLs, shareURLs: shareURLs)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

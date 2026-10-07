@@ -468,6 +468,64 @@ final class RecordingStore: ObservableObject {
         return transcriptWritten && persisted
     }
 
+    /// Insert a recording that arrived from elsewhere (a `.milashare`
+    /// import), or replace the one that already carries its id.
+    ///
+    /// Neither `add` nor `update` fits on its own: `add` always inserts at
+    /// index 0 — right for a recording made just now, wrong for a three-week-
+    /// old meeting a colleague shared, which would sit at the top of the list
+    /// until the next relaunch re-sorted it — and cannot replace, while
+    /// `update` cannot insert. More importantly, `add` would happily insert a
+    /// SECOND record with the same id, and every lookup here is
+    /// `firstIndex(where: id ==)`, so the duplicate would shadow the original
+    /// for ever after. This is the one entry point that guarantees a given
+    /// UUID appears at most once.
+    ///
+    /// What `upsertImported` did. Unlike `update(_:)`'s Bool, this separates
+    /// "nothing changed" from "saved, but the transcript sidecar didn't
+    /// land", because the caller owns an audio file whose fate depends on
+    /// the difference: after `.notSaved` the file is unreferenced and should
+    /// go; after `.savedWithoutTranscript` the library points at it and
+    /// deleting it would leave a row with no audio.
+    enum UpsertOutcome: Equatable {
+        /// Row in `recordings.json`, `.txt` sidecar on disk.
+        case saved
+        /// Row in `recordings.json`, but the `.txt` write failed. `load()`
+        /// falls back to the segments' text, so the recording stays usable.
+        case savedWithoutTranscript
+        /// `recordings.json` could not be written. The in-memory list and
+        /// the sidecars are rolled back, so the store is exactly as before.
+        case notSaved
+    }
+
+    /// `recordings.json` is the commit point: the in-memory mutation and the
+    /// sidecars are rolled back when it cannot be written, so a `.notSaved`
+    /// outcome leaves no trace of the attempt.
+    @discardableResult
+    func upsertImported(_ recording: Recording) -> UpsertOutcome {
+        let before = recordings
+        if let idx = recordings.firstIndex(where: { $0.id == recording.id }) {
+            recordings[idx] = recording
+        } else {
+            // The list is kept newest-first (see `load`); slot the newcomer
+            // where its own creation date says it belongs.
+            let idx = recordings.firstIndex { $0.createdAt <= recording.createdAt } ?? recordings.count
+            recordings.insert(recording, at: idx)
+        }
+        let transcriptWritten = writeTranscript(for: recording)
+        writeSummary(for: recording)
+        guard persist() else {
+            recordings = before
+            // The imported recording's sidecars derive from a freshly minted
+            // audio name, so they are new files and removing them cannot
+            // touch anything the previous row owned.
+            try? fileManager.removeItem(at: transcriptURL(for: recording))
+            try? fileManager.removeItem(at: summaryURL(for: recording))
+            return .notSaved
+        }
+        return transcriptWritten ? .saved : .savedWithoutTranscript
+    }
+
     /// `update(_:)` plus the one piece of bookkeeping a caller owes when it
     /// replaces a recording's **whole** `speakerNames` map because a pass
     /// re-keyed its `SPEAKER_NN` ids: `onSpeakerUnnamed` fires for every

@@ -13,6 +13,7 @@ struct ContentView: View {
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var updater: UpdaterViewModel
+    @EnvironmentObject private var shareImporter: RecordingShareImporter
 
     @State private var selection: SidebarSelection? = .home
     @State private var search: String = ""
@@ -207,6 +208,12 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: postRecording.activityStatus)
+        // A just-imported `.milashare` opens itself, the way a just-finished
+        // recording does — the user double-clicked a file and expects to
+        // see it, not to hunt for it in a list sorted by the SENDER's date.
+        .onChange(of: shareImporter.lastImport) { _, completion in
+            if let completion { selection = .recording(completion.recordingID) }
+        }
         .onChange(of: columnVisibility) { _, _ in
             // Sidebar visibility changed — ping the AppDelegate so it
             // re-applies the withinWindow blending on the (possibly

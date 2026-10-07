@@ -12,6 +12,12 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var modelManager: ModelManager
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
+    @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
+
+    /// Non-nil while the `.milashare` export sheet is up (see
+    /// `recordingShareSheet`).
+    @State private var shareSelection: SharedSpeakersExportSelection?
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -87,6 +93,7 @@ struct RecordingDetailView: View {
         // need a separate onChange handler to reconfigure the player.
         .onAppear { configurePlayer() }
         .onDisappear { teardownPlayer() }
+        .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
         .onChange(of: playbackSpeed) { _, newValue in
             let rate = Float(PlaybackSpeed.nearest(to: newValue).rawValue)
             player?.defaultRate = rate
@@ -116,6 +123,14 @@ struct RecordingDetailView: View {
                     Text("·")
                     RecordingFolderMenu(recordingID: recording.id,
                                         currentFolder: recording.folder)
+                    if let sharedBy = recording.sharedBy {
+                        Text("·")
+                        Label("Shared by \(sharedBy)", systemImage: "person.crop.circle.badge.checkmark")
+                            .help(recording.sharedAt.map {
+                                "Shared \($0.formatted(date: .abbreviated, time: .shortened))"
+                            } ?? "Shared recording")
+                            .accessibilityIdentifier("detail.sharedBy")
+                    }
                 }
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -209,10 +224,21 @@ struct RecordingDetailView: View {
             .disabled(busy)
             .help(recording.status == .completed ? "Re-transcribe" : "Transcribe")
 
-            ShareLink(item: store.audioURL(for: recording)) {
+            Menu {
+                Button {
+                    shareForMila()
+                } label: {
+                    Label("Share for Mila…", systemImage: "square.and.arrow.up.on.square")
+                }
+                .disabled(!RecordingShareExporter.canExport(recording))
+                ShareLink(item: store.audioURL(for: recording)) {
+                    Label("Share Audio…", systemImage: "waveform")
+                }
+            } label: {
                 Image(systemName: "square.and.arrow.up")
             }
-            .help("Share audio")
+            .fixedSize()
+            .help("Share this recording with another Mila user, or share just the audio")
 
             Button {
                 copyOverview()
@@ -229,6 +255,20 @@ struct RecordingDetailView: View {
             }
             .disabled(recording.segments.isEmpty)
             .help("Export subtitles (.srt) for the original video/audio")
+        }
+    }
+
+    /// Produce a `.milashare` for a colleague — the voice-profile opt-in
+    /// sheet first when there is something to offer, else the save panel.
+    private func shareForMila() {
+        if let selection = RecordingShareExporter.exportSelection(
+            for: recording, profiles: speakerProfileStore, voiceRecognition: voiceRecognition) {
+            shareSelection = selection
+        } else {
+            let recording = recording
+            Task { @MainActor in
+                await RecordingShareExporter.saveInteractively(recording, store: store, profiles: [])
+            }
         }
     }
 

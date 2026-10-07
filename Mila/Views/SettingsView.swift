@@ -2632,7 +2632,7 @@ private struct VoiceRecognitionSection: View {
             Toggle("Recognise returning speakers by voice", isOn: $settings.isEnabled)
                 .accessibilityIdentifier("speakers.voiceRecognition.toggle")
 
-            Text("Naming a speaker also saves a voice fingerprint for them: 256 numbers describing how the voice sounds, written to speaker-profiles.json in Mila's Application Support folder. The audio is not part of it and a fingerprint can't be played back — but it is enough to pick the same person out of a later recording, which is the point of it. Nothing is uploaded: the fingerprints stay on this Mac and are left out of diagnostic reports. They describe everyone whose name you fill in, not only you, so turn this on only where that is yours to decide.")
+            Text("Naming a speaker also saves a voice fingerprint for them: 256 numbers describing how the voice sounds, written to speaker-profiles.json in Mila's Application Support folder. The audio is not part of it and a fingerprint can't be played back — but it is enough to pick the same person out of a later recording, which is the point of it. Nothing is uploaded: the fingerprints stay on this Mac — unless you tick “Include voice profiles” when sharing a recording, which copies the fingerprints for that recording's speakers into the share file — and they are left out of diagnostic reports. They describe everyone whose name you fill in, not only you, so turn this on only where that is yours to decide.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

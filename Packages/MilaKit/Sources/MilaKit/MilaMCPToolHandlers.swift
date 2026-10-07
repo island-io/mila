@@ -446,6 +446,10 @@ public struct MilaMCPToolHandlers: Sendable {
         if let appName = recording.appName { obj["app_name"] = appName }
         // The stable companion to the localized `app_name`.
         if let bundleID = recording.appBundleID { obj["app_bundle_id"] = bundleID }
+        // Present only on recordings another Mila user shared as a
+        // `.milashare` bundle — a client answering "whose meeting was this?"
+        // should not have to guess from the title.
+        if let sharedBy = recording.sharedBy { obj["shared_by"] = sharedBy }
         return obj
     }
 

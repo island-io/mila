@@ -124,6 +124,13 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var actionItems: [ActionItem]?
     /// Raw diarizer ID (`SPEAKER_00`) → user-assigned display name.
     public var speakerNames: [String: String]
+    /// Display name of the Mila user who shared this recording as a
+    /// `.milashare` bundle; nil for recordings this Mac captured itself.
+    /// Attribution, not provenance of the audio — `source` still says how
+    /// the recording was captured.
+    public var sharedBy: String?
+    /// When that bundle was exported (the sender's clock). Set with `sharedBy`.
+    public var sharedAt: Date?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
@@ -155,7 +162,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, speakerNames, appBundleID
+             summary, actionItems, speakerNames, appBundleID, sharedBy, sharedAt
         case legacyFullText = "fullText"
     }
 
@@ -178,6 +185,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         summary = try c.decodeIfPresent(String.self, forKey: .summary)
         actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
+        sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -187,7 +196,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 deletedAt: Date? = nil, folder: String? = nil, appName: String? = nil,
                 appBundleID: String? = nil,
                 summary: String? = nil, actionItems: [ActionItem]? = nil,
-                speakerNames: [String: String] = [:], legacyFullText: String? = nil) {
+                speakerNames: [String: String] = [:], sharedBy: String? = nil,
+                sharedAt: Date? = nil, legacyFullText: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -205,6 +215,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.summary = summary
         self.actionItems = actionItems
         self.speakerNames = speakerNames
+        self.sharedBy = sharedBy
+        self.sharedAt = sharedAt
         self.legacyFullText = legacyFullText
     }
 }

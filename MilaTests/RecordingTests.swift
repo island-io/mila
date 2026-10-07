@@ -401,4 +401,49 @@ final class RecordingTests: XCTestCase {
         let decodedLegacy = try decoder.decode(Recording.self, from: legacy)
         XCTAssertNil(decodedLegacy.voiceMemoFolderUUID)
     }
+
+    /// `sharedBy` / `sharedAt` are attribution for recordings that arrived
+    /// as a `.milashare` bundle. They must round-trip when set and be
+    /// ABSENT from the JSON when nil, so every recording Mila captured
+    /// itself keeps encoding byte-for-byte as before.
+    func test_shared_attribution_round_trips_and_is_omitted_when_nil() throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let local = Recording(title: "Mine", source: .microphone, audioFileName: "mine.wav")
+        let localJSON = String(decoding: try encoder.encode(local), as: UTF8.self)
+        XCTAssertFalse(localJSON.contains("\"sharedBy\""))
+        XCTAssertFalse(localJSON.contains("\"sharedAt\""))
+        XCTAssertFalse(local.isShared)
+
+        let when = Date(timeIntervalSince1970: 1_700_000_000)
+        let shared = Recording(title: "Theirs", source: .meeting, audioFileName: "theirs.m4a",
+                               sharedBy: "Ada Lovelace", sharedAt: when)
+        let decoded = try decoder.decode(Recording.self, from: try encoder.encode(shared))
+        XCTAssertEqual(decoded.sharedBy, "Ada Lovelace")
+        XCTAssertEqual(decoded.sharedAt, when)
+        XCTAssertTrue(decoded.isShared)
+        // Attribution never changes how the recording was captured.
+        XCTAssertEqual(decoded.source, .meeting)
+
+        // A recordings.json written before these fields existed still decodes.
+        let legacy = """
+        {
+          "id": "11111111-2222-3333-4444-555555555555",
+          "title": "Old",
+          "createdAt": "2025-01-01T00:00:00Z",
+          "duration": 1.0,
+          "source": "meeting",
+          "audioFileName": "Old.wav",
+          "status": "completed",
+          "language": "en",
+          "segments": []
+        }
+        """.data(using: .utf8)!
+        let decodedLegacy = try decoder.decode(Recording.self, from: legacy)
+        XCTAssertNil(decodedLegacy.sharedBy)
+        XCTAssertNil(decodedLegacy.sharedAt)
+    }
 }
