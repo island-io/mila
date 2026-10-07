@@ -1122,7 +1122,246 @@ final class RecordingSummarizerTests: XCTestCase {
                       "and the retry gate must actually still be open")
     }
 
+    // MARK: - Output language: per-recording override vs. global setting
+
+    /// The resolution order, pinned without a store or a runner: a
+    /// recording's own override wins; otherwise the global setting; and the
+    /// global `.auto` is decided from the transcript text.
+    func test_prompt_language_resolution_order() {
+        var english = Recording(title: "T", source: .microphone, audioFileName: "t.wav",
+                                fullText: "we discussed the roadmap")
+        var hebrew = Recording(title: "T", source: .microphone, audioFileName: "t.wav",
+                               fullText: "דיברנו על מפת הדרכים")
+
+        // No override: the global decides. Auto reads the text.
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: english, global: .auto), "English")
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: hebrew, global: .auto), "Hebrew")
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: hebrew, global: .english), "English")
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: english, global: .hebrew), "Hebrew")
+
+        // An override beats every global value, including Auto's reading.
+        english.summaryLanguage = "he"
+        hebrew.summaryLanguage = "en"
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: english, global: .english), "Hebrew")
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: english, global: .auto), "Hebrew")
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: hebrew, global: .hebrew), "English")
+        XCTAssertEqual(RecordingSummarizer.promptLanguageName(for: hebrew, global: .auto), "English")
+    }
+
+    /// End-to-end: the override reaches the model. Same transcript, same
+    /// global setting, the only difference between the two recordings is the
+    /// override — so the two prompts disagreeing is attributable to it alone
+    /// (the nil case is the negative control).
+    func test_summarize_per_recording_override_wins_over_global() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        var prompts: [UUID: String] = [:]
+        useStubRunner { _, prompt, transcript, _, _, _, _, _, _, _, _ in
+            // Key by transcript so the two runs can be told apart.
+            prompts[UUID(uuidString: transcript) ?? UUID()] = prompt
+            return "ok"
+        }
+
+        // Each recording's transcript is its own id, so the stub can file
+        // the prompt under the right recording without peeking at state.
+        var withOverride = try addRecording(named: "Override", text: "")
+        withOverride.fullText = withOverride.id.uuidString
+        withOverride.summaryLanguage = "he"
+        store.update(withOverride)
+        var without = try addRecording(named: "Default", text: "")
+        without.fullText = without.id.uuidString
+        store.update(without)
+
+        summarizer.summarizeIfNeeded(withOverride)
+        summarizer.summarizeIfNeeded(without)
+        await summarizer.awaitInFlight(withOverride.id)
+        await summarizer.awaitInFlight(without.id)
+
+        let overridden = try XCTUnwrap(prompts[withOverride.id])
+        let defaulted = try XCTUnwrap(prompts[without.id])
+        XCTAssertTrue(overridden.contains(RecordingSummarizer.languageDirective("Hebrew")),
+                      "the override must name Hebrew; got \(overridden.suffix(200))")
+        XCTAssertFalse(overridden.contains("English"),
+                       "nothing in the prompt may still ask for the global language")
+        XCTAssertTrue(defaulted.contains(RecordingSummarizer.languageDirective("English")),
+                      "control: without an override the global setting applies")
+    }
+
+    /// Today's behaviour, pinned: with no override, global Auto follows the
+    /// transcript text and a literal global value is used as-is.
+    func test_summarize_without_override_follows_global_setting() async throws {
+        llm.tool = .claude
+        var lastPrompt = ""
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            lastPrompt = prompt
+            return "ok"
+        }
+
+        liveAI.outputLanguage = .auto
+        let hebrewText = try addRecording(named: "Auto-he", text: "דיברנו על מפת הדרכים והסכמנו")
+        summarizer.summarizeIfNeeded(hebrewText)
+        await summarizer.awaitInFlight(hebrewText.id)
+        XCTAssertTrue(lastPrompt.contains(RecordingSummarizer.languageDirective("Hebrew")))
+
+        let englishText = try addRecording(named: "Auto-en", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(englishText)
+        await summarizer.awaitInFlight(englishText.id)
+        XCTAssertTrue(lastPrompt.contains(RecordingSummarizer.languageDirective("English")))
+
+        liveAI.outputLanguage = .hebrew
+        let forcedHebrew = try addRecording(named: "Global-he", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(forcedHebrew)
+        await summarizer.awaitInFlight(forcedHebrew.id)
+        XCTAssertTrue(lastPrompt.contains(RecordingSummarizer.languageDirective("Hebrew")),
+                      "a literal global value applies regardless of the transcript's language")
+    }
+
+    /// recordings.json is user-editable on disk. A code the app does not know
+    /// must fall back to the global setting — NOT to Hebrew, which is what
+    /// `RecordingLanguage.fromCode` would have done
+    /// (`bugbot-rules/untrusted-persisted-data.md`).
+    func test_summarize_ignores_an_unknown_persisted_summary_language() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        var lastPrompt = ""
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            lastPrompt = prompt
+            return "ok"
+        }
+
+        var rec = try addRecording(named: "Unknown", text: "we discussed the roadmap")
+        rec.summaryLanguage = "fr"
+        store.update(rec)
+        XCTAssertNil(rec.summaryLanguageOverride, "an unknown code is not an override")
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertTrue(lastPrompt.contains(RecordingSummarizer.languageDirective("English")),
+                      "unknown code must defer to the global setting; got \(lastPrompt.suffix(200))")
+        XCTAssertFalse(lastPrompt.contains("Hebrew"))
+    }
+
+    /// The language used to reach the model ONLY through the `{{LANGUAGE}}`
+    /// slot in the user-editable summary prompt, so a user who deleted the
+    /// slot got a silent no-op from the setting. The directive Mila appends
+    /// is what makes the override reliable for such a prompt.
+    func test_summarize_language_directive_survives_a_custom_prompt_without_the_placeholder() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        liveAI.summaryPrompt = "Summarize this meeting in three bullet points."
+        var lastPrompt = ""
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            lastPrompt = prompt
+            return "ok"
+        }
+
+        var rec = try addRecording(named: "Custom", text: "we discussed the roadmap")
+        rec.summaryLanguage = "he"
+        store.update(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertTrue(lastPrompt.hasPrefix("Summarize this meeting in three bullet points."),
+                      "the user's prompt still leads the request")
+        XCTAssertTrue(lastPrompt.contains(RecordingSummarizer.languageDirective("Hebrew")),
+                      "the appended directive carries the language even with no placeholder")
+        XCTAssertFalse(lastPrompt.contains("{{LANGUAGE}}"))
+    }
+
+    /// The launch / config-flip backfill sweep goes through the same
+    /// `runSummary`, so a recording that carries an override but never got a
+    /// summary is summarized in ITS language, not the global one.
+    func test_backfill_honours_per_recording_override() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        var lastPrompt = ""
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            lastPrompt = prompt
+            return "BACKFILLED"
+        }
+
+        var rec = try addRecording(named: "Backfill", text: "we discussed the roadmap")
+        rec.status = .completed   // backfill only looks at completed rows
+        rec.summaryLanguage = "he"
+        store.update(rec)
+
+        summarizer.backfillIfNeeded()
+        await summarizer.awaitInFlight(rec.id)
+
+        let updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(updated.summary, "BACKFILLED")
+        XCTAssertTrue(lastPrompt.contains(RecordingSummarizer.languageDirective("Hebrew")))
+    }
+
+    /// Picking a language while a summary is already in flight. The language
+    /// was resolved when the run started, and `regenerate` is dropped by the
+    /// in-flight dedup guard — so, left alone, the override would be stored
+    /// and the OLD-language output written over it. The completion must
+    /// notice the override moved, discard its result and run again from the
+    /// live row. Deterministic: the stub parks on a gate the test opens only
+    /// after setting the override.
+    func test_summarize_reruns_when_the_summary_language_changes_mid_flight() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        let gate = TestGate()
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            if prompts.count == 1 {
+                await gate.wait()
+                return "FIRST (stale language)"
+            }
+            return "SECOND"
+        }
+
+        let rec = try addRecording(named: "Race", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+
+        // What the menu does: write the override on the live row, then ask
+        // for a regenerate — which the dedup guard drops.
+        let updated = try XCTUnwrap(store.setSummaryLanguage("he", recordingID: rec.id))
+        summarizer.regenerate(updated)
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+
+        // The re-run is scheduled one tick later (after `inFlight` clears),
+        // so give it a moment to register, then await it like any other run.
+        await waitUntil { self.summarizer.isSummarizing(rec.id) }
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(prompts.count, 2, "exactly one re-run")
+        XCTAssertTrue(prompts[0].contains(RecordingSummarizer.languageDirective("English")))
+        XCTAssertTrue(prompts[1].contains(RecordingSummarizer.languageDirective("Hebrew")),
+                      "the re-run must use the language the user just picked")
+        let final = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(final.summary, "SECOND",
+                       "the stale-language output must never be stored")
+        XCTAssertEqual(final.summaryLanguage, "he")
+    }
+
     // MARK: - Helpers
+
+    /// Add a completed-looking recording with `text` as its transcript (the
+    /// summarizer never reads the audio, but `RecordingStore.add` wants the
+    /// file to exist).
+    private func addRecording(named name: String, text: String) throws -> Recording {
+        let audioURL = store.freshAudioURL(suggestedName: name)
+        try Data("x".utf8).write(to: audioURL)
+        let rec = Recording(title: name, source: .microphone,
+                            audioFileName: audioURL.lastPathComponent,
+                            fullText: text)
+        store.add(rec)
+        return rec
+    }
+
+    /// Spin the main actor until `condition` holds, bounded so a regression
+    /// fails the assertion that follows instead of hanging the suite.
+    private func waitUntil(_ condition: @MainActor () -> Bool) async {
+        for _ in 0..<2_000 where !condition() {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
 
     /// The pre-fix salvage end-anchor, kept ONLY as a negative control for
     /// `test_parse_salvages_pretty_printed_malformed_envelope_without_leaking_scaffolding`.

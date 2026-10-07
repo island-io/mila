@@ -30,6 +30,8 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var llm: LLMSettings
+    @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var renameRequest: String?
     @State private var promptForNewFolder = false
@@ -148,6 +150,19 @@ private struct RecordingContextMenu: ViewModifier {
                     showingSendSheet = true
                 }
                 .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
+                // Per-recording summary language. Picking one persists it on
+                // the live row and regenerates right away, so the user sees
+                // the summary + action items come back in that language
+                // instead of waiting for the next automatic pass.
+                SummaryLanguageMenu(
+                    current: recording.summaryLanguageOverride,
+                    global: liveAI.outputLanguage,
+                    isDisabled: isBusy
+                        || summarizer.isSummarizing(recording.id)
+                        || recording.fullText
+                            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    onPick: { setSummaryLanguage($0) }
+                )
             }
             Divider()
             Button("Export Subtitles (.srt)…") {
@@ -184,6 +199,17 @@ private struct RecordingContextMenu: ViewModifier {
                                                              language: language.rawValue)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
+    }
+
+    /// Persist the summary-language override on the LIVE row and regenerate
+    /// from that row — never from the captured `recording`, which can be a
+    /// stale snapshot (see `RecordingStore.setSummaryLanguage`). A nil result
+    /// means the recording left the store; nothing to regenerate.
+    private func setSummaryLanguage(_ language: RecordingLanguage?) {
+        guard let updated = store.setSummaryLanguage(language?.rawValue,
+                                                     recordingID: recording.id)
+        else { return }
+        summarizer.regenerate(updated)
     }
 
     /// Save the recording's SRT to a user-chosen location. NSSavePanel lets

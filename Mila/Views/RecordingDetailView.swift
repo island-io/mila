@@ -12,6 +12,7 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var modelManager: ModelManager
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var player: AVPlayer?
     @State private var currentTime: Double = 0
@@ -67,6 +68,11 @@ struct RecordingDetailView: View {
                 isSummarizing: summarizer.isSummarizing(recording.id),
                 onRegenerateSummary: canRegenerateSummary
                     ? { summarizer.regenerate(recording) }
+                    : nil,
+                summaryLanguage: recording.summaryLanguageOverride,
+                globalOutputLanguage: liveAI.outputLanguage,
+                onSetSummaryLanguage: canRegenerateSummary
+                    ? { setSummaryLanguage($0) }
                     : nil
             )
             transcriptArea
@@ -260,6 +266,17 @@ struct RecordingDetailView: View {
         transcription.enqueue(prepared, isRetranscription: true)
     }
 
+
+    /// Persist the summary-language override on the LIVE row and regenerate
+    /// from it. `recording` here is a `let` snapshot, so it is addressed by
+    /// id and the row the store hands back is what goes to the summarizer
+    /// (see `RecordingStore.setSummaryLanguage`).
+    private func setSummaryLanguage(_ language: RecordingLanguage?) {
+        guard let updated = store.setSummaryLanguage(language?.rawValue,
+                                                     recordingID: recording.id)
+        else { return }
+        summarizer.regenerate(updated)
+    }
 
     /// Whether the user can ask for a fresh summary right now. Gates the
     /// "Regenerate summary" context-menu entry in `AIOverviewBanner` so
@@ -810,6 +827,10 @@ private struct AIOverviewBanner: View {
     /// hides the "Regenerate summary" item (e.g. when no LLM is
     /// configured or the transcript is empty).
     var onRegenerateSummary: (() -> Void)? = nil
+    /// Forwarded to `AIOverviewSection` for its "Summary language" submenu.
+    var summaryLanguage: RecordingLanguage? = nil
+    var globalOutputLanguage: LiveAISettings.OutputLanguage = .auto
+    var onSetSummaryLanguage: ((RecordingLanguage?) -> Void)? = nil
 
     var body: some View {
         let section = AIOverviewSection(
@@ -822,7 +843,10 @@ private struct AIOverviewBanner: View {
             // buttons (Summary+Action-items up top, transcript in the
             // transcript area), so the per-block header copy buttons are
             // hidden here. The block's native right-click "Copy" stays.
-            showsBlockCopyButtons: false
+            showsBlockCopyButtons: false,
+            summaryLanguage: summaryLanguage,
+            globalOutputLanguage: globalOutputLanguage,
+            onSetSummaryLanguage: onSetSummaryLanguage
         )
         if section.hasContent {
             VStack(spacing: 0) {

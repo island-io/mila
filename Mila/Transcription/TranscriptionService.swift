@@ -1197,7 +1197,10 @@ final class TranscriptionService: ObservableObject {
     ///   would then label the wrong voice. A failed/rejected pass must leave it
     ///   alone.
     /// * **User-owned** — never written here; the live row always wins:
-    ///   `title`, `folder`, `deletedAt`, `summary`, `actionItems`.
+    ///   `title`, `folder`, `deletedAt`, `summary`, `actionItems`,
+    ///   `summaryLanguage` (the summary-language override is about what the
+    ///   user wants the summary written in, not what the transcript is in, so
+    ///   a re-transcription in the other language keeps it).
     /// * **Store-owned** — identity and provenance, also never written here:
     ///   `id`, `createdAt`, `source`, `audioFileName`, `appName`,
     ///   `voiceMemoUniqueID`, `voiceMemoFolderUUID`. (`audioFileName` in

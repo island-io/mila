@@ -124,6 +124,13 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var actionItems: [ActionItem]?
     /// Raw diarizer ID (`SPEAKER_00`) → user-assigned display name.
     public var speakerNames: [String: String]
+    /// The app's per-recording override of the language its `summary` and
+    /// `actionItems` are written in (`"he"` / `"en"`), when the user set
+    /// one; nil means the app's global output-language setting applied.
+    /// Kept as a string so a language the app adds later doesn't fail the
+    /// decode. Mirrored because the app persists it — not exposed by any
+    /// tool today (the summary text speaks for itself).
+    public var summaryLanguage: String?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
@@ -155,7 +162,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, speakerNames, appBundleID
+             summary, actionItems, speakerNames, appBundleID, summaryLanguage
         case legacyFullText = "fullText"
     }
 
@@ -178,6 +185,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         summary = try c.decodeIfPresent(String.self, forKey: .summary)
         actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -187,7 +195,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 deletedAt: Date? = nil, folder: String? = nil, appName: String? = nil,
                 appBundleID: String? = nil,
                 summary: String? = nil, actionItems: [ActionItem]? = nil,
-                speakerNames: [String: String] = [:], legacyFullText: String? = nil) {
+                speakerNames: [String: String] = [:], summaryLanguage: String? = nil,
+                legacyFullText: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -205,6 +214,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.summary = summary
         self.actionItems = actionItems
         self.speakerNames = speakerNames
+        self.summaryLanguage = summaryLanguage
         self.legacyFullText = legacyFullText
     }
 }

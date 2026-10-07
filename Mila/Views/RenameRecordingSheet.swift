@@ -14,6 +14,7 @@ struct RenameRecordingSheet: View {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var llm: LLMSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
 
     @State private var title: String
     /// Mila folder the recording should be filed under (nil = unfiled).
@@ -456,7 +457,19 @@ struct RenameRecordingSheet: View {
             onRegenerateSummary: canRegenerateSummary
                 ? { summarizer.regenerate(liveRecording) }
                 : nil,
-            isSummarizing: summarizer.isSummarizing(liveRecording.id)
+            isSummarizing: summarizer.isSummarizing(liveRecording.id),
+            summaryLanguage: liveRecording.summaryLanguageOverride,
+            globalOutputLanguage: liveAI.outputLanguage,
+            onSetSummaryLanguage: canRegenerateSummary
+                ? { language in
+                    // Write the override on the live row and regenerate from
+                    // what the store hands back (`RecordingStore.setSummaryLanguage`).
+                    guard let updated = store.setSummaryLanguage(language?.rawValue,
+                                                                 recordingID: liveRecording.id)
+                    else { return }
+                    summarizer.regenerate(updated)
+                }
+                : nil
         )
         .padding(.horizontal, 10)
         .padding(.vertical, 8)

@@ -365,6 +365,41 @@ final class RecordingTests: XCTestCase {
         XCTAssertEqual(formatDuration(3_661), "1:01:01")
     }
 
+    /// The per-recording summary-language override round-trips, is OMITTED
+    /// from the JSON when unset (so an untouched recordings.json is written
+    /// byte-for-byte as before), and a legacy record without the key decodes
+    /// to nil. The typed accessor accepts only the two known codes: anything
+    /// else in the file is treated as "no override", never as Hebrew.
+    func test_summaryLanguage_round_trips_is_omitted_when_nil_and_rejects_unknown_codes() throws {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        let unset = Recording(title: "Plain", source: .microphone, audioFileName: "p.wav")
+        let unsetJSON = String(decoding: try encoder.encode(unset), as: UTF8.self)
+        XCTAssertFalse(unsetJSON.contains("summaryLanguage"),
+                       "nil must not be written — existing files stay unchanged")
+        XCTAssertNil(try decoder.decode(Recording.self, from: Data(unsetJSON.utf8)).summaryLanguage)
+
+        let overridden = Recording(title: "Hebrew summary", source: .meeting,
+                                   audioFileName: "h.wav", language: "en",
+                                   summaryLanguage: "he")
+        let decoded = try decoder.decode(Recording.self, from: try encoder.encode(overridden))
+        XCTAssertEqual(decoded.summaryLanguage, "he")
+        XCTAssertEqual(decoded.summaryLanguageOverride, .hebrew)
+        XCTAssertEqual(decoded.language, "en",
+                       "the summary language is independent of the transcription language")
+
+        var unknown = overridden
+        unknown.summaryLanguage = "fr"
+        XCTAssertNil(unknown.summaryLanguageOverride,
+                     "an unrecognised persisted code is not an override (and not Hebrew)")
+        unknown.summaryLanguage = "he-IL"
+        XCTAssertNil(unknown.summaryLanguageOverride,
+                     "only the exact raw values count; regional forms are not written by the app")
+    }
+
     /// The Voice-Memo source-folder field (issue #57) round-trips, and a legacy
     /// record without the key decodes to nil rather than throwing — so an
     /// upgrade never crashes on existing imports, and legacy-nil origins are
