@@ -128,6 +128,34 @@ final class RecordingShareImporterTests: XCTestCase {
         Set((try? FileManager.default.contentsOfDirectory(atPath: store.recordingsDirectory.path)) ?? [])
     }
 
+    /// Overwrite what the central directory DECLARES as `entryName`'s
+    /// uncompressed size. The local header and the data are untouched, so
+    /// the archive still extracts — this fakes exactly the one thing a
+    /// hostile archive can lie about to the pre-extraction check.
+    private func patchDeclaredSize(in archive: URL, entry entryName: String, to size: UInt32,
+                                   file: StaticString = #filePath, line: UInt = #line) throws {
+        var bytes = try Data(contentsOf: archive)
+        let signature: [UInt8] = [0x50, 0x4b, 0x01, 0x02]
+        let name = Array(entryName.utf8)
+        var patched = false
+        var i = 0
+        while i + 46 <= bytes.count {
+            if Array(bytes[i..<i + 4]) == signature {
+                let nameLength = Int(bytes[i + 28]) | Int(bytes[i + 29]) << 8
+                if i + 46 + nameLength <= bytes.count, Array(bytes[i + 46..<i + 46 + nameLength]) == name {
+                    for (k, shift) in [24, 25, 26, 27].enumerated() {
+                        bytes[i + shift] = UInt8(truncatingIfNeeded: size >> (8 * UInt32(k)))
+                    }
+                    patched = true
+                    break
+                }
+            }
+            i += 1
+        }
+        XCTAssertTrue(patched, "no central directory header for \(entryName)", file: file, line: line)
+        try bytes.write(to: archive)
+    }
+
     // MARK: - Fresh add
 
     func test_fresh_import_adds_the_recording_with_attribution_audio_and_sidecars() async throws {
@@ -409,6 +437,127 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertTrue(importer.errorMessage?.contains("valid Mila shared recording") == true,
                       importer.errorMessage ?? "nil")
         XCTAssertTrue(storeB.recordings.isEmpty)
+    }
+
+    // MARK: - Declared contents (checked before extraction)
+
+    /// `ditto -x` inflates everything it finds, so the archive's central
+    /// directory is checked first and an archive that is not exactly a
+    /// bundle is refused before a byte of it is inflated. The pure check is
+    /// pinned here; the tests after it go through `stage`.
+    func test_validateEntries_accepts_exactly_the_fixed_names_and_nothing_else() throws {
+        func entry(_ name: String, _ size: UInt64 = 10,
+                   dir: Bool = false, link: Bool = false) -> ZipArchiver.Entry {
+            ZipArchiver.Entry(name: name, uncompressedSize: size, isDirectory: dir, isSymlink: link)
+        }
+        let full = try RecordingShareImporter.validateEntries(
+            [entry("manifest.json"), entry("audio.m4a", 500), entry("transcript.txt")])
+        XCTAssertEqual(full, .init(audioEntryName: "audio.m4a", hasTranscript: true,
+                                   totalUncompressedBytes: 520))
+        let minimal = try RecordingShareImporter.validateEntries([entry("audio.wav", 44), entry("manifest.json")])
+        XCTAssertEqual(minimal, .init(audioEntryName: "audio.wav", hasTranscript: false,
+                                      totalUncompressedBytes: 54))
+
+        func rejects(_ entries: [ZipArchiver.Entry], _ fragment: String, line: UInt = #line) {
+            XCTAssertThrowsError(try RecordingShareImporter.validateEntries(entries), line: line) { error in
+                let message = (error as? ShareManifest.LoadError)?.errorDescription ?? "\(error)"
+                XCTAssertTrue(message.contains(fragment), message, line: line)
+            }
+        }
+        rejects([entry("manifest.json"), entry("audio.wav"), entry("notes.txt")], "entry Mila doesn't expect")
+        rejects([entry("manifest.json"), entry("audio.wav"), entry("__MACOSX/._manifest.json")],
+                "entry Mila doesn't expect")
+        rejects([entry("manifest.json"), entry("audio.wav"), entry("extra/", 0, dir: true)], "ordinary file")
+        rejects([entry("manifest.json"), entry("audio.wav", link: true)], "ordinary file")
+        rejects([entry("manifest.json"), entry("audio.wav"), entry("audio.m4a")], "more than one audio")
+        rejects([entry("manifest.json"), entry("manifest.json"), entry("audio.wav")], "same entry twice")
+        rejects([entry("audio.wav")], "no manifest")
+        rejects([entry("manifest.json")], "no audio")
+        rejects([entry("manifest.json", UInt64(RecordingShareImporter.maxManifestBytes) + 1), entry("audio.wav")],
+                "manifest is too large")
+        rejects([entry("manifest.json"), entry("audio.wav"),
+                 entry("transcript.txt", UInt64(RecordingShareImporter.maxTranscriptBytes) + 1)],
+                "transcript is too large")
+        rejects([entry("manifest.json"), entry("audio.wav", UInt64(RecordingShareImporter.maxUncompressedBytes))],
+                "too large to be a Mila shared recording")
+        // A sum that overflows is just another way of being too large.
+        rejects([entry("manifest.json"), entry("audio.wav", .max)], "too large to be a Mila shared recording")
+        rejects([entry("manifest.json", .max / 2 + 1), entry("audio.wav", .max / 2 + 1)],
+                "too large to be a Mila shared recording")
+    }
+
+    func test_an_unexpected_extra_entry_is_rejected_before_extraction() async throws {
+        // A real bundle with one more file in it, as a tool other than Mila
+        // might repack it.
+        let original = try makeCompletedRecording(in: storeA)
+        let dir = scratch.appendingPathComponent("extra", isDirectory: true)
+        try await ZipArchiver.unzip(try await export(original, from: storeA), into: dir)
+        try Data("notes".utf8).write(to: dir.appendingPathComponent("notes.txt"))
+        let importer = makeImporter()
+        await stage(try await zipDirectory(dir), with: importer)
+        XCTAssertNil(importer.pending)
+        XCTAssertTrue(importer.errorMessage?.contains("entry Mila doesn't expect") == true,
+                      importer.errorMessage ?? "nil")
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertEqual(recordingsDirectoryNames(storeB), [])
+
+        // A subfolder is two entries `ditto` would create — the directory
+        // and its file — and neither is a bundle's.
+        importer.errorMessage = nil
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("notes.txt"))
+        let sub = dir.appendingPathComponent("attachments", isDirectory: true)
+        try FileManager.default.createDirectory(at: sub, withIntermediateDirectories: true)
+        try Data("x".utf8).write(to: sub.appendingPathComponent("x.txt"))
+        await stage(try await zipDirectory(dir), with: importer)
+        XCTAssertNil(importer.pending)
+        XCTAssertTrue(importer.errorMessage?.contains("valid Mila shared recording") == true,
+                      importer.errorMessage ?? "nil")
+        XCTAssertTrue(storeB.recordings.isEmpty)
+    }
+
+    func test_a_declared_size_over_the_cap_is_rejected_without_extracting() async throws {
+        // A real, small bundle whose central directory has been edited to
+        // claim the audio inflates to 4 GB. Extracted, it would have imported
+        // — so a "too large" verdict can only have come from the listing.
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        try patchDeclaredSize(in: bundle, entry: "audio.wav", to: 0xFFFF_FFFE)
+        let importer = makeImporter()
+        await stage(bundle, with: importer)
+        XCTAssertNil(importer.pending)
+        XCTAssertTrue(importer.errorMessage?.contains("too large to be a Mila shared recording") == true,
+                      importer.errorMessage ?? "nil")
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertEqual(recordingsDirectoryNames(storeB), [])
+    }
+
+    func test_an_oversized_manifest_is_rejected() async throws {
+        // Honest: the directory declares the real size, and the listing
+        // refuses it before extraction.
+        let dir = scratch.appendingPathComponent("bigmanifest", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try Data(count: Int(RecordingShareImporter.maxManifestBytes) + 1)
+            .write(to: dir.appendingPathComponent("manifest.json"))
+        try Data(count: 44).write(to: dir.appendingPathComponent("audio.wav"))
+        let importer = makeImporter()
+        await stage(try await zipDirectory(dir), with: importer)
+        XCTAssertNil(importer.pending)
+        XCTAssertTrue(importer.errorMessage?.contains("manifest is too large") == true,
+                      importer.errorMessage ?? "nil")
+
+        // Lying: the same archive, its directory edited to declare a tiny
+        // manifest. The listing passes, and `ditto` inflates the whole
+        // stream regardless of what the directory said — so the extracted
+        // file's real size is checked again before it is read, and fails.
+        importer.errorMessage = nil
+        let lying = try await zipDirectory(dir)
+        try patchDeclaredSize(in: lying, entry: "manifest.json", to: 10)
+        await stage(lying, with: importer)
+        XCTAssertNil(importer.pending)
+        XCTAssertTrue(importer.errorMessage?.contains("manifest is too large") == true,
+                      importer.errorMessage ?? "nil")
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertEqual(recordingsDirectoryNames(storeB), [])
     }
 
     // MARK: - Storage cap, cancel, queue

@@ -43,9 +43,10 @@ only where that is yours to decide.
 ## Importing
 
 Double-click the file, drop it on Mila, or use **File → Import Shared
-Recording…**. Mila verifies the archive (size and SHA-256 of the audio
-against the manifest), then shows what will happen before anything is
-written:
+Recording…**. Mila reads the archive's table of contents before unpacking
+anything — it must list exactly the entries above, nothing else, within
+size limits — then verifies the audio (size and SHA-256 against the
+manifest), and shows what will happen before anything is written:
 
 - **Added to your library** when you do not have this recording.
 - **Replaces your existing copy** when you do — a recording keeps its id

@@ -102,6 +102,18 @@ final class RecordingShareImporter: ObservableObject {
 
     /// A bundle larger than this is refused before extraction.
     static let maxBundleBytes: Int64 = 4 << 30
+    /// What the archive may DECLARE it inflates to, in total, checked
+    /// against the central directory before anything is inflated. The same
+    /// ceiling as the file itself: a bundle's bulk is audio that `deflate`
+    /// barely shrinks, so a legitimate one inflates to about its own size.
+    static let maxUncompressedBytes: Int64 = maxBundleBytes
+    /// Caps on the two text entries, checked twice: against the declared
+    /// size before extraction, and against the extracted file before it is
+    /// read into memory (a declared size can lie). A manifest for a
+    /// three-hour meeting with voice profiles is well under a megabyte, so
+    /// these never trip for a real bundle.
+    static let maxManifestBytes: Int64 = 16 << 20
+    static let maxTranscriptBytes: Int64 = 16 << 20
     /// Suffix for the in-flight audio copy; never `.wav`, so never swept.
     static let partialSuffix = "partial"
 
@@ -220,11 +232,31 @@ final class RecordingShareImporter: ObservableObject {
             guard bundleBytes <= Self.maxBundleBytes else {
                 throw ShareManifest.LoadError.malformed("The file is too large to be a Mila shared recording.")
             }
-            if let free = try? store.recordingsDirectory
-                .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-                .volumeAvailableCapacityForImportantUsage,
-               free < bundleBytes * 2 {
-                throw ShareManifest.LoadError.unreadable("There isn't enough free disk space to import it.")
+
+            // `ditto -x` inflates everything it finds, so the archive's
+            // declared contents are checked BEFORE it runs: exactly the
+            // fixed entry names, each an ordinary file, text entries under
+            // their caps, and a total that fits the cap and the disk. A zip
+            // bomb — or just a stray 40 GB entry — is refused here, having
+            // cost one read of the central directory.
+            let entries: [ZipArchiver.Entry]
+            do {
+                entries = try ZipArchiver.listEntries(of: url)
+            } catch {
+                throw ShareManifest.LoadError.malformed("It isn't a zip archive Mila can read.")
+            }
+            let declared = try Self.validateEntries(entries)
+            // Peak use is the inflated bundle in the temporary directory
+            // plus the audio copied into the library, which may be another
+            // volume; ask each for a whole copy's headroom.
+            let needed = max(bundleBytes, declared.totalUncompressedBytes) * 2
+            for volume in [store.recordingsDirectory, fileManager.temporaryDirectory] {
+                if let free = try? volume
+                    .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+                    .volumeAvailableCapacityForImportantUsage,
+                   free < needed {
+                    throw ShareManifest.LoadError.unreadable("There isn't enough free disk space to import it.")
+                }
             }
 
             let dir = fileManager.temporaryDirectory
@@ -236,6 +268,8 @@ final class RecordingShareImporter: ObservableObject {
             let manifestURL = dir.appendingPathComponent(ShareManifest.manifestEntryName)
             try requireRegularFile(manifestURL, within: dir,
                                    missing: ShareManifest.LoadError.malformed("It has no manifest."))
+            try requireSize(of: manifestURL, atMost: Self.maxManifestBytes,
+                            detail: "Its manifest is too large.")
             let data: Data
             do {
                 data = try Data(contentsOf: manifestURL)
@@ -263,6 +297,8 @@ final class RecordingShareImporter: ObservableObject {
                 let transcriptURL = dir.appendingPathComponent(transcript.fileName)
                 try requireRegularFile(transcriptURL, within: dir,
                                        missing: ShareManifest.LoadError.integrity("Its transcript entry is missing."))
+                try requireSize(of: transcriptURL, atMost: Self.maxTranscriptBytes,
+                                detail: "Its transcript is too large.")
                 text = (try? String(contentsOf: transcriptURL, encoding: .utf8)) ?? ""
             }
             if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -311,6 +347,76 @@ final class RecordingShareImporter: ObservableObject {
         }
     }
 
+    /// What the central directory says a bundle contains, once it has
+    /// passed `validateEntries`.
+    struct DeclaredContents: Equatable {
+        /// `audio.wav` or `audio.m4a` — whichever the archive carries.
+        let audioEntryName: String
+        let hasTranscript: Bool
+        /// Sum of the declared uncompressed sizes.
+        let totalUncompressedBytes: Int64
+    }
+
+    /// The entry-set check on an archive's central directory, run BEFORE
+    /// extraction (see `stage`). Pure, so it is pinned directly.
+    ///
+    /// Exactly the fixed names — `manifest.json`, one of the two audio
+    /// names, optionally `transcript.txt` — each listed once and each an
+    /// ordinary file. Anything else is refused outright rather than ignored:
+    /// `ditto` would inflate an ignored entry all the same, and a bundle
+    /// Mila wrote never has one. The text entries' declared sizes must be
+    /// under their caps and the total under `maxUncompressedBytes`.
+    static func validateEntries(_ entries: [ZipArchiver.Entry]) throws -> DeclaredContents {
+        var audioEntryName: String?
+        var hasManifest = false
+        var hasTranscript = false
+        var seen = Set<String>()
+        var total: Int64 = 0
+        for entry in entries {
+            guard !entry.isDirectory, !entry.isSymlink else {
+                throw ShareManifest.LoadError.malformed("One of its entries isn't an ordinary file.")
+            }
+            guard seen.insert(entry.name).inserted else {
+                throw ShareManifest.LoadError.malformed("It lists the same entry twice.")
+            }
+            switch entry.name {
+            case ShareManifest.manifestEntryName:
+                guard entry.uncompressedSize <= UInt64(maxManifestBytes) else {
+                    throw ShareManifest.LoadError.malformed("Its manifest is too large.")
+                }
+                hasManifest = true
+            case ShareManifest.transcriptEntryName:
+                guard entry.uncompressedSize <= UInt64(maxTranscriptBytes) else {
+                    throw ShareManifest.LoadError.malformed("Its transcript is too large.")
+                }
+                hasTranscript = true
+            case let name where ShareManifest.isAllowedAudioEntryName(name):
+                guard audioEntryName == nil else {
+                    throw ShareManifest.LoadError.malformed("It has more than one audio entry.")
+                }
+                audioEntryName = name
+            default:
+                throw ShareManifest.LoadError.malformed("It contains an entry Mila doesn't expect.")
+            }
+            // Declared sizes are 64-bit and attacker-chosen; a sum that
+            // overflows is just another way of being too large.
+            guard entry.uncompressedSize <= UInt64(Int64.max) else {
+                throw ShareManifest.LoadError.malformed("The file is too large to be a Mila shared recording.")
+            }
+            let (sum, overflow) = total.addingReportingOverflow(Int64(entry.uncompressedSize))
+            guard !overflow, sum <= maxUncompressedBytes else {
+                throw ShareManifest.LoadError.malformed("The file is too large to be a Mila shared recording.")
+            }
+            total = sum
+        }
+        guard hasManifest else { throw ShareManifest.LoadError.malformed("It has no manifest.") }
+        guard let audioEntryName else {
+            throw ShareManifest.LoadError.malformed("It has no audio entry.")
+        }
+        return DeclaredContents(audioEntryName: audioEntryName, hasTranscript: hasTranscript,
+                                totalUncompressedBytes: total)
+    }
+
     /// An entry must be a regular file (not a symlink, not a directory) and
     /// must resolve inside the staging directory. `attributesOfItem` does
     /// not follow symlinks, which is the point.
@@ -320,6 +426,14 @@ final class RecordingShareImporter: ObservableObject {
               ObsidianPathSanitizer.isContained(url, in: root) else {
             throw ShareManifest.LoadError.malformed("One of its entries isn't an ordinary file.")
         }
+    }
+
+    /// The extracted file's REAL size against its cap, before it is read
+    /// whole into memory. The central directory already promised less, but
+    /// that promise is the archive's to break.
+    private func requireSize(of url: URL, atMost cap: Int64, detail: String) throws {
+        let size = Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? Int.max)
+        guard size <= cap else { throw ShareManifest.LoadError.malformed(detail) }
     }
 
     private func makeSpeakerPlan(for manifest: ShareManifest) -> SpeakerProfileImportPlan {
