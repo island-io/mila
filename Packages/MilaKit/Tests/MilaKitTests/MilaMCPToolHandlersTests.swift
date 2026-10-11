@@ -316,10 +316,14 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertThrowsError(try call("get_transcript", ["id": pending.id.uuidString, "format": "srt"])) { error in
             let message = String(describing: error)
             XCTAssertTrue(message.contains("transcription status is \"pending\""), message)
+            XCTAssertTrue(message.contains(pending.id.uuidString), message)
             XCTAssertFalse(message.contains("legacy"), message)
+            XCTAssertFalse(message.contains("Invalid arguments"),
+                           "a transcription still in progress is a precondition, not a caller mistake: \(message)")
         }
         XCTAssertThrowsError(try call("get_transcript", ["id": legacy.id.uuidString, "format": "srt"])) { error in
             let message = String(describing: error)
+            XCTAssertTrue(message.hasPrefix("Invalid arguments"), message)
             XCTAssertTrue(message.contains("legacy or text-only transcript"), message)
             XCTAssertFalse(message.contains("status is"), message)
         }

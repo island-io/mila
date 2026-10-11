@@ -293,24 +293,31 @@ public struct MilaMCPToolHandlers: Sendable {
                 // A `pending`/`running` (or `failed`) recording reaches this
                 // branch too — its segments simply are not stored yet — and
                 // that is a different situation from a legacy text-only
-                // record, so say which one it is.
-                let reason = recording.status == "completed"
-                    ? "legacy or text-only transcript"
-                    : "transcription status is \"\(recording.status)\""
+                // record. The first is a precondition that resolves on its
+                // own, reported the way "No completed recordings exist yet"
+                // is rather than as a caller mistake; the second can never
+                // succeed for this recording, so the argument is what is
+                // wrong.
+                guard recording.status == "completed" else {
+                    throw ToolError.notFound(
+                        "Recording \(recording.id.uuidString) has no timed segments "
+                        + "(transcription status is \"\(recording.status)\"); format \"srt\" needs "
+                        + "a completed transcription. Use format \"text\" for what exists so far.")
+                }
                 throw ToolError.invalidArguments(
                     "format \"srt\" is unavailable for recording \(recording.id.uuidString): "
-                    + "it has no timed segments (\(reason)). Use format \"text\".")
+                    + "it has no timed segments (legacy or text-only transcript). Use format \"text\".")
             }
             // `max_chars` keeps whole cues: a cue cut mid-timestamp is not
             // a subtitle file any player will load. Fewer characters than
             // asked for is the right answer; an invalid file is not.
             var kept: [String] = []
             if let maxChars, maxChars > 0 {
+                // Each kept cue costs its own text plus the terminator
+                // `srt(cues:)` appends to every cue.
+                let costs = cues.map { $0.count + TranscriptFormatter.srtCueTerminator.count }
                 var length = 0
-                for cue in cues {
-                    // Each kept cue costs its own text plus the terminator
-                    // `srt(cues:)` appends to every cue.
-                    let cost = cue.count + TranscriptFormatter.srtCueTerminator.count
+                for (cue, cost) in zip(cues, costs) {
                     guard length + cost <= maxChars else { break }
                     kept.append(cue)
                     length += cost
@@ -318,8 +325,7 @@ public struct MilaMCPToolHandlers: Sendable {
                 truncated = kept.count < cues.count
                 if kept.isEmpty {
                     sizeHint = "max_chars \(maxChars) is smaller than the first cue, which needs "
-                        + "\(cues[0].count + TranscriptFormatter.srtCueTerminator.count) characters "
-                        + "(including its trailing blank line); "
+                        + "\(costs[0]) characters (including its trailing blank line); "
                         + "raise it to receive any cues."
                 }
             } else {

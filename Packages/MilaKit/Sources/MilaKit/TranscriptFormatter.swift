@@ -72,8 +72,10 @@ public enum TranscriptFormatter {
             guard !text.isEmpty else { continue }
 
             let seqNum = entries.count + 1
-            let prefix = seg.speaker.map { (names[$0] ?? $0) + ": " } ?? ""
-            entries.append("\(seqNum)\n\(srtTimestamp(seg.start)) --> \(srtTimestamp(seg.end))\n\(prefix)\(text)")
+            // Same label resolution and `Name: text` shape as `plainText`,
+            // so the cue prefix and the clipboard text cannot drift apart.
+            let line = format(speaker: seg.speaker.map { names[$0] ?? $0 }, text: text)
+            entries.append("\(seqNum)\n\(srtTimestamp(seg.start)) --> \(srtTimestamp(seg.end))\n\(line)")
         }
         return entries
     }
@@ -93,11 +95,13 @@ public enum TranscriptFormatter {
         // row would take the server down for every client. So a stated,
         // bounded imprecision instead of a trap: a non-finite, negative or
         // absurd value is pinned to the nearest end of
-        // 00:00:00,000 … 999:59:59,999. No recording is that long, and a
-        // negative start is an upstream bug, not a time before the file
-        // began. (`max`/`min` pass NaN through, hence the explicit check.)
+        // 00:00:00,000 … 99:59:59,999 — the widest value SRT's two-digit
+        // hour field holds, so the pinned cue is still in-format. No
+        // recording is that long, and a negative start is an upstream bug,
+        // not a time before the file began. (`max`/`min` pass NaN through,
+        // hence the explicit check.)
         let rounded = (seconds * 1000).rounded()
-        let maxMillis = 3_599_999_999.0 // 999:59:59,999
+        let maxMillis = 359_999_999.0 // 99:59:59,999
         let totalMillis = Int(rounded.isNaN ? 0 : min(max(rounded, 0), maxMillis))
         let h = totalMillis / 3_600_000
         let m = (totalMillis % 3_600_000) / 60_000

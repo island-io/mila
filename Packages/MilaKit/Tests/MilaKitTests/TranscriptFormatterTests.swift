@@ -100,18 +100,21 @@ final class MilaKitTranscriptFormatterTests: XCTestCase {
 
     /// `seconds` comes out of a user-editable file, and this runs inside the
     /// long-lived mila-mcp process, where `Int(_:)` trapping on one bad row
-    /// would take the server down. Garbage pins to the nearest end of the
-    /// representable range instead of trapping or printing a negative field.
+    /// would take the server down. Garbage pins to the nearest end of what
+    /// SRT's HH:MM:SS,mmm field can hold instead of trapping, printing a
+    /// negative field, or overflowing the two-digit hour.
     func test_srt_timestamp_pins_unrepresentable_values_instead_of_trapping() {
         XCTAssertEqual(TranscriptFormatter.srtTimestamp(.nan), "00:00:00,000")
         XCTAssertEqual(TranscriptFormatter.srtTimestamp(-0.6), "00:00:00,000")
         XCTAssertEqual(TranscriptFormatter.srtTimestamp(-.infinity), "00:00:00,000")
-        XCTAssertEqual(TranscriptFormatter.srtTimestamp(.infinity), "999:59:59,999")
-        XCTAssertEqual(TranscriptFormatter.srtTimestamp(1e19), "999:59:59,999")
-        XCTAssertEqual(TranscriptFormatter.srtTimestamp(3_599_999.999), "999:59:59,999",
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(.infinity), "99:59:59,999")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(1e19), "99:59:59,999")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(360_000), "99:59:59,999",
+                       "100 hours does not fit the field either")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(359_999.999), "99:59:59,999",
                        "the last representable value itself is rendered as-is")
         let body = TranscriptFormatter.srt(segments: [TimedSeg(start: .nan, end: 1e300, text: "x")])
-        XCTAssertEqual(body, "1\n00:00:00,000 --> 999:59:59,999\nx\n\n")
+        XCTAssertEqual(body, "1\n00:00:00,000 --> 99:59:59,999\nx\n\n")
     }
 
     /// The handler drops cues to honour `max_chars` and reassembles the rest
