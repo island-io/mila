@@ -8,7 +8,10 @@ private let applierLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 /// labels should be rewritten to agree with it.
 struct SpeakerProfileImportResult: Equatable {
     /// Incoming (sender's) name → the name now on the receiver's profile.
-    /// Identity for skipped rows. `RecordingShareImporter` maps the shared
+    /// Identity for skipped rows — unless a local profile already carries
+    /// this bundle's token for the speaker (a re-import), in which case the
+    /// name of that profile, so the second import labels the transcript
+    /// exactly as the first did. `RecordingShareImporter` maps the shared
     /// recording's `speakerNames` through this before saving it, so a
     /// speaker merged into "Alex" is labelled "Alex" on the transcript and
     /// one kept separate is labelled "Alex (from Daniel)".
@@ -40,7 +43,14 @@ enum SpeakerProfileImportApplier {
 
             switch target {
             case .skip:
-                result.nameMapping[incoming.name] = incoming.name
+                // An "already imported" row skips by default. The first
+                // import folded this speaker into some local profile and
+                // relabelled the transcript with its name; the re-import
+                // must say the same name, or importing the same file twice
+                // reverts "Dan" to the sender's "Daniel". A plain skip (no
+                // profile carries the token) keeps the sender's label.
+                let holder = store.profiles.first { $0.importedShares.contains(token) }
+                result.nameMapping[incoming.name] = holder?.name ?? incoming.name
                 result.skipped += 1
 
             case .merge(let id):

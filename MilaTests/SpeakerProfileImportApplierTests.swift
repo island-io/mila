@@ -135,6 +135,8 @@ final class SpeakerProfileImportApplierTests: XCTestCase {
         XCTAssertEqual(result.skipped, 2)
         XCTAssertEqual(profilesFileBytes, after)
         XCTAssertEqual(store.profile(named: "Dan")?.sampleCount, 4, "no double count")
+        XCTAssertEqual(result.nameMapping, ["Daniel": "Dan", "Ada": "Ada"],
+                       "the labels still follow the profiles the first import chose")
     }
 
     func test_a_merge_target_deleted_before_apply_is_skipped() {

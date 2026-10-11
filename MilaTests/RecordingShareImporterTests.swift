@@ -709,7 +709,11 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertTrue(again.speakerPlan.rows.allSatisfy { $0.alreadyImported && $0.target == .skip })
         XCTAssertTrue(again.speakerPlan.rows.allSatisfy { !$0.isBlocked }, "but the menu stays enabled")
         await importer.confirm()
+        XCTAssertNil(importer.errorMessage)
         XCTAssertEqual(try XCTUnwrap(profiles.profile(named: "Dan")).sampleCount, 6, "no double count")
+        XCTAssertEqual(try XCTUnwrap(storeB.recordings.first).speakerNames,
+                       ["SPEAKER_00": "Dan", "SPEAKER_01": "Ada"],
+                       "a re-import keeps the labels the first import chose, not the sender's")
     }
 
     func test_with_voice_recognition_off_profiles_are_blocked_but_the_recording_imports() async throws {

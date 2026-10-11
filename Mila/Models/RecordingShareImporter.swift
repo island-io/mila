@@ -550,17 +550,12 @@ final class RecordingShareImporter: ObservableObject {
             return
         }
 
-        // Voice profiles FIRST. A recording whose labels point at profiles
-        // that were never created is wrong; profiles without the recording
-        // are merely unused.
-        var mapping: [String: String] = [:]
-        if !pending.speakerPlan.isEmpty, let profileStore {
-            mapping = SpeakerProfileImportApplier.apply(pending.speakerPlan, to: profileStore).nameMapping
-        }
-
         // From here to `upsertImported` is one synchronous main-actor run:
-        // the audio appears under its final name and the store learns about
-        // it without an intervening suspension point.
+        // the audio appears under its final name, the voice profiles are
+        // written and the store learns about the recording without an
+        // intervening suspension point. The rename goes first so that if it
+        // fails nothing has been written anywhere — least of all to the
+        // voice profiles, which the user cannot see from the error.
         do {
             try fileManager.moveItem(at: partial, to: destination)
         } catch {
@@ -568,6 +563,17 @@ final class RecordingShareImporter: ObservableObject {
             finish(pending, error: ShareManifest.LoadError.unreadable(error.localizedDescription))
             return
         }
+
+        // Voice profiles before the row. A recording whose labels point at
+        // profiles that were never created is wrong; profiles without the
+        // recording are merely unused — and if the store write below fails,
+        // the retry finds them through their import tokens and labels the
+        // transcript the same way (see `SpeakerProfileImportApplier`).
+        var mapping: [String: String] = [:]
+        if !pending.speakerPlan.isEmpty, let profileStore {
+            mapping = SpeakerProfileImportApplier.apply(pending.speakerPlan, to: profileStore).nameMapping
+        }
+
         var recording = manifest.recording.makeRecording(
             audioFileName: destination.lastPathComponent,
             fullText: pending.transcriptText,

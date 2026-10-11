@@ -85,8 +85,9 @@ speaker:
 - The recording's speaker labels follow your choice: a speaker merged into
   your "Dan" is labelled "Dan".
 - Importing the same file twice shows those speakers as *Already imported*
-  and defaults them to skip, so samples are not counted twice. Deleting a
-  profile forgets its imports.
+  and defaults them to skip, so samples are not counted twice; the
+  transcript keeps the names your first import chose. Deleting a profile
+  forgets its imports.
 
 With voice recognition off, the rows are shown but disabled — nothing is
 written behind an opted-out user, and the recording still imports.
