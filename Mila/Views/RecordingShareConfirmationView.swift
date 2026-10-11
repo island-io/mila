@@ -49,7 +49,18 @@ struct RecordingShareConfirmationView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .accessibilityIdentifier("share.import.disposition")
 
-            if pending.wouldExceedStorageCap {
+            if let message = importer.refusalMessage {
+                // `confirm()` refused — the live cap check, a recording
+                // being transcribed — and left the sheet up so the user can
+                // still cancel. An alert cannot present over a sheet (it
+                // would queue behind it and pop after Cancel), so the
+                // refusal is said here, in the sheet.
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("share.import.error")
+            } else if pending.wouldExceedStorageCap {
                 Text("Importing this would exceed your storage limit. Free up space or raise the limit in Settings ▸ Storage.")
                     .font(.caption)
                     .foregroundStyle(.red)

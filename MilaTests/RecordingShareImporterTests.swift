@@ -658,10 +658,12 @@ final class RecordingShareImporterTests: XCTestCase {
 
         await importer.confirm()
         XCTAssertNotNil(importer.pending, "the sheet stays up so the user can cancel")
-        XCTAssertTrue(importer.errorMessage?.contains("Storage limit") == true, importer.errorMessage ?? "nil")
+        XCTAssertTrue(importer.refusalMessage?.contains("Storage limit") == true, importer.refusalMessage ?? "nil")
+        XCTAssertNil(importer.errorMessage, "the refusal is the sheet's to show; no alert queues behind it")
         XCTAssertTrue(storeB.recordings.isEmpty)
         XCTAssertEqual(recordingsDirectoryNames(storeB), [])
         importer.cancel()
+        XCTAssertNil(importer.refusalMessage, "the refusal goes with the sheet it was shown in")
         XCTAssertFalse(FileManager.default.fileExists(atPath: pending.stagingDirectory.path))
     }
 

@@ -81,8 +81,15 @@ final class RecordingShareImporter: ObservableObject {
 
     /// Non-nil while the confirmation sheet should be shown.
     @Published var pending: PendingImport?
-    /// Non-nil to surface a load / verify / save error to the user.
+    /// Non-nil to surface a load / verify / save error to the user — in the
+    /// window's alert, because these happen with no sheet up.
     @Published var errorMessage: String?
+    /// Why `confirm()` declined to proceed while the sheet stays up (the
+    /// live storage-cap check, the local copy being transcribed). Shown by
+    /// the sheet itself: an alert cannot present over a sheet from the same
+    /// view, it queues behind it and pops only after Cancel. Cleared when
+    /// the sheet goes and when the user tries again.
+    @Published private(set) var refusalMessage: String?
     /// True while a bundle is being extracted and hashed.
     @Published private(set) var isStaging = false
     /// True from the Import click until the library write finished or was
@@ -207,6 +214,8 @@ final class RecordingShareImporter: ObservableObject {
                 isImporting = false
             }
         }
+        // A refusal belonged to the sheet being dismissed.
+        refusalMessage = nil
         pending = nil
         pumpQueue()
     }
@@ -541,12 +550,13 @@ final class RecordingShareImporter: ObservableObject {
         }()
 
         // Authoritative cap check — the preview was computed at stage time.
+        refusalMessage = nil
         if let message = capExceeded(incoming: manifest.audio.byteCount, replacing: existing) {
-            errorMessage = ImportError.storageCap(message).errorDescription
+            refusalMessage = ImportError.storageCap(message).errorDescription
             return  // keep `pending` so the user can still cancel
         }
         if let existing, isRecordingBusy(existing.id) {
-            errorMessage = ImportError.recordingBusy.errorDescription
+            refusalMessage = ImportError.recordingBusy.errorDescription
             return
         }
 
