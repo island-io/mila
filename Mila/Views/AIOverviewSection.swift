@@ -14,11 +14,14 @@ import AppKit
 /// `.regularMaterial` card. Both use `AIOverviewSection` below for the
 /// inner content (Summary header + body, Action items header + list).
 ///
-/// RTL: section-level decision matches the live view — prefer the
-/// actual text content (`isPredominantlyHebrew` over the summary +
-/// items blob) over `recordingLanguage`, so a conversation that
-/// happened in Hebrew with the dropdown stuck on English still aligns
-/// to the right edge.
+/// RTL: decided from the actual text content (`isPredominantlyHebrew`
+/// over the summary + items blob); `recordingLanguage` is only the
+/// fallback while there is no text yet — see `isRTL`. This no longer
+/// matches `LiveAIRecordingView.aiOutputIsRTL`, whose Auto branch checks
+/// `language == "he"` BEFORE looking at the text: the live view has no
+/// per-recording summary language, while here an English summary on a
+/// Hebrew recording is exactly what that override produces, and it must
+/// read left-to-right.
 struct AIOverviewSection: View {
     let summary: String?
     let items: [ActionItem]

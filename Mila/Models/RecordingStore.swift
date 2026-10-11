@@ -640,8 +640,9 @@ final class RecordingStore: ObservableObject {
     /// such a snapshot would clobber the live `.m4a` name back to a deleted
     /// file. Writing one field on the live row sidesteps that entirely.
     ///
-    /// Persists even when the value is unchanged — the caller is about to
-    /// regenerate, and a persist here is cheap next to that LLM call.
+    /// Persists unconditionally; whether a pick is actually a change is the
+    /// one caller's call — `RecordingSummarizer.setSummaryLanguage` skips
+    /// both the write and the regenerate when it is not.
     @discardableResult
     func setSummaryLanguage(_ code: String?, recordingID: UUID) -> Recording? {
         guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return nil }

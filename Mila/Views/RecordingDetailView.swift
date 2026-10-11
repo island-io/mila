@@ -72,7 +72,7 @@ struct RecordingDetailView: View {
                 summaryLanguage: recording.summaryLanguageOverride,
                 globalOutputLanguage: liveAI.outputLanguage,
                 onSetSummaryLanguage: canRegenerateSummary
-                    ? { setSummaryLanguage($0) }
+                    ? { summarizer.setSummaryLanguage($0, for: recording.id) }
                     : nil
             )
             transcriptArea
@@ -264,18 +264,6 @@ struct RecordingDetailView: View {
                                                              language: language.rawValue)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
-    }
-
-
-    /// Persist the summary-language override on the LIVE row and regenerate
-    /// from it. `recording` here is a `let` snapshot, so it is addressed by
-    /// id and the row the store hands back is what goes to the summarizer
-    /// (see `RecordingStore.setSummaryLanguage`).
-    private func setSummaryLanguage(_ language: RecordingLanguage?) {
-        guard let updated = store.setSummaryLanguage(language?.rawValue,
-                                                     recordingID: recording.id)
-        else { return }
-        summarizer.regenerate(updated)
     }
 
     /// Whether the user can ask for a fresh summary right now. Gates the

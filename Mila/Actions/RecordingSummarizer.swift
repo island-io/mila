@@ -259,6 +259,33 @@ final class RecordingSummarizer: ObservableObject {
         runSummary(for: recording, force: true)
     }
 
+    /// The "Summary language" menu's one entry point (`SummaryLanguageMenu`,
+    /// via every host's `onPick`): persist `language` as the per-recording
+    /// override on the LIVE row and regenerate from that row — never from
+    /// the `Recording` the menu captured, which can be a stale snapshot (see
+    /// `RecordingStore.setSummaryLanguage`).
+    ///
+    /// A pick that matches what is already in force is a no-op: nothing is
+    /// written and no LLM call starts. The menu shows a ✓ on that entry, so
+    /// re-picking it reads as "leave it", and the explicit re-run is
+    /// "Regenerate summary", one entry up. "In force" is the typed
+    /// `summaryLanguageOverride` — what the ✓ reflects — so an unrecognised
+    /// persisted code counts as Default rather than as a change worth an LLM
+    /// call. Before this lived here each of the three hosts had its own copy
+    /// of the glue, and every copy regenerated unconditionally (review of
+    /// #308).
+    func setSummaryLanguage(_ language: RecordingLanguage?, for recordingID: UUID) {
+        guard let live = liveRecording(recordingID) else { return }
+        guard live.summaryLanguageOverride != language else {
+            summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): unchanged — nothing to do")
+            return
+        }
+        guard let updated = store.setSummaryLanguage(language?.rawValue,
+                                                     recordingID: recordingID)
+        else { return }
+        regenerate(updated)
+    }
+
     /// Scan the store for completed recordings missing a summary, then
     /// process them newest-first with at most `maxConcurrent` in-flight
     /// CLI invocations. No-op when the LLM CLI isn't configured (the

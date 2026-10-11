@@ -2,9 +2,11 @@ import SwiftUI
 
 /// The "Summary language" submenu: Default (the global Settings → AI Features
 /// → Output language value) plus the two concrete languages, with a ✓ on
-/// whichever is in force for this recording. Picking an entry is expected to
-/// persist the choice on the recording AND regenerate its summary + action
-/// items right away — the caller's `onPick` does both.
+/// whichever is in force for this recording. Picking an entry persists the
+/// choice on the recording AND regenerates its summary + action items right
+/// away; picking the ✓'d entry again does nothing. Every host's `onPick`
+/// routes to `RecordingSummarizer.setSummaryLanguage(_:for:)`, which owns
+/// both rules.
 ///
 /// One view for every place the choice is offered — the recording's
 /// right-click menu (sidebar sub-rows + the All Transcripts list, via

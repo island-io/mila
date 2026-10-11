@@ -461,14 +461,7 @@ struct RenameRecordingSheet: View {
             summaryLanguage: liveRecording.summaryLanguageOverride,
             globalOutputLanguage: liveAI.outputLanguage,
             onSetSummaryLanguage: canRegenerateSummary
-                ? { language in
-                    // Write the override on the live row and regenerate from
-                    // what the store hands back (`RecordingStore.setSummaryLanguage`).
-                    guard let updated = store.setSummaryLanguage(language?.rawValue,
-                                                                 recordingID: liveRecording.id)
-                    else { return }
-                    summarizer.regenerate(updated)
-                }
+                ? { summarizer.setSummaryLanguage($0, for: liveRecording.id) }
                 : nil
         )
         .padding(.horizontal, 10)

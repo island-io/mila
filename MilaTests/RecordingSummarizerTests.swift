@@ -1318,10 +1318,12 @@ final class RecordingSummarizerTests: XCTestCase {
         summarizer.summarizeIfNeeded(rec)
         XCTAssertTrue(summarizer.isSummarizing(rec.id))
 
-        // What the menu does: write the override on the live row, then ask
-        // for a regenerate — which the dedup guard drops.
-        let updated = try XCTUnwrap(store.setSummaryLanguage("he", recordingID: rec.id))
-        summarizer.regenerate(updated)
+        // What the menu does: `setSummaryLanguage` writes the override on
+        // the live row, then asks for a regenerate — which the dedup guard
+        // drops.
+        summarizer.setSummaryLanguage(.hebrew, for: rec.id)
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summaryLanguage, "he",
+                       "the override is persisted even while the stale run is still out")
         gate.open()
         await summarizer.awaitInFlight(rec.id)
 
@@ -1338,6 +1340,67 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(final.summary, "SECOND",
                        "the stale-language output must never be stored")
         XCTAssertEqual(final.summaryLanguage, "he")
+    }
+
+    /// Re-picking the entry that is already ✓'d — Default while no override
+    /// is set, or the language already in force — must neither write the row
+    /// nor start an LLM call. The menu's job is to CHANGE the language;
+    /// "Regenerate summary" is the explicit re-run. Each host used to carry
+    /// its own copy of the pick glue and every copy regenerated
+    /// unconditionally, so a stray click on the ✓'d entry cost a full
+    /// summary call (review of #308).
+    func test_set_summary_language_noop_pick_neither_writes_nor_regenerates() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        var callCount = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            callCount += 1
+            return "SUMMARY \(callCount)"
+        }
+        let rec = try addRecording(named: "Noop", text: "we discussed the roadmap")
+        func live() -> Recording? { store.recordings.first { $0.id == rec.id } }
+
+        // Default is already in force: picking Default again does nothing.
+        summarizer.setSummaryLanguage(nil, for: rec.id)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        XCTAssertEqual(callCount, 0, "a no-op pick must not start an LLM call")
+        XCTAssertNil(live()?.summaryLanguage)
+
+        // A real change persists and regenerates exactly once.
+        summarizer.setSummaryLanguage(.hebrew, for: rec.id)
+        XCTAssertEqual(live()?.summaryLanguage, "he")
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertEqual(callCount, 1)
+        XCTAssertEqual(live()?.summary, "SUMMARY 1")
+
+        // Re-picking the language now in force is the no-op again.
+        summarizer.setSummaryLanguage(.hebrew, for: rec.id)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        XCTAssertEqual(callCount, 1, "re-picking the ✓'d language must not regenerate")
+        XCTAssertEqual(live()?.summary, "SUMMARY 1")
+
+        // Clearing back to Default IS a change: it regenerates.
+        summarizer.setSummaryLanguage(nil, for: rec.id)
+        XCTAssertNil(live()?.summaryLanguage)
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertEqual(callCount, 2)
+        XCTAssertEqual(live()?.summary, "SUMMARY 2")
+
+        // "In force" is the typed override, i.e. what the ✓ shows: an
+        // unrecognised persisted code reads as Default, so Default is the
+        // no-op and a concrete language is the change.
+        store.setSummaryLanguage("fr", recordingID: rec.id)
+        summarizer.setSummaryLanguage(nil, for: rec.id)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        XCTAssertEqual(callCount, 2, "Default on an unknown code is still the ✓'d entry")
+        summarizer.setSummaryLanguage(.english, for: rec.id)
+        XCTAssertEqual(live()?.summaryLanguage, "en")
+        await summarizer.awaitInFlight(rec.id)
+        XCTAssertEqual(callCount, 3)
+
+        // An id that is not in the store is ignored outright.
+        summarizer.setSummaryLanguage(.hebrew, for: UUID())
+        XCTAssertEqual(callCount, 3)
     }
 
     // MARK: - Helpers
