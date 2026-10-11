@@ -95,11 +95,16 @@ struct RecordingDetailView: View {
             Divider()
             playbackBar
         }
-        // ContentView applies .id(rec.id) at the call site, so SwiftUI
-        // rebuilds this view on navigation between recordings and we don't
-        // need a separate onChange handler to reconfigure the player.
+        // ContentView applies .id(rec.id) at the call site, so navigating
+        // between recordings rebuilds this view and `onAppear` configures
+        // the player for the new one.
         .onAppear { configurePlayer() }
         .onDisappear { teardownPlayer() }
+        // A `.milashare` import that replaces THIS recording keeps its id —
+        // so nothing above rebuilds — but swaps the audio file and deletes
+        // the old one. Re-point the player or it keeps playing a file that
+        // is gone.
+        .onChange(of: recording.audioFileName) { _, _ in configurePlayer() }
         .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
         .onChange(of: playbackSpeed) { _, newValue in
             let rate = Float(PlaybackSpeed.nearest(to: newValue).rawValue)
