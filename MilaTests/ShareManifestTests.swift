@@ -228,6 +228,7 @@ final class ShareManifestTests: XCTestCase {
                                      timestampSeconds: 3, source: .voiceCommand, addedAt: created)],
             voiceMemoUniqueID: "VM-1", voiceMemoFolderUUID: "VMF-1",
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
+            summaryLanguage: "en",
             sharedBy: "Someone Else", sharedAt: created)
     }
 
@@ -241,6 +242,7 @@ final class ShareManifestTests: XCTestCase {
         XCTAssertEqual(payload.segments.map(\.speaker), ["SPEAKER_00", "SPEAKER_01"])
         XCTAssertEqual(payload.speakerNames, ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"])
         XCTAssertEqual(payload.summary, "A summary.")
+        XCTAssertEqual(payload.summaryLanguage, "en", "the summary travels with its language")
         XCTAssertEqual(payload.actionItems?.first?.source, "voice_command")
         XCTAssertEqual(payload.appBundleID, "us.zoom.xos")
 
@@ -272,7 +274,20 @@ final class ShareManifestTests: XCTestCase {
         XCTAssertEqual(made.segments.count, 2)
         XCTAssertEqual(made.actionItems?.first?.source, .voiceCommand)
         XCTAssertEqual(made.speakerNames["SPEAKER_01"], "John Doe")
+        XCTAssertEqual(made.summaryLanguage, "en")
+        XCTAssertEqual(made.summaryLanguageOverride, .english)
         XCTAssertNil(made.voiceMemoUniqueID)
+    }
+
+    func test_validated_keeps_a_known_summary_language_and_drops_an_unknown_one() throws {
+        var m = sampleManifest()
+        m.recording.summaryLanguage = "he"
+        XCTAssertEqual(try m.validated().recording.summaryLanguage, "he")
+        m.recording.summaryLanguage = "klingon"
+        XCTAssertNil(try m.validated().recording.summaryLanguage,
+                     "a language this build can't summarise in is dropped, not stored")
+        m.recording.summaryLanguage = nil
+        XCTAssertNil(try m.validated().recording.summaryLanguage)
     }
 
     func test_unknown_source_and_action_source_fall_back_instead_of_failing() {

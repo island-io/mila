@@ -20,7 +20,7 @@ A `.milashare` is a zip archive with three fixed entries:
 
 | Entry | Contents |
 |---|---|
-| `manifest.json` | Title, date, duration, source, language, segments with timings and speaker ids, speaker names, summary, action items, who exported it and when, and (optionally) voice profiles. |
+| `manifest.json` | Title, date, duration, source, language, segments with timings and speaker ids, speaker names, summary (and its language, if the recording overrides it), action items, who exported it and when, and (optionally) voice profiles. |
 | `audio.m4a` or `audio.wav` | The recording's audio, copied as-is. |
 | `transcript.txt` | The plain-text transcript. |
 

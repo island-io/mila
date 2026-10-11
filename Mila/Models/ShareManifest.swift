@@ -118,6 +118,12 @@ struct ShareManifest: Codable, Equatable {
         var speakerNames: [String: String]
         var summary: String?
         var actionItems: [ActionItem]?
+        /// `Recording.summaryLanguage` — the per-recording override of the
+        /// summary language. It travels because the summary text does, in
+        /// that language; a re-summary on the receiver should stay in it
+        /// rather than fall back to their global setting. `validated()`
+        /// drops a value this build cannot summarise in.
+        var summaryLanguage: String?
 
         /// `TranscriptSegment` without its `id`: that UUID exists to give
         /// SwiftUI lists a stable identity and is regenerated on import.
@@ -198,7 +204,7 @@ struct ShareManifest: Codable, Equatable {
         init(id: UUID, title: String, createdAt: Date, duration: Double, source: String,
              language: String, modelName: String?, appName: String?, appBundleID: String?,
              segments: [Segment], speakerNames: [String: String], summary: String?,
-             actionItems: [ActionItem]?) {
+             actionItems: [ActionItem]?, summaryLanguage: String? = nil) {
             self.id = id
             self.title = title
             self.createdAt = createdAt
@@ -212,11 +218,12 @@ struct ShareManifest: Codable, Equatable {
             self.speakerNames = speakerNames
             self.summary = summary
             self.actionItems = actionItems
+            self.summaryLanguage = summaryLanguage
         }
 
         private enum CodingKeys: String, CodingKey {
             case id, title, createdAt, duration, source, language, modelName, appName,
-                 appBundleID, segments, speakerNames, summary, actionItems
+                 appBundleID, segments, speakerNames, summary, actionItems, summaryLanguage
         }
 
         init(from decoder: Decoder) throws {
@@ -234,6 +241,7 @@ struct ShareManifest: Codable, Equatable {
             speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
             summary = try c.decodeIfPresent(String.self, forKey: .summary)
             actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
+            summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
         }
 
         /// The names this recording's transcript actually uses, in
@@ -383,6 +391,12 @@ struct ShareManifest: Codable, Equatable {
         copy.exportedBy.name = exportedBy.name.trimmingCharacters(in: .whitespacesAndNewlines)
         if copy.exportedBy.name.isEmpty { copy.exportedBy.name = "Unknown sender" }
         if let profiles = speakerProfiles, profiles.isEmpty { copy.speakerProfiles = nil }
+        // Only a language this build can summarise in is kept.
+        // `Recording.summaryLanguageOverride` would read anything else as
+        // unset anyway; dropping it here keeps it out of recordings.json.
+        if let lang = recording.summaryLanguage, RecordingLanguage(rawValue: lang) == nil {
+            copy.recording.summaryLanguage = nil
+        }
         return copy
     }
 
@@ -418,7 +432,8 @@ extension ShareManifest.RecordingPayload {
                 ActionItem(id: $0.id, text: $0.text, speaker: $0.speaker,
                            timestampSeconds: $0.timestampSeconds,
                            source: $0.source.rawValue, addedAt: $0.addedAt)
-            }
+            },
+            summaryLanguage: recording.summaryLanguage
         )
     }
 
@@ -457,6 +472,7 @@ extension ShareManifest.RecordingPayload {
                                 addedAt: $0.addedAt ?? sharedAt)
             },
             speakerNames: speakerNames,
+            summaryLanguage: summaryLanguage,
             sharedBy: sharedBy,
             sharedAt: sharedAt
         )
