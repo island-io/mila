@@ -318,7 +318,11 @@ final class MicrophoneRecorder: ObservableObject {
 
     /// Guards against a configuration-change notification and a watchdog tick
     /// both deciding to rebuild at the same moment.
-    private var isRebuilding = false
+    ///
+    /// Readable (like `restartCount`) so a test can wait for a rebuild to have
+    /// FINISHED: `restartCount` turns over before the rebuild suspends into its
+    /// bring-up, so on its own it only says that one was decided (#279).
+    private(set) var isRebuilding = false
 
     /// Bumped by every `start()` and `stop()`. A rebuild captures the value it
     /// began with, because `isRunning` alone cannot tell "my session is still

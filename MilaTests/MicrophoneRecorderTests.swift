@@ -515,13 +515,15 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)   // past the 0.1s window
 
         postConfigurationChange(to: mic)
-        // Gate on the bring-up, not on `restartCount`: the rebuild bumps
-        // `restartCount` BEFORE it suspends into the bring-up, so a poll that
-        // returns on `restartCount >= 1` can reach the `bringUps() == 2`
-        // assertion below while the second bring-up is still in flight (#279).
-        // Waiting on the count the assertion reads closes that gap, and
-        // `restartCount` is already 1 by then, so "exactly once" still holds.
-        await waitUntil { bringUps() >= 2 }
+        // Gate on the rebuild having FINISHED, not on `restartCount`, which
+        // `rebuildEngine` bumps before it suspends into the bring-up — a poll
+        // on it alone could reach `bringUps() == 2` below with the second
+        // bring-up still in flight (#279). `bringUps() >= 2` would settle that
+        // assertion but still fires from inside the override, before the
+        // rebuild's tail (re-arm, new source) has run; `isRebuilding` is
+        // cleared by `rebuildEngine`'s `defer` on every exit path, so it is
+        // the signal that covers the whole thing.
+        await waitUntil { mic.restartCount >= 1 && !mic.isRebuilding }
 
         XCTAssertEqual(mic.restartCount, 1,
                        "a real device change must still be repaired promptly, and exactly once")
@@ -620,14 +622,11 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
 
         postConfigurationChange(to: mic)
-        // Same gate hazard as the test above (#279), in the other direction:
-        // `restartCount` turns 1 before the failing bring-up has run, so a
-        // poll on it can reach the source-identity assertion while nothing
-        // has yet had the chance to re-arm anything — it would then pass
-        // vacuously rather than defend the property. Wait for the second
-        // override call (the one that throws) instead; `restartCount` is
-        // already 1 by then.
-        await waitUntil { counter.withLock { $0 } >= 2 }
+        // Same gate as `test_change_after_the_grace_window_still_rebuilds`,
+        // for the opposite reason: the source-identity assertion below is
+        // only meaningful once the FAILED rebuild has returned — before that
+        // it passes vacuously rather than defending anything.
+        await waitUntil { mic.restartCount >= 1 && !mic.isRebuilding }
 
         XCTAssertEqual(mic.restartCount, 1, "the failed attempt still spends a rebuild slot")
         XCTAssertTrue(mic.configurationChangeSource === sourceAfterStart,
