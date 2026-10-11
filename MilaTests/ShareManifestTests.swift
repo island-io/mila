@@ -151,15 +151,43 @@ final class ShareManifestTests: XCTestCase {
             .init(start: -1, end: 1, text: "negative", speaker: nil),
             .init(start: 2, end: .infinity, text: "inf end", speaker: nil),
             .init(start: 3, end: 3, text: "zero length is fine", speaker: nil),
+            // Finite, but `Int(end * 1000)` in the SRT writer would trap.
+            .init(start: 4, end: 1e300, text: "finite but absurd", speaker: nil),
+            .init(start: 5, end: ShareManifest.maxTimeSeconds + 1, text: "just past the bound", speaker: nil),
+            .init(start: 6, end: ShareManifest.maxTimeSeconds, text: "at the bound is fine", speaker: nil),
         ]
         let v = try m.validated()
-        XCTAssertEqual(v.recording.segments.map(\.text), ["good", "zero length is fine"])
+        XCTAssertEqual(v.recording.segments.map(\.text),
+                       ["good", "zero length is fine", "at the bound is fine"])
+    }
+
+    func test_validated_drops_action_items_with_unusable_timestamps_and_keeps_the_rest() throws {
+        var m = sampleManifest()
+        m.recording.actionItems = [
+            .init(id: "ok", text: "good", speaker: nil, timestampSeconds: 3, source: "inferred", addedAt: nil),
+            .init(id: "nan", text: "nan", speaker: nil, timestampSeconds: .nan, source: "inferred", addedAt: nil),
+            .init(id: "neg", text: "negative", speaker: nil, timestampSeconds: -1, source: "inferred", addedAt: nil),
+            .init(id: "huge", text: "finite but absurd", speaker: nil, timestampSeconds: 1e300,
+                  source: "inferred", addedAt: nil),
+        ]
+        let v = try m.validated()
+        XCTAssertEqual(v.recording.actionItems?.map(\.id), ["ok"])
+
+        var none = sampleManifest()
+        none.recording.actionItems = nil
+        XCTAssertNil(try none.validated().recording.actionItems, "absent stays absent, not empty")
     }
 
     func test_validated_rejects_a_non_finite_duration_and_fills_an_empty_title() throws {
         var bad = sampleManifest()
         bad.recording.duration = .nan
         XCTAssertThrowsError(try bad.validated())
+        bad.recording.duration = -1
+        XCTAssertThrowsError(try bad.validated())
+        bad.recording.duration = 1e300
+        XCTAssertThrowsError(try bad.validated(), "finite, but `Int(duration.rounded())` would trap")
+        bad.recording.duration = ShareManifest.maxTimeSeconds
+        XCTAssertNoThrow(try bad.validated(), "the bound itself is allowed")
 
         var blank = sampleManifest()
         blank.recording.title = "   "

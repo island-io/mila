@@ -46,6 +46,15 @@ struct ShareManifest: Codable, Equatable {
     static let audioEntryStem = "audio"
     static let allowedAudioExtensions: Set<String> = ["wav", "m4a"]
 
+    /// Upper bound on every time value a manifest carries — a segment's
+    /// `end`, the recording's `duration`, an action item's timestamp.
+    /// Finiteness alone is not enough: the duration labels and the SRT
+    /// writer convert with `Int(seconds.rounded())` and `Int(seconds *
+    /// 1000)`, which trap past `Int.max`, so a finite `1e300` in a hostile
+    /// manifest would crash the receiver the moment it rendered. A week is
+    /// far beyond any recording and keeps every conversion in range.
+    static let maxTimeSeconds: Double = 7 * 24 * 60 * 60
+
     /// Schema version of this file. Required.
     var version: Int
     /// Minted once per export. The receiver's voice-profile import keys its
@@ -136,9 +145,12 @@ struct ShareManifest: Codable, Equatable {
             }
 
             /// Whether the timing survives arithmetic: finite, non-negative,
-            /// and not inverted. `validated()` drops anything else.
+            /// not inverted, and within `maxTimeSeconds` so the `Int`
+            /// conversions downstream cannot trap. `validated()` drops
+            /// anything else.
             var isSound: Bool {
                 start.isFinite && end.isFinite && start >= 0 && end >= start
+                    && end <= ShareManifest.maxTimeSeconds
             }
         }
 
@@ -173,6 +185,13 @@ struct ShareManifest: Codable, Equatable {
                 timestampSeconds = try c.decodeIfPresent(Double.self, forKey: .timestampSeconds) ?? 0
                 source = try c.decodeIfPresent(String.self, forKey: .source) ?? ""
                 addedAt = try c.decodeIfPresent(Date.self, forKey: .addedAt)
+            }
+
+            /// Same contract as `Segment.isSound`: the timestamp is rendered
+            /// through the same `Int` conversions.
+            var isSound: Bool {
+                timestampSeconds.isFinite && timestampSeconds >= 0
+                    && timestampSeconds <= ShareManifest.maxTimeSeconds
             }
         }
 
@@ -351,12 +370,14 @@ struct ShareManifest: Codable, Equatable {
         if let transcript, transcript.fileName != Self.transcriptEntryName {
             throw LoadError.malformed("Its transcript entry has an unexpected name.")
         }
-        guard recording.duration.isFinite, recording.duration >= 0 else {
+        guard recording.duration.isFinite, recording.duration >= 0,
+              recording.duration <= Self.maxTimeSeconds else {
             throw LoadError.malformed("Its recording duration is not a valid number.")
         }
 
         var copy = self
         copy.recording.segments = recording.segments.filter(\.isSound)
+        copy.recording.actionItems = recording.actionItems?.filter(\.isSound)
         let title = recording.title.trimmingCharacters(in: .whitespacesAndNewlines)
         copy.recording.title = title.isEmpty ? "Shared recording" : title
         copy.exportedBy.name = exportedBy.name.trimmingCharacters(in: .whitespacesAndNewlines)
