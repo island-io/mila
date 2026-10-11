@@ -31,7 +31,7 @@ final class AIOverviewSummaryTests: XCTestCase {
 
     /// With nothing to read yet — the "Generating summary…" placeholder —
     /// the recording language is still the fallback, so the placeholder sits
-    /// on the side the summary will most likely land on.
+    /// on the side the summary will most likely end up on.
     func test_direction_falls_back_to_recording_language_when_there_is_no_text() {
         XCTAssertTrue(AIOverviewSection.isRTL(summary: nil, items: [], recordingLanguage: "he"))
         XCTAssertFalse(AIOverviewSection.isRTL(summary: "", items: [], recordingLanguage: "en"))

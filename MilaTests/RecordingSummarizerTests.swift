@@ -1327,9 +1327,12 @@ final class RecordingSummarizerTests: XCTestCase {
         gate.open()
         await summarizer.awaitInFlight(rec.id)
 
-        // The re-run is scheduled one tick later (after `inFlight` clears),
-        // so give it a moment to register, then await it like any other run.
-        await waitUntil { self.summarizer.isSummarizing(rec.id) }
+        // The re-run is scheduled one tick later (after `inFlight` clears).
+        // Wait for the stub to have been CALLED a second time — monotonic —
+        // rather than for `isSummarizing`, which may already have flipped
+        // back to false if the re-run completed before this continuation
+        // resumed; then await it like any other run.
+        await waitUntil { prompts.count == 2 }
         await summarizer.awaitInFlight(rec.id)
 
         XCTAssertEqual(prompts.count, 2, "exactly one re-run")
@@ -1339,6 +1342,45 @@ final class RecordingSummarizerTests: XCTestCase {
         let final = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertEqual(final.summary, "SECOND",
                        "the stale-language output must never be stored")
+        XCTAssertEqual(final.summaryLanguage, "he")
+    }
+
+    /// The mid-flight replay must not depend on the interrupted call
+    /// succeeding: a pick made while a run is out is a user action, and it
+    /// gets its one re-run whether that run stored a summary, parsed nothing
+    /// or failed. Before this, only the success path compared the language,
+    /// so a timeout at the wrong moment left ✓ Hebrew on the menu and an
+    /// English summary on the recording with nothing scheduled to fix it.
+    /// (The empty-output path goes through the same helper.)
+    func test_summarize_reruns_in_the_new_language_when_the_interrupted_call_fails() async throws {
+        struct StubFailure: Error {}
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        let gate = TestGate()
+        var prompts: [String] = []
+        useStubRunner { _, prompt, _, _, _, _, _, _, _, _, _ in
+            prompts.append(prompt)
+            if prompts.count == 1 {
+                await gate.wait()
+                throw StubFailure()
+            }
+            return "SECOND"
+        }
+
+        let rec = try addRecording(named: "Race", text: "we discussed the roadmap")
+        summarizer.summarizeIfNeeded(rec)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+        summarizer.setSummaryLanguage(.hebrew, for: rec.id)
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await waitUntil { prompts.count == 2 }
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(prompts.count, 2, "exactly one re-run, even though the first call failed")
+        XCTAssertTrue(prompts[1].contains(RecordingSummarizer.languageDirective("Hebrew")),
+                      "the re-run must use the language the user picked")
+        let final = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(final.summary, "SECOND")
         XCTAssertEqual(final.summaryLanguage, "he")
     }
 
@@ -1386,13 +1428,15 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(callCount, 2)
         XCTAssertEqual(live()?.summary, "SUMMARY 2")
 
-        // "In force" is the typed override, i.e. what the ✓ shows: an
-        // unrecognised persisted code reads as Default, so Default is the
-        // no-op and a concrete language is the change.
+        // An unrecognised persisted code reads as Default (what the ✓ shows),
+        // so picking Default cleans the stored value WITHOUT an LLM call —
+        // the language in force did not change — while a concrete language
+        // is a real change.
         store.setSummaryLanguage("fr", recordingID: rec.id)
         summarizer.setSummaryLanguage(nil, for: rec.id)
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
         XCTAssertEqual(callCount, 2, "Default on an unknown code is still the ✓'d entry")
+        XCTAssertNil(live()?.summaryLanguage, "…but the junk value is cleaned out of the row")
         summarizer.setSummaryLanguage(.english, for: rec.id)
         XCTAssertEqual(live()?.summaryLanguage, "en")
         await summarizer.awaitInFlight(rec.id)
