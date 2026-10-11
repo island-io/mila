@@ -276,7 +276,7 @@ final class RecordingShareImporterTests: XCTestCase {
     func test_cancel_during_the_audio_copy_imports_nothing() async throws {
         let original = try makeCompletedRecording(in: storeA)
         let bundle = try await export(original, from: storeA)
-        // Copy for real, then park: Cancel lands with the `.partial` already
+        // Copy for real, then park: Cancel arrives with the `.partial` already
         // on disk and the import suspended, which is the worst moment.
         let copied = Gate()
         let release = Gate()

@@ -40,7 +40,7 @@ running through `whisper.cpp` (GPU via Metal).
 - **Share a recording with a colleague** — right-click → **Share Recording…**
   produces a single `.milashare` file (audio + transcript + speaker names +
   summary + action items, optionally the speakers' voice profiles). They
-  double-click it and it lands in their library tagged "Shared by …";
+  double-click it and it arrives in their library tagged "Shared by …";
   re-sharing an updated transcript updates their copy instead of duplicating
   it. See [`docs/sharing.md`](docs/sharing.md).
 - **Transcription queue** — view queued, in-progress, and recently-deleted jobs;

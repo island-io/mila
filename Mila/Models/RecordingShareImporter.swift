@@ -134,7 +134,7 @@ final class RecordingShareImporter: ObservableObject {
     /// id — replacing a recording under an in-flight pass would clobber it.
     private let isRecordingBusy: (UUID) -> Bool
     /// Whether an imported `.wav` gets the same AAC compression a local
-    /// recording does once it lands. Tests turn it off so the audio filename
+    /// recording does once it is in the library. Tests turn it off so the audio filename
     /// they assert on isn't renamed underneath them.
     private let compressImportedWAV: Bool
 
