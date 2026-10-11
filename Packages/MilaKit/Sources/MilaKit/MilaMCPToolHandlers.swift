@@ -265,6 +265,10 @@ public struct MilaMCPToolHandlers: Sendable {
         let maxChars = args["max_chars"] as? Int
         var transcript: String
         var truncated = false
+        // Set only when `max_chars` is too small for even the first SRT cue:
+        // `transcript: ""` + `transcript_truncated: true` is the right answer
+        // there, but on its own it gives the client nothing to act on.
+        var sizeHint: String?
         switch format {
         case .text:
             transcript = source.namedTranscript(for: recording)
@@ -282,9 +286,16 @@ public struct MilaMCPToolHandlers: Sendable {
             let cues = TranscriptFormatter.srtCues(segments: recording.segments,
                                                    names: recording.speakerNames)
             guard !cues.isEmpty else {
+                // A `pending`/`running` (or `failed`) recording reaches this
+                // branch too — its segments simply are not stored yet — and
+                // that is a different situation from a legacy text-only
+                // record, so say which one it is.
+                let reason = recording.status == "completed"
+                    ? "legacy or text-only transcript"
+                    : "transcription status is \"\(recording.status)\""
                 throw ToolError.invalidArguments(
                     "format \"srt\" is unavailable for recording \(recording.id.uuidString): "
-                    + "it has no timed segments (legacy or text-only transcript). Use format \"text\".")
+                    + "it has no timed segments (\(reason)). Use format \"text\".")
             }
             // `max_chars` keeps whole cues: a cue cut mid-timestamp is not
             // a subtitle file any player will load. Fewer characters than
@@ -301,6 +312,11 @@ public struct MilaMCPToolHandlers: Sendable {
                     length += cost
                 }
                 truncated = kept.count < cues.count
+                if kept.isEmpty {
+                    sizeHint = "max_chars \(maxChars) is smaller than the first cue, which needs "
+                        + "\(cues[0].count + 2) characters (including its trailing blank line); "
+                        + "raise it to receive any cues."
+                }
             } else {
                 kept = cues
             }
@@ -311,9 +327,12 @@ public struct MilaMCPToolHandlers: Sendable {
         result["format"] = format.rawValue
         result["transcript"] = transcript
         result["transcript_truncated"] = truncated
+        var notes: [String] = []
         if recording.status != "completed" {
-            result["note"] = "Transcription status is \"\(recording.status)\" — the transcript may be partial."
+            notes.append("Transcription status is \"\(recording.status)\" — the transcript may be partial.")
         }
+        if let sizeHint { notes.append(sizeHint) }
+        if !notes.isEmpty { result["note"] = notes.joined(separator: " ") }
         if (args["include_summary"] as? Bool) ?? true {
             if let summary = recording.summary, !summary.isEmpty {
                 result["summary"] = summary

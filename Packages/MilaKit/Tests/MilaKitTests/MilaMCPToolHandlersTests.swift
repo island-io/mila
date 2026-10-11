@@ -295,6 +295,58 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         }
     }
 
+    /// A `pending`/`running` recording has no segments stored yet either, and
+    /// that is not a legacy text-only record: the refusal names the status so
+    /// the client knows to wait rather than give up on subtitles.
+    func test_get_transcript_format_srt_without_segments_names_the_status() throws {
+        var pending = meeting("Fresh", daysAgo: 0)
+        pending.status = "pending"
+        pending.segments = []
+        let legacy = StoredRecording(title: "Legacy", createdAt: Date(timeIntervalSince1970: 1_600_000_000),
+                                     audioFileName: "Legacy.wav", status: "completed",
+                                     legacyFullText: "only ever stored as text")
+        try seedStore([pending, legacy])
+
+        XCTAssertThrowsError(try call("get_transcript", ["id": pending.id.uuidString, "format": "srt"])) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("transcription status is \"pending\""), message)
+            XCTAssertFalse(message.contains("legacy"), message)
+        }
+        XCTAssertThrowsError(try call("get_transcript", ["id": legacy.id.uuidString, "format": "srt"])) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains("legacy or text-only transcript"), message)
+            XCTAssertFalse(message.contains("status is"), message)
+        }
+    }
+
+    /// `transcript: ""` + `transcript_truncated: true` is the right answer
+    /// when not even the first cue fits, but alone it reads like an empty
+    /// recording. The `note` says what would have made it fit — and joins
+    /// the status note rather than replacing it.
+    func test_get_transcript_format_srt_explains_a_max_chars_too_small_for_one_cue() throws {
+        try seedStore([meeting("Subtitled", daysAgo: 0)])
+        let full = try XCTUnwrap(try call("get_transcript", ["format": "srt"])["transcript"] as? String)
+        let firstCue = try XCTUnwrap(full.components(separatedBy: "\n\n").first)
+
+        let tiny = try call("get_transcript", ["format": "srt", "max_chars": 10])
+        XCTAssertEqual(tiny["transcript"] as? String, "")
+        XCTAssertEqual(tiny["transcript_truncated"] as? Bool, true)
+        let note = try XCTUnwrap(tiny["note"] as? String)
+        XCTAssertTrue(note.contains("max_chars 10") && note.contains("\(firstCue.count + 2) characters"), note)
+
+        let fits = try call("get_transcript", ["format": "srt", "max_chars": firstCue.count + 2])
+        XCTAssertEqual(fits["transcript"] as? String, firstCue + "\n\n")
+        XCTAssertNil(fits["note"], "the hint is only for an empty result")
+
+        var running = meeting("Still going", daysAgo: 0)
+        running.status = "running"
+        try seedStore([running])
+        let both = try XCTUnwrap(
+            try call("get_transcript", ["id": running.id.uuidString, "format": "srt", "max_chars": 10])["note"] as? String)
+        XCTAssertTrue(both.hasPrefix("Transcription status is \"running\""), both)
+        XCTAssertTrue(both.contains("max_chars 10"), both)
+    }
+
     func test_get_transcript_unknown_id_throws_not_found() throws {
         try seedStore([meeting("A", daysAgo: 0)])
         XCTAssertThrowsError(try call("get_transcript", ["id": UUID().uuidString]))
