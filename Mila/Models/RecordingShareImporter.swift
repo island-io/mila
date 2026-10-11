@@ -574,7 +574,13 @@ final class RecordingShareImporter: ObservableObject {
             sharedBy: manifest.exportedBy.name,
             sharedAt: manifest.exportedAt,
             folder: existing?.folder)          // local wins for the folder
-        recording.speakerNames = recording.speakerNames.mapValues { mapping[$0] ?? $0 }
+        // The plan keyed its rows on TRIMMED names (see
+        // `SpeakerProfileImportResolver.resolve`), so look the raw label up
+        // the same way or a name with a stray trailing space misses its
+        // merge and keeps the sender's label.
+        recording.speakerNames = recording.speakerNames.mapValues {
+            mapping[$0.trimmingCharacters(in: .whitespacesAndNewlines)] ?? $0
+        }
         for name in Set(recording.speakerNames.values) {
             speakerDirectory?.add(name)
         }
@@ -600,7 +606,7 @@ final class RecordingShareImporter: ObservableObject {
                 try? fileManager.removeItem(at: url)
             }
         }
-        try? TranscriptExporter.writeSRT(for: recording, in: store.recordingsDirectory)
+        TranscriptExporter.writeSRT(for: recording, in: store.recordingsDirectory)
 
         log.log("""
             imported shared recording \(recording.id, privacy: .public) \

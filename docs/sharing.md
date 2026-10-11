@@ -51,8 +51,10 @@ manifest), and shows what will happen before anything is written:
 - **Added to your library** when you do not have this recording.
 - **Replaces your existing copy** when you do — a recording keeps its id
   across shares, so re-sending an updated transcript updates rather than
-  duplicates. Your local transcript edits are overwritten; the folder you
-  filed it in is kept. If your copy was in Recently Deleted it is restored.
+  duplicates. The title, transcript, speaker names, summary, action items
+  and audio are all taken from the shared file, so your local edits to
+  those are overwritten; the folder you filed it in is kept. If your copy
+  was in Recently Deleted it is restored.
 
 The imported recording is an ordinary recording: rename it, re-summarise it,
 move it, delete it. It shows "Shared by <name>" in the list and in the

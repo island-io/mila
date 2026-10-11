@@ -113,7 +113,7 @@ struct RecordingShareConfirmationView: View {
         case .add:
             return "Will be added to your library."
         case .update(let existing):
-            var text = "Will replace your existing copy of “\(existing.title)”. Your local transcript edits are overwritten; the folder it is filed in is kept."
+            var text = "Will replace your existing copy of “\(existing.title)”. Its title, transcript, speaker names, summary, action items and audio are taken from the shared file, so your local edits to those are overwritten; the folder it is filed in is kept."
             if existing.isTrashed {
                 text += " It is in Recently Deleted and will be restored."
             }
