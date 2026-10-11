@@ -35,7 +35,13 @@ final class ObsidianExporterTests: XCTestCase {
     /// 2026-01-02T12:00:00Z. Midday rather than the midnight this used to be,
     /// so the fixture doesn't sit on a date boundary that a local time zone can
     /// push either way.
-    private static let fixtureDate = Date(timeIntervalSince1970: 1_767_355_200)
+    ///
+    /// `nonisolated` because `makeRecording` uses it as a default argument, and
+    /// default arguments are evaluated in the caller's context, which the
+    /// compiler treats as nonisolated — so a main-actor static there is a
+    /// warning today and an error in the Swift 6 language mode (#278). An
+    /// immutable `Date` built from a literal has no reason to be isolated.
+    private nonisolated static let fixtureDate = Date(timeIntervalSince1970: 1_767_355_200)
 
     /// The date `ObsidianExporter.fileName` will actually produce for
     /// `fixtureDate`. Derived, not hard-coded: `fileName` formats in the local
