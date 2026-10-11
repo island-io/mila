@@ -53,6 +53,16 @@ struct AIOverviewSection: View {
     var summaryLanguage: RecordingLanguage? = nil
     var globalOutputLanguage: LiveAISettings.OutputLanguage = .auto
     var onSetSummaryLanguage: ((RecordingLanguage?) -> Void)? = nil
+    /// True while the recording is queued for or inside a (re-)transcription
+    /// pass. Greys out "Regenerate summary" and the "Summary language"
+    /// submenu for its duration, matching the recording context menu's
+    /// `isBusy` gate on the same submenu. A regenerate started now would
+    /// summarise the transcript that is about to be replaced, and if it is
+    /// still in flight when the pass completes, the summarizer's in-flight
+    /// dedup drops the post-transcription regenerate — so the old-transcript
+    /// summary is what gets stored (Bugbot on #313). Declared last for the
+    /// same memberwise-init reason as above.
+    var isTranscribing: Bool = false
 
     /// True iff there's at least one non-empty piece to show. Callers
     /// can use this to collapse their wrapper (avoiding an empty card
@@ -163,14 +173,14 @@ struct AIOverviewSection: View {
                             Button("Regenerate summary") {
                                 onRegenerateSummary()
                             }
-                            .disabled(isSummarizing)
+                            .disabled(isSummarizing || isTranscribing)
                             .accessibilityIdentifier("detail.summary.regenerate")
                         }
                         if let onSetSummaryLanguage {
                             SummaryLanguageMenu(
                                 current: summaryLanguage,
                                 global: globalOutputLanguage,
-                                isDisabled: isSummarizing,
+                                isDisabled: isSummarizing || isTranscribing,
                                 onPick: onSetSummaryLanguage
                             )
                         }

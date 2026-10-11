@@ -73,7 +73,8 @@ struct RecordingDetailView: View {
                 globalOutputLanguage: liveAI.outputLanguage,
                 onSetSummaryLanguage: canRegenerateSummary
                     ? { summarizer.setSummaryLanguage($0, for: recording.id) }
-                    : nil
+                    : nil,
+                isTranscribing: isTranscriptionBusy
             )
             transcriptArea
                 // Force the transcript area to take the remaining
@@ -183,8 +184,7 @@ struct RecordingDetailView: View {
 
     private var actionButtons: some View {
         let currentLang = RecordingLanguage.fromCode(recording.language)
-        let busy = transcription.activeRecordingID == recording.id
-                   || transcription.pendingIDs.contains(recording.id)
+        let busy = isTranscriptionBusy
         // Icon-only buttons with hover tooltips. Labeled buttons here
         // competed with the title for header width and truncated ("Copy
         // tra…"); icons keep all four actions visible at any window size.
@@ -277,6 +277,15 @@ struct RecordingDetailView: View {
         return !recording.fullText
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .isEmpty
+    }
+
+    /// Queued for or inside a transcription pass. One predicate for the
+    /// header's Re-transcribe menu and the AI overview's regenerate /
+    /// summary-language entries, so the two cannot disagree about whether
+    /// the transcript is about to change under a summary call.
+    private var isTranscriptionBusy: Bool {
+        transcription.activeRecordingID == recording.id
+            || transcription.pendingIDs.contains(recording.id)
     }
 
     /// Human-readable name of the whisper model that will run for the
@@ -819,6 +828,8 @@ private struct AIOverviewBanner: View {
     var summaryLanguage: RecordingLanguage? = nil
     var globalOutputLanguage: LiveAISettings.OutputLanguage = .auto
     var onSetSummaryLanguage: ((RecordingLanguage?) -> Void)? = nil
+    /// Forwarded to `AIOverviewSection.isTranscribing`.
+    var isTranscribing: Bool = false
 
     var body: some View {
         let section = AIOverviewSection(
@@ -834,7 +845,8 @@ private struct AIOverviewBanner: View {
             showsBlockCopyButtons: false,
             summaryLanguage: summaryLanguage,
             globalOutputLanguage: globalOutputLanguage,
-            onSetSummaryLanguage: onSetSummaryLanguage
+            onSetSummaryLanguage: onSetSummaryLanguage,
+            isTranscribing: isTranscribing
         )
         if section.hasContent {
             VStack(spacing: 0) {
