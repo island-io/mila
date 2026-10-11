@@ -283,6 +283,7 @@ final class RecordingShareImporter: ObservableObject {
                 .appendingPathComponent("mila-share-import-\(UUID().uuidString)", isDirectory: true)
             staging = dir
             try await ZipArchiver.unzip(url, into: dir)
+            try Self.requireExtractedEntries(in: dir, match: declared)
 
             // Only the fixed names are ever looked at — see the type comment.
             let manifestURL = dir.appendingPathComponent(ShareManifest.manifestEntryName)
@@ -375,6 +376,9 @@ final class RecordingShareImporter: ObservableObject {
         let hasTranscript: Bool
         /// Sum of the declared uncompressed sizes.
         let totalUncompressedBytes: Int64
+        /// Every name the central directory listed — what the staging
+        /// directory must contain, exactly, once `ditto` has run.
+        let entryNames: Set<String>
     }
 
     /// The entry-set check on an archive's central directory, run BEFORE
@@ -434,7 +438,25 @@ final class RecordingShareImporter: ObservableObject {
             throw ShareManifest.LoadError.malformed("It has no audio entry.")
         }
         return DeclaredContents(audioEntryName: audioEntryName, hasTranscript: hasTranscript,
-                                totalUncompressedBytes: total)
+                                totalUncompressedBytes: total, entryNames: seen)
+    }
+
+    /// The staged directory holds exactly the entries the central directory
+    /// declared. `ditto` extracts what the archive's LOCAL headers describe,
+    /// and nothing forces those to agree with the central directory
+    /// `validateEntries` read — an entry present in the stream but absent
+    /// from the listing would be inflated unseen. One directory read closes
+    /// that gap: anything extra, or anything missing, refuses the bundle.
+    static func requireExtractedEntries(in dir: URL, match declared: DeclaredContents) throws {
+        let found: Set<String>
+        do {
+            found = Set(try FileManager.default.contentsOfDirectory(atPath: dir.path))
+        } catch {
+            throw ShareManifest.LoadError.unreadable(error.localizedDescription)
+        }
+        guard found == declared.entryNames else {
+            throw ShareManifest.LoadError.malformed("Its contents don't match its table of contents.")
+        }
     }
 
     /// An entry must be a regular file (not a symlink, not a directory) and

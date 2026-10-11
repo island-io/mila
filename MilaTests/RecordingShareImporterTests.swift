@@ -496,10 +496,12 @@ final class RecordingShareImporterTests: XCTestCase {
         let full = try RecordingShareImporter.validateEntries(
             [entry("manifest.json"), entry("audio.m4a", 500), entry("transcript.txt")])
         XCTAssertEqual(full, .init(audioEntryName: "audio.m4a", hasTranscript: true,
-                                   totalUncompressedBytes: 520))
+                                   totalUncompressedBytes: 520,
+                                   entryNames: ["manifest.json", "audio.m4a", "transcript.txt"]))
         let minimal = try RecordingShareImporter.validateEntries([entry("audio.wav", 44), entry("manifest.json")])
         XCTAssertEqual(minimal, .init(audioEntryName: "audio.wav", hasTranscript: false,
-                                      totalUncompressedBytes: 54))
+                                      totalUncompressedBytes: 54,
+                                      entryNames: ["manifest.json", "audio.wav"]))
 
         func rejects(_ entries: [ZipArchiver.Entry], _ fragment: String, line: UInt = #line) {
             XCTAssertThrowsError(try RecordingShareImporter.validateEntries(entries), line: line) { error in
@@ -531,6 +533,43 @@ final class RecordingShareImporterTests: XCTestCase {
         rejects([entry("manifest.json"), entry("audio.wav", .max)], "too large to be a Mila shared recording")
         rejects([entry("manifest.json"), entry("audio.wav", UInt64(Int64.max))],
                 "too large to be a Mila shared recording")
+    }
+
+    /// The other half of the entry-set check: what `ditto` actually put in
+    /// the staging directory must be what the central directory listed.
+    /// Exercised on a directory directly — an archive whose local headers
+    /// disagree with its central directory is not something `ditto` or
+    /// `zip` will write — and wired into `stage` right after the unzip.
+    func test_extracted_contents_must_match_the_declared_entry_set_exactly() throws {
+        let dir = TestSupport.makeTempRoot(label: "RecordingShareImporterTests.extracted")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let declared = RecordingShareImporter.DeclaredContents(
+            audioEntryName: "audio.wav", hasTranscript: true, totalUncompressedBytes: 30,
+            entryNames: ["manifest.json", "audio.wav", "transcript.txt"])
+        for name in declared.entryNames {
+            try Data("x".utf8).write(to: dir.appendingPathComponent(name))
+        }
+        XCTAssertNoThrow(try RecordingShareImporter.requireExtractedEntries(in: dir, match: declared))
+
+        // An entry the listing never mentioned.
+        let smuggled = dir.appendingPathComponent("payload.sh")
+        try Data("x".utf8).write(to: smuggled)
+        XCTAssertThrowsError(try RecordingShareImporter.requireExtractedEntries(in: dir, match: declared)) { error in
+            let message = (error as? ShareManifest.LoadError)?.errorDescription ?? "\(error)"
+            XCTAssertTrue(message.contains("table of contents"), message)
+        }
+        try FileManager.default.removeItem(at: smuggled)
+
+        // An entry the listing promised and the stream did not deliver.
+        try FileManager.default.removeItem(at: dir.appendingPathComponent("transcript.txt"))
+        XCTAssertThrowsError(try RecordingShareImporter.requireExtractedEntries(in: dir, match: declared))
+
+        // No staging directory at all is "unreadable", not "malformed".
+        XCTAssertThrowsError(try RecordingShareImporter.requireExtractedEntries(
+            in: dir.appendingPathComponent("missing"), match: declared)) { error in
+            if case .unreadable = error as? ShareManifest.LoadError {} else { XCTFail("\(error)") }
+        }
     }
 
     func test_an_unexpected_extra_entry_is_rejected_before_extraction() async throws {
