@@ -523,9 +523,13 @@ final class RecordingShareImporterTests: XCTestCase {
                 "transcript is too large")
         rejects([entry("manifest.json"), entry("audio.wav", UInt64(RecordingShareImporter.maxUncompressedBytes))],
                 "too large to be a Mila shared recording")
-        // A sum that overflows is just another way of being too large.
+        // A sum that overflows is just another way of being too large. Only
+        // the audio entry can carry a size that big — the text entries hit
+        // their own caps first — so the overflow is the manifest's few
+        // bytes on top of an audio entry at `Int64.max` exactly (one past it
+        // fails the per-entry bound instead).
         rejects([entry("manifest.json"), entry("audio.wav", .max)], "too large to be a Mila shared recording")
-        rejects([entry("manifest.json", .max / 2 + 1), entry("audio.wav", .max / 2 + 1)],
+        rejects([entry("manifest.json"), entry("audio.wav", UInt64(Int64.max))],
                 "too large to be a Mila shared recording")
     }
 
