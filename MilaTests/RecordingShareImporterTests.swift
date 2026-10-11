@@ -358,6 +358,36 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertFalse(try XCTUnwrap(storeB.recordings.first).isTrashed)
     }
 
+    func test_confirm_resolves_the_existing_copy_against_the_live_store() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        let importer = makeImporter()
+        await stage(bundle, with: importer)
+        await importer.confirm()
+        let first = try XCTUnwrap(storeB.recordings.first)
+        XCTAssertNotNil(storeB.createFolder("Clients"))
+        storeB.assign(first, toFolder: "Clients")
+
+        // The sheet says "replace" — then the user deletes their copy for
+        // good while it is up. The import must add rather than replace a
+        // row that is no longer there, and must not inherit the deleted
+        // copy's filing.
+        await stage(bundle, with: importer)
+        let pending = try XCTUnwrap(importer.pending)
+        XCTAssertTrue(pending.isUpdate)
+        storeB.permanentlyDelete(try XCTUnwrap(storeB.recordings.first))
+        XCTAssertTrue(storeB.recordings.isEmpty)
+
+        await importer.confirm()
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertNil(importer.refusalMessage)
+        XCTAssertEqual(storeB.recordings.count, 1)
+        let imported = try XCTUnwrap(storeB.recordings.first)
+        XCTAssertEqual(imported.id, original.id)
+        XCTAssertNil(imported.folder, "the deleted copy's filing is not resurrected")
+        XCTAssertTrue(recordingsDirectoryNames(storeB).contains(imported.audioFileName))
+    }
+
     func test_a_busy_recording_is_not_replaced() async throws {
         let original = try makeCompletedRecording(in: storeA)
         let bundle = try await export(original, from: storeA)

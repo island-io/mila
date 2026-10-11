@@ -544,10 +544,12 @@ final class RecordingShareImporter: ObservableObject {
         // Cancel while the audio copy below is in flight. Every resumption
         // re-checks that THIS import is still the one on screen.
         let manifest = pending.manifest
-        let existing: Recording? = {
-            if case .update(let e) = pending.disposition { return e }
-            return nil
-        }()
+        // Resolved against the live store, not read off the disposition the
+        // sheet was built from: the user may have deleted or trashed their
+        // copy while the sheet was up, and `upsertImported` replaces by id
+        // whatever the sheet said — so the cap, the busy check, the kept
+        // folder and the old-file cleanup must all agree with the store NOW.
+        let existing = store.recordings.first { $0.id == manifest.recording.id }
 
         // Authoritative cap check — the preview was computed at stage time.
         refusalMessage = nil
