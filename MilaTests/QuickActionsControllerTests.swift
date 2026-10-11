@@ -624,6 +624,26 @@ final class QuickActionsControllerTests: XCTestCase {
         controller.isFinalizingRecording = false
     }
 
+    /// The app picker's "Start recording" calls `startAppRecording` directly,
+    /// and the picker is not disabled during the drain the way the Home
+    /// button is, so this path needs the same finalize gate as `toggleRecord`.
+    /// The permission-alert and error assertions are what make the test
+    /// non-vacuous: without the gate the path publishes `.starting` and runs
+    /// a real system-audio bring-up, which on a grant-less CI host comes back
+    /// to `.none` through one of those two.
+    func test_startAppRecording_no_op_while_finalizing() async {
+        XCTAssertEqual(controller.activeJob, .none)
+        controller.isFinalizingRecording = true
+        await controller.startAppRecording(app: nil, includeMic: false)
+        XCTAssertEqual(controller.activeJob, .none,
+                       "startAppRecording must not start a recording while finalize is in flight")
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(controller.screenRecordingPermissionMissing)
+        XCTAssertNil(service.lastError)
+        controller.isFinalizingRecording = false
+    }
+
     /// REGRESSION (user report: "couldn't start a new recording until the
     /// previous one finished processing; the Record button said
     /// 'Finalizing'").

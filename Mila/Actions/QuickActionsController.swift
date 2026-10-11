@@ -640,6 +640,19 @@ final class QuickActionsController: ObservableObject {
         }
         // Storage cap: refuse to start if the library is already full.
         if storageCapReached() { return }
+        // Same finalize gate as `toggleRecord`. `stopRecording` releases
+        // `activeJob` to `.none` BEFORE its inline live-pipeline drain and
+        // clears `isFinalizingRecording` only after it, so for the length of
+        // the drain `beginStarting()` alone would let a start through — one
+        // whose `session.start` / `liveAISession.start()` reset the
+        // transcriber, diarizer and LLM session under the snapshot the drain
+        // is still reading. The Home button is disabled for that window;
+        // the app picker's "Start recording" is not, and it reaches here
+        // directly.
+        if isFinalizingRecording {
+            quickActionsLog.log("startAppRecording ignored — finalize in progress")
+            return
+        }
         // Accept the click and say so before the first `await` — see
         // `beginStarting`. This is also the first re-entry guard this path
         // has had: the app picker's "Start recording" reaches here directly,
