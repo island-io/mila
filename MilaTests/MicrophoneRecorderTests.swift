@@ -476,6 +476,20 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         }
     }
 
+    /// Wait for the rebuild a single configuration change provoked to have
+    /// RETURNED, success or failure. `rebuildEngine` sets `isRebuilding` and
+    /// bumps `restartCount` before it suspends into the bring-up, and clears
+    /// `isRebuilding` in a `defer` as it returns (for a rebuild whose session
+    /// is still live — `stop()` mid-rebuild leaves it for `start()` to reset),
+    /// so neither alone says the rebuild is over: `restartCount >= 1` fires
+    /// with the bring-up still in flight (#279), and `!isRebuilding` holds
+    /// trivially before anything was decided. Exact only while nothing can
+    /// chain a SECOND rebuild before the poll runs, which every caller here
+    /// guarantees: watchdog parked, one notification, 1s throttle.
+    private func waitForRebuildToFinish(_ mic: MicrophoneRecorder) async {
+        await waitUntil { mic.restartCount >= 1 && !mic.isRebuilding }
+    }
+
     private func postConfigurationChange(to mic: MicrophoneRecorder) {
         // Re-read the source every time: production installs a brand-new
         // engine on each rebuild, and it is the new engine that posts the next
@@ -515,15 +529,9 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)   // past the 0.1s window
 
         postConfigurationChange(to: mic)
-        // Gate on the rebuild having FINISHED, not on `restartCount`, which
-        // `rebuildEngine` bumps before it suspends into the bring-up — a poll
-        // on it alone could reach `bringUps() == 2` below with the second
-        // bring-up still in flight (#279). `bringUps() >= 2` would settle that
-        // assertion but still fires from inside the override, before the
-        // rebuild's tail (re-arm, new source) has run; `isRebuilding` is
-        // cleared by `rebuildEngine`'s `defer` on every exit path, so it is
-        // the signal that covers the whole thing.
-        await waitUntil { mic.restartCount >= 1 && !mic.isRebuilding }
+        // Not `restartCount >= 1`: that fires with the second bring-up still
+        // in flight and `bringUps()` still 1 — the #279 flake.
+        await waitForRebuildToFinish(mic)
 
         XCTAssertEqual(mic.restartCount, 1,
                        "a real device change must still be repaired promptly, and exactly once")
@@ -622,11 +630,9 @@ final class MicrophoneConfigurationChangeTests: XCTestCase {
         try await Task.sleep(nanoseconds: 400_000_000)
 
         postConfigurationChange(to: mic)
-        // Same gate as `test_change_after_the_grace_window_still_rebuilds`,
-        // for the opposite reason: the source-identity assertion below is
-        // only meaningful once the FAILED rebuild has returned — before that
-        // it passes vacuously rather than defending anything.
-        await waitUntil { mic.restartCount >= 1 && !mic.isRebuilding }
+        // The source-identity assertion below is only meaningful once the
+        // FAILED rebuild has returned; before that it passes vacuously.
+        await waitForRebuildToFinish(mic)
 
         XCTAssertEqual(mic.restartCount, 1, "the failed attempt still spends a rebuild slot")
         XCTAssertTrue(mic.configurationChangeSource === sourceAfterStart,
