@@ -226,6 +226,19 @@ final class VoiceProfileValidationTests: XCTestCase {
                      "positive control: a sound profile has no reason to be rejected")
     }
 
+    /// Finite is not enough. `updateProfile` folds `component * Float(count)`
+    /// with a count of up to `maxSampleCount` (≈ 4.6 × 10¹⁸); a component of
+    /// 10³⁰ — finite, and perfectly decodable — overflows that to infinity,
+    /// which `JSONEncoder` then refuses, and the store stops persisting.
+    func test_an_embedding_component_beyond_the_magnitude_bound_is_not_a_usable_profile() {
+        let bound = VoiceProfile.maxEmbeddingMagnitude
+        XCTAssertNotNil(profile(name: "Huge", embedding: [1e30, 0, 0, 0], sampleCount: 4).unusableReason)
+        XCTAssertNotNil(profile(name: "Just over", embedding: [0, -bound.nextUp, 0, 0], sampleCount: 4)
+                            .unusableReason)
+        XCTAssertNil(profile(name: "At the bound", embedding: [bound, -bound, 0, 0], sampleCount: 4)
+                        .unusableReason)
+    }
+
     /// The reachable half of the same story, and the one exception to
     /// per-entry dropping: a number the decoder cannot represent fails inside
     /// `decode`, before any entry exists, so the whole file is refused. The

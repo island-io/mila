@@ -139,13 +139,16 @@ final class SpeakerProfileImportResolverTests: XCTestCase {
         let narrow = SharedSpeakerProfile(name: "N", embedding: [1, 0], sampleCount: 1, embeddingModel: model.id)
         let zeroSamples = incoming("Z", [1, 0], samples: 0)
         let blank = incoming("   ", [1, 0])
-        let plan = resolve([unknown, narrow, zeroSamples, blank], context([local("Dan", [1, 0])]))
+        // Finite, but large enough to overflow the store's weighted fold.
+        let huge = incoming("H", [1e30, 0])
+        let plan = resolve([unknown, narrow, zeroSamples, blank, huge], context([local("Dan", [1, 0])]))
 
         let byName = Dictionary(uniqueKeysWithValues: plan.rows.map { ($0.id, $0) })
         XCTAssertEqual(byName["U"]?.blocker, .unknownEmbeddingModel("model-from-the-future"))
         XCTAssertEqual(byName["N"]?.blocker, .dimensionMismatch(found: 2, expected: model.dimension))
         if case .invalidProfile = byName["Z"]?.blocker {} else { XCTFail("\(String(describing: byName["Z"]?.blocker))") }
         if case .invalidProfile = byName[""]?.blocker {} else { XCTFail("\(String(describing: byName[""]?.blocker))") }
+        if case .invalidProfile = byName["H"]?.blocker {} else { XCTFail("\(String(describing: byName["H"]?.blocker))") }
         XCTAssertTrue(plan.rows.allSatisfy { $0.target == .skip })
     }
 

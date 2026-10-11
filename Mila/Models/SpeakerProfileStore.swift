@@ -119,6 +119,18 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
     /// imprecision is bounded, documented and never paid.
     static let maxSampleCount = Int.max / 2
 
+    /// Largest magnitude any embedding component may have. The weighted
+    /// fold in `updateProfile` evaluates `component * Float(count)` with a
+    /// count of up to `maxSampleCount` (≈ 4.6 × 10¹⁸); `Float` tops out at
+    /// ≈ 3.4 × 10³⁸, so a finite — and perfectly decodable — component of
+    /// 10³⁰ overflows the product to infinity, the centroid takes it, and
+    /// `JSONEncoder` then refuses the whole file: `save()` fails from that
+    /// point on. Real embeddings have components in the single digits; the
+    /// bound exists only so that nothing reaching the fold — a hand-edited
+    /// file, a hostile `.milashare` — can get it there. At 10⁶ the product
+    /// stays twelve orders of magnitude short of the overflow.
+    static let maxEmbeddingMagnitude: Float = 1_000_000
+
     /// Why this profile cannot be used, or nil when it is sound.
     ///
     /// `speaker-profiles.json` is a plain file in Application Support that
@@ -155,6 +167,9 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
     ///   makes the *whole file* fail to parse. The clause states the
     ///   invariant the arithmetic actually rests on, so it survives a change
     ///   of encoding or of where embeddings come from.
+    /// * **a component beyond `maxEmbeddingMagnitude`** — the reachable way
+    ///   to the same infinity: finite in the file, decodable, and overflowing
+    ///   `Float` the moment the fold multiplies it by a sample count.
     /// * **an empty name or embedding** — nothing to label with, nothing to
     ///   match against.
     ///
@@ -169,6 +184,7 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
         if name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "empty name" }
         if embedding.isEmpty { return "empty embedding" }
         if embedding.contains(where: { !$0.isFinite }) { return "non-finite embedding value" }
+        if embedding.contains(where: { abs($0) > Self.maxEmbeddingMagnitude }) { return "embedding value out of range" }
         if sampleCount <= 0 { return "non-positive sampleCount (\(sampleCount))" }
         if sampleCount > Self.maxSampleCount { return "sampleCount out of range (\(sampleCount))" }
         return nil
@@ -331,11 +347,12 @@ final class SpeakerProfileStore: ObservableObject {
         // way back off disk — kept identical on purpose, so the store never
         // accepts something it would later refuse to load, or vice versa. The
         // finiteness and upper-bound clauses matter here too: a NaN reaching
-        // the centroid poisons it permanently, and an unbounded count makes
-        // the addition below trap.
+        // the centroid poisons it permanently, an unbounded count makes the
+        // addition below trap, and an unbounded component makes the fold's
+        // `component * Float(count)` overflow to infinity.
         guard !trimmed.isEmpty,
               !embedding.isEmpty,
-              embedding.allSatisfy({ $0.isFinite }),
+              embedding.allSatisfy({ $0.isFinite && abs($0) <= VoiceProfile.maxEmbeddingMagnitude }),
               sampleCount > 0,
               sampleCount <= VoiceProfile.maxSampleCount else { return }
 

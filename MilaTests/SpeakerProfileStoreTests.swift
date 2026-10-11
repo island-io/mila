@@ -163,6 +163,24 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.profiles[0].embedding.count, 3)
     }
 
+    func test_updateProfile_refuses_an_embedding_beyond_the_magnitude_bound() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 2)
+        // Finite and decodable — and, multiplied by a sample count in the
+        // fold, enough to overflow `Float` to infinity, which `save()` could
+        // not encode. Refused outright, for a merge and for a new profile.
+        store.updateProfile(name: "Alice", embedding: [1e30, 0, 0], sampleCount: VoiceProfile.maxSampleCount)
+        store.updateProfile(name: "Mallory", embedding: [0, 1e30, 0], sampleCount: 1)
+
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice"])
+        XCTAssertEqual(store.profiles[0].sampleCount, 2, "the fold was refused, not clamped")
+        XCTAssertEqual(store.profiles[0].embedding, [1, 0, 0])
+    }
+
     func test_deleteProfile_by_name() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
