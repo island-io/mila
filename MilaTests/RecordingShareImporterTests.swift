@@ -388,6 +388,96 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertTrue(recordingsDirectoryNames(storeB).contains(imported.audioFileName))
     }
 
+    /// The audio copy is an `await`, and the store can move under it, so
+    /// `confirm()` resolves the local copy against the store again once the
+    /// copy is done: here the user deletes their copy for good while the
+    /// audio is copying, and the import must add rather than inherit the
+    /// deleted copy's filing.
+    func test_existing_copy_is_resolved_again_after_the_audio_copy() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        let plain = makeImporter()
+        await stage(bundle, with: plain)
+        await plain.confirm()
+        let first = try XCTUnwrap(storeB.recordings.first)
+        XCTAssertNotNil(storeB.createFolder("Clients"))
+        storeB.assign(first, toFolder: "Clients")
+
+        let copied = Gate()
+        let release = Gate()
+        let importer = makeImporter(copyAudio: { source, destination in
+            try await RecordingShareImporter.copyFile(source, to: destination)
+            await copied.open()
+            await release.wait()
+        })
+        await stage(bundle, with: importer)
+        XCTAssertTrue(try XCTUnwrap(importer.pending).isUpdate, "the sheet says replace")
+
+        let importTask = Task { @MainActor in await importer.confirm() }
+        for _ in 0..<400 {
+            if await copied.opened { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let reachedTheCopy = await copied.opened
+        XCTAssertTrue(reachedTheCopy, "confirm() never reached the audio copy")
+        storeB.permanentlyDelete(try XCTUnwrap(storeB.recordings.first))
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        await release.open()
+        await importTask.value
+
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertNil(importer.refusalMessage)
+        XCTAssertEqual(storeB.recordings.count, 1)
+        let imported = try XCTUnwrap(storeB.recordings.first)
+        XCTAssertEqual(imported.id, original.id)
+        XCTAssertNil(imported.folder, "the deleted copy's filing is not resurrected")
+        XCTAssertFalse(recordingsDirectoryNames(storeB).contains { $0.hasSuffix(".partial") })
+    }
+
+    /// Same window, the case the busy check exists for: transcription of the
+    /// local copy starts while the audio is copying. The import must not
+    /// replace a recording under an in-flight pass, and must refuse the way
+    /// the pre-copy check does — sheet left up, nothing written.
+    func test_a_copy_that_becomes_busy_during_the_audio_copy_is_not_replaced() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let bundle = try await export(original, from: storeA)
+        let plain = makeImporter()
+        await stage(bundle, with: plain)
+        await plain.confirm()
+        let before = try XCTUnwrap(storeB.recordings.first)
+
+        final class Flag { var isOn = false }
+        let busy = Flag()
+        let copied = Gate()
+        let release = Gate()
+        let importer = makeImporter(busy: { _ in busy.isOn }, copyAudio: { source, destination in
+            try await RecordingShareImporter.copyFile(source, to: destination)
+            await copied.open()
+            await release.wait()
+        })
+        await stage(bundle, with: importer)   // not busy yet, so it stages
+
+        let importTask = Task { @MainActor in await importer.confirm() }
+        for _ in 0..<400 {
+            if await copied.opened { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let reachedTheCopy = await copied.opened
+        XCTAssertTrue(reachedTheCopy, "confirm() never reached the audio copy")
+        busy.isOn = true
+        await release.open()
+        await importTask.value
+
+        XCTAssertNotNil(importer.pending, "the sheet stays up, as after a pre-copy refusal")
+        XCTAssertEqual(importer.refusalMessage, RecordingShareImporter.ImportError.recordingBusy.errorDescription)
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertFalse(importer.isImporting)
+        XCTAssertEqual(storeB.recordings.first, before, "nothing replaced")
+        XCTAssertFalse(recordingsDirectoryNames(storeB).contains { $0.hasSuffix(".partial") },
+                       "no .partial left behind")
+        importer.cancel()
+    }
+
     func test_a_busy_recording_is_not_replaced() async throws {
         let original = try makeCompletedRecording(in: storeA)
         let bundle = try await export(original, from: storeA)

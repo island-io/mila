@@ -549,7 +549,8 @@ final class RecordingShareImporter: ObservableObject {
         // copy while the sheet was up, and `upsertImported` replaces by id
         // whatever the sheet said — so the cap, the busy check, the kept
         // folder and the old-file cleanup must all agree with the store NOW.
-        let existing = store.recordings.first { $0.id == manifest.recording.id }
+        // Resolved AGAIN after the audio copy below, which is an `await`.
+        var existing = store.recordings.first { $0.id == manifest.recording.id }
 
         // Authoritative cap check — the preview was computed at stage time.
         refusalMessage = nil
@@ -581,6 +582,17 @@ final class RecordingShareImporter: ObservableObject {
             // nothing of it may reach the library or the voice profiles.
             try? fileManager.removeItem(at: partial)
             log.log("import of \(manifest.recording.id, privacy: .public) cancelled during the audio copy")
+            return
+        }
+        // The copy took as long as the audio is big, and the store can move
+        // under it: the local copy deleted, trashed — or handed to the
+        // transcriber, which is the case the busy check exists for. Resolve
+        // it again as the store is NOW; a refusal here leaves the sheet up
+        // exactly as the pre-copy one does, minus the `.partial`.
+        existing = store.recordings.first { $0.id == manifest.recording.id }
+        if let existing, isRecordingBusy(existing.id) {
+            try? fileManager.removeItem(at: partial)
+            refusalMessage = ImportError.recordingBusy.errorDescription
             return
         }
 
