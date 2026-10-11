@@ -130,6 +130,24 @@ final class RecordingShareImporter: ObservableObject {
     /// recording does once it lands. Tests turn it off so the audio filename
     /// they assert on isn't renamed underneath them.
     private let compressImportedWAV: Bool
+
+    /// How the staged audio reaches the library's `.partial` slot. The
+    /// default is `copyFile`: a plain copy off the main actor (a two-hour
+    /// `.wav` is hundreds of MB). Tests substitute one that parks until
+    /// told to go — the only way to pin what `confirm()` does when Cancel
+    /// arrives while the copy is in flight, because from the main actor
+    /// there is no other moment at which it provably is.
+    typealias AudioCopier = @Sendable (_ source: URL, _ destination: URL) async throws -> Void
+    private let copyAudio: AudioCopier
+
+    /// `nonisolated` so it can serve as a default argument (those are
+    /// evaluated outside the actor), as `RecordingShareExporter.currentAppInfo` is.
+    nonisolated static func copyFile(_ source: URL, to destination: URL) async throws {
+        try await Task.detached(priority: .userInitiated) {
+            try FileManager.default.copyItem(at: source, to: destination)
+        }.value
+    }
+
     private let fileManager = FileManager.default
     private var queue: [URL] = []
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingShare")
@@ -141,7 +159,8 @@ final class RecordingShareImporter: ObservableObject {
          similarityThreshold: @escaping () -> Double = { 0.55 },
          speakerDirectory: SpeakerDirectory? = nil,
          isRecordingBusy: @escaping (UUID) -> Bool = { _ in false },
-         compressImportedWAV: Bool = true) {
+         compressImportedWAV: Bool = true,
+         copyAudio: @escaping AudioCopier = { try await RecordingShareImporter.copyFile($0, to: $1) }) {
         self.store = store
         self.storageSettings = storageSettings
         self.profileStore = profileStore
@@ -150,6 +169,7 @@ final class RecordingShareImporter: ObservableObject {
         self.speakerDirectory = speakerDirectory
         self.isRecordingBusy = isRecordingBusy
         self.compressImportedWAV = compressImportedWAV
+        self.copyAudio = copyAudio
         sweepPartialFiles()
     }
 
@@ -513,9 +533,7 @@ final class RecordingShareImporter: ObservableObject {
         let partial = destination.appendingPathExtension(Self.partialSuffix)
         let source = pending.audioURL
         do {
-            try await Task.detached(priority: .userInitiated) {
-                try FileManager.default.copyItem(at: source, to: partial)
-            }.value
+            try await copyAudio(source, partial)
         } catch {
             try? fileManager.removeItem(at: partial)
             // If Cancel already dismissed this import, it also removed the

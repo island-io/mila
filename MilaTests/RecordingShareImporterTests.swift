@@ -65,13 +65,34 @@ final class RecordingShareImporterTests: XCTestCase {
                               profiles: SpeakerProfileStore? = nil,
                               voice: VoiceRecognitionSettings? = nil,
                               threshold: Double = 0.55,
-                              busy: @escaping (UUID) -> Bool = { _ in false }) -> RecordingShareImporter {
+                              busy: @escaping (UUID) -> Bool = { _ in false },
+                              copyAudio: @escaping RecordingShareImporter.AudioCopier = {
+                                  try await RecordingShareImporter.copyFile($0, to: $1)
+                              }) -> RecordingShareImporter {
         RecordingShareImporter(store: storeB, storageSettings: storage, profileStore: profiles,
                                voiceRecognition: voice, similarityThreshold: { threshold },
                                speakerDirectory: SpeakerDirectory(directory: rootB),
                                isRecordingBusy: busy,
                                // Keep the audio filename stable for the assertions below.
-                               compressImportedWAV: false)
+                               compressImportedWAV: false,
+                               copyAudio: copyAudio)
+    }
+
+    /// A one-shot latch for sequencing an async test: `wait()` suspends
+    /// until `open()`, and stays open.
+    private actor Gate {
+        private var isOpen = false
+        private var waiters: [CheckedContinuation<Void, Never>] = []
+        var opened: Bool { isOpen }
+        func open() {
+            isOpen = true
+            waiters.forEach { $0.resume() }
+            waiters.removeAll()
+        }
+        func wait() async {
+            if isOpen { return }
+            await withCheckedContinuation { waiters.append($0) }
+        }
     }
 
     private func makeVoiceSettings(enabled: Bool, ready: Bool = true) -> VoiceRecognitionSettings {
@@ -246,20 +267,42 @@ final class RecordingShareImporterTests: XCTestCase {
     /// the recordings folder and the voice profiles untouched: `confirm()`
     /// holds a value copy of the pending import across that `await`, so it
     /// has to re-check that the import is still the one on screen.
+    ///
+    /// The copy is held open through the importer's copy seam. Without it
+    /// there is no moment at which Cancel provably arrives mid-copy: a
+    /// `Task { confirm() }` followed by `cancel()` on the same main-actor
+    /// turn cancels BEFORE `confirm()` has run a line, so it returns at its
+    /// first guard and the re-check after the `await` is never exercised.
     func test_cancel_during_the_audio_copy_imports_nothing() async throws {
         let original = try makeCompletedRecording(in: storeA)
         let bundle = try await export(original, from: storeA)
-        let importer = makeImporter()
+        // Copy for real, then park: Cancel lands with the `.partial` already
+        // on disk and the import suspended, which is the worst moment.
+        let copied = Gate()
+        let release = Gate()
+        let importer = makeImporter(copyAudio: { source, destination in
+            try await RecordingShareImporter.copyFile(source, to: destination)
+            await copied.open()
+            await release.wait()
+        })
         await stage(bundle, with: importer)
         XCTAssertNotNil(importer.pending)
 
-        // Start the import, then cancel before the copy can resume on the
-        // main actor. `confirm()`'s first suspension is the detached copy,
-        // so the cancel below runs while it is in flight.
         let importTask = Task { @MainActor in await importer.confirm() }
+        for _ in 0..<400 {
+            if await copied.opened { break }
+            try? await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let reachedTheCopy = await copied.opened
+        XCTAssertTrue(reachedTheCopy, "confirm() never reached the audio copy")
+        XCTAssertTrue(importer.isImporting, "the slot is held while the copy is in flight")
+        XCTAssertTrue(recordingsDirectoryNames(storeB).contains { $0.hasSuffix(".partial") },
+                      "the copy is on disk when Cancel arrives — that is the case under test")
+
         importer.cancel()
         XCTAssertFalse(importer.isImporting,
                        "cancel releases the import slot at once — a queued sheet must not inherit a disabled button")
+        await release.open()
         await importTask.value
 
         XCTAssertNil(importer.pending)
