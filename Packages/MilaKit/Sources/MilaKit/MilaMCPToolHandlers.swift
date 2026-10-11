@@ -121,7 +121,8 @@ public struct MilaMCPToolHandlers: Sendable {
             Pass format "srt" for SubRip subtitles (one timed cue per segment, speaker \
             names as cue prefixes) — the same bytes Mila's own Export Subtitles writes; \
             save them to a .srt file rather than quoting them. With "srt", max_chars \
-            drops whole cues from the end so the result stays a valid file.
+            drops whole cues from the end so the result stays a valid file — omit it \
+            for the complete file, and check transcript_truncated before saving one.
             """,
             inputSchema: [
                 "type": "object",
@@ -239,6 +240,11 @@ public struct MilaMCPToolHandlers: Sendable {
     }
 
     private func getTranscript(_ args: [String: Any]) throws -> String {
+        // Validate the arguments before touching the store, as the other
+        // tools do: a bad `format` should surface on its own rather than
+        // hide behind an unknown `id` or cost a recordings.json load first.
+        let format = try enumArg(args, "format", TranscriptFormat.self) ?? .text
+        let maxChars = args["max_chars"] as? Int
         let recording: StoredRecording
         do {
             if let idString = args["id"] as? String {
@@ -261,8 +267,6 @@ public struct MilaMCPToolHandlers: Sendable {
             throw ToolError.storeUnavailable(String(describing: error))
         }
 
-        let format = try enumArg(args, "format", TranscriptFormat.self) ?? .text
-        let maxChars = args["max_chars"] as? Int
         var transcript: String
         var truncated = false
         // Set only when `max_chars` is too small for even the first SRT cue:
@@ -304,9 +308,9 @@ public struct MilaMCPToolHandlers: Sendable {
             if let maxChars, maxChars > 0 {
                 var length = 0
                 for cue in cues {
-                    // Each kept cue costs its own text plus the "\n\n" that
-                    // follows it in the joined output.
-                    let cost = cue.count + 2
+                    // Each kept cue costs its own text plus the terminator
+                    // `srt(cues:)` appends to every cue.
+                    let cost = cue.count + TranscriptFormatter.srtCueTerminator.count
                     guard length + cost <= maxChars else { break }
                     kept.append(cue)
                     length += cost
@@ -314,13 +318,14 @@ public struct MilaMCPToolHandlers: Sendable {
                 truncated = kept.count < cues.count
                 if kept.isEmpty {
                     sizeHint = "max_chars \(maxChars) is smaller than the first cue, which needs "
-                        + "\(cues[0].count + 2) characters (including its trailing blank line); "
+                        + "\(cues[0].count + TranscriptFormatter.srtCueTerminator.count) characters "
+                        + "(including its trailing blank line); "
                         + "raise it to receive any cues."
                 }
             } else {
                 kept = cues
             }
-            transcript = kept.isEmpty ? "" : kept.joined(separator: "\n\n") + "\n\n"
+            transcript = TranscriptFormatter.srt(cues: kept)
         }
         var result = summaryObject(for: recording)
         result["language"] = recording.language

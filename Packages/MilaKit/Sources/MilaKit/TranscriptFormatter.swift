@@ -39,8 +39,23 @@ public enum TranscriptFormatter {
     public static func srt<S: TimedSpeakerTextSegment>(
         segments: [S], names: [String: String] = [:]
     ) -> String {
-        let cues = srtCues(segments: segments, names: names)
-        return cues.isEmpty ? "" : cues.joined(separator: "\n\n") + "\n\n"
+        srt(cues: srtCues(segments: segments, names: names))
+    }
+
+    /// What follows every cue in a rendered file, the last one included:
+    /// SRT separates cues with a blank line, and a trailing one keeps the
+    /// file well-formed for strict players. The handler's `max_chars`
+    /// accounting budgets with this same constant, so the per-cue cost it
+    /// assumes is the real one.
+    static let srtCueTerminator = "\n\n"
+
+    /// The assembly half of `srt`: joins cues already produced by
+    /// `srtCues`. Exposed so a caller that dropped cues to fit a size cap
+    /// (`get_transcript`'s `max_chars`) renders the remainder with exactly
+    /// the separators `srt(segments:)` would have used — the format
+    /// knowledge stays in one place.
+    public static func srt(cues: [String]) -> String {
+        cues.map { $0 + srtCueTerminator }.joined()
     }
 
     /// The individual cues `srt` joins, each already formatted as
@@ -71,7 +86,19 @@ public enum TranscriptFormatter {
         // "00:00:60,000" instead of "00:01:00,000"). Local whisper sits on
         // a 10ms grid, but the remote path passes through the server's
         // full-precision floats.
-        let totalMillis = Int((seconds * 1000).rounded())
+        //
+        // `seconds` comes straight out of recordings.json — user-editable,
+        // and written by older app versions — and this now runs inside the
+        // long-lived mila-mcp process, where `Int(_:)` trapping on one bad
+        // row would take the server down for every client. So a stated,
+        // bounded imprecision instead of a trap: a non-finite, negative or
+        // absurd value is pinned to the nearest end of
+        // 00:00:00,000 … 999:59:59,999. No recording is that long, and a
+        // negative start is an upstream bug, not a time before the file
+        // began. (`max`/`min` pass NaN through, hence the explicit check.)
+        let rounded = (seconds * 1000).rounded()
+        let maxMillis = 3_599_999_999.0 // 999:59:59,999
+        let totalMillis = Int(rounded.isNaN ? 0 : min(max(rounded, 0), maxMillis))
         let h = totalMillis / 3_600_000
         let m = (totalMillis % 3_600_000) / 60_000
         let s = (totalMillis % 60_000) / 1_000

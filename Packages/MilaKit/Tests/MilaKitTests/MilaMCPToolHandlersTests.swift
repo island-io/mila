@@ -293,6 +293,12 @@ final class MilaMCPToolHandlersTests: XCTestCase {
             XCTAssertTrue(String(describing: error).contains("Invalid arguments"),
                           String(describing: error))
         }
+        // Arguments are validated before the store lookup, as in the other
+        // tools, so a bad format is not hidden behind an unknown id.
+        XCTAssertThrowsError(try call("get_transcript", ["id": UUID().uuidString, "format": "vtt"])) { error in
+            XCTAssertTrue(String(describing: error).contains("Invalid arguments"),
+                          String(describing: error))
+        }
     }
 
     /// A `pending`/`running` recording has no segments stored yet either, and

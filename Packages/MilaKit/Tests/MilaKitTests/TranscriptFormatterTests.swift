@@ -97,6 +97,33 @@ final class MilaKitTranscriptFormatterTests: XCTestCase {
         XCTAssertEqual(TranscriptFormatter.srt(segments: [TimedSeg(start: 0, end: 1, text: " \n ")]), "")
         XCTAssertTrue(TranscriptFormatter.srtCues(segments: [TimedSeg(start: 0, end: 1, text: "")]).isEmpty)
     }
+
+    /// `seconds` comes out of a user-editable file, and this runs inside the
+    /// long-lived mila-mcp process, where `Int(_:)` trapping on one bad row
+    /// would take the server down. Garbage pins to the nearest end of the
+    /// representable range instead of trapping or printing a negative field.
+    func test_srt_timestamp_pins_unrepresentable_values_instead_of_trapping() {
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(.nan), "00:00:00,000")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(-0.6), "00:00:00,000")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(-.infinity), "00:00:00,000")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(.infinity), "999:59:59,999")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(1e19), "999:59:59,999")
+        XCTAssertEqual(TranscriptFormatter.srtTimestamp(3_599_999.999), "999:59:59,999",
+                       "the last representable value itself is rendered as-is")
+        let body = TranscriptFormatter.srt(segments: [TimedSeg(start: .nan, end: 1e300, text: "x")])
+        XCTAssertEqual(body, "1\n00:00:00,000 --> 999:59:59,999\nx\n\n")
+    }
+
+    /// The handler drops cues to honour `max_chars` and reassembles the rest
+    /// through `srt(cues:)`; that must produce the same bytes `srt(segments:)`
+    /// would, so the two paths cannot drift.
+    func test_srt_cues_reassemble_to_the_same_bytes_as_srt() {
+        let segments = [TimedSeg(start: 0, end: 1, text: "a"), TimedSeg(start: 1, end: 2, text: "b")]
+        let cues = TranscriptFormatter.srtCues(segments: segments)
+        XCTAssertEqual(TranscriptFormatter.srt(cues: cues), TranscriptFormatter.srt(segments: segments))
+        XCTAssertEqual(TranscriptFormatter.srt(cues: Array(cues.prefix(1))), cues[0] + "\n\n")
+        XCTAssertEqual(TranscriptFormatter.srt(cues: []), "")
+    }
 }
 
 private struct TimedSeg: TimedSpeakerTextSegment {
