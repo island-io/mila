@@ -41,7 +41,7 @@ final class QuickActionsController: ObservableObject {
         /// checkbox).
         case recording(withSystemAudio: Bool)
         case recordingApp(processID: pid_t?, includeMic: Bool)
-        /// Held only while nothing else owns the job — an import that lands
+        /// Held only while nothing else owns the job — an import that arrives
         /// during a recording (or a start) leaves `activeJob` alone. See
         /// `transcribeFile`.
         case importingFile(URL)
@@ -493,14 +493,18 @@ final class QuickActionsController: ObservableObject {
         // first `await`, so the button flips the instant the user lets go of
         // it rather than whenever CoreAudio gets round to finishing (#293).
         guard beginStarting() else { return }
+        // Every exit below that is not the success path must take `.starting`
+        // back to `.none`, or the Record button and ⌘N stay on "Starting…"
+        // for good. `endStartingWithoutRecording` is a no-op once `activeJob`
+        // has moved on — the success path writes `.recording…` before
+        // returning — so one `defer` covers the permission denial, both catch
+        // arms, and any early exit added later.
+        defer { endStartingWithoutRecording() }
         // Pre-flight the mic auth check — if denied we want to point the
         // user at System Settings (like we do for screen recording),
         // not surface a vague "operation couldn't be completed" error
         // from deep inside AVAudioEngine.
-        guard await ensureMicrophonePermission() else {
-            endStartingWithoutRecording()
-            return
-        }
+        guard await ensureMicrophonePermission() else { return }
         let prefix = withSystemAudio ? "Recording" : "Voice Memo"
         let url = store.freshAudioURL(suggestedName: prefix)
         // `.meeting` mixes mic + system audio; `.microphone` is mic only.
@@ -530,10 +534,8 @@ final class QuickActionsController: ObservableObject {
             startSilenceWatch(watching: source)
             armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
-            endStartingWithoutRecording()
             screenRecordingPermissionMissing = true
         } catch {
-            endStartingWithoutRecording()
             if withSystemAudio, SystemAudioRecorder.isPermissionError(error) {
                 screenRecordingPermissionMissing = true
             } else {
@@ -641,17 +643,16 @@ final class QuickActionsController: ObservableObject {
         // Accept the click and say so before the first `await` — see
         // `beginStarting`. This is also the first re-entry guard this path
         // has had: the app picker's "Start recording" reaches here directly,
-        // and a pick landing on an active job used to fall through
+        // and a pick made during an active job used to fall through
         // `session.start`'s silent `state == .idle` no-op and then overwrite
         // `activeJob` with a `.recordingApp` that captured nothing.
         guard beginStarting() else { return }
+        // See the matching `defer` in `startRecording`.
+        defer { endStartingWithoutRecording() }
         // When the user opted into capturing their mic alongside system
         // audio, pre-flight the mic auth check too — otherwise the same
         // vague-error-after-rename trap as Voice Memo.
-        if includeMic, !(await ensureMicrophonePermission()) {
-            endStartingWithoutRecording()
-            return
-        }
+        if includeMic, !(await ensureMicrophonePermission()) { return }
         session.selectApp(app)
         let titleBase = app?.applicationName ?? "System Audio"
         let url = store.freshAudioURL(suggestedName: titleBase)
@@ -666,10 +667,8 @@ final class QuickActionsController: ObservableObject {
             startSilenceWatch(watching: source)
             armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
-            endStartingWithoutRecording()
             screenRecordingPermissionMissing = true
         } catch {
-            endStartingWithoutRecording()
             if SystemAudioRecorder.isPermissionError(error) {
                 screenRecordingPermissionMissing = true
             } else {
@@ -718,7 +717,7 @@ final class QuickActionsController: ObservableObject {
         // already-assigned `fileURL` without stopping anything, and the code
         // below would then save a zero-length "recording", present the rename
         // sheet, and stamp `.none` over `.starting` seconds before the
-        // bring-up lands and flips it back to `.recording`. Every UI stop
+        // bring-up completes and flips it back to `.recording`. Every UI stop
         // affordance is hidden or disabled in this window; this covers the
         // programmatic callers.
         if activeJob == .starting {

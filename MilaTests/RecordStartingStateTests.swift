@@ -200,7 +200,7 @@ final class RecordStartingStateTests: XCTestCase {
     /// stop affordance is hidden or disabled; the programmatic callers still
     /// reach it. Letting it through would save a zero-length "recording",
     /// present the rename sheet, and stamp `.none` over `.starting` seconds
-    /// before the bring-up lands.
+    /// before the bring-up completes.
     func test_stop_during_starting_is_ignored_rather_than_saving_a_phantom_recording() async throws {
         let gate = BringUpGate()
         session.mic.bringUpOverride = { await gate.wait() }
@@ -213,7 +213,7 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertEqual(controller.activeJob, .starting,
                        "a stop before capture is up has nothing to stop and must leave the start alone")
         XCTAssertTrue(store.recordings.isEmpty,
-                      "a stop that lands before capture is up must not mint a recording")
+                      "a stop that arrives before capture is up must not mint a recording")
         XCTAssertFalse(controller.isFinalizingRecording)
 
         await gate.open()
@@ -246,7 +246,7 @@ final class RecordStartingStateTests: XCTestCase {
         let reachedStarting = await waitUntil { controller.activeJob == .starting }
         XCTAssertTrue(reachedStarting)
 
-        // ⌘O lands while capture is still coming up.
+        // ⌘O arrives while capture is still coming up.
         let imported = tempRoot.appendingPathComponent("import-during-start.wav")
         try TestSupport.writeStereo48kSineWav(at: imported, durationSeconds: 0.4)
         await controller.transcribeFile(imported)

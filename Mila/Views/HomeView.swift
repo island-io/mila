@@ -171,7 +171,7 @@ struct HomeView: View {
         .toggleStyle(.switch)
         .controlSize(.small)
         // Frozen from the accepted click onwards, not just from `.recording`:
-        // the source was chosen when the click landed, and flipping a toggle
+        // the source was chosen at the click, and flipping a toggle
         // mid-bring-up would show a caption for a source other than the one
         // actually coming up.
         .disabled(isRecording || actions.isStartingRecording)
