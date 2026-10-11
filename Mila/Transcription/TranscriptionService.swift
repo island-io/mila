@@ -319,7 +319,16 @@ final class TranscriptionService: ObservableObject {
     /// `isRetranscription` marks a deliberate re-run of an existing recording so
     /// the auto-drop gate never discards it (see `retranscriptionIDs`).
     func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
-        guard !cancellation.isStopped else { return }
+        guard !cancellation.isStopped else {
+            // Leave a trace: the row stays pending for the next launch's
+            // recovery sweep, and without this line a "not transcribed until
+            // I relaunched" report has nothing in the log to correlate.
+            serviceLog.log("""
+                queue: refused \(recording.id.uuidString.prefix(8), privacy: .public) \
+                (\(recording.title, privacy: .private)) — service is shutting down
+                """)
+            return
+        }
         if activeRecordingID == recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
         if isRetranscription { retranscriptionIDs.insert(recording.id) }

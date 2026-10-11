@@ -220,10 +220,9 @@ distribution via the App Store you'd:
 
 ## Changelog
 
-- **Unreleased** — Quitting during remote transcription safely cancels uploads and leaves unfinished recordings available for automatic retry on the next launch.
-
 Newest first. Dates are release dates.
 
+- **Unreleased** — Quitting during remote transcription safely cancels uploads and leaves unfinished recordings available for automatic retry on the next launch.
 - **1.9.0** (2026-07-22) — Remote transcription server support (OpenAI-compatible API), one-click `.milaconfig` setup files, iPhone Voice Memos sync, named speaker labels, opt-in beta updates, hallucination reduction via neural VAD, adaptive gain for quiet mics, auto-discard of empty clips, stop/remove queue items, no more stuck "Queued" items after relaunch, color-coded speakers, mid-recording SRT export, automatic summaries toggle with configurable timeout, record button no longer waits on the previous summary, collapsible "All Transcriptions" sidebar section, CodeQL security scanning added to CI, and a large sweep of reliability fixes across audio capture, diarization, and UI.
 - **1.8.5** (2026-06-09) — Independent mic / app-audio capture toggles, AAC (`.m4a`) recordings, and a configurable recording-storage cap.
 - **1.8.4** (2026-06-09) — Fixed speaker diarization silently breaking in notarized builds (the bundled Python couldn't load torch's dylibs).

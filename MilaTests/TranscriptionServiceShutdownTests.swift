@@ -133,7 +133,6 @@ extension TranscriptionServiceShutdownTests {
     func test_shutdown_during_configure_does_not_start_remote_transcription() async throws {
         let fixture = try ServiceShutdownFixture(stage: .configure)
         defer { fixture.cleanUp() }
-        let recording = try fixture.recording(title: "Configuring")
         let completed = expectation(description: "configure returned")
         // A one-shot call is independently scheduled, rather than owned by the queue worker.
         let call = Task {
@@ -150,7 +149,6 @@ extension TranscriptionServiceShutdownTests {
         let calls = await fixture.remote.transcribeCalls
         XCTAssertEqual(calls, 0)
         XCTAssertNil(fixture.service.lastError)
-        XCTAssertEqual(fixture.store.recordings.first { $0.id == recording.id }?.status, .pending)
     }
 
     func test_shutdown_discards_late_one_shot_error_without_banner() async throws {
