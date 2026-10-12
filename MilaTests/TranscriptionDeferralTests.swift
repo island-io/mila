@@ -261,6 +261,8 @@ final class TranscriptionDeferralTests: XCTestCase {
         transcribeAgain(target.recording.id)
         XCTAssertEqual(service.pendingIDs, [target.recording.id],
                        "the request must be queued behind the stop, not dropped")
+        XCTAssertTrue(service.isQueuedOrActive(target.recording.id),
+                      "the re-queued run must be stoppable: it is the run Stop now addresses")
 
         await waitUntilWhisperStarted(calls: 2)
         await service.waitForIdle()
@@ -474,7 +476,11 @@ final class TranscriptionDeferralTests: XCTestCase {
                 every: .milliseconds(50),
                 isCancelled: { flag.contains(id) }
             ) {
-                try await SpeakerDiarizer.runPython(path: "/bin/sh", arguments: ["-c", "sleep 30"])
+                // `/bin/sleep` itself, not `sh -c "sleep 30"`: the test terminates
+                // the PID `runPython` spawned, and a shell that forks rather than
+                // execs would die while its child kept the stdout pipe open for
+                // the full 30 s.
+                try await SpeakerDiarizer.runPython(path: "/bin/sleep", arguments: ["30"])
             }
         }
         try await Task.sleep(nanoseconds: 300_000_000)   // let the subprocess start

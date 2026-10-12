@@ -360,7 +360,7 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
-    /// Poll until the stub has been entered, so a `stop()`/`reset()` lands
+    /// Poll until the stub has been entered, so a `stop()`/`reset()` arrives
     /// while whisper is still running rather than before the tick started.
     private func waitUntilWhisperEntered(file: StaticString = #filePath, line: UInt = #line) async {
         let deadline = Date().addingTimeInterval(5)

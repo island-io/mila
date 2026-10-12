@@ -740,8 +740,18 @@ final class TranscriptionService: ObservableObject {
     /// and not already stopping — i.e. whether Stop Transcribing has anything
     /// left to do. The UI keys that control on this rather than on the row's
     /// status: a `.pending` row that is still being finalized has no run yet.
+    ///
+    /// `processingID` counts as active: between the worker popping a job and
+    /// `activeRecordingID` being published there is a suspension
+    /// (`remoteEngine.configure`), and `deferTranscription` finds the run
+    /// there — so the control has to be offered there too, or it blinks out
+    /// for the length of a network round trip. A row that is queued AGAIN
+    /// while its previous run is still stopping (Transcribe clicked during
+    /// "Stopping…", see `enqueue`) is simply queued: the new run is what the
+    /// control would stop.
     func isQueuedOrActive(_ recordingID: UUID) -> Bool {
-        (activeRecordingID == recordingID || pendingIDs.contains(recordingID))
+        if pendingIDs.contains(recordingID) { return true }
+        return (activeRecordingID == recordingID || processingID == recordingID)
             && stoppingRecordingID != recordingID
     }
 

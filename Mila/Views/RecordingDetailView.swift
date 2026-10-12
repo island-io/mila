@@ -387,7 +387,12 @@ struct RecordingDetailView: View {
 
     @ViewBuilder
     private var transcriptArea: some View {
-        if transcription.stoppingRecordingID == recording.id {
+        // Queued wins over "Stopping…" and over the progress view: a row
+        // re-queued with Transcribe while its previous run is still unwinding
+        // (`TranscriptionService.enqueue`) is waiting for its NEW run, and
+        // that is the run the Stop button here addresses.
+        let queuedAgain = transcription.pendingIDs.contains(recording.id)
+        if transcription.stoppingRecordingID == recording.id, !queuedAgain {
             // Stop was clicked; the run is unwinding (possibly waiting out a
             // model load nothing can interrupt). No percentage, no second Stop.
             VStack(spacing: 12) {
@@ -399,7 +404,7 @@ struct RecordingDetailView: View {
                 Spacer()
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if transcription.activeRecordingID == recording.id {
+        } else if transcription.activeRecordingID == recording.id, !queuedAgain {
             VStack(spacing: 12) {
                 Spacer()
                 ProgressView(value: transcription.progress) {
@@ -423,8 +428,8 @@ struct RecordingDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else if recording.segments.isEmpty {
             let placeholder = Self.emptyTranscriptPlaceholder(
-                isActive: transcription.activeRecordingID == recording.id,
-                isQueued: transcription.pendingIDs.contains(recording.id),
+                isActive: transcription.activeRecordingID == recording.id && !queuedAgain,
+                isQueued: queuedAgain,
                 isDeferred: recording.isTranscriptionDeferred
             )
             if placeholder == .waitingInQueue {

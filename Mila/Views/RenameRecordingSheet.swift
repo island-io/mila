@@ -642,6 +642,11 @@ private struct RenameTranscriptionStatusRow: View {
     /// "Transcribing… NN%", "Identifying speakers…", "Transcript ready",
     /// "Transcription failed", "Waiting to transcribe…".
     private var label: String {
+        // Queued again while the previous run is still unwinding (Transcribe
+        // clicked during "Stopping…"): the row is waiting for its new run.
+        if transcription.pendingIDs.contains(recordingID) {
+            return "Waiting to transcribe…"
+        }
         if transcription.stoppingRecordingID == recordingID {
             return "Stopping…"
         }
