@@ -738,10 +738,11 @@ final class RecordingSummarizer: ObservableObject {
     /// `.rerun` when the row moved on (its transcript, or the language its
     /// prompt resolves to, differs from the run's snapshot), when a `regenerate` asked
     /// for different inputs, or when a folded-in `regenerate` would
-    /// otherwise end with nothing (`produced == false`). A row in Recently
-    /// Deleted still discards, so a stale summary cannot come back on
-    /// restore, but gets no follow-up and no signal. A row that is gone
-    /// proceeds, and the callers' own lookups keep it unsignalled.
+    /// otherwise end with nothing (`produced == false`). A STALE run on a
+    /// row in Recently Deleted still discards, so a stale summary cannot
+    /// come back on restore, but gets no follow-up and no signal. (A run
+    /// that is not stale treats a trashed row as it always has.) A row that
+    /// is gone proceeds, and the callers' own lookups keep it unsignalled.
     ///
     /// Several requests during one run therefore cost one follow-up, built
     /// from the row as of completion; it can only chain if something changes

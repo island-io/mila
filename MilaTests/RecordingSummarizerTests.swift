@@ -1613,6 +1613,9 @@ final class RecordingSummarizerTests: XCTestCase {
             return "SUMMARY"
         }
 
+        var finished = 0
+        summarizer.onSummaryFinished = { _ in finished += 1 }
+
         let rec = try addRecording(named: "Trashed", text: "old transcript")
         summarizer.summarizeIfNeeded(rec)
         var row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
@@ -1627,6 +1630,8 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(calls, 1, "no follow-up for a trashed recording")
         XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summary,
                      "the stale output must not be stored, or a restore brings it back")
+        XCTAssertEqual(finished, 0,
+                       "no completion work (an Obsidian export) for a recording the user threw away")
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
     }
 
