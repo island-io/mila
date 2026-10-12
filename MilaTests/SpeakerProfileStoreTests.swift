@@ -328,6 +328,24 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertTrue(store.hasStoredProfilesOnDisk)
     }
 
+    /// A file the snapshot could not read cannot be put back, and the
+    /// caller has to be told rather than handed a silent success.
+    func test_restore_reports_failure_for_a_file_that_was_unreadable_at_the_snapshot() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fileURL.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path) }
+
+        let snapshot = store.snapshot()
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+        XCTAssertFalse(store.restore(snapshot))
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice"], "memory is restored regardless")
+    }
+
     // MARK: - Deletion observers
 
     /// Deleting is a privacy action, and the store is not the only place the

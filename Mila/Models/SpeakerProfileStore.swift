@@ -615,8 +615,10 @@ final class SpeakerProfileStore: ObservableObject {
     /// them in between; a caller that suspends between the two must not
     /// use this.
     ///
-    /// Returns whether the file was put back. On `false` the error is
-    /// logged and the disk may still hold the writes being undone.
+    /// Returns whether the file was put back. On `false` (a failed write,
+    /// or a file that was unreadable at the snapshot) the error is logged,
+    /// memory is restored anyway, and the disk may still hold the writes
+    /// being undone.
     @discardableResult
     func restore(_ snapshot: Snapshot) -> Bool {
         profiles = snapshot.profiles
@@ -630,14 +632,19 @@ final class SpeakerProfileStore: ObservableObject {
             case .bytes(let data):
                 try data.write(to: storeURL, options: .atomic)
             case .unreadable:
-                break
+                // Nothing to put back. Whatever was written since stays,
+                // and the caller has to hear that.
+                restored = false
+                profileLog.error("restore: speaker-profiles.json was unreadable at the snapshot, so it cannot be put back")
             }
         } catch {
             restored = false
             profileLog.error("restore: could not put speaker-profiles.json back: \(error.localizedDescription, privacy: .public)")
         }
         hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
-        profileLog.log("restored \(snapshot.profiles.count) voice profiles from a snapshot")
+        if restored {
+            profileLog.log("restored \(snapshot.profiles.count) voice profiles from a snapshot")
+        }
         return restored
     }
 
