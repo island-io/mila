@@ -92,9 +92,13 @@ public enum TranscriptFormatter {
     /// Text with no line break in it is returned as-is — not re-split and
     /// re-joined into equal bytes, the same `String` — which is what keeps
     /// the app's `.srt` export unchanged for every segment whisper produces.
-    /// Only `\r` and `\n` count as line breaks, the two an SRT parser splits
-    /// on; `\r\n` therefore rejoins as `\n`, the separator the rest of the
-    /// file already uses.
+    /// Every Unicode line terminator counts (`CharacterSet.newlines`: `\n`,
+    /// `\r`, VT, FF, NEL, U+2028, U+2029), not only the `\r`/`\n` an SRT
+    /// parser proper splits on: a reader built on a generic line splitter
+    /// such as Python's `str.splitlines()` breaks on all of them, so
+    /// `"a\u{2028}\u{2028}b"` would split the cue just as `"a\n\nb"` did.
+    /// Each surviving break rejoins as `\n`, the separator the rest of the
+    /// file already uses (so `\r\n` becomes `\n`).
     static func cueText(_ trimmedText: String) -> String {
         guard trimmedText.rangeOfCharacter(from: cueLineBreaks) != nil else { return trimmedText }
         return trimmedText.components(separatedBy: cueLineBreaks)
@@ -102,7 +106,7 @@ public enum TranscriptFormatter {
             .joined(separator: "\n")
     }
 
-    private static let cueLineBreaks = CharacterSet(charactersIn: "\r\n")
+    private static let cueLineBreaks = CharacterSet.newlines
 
     static func srtTimestamp(_ seconds: Double) -> String {
         // Round to whole milliseconds FIRST, then decompose. The previous

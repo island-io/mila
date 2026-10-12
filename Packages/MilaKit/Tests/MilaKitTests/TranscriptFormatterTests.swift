@@ -154,9 +154,9 @@ final class MilaKitTranscriptFormatterTests: XCTestCase {
         XCTAssertEqual(blocks.count, segments.count)
     }
 
-    /// Text with no line break in it must come back as the SAME string, not
-    /// merely equal bytes: that is the guarantee that the app's `.srt`
-    /// export (every whisper segment is one line) did not change.
+    /// Text with no line break in it must come back unchanged: that is the
+    /// guarantee that the app's `.srt` export (every whisper segment is one
+    /// line) did not change. The other cases pin how breaks are rejoined.
     func test_cue_text_without_a_line_break_is_returned_untouched() {
         let plain = "no breaks here,  just   spacing "
         XCTAssertEqual(TranscriptFormatter.cueText(plain), plain)
@@ -165,6 +165,9 @@ final class MilaKitTranscriptFormatterTests: XCTestCase {
         XCTAssertEqual(TranscriptFormatter.cueText("x\n  \ny"), "x\ny", "a whitespace-only line is blank to a lenient parser")
         XCTAssertEqual(TranscriptFormatter.cueText("keep  \n  inner"), "keep  \n  inner",
                        "surviving lines keep their own bytes")
+        XCTAssertEqual(TranscriptFormatter.cueText("a\u{2028}\u{2028}b"), "a\nb",
+                       "a generic line splitter breaks on U+2028 too")
+        XCTAssertEqual(TranscriptFormatter.cueText("a\u{2029}b"), "a\nb")
     }
 }
 
