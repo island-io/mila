@@ -1294,11 +1294,11 @@ final class RecordingSummarizerTests: XCTestCase {
     }
 
     /// Picking a language while a summary is already in flight. The language
-    /// was resolved when the run started, and `regenerate` is dropped by the
-    /// in-flight dedup guard — so, left alone, the override would be stored
-    /// and the OLD-language output written over it. The completion must
-    /// notice the override moved, discard its result and run again from the
-    /// live row. Deterministic: the stub parks on a gate the test opens only
+    /// was resolved when the run started, so, left alone, the override would
+    /// be stored and the OLD-language output written over it. The pick's
+    /// `regenerate` hits the in-flight guard and requests a re-run (#318);
+    /// the completion must discard its result and run again from the live
+    /// row. Deterministic: the stub parks on a gate the test opens only
     /// after setting the override.
     func test_summarize_reruns_when_the_summary_language_changes_mid_flight() async throws {
         llm.tool = .claude
@@ -1384,6 +1384,152 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(final.summaryLanguage, "he")
     }
 
+    // MARK: - Regenerate while a run is in flight (#318)
+
+    /// A re-transcription finishing (or "Regenerate summary") while the
+    /// previous transcript's summary is still out used to be dropped by the
+    /// in-flight dedup guard, so the OLD transcript's summary was stored and
+    /// shown as current with nothing left to fix it. The request must cause
+    /// exactly one follow-up, and the interrupted call's output must never
+    /// be stored — not even briefly before the follow-up replaces it — and
+    /// the attempt must be signalled once, by the follow-up.
+    func test_regenerate_during_an_in_flight_run_causes_one_follow_up_and_never_stores_the_stale_output() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var transcripts: [String] = []
+        var summaryAtFollowUp: String??
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            transcripts.append(transcript)
+            if transcripts.count == 1 {
+                await gate.wait()
+                return "STALE"
+            }
+            // The only row in the store is the one under test.
+            summaryAtFollowUp = .some(self.store.recordings.first?.summary)
+            return "FRESH"
+        }
+        var finished = 0
+        summarizer.onSummaryFinished = { _ in finished += 1 }
+
+        let rec = try addRecording(named: "Retranscribed", text: "old transcript")
+        summarizer.summarizeIfNeeded(rec)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+
+        // What `TranscriptionService` does on a re-transcription: persist
+        // the new transcript, then ask for a fresh summary.
+        var updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        updated.fullText = "new transcript"
+        store.update(updated)
+        summarizer.regenerate(updated)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await waitUntil { transcripts.count == 2 }
+        await summarizer.awaitInFlight(rec.id)
+        await settle()
+
+        XCTAssertEqual(transcripts, ["old transcript", "new transcript"],
+                       "exactly one follow-up, summarizing the new transcript")
+        XCTAssertEqual(summaryAtFollowUp, .some(nil),
+                       "the stale output must not be stored while the follow-up runs")
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "FRESH")
+        XCTAssertEqual(finished, 1, "the attempt is signalled once, by the follow-up")
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
+    /// Several regenerate requests during one run coalesce into ONE
+    /// follow-up: the follow-up reads the live row, so a second one would
+    /// summarize the same transcript again and bill for it twice.
+    func test_regenerate_requests_during_one_run_coalesce_into_one_follow_up() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            if calls == 1 { await gate.wait() }
+            return "SUMMARY \(calls)"
+        }
+
+        let rec = try addRecording(named: "Coalesce", text: "a transcript")
+        summarizer.regenerate(rec)
+        XCTAssertTrue(summarizer.isSummarizing(rec.id))
+        summarizer.regenerate(rec)
+        summarizer.regenerate(rec)
+        // A non-force request during the run stays a plain duplicate.
+        summarizer.summarizeIfNeeded(rec)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await waitUntil { calls == 2 }
+        await summarizer.awaitInFlight(rec.id)
+        await settle()
+
+        XCTAssertEqual(calls, 2, "two requests during one run cost exactly one follow-up")
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY 2")
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
+    /// The follow-up re-reads the live row when it starts, so it summarizes
+    /// the transcript as of COMPLETION — not the one the request carried.
+    /// A transcript that changes again between the request and completion
+    /// (e.g. a speaker rename rewriting the text) is the one summarized.
+    func test_follow_up_uses_the_transcript_as_of_completion_not_as_of_the_request() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var transcripts: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            transcripts.append(transcript)
+            if transcripts.count == 1 { await gate.wait() }
+            return "SUMMARY \(transcripts.count)"
+        }
+
+        let rec = try addRecording(named: "Moving", text: "first")
+        summarizer.summarizeIfNeeded(rec)
+        var atRequest = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        atRequest.fullText = "second"
+        store.update(atRequest)
+        summarizer.regenerate(atRequest)
+        var atCompletion = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        atCompletion.fullText = "third"
+        store.update(atCompletion)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await waitUntil { transcripts.count == 2 }
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(transcripts, ["first", "third"])
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY 2")
+    }
+
+    /// A permanent delete between the request and the run's completion must
+    /// not spend an LLM call on a recording that is gone.
+    func test_follow_up_is_not_started_for_a_recording_deleted_mid_flight() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            if calls == 1 { await gate.wait() }
+            return "SUMMARY"
+        }
+        var finished = 0
+        summarizer.onSummaryFinished = { _ in finished += 1 }
+
+        let rec = try addRecording(named: "Doomed", text: "a transcript")
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.regenerate(rec)
+        store.permanentlyDelete(rec)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await settle()
+
+        XCTAssertEqual(calls, 1, "no follow-up for a deleted recording")
+        XCTAssertEqual(finished, 0, "nothing to export for a deleted recording")
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
     /// Re-picking the entry that is already ✓'d — Default while no override
     /// is set, or the language already in force — must neither write the row
     /// nor start an LLM call. The menu's job is to CHANGE the language;
@@ -1460,6 +1606,12 @@ final class RecordingSummarizerTests: XCTestCase {
                             fullText: text)
         store.add(rec)
         return rec
+    }
+
+    /// Give a wrongly scheduled extra follow-up the ticks it would need to
+    /// start, so an "exactly N calls" assertion after it means something.
+    private func settle() async {
+        for _ in 0..<20 { try? await Task.sleep(nanoseconds: 1_000_000) }
     }
 
     /// Spin the main actor until `condition` holds, bounded so a regression
