@@ -1327,7 +1327,7 @@ final class RecordingSummarizerTests: XCTestCase {
         gate.open()
         await summarizer.awaitInFlight(rec.id)
 
-        // The re-run is scheduled one tick later (after `inFlight` clears).
+        // The re-run is started from the interrupted run's completion.
         // Wait for the stub to have been CALLED a second time — monotonic —
         // rather than for `isSummarizing`, which may already have flipped
         // back to false if the re-run completed before this continuation
@@ -1423,10 +1423,12 @@ final class RecordingSummarizerTests: XCTestCase {
         summarizer.regenerate(updated)
 
         gate.open()
+        // The follow-up is started synchronously in the interrupted run's
+        // completion, so awaiting the run in flight twice — the stale one,
+        // then the follow-up — is deterministic, and nothing can be left
+        // scheduled once the second returns.
         await summarizer.awaitInFlight(rec.id)
-        await waitUntil { transcripts.count == 2 }
         await summarizer.awaitInFlight(rec.id)
-        await settle()
 
         XCTAssertEqual(transcripts, ["old transcript", "new transcript"],
                        "exactly one follow-up, summarizing the new transcript")
@@ -1460,9 +1462,7 @@ final class RecordingSummarizerTests: XCTestCase {
 
         gate.open()
         await summarizer.awaitInFlight(rec.id)
-        await waitUntil { calls == 2 }
         await summarizer.awaitInFlight(rec.id)
-        await settle()
 
         XCTAssertEqual(calls, 2, "two requests during one run cost exactly one follow-up")
         XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY 2")
@@ -1495,7 +1495,6 @@ final class RecordingSummarizerTests: XCTestCase {
 
         gate.open()
         await summarizer.awaitInFlight(rec.id)
-        await waitUntil { transcripts.count == 2 }
         await summarizer.awaitInFlight(rec.id)
 
         XCTAssertEqual(transcripts, ["first", "third"])
@@ -1523,10 +1522,68 @@ final class RecordingSummarizerTests: XCTestCase {
 
         gate.open()
         await summarizer.awaitInFlight(rec.id)
-        await settle()
 
         XCTAssertEqual(calls, 1, "no follow-up for a deleted recording")
         XCTAssertEqual(finished, 0, "nothing to export for a deleted recording")
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
+    /// The #318 case as `onTranscriptionCompleted` actually routes it when
+    /// the re-transcribed row had NO summary yet (its first one is the run
+    /// in flight): `wasRetranscription` is false, so the new transcript
+    /// arrives through `summarizeIfNeeded`, not `regenerate`. A non-force
+    /// request carrying a different transcript is not a duplicate; one with
+    /// the same transcript (a backfill sweep) still is.
+    func test_non_force_request_with_a_new_transcript_during_a_run_causes_a_follow_up() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var transcripts: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            transcripts.append(transcript)
+            if transcripts.count == 1 { await gate.wait() }
+            return "SUMMARY of \(transcript)"
+        }
+
+        let rec = try addRecording(named: "FirstPass", text: "old transcript")
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.summarizeIfNeeded(rec)  // same transcript: a true duplicate
+        var updated = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        updated.fullText = "new transcript"
+        store.update(updated)
+        summarizer.summarizeIfNeeded(updated)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(transcripts, ["old transcript", "new transcript"])
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary,
+                       "SUMMARY of new transcript")
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
+    /// A row moved to Recently Deleted while its run was out gets no
+    /// follow-up call: summarizer spend on trashed rows is skipped
+    /// elsewhere too.
+    func test_follow_up_is_not_started_for_a_recording_trashed_mid_flight() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            if calls == 1 { await gate.wait() }
+            return "SUMMARY"
+        }
+
+        let rec = try addRecording(named: "Trashed", text: "a transcript")
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.regenerate(rec)
+        store.softDelete(rec)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(calls, 1, "no follow-up for a trashed recording")
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
     }
 
@@ -1606,12 +1663,6 @@ final class RecordingSummarizerTests: XCTestCase {
                             fullText: text)
         store.add(rec)
         return rec
-    }
-
-    /// Give a wrongly scheduled extra follow-up the ticks it would need to
-    /// start, so an "exactly N calls" assertion after it means something.
-    private func settle() async {
-        for _ in 0..<20 { try? await Task.sleep(nanoseconds: 1_000_000) }
     }
 
     /// Spin the main actor until `condition` holds, bounded so a regression
