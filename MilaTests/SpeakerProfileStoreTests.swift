@@ -305,6 +305,29 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertTrue(store.hasStoredProfilesOnDisk)
     }
 
+    /// Memory is not always the file: `load()` leaves a file it cannot
+    /// parse on disk, untouched, for the user to repair. A restore must put
+    /// THOSE bytes back, not re-encode the empty list memory holds, or a
+    /// failed import would replace the user's profiles with `[]`.
+    func test_restore_puts_back_a_file_that_load_could_not_parse() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let damaged = Data("[{\"name\": \"Alice\", \"embedding\": [1, 0,".utf8)
+        try damaged.write(to: fileURL)
+        let store = makeStore(in: dir)
+        XCTAssertTrue(store.profiles.isEmpty, "the file does not parse")
+
+        let snapshot = store.snapshot()
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+        XCTAssertNotEqual(try Data(contentsOf: fileURL), damaged)
+        XCTAssertTrue(store.restore(snapshot))
+        XCTAssertTrue(store.profiles.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: fileURL), damaged)
+        XCTAssertTrue(store.hasStoredProfilesOnDisk)
+    }
+
     // MARK: - Deletion observers
 
     /// Deleting is a privacy action, and the store is not the only place the

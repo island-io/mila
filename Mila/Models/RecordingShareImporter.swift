@@ -644,7 +644,9 @@ final class RecordingShareImporter: ObservableObject {
             // and removing it leaves no trace of the attempt. Neither may
             // the voice profiles: they were written on behalf of a
             // recording that now does not exist.
-            if let profilesBefore { profileStore?.restore(profilesBefore) }
+            if let profilesBefore, let profileStore, !profileStore.restore(profilesBefore) {
+                log.error("import of \(recording.id, privacy: .public) failed and its voice profiles could not be rolled back on disk")
+            }
             try? fileManager.removeItem(at: destination)
             finish(pending, error: ImportError.saveFailed)
             return

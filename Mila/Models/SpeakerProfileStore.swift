@@ -564,12 +564,18 @@ final class SpeakerProfileStore: ObservableObject {
     /// The store's state at one moment, for `restore(_:)`. Opaque on
     /// purpose: only a snapshot this store handed out can be restored.
     struct Snapshot {
+        fileprivate enum File {
+            case absent
+            case bytes(Data)
+            /// It exists but could not be read; `restore` leaves it alone.
+            case unreadable
+        }
         fileprivate let profiles: [VoiceProfile]
-        fileprivate let hadFileOnDisk: Bool
+        fileprivate let file: File
     }
 
-    /// Capture the profiles in memory and whether `speaker-profiles.json`
-    /// exists, so a caller that writes to this store ahead of a commit
+    /// Capture the profiles in memory and `speaker-profiles.json` as it is
+    /// on disk, so a caller that writes to this store ahead of a commit
     /// point it does not own can take the writes back.
     ///
     /// `RecordingShareImporter.confirm()` is that caller: it folds a
@@ -578,33 +584,61 @@ final class SpeakerProfileStore: ObservableObject {
     /// `recordings.json` write can still fail. Without this, a failed
     /// import left centroids moved, new profiles created and import tokens
     /// recorded for a recording that does not exist (#319).
+    ///
+    /// The file is captured as raw bytes, read from disk now rather than
+    /// re-encoded from memory or inferred from `hasStoredProfilesOnDisk`:
+    /// memory is not always the file. `load()` drops entries it cannot use
+    /// and leaves a file it cannot parse on disk for the user to repair,
+    /// and a failed `save()` leaves memory ahead of it. Re-encoding would
+    /// overwrite either of those with what memory happened to hold.
     func snapshot() -> Snapshot {
-        Snapshot(profiles: profiles, hadFileOnDisk: hasStoredProfilesOnDisk)
+        let file: Snapshot.File
+        if !fileManager.fileExists(atPath: storeURL.path) {
+            file = .absent
+        } else if let data = try? Data(contentsOf: storeURL) {
+            file = .bytes(data)
+        } else {
+            file = .unreadable
+        }
+        return Snapshot(profiles: profiles, file: file)
     }
 
-    /// Put the store back as `snapshot()` found it, in memory and on disk.
+    /// Put the store back as `snapshot()` found it: the same profiles in
+    /// memory and the same bytes on disk — or no file, if there was none
+    /// (Settings reads the file's existence as "voice profiles from an
+    /// earlier opt-in are still stored" and would offer to delete an
+    /// empty set).
     ///
-    /// The file is rewritten from the snapshot through `save()`, behind its
-    /// `isEnabled` gate — the same bytes as before, since the encoder is
-    /// deterministic over the same values. When there was no file at the
-    /// snapshot, the file is removed instead of being written as `[]`:
-    /// Settings reads its existence as "voice profiles from an earlier
-    /// opt-in are still stored" and would offer to delete an empty set.
-    func restore(_ snapshot: Snapshot) {
+    /// No deletion observers fire for the profiles this takes away. That
+    /// is only sound because the caller restores in the same synchronous
+    /// main-actor run that wrote them, so nothing can have seeded from
+    /// them in between; a caller that suspends between the two must not
+    /// use this.
+    ///
+    /// Returns whether the file was put back. On `false` the error is
+    /// logged and the disk may still hold the writes being undone.
+    @discardableResult
+    func restore(_ snapshot: Snapshot) -> Bool {
         profiles = snapshot.profiles
-        if snapshot.hadFileOnDisk {
-            save()
-        } else {
-            do {
+        var restored = true
+        do {
+            switch snapshot.file {
+            case .absent:
                 if fileManager.fileExists(atPath: storeURL.path) {
                     try fileManager.removeItem(at: storeURL)
                 }
-            } catch {
-                profileLog.log("restore: could not remove the file written since the snapshot: \(error.localizedDescription, privacy: .public)")
+            case .bytes(let data):
+                try data.write(to: storeURL, options: .atomic)
+            case .unreadable:
+                break
             }
-            hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        } catch {
+            restored = false
+            profileLog.error("restore: could not put speaker-profiles.json back: \(error.localizedDescription, privacy: .public)")
         }
+        hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
         profileLog.log("restored \(snapshot.profiles.count) voice profiles from a snapshot")
+        return restored
     }
 
     /// Rename a profile.
