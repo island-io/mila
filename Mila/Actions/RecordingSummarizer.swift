@@ -69,26 +69,36 @@ final class RecordingSummarizer: ObservableObject {
     /// spinner on the summary section while a call is in flight (used by
     /// the "Regenerate summary" affordance + backfill).
     @Published private(set) var inFlightIDs: Set<UUID> = []
-    private var inFlight: [UUID: Task<Void, Never>] = [:]
+    private var inFlight: [UUID: InFlightRun] = [:]
 
-    /// Recordings whose in-flight run was made stale by a request that
-    /// arrived while it was out: any `force` request (`regenerate` — a
-    /// re-transcription of a summarized row, "Regenerate summary", a
-    /// summary-language pick), or a non-force one carrying a different
-    /// transcript than the run was started with (a re-transcription that
-    /// finished before the row's FIRST summary came back, which
-    /// `onTranscriptionCompleted` routes through `summarizeIfNeeded`).
-    /// Instead of dropping the request (which left the OLD transcript's
-    /// summary stored as current, #318) the run's completion discards its
-    /// output and starts one follow-up from the live row — see
-    /// `consumeRerunRequest`. A set, so any number of requests during one
-    /// run coalesce into one follow-up.
-    private var rerunRequested: Set<UUID> = []
-
-    /// The transcript each in-flight run was started with, so a non-force
-    /// request can tell a true duplicate (same text: a backfill sweep, a
-    /// re-enqueue) from a new transcript.
-    private var inFlightTranscripts: [UUID: String] = [:]
+    /// One in-flight summary call, with the snapshot it was built from.
+    ///
+    /// The snapshot is how a completion tells whether its output is still a
+    /// summary of the recording (#318). A re-transcription persisting a new
+    /// transcript, a summary-language pick, a `.milashare` re-import — any of
+    /// them can change the row while the call is out, and requests that
+    /// arrive meanwhile are dropped by the dedup guard. So instead of trusting
+    /// requests, the completion compares the LIVE row's `fullText` and
+    /// `summaryLanguage` against the snapshot: if either moved, the output is
+    /// discarded and one follow-up runs from the live row. That replaces
+    /// #313's language-only `replayIfSummaryLanguageChanged` rather than
+    /// adding a second mechanism next to it.
+    private struct InFlightRun {
+        /// Identifies THIS run, so a completion only tears down its own
+        /// state: after `cancel(recordingID:)` a newer run for the same id can
+        /// start while the cancelled task is still unwinding.
+        let token: UUID
+        let task: Task<Void, Never>
+        let transcript: String
+        let summaryLanguage: String?
+        /// Starts as the run's own `force`; set by a `regenerate` that hits
+        /// the dedup guard. Such a request is served by THIS run — its output
+        /// is stored with force semantics (overwriting a summary another path
+        /// stored meanwhile) — rather than paying for a second identical
+        /// call. If the snapshot went stale as well, the follow-up is a
+        /// `regenerate` too.
+        var force: Bool
+    }
 
     /// Fired once per summarize attempt, after the recording's summary state
     /// is final — i.e. after a summary was generated, or synchronously when
@@ -105,7 +115,7 @@ final class RecordingSummarizer: ObservableObject {
     /// surfaces here as a thrown `CancellationError`).
     ///
     /// Exactly one of the branches below fires it per attempt — or hands the
-    /// attempt off to a re-run (`consumeRerunRequest`), whose own
+    /// attempt off to a re-run (`isStale`), whose own
     /// completion fires instead — and each one returns immediately
     /// afterwards, so a single `runSummary` can never fire twice. Anything
     /// the observer does is its own problem: this is a plain
@@ -234,8 +244,8 @@ final class RecordingSummarizer: ObservableObject {
     /// entry in a `defer`, so by the time this returns the store write (if any)
     /// has already happened.
     func awaitInFlight(_ recordingID: UUID) async {
-        guard let task = inFlight[recordingID] else { return }
-        await task.value
+        guard let run = inFlight[recordingID] else { return }
+        await run.task.value
     }
 
     // MARK: - Public API
@@ -243,7 +253,9 @@ final class RecordingSummarizer: ObservableObject {
     /// Kick off a background summary for `recording` if the gate above
     /// allows. Returns immediately — the caller doesn't await the LLM.
     /// Idempotent: a second call while one is in flight is a no-op so a
-    /// re-enqueue from the transcription path can't double-bill.
+    /// re-enqueue from the transcription path can't double-bill. If the
+    /// transcript changed meanwhile, the in-flight run's completion notices
+    /// and re-runs (`InFlightRun`).
     func summarizeIfNeeded(_ recording: Recording) {
         guard shouldSummarize(recording) else {
             logSkip(recording, force: false)
@@ -264,9 +276,10 @@ final class RecordingSummarizer: ObservableObject {
     ///
     /// Still respects the two hard requirements: LLM must be configured,
     /// transcript must be non-empty. Returns immediately. A call while this
-    /// recording's run is in flight is not dropped: it marks the run stale,
-    /// and the run's completion starts one follow-up from the live row
-    /// (`rerunRequested`).
+    /// recording's run is in flight is not dropped: that run's output is
+    /// stored with force semantics, and if the transcript or language moved
+    /// meanwhile it is discarded for a follow-up regenerate from the live row
+    /// (`InFlightRun`).
     func regenerate(_ recording: Recording) {
         guard llmSettings.isConfigured else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — LLM not configured")
@@ -373,10 +386,8 @@ final class RecordingSummarizer: ObservableObject {
     /// call on output that has nowhere to land.
     func cancel(recordingID: UUID) {
         backfillQueue.removeAll { $0 == recordingID }
-        rerunRequested.remove(recordingID)
-        inFlightTranscripts[recordingID] = nil
-        if let task = inFlight.removeValue(forKey: recordingID) {
-            task.cancel()
+        if let run = inFlight.removeValue(forKey: recordingID) {
+            run.task.cancel()
             inFlightIDs.remove(recordingID)
         }
     }
@@ -405,18 +416,15 @@ final class RecordingSummarizer: ObservableObject {
     /// when the CLI returns.
     private func runSummary(for recording: Recording, force: Bool) {
         let id = recording.id
-        // Dedup: a second non-force request for the SAME transcript (a
-        // re-enqueue from the transcription path, a backfill sweep) while one
-        // is in flight is a no-op so it can't double-bill. A `force` request,
-        // or one carrying a different transcript, is NOT a duplicate — it
-        // says the in-flight run's snapshot is stale (new transcript,
-        // explicit regenerate, new summary language) — so it is recorded and
-        // served by ONE follow-up when the run completes, however many
-        // arrive in the meantime (#318).
+        // Dedup: a second request while one is in flight never starts a
+        // second overlapping call, so a re-enqueue can't double-bill. It is
+        // not lost either: the completion re-runs if the row's transcript or
+        // language moved meanwhile (`InFlightRun`), and a `force` request
+        // makes the in-flight run store with force semantics.
         guard inFlight[id] == nil else {
-            if force || recording.fullText != inFlightTranscripts[id] {
-                rerunRequested.insert(id)
-                summarizerLog.log("\(self.shortID(id), privacy: .public): already in flight — re-run requested")
+            if force, inFlight[id]?.force == false {
+                inFlight[id]?.force = true
+                summarizerLog.log("\(self.shortID(id), privacy: .public): already in flight — regenerate folded into it")
             } else {
                 summarizerLog.log("\(self.shortID(id), privacy: .public): skipped — already in flight")
             }
@@ -468,15 +476,15 @@ final class RecordingSummarizer: ObservableObject {
         let runLLM = self.runLLM
 
         inFlightIDs.insert(id)
-        inFlightTranscripts[id] = transcript
+        let token = UUID()
         // `language` is the resolved keyword ("Hebrew"/"English"), never user
         // text, so it is safe as a `.public` field — and it is what makes a
         // "why is this summary in the wrong language" report diagnosable.
         summarizerLog.log("started \(self.shortID(id), privacy: .public) transcript=\(transcript.count, privacy: .public)c force=\(force, privacy: .public) language=\(promptLanguageName, privacy: .public) override=\(hasLanguageOverride, privacy: .public)")
 
         let task = Task { @MainActor [weak self] in
-            // Set by whichever outcome below hands this attempt off to a
-            // follow-up (`consumeRerunRequest`); acted on in the `defer`.
+            // Set by whichever outcome below found its snapshot stale
+            // (`isStale`); acted on in the `defer`.
             var followUp = false
             defer {
                 // `return` cannot transfer control out of a defer body in
@@ -485,22 +493,27 @@ final class RecordingSummarizer: ObservableObject {
                 // has already deinit'd, there's nothing to clean up —
                 // the dictionary and the publisher set went with it.
                 if let self {
-                    self.inFlight[id] = nil
-                    self.inFlightIDs.remove(id)
-                    self.inFlightTranscripts[id] = nil
-                    // Whatever ended this run, a re-run request made during
-                    // it is now spent: served by the follow-up below, or moot
-                    // because the row is gone. Never left to discard the
-                    // output of some LATER run.
-                    self.rerunRequested.remove(id)
-                    // Started HERE, synchronously, once `inFlight` is clear
-                    // and BEFORE the backfill pump: the follow-up takes the
-                    // slot this run just freed instead of starting on top of
-                    // a backfill candidate that took it, so `maxConcurrent`
-                    // holds. Re-read now, so it summarizes the transcript
-                    // and language override as of completion.
-                    if followUp, let live = self.liveRecording(id) {
-                        self.regenerate(live)
+                    // Only this run's own state: after `cancel` a newer run
+                    // may own the id.
+                    if let run = self.inFlight[id], run.token == token {
+                        self.inFlight[id] = nil
+                        self.inFlightIDs.remove(id)
+                        // Started HERE, synchronously, once `inFlight` is
+                        // clear and BEFORE the backfill pump: the follow-up
+                        // takes the slot this run just freed instead of
+                        // starting on top of a backfill candidate that took
+                        // it, so `maxConcurrent` holds. Re-read now, so it
+                        // summarizes the row as of completion; a row deleted
+                        // or moved to Recently Deleted gets no LLM call.
+                        // Non-force follow-ups go back through the normal
+                        // gate (auto-summary may have been switched off).
+                        if followUp, let live = self.liveRecording(id), !live.isTrashed {
+                            if run.force {
+                                self.regenerate(live)
+                            } else {
+                                self.summarizeIfNeeded(live)
+                            }
+                        }
                     }
                     // After each completion, try to pull the next
                     // queued backfill candidate in.
@@ -542,10 +555,10 @@ final class RecordingSummarizer: ObservableObject {
                     // `.public` log field (`bugbot-rules/no-user-content-in-logs.md`).
                     summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): no summary parsed origin=\(origin.rawValue, privacy: .public) output=\(raw.count, privacy: .public)c")
                     guard let self else { return }
-                    // A regenerate requested while this call was out gets its
-                    // re-run whatever became of the call it interrupted; the
-                    // re-run signals in this attempt's place.
-                    if self.consumeRerunRequest(id) { followUp = true; return }
+                    // A row that changed while this call was out gets its
+                    // re-run whatever became of the call; the re-run signals
+                    // in this attempt's place.
+                    if self.isStale(id, token: token) { followUp = true; return }
                     // No summary came back — let a pending export fall back to
                     // the transcript rather than waiting forever. Skip the
                     // signal entirely if the recording went away mid-flight.
@@ -564,14 +577,15 @@ final class RecordingSummarizer: ObservableObject {
                     return
                 }
                 // Checked before the "a summary is already there" skip below,
-                // and before storing: a regenerate requested while this call
-                // was out means its snapshot (transcript or language) is
-                // stale, so its output must not be shown as current even
-                // briefly — nor survive a failed follow-up.
-                if self.consumeRerunRequest(id) { followUp = true; return }
+                // and before storing: output built from a snapshot that is no
+                // longer the row's transcript or language must not be shown
+                // as current even briefly, nor survive a failed follow-up.
+                if self.isStale(id, token: token) { followUp = true; return }
                 let existing = (current.summary ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !force, !existing.isEmpty {
+                // A `regenerate` folded into this run upgrades it.
+                let forceNow = self.inFlight[id].map { $0.token == token && $0.force } ?? false
+                if !force, !forceNow, !existing.isEmpty {
                     summarizerLog.log("skipped \(self.shortID(id), privacy: .public): a summary landed mid-flight")
                     // A summary is present (just from another path) — the
                     // recording is ready to export.
@@ -607,12 +621,12 @@ final class RecordingSummarizer: ObservableObject {
                     \(LLMRunnerError.logMessage(for: error), privacy: .public)
                     """)
                 guard let self else { return }
-                // A regenerate requested while this call was out gets its
-                // re-run whatever became of the call it interrupted — a
-                // timeout at the wrong moment must not leave a new transcript
-                // or a persisted language override never honoured. The re-run
-                // signals in this attempt's place.
-                if self.consumeRerunRequest(id) { followUp = true; return }
+                // A row that changed while this call was out gets its re-run
+                // whatever became of the call — a timeout at the wrong moment
+                // must not leave a new transcript or a persisted language
+                // override never honoured. The re-run signals in this
+                // attempt's place.
+                if self.isStale(id, token: token) { followUp = true; return }
                 // Failed generation — signal so a pending export can still
                 // write the transcript fallback. A permanent delete cancels
                 // the task, which arrives here as a CancellationError, so the
@@ -622,37 +636,38 @@ final class RecordingSummarizer: ObservableObject {
                 }
             }
         }
-        inFlight[id] = task
+        inFlight[id] = InFlightRun(token: token,
+                                   task: task,
+                                   transcript: transcript,
+                                   summaryLanguage: recording.summaryLanguage,
+                                   force: force)
     }
 
-    /// A request made `id`'s in-flight run stale while it was out (see
-    /// `rerunRequested`): a re-transcription finishing, "Regenerate
-    /// summary", or a summary-language pick (`setSummaryLanguage`
-    /// regenerates). Whatever the run produced — a summary of the OLD
-    /// transcript or in the OLD language, nothing parseable, or an error —
-    /// gets one re-run. Called from every completion outcome, not just
-    /// success: the request is a user action (or a new transcript) and gets
-    /// its re-run regardless of what became of the call it interrupted.
-    /// Returns true when the caller must hand off — NOT store its output (a
-    /// summary of the old transcript must not be shown as current even
-    /// briefly, nor survive a failed follow-up) and NOT fire
-    /// `onSummaryFinished`; the task's `defer` then starts the follow-up and
-    /// the follow-up's own completion signals.
+    /// True when the row this run (`token`) was built from has moved on: its
+    /// transcript or its per-recording summary language differs from the
+    /// run's snapshot (`InFlightRun`). Called from every completion outcome,
+    /// not just success — a re-transcription or a language pick gets its
+    /// re-run regardless of what became of the call it interrupted. When it
+    /// returns true the caller must hand off: NOT store its output and NOT
+    /// fire `onSummaryFinished`; the task's `defer` starts the follow-up and
+    /// the follow-up's own completion signals. A row moved to Recently
+    /// Deleted still discards (the stale summary must not come back on
+    /// restore) but gets no follow-up call; a row that is gone is not stale,
+    /// so nothing is signalled for it.
     ///
-    /// The flag is cleared in the `defer` on every path, so any number of
-    /// requests during one run coalesce into one follow-up, which cannot
-    /// chain unless another request arrives while IT is out. No follow-up
-    /// for a row that is gone (a permanent delete must not spend an LLM
-    /// call) or in Recently Deleted (`TranscriptionService` does not spend
-    /// summarizer calls on trashed rows either). This replaces #313's
-    /// language-only comparison: a pick's regenerate sets the same flag, so
-    /// it is one case of this rather than a second mechanism.
-    private func consumeRerunRequest(_ id: UUID) -> Bool {
-        guard rerunRequested.contains(id),
-              let live = liveRecording(id), !live.isTrashed else {
+    /// Several changes during one run therefore cost one follow-up, built
+    /// from the row as of completion; it can only chain if the row changes
+    /// again while IT is out. A GLOBAL setting flip mid-flight keeps the
+    /// result, as it always has.
+    private func isStale(_ id: UUID, token: UUID) -> Bool {
+        guard let run = inFlight[id], run.token == token,
+              let live = liveRecording(id) else {
             return false
         }
-        summarizerLog.log("discarded \(self.shortID(id), privacy: .public): re-run requested mid-flight — re-running from the live row")
+        guard live.fullText != run.transcript || live.summaryLanguage != run.summaryLanguage else {
+            return false
+        }
+        summarizerLog.log("discarded \(self.shortID(id), privacy: .public): transcript or summary language changed mid-flight — re-running from the live row")
         return true
     }
 

@@ -1262,7 +1262,9 @@ final class TranscriptionService: ObservableObject {
                     TranscriptExporter.writeSRT(for: persisted, in: store.recordingsDirectory)
                     announceCompletion(persisted,
                                        clearedSpeakerNames: clearedSpeakerNames,
-                                       wasRetranscription: hadSummaryBeforeRun)
+                                       wasRetranscription: Self.isRetranscription(
+                                           hadSummaryBeforeRun: hadSummaryBeforeRun,
+                                           persisted: persisted))
                 }
                 // Shrink storage: transcode the WAV to m4a now that
                 // transcription + diarization are done reading it. Runs in
@@ -1407,6 +1409,18 @@ final class TranscriptionService: ObservableObject {
     ///
     /// `TranscriptionServiceSpeakerCarryTests` pins the order and the payload
     /// through a real pass.
+    /// Whether the completion hook must force-regenerate the summary. True
+    /// when the row had a summary when the pass started — and ALSO when it
+    /// has one now, at completion: a summary stored while the pass ran (the
+    /// row's first summary, still in flight when this re-transcription was
+    /// queued) was built from the transcript this pass just replaced.
+    /// `summarizeIfNeeded` would skip such a row as "already summarized" and
+    /// leave the old transcript's summary showing as current (#318).
+    static func isRetranscription(hadSummaryBeforeRun: Bool, persisted: Recording) -> Bool {
+        hadSummaryBeforeRun
+            || !(persisted.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func announceCompletion(_ persisted: Recording,
                             clearedSpeakerNames: [String: String],
                             wasRetranscription: Bool) {

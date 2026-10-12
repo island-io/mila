@@ -1439,40 +1439,78 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
     }
 
-    /// Several regenerate requests during one run coalesce into ONE
-    /// follow-up: the follow-up reads the live row, so a second one would
-    /// summarize the same transcript again and bill for it twice.
-    func test_regenerate_requests_during_one_run_coalesce_into_one_follow_up() async throws {
+    /// Several changes during one run — two re-transcriptions and a
+    /// language pick, each followed by its request — coalesce into ONE
+    /// follow-up: it reads the live row, so a second one would summarize the
+    /// same row again and bill for it twice.
+    func test_changes_during_one_run_coalesce_into_one_follow_up() async throws {
         llm.tool = .claude
         let gate = TestGate()
-        var calls = 0
-        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
-            calls += 1
-            if calls == 1 { await gate.wait() }
-            return "SUMMARY \(calls)"
+        var transcripts: [String] = []
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            transcripts.append(transcript)
+            if transcripts.count == 1 { await gate.wait() }
+            return "SUMMARY \(transcripts.count)"
         }
 
-        let rec = try addRecording(named: "Coalesce", text: "a transcript")
+        let rec = try addRecording(named: "Coalesce", text: "v1")
         summarizer.regenerate(rec)
         XCTAssertTrue(summarizer.isSummarizing(rec.id))
-        summarizer.regenerate(rec)
-        summarizer.regenerate(rec)
-        // A non-force request during the run stays a plain duplicate.
+        for text in ["v2", "v3"] {
+            var row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+            row.fullText = text
+            store.update(row)
+            summarizer.regenerate(row)
+        }
+        summarizer.setSummaryLanguage(.hebrew, for: rec.id)
         summarizer.summarizeIfNeeded(rec)
 
         gate.open()
         await summarizer.awaitInFlight(rec.id)
         await summarizer.awaitInFlight(rec.id)
 
-        XCTAssertEqual(calls, 2, "two requests during one run cost exactly one follow-up")
+        XCTAssertEqual(transcripts, ["v1", "v3"], "one follow-up, from the row as of completion")
         XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY 2")
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
+    /// "Regenerate summary" while a run is out on the SAME transcript and
+    /// language is served by that run instead of paying for a second
+    /// identical call: the run's output is stored with force semantics, so it
+    /// replaces a summary another path stored meanwhile.
+    func test_regenerate_with_unchanged_inputs_is_folded_into_the_in_flight_run() async throws {
+        llm.tool = .claude
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            if calls == 1 { await gate.wait() }
+            return "FROM THE RUN"
+        }
+        var finished = 0
+        summarizer.onSummaryFinished = { _ in finished += 1 }
+
+        let rec = try addRecording(named: "Fold", text: "a transcript")
+        summarizer.summarizeIfNeeded(rec)
+        var row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        row.summary = "stored by another path"
+        store.update(row)
+        summarizer.regenerate(row)
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(calls, 1, "no second call for identical inputs")
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "FROM THE RUN",
+                       "the folded-in regenerate overwrites, as a regenerate does")
+        XCTAssertEqual(finished, 1)
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
     }
 
     /// The follow-up re-reads the live row when it starts, so it summarizes
     /// the transcript as of COMPLETION — not the one the request carried.
-    /// A transcript that changes again between the request and completion
-    /// (e.g. a speaker rename rewriting the text) is the one summarized.
+    /// A transcript that changes again between the request and completion,
+    /// with no request of its own, is the one summarized.
     func test_follow_up_uses_the_transcript_as_of_completion_not_as_of_the_request() async throws {
         llm.tool = .claude
         let gate = TestGate()
@@ -1531,9 +1569,9 @@ final class RecordingSummarizerTests: XCTestCase {
     /// The #318 case as `onTranscriptionCompleted` actually routes it when
     /// the re-transcribed row had NO summary yet (its first one is the run
     /// in flight): `wasRetranscription` is false, so the new transcript
-    /// arrives through `summarizeIfNeeded`, not `regenerate`. A non-force
-    /// request carrying a different transcript is not a duplicate; one with
-    /// the same transcript (a backfill sweep) still is.
+    /// arrives through `summarizeIfNeeded`, not `regenerate`. The completion
+    /// still sees the transcript moved, and the follow-up goes back through
+    /// the normal (non-force) gate.
     func test_non_force_request_with_a_new_transcript_during_a_run_causes_a_follow_up() async throws {
         llm.tool = .claude
         let gate = TestGate()
@@ -1562,9 +1600,9 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
     }
 
-    /// A row moved to Recently Deleted while its run was out gets no
-    /// follow-up call: summarizer spend on trashed rows is skipped
-    /// elsewhere too.
+    /// A row re-transcribed and then moved to Recently Deleted while its run
+    /// was out gets no follow-up call (summarizer spend on trashed rows is
+    /// skipped elsewhere too), and the stale output is still discarded.
     func test_follow_up_is_not_started_for_a_recording_trashed_mid_flight() async throws {
         llm.tool = .claude
         let gate = TestGate()
@@ -1575,16 +1613,36 @@ final class RecordingSummarizerTests: XCTestCase {
             return "SUMMARY"
         }
 
-        let rec = try addRecording(named: "Trashed", text: "a transcript")
+        let rec = try addRecording(named: "Trashed", text: "old transcript")
         summarizer.summarizeIfNeeded(rec)
-        summarizer.regenerate(rec)
-        store.softDelete(rec)
+        var row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        row.fullText = "new transcript"
+        store.update(row)
+        summarizer.summarizeIfNeeded(row)
+        store.softDelete(row)
 
         gate.open()
         await summarizer.awaitInFlight(rec.id)
 
         XCTAssertEqual(calls, 1, "no follow-up for a trashed recording")
+        XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summary,
+                     "the stale output must not be stored, or a restore brings it back")
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
+    }
+
+    /// The other half of #318: when the row's FIRST summary finishes while a
+    /// re-transcription is still running, the pass started with no summary,
+    /// but completes with one built from the transcript it just replaced.
+    /// That must still count as a re-transcription, so the hook regenerates
+    /// instead of `summarizeIfNeeded` skipping the row as summarized.
+    func test_a_summary_stored_mid_pass_makes_the_completion_a_retranscription() {
+        var row = Recording(title: "R", source: .microphone, audioFileName: "r.wav", fullText: "new")
+        XCTAssertFalse(TranscriptionService.isRetranscription(hadSummaryBeforeRun: false, persisted: row))
+        XCTAssertTrue(TranscriptionService.isRetranscription(hadSummaryBeforeRun: true, persisted: row))
+        row.summary = "  "
+        XCTAssertFalse(TranscriptionService.isRetranscription(hadSummaryBeforeRun: false, persisted: row))
+        row.summary = "summary of the old transcript"
+        XCTAssertTrue(TranscriptionService.isRetranscription(hadSummaryBeforeRun: false, persisted: row))
     }
 
     /// Re-picking the entry that is already ✓'d — Default while no override
