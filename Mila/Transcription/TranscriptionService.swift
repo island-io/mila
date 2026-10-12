@@ -1394,6 +1394,18 @@ final class TranscriptionService: ObservableObject {
         mergePassResult(id: recording.id) { $0.status = .failed }
     }
 
+    /// Whether the completion hook must force-regenerate the summary. True
+    /// when the row had a summary when the pass started — and ALSO when it
+    /// has one now, at completion: a summary stored while the pass ran (the
+    /// row's first summary, still in flight when this re-transcription was
+    /// queued) was built from the transcript this pass just replaced.
+    /// `summarizeIfNeeded` would skip such a row as "already summarized" and
+    /// leave the old transcript's summary showing as current (#318).
+    static func isRetranscription(hadSummaryBeforeRun: Bool, persisted: Recording) -> Bool {
+        hadSummaryBeforeRun
+            || !(persisted.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Tell the app a pass finished: the names it cleared first, the
     /// completion second.
     ///
@@ -1409,18 +1421,6 @@ final class TranscriptionService: ObservableObject {
     ///
     /// `TranscriptionServiceSpeakerCarryTests` pins the order and the payload
     /// through a real pass.
-    /// Whether the completion hook must force-regenerate the summary. True
-    /// when the row had a summary when the pass started — and ALSO when it
-    /// has one now, at completion: a summary stored while the pass ran (the
-    /// row's first summary, still in flight when this re-transcription was
-    /// queued) was built from the transcript this pass just replaced.
-    /// `summarizeIfNeeded` would skip such a row as "already summarized" and
-    /// leave the old transcript's summary showing as current (#318).
-    static func isRetranscription(hadSummaryBeforeRun: Bool, persisted: Recording) -> Bool {
-        hadSummaryBeforeRun
-            || !(persisted.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
     func announceCompletion(_ persisted: Recording,
                             clearedSpeakerNames: [String: String],
                             wasRetranscription: Bool) {
