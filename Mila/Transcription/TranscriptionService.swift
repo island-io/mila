@@ -1470,6 +1470,15 @@ final class TranscriptionService: ObservableObject {
     private func mergePassResult(id: UUID, _ apply: (inout Recording) -> Void) -> Recording? {
         guard var live = store.recordings.first(where: { $0.id == id }) else { return nil }
         apply(&live)
+        // A pass that settled the row ended the re-run, so what the row looked
+        // like before it (`Recording.retranscriptionPriorState`) is no longer
+        // anything a stop could restore — a stop needs a `.pending`/`.running`
+        // row. Cleared here, where every pass result goes through, rather than
+        // at each of the four terminal writes. The `.running` write at the
+        // start of a pass leaves it alone: the user may still stop that run.
+        if live.status == .completed || live.status == .failed {
+            live.retranscriptionPriorState = nil
+        }
         store.update(live)
         return live
     }

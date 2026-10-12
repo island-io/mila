@@ -320,22 +320,6 @@ final class RecordingStore: ObservableObject {
     /// `compressRecordingAudio` runs overlapping for the same id.
     private var compressingIDs: Set<UUID> = []
 
-    /// What a recording that already held a transcript looked like before
-    /// `prepareForRetranscription` set up a re-run of it — so a re-run the
-    /// user stops (`markTranscriptionDeferred`) is undone exactly: the kept
-    /// transcript goes back to the status, language and model that describe
-    /// it, not the ones of the run that never happened (a stopped
-    /// "Re-transcribe in Hebrew" must not leave English text labelled Hebrew).
-    /// In memory only — a re-run interrupted by a relaunch loses it and is
-    /// treated as an ordinary stopped transcription. A stale entry is
-    /// harmless: only a stop consumes it, and every run a user can stop on a
-    /// transcribed row starts with `prepareForRetranscription`, which
-    /// overwrites it.
-    private var stateBeforeRetranscription: [UUID: (status: TranscriptionStatus,
-                                                    language: String,
-                                                    modelName: String?,
-                                                    transcriptionDeferredAt: Date?)] = [:]
-
     /// Transcode a recording's WAV to AAC/.m4a, point the recording at the
     /// smaller file, and delete the WAV. The audio base name is unchanged
     /// (only `.wav`→`.m4a`), so the `.txt`/`.srt`/`.summary.txt` sidecars
@@ -686,9 +670,26 @@ final class RecordingStore: ObservableObject {
     func prepareForRetranscription(id: UUID, language: String? = nil) -> Recording? {
         guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return nil }
         let before = recordings[idx]
-        stateBeforeRetranscription[id] = Self.hasTranscript(before)
-            ? (before.status, before.language, before.modelName, before.transcriptionDeferredAt)
-            : nil
+        // Remember what the kept transcript looked like, so a stop
+        // (`markTranscriptionDeferred`) undoes the re-run exactly: the
+        // transcript goes back to the status, language and model that
+        // describe it, not the ones of the run that never happened (a stopped
+        // "Re-transcribe in Hebrew" must not leave English text labelled
+        // Hebrew). On the row — persisted — because the re-run may be stopped
+        // only after a relaunch, from a process that never saw this call
+        // (`Recording.retranscriptionPriorState`, island-io/mila#320).
+        //
+        // Captured only from a settled row: `.pending`/`.running` describe a
+        // run, not the transcript, and a row already in flight (the UI never
+        // offers Re-transcribe on one) keeps whatever it holds.
+        if before.status == .completed || before.status == .failed {
+            recordings[idx].retranscriptionPriorState = Self.hasTranscript(before)
+                ? .init(status: before.status,
+                        language: before.language,
+                        modelName: before.modelName,
+                        transcriptionDeferredAt: before.transcriptionDeferredAt)
+                : nil
+        }
         if let language { recordings[idx].language = language }
         recordings[idx].status = .pending
         // The user is starting the run they earlier put off.
@@ -1102,7 +1103,8 @@ final class RecordingStore: ObservableObject {
     ///  * **A re-run of a recording that already had a transcript** (Re-
     ///    transcribe, in either language): the re-run is undone — status,
     ///    language and model go back to what they were before
-    ///    `prepareForRetranscription` (`stateBeforeRetranscription`), and the
+    ///    `prepareForRetranscription` (`Recording.retranscriptionPriorState`,
+    ///    read off the row so it holds across a relaunch), and the
     ///    transcript the pass never got to replace is still there. Demoting a
     ///    finished transcript to `.failed` would switch off everything keyed
     ///    on `.completed` (SRT rewrites, summaries, the MCP "latest recording").
@@ -1128,8 +1130,9 @@ final class RecordingStore: ObservableObject {
         guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return }
         let row = recordings[idx]
         guard row.status == .pending || row.status == .running else { return }
-        let before = stateBeforeRetranscription.removeValue(forKey: id)
-        if let before, Self.hasTranscript(row),
+        // The status check is defence against a hand-edited file: the writer
+        // only ever captures a settled state.
+        if let before = row.retranscriptionPriorState, Self.hasTranscript(row),
            before.status == .completed || before.status == .failed {
             recordings[idx].status = before.status
             recordings[idx].language = before.language
@@ -1139,6 +1142,9 @@ final class RecordingStore: ObservableObject {
             recordings[idx].status = .failed
             recordings[idx].transcriptionDeferredAt = Date()
         }
+        // Consumed either way: the row is settled, there is no re-run left
+        // to undo.
+        recordings[idx].retranscriptionPriorState = nil
         persist()
     }
 

@@ -154,6 +154,40 @@ struct Recording: Identifiable, Codable, Hashable {
     /// KEY is ignored instead — an older build just reads the row as `.failed`.
     var transcriptionDeferredAt: Date?
 
+    /// What a recording that already held a transcript looked like before
+    /// the user started a re-transcription of it — the status, language and
+    /// model that describe the transcript still on the row. Captured by
+    /// `RecordingStore.prepareForRetranscription`, consumed by
+    /// `markTranscriptionDeferred` when the user stops the re-run (the row
+    /// goes back to exactly this, not to the language and model of the run
+    /// that never finished), and cleared when a pass settles the row.
+    ///
+    /// Persisted on the row, not held in memory, because the re-run can
+    /// outlive the process: "Re-transcribe in Hebrew" on an English
+    /// recording, quit, relaunch — the recovery sweep hands the `.pending`
+    /// row straight back to the worker, nothing calls
+    /// `prepareForRetranscription` again — and a Stop after that must still
+    /// know the transcript is English. In memory it didn't (island-io/mila#320).
+    ///
+    /// Non-nil only while the row is `.pending`/`.running` — a stop or a
+    /// finished pass clears it. A stale value, should one survive (a crash
+    /// between the status write and the clear), is harmless: nothing but a
+    /// stop reads it, and a stop needs a `.pending`/`.running` row, which
+    /// only `prepareForRetranscription` (which overwrites it) or the launch
+    /// sweep (for which it is exactly right) produces.
+    struct RetranscriptionPriorState: Codable, Hashable {
+        var status: TranscriptionStatus
+        var language: String
+        var modelName: String?
+        var transcriptionDeferredAt: Date?
+    }
+
+    /// See `RetranscriptionPriorState`. Omitted from recordings.json when nil,
+    /// so a row that was never re-transcribed encodes byte-identically to
+    /// before the field existed; an older build ignores the key and reads the
+    /// row as it always did. Mirrored in MilaKit's `StoredRecording`.
+    var retranscriptionPriorState: RetranscriptionPriorState?
+
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose
@@ -184,7 +218,8 @@ struct Recording: Identifiable, Codable, Hashable {
          summaryLanguage: String? = nil,
          sharedBy: String? = nil,
          sharedAt: Date? = nil,
-         transcriptionDeferredAt: Date? = nil) {
+         transcriptionDeferredAt: Date? = nil,
+         retranscriptionPriorState: RetranscriptionPriorState? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -209,6 +244,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.sharedBy = sharedBy
         self.sharedAt = sharedAt
         self.transcriptionDeferredAt = transcriptionDeferredAt
+        self.retranscriptionPriorState = retranscriptionPriorState
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -251,7 +287,8 @@ struct Recording: Identifiable, Codable, Hashable {
              status, language, modelName, segments, deletedAt, folder, appName,
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt
+             speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt,
+             retranscriptionPriorState
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -282,6 +319,13 @@ struct Recording: Identifiable, Codable, Hashable {
         self.sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
         self.sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
         self.transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
+        // `try?`, not `try`: recordings.json loads all-or-nothing, so a prior
+        // state this build cannot read (a `status` value a newer build added,
+        // say) must not empty the whole library. Dropping it costs only what
+        // a relaunch used to cost — a stop parks the row as an ordinary
+        // stopped transcription instead of restoring it.
+        self.retranscriptionPriorState = try? c.decodeIfPresent(RetranscriptionPriorState.self,
+                                                                forKey: .retranscriptionPriorState)
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -318,6 +362,7 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(sharedBy, forKey: .sharedBy)
         try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
         try c.encodeIfPresent(transcriptionDeferredAt, forKey: .transcriptionDeferredAt)
+        try c.encodeIfPresent(retranscriptionPriorState, forKey: .retranscriptionPriorState)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

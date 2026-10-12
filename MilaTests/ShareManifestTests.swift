@@ -229,7 +229,11 @@ final class ShareManifestTests: XCTestCase {
             voiceMemoUniqueID: "VM-1", voiceMemoFolderUUID: "VMF-1",
             speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
             summaryLanguage: "en",
-            sharedBy: "Someone Else", sharedAt: created)
+            sharedBy: "Someone Else", sharedAt: created,
+            // Mid-re-run bookkeeping; set so the key-set test below sees the
+            // key and can hold it to the allowlist.
+            retranscriptionPriorState: .init(status: .completed, language: "he",
+                                             modelName: "Earlier model"))
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -318,6 +322,11 @@ final class ShareManifestTests: XCTestCase {
             "voiceMemoFolderUUID",
             "sharedBy",             // a re-share attributes to the re-sharer
             "sharedAt",
+            // What the sender's row looked like before a re-transcription the
+            // sender has not finished (or stopped) yet. The receiver imports a
+            // completed transcript in the language the manifest states; the
+            // sender's in-flight run is not its concern.
+            "retranscriptionPriorState",
         ]
         let storeEncoder = JSONEncoder()
         storeEncoder.dateEncodingStrategy = .iso8601

@@ -368,6 +368,72 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertEqual(restored.fullText, "an earlier, complete transcript")
     }
 
+    /// The same stop, after a relaunch (island-io/mila#320). The re-run was
+    /// set up, the app quit before it finished, and the launch sweep handed
+    /// the `.pending` row straight back to a fresh worker — nothing in the new
+    /// process called `prepareForRetranscription`. What the row looked like
+    /// before the re-run therefore has to come off the row itself.
+    func test_stopping_a_rerun_after_a_relaunch_still_restores_the_language_and_model() async throws {
+        let id = try makeFinished("English meeting", language: "en")
+        _ = try XCTUnwrap(store.prepareForRetranscription(id: id, language: "he"))
+        // The interrupted pass had already stamped its own model on the row.
+        var stamped = try row(id)
+        stamped.modelName = "Re-run model"
+        store.update(stamped)
+
+        // Relaunch: a fresh store and service over the same directory.
+        let relaunchedStore = RecordingStore(rootDirectory: tempRoot)
+        let manager = TestSupport.isolatedModelManager(
+            modelsDirectory: tempRoot.appendingPathComponent("Models"),
+            label: "\(suitePrefix).relaunch")
+        try TestSupport.installFakeModel(into: manager)
+        let relaunchedStub = StubWhisperEngine()
+        await relaunchedStub.setDefaultDelay(0.8)
+        let relaunchedService = TranscriptionService(
+            store: relaunchedStore,
+            modelManager: manager,
+            diarizationSettings: DiarizationSettings(
+                defaults: .init(suiteName: "\(suitePrefix).diarization")!),
+            remoteSettings: TestSupport.isolatedRemoteSettings(label: "\(suitePrefix).relaunch"),
+            engine: relaunchedStub)
+        let reloaded = try XCTUnwrap(relaunchedStore.recordings.first { $0.id == id })
+        XCTAssertEqual(reloaded.status, .pending, "precondition: the sweep finds a re-run to resume")
+        XCTAssertEqual(reloaded.language, "he")
+
+        // As `enqueueRecoveredRecordings` does: straight to the worker, behind
+        // another job so the stop finds it queued.
+        let blocker = try TestRecordingFixture.make(in: relaunchedStore, title: "Blocker")
+        relaunchedService.enqueue(blocker.recording)
+        relaunchedService.enqueue(reloaded)
+        XCTAssertTrue(relaunchedService.deferTranscription(of: id))
+        await relaunchedService.waitForIdle()
+
+        let restored = try XCTUnwrap(relaunchedStore.recordings.first { $0.id == id })
+        XCTAssertEqual(restored.status, .completed, "the kept transcript is still a finished one")
+        XCTAssertNil(restored.transcriptionDeferredAt)
+        XCTAssertEqual(restored.language, "en", "the kept transcript is English")
+        XCTAssertEqual(restored.modelName, "Earlier model", "…and was made by the earlier model")
+        XCTAssertNil(restored.retranscriptionPriorState, "consumed by the stop")
+        XCTAssertNil(RecordingStore(rootDirectory: tempRoot).recordings
+                        .first { $0.id == id }?.retranscriptionPriorState,
+                     "…and the consumption is persisted")
+    }
+
+    /// A re-run that finishes leaves nothing to undo, so it must not leave the
+    /// prior state behind on the row.
+    func test_a_finished_rerun_clears_the_prior_state() async throws {
+        let id = try makeFinished("English meeting", language: "en")
+        guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
+            return XCTFail("recording vanished")
+        }
+        XCTAssertNotNil(try row(id).retranscriptionPriorState, "precondition: captured")
+        service.enqueue(prepared, isRetranscription: true)
+        await service.waitForIdle()
+
+        XCTAssertEqual(try row(id).status, .completed)
+        XCTAssertNil(try row(id).retranscriptionPriorState)
+    }
+
     /// A chunk-mode live draft waiting on its first full pass has text but was
     /// never transcribed properly. Stopping it must not pass it off as
     /// finished (`.completed` would skip the SRT/summary/compression only a

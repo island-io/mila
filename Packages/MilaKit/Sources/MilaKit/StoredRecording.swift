@@ -96,6 +96,42 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         }
     }
 
+    /// Mirror of the app's `Recording.RetranscriptionPriorState`: what a
+    /// recording that already had a transcript looked like before the user
+    /// started a re-transcription of it, kept on the row so a Stop after a
+    /// relaunch can still put the transcript's own language and model back.
+    /// Present only while the re-run is `pending`/`running`. Mirrored because
+    /// the app persists it — no tool exposes it today, though it is the
+    /// honest answer to "what language is this text in?" while a re-run in
+    /// the other language is in flight.
+    public struct RetranscriptionPriorState: Codable, Equatable, Sendable {
+        /// Raw value of the app's `TranscriptionStatus` the row will go back to.
+        public var status: String
+        public var language: String
+        public var modelName: String?
+        public var transcriptionDeferredAt: Date?
+
+        public init(status: String = "", language: String = "", modelName: String? = nil,
+                    transcriptionDeferredAt: Date? = nil) {
+            self.status = status
+            self.language = language
+            self.modelName = modelName
+            self.transcriptionDeferredAt = transcriptionDeferredAt
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case status, language, modelName, transcriptionDeferredAt
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+            language = try c.decodeIfPresent(String.self, forKey: .language) ?? ""
+            modelName = try c.decodeIfPresent(String.self, forKey: .modelName)
+            transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
+        }
+    }
+
     public var id: UUID
     public var title: String
     public var createdAt: Date
@@ -143,6 +179,9 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     /// no transcript, or only a live draft — and it is what tells "the user
     /// chose not to transcribe this yet" apart from a genuine failure.
     public var transcriptionDeferredAt: Date?
+    /// See `RetranscriptionPriorState`. Nil unless a re-transcription of a
+    /// row that already had a transcript is in flight.
+    public var retranscriptionPriorState: RetranscriptionPriorState?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
@@ -176,7 +215,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
              summary, actionItems, speakerNames, appBundleID, summaryLanguage,
-             sharedBy, sharedAt, transcriptionDeferredAt
+             sharedBy, sharedAt, transcriptionDeferredAt, retranscriptionPriorState
         case legacyFullText = "fullText"
     }
 
@@ -203,6 +242,10 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
         sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
         transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
+        // `try?`: bookkeeping no tool reads must never cost the helper the
+        // whole store (the decode is all-or-nothing).
+        retranscriptionPriorState = try? c.decodeIfPresent(RetranscriptionPriorState.self,
+                                                           forKey: .retranscriptionPriorState)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -215,6 +258,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 speakerNames: [String: String] = [:], summaryLanguage: String? = nil,
                 sharedBy: String? = nil, sharedAt: Date? = nil,
                 transcriptionDeferredAt: Date? = nil,
+                retranscriptionPriorState: RetranscriptionPriorState? = nil,
                 legacyFullText: String? = nil) {
         self.id = id
         self.title = title
@@ -237,6 +281,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.sharedBy = sharedBy
         self.sharedAt = sharedAt
         self.transcriptionDeferredAt = transcriptionDeferredAt
+        self.retranscriptionPriorState = retranscriptionPriorState
         self.legacyFullText = legacyFullText
     }
 }

@@ -470,6 +470,19 @@ struct RecordingDetailView: View {
                             .foregroundStyle(.secondary)
                         stopTranscribingButton
                             .controlSize(.small)
+                    } else if recording.isTranscriptionDeferred {
+                        // A chunk-mode live draft whose first full pass was
+                        // stopped keeps its text on screen, so without this it
+                        // reads as a finished transcript. Same cue the
+                        // empty-transcript placeholder gives.
+                        Label {
+                            Text("Transcription stopped — click \(Image(systemName: "text.badge.checkmark")) Transcribe to run it.")
+                        } icon: {
+                            Image(systemName: "pause.circle")
+                        }
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("recording.transcriptionStopped")
                     }
                     Spacer()
                     Button {
