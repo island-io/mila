@@ -895,4 +895,96 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertFalse(profiles.hasStoredProfilesOnDisk, "nothing written behind an opted-out user")
         XCTAssertFalse(voice.isEnabled, "import never flips the toggle")
     }
+
+    /// `recordings.json` is the commit point for the whole import, and the
+    /// voice profiles are written BEFORE it — folded, created and tagged
+    /// with this bundle's tokens — because the row's labels come out of that
+    /// step. When the row cannot be saved they have to go back exactly, or
+    /// the user keeps voice data from a recording they do not have and the
+    /// retry greets them with "Already imported from this file" (#319).
+    func test_a_failed_library_write_puts_the_voice_profiles_back_and_the_retry_imports_them() async throws {
+        let original = try makeCompletedRecording(in: storeA,
+                                                  speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "Ada"])
+        let shared = [
+            SharedSpeakerProfile(name: "Daniel", embedding: vector([1, 0]), sampleCount: 4,
+                                 embeddingModel: SpeakerEmbeddingModel.current.id),
+            SharedSpeakerProfile(name: "Ada", embedding: vector([0, 1]), sampleCount: 2,
+                                 embeddingModel: SpeakerEmbeddingModel.current.id),
+        ]
+        let bundle = try await export(original, from: storeA, profiles: shared)
+
+        let voice = makeVoiceSettings(enabled: true)
+        let profiles = SpeakerProfileStore(directory: rootB, settings: voice)
+        profiles.updateProfile(name: "Dan", embedding: vector([0.99, 0.01]), sampleCount: 2)
+        let dan = try XCTUnwrap(profiles.profile(named: "Dan"))
+        let profilesURL = rootB.appendingPathComponent("speaker-profiles.json")
+        let bytesBefore = try Data(contentsOf: profilesURL)
+        let importer = makeImporter(profiles: profiles, voice: voice)
+
+        // Make recordings.json a directory so the atomic write cannot
+        // succeed — the seam `RecordingStoreUpsertTests` uses.
+        try? FileManager.default.removeItem(at: storeB.storeURL)
+        try FileManager.default.createDirectory(at: storeB.storeURL, withIntermediateDirectories: true)
+        let audioFilesBefore = recordingsDirectoryNames(storeB)
+
+        await stage(bundle, with: importer)
+        let pending = try XCTUnwrap(importer.pending)
+        XCTAssertEqual(pending.speakerPlan.rows.map(\.target), [.addAsNew(name: "Ada"), .merge(into: dan.id)],
+                       "the plan would change the profiles")
+        await importer.confirm()
+
+        XCTAssertEqual(importer.errorMessage, RecordingShareImporter.ImportError.saveFailed.errorDescription)
+        XCTAssertNil(importer.pending)
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertEqual(recordingsDirectoryNames(storeB), audioFilesBefore, "the copied audio is gone")
+        XCTAssertEqual(profiles.profiles.map(\.name), ["Dan"], "no profile added")
+        XCTAssertEqual(try XCTUnwrap(profiles.profile(named: "Dan")).sampleCount, 2, "nothing folded")
+        XCTAssertTrue(profiles.importedShareTokens.isEmpty, "no token, so the retry is a first import")
+        XCTAssertEqual(try Data(contentsOf: profilesURL), bytesBefore, "speaker-profiles.json is byte-identical")
+
+        // The library is writable again: the retry is a first import, and
+        // brings the recording AND its voice data.
+        try FileManager.default.removeItem(at: storeB.storeURL)
+        importer.errorMessage = nil
+        await stage(bundle, with: importer)
+        let retry = try XCTUnwrap(importer.pending)
+        XCTAssertTrue(retry.speakerPlan.rows.allSatisfy { !$0.alreadyImported })
+        XCTAssertEqual(retry.speakerPlan.rows.map(\.target), [.addAsNew(name: "Ada"), .merge(into: dan.id)])
+        await importer.confirm()
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertEqual(try XCTUnwrap(storeB.recordings.first).speakerNames,
+                       ["SPEAKER_00": "Dan", "SPEAKER_01": "Ada"])
+        XCTAssertEqual(try XCTUnwrap(profiles.profile(named: "Dan")).sampleCount, 6)
+        XCTAssertEqual(try XCTUnwrap(profiles.profile(named: "Ada")).sampleCount, 2)
+        XCTAssertEqual(profiles.importedShareTokens.count, 2)
+    }
+
+    /// The no-file case of the same rollback. A receiver who had never
+    /// stored a voice profile must not end up with a `speaker-profiles.json`
+    /// holding `[]`: Settings reads the file's existence as "voice profiles
+    /// from an earlier opt-in are still stored" and offers to delete them.
+    func test_a_failed_library_write_leaves_no_speaker_profiles_file_behind() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let shared = [SharedSpeakerProfile(name: "Daniel", embedding: vector([1, 0]), sampleCount: 4,
+                                           embeddingModel: SpeakerEmbeddingModel.current.id)]
+        let bundle = try await export(original, from: storeA, profiles: shared)
+        let voice = makeVoiceSettings(enabled: true)
+        let profiles = SpeakerProfileStore(directory: rootB, settings: voice)
+        let profilesURL = rootB.appendingPathComponent("speaker-profiles.json")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: profilesURL.path))
+        let importer = makeImporter(profiles: profiles, voice: voice)
+        try? FileManager.default.removeItem(at: storeB.storeURL)
+        try FileManager.default.createDirectory(at: storeB.storeURL, withIntermediateDirectories: true)
+
+        await stage(bundle, with: importer)
+        XCTAssertEqual(try XCTUnwrap(importer.pending).speakerPlan.rows.map(\.target),
+                       [.addAsNew(name: "Daniel")])
+        await importer.confirm()
+
+        XCTAssertEqual(importer.errorMessage, RecordingShareImporter.ImportError.saveFailed.errorDescription)
+        XCTAssertTrue(storeB.recordings.isEmpty)
+        XCTAssertTrue(profiles.profiles.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: profilesURL.path))
+        XCTAssertFalse(profiles.hasStoredProfilesOnDisk)
+    }
 }

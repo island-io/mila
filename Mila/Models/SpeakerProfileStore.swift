@@ -559,6 +559,54 @@ final class SpeakerProfileStore: ObservableObject {
         save()
     }
 
+    // MARK: - Snapshot / restore
+
+    /// The store's state at one moment, for `restore(_:)`. Opaque on
+    /// purpose: only a snapshot this store handed out can be restored.
+    struct Snapshot {
+        fileprivate let profiles: [VoiceProfile]
+        fileprivate let hadFileOnDisk: Bool
+    }
+
+    /// Capture the profiles in memory and whether `speaker-profiles.json`
+    /// exists, so a caller that writes to this store ahead of a commit
+    /// point it does not own can take the writes back.
+    ///
+    /// `RecordingShareImporter.confirm()` is that caller: it folds a
+    /// `.milashare`'s voice profiles in BEFORE the recording row, because
+    /// the row's speaker labels come out of that step, and the row's
+    /// `recordings.json` write can still fail. Without this, a failed
+    /// import left centroids moved, new profiles created and import tokens
+    /// recorded for a recording that does not exist (#319).
+    func snapshot() -> Snapshot {
+        Snapshot(profiles: profiles, hadFileOnDisk: hasStoredProfilesOnDisk)
+    }
+
+    /// Put the store back as `snapshot()` found it, in memory and on disk.
+    ///
+    /// The file is rewritten from the snapshot through `save()`, behind its
+    /// `isEnabled` gate — the same bytes as before, since the encoder is
+    /// deterministic over the same values. When there was no file at the
+    /// snapshot, the file is removed instead of being written as `[]`:
+    /// Settings reads its existence as "voice profiles from an earlier
+    /// opt-in are still stored" and would offer to delete an empty set.
+    func restore(_ snapshot: Snapshot) {
+        profiles = snapshot.profiles
+        if snapshot.hadFileOnDisk {
+            save()
+        } else {
+            do {
+                if fileManager.fileExists(atPath: storeURL.path) {
+                    try fileManager.removeItem(at: storeURL)
+                }
+            } catch {
+                profileLog.log("restore: could not remove the file written since the snapshot: \(error.localizedDescription, privacy: .public)")
+            }
+            hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        }
+        profileLog.log("restored \(snapshot.profiles.count) voice profiles from a snapshot")
+    }
+
     /// Rename a profile.
     func renameProfile(from oldName: String, to newName: String) {
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)

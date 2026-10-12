@@ -264,6 +264,47 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.profiles[0].sampleCount, 5)
     }
 
+    // MARK: - Snapshot / restore
+
+    /// `snapshot()` / `restore(_:)` exist for `RecordingShareImporter`: it
+    /// writes a bundle's voice profiles BEFORE the recording row, and when
+    /// the row cannot be saved they have to go back — in memory, on disk
+    /// byte for byte, and with no file left behind when there was none
+    /// before (#319).
+    func test_restore_puts_the_profiles_and_the_file_back_as_the_snapshot_found_them() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let store = makeStore(in: dir)
+
+        // No file yet: a restore removes the one written since.
+        let empty = store.snapshot()
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
+        store.restore(empty)
+        XCTAssertTrue(store.profiles.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertFalse(store.hasStoredProfilesOnDisk)
+
+        // A file with content: a restore rewrites it byte for byte.
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        let before = try Data(contentsOf: fileURL)
+        let snapshot = store.snapshot()
+        store.updateProfile(name: "Alice", embedding: [0, 1, 0], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+        store.recordImport(token: ImportedShareToken(bundleKey: "bundle", sharedName: "Al"),
+                           onProfileNamed: "Alice")
+        XCTAssertNotEqual(try Data(contentsOf: fileURL), before)
+        store.restore(snapshot)
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice"])
+        XCTAssertEqual(store.profiles[0].embedding, [1, 0, 0])
+        XCTAssertEqual(store.profiles[0].sampleCount, 1)
+        XCTAssertTrue(store.importedShareTokens.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+        XCTAssertTrue(store.hasStoredProfilesOnDisk)
+    }
+
     // MARK: - Deletion observers
 
     /// Deleting is a privacy action, and the store is not the only place the

@@ -610,13 +610,18 @@ final class RecordingShareImporter: ObservableObject {
             return
         }
 
-        // Voice profiles before the row. A recording whose labels point at
-        // profiles that were never created is wrong; profiles without the
-        // recording are merely unused — and if the store write below fails,
-        // the retry finds them through their import tokens and labels the
-        // transcript the same way (see `SpeakerProfileImportApplier`).
+        // Voice profiles before the row: the row's labels are rewritten
+        // through the applier's `nameMapping`, so the applier has to run
+        // first. The row is the commit point, though. If its write fails
+        // the profiles go back to this snapshot — folds, new profiles and
+        // import tokens alike — so a failed import leaves no voice data
+        // behind for a recording that does not exist, and the retry is a
+        // first import again rather than one the sheet calls "already
+        // imported" (#319).
         var mapping: [String: String] = [:]
+        var profilesBefore: SpeakerProfileStore.Snapshot?
         if !pending.speakerPlan.isEmpty, let profileStore {
+            profilesBefore = profileStore.snapshot()
             mapping = SpeakerProfileImportApplier.apply(pending.speakerPlan, to: profileStore).nameMapping
         }
 
@@ -633,14 +638,13 @@ final class RecordingShareImporter: ObservableObject {
         recording.speakerNames = recording.speakerNames.mapValues {
             mapping[$0.trimmingCharacters(in: .whitespacesAndNewlines)] ?? $0
         }
-        for name in Set(recording.speakerNames.values) {
-            speakerDirectory?.add(name)
-        }
-
         switch store.upsertImported(recording) {
         case .notSaved:
             // The store rolled itself back, so the audio is unreferenced
-            // and removing it leaves no trace of the attempt.
+            // and removing it leaves no trace of the attempt. Neither may
+            // the voice profiles: they were written on behalf of a
+            // recording that now does not exist.
+            if let profilesBefore { profileStore?.restore(profilesBefore) }
             try? fileManager.removeItem(at: destination)
             finish(pending, error: ImportError.saveFailed)
             return
@@ -650,6 +654,12 @@ final class RecordingShareImporter: ObservableObject {
             log.error("imported \(recording.id, privacy: .public) but its .txt sidecar did not land")
         case .saved:
             break
+        }
+
+        // The name list is autocomplete housekeeping; it follows the row for
+        // the same reason the profiles go back above.
+        for name in Set(recording.speakerNames.values) {
+            speakerDirectory?.add(name)
         }
 
         if let existing, existing.audioFileName != recording.audioFileName {
