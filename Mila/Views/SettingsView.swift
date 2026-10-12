@@ -408,7 +408,7 @@ private struct AudioSettingsTab: View {
                 }
                 // The ~47 Hz level is observed by the leaf below, not by
                 // this tab — see `InputLevelMonitor.meter`.
-                LiveInputLevelMeter(isLive: monitor.isRunning && !actions.isRecording)
+                LiveInputLevelMeter(isLive: monitor.isRunning && !captureOwnsInput)
             }
 
             Divider().padding(.vertical, 4)
@@ -465,13 +465,20 @@ private struct AudioSettingsTab: View {
             monitor.preferredUID = newValue
             Task { await monitor.restart() }
         }
-        .onChange(of: actions.isRecording) { _, _ in
+        .onChange(of: captureOwnsInput) { _, _ in
             Task { await refreshMonitor() }
         }
     }
 
+    /// True while a recording owns the input — and also while one is still
+    /// being brought up (`.starting`), so the meter pauses with the Record
+    /// click rather than ticking "Live" through the bring-up (#321).
+    private var captureOwnsInput: Bool {
+        actions.isRecording || actions.isStartingRecording
+    }
+
     private func refreshMonitor() async {
-        if actions.isRecording {
+        if captureOwnsInput {
             await monitor.stop()
         } else {
             await monitor.start()
@@ -479,6 +486,9 @@ private struct AudioSettingsTab: View {
     }
 
     private var meterStatusText: String {
+        if actions.isStartingRecording {
+            return "Paused — recording is starting"
+        }
         if actions.isRecording {
             return "Paused — recording in progress"
         }

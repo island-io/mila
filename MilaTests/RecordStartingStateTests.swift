@@ -100,7 +100,7 @@ final class RecordStartingStateTests: XCTestCase {
 
         let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
 
-        let reachedStarting = await waitUntil { controller.activeJob == .starting }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.microphone) }
         XCTAssertTrue(reachedStarting,
                       "`.starting` must be published before the first await of the start path — "
                       + "it is the only thing the user sees for the length of the bring-up")
@@ -116,7 +116,7 @@ final class RecordStartingStateTests: XCTestCase {
         // start (a second bring-up on the same recorder).
         await controller.toggleRecord(microphone: true, appAudio: false)
         await controller.toggleRecord(withSystemAudio: false)
-        XCTAssertEqual(controller.activeJob, .starting,
+        XCTAssertEqual(controller.activeJob, .starting(.microphone),
                        "a click during the bring-up must be dropped, not toggle the state")
 
         await gate.open()
@@ -127,7 +127,7 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertFalse(controller.isStartingRecording)
         XCTAssertEqual(session.state, .recording)
         XCTAssertTrue(session.mic.isRunning)
-        XCTAssertEqual(published.jobs, [.starting, .recording(withSystemAudio: false)],
+        XCTAssertEqual(published.jobs, [.starting(.microphone), .recording(withSystemAudio: false)],
                        "one flip in, one flip out — the dropped clicks must not have published anything")
 
         await controller.stopRecording()
@@ -152,7 +152,7 @@ final class RecordStartingStateTests: XCTestCase {
         let published = PublishedJobs(controller)
 
         let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
-        let reachedStarting = await waitUntil { controller.activeJob == .starting }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.microphone) }
         XCTAssertTrue(reachedStarting)
 
         await gate.open()
@@ -165,7 +165,7 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertFalse(session.mic.isRunning, "the session tore its partial bring-up down")
         XCTAssertNotNil(service.lastError, "the failure is reported to the user, not swallowed")
         XCTAssertTrue(store.recordings.isEmpty, "nothing was captured, so nothing may be saved")
-        XCTAssertEqual(published.jobs, [.starting, .none])
+        XCTAssertEqual(published.jobs, [.starting(.microphone), .none])
 
         // The failure must not wedge the button: the next click starts for real.
         session.mic.bringUpOverride = { }
@@ -191,7 +191,7 @@ final class RecordStartingStateTests: XCTestCase {
                       "the denial must still surface the Privacy Settings alert")
         XCTAssertEqual(session.state, .idle)
         XCTAssertFalse(session.mic.isRunning, "a denied permission must never reach the bring-up")
-        XCTAssertEqual(published.jobs, [.starting, .none])
+        XCTAssertEqual(published.jobs, [.starting(.microphone), .none])
     }
 
     // MARK: - Nothing to stop yet
@@ -206,11 +206,11 @@ final class RecordStartingStateTests: XCTestCase {
         session.mic.bringUpOverride = { await gate.wait() }
 
         let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
-        let reachedStarting = await waitUntil { controller.activeJob == .starting }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.microphone) }
         XCTAssertTrue(reachedStarting)
 
         await controller.stopRecording()
-        XCTAssertEqual(controller.activeJob, .starting,
+        XCTAssertEqual(controller.activeJob, .starting(.microphone),
                        "a stop before capture is up has nothing to stop and must leave the start alone")
         XCTAssertTrue(store.recordings.isEmpty,
                       "a stop that arrives before capture is up must not mint a recording")
@@ -243,14 +243,14 @@ final class RecordStartingStateTests: XCTestCase {
         session.mic.bringUpOverride = { await gate.wait() }
 
         let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
-        let reachedStarting = await waitUntil { controller.activeJob == .starting }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.microphone) }
         XCTAssertTrue(reachedStarting)
 
         // ⌘O arrives while capture is still coming up.
         let imported = tempRoot.appendingPathComponent("import-during-start.wav")
         try TestSupport.writeStereo48kSineWav(at: imported, durationSeconds: 0.4)
         await controller.transcribeFile(imported)
-        XCTAssertEqual(controller.activeJob, .starting,
+        XCTAssertEqual(controller.activeJob, .starting(.microphone),
                        "an import must neither take activeJob away from a start in flight nor release it to .none afterwards")
         XCTAssertNotNil(store.recordings.first { $0.title == "import-during-start" },
                         "the import itself still goes through")
@@ -264,6 +264,186 @@ final class RecordStartingStateTests: XCTestCase {
         await controller.awaitFinalizeTails()
         await service.waitForIdle()
         XCTAssertEqual(controller.activeJob, .none)
+    }
+
+    // MARK: - Sleep / lock during the bring-up (#321)
+
+    /// The sleep and lock guards used to act only on `isRecording`, which
+    /// excludes `.starting`, so a lid close inside the bring-up window let
+    /// capture come up after the wake and run unattended. The request must
+    /// hold the job at `.starting` while the bring-up is still out (a second
+    /// start would run a second bring-up on the same recorder, #293), and
+    /// when the bring-up returns, take capture back down, save nothing, leave
+    /// no WAV behind, tell the user, and leave the button usable.
+    func test_sleep_during_starting_abandons_the_start() async throws {
+        try await assertAbandonsTheStart(reason: .systemSleep, cause: "sleep")
+    }
+
+    /// Same shape for a deliberate Lock Screen.
+    func test_screen_lock_during_starting_abandons_the_start() async throws {
+        try await assertAbandonsTheStart(reason: .screenLock, cause: "locked")
+    }
+
+    /// A bring-up that fails on its own after the start was abandoned reports
+    /// the abandonment — what the user did — not an error from a start they
+    /// were not there to see.
+    func test_an_abandoned_start_whose_bring_up_fails_reports_the_abandonment() async throws {
+        let gate = BringUpGate()
+        session.mic.bringUpOverride = {
+            await gate.wait()
+            throw MicrophoneError.bringUpTimedOut(device: "AirPods 4", timeout: 12)
+        }
+        let published = PublishedJobs(controller)
+
+        let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.microphone) }
+        XCTAssertTrue(reachedStarting)
+
+        controller.abandonStartingRecording(reason: .systemSleep)
+        await gate.open()
+        await start.value
+
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertTrue(service.lastError?.contains("did not start") ?? false,
+                      "expected the abandonment message, got \(String(describing: service.lastError))")
+        XCTAssertEqual(published.jobs, [.starting(.microphone), .none])
+    }
+
+    /// Sleep can arrive while the microphone permission prompt is still up —
+    /// before the bring-up has even begun. The start must stop there rather
+    /// than go on to bring capture up.
+    func test_sleep_during_the_permission_prompt_never_reaches_the_bring_up() async throws {
+        let bringUps = BringUpCounter()
+        session.mic.bringUpOverride = { await bringUps.increment() }
+        controller.microphonePermissionOverride = { [unowned self] in
+            MainActor.assumeIsolated {
+                self.controller.abandonStartingRecording(reason: .systemSleep)
+            }
+            return true
+        }
+
+        await controller.toggleRecord(microphone: true, appAudio: false)
+
+        XCTAssertEqual(controller.activeJob, .none)
+        let bringUpCount = await bringUps.count
+        XCTAssertEqual(bringUpCount, 0, "an abandoned start must not go on to bring capture up")
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertTrue(service.lastError?.contains("did not start") ?? false)
+    }
+
+    /// Outside `.starting` the request is a no-op: an idle controller has
+    /// nothing to abandon — and a stale request must not reach the NEXT
+    /// start — and an active recording is the guards' `stopRecording` path,
+    /// which this must not pre-empt.
+    func test_abandon_outside_starting_is_a_no_op() async throws {
+        controller.abandonStartingRecording(reason: .systemSleep)
+        session.mic.bringUpOverride = { }
+        await controller.toggleRecord(microphone: true, appAudio: false)
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false),
+                       "a request made while idle must not abandon a later start")
+        XCTAssertNil(service.lastError)
+
+        controller.abandonStartingRecording(reason: .screenLock)
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false))
+        XCTAssertEqual(session.state, .recording,
+                       "an active recording is stopped by the guards' existing path, not by this")
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+        XCTAssertEqual(controller.activeJob, .none)
+    }
+
+    // MARK: - What "Starting…" is waiting on (#321)
+
+    /// ⌘N / New Voice Memo and the meeting prompt's Record both bring the
+    /// microphone up whatever the Home Microphone toggle says, so the
+    /// caption has to come from the source the controller is starting. ⌘N
+    /// is a mic-only start; the meeting prompt is mic + system audio.
+    func test_starting_carries_the_source_being_brought_up() async throws {
+        let gate = BringUpGate()
+        session.mic.bringUpOverride = {
+            await gate.wait()
+            // End both starts before the system-audio leg, which CI cannot run.
+            throw MicrophoneError.bringUpTimedOut(device: "AirPods 4", timeout: 12)
+        }
+
+        let voiceMemo = Task { await controller.toggleVoiceMemo() }
+        let memoStarting = await waitUntil { controller.startingSource == .microphone }
+        XCTAssertTrue(memoStarting, "⌘N starts a microphone capture")
+        await gate.open()
+        await voiceMemo.value
+        XCTAssertNil(controller.startingSource)
+
+        let gate2 = BringUpGate()
+        session.mic.bringUpOverride = {
+            await gate2.wait()
+            throw MicrophoneError.bringUpTimedOut(device: "AirPods 4", timeout: 12)
+        }
+        let meeting = Task { await controller.toggleRecord(withSystemAudio: true) }
+        let meetingStarting = await waitUntil { controller.startingSource == .meeting }
+        XCTAssertTrue(meetingStarting, "the meeting prompt's Record starts mic + system audio")
+        XCTAssertTrue(controller.isStartingRecording)
+        await gate2.open()
+        await meeting.value
+        XCTAssertNil(controller.startingSource)
+        XCTAssertEqual(controller.activeJob, .none)
+    }
+
+    private func assertAbandonsTheStart(reason: QuickActionsController.StartAbandonReason,
+                                        cause: String,
+                                        file: StaticString = #filePath,
+                                        line: UInt = #line) async throws {
+        let gate = BringUpGate()
+        session.mic.bringUpOverride = { await gate.wait() }
+        let published = PublishedJobs(controller)
+
+        let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.microphone) }
+        XCTAssertTrue(reachedStarting, file: file, line: line)
+
+        controller.abandonStartingRecording(reason: reason)
+        XCTAssertEqual(controller.activeJob, .starting(.microphone),
+                       "the job must stay claimed until the bring-up in flight returns",
+                       file: file, line: line)
+        // A click in the meantime is still dropped, not a second bring-up.
+        await controller.toggleRecord(microphone: true, appAudio: false)
+        XCTAssertEqual(controller.activeJob, .starting(.microphone), file: file, line: line)
+
+        await gate.open()
+        await start.value
+
+        XCTAssertEqual(controller.activeJob, .none, "an abandoned start must not become a recording",
+                       file: file, line: line)
+        XCTAssertFalse(controller.isRecording, file: file, line: line)
+        XCTAssertEqual(session.state, .idle, file: file, line: line)
+        XCTAssertFalse(session.mic.isRunning, "the capture that came up must be taken down again",
+                       file: file, line: line)
+        XCTAssertTrue(store.recordings.isEmpty, "nothing was recorded, so nothing may be saved",
+                      file: file, line: line)
+        let leftovers = (try? FileManager.default.contentsOfDirectory(
+            at: store.recordingsDirectory, includingPropertiesForKeys: nil))?
+            .filter { $0.pathExtension == "wav" } ?? []
+        XCTAssertEqual(leftovers, [], "the never-used WAV must not survive to be 'recovered' on next launch",
+                       file: file, line: line)
+        let message = service.lastError ?? ""
+        XCTAssertTrue(message.contains("did not start") && message.contains(cause),
+                      "the user must be told why nothing is recording, got \(message)",
+                      file: file, line: line)
+        XCTAssertEqual(published.jobs, [.starting(.microphone), .none], file: file, line: line)
+
+        // The abandonment must not wedge the button.
+        service.lastError = nil
+        session.mic.bringUpOverride = { }
+        await controller.toggleRecord(microphone: true, appAudio: false)
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false), file: file, line: line)
+        XCTAssertNil(service.lastError, "a fresh start must not inherit the abandoned one's request",
+                     file: file, line: line)
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
     }
 
     // MARK: - Helpers
@@ -315,4 +495,11 @@ private actor BringUpGate {
         waiters.removeAll()
         for waiter in pending { waiter.resume() }
     }
+}
+
+/// Counts how many times the fake bring-up ran. An actor for the same reason
+/// as `BringUpGate`: the override runs off the main actor.
+private actor BringUpCounter {
+    private(set) var count = 0
+    func increment() { count += 1 }
 }

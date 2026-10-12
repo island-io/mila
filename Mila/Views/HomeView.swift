@@ -97,7 +97,7 @@ struct HomeView: View {
     private var heroAction: some View {
         HeroRecordButton(
             isRecording: isRecording,
-            isStarting: actions.isStartingRecording,
+            startingSource: actions.startingSource,
             isFinalizing: actions.isFinalizingRecording,
             isPreparingModel: transcription.isPreparingModel,
             preparationStatus: transcription.preparationStatus,
@@ -268,14 +268,18 @@ struct HomeView: View {
 /// circle — once you're recording you want it loud and unmissable.
 private struct HeroRecordButton: View {
     let isRecording: Bool
-    /// True from the accepted Record click until capture is actually up
-    /// (`QuickActionsController.isStartingRecording`). The caller disables
-    /// the button in this state; here it gets a spinner in the icon circle
-    /// and a "Starting…" title so a slow microphone bring-up (#291) reads
-    /// as "working on it" rather than "the click did nothing" (#293).
+    /// Non-nil from the accepted Record click until capture is actually up
+    /// (`QuickActionsController.startingSource`). The caller disables the
+    /// button in this state; here it gets a spinner in the icon circle and
+    /// a "Starting…" title so a slow microphone bring-up (#291) reads as
+    /// "working on it" rather than "the click did nothing" (#293). The
+    /// value is the source the controller is bringing up, which is what the
+    /// caption describes — NOT `microphoneEnabled`: ⌘N and the meeting
+    /// prompt start a microphone capture with that toggle off (#321).
     /// Mutually exclusive with `isRecording` and `isFinalizing` — the
     /// controller publishes exactly one job state at a time.
-    let isStarting: Bool
+    let startingSource: RecordingSource?
+    private var isStarting: Bool { startingSource != nil }
     /// True while `stopRecording`'s inline drain is running. The button
     /// is `.disabled` in this state (set by the caller) but we also want
     /// the visible title/caption to say "Finalizing…" so the user
@@ -444,10 +448,16 @@ private struct HeroRecordButton: View {
         if isFinalizing {
             return "Saving transcript…"
         }
-        if isStarting {
+        if let startingSource {
             // The slow leg is the microphone (Bluetooth format negotiation,
             // #291); an app-only capture waits on ScreenCaptureKit instead.
-            return microphoneEnabled ? "Waiting for the microphone…" : "Setting up audio capture…"
+            // Keyed off the source actually being started, not the Home
+            // Microphone toggle: ⌘N and the meeting prompt bring the mic up
+            // with that toggle off (#321).
+            switch startingSource {
+            case .microphone, .meeting: return "Waiting for the microphone…"
+            case .systemAudio, .voiceMemo: return "Setting up audio capture…"
+            }
         }
         if isRecording {
             return "Tap to stop"

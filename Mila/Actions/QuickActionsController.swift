@@ -32,7 +32,13 @@ final class QuickActionsController: ObservableObject {
         /// is no session to stop yet, so nothing may route a Stop at it.
         /// One flip per recording, so it is well inside the publish budget
         /// an App-level `@StateObject` is allowed (`AppSceneChurnTests`).
-        case starting
+        ///
+        /// The payload is the source being brought up, so the UI can say
+        /// what it is waiting on. It has to come from here rather than from
+        /// the Home toggles: ⌘N and the meeting prompt start a microphone
+        /// capture whatever those toggles say, and the slow leg IS the
+        /// microphone (#321).
+        case starting(RecordingSource)
         case recordingMic
         /// Unified "Record" job — mic + optionally the entire system's
         /// audio. Replaces the old separation between Voice Memo and
@@ -124,6 +130,22 @@ final class QuickActionsController: ObservableObject {
     private enum SleepStopReason {
         case willSleep
     }
+
+    /// Why a start that was still bringing capture up was abandoned. See
+    /// `abandonStartingRecording(reason:)`.
+    enum StartAbandonReason: Equatable {
+        /// `NSWorkspace.willSleepNotification` — lid close, sleep menu, low
+        /// battery.
+        case systemSleep
+        /// `com.apple.screenIsLocked` — a deliberate Lock Screen.
+        case screenLock
+    }
+
+    /// Set by `abandonStartingRecording(reason:)` while `activeJob` is
+    /// `.starting`; read — and cleared — by the start path in flight at the
+    /// first point it regains control after an `await`. Reset by
+    /// `beginStarting` so a stale request can never reach the next start.
+    private var pendingStartAbandonReason: StartAbandonReason?
 
     /// Silence-watch tunables — exposed on the type so tests can override
     /// (we don't want the test suite to sleep for 10 seconds).
@@ -360,7 +382,7 @@ final class QuickActionsController: ObservableObject {
             // through this method, but covers a stale ActiveJob from an
             // in-flight session that started under an older code path.
             await stopRecording()
-        } else if activeJob == .starting {
+        } else if case .starting = activeJob {
             // The previous click is still bringing capture up. Neither a
             // second start (two concurrent bring-ups on one recorder) nor a
             // stop (there is no session to stop yet) is right, so the click
@@ -395,7 +417,7 @@ final class QuickActionsController: ObservableObject {
             return
         }
         guard activeJob == .none else {
-            if activeJob == .starting {
+            if case .starting = activeJob {
                 // Same double-click window as in `toggleRecord(withSystemAudio:)`.
                 quickActionsLog.log("toggleRecord ignored — recording is still starting")
             }
@@ -529,30 +551,32 @@ final class QuickActionsController: ObservableObject {
         }
         // Storage cap: refuse to start if the library is already full.
         if storageCapReached() { return }
-        // From here on the click is accepted: publish `.starting` BEFORE the
-        // first `await`, so the button flips the instant the user lets go of
-        // it rather than whenever CoreAudio gets round to finishing (#293).
-        guard beginStarting() else { return }
-        // Every exit below that is not the success path must take `.starting`
-        // back to `.none`, or the Record button and ⌘N stay on "Starting…"
-        // for good. `endStartingWithoutRecording` is a no-op once `activeJob`
-        // has moved on — the success path writes `.recording…` before
-        // returning — so one `defer` covers the permission denial, both catch
-        // arms, and any early exit added later.
-        defer { endStartingWithoutRecording() }
-        // Pre-flight the mic auth check — if denied we want to point the
-        // user at System Settings (like we do for screen recording),
-        // not surface a vague "operation couldn't be completed" error
-        // from deep inside AVAudioEngine.
-        guard await ensureMicrophonePermission() else { return }
-        let prefix = withSystemAudio ? "Recording" : "Voice Memo"
-        let url = store.freshAudioURL(suggestedName: prefix)
         // `.meeting` mixes mic + system audio; `.microphone` is mic only.
         // The pure system-audio case (`.systemAudio`) is now reachable
         // only via the More page's "App Audio" entry — Home's Record
         // button always captures the mic so the user can talk on top
         // of whatever's playing.
         let source: RecordingSource = withSystemAudio ? .meeting : .microphone
+        // From here on the click is accepted: publish `.starting` BEFORE the
+        // first `await`, so the button flips the instant the user lets go of
+        // it rather than whenever CoreAudio gets round to finishing (#293).
+        guard beginStarting(source: source) else { return }
+        // Every exit below that is not the success path must take `.starting`
+        // back to `.none`, or the Record button and ⌘N stay on "Starting…"
+        // for good. `endStartingWithoutRecording` is a no-op once `activeJob`
+        // has moved on — the success path writes `.recording…` before
+        // returning — so one `defer` covers the permission denial, both catch
+        // arms, an abandoned start, and any early exit added later.
+        defer { endStartingWithoutRecording() }
+        // Pre-flight the mic auth check — if denied we want to point the
+        // user at System Settings (like we do for screen recording),
+        // not surface a vague "operation couldn't be completed" error
+        // from deep inside AVAudioEngine.
+        guard await ensureMicrophonePermission() else { return }
+        // Sleep or lock can arrive while the permission prompt is up.
+        if await abandonStartIfRequested(discarding: nil) { return }
+        let prefix = withSystemAudio ? "Recording" : "Voice Memo"
+        let url = store.freshAudioURL(suggestedName: prefix)
         // For system-audio-inclusive captures, the SystemAudioRecorder
         // also needs to know we want "everything" (no specific app).
         if withSystemAudio {
@@ -561,6 +585,11 @@ final class QuickActionsController: ObservableObject {
         prepareLivePipeline()
         do {
             try await session.start(source: source, outputURL: url)
+            // Sleep or lock arrived during the bring-up: capture is up now
+            // and the user is gone, so take it down again rather than record
+            // unattended — the same decision the guards make for an active
+            // recording (#321).
+            if await abandonStartIfRequested(discarding: url) { return }
             // Guarantee a fresh, isolated Live AI session for THIS recording
             // (new Claude session UUID + cleared summary/action items) before
             // any transcript can be fed. This is the single deterministic
@@ -577,6 +606,10 @@ final class QuickActionsController: ObservableObject {
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             screenRecordingPermissionMissing = true
         } catch {
+            // A bring-up that failed on its own after sleep / lock had
+            // already abandoned it: report the abandonment — the thing the
+            // user did — rather than an error they were not there to see.
+            if await abandonStartIfRequested(discarding: url) { return }
             if withSystemAudio, SystemAudioRecorder.isPermissionError(error) {
                 screenRecordingPermissionMissing = true
             } else {
@@ -599,21 +632,56 @@ final class QuickActionsController: ObservableObject {
     /// `MicrophoneRecorder.start`'s `!isRunning` both still pass until the
     /// bring-up has finished, so without this a second click ran a second
     /// bring-up against the same recorder (#293).
-    private func beginStarting() -> Bool {
+    ///
+    /// `source` is what this start is about to bring up; it rides on the
+    /// published state so the UI can describe the wait (see
+    /// `ActiveJob.starting`).
+    private func beginStarting(source: RecordingSource) -> Bool {
         guard activeJob == .none else {
             quickActionsLog.log("record start ignored — another job already owns activeJob")
             return false
         }
-        activeJob = .starting
+        pendingStartAbandonReason = nil
+        activeJob = .starting(source)
         return true
     }
 
     /// Undo `beginStarting()` on a failure exit (permission denied, bring-up
-    /// threw). Guarded rather than a bare `activeJob = .none` so a start that
-    /// lost `activeJob` to something else during its awaits does not stamp
-    /// `.none` over that other job.
+    /// threw, start abandoned). Guarded rather than a bare `activeJob = .none`
+    /// so a start that lost `activeJob` to something else during its awaits
+    /// does not stamp `.none` over that other job.
     private func endStartingWithoutRecording() {
-        if activeJob == .starting { activeJob = .none }
+        if case .starting = activeJob { activeJob = .none }
+    }
+
+    /// The check every start path runs when it regains control after an
+    /// `await`: did sleep or lock abandon this start in the meantime
+    /// (`abandonStartingRecording`)? If not, nothing happens and this returns
+    /// false. If so, whatever capture came up is torn down, the WAV the
+    /// session opened is deleted, the user is told why nothing is recording,
+    /// and the caller exits through its `defer`.
+    ///
+    /// The WAV is deleted because nothing was recorded, yet it is not
+    /// guaranteed to be empty: `RecordingSession.start` has the mic stream
+    /// flowing before it returns, so a few buffers can reach the file before
+    /// `cancelAll` closes it — enough to clear `RecordingStore
+    /// .emptyWAVByteCount` and come back after the next launch as a
+    /// "Recovered recording" of nothing. `cancelAll` is a no-op while the
+    /// session is still `.idle` (the bring-up threw, or never began), so the
+    /// same call serves every point this is checked from.
+    private func abandonStartIfRequested(discarding outputURL: URL?) async -> Bool {
+        guard let reason = pendingStartAbandonReason else { return false }
+        pendingStartAbandonReason = nil
+        await session.cancelAll()
+        if let outputURL { try? FileManager.default.removeItem(at: outputURL) }
+        let cause: String
+        switch reason {
+        case .systemSleep: cause = "the Mac went to sleep"
+        case .screenLock: cause = "the screen was locked"
+        }
+        quickActionsLog.log("record start abandoned — \(cause, privacy: .public) while capture was being set up")
+        transcription.lastError = "Recording did not start — \(cause) while capture was being set up."
+        return true
     }
 
     // Back-compat shim so existing call sites + tests that toggle a
@@ -700,20 +768,23 @@ final class QuickActionsController: ObservableObject {
         // and a pick made during an active job used to fall through
         // `session.start`'s silent `state == .idle` no-op and then overwrite
         // `activeJob` with a `.recordingApp` that captured nothing.
-        guard beginStarting() else { return }
+        let source: RecordingSource = includeMic ? .meeting : .systemAudio
+        guard beginStarting(source: source) else { return }
         // See the matching `defer` in `startRecording`.
         defer { endStartingWithoutRecording() }
         // When the user opted into capturing their mic alongside system
         // audio, pre-flight the mic auth check too — otherwise the same
         // vague-error-after-rename trap as Voice Memo.
         if includeMic, !(await ensureMicrophonePermission()) { return }
+        if await abandonStartIfRequested(discarding: nil) { return }
         session.selectApp(app)
         let titleBase = app?.applicationName ?? "System Audio"
         let url = store.freshAudioURL(suggestedName: titleBase)
         prepareLivePipeline()
         do {
-            let source: RecordingSource = includeMic ? .meeting : .systemAudio
             try await session.start(source: source, outputURL: url)
+            // Sleep / lock during the bring-up — see `startRecording`.
+            if await abandonStartIfRequested(discarding: url) { return }
             // Fresh, isolated per-recording Live AI session — see the matching
             // call in startRecording() for the full rationale.
             liveAISession?.start()
@@ -724,6 +795,7 @@ final class QuickActionsController: ObservableObject {
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             screenRecordingPermissionMissing = true
         } catch {
+            if await abandonStartIfRequested(discarding: url) { return }
             if SystemAudioRecorder.isPermissionError(error) {
                 screenRecordingPermissionMissing = true
             } else {
@@ -774,8 +846,9 @@ final class QuickActionsController: ObservableObject {
         // sheet, and stamp `.none` over `.starting` seconds before the
         // bring-up completes and flips it back to `.recording`. Every UI stop
         // affordance is hidden or disabled in this window; this covers the
-        // programmatic callers.
-        if activeJob == .starting {
+        // programmatic callers. The sleep / lock guards, which DO need to end
+        // a start in flight, use `abandonStartingRecording` instead.
+        if case .starting = activeJob {
             quickActionsLog.log("stopRecording ignored — capture is still starting")
             return
         }
@@ -1624,6 +1697,33 @@ final class QuickActionsController: ObservableObject {
         await stopRecording()
     }
 
+    /// The sleep / lock guards' counterpart to `stopBecauseOfSleep` and
+    /// `stopRecording` for a recording that is still being STARTED. Both
+    /// guards used to act only on `isRecording`, which excludes `.starting`,
+    /// so a lid close or Lock Screen during the bring-up window (up to
+    /// `bringUpTimeout`, ~12 s on macOS 27 with AirPods — #291) let capture
+    /// come up afterwards and run unattended (#321).
+    ///
+    /// No-op outside `.starting`: an active recording is the guards' existing
+    /// `stopRecording` path, and there is nothing to abandon otherwise.
+    ///
+    /// This records the request rather than ending the start here, because
+    /// nothing CAN end it here: the bring-up runs on a detached CoreAudio
+    /// worker behind a continuation (`MicrophoneRecorder.withTimeout`), out
+    /// of reach of cooperative cancellation, and `stopRecording` is a no-op
+    /// in this window by design. The start path honours the request at the
+    /// first point it regains control (`abandonStartIfRequested`): it tears
+    /// down whatever came up and exits through its `defer`, which releases
+    /// the job. Until then `activeJob` stays `.starting` — releasing it
+    /// earlier would let a new start run a second bring-up on the same
+    /// recorder, the exact hazard `.starting` exists to prevent (#293). The
+    /// wait is bounded by `bringUpTimeout` once the machine is awake.
+    func abandonStartingRecording(reason: StartAbandonReason) {
+        guard case .starting = activeJob else { return }
+        quickActionsLog.log("record start will be abandoned (\(String(describing: reason), privacy: .public)) — capture is still being set up")
+        pendingStartAbandonReason = reason
+    }
+
     /// Called by `MilaAppDelegate` on `didWakeNotification`. No-op when
     /// `sleepInterruption` is nil (the recording wasn't ours to stop, or
     /// the user already dismissed the previous wake alert).
@@ -1820,7 +1920,16 @@ final class QuickActionsController: ObservableObject {
     /// "Starting…" and disable themselves. Deliberately disjoint from
     /// `isRecording`: while this is true there is no session to stop, pause,
     /// or show a chip for. See `ActiveJob.starting`.
-    var isStartingRecording: Bool { activeJob == .starting }
+    var isStartingRecording: Bool { startingSource != nil }
+
+    /// The source the start in flight is bringing up; nil outside
+    /// `.starting`. What the Home Record button's "Starting…" caption is
+    /// derived from — not the Home toggles, which ⌘N and the meeting prompt
+    /// do not consult (#321).
+    var startingSource: RecordingSource? {
+        if case .starting(let source) = activeJob { return source }
+        return nil
+    }
 
     var elapsed: TimeInterval { session.elapsed }
     var micLevel: Float { session.micLevel }

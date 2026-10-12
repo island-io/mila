@@ -2577,12 +2577,22 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// menu). We race the system sleep timer to flush the WAV — the
     /// `stopBecauseOfSleep` path stashes the metadata so the wake-up
     /// alert can show duration + "stopped by sleep".
+    ///
+    /// A recording that is still being STARTED is not `isRecording` (there
+    /// is no session to stop yet), so it has its own branch: the start is
+    /// abandoned and never becomes a recording, instead of coming up after
+    /// the wake and running unattended (#321). Nothing to flush, so no await.
     @objc private func handleWillSleep(_ notification: Notification) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if let actions = self.actions, actions.isRecording {
-                print("Sleep guard: stopping recording before system sleeps")
-                await actions.stopBecauseOfSleep()
+            if let actions = self.actions {
+                if actions.isStartingRecording {
+                    print("Sleep guard: abandoning the recording that is still starting")
+                    actions.abandonStartingRecording(reason: .systemSleep)
+                } else if actions.isRecording {
+                    print("Sleep guard: stopping recording before system sleeps")
+                    await actions.stopBecauseOfSleep()
+                }
             }
             if let dictation = self.dictation, case .recording = dictation.state {
                 print("Sleep guard: cancelling dictation before system sleeps")
@@ -2613,9 +2623,15 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// This only runs for *deliberate* locks: while recording, `SleepGuard`
     /// holds a display-sleep assertion that prevents the idle auto-lock from
     /// firing, so reaching here means the user explicitly locked the screen.
+    ///
+    /// A recording still being started is abandoned rather than stopped —
+    /// same reasoning as in `handleWillSleep` (#321).
     private func pauseForScreenLock(reason: String) async {
         guard let actions else { return }
-        if actions.isRecording {
+        if actions.isStartingRecording {
+            print("Screen-lock guard: abandoning the recording that is still starting (\(reason))")
+            actions.abandonStartingRecording(reason: .screenLock)
+        } else if actions.isRecording {
             print("Screen-lock guard: stopping active recording (\(reason))")
             await actions.stopRecording()
         }
