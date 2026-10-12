@@ -604,6 +604,7 @@ final class QuickActionsController: ObservableObject {
             startSilenceWatch(watching: source)
             armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
+            if await abandonStartIfRequested(discarding: url) { return }
             screenRecordingPermissionMissing = true
         } catch {
             // A bring-up that failed on its own after sleep / lock had
@@ -651,6 +652,9 @@ final class QuickActionsController: ObservableObject {
     /// so a start that lost `activeJob` to something else during its awaits
     /// does not stamp `.none` over that other job.
     private func endStartingWithoutRecording() {
+        // An exit that returned without consulting the request (permission
+        // denied after sleep) must not leave it lying around.
+        pendingStartAbandonReason = nil
         if case .starting = activeJob { activeJob = .none }
     }
 
@@ -673,6 +677,19 @@ final class QuickActionsController: ObservableObject {
         guard let reason = pendingStartAbandonReason else { return false }
         pendingStartAbandonReason = nil
         await session.cancelAll()
+        // A bring-up that succeeded had already published `.recording`, so
+        // `wireLiveAIPipeline` wired the live pipeline and now runs its
+        // `.idle` drain — asynchronously, ending in `aiSession.cancel()` and
+        // `sidecarWriter.finish`. Hold `.starting` (the caller's `defer`
+        // releases it) until that drain is done, or a quick next Record
+        // click would start a recording whose fresh Live AI session and live
+        // sidecar the old drain then tears down. The drain's last act is
+        // clearing `onLiveSamples`; bounded, as in
+        // `discardFakeRecordingForTesting`, because the observer is not
+        // installed in every host.
+        for _ in 0..<200 where session.onLiveSamples != nil {   // ≤ 10 s
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
         if let outputURL { try? FileManager.default.removeItem(at: outputURL) }
         let cause: String
         switch reason {
@@ -793,6 +810,7 @@ final class QuickActionsController: ObservableObject {
             startSilenceWatch(watching: source)
             armRemoteProbe()
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
+            if await abandonStartIfRequested(discarding: url) { return }
             screenRecordingPermissionMissing = true
         } catch {
             if await abandonStartIfRequested(discarding: url) { return }

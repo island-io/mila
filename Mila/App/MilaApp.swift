@@ -2008,12 +2008,17 @@ struct MilaApp: App {
                     // deferred by the min-interval floor can still wake and
                     // spawn a `claude` child while the app is tearing down
                     // AVAudioEngine (CodeRabbit on #113). Safe to clear
-                    // `summary` / `actionItems` here — the only path that
-                    // reaches this branch today is `cancelAll()` at app
+                    // `summary` / `actionItems` here — the paths that
+                    // reach this branch are `cancelAll()` at app
                     // termination, which by design does NOT flush a WAV or
                     // assemble a Recording (the orphan WAV is recovered on
-                    // next launch instead), so there is no snapshot to
-                    // protect. Sleep and screen-lock both route through
+                    // next launch instead), and a start abandoned by sleep /
+                    // lock while it was still `.starting` (#321), which
+                    // discards its WAV — so there is no snapshot to protect.
+                    // The abandoned start keeps `activeJob` at `.starting`
+                    // until this drain has cleared `onLiveSamples`, so it
+                    // cannot overlap the next recording's start. Sleep and
+                    // screen-lock of an ACTIVE recording both route through
                     // `stopRecording`, which owns finalize and cancels the
                     // session itself once its snapshot is stored.
                     aiSession.cancel()
