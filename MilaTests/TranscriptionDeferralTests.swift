@@ -376,8 +376,10 @@ final class TranscriptionDeferralTests: XCTestCase {
     func test_stopping_a_rerun_after_a_relaunch_still_restores_the_language_and_model() async throws {
         let id = try makeFinished("English meeting", language: "en")
         _ = try XCTUnwrap(store.prepareForRetranscription(id: id, language: "he"))
-        // The interrupted pass had already stamped its own model on the row.
+        // Quit mid-pass: the interrupted pass had already moved the row to
+        // `.running` and stamped its own model on it.
         var stamped = try row(id)
+        stamped.status = .running
         stamped.modelName = "Re-run model"
         store.update(stamped)
 
@@ -397,14 +399,21 @@ final class TranscriptionDeferralTests: XCTestCase {
             remoteSettings: TestSupport.isolatedRemoteSettings(label: "\(suitePrefix).relaunch"),
             engine: relaunchedStub)
         let reloaded = try XCTUnwrap(relaunchedStore.recordings.first { $0.id == id })
-        XCTAssertEqual(reloaded.status, .pending, "precondition: the sweep finds a re-run to resume")
+        XCTAssertEqual(reloaded.status, .running, "precondition: the sweep finds a re-run to resume")
         XCTAssertEqual(reloaded.language, "he")
+        XCTAssertEqual(MilaApp.recoveryAction(status: reloaded.status, wavExists: true), .reenqueue)
 
-        // As `enqueueRecoveredRecordings` does: straight to the worker, behind
-        // another job so the stop finds it queued.
+        // As `enqueueRecoveredRecordings` does: `.running` reset to
+        // `.pending` from a snapshot, written back with `updateAll`, then
+        // straight to the worker as a re-transcription — never through
+        // `prepareForRetranscription`. Behind another job so the stop finds
+        // it queued.
+        var fixed = reloaded
+        fixed.status = .pending
+        relaunchedStore.updateAll([fixed])
         let blocker = try TestRecordingFixture.make(in: relaunchedStore, title: "Blocker")
         relaunchedService.enqueue(blocker.recording)
-        relaunchedService.enqueue(reloaded)
+        relaunchedService.enqueue(fixed, isRetranscription: true)
         XCTAssertTrue(relaunchedService.deferTranscription(of: id))
         await relaunchedService.waitForIdle()
 

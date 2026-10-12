@@ -1090,6 +1090,8 @@ final class RecordingStore: ObservableObject {
         guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
         recordings[idx].status = .failed
         recordings[idx].deletedAt = Date()
+        // Settled: nothing left for a stop to undo.
+        recordings[idx].retranscriptionPriorState = nil
         persist()
     }
 

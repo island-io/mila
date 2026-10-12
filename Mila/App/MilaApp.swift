@@ -2131,6 +2131,10 @@ struct MilaApp: App {
                 toEnqueue.append(fixed)
             case .markFailed:
                 fixed.status = .failed
+                // Settled, so there is no re-run left for a stop to undo
+                // (`Recording.retranscriptionPriorState` is only meaningful
+                // on a `.pending`/`.running` row).
+                fixed.retranscriptionPriorState = nil
                 statusChanged.append(fixed)
                 appLog.log("""
                     reset stale \(recording.status.rawValue, privacy: .public) \
