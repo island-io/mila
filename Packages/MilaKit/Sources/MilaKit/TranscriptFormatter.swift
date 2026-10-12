@@ -74,11 +74,35 @@ public enum TranscriptFormatter {
             let seqNum = entries.count + 1
             // Same label resolution and `Name: text` shape as `plainText`,
             // so the cue prefix and the clipboard text cannot drift apart.
-            let line = format(speaker: seg.speaker.map { names[$0] ?? $0 }, text: text)
+            let line = format(speaker: seg.speaker.map { names[$0] ?? $0 }, text: cueText(text))
             entries.append("\(seqNum)\n\(srtTimestamp(seg.start)) --> \(srtTimestamp(seg.end))\n\(line)")
         }
         return entries
     }
+
+    /// `trimmedText` with no blank line left inside it. A blank line is
+    /// SRT's one and only cue delimiter, so a segment whose text carried an
+    /// interior `\n\n` — or a whitespace-only line, which lenient players
+    /// read as blank too — came back from the file as TWO cues, the second
+    /// with no number and no timing: strict players reject it, lenient ones
+    /// mis-time it. Empty and whitespace-only lines are dropped and the rest
+    /// rejoined with `\n`, so one segment is one cue whatever its text
+    /// carries. A line break on its own is a legal two-line cue and stays.
+    ///
+    /// Text with no line break in it is returned as-is — not re-split and
+    /// re-joined into equal bytes, the same `String` — which is what keeps
+    /// the app's `.srt` export unchanged for every segment whisper produces.
+    /// Only `\r` and `\n` count as line breaks, the two an SRT parser splits
+    /// on; `\r\n` therefore rejoins as `\n`, the separator the rest of the
+    /// file already uses.
+    static func cueText(_ trimmedText: String) -> String {
+        guard trimmedText.rangeOfCharacter(from: cueLineBreaks) != nil else { return trimmedText }
+        return trimmedText.components(separatedBy: cueLineBreaks)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .joined(separator: "\n")
+    }
+
+    private static let cueLineBreaks = CharacterSet(charactersIn: "\r\n")
 
     static func srtTimestamp(_ seconds: Double) -> String {
         // Round to whole milliseconds FIRST, then decompose. The previous

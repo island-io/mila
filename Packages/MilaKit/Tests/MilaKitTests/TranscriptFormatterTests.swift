@@ -127,6 +127,45 @@ final class MilaKitTranscriptFormatterTests: XCTestCase {
         XCTAssertEqual(TranscriptFormatter.srt(cues: Array(cues.prefix(1))), cues[0] + "\n\n")
         XCTAssertEqual(TranscriptFormatter.srt(cues: []), "")
     }
+
+    /// A blank line is SRT's only cue delimiter, so a segment whose text
+    /// carried one read back as two cues — the second without a number or
+    /// timing. Interior blank lines (empty or whitespace-only, `\n` or
+    /// `\r\n`) collapse so one segment stays one cue; a lone line break is a
+    /// legal two-line cue and stays; the outer trim is unchanged.
+    func test_srt_keeps_one_segment_one_cue_when_the_text_carries_a_blank_line() {
+        let segments = [
+            TimedSeg(start: 0, end: 1, text: "first line\n\nsecond line", speaker: "SPEAKER_00"),
+            TimedSeg(start: 1, end: 2, text: "a\n \n\t\nb\r\n\r\nc"),
+            TimedSeg(start: 2, end: 3, text: "two\nlines"),
+            TimedSeg(start: 3, end: 4, text: "  padded  "),
+        ]
+        let cues = TranscriptFormatter.srtCues(segments: segments)
+        XCTAssertEqual(cues, [
+            "1\n00:00:00,000 --> 00:00:01,000\nSPEAKER_00: first line\nsecond line",
+            "2\n00:00:01,000 --> 00:00:02,000\na\nb\nc",
+            "3\n00:00:02,000 --> 00:00:03,000\ntwo\nlines",
+            "4\n00:00:03,000 --> 00:00:04,000\npadded",
+        ])
+        // The read-back statement of the same thing: a parser splitting the
+        // file on blank lines finds exactly one block per segment.
+        let blocks = TranscriptFormatter.srt(segments: segments)
+            .components(separatedBy: "\n\n").filter { !$0.isEmpty }
+        XCTAssertEqual(blocks.count, segments.count)
+    }
+
+    /// Text with no line break in it must come back as the SAME string, not
+    /// merely equal bytes: that is the guarantee that the app's `.srt`
+    /// export (every whisper segment is one line) did not change.
+    func test_cue_text_without_a_line_break_is_returned_untouched() {
+        let plain = "no breaks here,  just   spacing "
+        XCTAssertEqual(TranscriptFormatter.cueText(plain), plain)
+        XCTAssertEqual(TranscriptFormatter.cueText("x\n\n\ny"), "x\ny")
+        XCTAssertEqual(TranscriptFormatter.cueText("x\r\ny"), "x\ny", "CRLF rejoins with the file's own separator")
+        XCTAssertEqual(TranscriptFormatter.cueText("x\n  \ny"), "x\ny", "a whitespace-only line is blank to a lenient parser")
+        XCTAssertEqual(TranscriptFormatter.cueText("keep  \n  inner"), "keep  \n  inner",
+                       "surviving lines keep their own bytes")
+    }
 }
 
 private struct TimedSeg: TimedSpeakerTextSegment {

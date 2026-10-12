@@ -445,16 +445,16 @@ public struct MilaMCPToolHandlers: Sendable {
         // state == .recording
         guard snapshot.liveTranscriptAvailable else {
             result["status"] = "recording_live_unavailable"
-            result["elapsed_seconds"] = Int(now().timeIntervalSince(snapshot.recordingStartedAt))
+            result["elapsed_seconds"] = Self.wholeSeconds(now().timeIntervalSince(snapshot.recordingStartedAt))
             result["note"] = "A recording is in progress, but live transcription is off for it (turned off in Mila's settings, or not available on this Mac) — no text will appear until it completes. Poll occasionally for status \"completed\" instead of expecting segments."
             return try json(result)
         }
         let heartbeatAge = now().timeIntervalSince(snapshot.updatedAt)
         let status = heartbeatAge > LiveTranscriptSnapshot.staleAfter ? "stale" : "recording"
         result["status"] = status
-        result["elapsed_seconds"] = Int(now().timeIntervalSince(snapshot.recordingStartedAt))
+        result["elapsed_seconds"] = Self.wholeSeconds(now().timeIntervalSince(snapshot.recordingStartedAt))
         if status == "stale" {
-            result["note"] = "The live snapshot hasn't been refreshed in \(Int(heartbeatAge))s — the Mila app may have crashed or hung; this transcript may be incomplete and won't grow."
+            result["note"] = "The live snapshot hasn't been refreshed in \(Self.wholeSeconds(heartbeatAge))s — the Mila app may have crashed or hung; this transcript may be incomplete and won't grow."
         }
 
         let clientSession = (args["session_id"] as? String).flatMap(UUID.init(uuidString:))
@@ -518,12 +518,41 @@ public struct MilaMCPToolHandlers: Sendable {
 
     // MARK: - Helpers
 
+    /// Every integer-seconds field the tools report (`duration_seconds`,
+    /// `elapsed_seconds`, the stale-heartbeat note) goes through here.
+    /// `Int(_:)` traps on NaN, ±infinity and anything at or beyond 2^63,
+    /// and `duration` arrives verbatim from recordings.json — user-editable,
+    /// written by every past app version — so a single row with
+    /// `"duration": 1e300` (valid JSON, a valid Double) used to abort this
+    /// long-lived process on EVERY list_recordings / get_transcript /
+    /// search_transcripts call, not just the one that touched the row, and
+    /// again after each restart. Same family as the `srtTimestamp` trap
+    /// (#311). The `Date` differences in get_live_transcript are bounded by
+    /// the ISO8601 decoder in practice but have the same shape, so they take
+    /// the same path rather than staying the odd ones out.
+    ///
+    /// Truncates toward zero exactly as `Int(_:)` did, so every sane value
+    /// is reported unchanged. Anything that is not a finite, non-negative,
+    /// representable count reports 0 — the value a row with no `duration`
+    /// at all already reports (`StoredRecording` defaults the field), so
+    /// "unknown" has one spelling on the surface instead of a trap, a
+    /// negative, or a sentinel a client would have to know about. No cap
+    /// below representability: there is no principled line between a
+    /// 1e15-second recording and a 9e18-second one, and neither traps.
+    static func wholeSeconds(_ seconds: Double) -> Int {
+        // `Int(exactly:)` answers nil for NaN, ±inf and out-of-range values
+        // where `Int(_:)` would trap; truncating first makes it accept every
+        // in-range value, integral or not.
+        guard let whole = Int(exactly: seconds.rounded(.towardZero)), whole >= 0 else { return 0 }
+        return whole
+    }
+
     private func summaryObject(for recording: StoredRecording) -> [String: Any] {
         var obj: [String: Any] = [
             "id": recording.id.uuidString,
             "title": recording.title,
             "created_at": iso(recording.createdAt),
-            "duration_seconds": Int(recording.duration.rounded()),
+            "duration_seconds": Self.wholeSeconds(recording.duration.rounded()),
             "source": recording.source,
             "status": recording.status,
             "speakers": recording.speakerDisplayNames,

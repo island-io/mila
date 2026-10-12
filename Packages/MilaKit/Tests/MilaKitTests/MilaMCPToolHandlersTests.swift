@@ -125,6 +125,63 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertEqual(first["has_summary"] as? Bool, false)
     }
 
+    /// `duration` arrives verbatim from recordings.json, and `Int(_:)`
+    /// traps on anything that is not a finite, representable count — so a
+    /// single `"duration": 1e300` row used to abort the whole `mila-mcp`
+    /// process on every tool that lists or opens recordings (#322). That row
+    /// must report 0, and the healthy row next to it must keep answering.
+    func test_an_unrepresentable_duration_reports_zero_instead_of_trapping() throws {
+        let huge = UUID(), healthy = UUID()
+        let json = """
+        [{"id":"\(huge.uuidString)","title":"Huge","createdAt":"2023-11-14T22:13:20Z",
+        "duration":1e300,"source":"meeting","audioFileName":"Huge.wav","status":"completed",
+        "segments":[{"start":0,"end":1,"text":"needle","speaker":"SPEAKER_00"}]},
+        {"id":"\(healthy.uuidString)","title":"Healthy","createdAt":"2023-11-13T22:13:20Z",
+        "duration":299.6,"source":"meeting","audioFileName":"Healthy.wav","status":"completed",
+        "segments":[{"start":0,"end":1,"text":"needle","speaker":"SPEAKER_00"}]}]
+        """
+        try Data(json.utf8).write(to: root.appendingPathComponent("recordings.json"))
+
+        let listed = try XCTUnwrap(try call("list_recordings")["recordings"] as? [[String: Any]])
+        XCTAssertEqual(listed.map { $0["title"] as? String }, ["Huge", "Healthy"])
+        XCTAssertEqual(listed.map { $0["duration_seconds"] as? Int }, [0, 300],
+                       "a sane duration still rounds exactly as before")
+        XCTAssertEqual(try call("get_transcript", ["id": huge.uuidString])["duration_seconds"] as? Int, 0)
+        let hits = try XCTUnwrap(try call("search_transcripts", ["query": "needle"])["results"] as? [[String: Any]])
+        XCTAssertEqual(hits.count, 2)
+    }
+
+    /// NaN and ±infinity cannot be spelled in JSON, but `StoredRecording`
+    /// and the `MilaDataSource` seam carry them, and they trap `Int(_:)` the
+    /// same way; a negative duration must not surface as a negative count.
+    func test_non_finite_and_negative_durations_report_zero() throws {
+        let values: [String: Double] = ["NaN": .nan, "Inf": .infinity, "NegInf": -.infinity,
+                                        "Negative": -42, "Max": .greatestFiniteMagnitude]
+        // Seeded sane (JSONEncoder refuses NaN/inf); the source substitutes them.
+        try seedStore(values.keys.sorted().enumerated().map { index, title in
+            meeting(title, daysAgo: Double(index))
+        } + [meeting("Healthy", daysAgo: 10)])
+        let handlers = MilaMCPToolHandlers(root: root, source: DurationOverridingSource(
+            base: FileBackedDataSource(root: root), durations: values))
+
+        let raw = try handlers.handle(tool: "list_recordings", arguments: ["limit": 50])
+        let result = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
+        let listed = try XCTUnwrap(result["recordings"] as? [[String: Any]])
+        var reported: [String: Int] = [:]
+        for row in listed { reported[row["title"] as! String] = row["duration_seconds"] as? Int }
+        XCTAssertEqual(reported, ["NaN": 0, "Inf": 0, "NegInf": 0, "Negative": 0, "Max": 0, "Healthy": 300])
+    }
+
+    func test_whole_seconds_truncates_sane_values_and_zeroes_the_rest() {
+        XCTAssertEqual(MilaMCPToolHandlers.wholeSeconds(0), 0)
+        XCTAssertEqual(MilaMCPToolHandlers.wholeSeconds(59.9), 59, "truncates toward zero, as Int(_:) did")
+        XCTAssertEqual(MilaMCPToolHandlers.wholeSeconds(3_600), 3_600)
+        XCTAssertEqual(MilaMCPToolHandlers.wholeSeconds(-0.5), 0)
+        for bad in [Double.nan, .infinity, -.infinity, 1e300, 9.3e18, -1] {
+            XCTAssertEqual(MilaMCPToolHandlers.wholeSeconds(bad), 0, "\(bad)")
+        }
+    }
+
     /// `appBundleID` is mirrored and exposed alongside `app_name` — the stable
     /// key next to the localized display string. It was previously absent from
     /// the mirror entirely, which the drift guard couldn't see because its
@@ -787,4 +844,32 @@ final class MilaMCPToolHandlersTests: XCTestCase {
                           String(describing: error))
         }
     }
+}
+
+/// Wraps the real file-backed source and substitutes `duration` by title —
+/// the only way to put NaN / ±infinity in front of the handlers, since JSON
+/// cannot spell them.
+private struct DurationOverridingSource: MilaDataSource {
+    let base: FileBackedDataSource
+    let durations: [String: Double]
+
+    private func patch(_ recording: StoredRecording) -> StoredRecording {
+        var copy = recording
+        if let value = durations[recording.title] { copy.duration = value }
+        return copy
+    }
+
+    func listRecordings(filter: MilaStoreReader.Filter, sort: MilaStoreReader.SortKey,
+                        order: MilaStoreReader.SortOrder, limit: Int) throws -> [StoredRecording] {
+        try base.listRecordings(filter: filter, sort: sort, order: order, limit: limit).map(patch)
+    }
+    func recording(id: UUID) throws -> StoredRecording? { try base.recording(id: id).map(patch) }
+    func latestCompletedRecording() throws -> StoredRecording? { try base.latestCompletedRecording().map(patch) }
+    func namedTranscript(for recording: StoredRecording) -> String { base.namedTranscript(for: recording) }
+    func searchTranscripts(query: String, speaker: String?, sort: MilaStoreReader.SearchSortKey,
+                           order: MilaStoreReader.SortOrder, limit: Int) throws -> [MilaStoreReader.SearchHit] {
+        try base.searchTranscripts(query: query, speaker: speaker, sort: sort, order: order, limit: limit)
+            .map { .init(recording: patch($0.recording), matchCount: $0.matchCount, snippets: $0.snippets) }
+    }
+    func liveSnapshot() -> LiveTranscriptSnapshot? { base.liveSnapshot() }
 }
