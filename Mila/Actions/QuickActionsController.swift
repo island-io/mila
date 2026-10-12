@@ -471,7 +471,14 @@ final class QuickActionsController: ObservableObject {
     ///     observer. When the pipeline does run, the observer's own
     ///     `transcriber.start()` / `diarizer.reset()` repeat this harmlessly.
     private func prepareLivePipeline() {
-        recordingRunsLivePipeline = liveAISettings?.runsLivePipeline ?? false
+        // No settings object means no gate to apply: a host that never
+        // injected `LiveAISettings` (the unit-test seams) gets the historical
+        // behaviour — the live pipeline is whatever got wired, and Stop
+        // snapshots it. `stopRecording` keys its live-state snapshot on this
+        // value, so `false` here is not a harmless default: it would discard
+        // the live transcript and speaker names of a recording whose pipeline
+        // did run. In the app the settings are always injected.
+        recordingRunsLivePipeline = liveAISettings?.runsLivePipeline ?? true
         liveTranscriber?.reset()
         liveDiarizer?.reset()
     }
