@@ -240,6 +240,37 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertEqual(calls.count, 2, "one aborted pass, one real one")
     }
 
+    /// Transcribe clicked while the stopped run is still unwinding — the
+    /// "Stopping…" window, which lasts until whisper notices the abort flag
+    /// (or for the whole model load, which cannot be interrupted). `enqueue`
+    /// used to see the unwinding run as "already in flight" and drop the
+    /// request silently, leaving the row `.pending` and unqueued until a
+    /// second click. It is queued behind the stop instead, and runs once the
+    /// stop has completed.
+    func test_transcribe_during_stopping_is_queued_behind_the_stop_and_runs() async throws {
+        let target = try TestRecordingFixture.make(in: store, title: "Eager")
+        await stub.setDefaultDelay(0.8)
+        service.enqueue(target.recording)
+        await waitUntilActive(target.recording.id)
+        await waitUntilWhisperStarted()
+        service.deferTranscription(of: target.recording.id)
+        XCTAssertEqual(service.stoppingRecordingID, target.recording.id, "precondition: still stopping")
+        try assertParkedAsStopped(target.recording.id)
+
+        await stub.setDefaultDelay(0)
+        transcribeAgain(target.recording.id)
+        XCTAssertEqual(service.pendingIDs, [target.recording.id],
+                       "the request must be queued behind the stop, not dropped")
+
+        await waitUntilWhisperStarted(calls: 2)
+        await service.waitForIdle()
+        let done = try row(target.recording.id)
+        XCTAssertEqual(done.status, .completed, "the re-run must run without a second click")
+        XCTAssertNil(done.transcriptionDeferredAt)
+        XCTAssertFalse(done.fullText.isEmpty)
+        XCTAssertNil(service.stoppingRecordingID)
+    }
+
     func test_a_stopped_queued_item_transcribes_on_the_first_try_later() async throws {
         let blocker = try TestRecordingFixture.make(in: store, title: "Blocker")
         let target = try TestRecordingFixture.make(in: store, title: "Queued")

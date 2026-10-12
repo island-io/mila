@@ -346,8 +346,15 @@ final class TranscriptionService: ObservableObject {
         }
         // `processingID` covers the moment between the worker popping the job
         // and publishing `activeRecordingID`, which would otherwise let the
-        // same recording be queued behind its own in-flight run.
-        if activeRecordingID == recording.id || processingID == recording.id { return }
+        // same recording be queued behind its own in-flight run. A run the
+        // user is STOPPING is the one exception: it is unwinding, not
+        // running, and a Transcribe click in that "Stopping…" window means
+        // "run it again once it has". So it IS queued behind the in-flight
+        // run — the worker pops it after `run()` has cleared that run's stop
+        // flag. Refusing it silently, as this used to, left the row
+        // `.pending` and unqueued until a second click.
+        let inFlight = activeRecordingID == recording.id || processingID == recording.id
+        if inFlight, stoppingRecordingID != recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
         if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
