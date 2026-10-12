@@ -1719,6 +1719,33 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY 1")
     }
 
+    /// Picking an explicit language that matches what the running call
+    /// already resolved to (English while the global setting is English)
+    /// changes the stored override but not the prompt, so the run's output
+    /// is kept and no second call is made.
+    func test_picking_the_language_already_in_force_mid_flight_does_not_rerun() async throws {
+        llm.tool = .claude
+        liveAI.outputLanguage = .english
+        let gate = TestGate()
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            if calls == 1 { await gate.wait() }
+            return "SUMMARY \(calls)"
+        }
+
+        let rec = try addRecording(named: "Same", text: "a transcript")
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.setSummaryLanguage(.english, for: rec.id)
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summaryLanguage, "en")
+
+        gate.open()
+        await summarizer.awaitInFlight(rec.id)
+
+        XCTAssertEqual(calls, 1)
+        XCTAssertEqual(store.recordings.first { $0.id == rec.id }?.summary, "SUMMARY 1")
+    }
+
     /// A run cancelled via `cancel(recordingID:)` stores nothing and signals
     /// nothing when its call returns anyway, so it cannot overwrite what a
     /// newer run for the same id produces.
