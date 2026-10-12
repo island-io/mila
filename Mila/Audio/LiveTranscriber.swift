@@ -124,12 +124,18 @@ final class LiveTranscriber: ObservableObject {
     private var inFlight: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
     private var language: String = "he"
-    /// Incremented on every `start()`. A `transcribeUtterance` call
+    /// Incremented on every `stop()` — and so on every `reset()` and
+    /// `start()`, which begin with one. A `transcribeUtterance` call
     /// captures this at entry and re-checks before mutating state —
     /// drops the result if the user started a new recording mid-flight.
     /// Without this, a late-arriving whisper result from recording N
     /// appends to recording N+1's segments (user reported seeing the
-    /// previous conversation's text in a fresh recording).
+    /// previous conversation's text in a fresh recording). `runOnce()`,
+    /// the fixed-window tick, does the same: whisper does not observe
+    /// Task cancellation, so the `inFlight` cancel in `stop()` cannot
+    /// stop a tick that is already inside the engine, and its result
+    /// comes back after the teardown — into whichever recording owns
+    /// `segments` by then.
     private var epoch: Int = 0
 
     init(transcription: TranscriptionService) {
@@ -150,9 +156,9 @@ final class LiveTranscriber: ObservableObject {
     /// NOT run the live pipeline needs it on its own, because `stop()` keeps
     /// `segments` (stopRecording snapshots them first) and stopRecording would
     /// otherwise save the previous meeting's live transcript as this one's —
-    /// marked final, so its batch pass would never run. Bumps `epoch` too, so
-    /// a whisper result still in flight from that meeting is dropped rather
-    /// than landing here.
+    /// marked final, so its batch pass would never run. `epoch` is bumped
+    /// too (by `stop()`), so a whisper result still in flight from that
+    /// meeting is dropped rather than merged here.
     func reset() {
         stop()
         self.buffer.removeAll(keepingCapacity: true)
@@ -163,7 +169,6 @@ final class LiveTranscriber: ObservableObject {
         self.segments = []
         self.speakerNames = [:]
         self.lastError = nil
-        self.epoch &+= 1
     }
 
     func start(language: String) {
@@ -198,6 +203,14 @@ final class LiveTranscriber: ObservableObject {
         detector = nil
         lastUtteranceTask?.cancel()
         lastUtteranceTask = nil
+        // Every `stop()` is a teardown, so nothing that was in flight when it
+        // ran may be merged afterwards: a whisper pass already inside the
+        // engine ignores the cancellations above and returns later — after
+        // `stopRecording` has snapshotted this recording, or after the next
+        // recording's `reset()`. Bumping here, rather than only in
+        // `reset()`/`start()`, is what makes the epoch guards in `runOnce()`
+        // and `transcribeUtterance` drop that result in both cases.
+        epoch &+= 1
         // The deletions belong to the recording that just ended. `start()` is
         // NOT the only way the next one begins — a recording that skips the
         // live pipeline gets `reset()` instead, which clears them as well — so
@@ -554,6 +567,11 @@ final class LiveTranscriber: ObservableObject {
     }
 
     private func runOnce() async {
+        // Captured before the suspension below; see `epoch`. A tick that was
+        // in flight when `stop()`/`reset()` ran belongs to a recording that
+        // is over, and its result must not be merged into whatever recording
+        // owns `segments` by the time whisper returns.
+        let runEpoch = epoch
         let total = buffer.count
         // Need at least 1s of audio before whisper produces anything
         // useful — below that, segment timestamps are garbage and the
@@ -583,6 +601,13 @@ final class LiveTranscriber: ObservableObject {
         )
         let elapsed = Date().timeIntervalSince(startedAt)
         liveLog.log("LiveTranscriber tick: samples=\(slice.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) lang=\(self.language, privacy: .public)")
+        // The pipeline was torn down — or a new recording begun — while
+        // whisper ran. Not even `trimBuffer()`: the buffer is the new
+        // recording's now.
+        guard runEpoch == epoch else {
+            liveLog.log("LiveTranscriber tick dropped post-whisper — epoch changed (run=\(runEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
+            return
+        }
         guard !whisperSegs.isEmpty else { return }
 
         let absoluteSegs: [LiveSegment] = whisperSegs.compactMap { s in
