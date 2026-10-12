@@ -773,6 +773,15 @@ final class QuickActionsController: ObservableObject {
             return
         }
         let captured = activeJob
+        // Pinned at record start by `prepareLivePipeline()`. Every read of
+        // the live singletons below is gated on it: when the live pipeline
+        // did not run for THIS recording, nothing they hold can be this
+        // recording's — at best it is empty, at worst it is a tick of the
+        // previous meeting that was still in flight when `reset()` ran.
+        // `reset()` and the transcriber's epoch guard are the first line of
+        // defence; this is the second, so a snapshot can never promote stray
+        // live text into a final transcript and skip the batch pass.
+        let runsLivePipeline = recordingRunsLivePipeline
         let durationBeforeStop = session.elapsed
         let sleepReason = pendingSleepStopReason
         pendingSleepStopReason = nil
@@ -918,10 +927,10 @@ final class QuickActionsController: ObservableObject {
         // live pane. Now the dialog pops up instantly; the
         // background drain below updates the Recording (and thus
         // the sheet, which observes the store) as more data lands.
-        let initialTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
-        let initialSummary = (liveAISession?.summary ?? "")
+        let initialTranscriptSegments = runsLivePipeline ? (liveTranscriber?.transcriptSegments ?? []) : []
+        let initialSummary = (runsLivePipeline ? (liveAISession?.summary ?? "") : "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let initialItems = liveAISession?.actionItems ?? []
+        let initialItems = runsLivePipeline ? (liveAISession?.actionItems ?? []) : []
         // Use `.running` so the sheet shows the "transcribing in
         // progress" status icon while the background drain finishes
         // up. The flip to `.completed` (or `.pending` → `.enqueue`
@@ -1059,10 +1068,16 @@ final class QuickActionsController: ObservableObject {
         // `isFinalizingRecording` was set above (before `session.stop()`)
         // so the `.idle` handler skips its own drain + cleanup. We own
         // the lifecycle in this codepath.
-        await liveTranscriber?.transcribeNow()
-        await liveDiarizer?.awaitPending()
-        if let diar = liveDiarizer {
-            liveTranscriber?.applySpeakerLabels(diar.intervals)
+        // Nothing to drain when the live pipeline never ran for this
+        // recording — and `transcribeNow()` would start a whisper pass over
+        // whatever audio the transcriber happens to hold, which is not this
+        // recording's.
+        if runsLivePipeline {
+            await liveTranscriber?.transcribeNow()
+            await liveDiarizer?.awaitPending()
+            if let diar = liveDiarizer {
+                liveTranscriber?.applySpeakerLabels(diar.intervals)
+            }
         }
         // The final Live-AI summary tick is deliberately NOT awaited here.
         // It used to run inline (feed the post-drain transcript, then
@@ -1080,15 +1095,15 @@ final class QuickActionsController: ObservableObject {
         // Snapshot final state. Safe to read now because `.idle`
         // handler is skipping its `transcriber.stop()` /
         // `diarizer.stop()` while `isFinalizingRecording` is true.
-        let finalTranscriptSegments = liveTranscriber?.transcriptSegments ?? []
+        let finalTranscriptSegments = runsLivePipeline ? (liveTranscriber?.transcriptSegments ?? []) : []
         // Snapshotted here for the same reason as the segments themselves —
         // before `liveTranscriber?.stop()` below — because it is what tells an
         // emptied live transcript apart from one that never existed. See
         // `liveTranscriptIsAuthoritative`.
-        let userDeletedLiveLines = liveTranscriber?.hasUserDeletedSegments ?? false
-        let finalSummary = (liveAISession?.summary ?? "")
+        let userDeletedLiveLines = runsLivePipeline && (liveTranscriber?.hasUserDeletedSegments ?? false)
+        let finalSummary = (runsLivePipeline ? (liveAISession?.summary ?? "") : "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let finalItems = liveAISession?.actionItems ?? []
+        let finalItems = runsLivePipeline ? (liveAISession?.actionItems ?? []) : []
         // Whether the live pipeline ran in VAD mode (utterance-bounded
         // + speaker-diarized). Chunk mode produces segments too but
         // they lack speakers, so the batch pass still needs to run.
@@ -1098,7 +1113,7 @@ final class QuickActionsController: ObservableObject {
         // Cursor (PRRT_kwDOSY2m-s6GOIj4) caught this: gating on
         // `enabled` made VAD-with-LiveAI-off recordings unnecessarily
         // re-batch-transcribed.
-        let vadActive = (liveAISettings?.useVAD == true)
+        let vadActive = runsLivePipeline && (liveAISettings?.useVAD == true)
         // Meeting mode now feeds the mic+system MIX to the live
         // transcriber (RecordingSession.consumeMic clocks off the mic and
         // mixes in buffered system audio), so the live transcript is
@@ -1129,9 +1144,11 @@ final class QuickActionsController: ObservableObject {
         //      them visible but enqueue for batch diarization, which
         //      overwrites them when done.
         //
-        // `vadActive` is `liveAISettings.useVAD` alone (see above). A
-        // recording that skipped the live pipeline gets here with no segments
-        // (`prepareLivePipeline` cleared them), so it is never authoritative.
+        // `vadActive` is `liveAISettings.useVAD` (see above) AND
+        // `runsLivePipeline`: a recording that skipped the live pipeline
+        // snapshots nothing above — `prepareLivePipeline` cleared the
+        // transcriber at record start, and the snapshot ignores it anyway —
+        // so it is never authoritative, whatever the transcriber holds.
         let hasLiveSegments = !finalTranscriptSegments.isEmpty
         // A live transcript the user EMPTIED by deleting every line is not the
         // same thing as one that was never produced, and `hasLiveSegments`
@@ -1266,7 +1283,8 @@ final class QuickActionsController: ObservableObject {
         // (island-io/mila#209). Read from `liveTranscriber` here — before the
         // teardown below — and applied on the far side through
         // `store.setSpeakerName`, the single persistence trigger.
-        onRecordingFinalized?(recording.id, liveTranscriber?.speakerNames ?? [:])
+        onRecordingFinalized?(recording.id,
+                              runsLivePipeline ? (liveTranscriber?.speakerNames ?? [:]) : [:])
         // Those names are written into the STORED row by `setSpeakerName`, not
         // into this local copy, so re-read it. Without this the tail below
         // carries a `speakerNames`-less snapshot and its

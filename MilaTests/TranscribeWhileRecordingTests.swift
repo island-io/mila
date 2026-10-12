@@ -250,6 +250,43 @@ final class TranscribeWhileRecordingTests: XCTestCase {
                        "the live-off recording must be transcribed by the batch pass, from its own audio")
     }
 
+    /// The record-start `reset()` is the first line of defence against
+    /// inheriting live text; `stopRecording`'s snapshot gate is the second.
+    /// If live text reaches the transcriber anyway during a live-off
+    /// recording — a tick of the previous meeting that was still in flight
+    /// when `reset()` ran is the realistic route — Stop must not snapshot it:
+    /// with auto-segment on, that text would be saved as this recording's
+    /// FINAL transcript and its batch pass would never run. The recording is
+    /// saved with no live transcript instead, goes `.pending`, and is
+    /// transcribed from its own audio. (Ported from #289 by @noamleibovitch.)
+    func test_stop_snapshots_nothing_from_the_live_pipeline_when_it_did_not_run() async throws {
+        liveAISettings.transcribeWhileRecording = false
+        let url = try await startFakeRecording(named: "LiveOff")
+        XCTAssertFalse(controller.recordingRunsLivePipeline, "precondition")
+        XCTAssertTrue(transcriber.segments.isEmpty, "precondition: record start cleared the transcriber")
+
+        // Stray live text arriving after record start, exactly as a late tick
+        // would deliver it: a whisper result merged into `segments`.
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: Self.firstMeetingLine)])
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), [Self.firstMeetingLine],
+                       "precondition: the transcriber holds text that is not this recording's")
+
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: Self.secondMeetingLine)])
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+
+        let saved = try XCTUnwrap(store.recordings.first { $0.audioFileName == url.lastPathComponent })
+        XCTAssertFalse(saved.fullText.contains(Self.firstMeetingLine),
+                       "the stray live text was snapshotted onto the live-off recording")
+        XCTAssertEqual(saved.status, .completed, "the batch pass must have run")
+        XCTAssertEqual(saved.fullText, Self.secondMeetingLine,
+                       "the live-off recording must be transcribed from its own audio")
+    }
+
     // MARK: - Helpers
 
     @discardableResult
