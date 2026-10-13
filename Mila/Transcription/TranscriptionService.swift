@@ -851,7 +851,7 @@ final class TranscriptionService: ObservableObject {
             guard remoteSettings.isConfigured,
                   let config = remoteSettings.currentConfig(for: working.language) else {
                 lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
-                markFailed(recording)
+                markFailed(working)
                 return
             }
             await remoteEngine.configure(config)
@@ -864,7 +864,7 @@ final class TranscriptionService: ObservableObject {
         } else {
             guard let model = modelManager.model(for: working.language) else {
                 lastError = "No model selected."
-                markFailed(recording)
+                markFailed(working)
                 return
             }
             guard modelManager.isInstalled(model) else {
@@ -878,7 +878,7 @@ final class TranscriptionService: ObservableObject {
                     ? "\(model.displayName) was deleted. Download it again in Settings → Models."
                     : "Whisper model is still downloading. Try again once it's ready."
                 serviceLog.log("skipped: model \(model.name, privacy: .public) not installed yet (declined=\(declined, privacy: .public))")
-                markFailed(recording)
+                markFailed(working)
                 return
             }
             localModel = model
@@ -1324,7 +1324,10 @@ final class TranscriptionService: ObservableObject {
             // `speakerNames`/`segments`, which it never re-keyed. Merging onto
             // the live row also means a rename/re-file/soft-delete the user
             // made while the pass was failing survives (see `mergePassResult`).
-            mergePassResult(id: recording.id) { $0.status = .failed }
+            // A re-run that failed keeps the earlier transcript, so it gets
+            // that transcript's language and model back
+            // (`Recording.settleFailedPass`).
+            mergePassResult(id: recording.id) { $0.settleFailedPass(passLanguage: working.language) }
             lastError = "Transcription failed: \(error.localizedDescription)"
         }
     }
@@ -1391,7 +1394,7 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func markFailed(_ recording: Recording) {
-        mergePassResult(id: recording.id) { $0.status = .failed }
+        mergePassResult(id: recording.id) { $0.settleFailedPass(passLanguage: recording.language) }
     }
 
     /// Whether the completion hook must force-regenerate the summary. True

@@ -2135,7 +2135,10 @@ struct MilaApp: App {
                     """)
                 toEnqueue.append(fixed)
             case .markFailed:
-                fixed.status = .failed
+                // A failed re-run keeps the earlier transcript, so it gets
+                // that transcript's language and model back
+                // (`Recording.settleFailedPass`).
+                fixed.settleFailedPass(passLanguage: fixed.language)
                 // Settled, so there is no re-run left for a stop to undo
                 // (`Recording.retranscriptionPriorState` is only meaningful
                 // on a `.pending`/`.running` row).

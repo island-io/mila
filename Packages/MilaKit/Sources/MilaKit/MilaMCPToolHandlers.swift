@@ -334,7 +334,8 @@ public struct MilaMCPToolHandlers: Sendable {
             transcript = TranscriptFormatter.srt(cues: kept)
         }
         var result = summaryObject(for: recording)
-        result["language"] = recording.language
+        // The language of the text returned, not of a re-run still in flight.
+        result["language"] = recording.transcriptLanguage
         result["format"] = format.rawValue
         result["transcript"] = transcript
         result["transcript_truncated"] = truncated
@@ -343,6 +344,8 @@ public struct MilaMCPToolHandlers: Sendable {
             // Stored as `failed` (see `StoredRecording.transcriptionDeferredAt`),
             // but nothing failed: the user chose to transcribe it later.
             notes.append("The user stopped this recording's transcription in Mila to run it later, so it hasn't been fully transcribed — any text here is only a partial live draft.")
+        } else if recording.isRetranscriptionInFlight {
+            notes.append("A re-transcription of this recording is in progress; this is the earlier, finished transcript, which it will replace when it completes.")
         } else if recording.status != "completed" {
             notes.append("Transcription status is \"\(recording.status)\" — the transcript may be partial.")
         }

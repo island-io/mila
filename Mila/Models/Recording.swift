@@ -188,6 +188,34 @@ struct Recording: Identifiable, Codable, Hashable {
     /// row as it always did. Mirrored in MilaKit's `StoredRecording`.
     var retranscriptionPriorState: RetranscriptionPriorState?
 
+    /// Settle a pass that FAILED (rather than being stopped) as `.failed`,
+    /// and — when it was a re-run that left the earlier transcript in
+    /// place — put back the language and model that describe that
+    /// transcript. Without this a failed "Re-transcribe in Hebrew" leaves the
+    /// English text labelled Hebrew: rendered right-to-left, reported as
+    /// Hebrew over MCP, and "Re-transcribe (current)" offers the language
+    /// that just failed (island-io/mila#330).
+    ///
+    /// Unlike a stop (`RecordingStore.markTranscriptionDeferred`), the status
+    /// is NOT restored: the run genuinely failed, and `.failed` (with no
+    /// `transcriptionDeferredAt`) is how the list and detail view say so.
+    /// The transcript itself is untouched — a failed pass produced none.
+    ///
+    /// `passLanguage` is the language the failed pass ran in. The labels go
+    /// back only while the row still carries it, so a newer language switch
+    /// (`prepareForRetranscription` is `language`'s writer) is never rolled
+    /// back by an older pass failing. The prior state is cleared by
+    /// `TranscriptionService.mergePassResult`, as for every settled row.
+    mutating func settleFailedPass(passLanguage: String) {
+        status = .failed
+        guard let before = retranscriptionPriorState, language == passLanguage,
+              !segments.isEmpty
+                || !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else { return }
+        language = before.language
+        modelName = before.modelName
+    }
+
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose

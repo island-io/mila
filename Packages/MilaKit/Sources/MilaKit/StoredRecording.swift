@@ -189,6 +189,24 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var isTrashed: Bool { deletedAt != nil }
     public var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
 
+    /// Whether a re-transcription of a row that already had a transcript is
+    /// in flight — the transcript on disk is still the EARLIER one.
+    public var isRetranscriptionInFlight: Bool {
+        retranscriptionPriorState != nil && (status == "pending" || status == "running")
+    }
+
+    /// The language of the transcript this row currently holds. Normally
+    /// `language`; while a re-run is in flight it is the prior state's,
+    /// because the app switches `language` to the re-run's the moment the
+    /// re-run is queued, long before any new text exists (island-io/mila#330).
+    public var transcriptLanguage: String {
+        if isRetranscriptionInFlight, let before = retranscriptionPriorState,
+           !before.language.isEmpty {
+            return before.language
+        }
+        return language
+    }
+
     /// Sidecar names, derived from `audioFileName` the same way the app does.
     public var transcriptFileName: String {
         (audioFileName as NSString).deletingPathExtension + ".txt"

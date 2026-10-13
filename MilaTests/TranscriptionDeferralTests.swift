@@ -443,6 +443,65 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertNil(try row(id).retranscriptionPriorState)
     }
 
+    /// A re-run in the other language that FAILS, rather than being stopped
+    /// (island-io/mila#330). The pass produced nothing, so the English
+    /// transcript is still there — and the labels must describe it: English,
+    /// by the earlier model. The status stays `.failed` (not "stopped"), so
+    /// the UI still says the run failed.
+    func test_a_failed_rerun_in_the_other_language_restores_the_language_and_model() async throws {
+        let id = try makeFinished("English meeting", language: "en")
+        await stub.setNextError(LoadFailure())
+        guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
+            return XCTFail("recording vanished")
+        }
+        service.enqueue(prepared, isRetranscription: true)
+        await service.waitForIdle()
+
+        XCTAssertNotNil(service.lastError, "a genuine failure is still reported")
+        let failed = try row(id)
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertNil(failed.transcriptionDeferredAt, "it failed — it must not read as stopped")
+        XCTAssertEqual(failed.language, "en", "the kept transcript is English")
+        XCTAssertEqual(failed.modelName, "Earlier model", "…and was made by the earlier model")
+        XCTAssertEqual(failed.fullText, "an earlier, complete transcript")
+        XCTAssertNil(failed.retranscriptionPriorState, "settled: nothing left to undo")
+        XCTAssertEqual(MilaApp.recoveryAction(status: failed.status, wavExists: true), .leaveAlone)
+    }
+
+    /// `settleFailedPass` restores only what describes a transcript that is
+    /// still there, and never rolls back a newer language switch.
+    func test_settling_a_failed_pass_restores_labels_only_for_a_kept_transcript_of_that_run() {
+        let before = Recording.RetranscriptionPriorState(
+            status: .completed, language: "en", modelName: "Earlier model", transcriptionDeferredAt: nil)
+        var rerun = Recording(title: "t", source: .microphone, audioFileName: "t.wav",
+                              status: .running, language: "he", modelName: "Re-run model",
+                              fullText: "an earlier transcript", retranscriptionPriorState: before)
+
+        var newerSwitch = rerun
+        newerSwitch.language = "ru"
+        newerSwitch.settleFailedPass(passLanguage: "he")
+        XCTAssertEqual(newerSwitch.status, .failed)
+        XCTAssertEqual(newerSwitch.language, "ru", "a newer switch is not the failed run's to undo")
+        XCTAssertEqual(newerSwitch.modelName, "Re-run model")
+
+        var noTranscript = rerun
+        noTranscript.fullText = ""
+        noTranscript.settleFailedPass(passLanguage: "he")
+        XCTAssertEqual(noTranscript.status, .failed)
+        XCTAssertEqual(noTranscript.language, "he", "nothing kept for the earlier labels to describe")
+
+        var firstPass = rerun
+        firstPass.retranscriptionPriorState = nil
+        firstPass.settleFailedPass(passLanguage: "he")
+        XCTAssertEqual(firstPass.status, .failed)
+        XCTAssertEqual(firstPass.language, "he")
+
+        rerun.settleFailedPass(passLanguage: "he")
+        XCTAssertEqual(rerun.status, .failed)
+        XCTAssertEqual(rerun.language, "en")
+        XCTAssertEqual(rerun.modelName, "Earlier model")
+    }
+
     /// A chunk-mode live draft waiting on its first full pass has text but was
     /// never transcribed properly. Stopping it must not pass it off as
     /// finished (`.completed` would skip the SRT/summary/compression only a
