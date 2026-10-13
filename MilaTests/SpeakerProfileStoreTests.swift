@@ -648,6 +648,25 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(deletions, [.named(["Bob"])])
     }
 
+    /// A live file removed by hand takes its profiles out of memory too,
+    /// reported like a delete, so the next save does not write them back.
+    func test_recheck_after_the_file_is_removed_by_hand_drops_its_profiles() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        var deletions: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { deletions.append($0) }
+
+        try FileManager.default.removeItem(at: fileURL)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.profiles.map(\.name), [])
+        XCTAssertEqual(deletions, [.named(["Alice"])])
+        XCTAssertFalse(store.hasStoredProfilesOnDisk)
+    }
+
     /// Delete Voice Profiles forgets dismissed names along with the files,
     /// so a later backup that reuses a name is still announced.
     func test_delete_all_forgets_dismissed_backup_names() throws {

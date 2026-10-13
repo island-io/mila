@@ -885,6 +885,16 @@ final class SpeakerProfileStore: ObservableObject {
     func recheckDamagedProfiles() {
         let date = currentFileDate()
         if date == nil {
+            // Removed by hand. If it held profiles this store had read or
+            // written, memory must follow — otherwise Settings hides
+            // "Delete Voice Profiles" while the next save writes the
+            // voices straight back.
+            if lastSeenFileDate != nil, settings.isEnabled, !hasUnsavedChanges {
+                let removed = Set(profiles.map(\.name))
+                profiles.removeAll()
+                if !removed.isEmpty { notifyDeleted(.named(removed)) }
+            }
+            lastSeenFileDate = nil
             loadedFromDamagedFile = false
         } else if date != lastSeenFileDate, !hasUnsavedChanges {
             if settings.isEnabled {
