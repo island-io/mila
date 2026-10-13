@@ -2692,6 +2692,10 @@ private struct VoiceRecognitionSection: View {
                     .accessibilityIdentifier("speakers.voiceRecognition.waiting")
             }
 
+            if let notice = profileStore.damagedProfilesNotice {
+                damagedProfilesNotice(notice)
+            }
+
             if profileStore.hasStoredProfilesOnDisk {
                 Divider()
                 HStack(alignment: .firstTextBaseline) {
@@ -2715,6 +2719,46 @@ private struct VoiceRecognitionSection: View {
                     Text("This deletes speaker-profiles.json and every voice fingerprint in it. Speaker names already on your recordings are untouched, but nobody will be recognised in new ones. This can't be undone.")
                 }
             }
+        }
+    }
+
+    /// The profiles file could not be read (#336). Without this the voices
+    /// just stop being recognised and the backup sits unannounced in
+    /// Application Support. Same orange callout as the other warnings here.
+    private func damagedProfilesNotice(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(damagedProfilesMessage(notice))
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
+                    }
+                    .accessibilityIdentifier("speakers.voiceRecognition.damaged.showInFinder")
+                    if case .setAside = notice {
+                        Button("Dismiss") { profileStore.dismissDamagedProfilesNotice() }
+                            .accessibilityIdentifier("speakers.voiceRecognition.damaged.dismiss")
+                    }
+                }
+                .font(.caption)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("speakers.voiceRecognition.damaged")
+    }
+
+    private func damagedProfilesMessage(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {
+        switch notice {
+        case .unreadable(let file):
+            return "Your saved voice profiles couldn't be loaded: \(file.lastPathComponent) can't be read, so nobody it describes will be recognised. The file is left untouched and will be kept as a backup copy the next time Mila saves a voice profile."
+        case .setAside(let backup):
+            return "Your previous voice profiles couldn't be loaded, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
         }
     }
 

@@ -238,6 +238,29 @@ final class SpeakerProfileStore: ObservableObject {
     /// deleted by the user, or loaded successfully.
     private(set) var loadedFromDamagedFile = false
 
+    /// What Settings tells the user about voice profiles that could not be
+    /// loaded (#336). Without it the profiles just vanish from recognition
+    /// and the only trace is a log line.
+    enum DamagedProfilesNotice: Equatable {
+        /// `speaker-profiles.json` could not be read or parsed, so none of
+        /// its profiles are in use. Still at its own path; the next write
+        /// moves it aside.
+        case unreadable(URL)
+        /// A file that could not be read was kept as this backup.
+        case setAside(URL)
+
+        var fileURL: URL {
+            switch self {
+            case .unreadable(let url), .setAside(let url): return url
+            }
+        }
+    }
+
+    /// Recomputed only by `refreshDamagedProfilesNotice()` — on load, on a
+    /// move aside, on delete and on dismiss — so this is a once-in-a-while
+    /// publish, safe on an App-level `@StateObject` (see CLAUDE.md).
+    @Published private(set) var damagedProfilesNotice: DamagedProfilesNotice?
+
     /// What a deletion removed, handed to the observers below.
     enum Deletion: Equatable {
         /// Every profile — `deleteAllProfiles`. Carries no names on purpose:
@@ -297,6 +320,7 @@ final class SpeakerProfileStore: ObservableObject {
         // embedding reaches memory, so nothing can be seeded or matched
         // even by a caller that forgot its own guard.
         if settings.isEnabled { load() }
+        refreshDamagedProfilesNotice()
         // Toggling mid-session has to take effect without a relaunch:
         // opting in loads what was stored, opting out drops it again.
         settings.addEnabledObserver { [weak self] nowEnabled in
@@ -521,6 +545,7 @@ final class SpeakerProfileStore: ObservableObject {
             }
         }
         hasStoredProfilesOnDisk = storedFilesExist()
+        refreshDamagedProfilesNotice()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
         // so the file was never parsed) — that is precisely the case where
@@ -809,6 +834,33 @@ final class SpeakerProfileStore: ObservableObject {
 
     private static let damagedPrefix = "speaker-profiles.damaged-"
 
+    /// Hide the notice for a set-aside backup; remembered per file name, so
+    /// a later damaged file still gets its own notice. The backup itself is
+    /// left alone. An `.unreadable` notice cannot be dismissed: it clears
+    /// on its own once the file is moved aside, repaired, or deleted.
+    func dismissDamagedProfilesNotice() {
+        guard case .setAside(let backup) = damagedProfilesNotice else { return }
+        settings.dismissDamagedBackup(backup.lastPathComponent)
+        refreshDamagedProfilesNotice()
+    }
+
+    /// The newest backup the user has not dismissed, unless the live file
+    /// itself is unreadable right now — that is the more urgent message.
+    /// Backup names carry a sortable UTC stamp, so the greatest is newest.
+    private func refreshDamagedProfilesNotice() {
+        let notice: DamagedProfilesNotice?
+        if loadedFromDamagedFile {
+            notice = .unreadable(storeURL)
+        } else if let backup = damagedCopies()
+            .filter({ !settings.isDamagedBackupDismissed($0.lastPathComponent) })
+            .max(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+            notice = .setAside(backup)
+        } else {
+            notice = nil
+        }
+        if damagedProfilesNotice != notice { damagedProfilesNotice = notice }
+    }
+
     /// The copies `moveDamagedFileAside()` left next to the live file.
     private func damagedCopies() -> [URL] {
         let dir = storeURL.deletingLastPathComponent()
@@ -839,6 +891,7 @@ final class SpeakerProfileStore: ObservableObject {
         guard fileManager.fileExists(atPath: storeURL.path) else {
             // Removed by hand since launch: nothing left to protect.
             loadedFromDamagedFile = false
+            refreshDamagedProfilesNotice()
             return true
         }
         let formatter = DateFormatter()
@@ -860,6 +913,7 @@ final class SpeakerProfileStore: ObservableObject {
             return false
         }
         loadedFromDamagedFile = false
+        refreshDamagedProfilesNotice()
         profileLog.error("moved a speaker-profiles.json that could not be parsed to \(destination.lastPathComponent, privacy: .public) before writing a new one")
         return true
     }
@@ -890,8 +944,10 @@ final class SpeakerProfileStore: ObservableObject {
         guard settings.isEnabled else { return }
         guard fileManager.fileExists(atPath: storeURL.path) else {
             loadedFromDamagedFile = false
+            refreshDamagedProfilesNotice()
             return
         }
+        defer { refreshDamagedProfilesNotice() }
         do {
             let data = try Data(contentsOf: storeURL)
             let decoder = JSONDecoder()
