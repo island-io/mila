@@ -144,6 +144,14 @@ final class PostRecordingCoordinator: ObservableObject {
             .sink { [weak self] ids in
                 guard let self else { return }
                 for id in ids { self.cancelLLMWork(for: id) }
+                // And close a rename sheet still showing a deleted row (the
+                // short-empty auto-drop, or Empty Recently Deleted from the
+                // menu): its Suggest / Send would otherwise start new calls
+                // for it after this hook has already fired, which nothing
+                // would cancel.
+                if let shown = self.pending, ids.contains(shown.id) {
+                    self.pending = nil
+                }
             }
             .store(in: &cancellables)
     }
@@ -680,9 +688,9 @@ final class PostRecordingCoordinator: ObservableObject {
     ///  5. dismiss the sheet
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
-        // Also done by the `permanentlyDeleted` hook below, but only when
-        // the row is still in the store; a pending recording can be gone
-        // already and still have work in flight.
+        // The `permanentlyDeleted` hook installed in `init` does this too,
+        // but only when the row is still in the store to delete; a pending
+        // recording can be gone already and still have work in flight.
         cancelLLMWork(for: recording.id)
         transcription.cancel(recordingID: recording.id)
         let stored = store.recordings.first(where: { $0.id == recording.id })

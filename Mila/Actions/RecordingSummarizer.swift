@@ -150,10 +150,9 @@ final class RecordingSummarizer: ObservableObject {
     /// action items are ready, falling back to the transcript when no summary
     /// was produced. It is NOT fired for the dedup early-return (a duplicate
     /// call while one is already in flight — the in-flight task fires instead)
-    /// or when the recording is no longer in the store (a skipped request
-    /// for a deleted row signals nothing either), or has been deleted
-    /// mid-flight, or was moved to
-    /// Recently Deleted while a stale run was out (nothing to export;
+    /// or when the recording is no longer in the store (whether it was
+    /// deleted mid-flight or before a skipped request arrived), or was moved
+    /// to Recently Deleted while a stale run was out (nothing to export;
     /// this covers the failure and empty-output paths too, not just success —
     /// a permanent delete calls `cancel(recordingID:)` through
     /// `RecordingStore.permanentlyDeleted`, and the cancelled call surfaces

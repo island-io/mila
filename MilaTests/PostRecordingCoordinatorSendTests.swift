@@ -840,6 +840,23 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
         try await waitFor(calls.cancelled == 1)
     }
 
+    /// A permanent delete also closes a rename sheet still showing that
+    /// recording: its Suggest / Send would otherwise start calls for a
+    /// deleted row after the delete hook had fired. Another row's sheet is
+    /// left alone.
+    func test_permanent_delete_closes_the_rename_sheet_for_that_recording() {
+        let shown = addCompletedRecording(text: "shown")
+        let other = addCompletedRecording(text: "other")
+        coordinator.present(shown)
+        XCTAssertEqual(coordinator.pending?.id, shown.id)
+
+        store.permanentlyDelete(other)
+        XCTAssertEqual(coordinator.pending?.id, shown.id, "deleting another row must not close the sheet")
+
+        store.permanentlyDelete(shown)
+        XCTAssertNil(coordinator.pending, "the sheet must not stay up on a deleted recording")
+    }
+
     // MARK: - Helpers
 
     /// Wait up to `timeoutSeconds` (default 5) for `condition` to hold, polling
