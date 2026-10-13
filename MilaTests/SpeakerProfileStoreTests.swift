@@ -582,6 +582,8 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let store = makeStore(in: dir)
         XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
         try good.write(to: fileURL)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)],
+                                              ofItemAtPath: fileURL.path)
         store.recheckDamagedProfiles()
         XCTAssertNil(store.damagedProfilesNotice)
         XCTAssertEqual(store.profiles.map(\.name), ["Alice"], "the repair takes effect")
@@ -593,6 +595,57 @@ final class SpeakerProfileStoreTests: XCTestCase {
         try FileManager.default.removeItem(at: backup)
         store.recheckDamagedProfiles()
         XCTAssertNil(store.damagedProfilesNotice)
+    }
+
+    /// A profile whose save failed lives only in memory; a recheck must
+    /// not re-read the file over it.
+    func test_recheck_does_not_reload_over_an_unsaved_profile() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let writer = makeStore(in: dir)
+        writer.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        let good = try Data(contentsOf: fileURL)
+
+        try Data("not json".utf8).write(to: fileURL)
+        let store = makeStore(in: dir)
+        // Read-only folder: the move aside fails, so Bob is memory-only.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"])
+
+        try good.write(to: fileURL)  // the file itself stays writable
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)],
+                                              ofItemAtPath: fileURL.path)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"], "the unsaved profile is not dropped")
+    }
+
+    /// A re-read that drops a profile reports it like a delete, so a
+    /// seeded recording in flight does not write it back at stop.
+    func test_recheck_reports_profiles_a_reread_removed() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let writer = makeStore(in: dir)
+        writer.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        let onlyAlice = try Data(contentsOf: fileURL)
+        writer.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+
+        let store = makeStore(in: dir)
+        var deletions: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { deletions.append($0) }
+        try onlyAlice.write(to: fileURL)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)],
+                                              ofItemAtPath: fileURL.path)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice"])
+        XCTAssertEqual(deletions, [.named(["Bob"])])
     }
 
     /// Delete Voice Profiles forgets dismissed names along with the files,

@@ -237,9 +237,10 @@ final class SpeakerProfileStore: ObservableObject {
     /// rather than writing over it (#329). Cleared once it has been moved,
     /// deleted by the user, or loaded successfully.
     private(set) var loadedFromDamagedFile = false {
-        // Every change to it changes what Settings must say (#336). Not
-        // fired by `init` itself, which refreshes explicitly.
-        didSet { refreshDamagedProfilesNotice() }
+        // A change to it changes what Settings must say (#336). `init`
+        // refreshes unconditionally on its own, since a load that leaves
+        // this false does not fire here.
+        didSet { if loadedFromDamagedFile != oldValue { refreshDamagedProfilesNotice() } }
     }
 
     /// What Settings tells the user about voice profiles that could not be
@@ -324,7 +325,8 @@ final class SpeakerProfileStore: ObservableObject {
         // Only read the file when the user has opted in. Off means off: no
         // embedding reaches memory, so nothing can be seeded or matched
         // even by a caller that forgot its own guard.
-        if settings.isEnabled { load() } else { refreshDamagedProfilesNotice() }
+        if settings.isEnabled { load() }
+        refreshDamagedProfilesNotice()
         // Toggling mid-session has to take effect without a relaunch:
         // opting in loads what was stored, opting out drops it again.
         settings.addEnabledObserver { [weak self] nowEnabled in
@@ -820,6 +822,7 @@ final class SpeakerProfileStore: ObservableObject {
         // Move it out of the way first; if that fails, do not write at all.
         if loadedFromDamagedFile, !moveDamagedFileAside() {
             profileLog.error("save skipped — the damaged speaker-profiles.json could not be moved aside")
+            hasUnsavedChanges = true
             return false
         }
         let encoder = JSONEncoder()
@@ -834,10 +837,12 @@ final class SpeakerProfileStore: ObservableObject {
             let data = try encoder.encode(profiles)
             try data.write(to: storeURL, options: .atomic)
             lastSeenFileDate = currentFileDate()
+            hasUnsavedChanges = false
             hasStoredProfilesOnDisk = true
             return true
         } catch {
             profileLog.log("save error: \(error.localizedDescription, privacy: .public)")
+            hasUnsavedChanges = true
             hasStoredProfilesOnDisk = storedFilesExist()
             return false
         }
@@ -861,27 +866,49 @@ final class SpeakerProfileStore: ObservableObject {
     /// it when it appears and whenever Mila becomes active again — the
     /// notice's own "Show in Finder" invites the user to delete a backup or
     /// repair the live file there, which nothing here would otherwise see.
-    /// An unreadable live file is re-read, so a repair takes effect —
-    /// but only while nothing else is in memory: a profile created since
-    /// the failed load exists only there (its save could not move the file
-    /// aside), and re-reading would drop it.
     ///
-    /// Re-reads only when the live file is not the one this store last
+    /// The live file is re-read only when it is not the one this store last
     /// read or wrote (`lastSeenFileDate`), so a still-broken file is not
     /// re-parsed on every focus change, and a repaired one — including a
-    /// backup the user fixed and put back over the file `save()` wrote —
-    /// is loaded instead of being overwritten by the next save.
+    /// backup the user fixed and put back over the file `save()` wrote — is
+    /// loaded instead of being overwritten by the next save. Never while a
+    /// change exists only in memory (`hasUnsavedChanges`: its save failed),
+    /// which a re-read would drop. Profiles the re-read removes are
+    /// reported to the deletion observers, exactly as a delete from
+    /// Settings is, so a recording in flight does not write them back.
+    ///
+    /// While the feature is off the file is never parsed, so a changed
+    /// file just clears the unreadable state; opting in re-detects it.
     func recheckDamagedProfiles() {
-        if loadedFromDamagedFile, !fileManager.fileExists(atPath: storeURL.path) {
-            loadedFromDamagedFile = false
-        } else if settings.isEnabled, let date = currentFileDate(), date != lastSeenFileDate {
-            load()
+        let date = currentFileDate()
+        if date == nil {
+            if loadedFromDamagedFile { loadedFromDamagedFile = false }
+        } else if date != lastSeenFileDate, !hasUnsavedChanges {
+            if settings.isEnabled {
+                let before = Set(profiles.map(\.name))
+                load()
+                let removed = before.subtracting(profiles.map(\.name))
+                if !removed.isEmpty { notifyDeleted(.named(removed)) }
+            } else if loadedFromDamagedFile {
+                loadedFromDamagedFile = false
+            }
+        }
+        // Forget dismissals of backups the user removed by hand, so a later
+        // backup that reuses a name is still announced.
+        let present = Set(damagedCopies().map(\.lastPathComponent))
+        let dismissed = settings.dismissedDamagedBackups
+        if !dismissed.isSubset(of: present) {
+            settings.setDismissedDamagedBackups(dismissed.intersection(present))
         }
         refreshDamagedProfilesNotice()
         let stored = storedFilesExist()
         // Unconditional assignment would publish on every app activation.
         if stored != hasStoredProfilesOnDisk { hasStoredProfilesOnDisk = stored }
     }
+
+    /// A change that `save()` could not write (the damaged file could not
+    /// be moved aside, or the write failed). Blocks a recheck's re-read.
+    private var hasUnsavedChanges = false
 
     /// Modification date of the live file this store last read or wrote.
     private var lastSeenFileDate: Date?
@@ -1016,6 +1043,7 @@ final class SpeakerProfileStore: ObservableObject {
                 accepted.append(profile)
             }
             profiles = accepted
+            hasUnsavedChanges = false
             loadedFromDamagedFile = false
             profileLog.log("loaded \(accepted.count) of \(decoded.count) voice profiles")
         } catch {
