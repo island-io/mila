@@ -1905,6 +1905,52 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(calls, 0, "a deleted recording must not cost an LLM call")
     }
 
+    /// A request that is SKIPPED (no call: auto-summary off, LLM not
+    /// configured, empty transcript) for a recording that was already
+    /// permanently deleted signals nothing. The skip paths used to signal
+    /// with the caller's stale copy, so the completion hook ran for a row
+    /// that no longer exists. A row still in the store keeps its signal.
+    func test_a_skipped_request_for_a_deleted_recording_is_not_signalled() async throws {
+        llm.tool = .claude
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            return "SUMMARY"
+        }
+        var finished: [UUID] = []
+        summarizer.onSummaryFinished = { finished.append($0.id) }
+
+        let gone = try addRecording(named: "Gone", text: "a transcript")
+        let kept = try addRecording(named: "Kept", text: "a transcript")
+        store.permanentlyDelete(gone)
+
+        // summarizeIfNeeded's skip: auto-summary off.
+        llm.summaryEnabled = false
+        summarizer.summarizeIfNeeded(gone)
+        summarizer.summarizeIfNeeded(kept)
+        XCTAssertEqual(finished, [kept.id],
+                       "summarizeIfNeeded's skip must not signal a deleted recording")
+
+        // regenerate's skips: LLM not configured, then an empty transcript.
+        finished = []
+        llm.summaryEnabled = true
+        llm.tool = .none
+        summarizer.regenerate(gone)
+        summarizer.regenerate(kept)
+        XCTAssertEqual(finished, [kept.id],
+                       "regenerate's not-configured skip must not signal a deleted recording")
+
+        finished = []
+        llm.tool = .claude
+        var emptyGone = gone
+        emptyGone.fullText = ""
+        summarizer.regenerate(emptyGone)
+        XCTAssertEqual(finished, [], "regenerate's empty-transcript skip must not signal a deleted recording")
+
+        await summarizer.awaitInFlight(gone.id)
+        XCTAssertEqual(calls, 0)
+    }
+
     /// A cancelled run keeps its slot until its call has actually unwound —
     /// in production, until `LLMRunner` has killed and reaped the child.
     /// `cancel` drops the run from `inFlight` at once, so without that

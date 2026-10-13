@@ -397,6 +397,102 @@ final class LLMRunnerTests: XCTestCase {
         // the point is "returns in seconds, not after the grandchild's 60s".
         XCTAssertLessThan(elapsed, 40,
                           "run() must not wait for the orphaned grandchild to release the pipes; took \(elapsed)s")
+        // And the grandchild is killed with it: the kill goes to the CLI's
+        // whole process group, not just its pid (#340).
+        if let pid = Self.readPID(pidFile) {
+            let dead = await Self.waitForExit(of: pid)
+            XCTAssertTrue(dead, "a timed-out CLI's helper must be killed with it, not left running")
+        } else {
+            XCTFail("the script never recorded its grandchild")
+        }
+    }
+
+    /// The child runs as the leader of its own process group. That is what
+    /// lets a timeout or a cancel kill the helpers a CLI spawns: the kill
+    /// goes to the group. It is Foundation's behaviour, not documented API,
+    /// so it is pinned here; if it ever changes, `processGroup(ledBy:)`
+    /// returns nil and the kill quietly falls back to the bare pid.
+    func test_cli_runs_as_the_leader_of_its_own_process_group() async throws {
+        let script = makeScript("""
+            #!/bin/sh
+            echo "$$ $(ps -o pgid= -p $$)"
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        let out = try await LLMRunner.run(tool: .claude,
+                                          prompt: "x",
+                                          transcript: "y",
+                                          executablePathOverride: script.path,
+                                          timeout: 30)
+        let parts = out.split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }
+        XCTAssertEqual(parts.count, 2, "unexpected output: \(out)")
+        guard parts.count == 2 else { return }
+        XCTAssertEqual(parts[0], parts[1], "the CLI must lead its own process group")
+        XCTAssertNotEqual(parts[1], getpgrp(), "the CLI must not share Mila's process group")
+        XCTAssertNil(LLMRunner.processGroup(ledBy: getpid()),
+                     "processGroup(ledBy:) must never name Mila's own group")
+    }
+
+    /// Cancelling a run kills the helpers the CLI spawned, not just the CLI.
+    /// The cancel used to SIGTERM only the CLI's pid, so a helper (an MCP
+    /// server, a node child) ran on after the recording it worked for was
+    /// deleted. The helper here is a background `sleep` with its output sent
+    /// away from the pipes, so only the group kill can end it.
+    func test_cancel_kills_the_helpers_the_cli_spawned() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-helper-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 60 >/dev/null 2>&1 &
+            echo $! > "\(pidFile.path)"
+            sleep 60
+            """)
+        defer {
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude,
+                                    prompt: "x",
+                                    transcript: "y",
+                                    executablePathOverride: script.path,
+                                    timeout: 120)
+        }
+        var helper: pid_t?
+        for _ in 0..<400 {
+            helper = Self.readPID(pidFile)
+            if helper != nil { break }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        let pid = try XCTUnwrap(helper, "the script never started its helper")
+
+        task.cancel()
+        let result = await task.result
+        if case .success(let out) = result {
+            XCTFail("Expected .cancelled, got output: \(out)")
+        }
+        let dead = await Self.waitForExit(of: pid)
+        XCTAssertTrue(dead, "a cancelled CLI's helper must be killed with it, not left running")
+    }
+
+    /// The pid a test script parked in `url`, once it has been written.
+    private static func readPID(_ url: URL) -> pid_t? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Poll until `pid` is gone, bounded. A killed helper is reparented to
+    /// launchd, which reaps it, so `kill(pid, 0)` starts failing shortly
+    /// after the SIGKILL.
+    private static func waitForExit(of pid: pid_t, seconds: TimeInterval = 15) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if kill(pid, 0) != 0 { return true }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return kill(pid, 0) != 0
     }
 
     /// Cancelling a run whose CLI ignores SIGTERM must still end it in

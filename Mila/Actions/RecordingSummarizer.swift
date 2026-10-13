@@ -150,7 +150,9 @@ final class RecordingSummarizer: ObservableObject {
     /// action items are ready, falling back to the transcript when no summary
     /// was produced. It is NOT fired for the dedup early-return (a duplicate
     /// call while one is already in flight — the in-flight task fires instead)
-    /// or when the recording has been deleted mid-flight, or was moved to
+    /// or when the recording is no longer in the store (a skipped request
+    /// for a deleted row signals nothing either), or has been deleted
+    /// mid-flight, or was moved to
     /// Recently Deleted while a stale run was out (nothing to export;
     /// this covers the failure and empty-output paths too, not just success —
     /// a permanent delete calls `cancel(recordingID:)` through
@@ -343,7 +345,7 @@ final class RecordingSummarizer: ObservableObject {
             logSkip(recording, force: false)
             // No summary will be generated — signal completion now so a
             // pending Obsidian export falls back to the transcript.
-            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
+            signalSkipped(recording.id)
             return
         }
         runSummary(for: recording, force: false)
@@ -368,14 +370,14 @@ final class RecordingSummarizer: ObservableObject {
         let recording = latestRecording(recording.id, fallback: recording)
         guard llmSettings.isConfigured else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — LLM not configured")
-            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
+            signalSkipped(recording.id)
             return
         }
         let transcript = recording.fullText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !transcript.isEmpty else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — transcript empty")
-            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
+            signalSkipped(recording.id)
             return
         }
         runSummary(for: recording, force: true)
@@ -1248,6 +1250,22 @@ final class RecordingSummarizer: ObservableObject {
     /// same object it already holds.
     private func latestRecording(_ id: UUID, fallback: Recording) -> Recording {
         store.recordings.first(where: { $0.id == id }) ?? fallback
+    }
+
+    /// Signal `onSummaryFinished` for a request that was skipped without a
+    /// call, with the LIVE row, and not at all when the row is gone. The
+    /// skip paths used to fall back to the caller's copy, so a request
+    /// arriving after a permanent delete (a post-recording step finishing
+    /// after a discard) signalled a recording that no longer exists, and
+    /// only the Obsidian exporter's discard tombstone kept that from filing
+    /// a note for it. The asynchronous completion paths already refused a
+    /// row that is gone; this is the same rule for the synchronous ones.
+    private func signalSkipped(_ id: UUID) {
+        guard let live = liveRecording(id) else {
+            summarizerLog.log("skipped \(self.shortID(id), privacy: .public): recording is gone — not signalled")
+            return
+        }
+        onSummaryFinished?(live)
     }
 
     /// The recording as the store currently holds it, or nil when it's gone.
