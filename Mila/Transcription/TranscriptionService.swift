@@ -1007,6 +1007,13 @@ final class TranscriptionService: ObservableObject {
                     (\(working.title, privacy: .private)) — too short or too quiet \
                     to be real speech
                     """)
+                // A re-run of a recording that already has a transcript must
+                // not swap it for nothing: undo the re-run as a failed one is
+                // undone, and say why (it was asked for, so it gets an answer).
+                if settleUnusableRerun(
+                    id: recordingID,
+                    reason: "Re-transcription skipped: the audio is too short or too quiet to transcribe. The earlier transcript was kept."
+                ) { return }
                 working.status = .failed
                 working.fullText = ""
                 working.segments = []
@@ -1187,6 +1194,16 @@ final class TranscriptionService: ObservableObject {
                 \(enrichedSegments.count, privacy: .public) segments, \
                 \(text.count, privacy: .public) chars
                 """)
+
+            // A re-run that came back with no text keeps the transcript it
+            // was meant to replace — an empty result is not a better one.
+            // Checked before anything is written or announced: the restored
+            // row may read `.completed`, and the completion work below (SRT,
+            // summary regeneration, compression) belongs to a new transcript.
+            if text.isEmpty, settleUnusableRerun(
+                id: recordingID,
+                reason: "Re-transcription produced no text. The earlier transcript was kept."
+            ) { return }
 
             working.segments = enrichedSegments
             // The batch pass minted fresh speaker IDs (new clustering, new
@@ -1392,6 +1409,31 @@ final class TranscriptionService: ObservableObject {
         // has to re-key a server-side diarizer's labels and is not on the main
         // actor — can share it instead of duplicating it.
         SpeakerLabels.normalized(in: segments)
+    }
+
+    /// Settle a re-transcription that produced no usable text — its audio
+    /// was rejected as too short or too quiet, or whisper returned nothing —
+    /// by undoing it exactly as a failed re-run is undone
+    /// (`Recording.settleFailedPass`): the earlier transcript, segments and
+    /// speaker names stay, and the status, language and model that describe
+    /// them come back. `reason` is reported through `lastError`.
+    ///
+    /// Returns false, changing nothing, unless the LIVE row is a re-run in
+    /// flight whose earlier transcript is still there
+    /// (`isRetranscriptionInFlight` + `hasTranscript`, the same test the
+    /// restore applies). A first transcription, or a re-run of a row with no
+    /// transcript to keep, then goes on to the caller's ordinary empty-result
+    /// handling. The check and the write share one main-actor turn.
+    private func settleUnusableRerun(id: UUID, reason: String) -> Bool {
+        guard let live = store.recordings.first(where: { $0.id == id }),
+              live.isRetranscriptionInFlight, live.hasTranscript else { return false }
+        serviceLog.log("""
+            \(id.uuidString.prefix(8), privacy: .public) re-run produced no usable \
+            text — keeping the earlier transcript
+            """)
+        mergePassResult(id: id) { $0.settleFailedPass() }
+        lastError = reason
+        return true
     }
 
     private func markFailed(_ recording: Recording) {

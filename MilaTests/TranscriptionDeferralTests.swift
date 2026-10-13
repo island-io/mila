@@ -82,8 +82,11 @@ final class TranscriptionDeferralTests: XCTestCase {
 
     /// A finished recording: `.completed`, with a transcript, in `language`.
     private func makeFinished(_ title: String, language: String = "en",
-                              text: String = "an earlier, complete transcript") throws -> UUID {
-        let fixture = try TestRecordingFixture.make(in: store, title: title, language: language)
+                              text: String = "an earlier, complete transcript",
+                              durationSeconds: Double = 0.5) throws -> UUID {
+        let fixture = try TestRecordingFixture.make(in: store, title: title,
+                                                    durationSeconds: durationSeconds,
+                                                    language: language)
         var finished = try row(fixture.recording.id)
         finished.status = .completed
         finished.modelName = "Earlier model"
@@ -469,6 +472,96 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertNil(RecordingStore(rootDirectory: tempRoot).recordings
                         .first { $0.id == id }?.retranscriptionPriorState,
                      "…and the consumption is persisted")
+    }
+
+    // MARK: - Re-runs that produce no usable text
+
+    /// What a re-run that produced nothing usable must leave behind: the
+    /// earlier English transcript, exactly as it was, with the status,
+    /// language and model that describe it — the same undo a failed re-run
+    /// gets — and no completion work (SRT, summary regeneration) for a
+    /// transcript that did not change. The reason goes to `lastError`.
+    private func assertEarlierTranscriptKept(_ id: UUID, completions: Int,
+                                             file: StaticString = #filePath, line: UInt = #line) throws {
+        let kept = try row(id)
+        XCTAssertEqual(kept.fullText, "an earlier, complete transcript",
+                       "an empty re-run must not replace the transcript", file: file, line: line)
+        XCTAssertEqual(kept.segments.map(\.text), ["an earlier, complete transcript"], file: file, line: line)
+        XCTAssertEqual(kept.speakerNames, ["SPEAKER_00": "Dana"], file: file, line: line)
+        XCTAssertEqual(kept.status, .completed, "the kept transcript is still a finished one", file: file, line: line)
+        XCTAssertEqual(kept.language, "en", "the kept transcript is English", file: file, line: line)
+        XCTAssertEqual(kept.modelName, "Earlier model", file: file, line: line)
+        XCTAssertNil(kept.transcriptionDeferredAt, file: file, line: line)
+        XCTAssertNil(kept.retranscriptionPriorState, "settled: nothing left to undo", file: file, line: line)
+        XCTAssertNotNil(service.lastError, "the user asked for this run, so it says why nothing changed",
+                        file: file, line: line)
+        XCTAssertEqual(completions, 0, "no completion work for a transcript that did not change",
+                       file: file, line: line)
+        let reloaded = try XCTUnwrap(RecordingStore(rootDirectory: tempRoot).recordings.first { $0.id == id },
+                                     file: file, line: line)
+        XCTAssertEqual(reloaded.fullText, "an earlier, complete transcript", "…and that is what is persisted",
+                       file: file, line: line)
+        XCTAssertEqual(reloaded.language, "en", file: file, line: line)
+        XCTAssertNil(reloaded.retranscriptionPriorState, file: file, line: line)
+    }
+
+    private func nameSpeaker(_ id: UUID) throws {
+        var named = try row(id)
+        named.speakerNames = ["SPEAKER_00": "Dana"]
+        store.update(named)
+    }
+
+    func test_a_rerun_that_returns_no_text_keeps_the_earlier_transcript() async throws {
+        let id = try makeFinished("English meeting", language: "en")
+        try nameSpeaker(id)
+        // Whitespace-only segments: no text, but not an empty segment list
+        // either — the pass must not keep them or re-key the speaker names.
+        await stub.setCannedQueue([[TranscriptSegment(start: 0, end: 1, text: "  ")]])
+        var completions = 0
+        service.onTranscriptionCompleted = { _, _ in completions += 1 }
+        guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
+            return XCTFail("recording vanished")
+        }
+        service.enqueue(prepared, isRetranscription: true)
+        await service.waitForIdle()
+
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 1, "precondition: whisper ran and came back empty")
+        try assertEarlierTranscriptKept(id, completions: completions)
+    }
+
+    func test_a_rerun_whose_audio_is_rejected_keeps_the_earlier_transcript() async throws {
+        // Under `minimumAudioDurationSeconds`: rejected before whisper.
+        let id = try makeFinished("English meeting", language: "en", durationSeconds: 0.1)
+        try nameSpeaker(id)
+        var completions = 0
+        service.onTranscriptionCompleted = { _, _ in completions += 1 }
+        // A re-run is never auto-dropped, but wire the gate as the app does
+        // so the test would catch a re-run reaching it.
+        service.shouldAutoDropShortEmpty = { _, _ in true }
+        guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
+            return XCTFail("recording vanished")
+        }
+        service.enqueue(prepared, isRetranscription: true)
+        await service.waitForIdle()
+
+        let calls = await stub.transcribeCalls
+        XCTAssertEqual(calls.count, 0, "precondition: the audio was rejected before whisper")
+        try assertEarlierTranscriptKept(id, completions: completions)
+    }
+
+    /// A FIRST transcription that comes back empty is unchanged: `.failed`,
+    /// no transcript, and no alert (it runs in the background).
+    func test_a_first_transcription_with_no_text_still_fails_quietly() async throws {
+        let fixture = try TestRecordingFixture.make(in: store, title: "Fresh", source: .systemAudio)
+        await stub.setCannedQueue([[]])
+        service.enqueue(fixture.recording)
+        await service.waitForIdle()
+
+        let failed = try row(fixture.recording.id)
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertEqual(failed.fullText, "")
+        XCTAssertNil(service.lastError)
     }
 
     /// `settleFailedPass` undoes only an in-flight re-run whose earlier
