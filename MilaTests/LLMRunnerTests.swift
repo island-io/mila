@@ -399,6 +399,67 @@ final class LLMRunnerTests: XCTestCase {
                           "run() must not wait for the orphaned grandchild to release the pipes; took \(elapsed)s")
     }
 
+    /// Cancelling a run whose CLI ignores SIGTERM must still end it in
+    /// seconds. The cancel path used to send SIGTERM and then wait for the
+    /// exit until the run's own deadline, so a child that ignored the signal
+    /// ran for the whole timeout — for a permanently deleted recording's
+    /// summary, holding one of `RecordingSummarizer`'s two slots (and the
+    /// LLM call) for nothing. Cancel now shares the timeout path's
+    /// SIGTERM -> grace -> SIGKILL escalation, with every wait bounded.
+    ///
+    /// The script traps TERM to nothing and loops on short sleeps, so the
+    /// only thing that can stop it before the 120s deadline is the SIGKILL;
+    /// the short sleeps mean no grandchild holds the pipes long after it.
+    func test_cancel_kills_a_child_that_ignores_sigterm() async throws {
+        let ready = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-llm-ready-\(UUID().uuidString)")
+        let script = makeScript("""
+            #!/bin/sh
+            trap '' TERM
+            : > "\(ready.path)"
+            i=0
+            while [ $i -lt 600 ]; do sleep 0.2; i=$((i+1)); done
+            """)
+        defer {
+            try? FileManager.default.removeItem(at: ready)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude,
+                                    prompt: "x",
+                                    transcript: "y",
+                                    executablePathOverride: script.path,
+                                    timeout: 120)
+        }
+        // Cancel only once the trap is installed, or the SIGTERM would end
+        // the shell and the test would pass without exercising the SIGKILL.
+        for _ in 0..<400 where !FileManager.default.fileExists(atPath: ready.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path),
+                      "the script never started")
+
+        let cancelledAt = Date()
+        task.cancel()
+        let result = await task.result
+        let elapsed = Date().timeIntervalSince(cancelledAt)
+
+        switch result {
+        case .success(let out):
+            XCTFail("Expected .cancelled, got output: \(out)")
+        case .failure(let error):
+            guard case LLMRunnerError.cancelled = error else {
+                XCTFail("Wrong error: \(error)")
+                return
+            }
+        }
+        // Generous CI bound (same flake class as the timeout tests): the
+        // point is "seconds after the cancel", not the 120s deadline.
+        XCTAssertLessThan(elapsed, 40,
+                          "a cancelled child that ignores SIGTERM must be killed, not waited out; took \(elapsed)s")
+    }
+
     // MARK: - Real-CLI smoke tests
     //
     // These hit the actual `claude` / `cursor-agent` binaries if installed.

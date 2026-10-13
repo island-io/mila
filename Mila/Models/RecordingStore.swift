@@ -51,6 +51,25 @@ final class RecordingStore: ObservableObject {
     /// those two agree.
     var onSpeakerIDAbsorbed: ((_ recordingID: UUID, _ sourceRawID: String, _ targetRawID: String) -> Void)?
 
+    /// Emits the ids of recordings that were just permanently deleted, from
+    /// both removal primitives — `permanentlyDelete(_:)` and `emptyTrash()`
+    /// — after the rows have left `recordings`. Every caller that throws a
+    /// recording away for good (context menu, Queue "Remove", discard sheet,
+    /// the short-empty auto-drop, "Empty Recently Deleted") goes through one
+    /// of those two, so a subscriber here hears about all of them without
+    /// each call site having to remember it.
+    ///
+    /// `RecordingSummarizer` subscribes to cancel a summary call still out
+    /// for a deleted row: otherwise the `claude -p` / `cursor-agent` child
+    /// runs to completion, holding one of its `maxConcurrent` slots and
+    /// spending an LLM call on output that has nowhere to go.
+    ///
+    /// A subject rather than an `on…` closure because the subscriber lives
+    /// on an object (with its own cancellable bag), not in `MilaApp.init`,
+    /// and a subject lets more than one object listen. Moving a row to
+    /// Recently Deleted does NOT emit: that is reversible.
+    let permanentlyDeleted = PassthroughSubject<[UUID], Never>()
+
     private let fileManager = FileManager.default
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
@@ -1189,6 +1208,7 @@ final class RecordingStore: ObservableObject {
             persistTombstones()
         }
         persist()
+        permanentlyDeleted.send([recording.id])
     }
 
     /// Backwards-compatible delete: soft-delete first, permanent if already trashed.
@@ -1228,6 +1248,7 @@ final class RecordingStore: ObservableObject {
         recordings.removeAll { trashedIDs.contains($0.id) }
         if tombstonedAny { persistTombstones() }
         persist()
+        permanentlyDeleted.send(trashed.map(\.id))
         return trashed.count
     }
 

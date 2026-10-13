@@ -153,8 +153,9 @@ final class RecordingSummarizer: ObservableObject {
     /// or when the recording has been deleted mid-flight, or was moved to
     /// Recently Deleted while a stale run was out (nothing to export;
     /// this covers the failure and empty-output paths too, not just success —
-    /// `cancel(recordingID:)` is what a permanent delete calls, and that
-    /// surfaces here as a thrown `CancellationError`).
+    /// a permanent delete calls `cancel(recordingID:)` through
+    /// `RecordingStore.permanentlyDeleted`, and the cancelled call surfaces
+    /// here as a thrown `LLMRunnerError.cancelled` / `CancellationError`).
     ///
     /// Exactly one of the branches below fires it per attempt — or hands the
     /// attempt off to a re-run (`Completion.rerun`), whose own
@@ -247,6 +248,19 @@ final class RecordingSummarizer: ObservableObject {
                 guard let self, nowConfigured else { return }
                 summarizerLog.log("llm configured flipped on — scheduling backfill")
                 self.backfillIfNeeded()
+            }
+            .store(in: &cancellables)
+
+        // Permanent delete (single row, or emptying Recently Deleted) cancels
+        // that row's summary call. Wired here rather than at each delete call
+        // site so no path can forget it: every permanent removal goes through
+        // `RecordingStore.permanentlyDelete` / `emptyTrash`, and both emit.
+        // Synchronous on the main actor, like the store mutation itself, so
+        // the cancel happens in the same turn as the delete.
+        store.permanentlyDeleted
+            .sink { [weak self] ids in
+                guard let self else { return }
+                for id in ids { self.cancel(recordingID: id) }
             }
             .store(in: &cancellables)
     }
@@ -432,9 +446,27 @@ final class RecordingSummarizer: ObservableObject {
         pumpBackfill()
     }
 
-    /// Cancel any in-flight summary work for `recordingID`. Used when a
-    /// recording is being permanently deleted so we don't spend a CLI
-    /// call on output that has nowhere to land.
+    /// Cancel any summary work for `recordingID`: drop it from the backfill
+    /// queue and cancel its in-flight call. Called for every permanent
+    /// delete via `RecordingStore.permanentlyDeleted` (see `init`), so a
+    /// deleted recording does not spend a CLI call on output that has
+    /// nowhere to go.
+    ///
+    /// Cancelling the task is what stops the child: `LLMRunner.run` bridges
+    /// task cancellation to SIGTERM, escalating to SIGKILL after a short
+    /// grace, with every wait bounded. The slot is handed on once that child
+    /// is gone, not before: the cancelled task's `defer` runs
+    /// `pumpBackfill()` when the call unwinds, so the next queued recording
+    /// starts then, and `maxConcurrent` keeps counting processes that are
+    /// really running rather than ones still being killed.
+    ///
+    /// NOT called when a recording is moved to Recently Deleted. That is
+    /// reversible, and nothing re-queues a restored recording's summary
+    /// until the next launch's backfill, so cancelling would leave a
+    /// restored row without one; letting the call finish costs only the
+    /// call the recording was already owed. A trashed row that has not
+    /// started yet is skipped by `pumpBackfill`, and emptying the bin
+    /// cancels whatever is still running.
     func cancel(recordingID: UUID) {
         backfillQueue.removeAll { $0 == recordingID }
         if let run = inFlight.removeValue(forKey: recordingID) {
@@ -456,8 +488,11 @@ final class RecordingSummarizer: ObservableObject {
             }
             // Re-check the gate — the recording may have been trashed,
             // re-transcribed, or summarized via another code path
-            // between scan time and now.
-            guard shouldSummarize(rec) else { continue }
+            // between scan time and now. The trash check is spelled out
+            // because `shouldSummarize` does not look at `isTrashed`: the
+            // scan excludes trashed rows, and a row trashed while queued
+            // must not start a call either.
+            guard !rec.isTrashed, shouldSummarize(rec) else { continue }
             runSummary(for: rec, force: false)
         }
     }
