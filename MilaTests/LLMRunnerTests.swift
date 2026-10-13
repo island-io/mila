@@ -457,13 +457,7 @@ final class LLMRunnerTests: XCTestCase {
                                     executablePathOverride: script.path,
                                     timeout: 120)
         }
-        var helper: pid_t?
-        for _ in 0..<400 {
-            helper = Self.readPID(pidFile)
-            if helper != nil { break }
-            try await Task.sleep(nanoseconds: 50_000_000)
-        }
-        let pid = try XCTUnwrap(helper, "the script never started its helper")
+        let pid = try await Self.awaitPID(pidFile)
 
         task.cancel()
         let result = await task.result

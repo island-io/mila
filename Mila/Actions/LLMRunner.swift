@@ -1515,7 +1515,14 @@ enum LLMRunner {
         // ran on until the deadline — for a permanently deleted recording's
         // summary, that held one of `RecordingSummarizer`'s two slots for the
         // whole `cliTimeout`.
-        if timedOut || handle.wasTerminated {
+        //
+        // Read ONCE: the escalation and the drain must take the same branch.
+        // A cancel arriving between two separate reads used to send the run
+        // down the killed drain without the helper sweep, leaving a helper
+        // that holds the pipes running. A cancel after this read is seen by
+        // the normal drain below, which sweeps itself.
+        let killed = timedOut || handle.wasTerminated
+        if killed {
             // SIGTERM first; if the CLI ignores it, hard-kill after a short
             // grace period so we don't read half-drained pipes or remove the
             // sandbox out from under a still-running child.
@@ -1552,7 +1559,7 @@ enum LLMRunner {
             }
         }
         // Drain the pipe readers once the process is known to be gone.
-        if timedOut || handle.wasTerminated {
+        if killed {
             // Killed path: BOUNDED. A grandchild that inherited the pipes
             // and survived the kill (an MCP server or node helper the CLI
             // spawned) holds them open indefinitely, and an unbounded wait
@@ -1595,10 +1602,12 @@ enum LLMRunner {
             while DispatchTime.now() < drainDeadline {
                 drainResult = group.wait(timeout: min(.now() + .milliseconds(250), drainDeadline))
                 if drainResult == .success { break }
-                if handle.wasTerminated, let childGroup {
-                    terminateHelpers(of: childGroup)
+                if handle.wasTerminated {
+                    if let childGroup {
+                        terminateHelpers(of: childGroup)
+                    }
                     // Cancelled: the output is discarded, so the kill
-                    // path's short bound applies from here.
+                    // path's short bound applies from here, group or not.
                     drainResult = group.wait(timeout: .now() + 3)
                     break
                 }
@@ -1659,8 +1668,9 @@ enum LLMRunner {
     /// pid that is still in use as a process group id, so while any helper
     /// is left this id names only that group, and once none is left the
     /// calls fail with ESRCH, unless the pid has been recycled by a new
-    /// group leader within this second, which would take a full wrap of the
-    /// pid space. Runs on `executeProcess`'s dedicated thread, so the short
+    /// group leader since the CLI was reaped (at most the 30 s drain ago on
+    /// the cancelled-drain path), which takes a full wrap of the
+    /// sequentially allocated pid space. Runs on `executeProcess`'s dedicated thread, so the short
     /// sleeps block nothing shared.
     static func terminateHelpers(of group: pid_t) {
         guard killpg(group, SIGTERM) == 0 else { return }  // nobody left
