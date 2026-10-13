@@ -814,15 +814,18 @@ private struct AppPickerSheet: View {
 private struct DamagedVoiceProfilesBanner: View {
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @Environment(\.openSettings) private var openSettings
+    /// `.inactive` while the window is minimised, hidden or Mila is in the
+    /// background — built into the view tree is not the same as seen.
+    @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
         Group {
             if let notice = profileStore.damagedProfilesAnnouncement {
                 banner(notice)
-                    // On screen: this incident is now announced (#342).
-                    .onChange(of: notice, initial: true) { _, _ in
-                        profileStore.noteDamagedProfilesAnnouncementShown()
-                    }
+                    // In front of the user: this incident is now announced
+                    // (#342).
+                    .onChange(of: notice, initial: true) { _, _ in noteIfVisible() }
+                    .onChange(of: controlActiveState) { _, _ in noteIfVisible() }
             }
         }
         // "Show in Finder" invites the user to fix things by hand; look
@@ -835,6 +838,11 @@ private struct DamagedVoiceProfilesBanner: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: profileStore.damagedProfilesAnnouncement)
+    }
+
+    private func noteIfVisible() {
+        guard controlActiveState != .inactive else { return }
+        profileStore.noteDamagedProfilesAnnouncementShown()
     }
 
     private func banner(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> some View {

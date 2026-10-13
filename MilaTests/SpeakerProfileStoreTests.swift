@@ -580,6 +580,45 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(backup))
     }
 
+    /// Settings showing the same notice hides the banner for the session,
+    /// but does not use the incident up: the section may be below the fold.
+    func test_hiding_for_settings_does_not_count_as_announced() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let settings = makeSettings(enabled: true)
+
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        store.hideDamagedProfilesAnnouncement()
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
+                       .setAside(backup))
+    }
+
+    /// A file edited since it was announced (and still broken) is a new
+    /// incident: its backup does not inherit the old announcement.
+    func test_a_file_edited_since_it_was_announced_is_news_when_moved() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        try Data("not json".utf8).write(to: fileURL)
+        let settings = makeSettings(enabled: true)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        store.acknowledgeDamagedProfilesAnnouncement()
+
+        try Data("still not json".utf8).write(to: fileURL)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)],
+                                              ofItemAtPath: fileURL.path)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)  // moves it aside
+
+        let names = try backups(in: dir)
+        XCTAssertEqual(names.count, 1)
+        XCTAssertEqual(store.damagedProfilesAnnouncement?.fileURL.lastPathComponent, names[0])
+    }
+
     /// No damaged file, no announcement.
     func test_no_announcement_without_a_damaged_file() throws {
         let dir = tempDir()

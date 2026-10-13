@@ -2730,11 +2730,13 @@ private struct VoiceRecognitionSection: View {
 
             if let notice = profileStore.damagedProfilesNotice {
                 damagedProfilesNotice(notice)
-                    // Seen here, so the main window need not say it too
-                    // (#342) — including an announcement raised while this
-                    // is already showing, e.g. by the toggle above.
+                    // Said here, so the main window need not say it too this
+                    // session (#342) — including an announcement raised
+                    // while this is already showing, e.g. by the toggle
+                    // above. Not recorded as seen: see
+                    // `hideDamagedProfilesAnnouncement`.
                     .onChange(of: profileStore.damagedProfilesAnnouncement, initial: true) { _, announcement in
-                        if announcement != nil { profileStore.acknowledgeDamagedProfilesAnnouncement() }
+                        if announcement != nil { profileStore.hideDamagedProfilesAnnouncement() }
                     }
             }
 

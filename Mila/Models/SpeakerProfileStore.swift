@@ -294,6 +294,7 @@ final class SpeakerProfileStore: ObservableObject {
     private var shownAnnouncementKey: String?
 
     private static let unreadableKeyPrefix = "unreadable@"
+    private let sessionID = UUID().uuidString
 
     /// What a deletion removed, handed to the observers below.
     enum Deletion: Equatable {
@@ -588,8 +589,10 @@ final class SpeakerProfileStore: ObservableObject {
         // and must not hide a later backup that happens to reuse one.
         // Keep only names whose file survived a failed removal, so that one
         // does not come back as if never dismissed.
-        let surviving = Set(damagedCopies().map(\.lastPathComponent))
-        settings.setDismissedDamagedBackups(settings.dismissedDamagedBackups.intersection(surviving))
+        // Not from a failed listing, which would read as "none survived".
+        if let surviving = damagedCopyNames().map(Set.init) {
+            settings.setDismissedDamagedBackups(settings.dismissedDamagedBackups.intersection(surviving))
+        }
         refreshDamagedProfilesNotice()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
@@ -938,10 +941,12 @@ final class SpeakerProfileStore: ObservableObject {
         }
         // Forget dismissals of backups the user removed by hand, so a later
         // backup that reuses a name is still announced.
-        let present = Set(damagedCopies().map(\.lastPathComponent))
-        let dismissed = settings.dismissedDamagedBackups
-        if !dismissed.isSubset(of: present) {
-            settings.setDismissedDamagedBackups(dismissed.intersection(present))
+        // Not from a failed listing, which would forget every dismissal.
+        if let present = damagedCopyNames().map(Set.init) {
+            let dismissed = settings.dismissedDamagedBackups
+            if !dismissed.isSubset(of: present) {
+                settings.setDismissedDamagedBackups(dismissed.intersection(present))
+            }
         }
         refreshDamagedProfilesNotice()
         let stored = storedFilesExist()
@@ -1006,11 +1011,18 @@ final class SpeakerProfileStore: ObservableObject {
         settings.setAnnouncedDamagedProfiles(announced)
     }
 
-    /// The user closed the banner, followed it into Settings, or is looking
-    /// at the same notice in Settings (#342). Counts as seen, and takes it
-    /// down for the rest of the session.
+    /// The user closed the banner or followed it into Settings (#342).
+    /// Counts as seen, and takes it down for the rest of the session.
     func acknowledgeDamagedProfilesAnnouncement() {
         noteDamagedProfilesAnnouncementShown()
+        hideDamagedProfilesAnnouncement()
+    }
+
+    /// Settings → Speakers is showing the same notice, so the main window
+    /// need not repeat it this session. Deliberately does NOT count as
+    /// announced: the section sits below the fold, and Settings being open
+    /// on Speakers does not mean the user scrolled to it.
+    func hideDamagedProfilesAnnouncement() {
         shownAnnouncementKey = nil
         if damagedProfilesAnnouncement != nil { damagedProfilesAnnouncement = nil }
     }
@@ -1024,7 +1036,11 @@ final class SpeakerProfileStore: ObservableObject {
         case .setAside(let backup):
             return backup.lastPathComponent
         case .unreadable:
-            let stamp = lastSeenFileDate.map { String(Int64(($0.timeIntervalSince1970 * 1000).rounded())) } ?? "unknown"
+            // No date (the file could not even be stat'ed): nothing ties two
+            // such failures together, so each session is its own incident
+            // rather than every one sharing a key that is announced once.
+            let stamp = lastSeenFileDate.map { String(Int64(($0.timeIntervalSince1970 * 1000).rounded())) }
+                ?? "unknown-\(sessionID)"
             return Self.unreadableKeyPrefix + stamp
         }
     }
@@ -1101,6 +1117,7 @@ final class SpeakerProfileStore: ObservableObject {
             destination = dir.appendingPathComponent("\(Self.damagedPrefix)\(stamp)-\(attempt).json")
             attempt += 1
         }
+        let movedFileDate = currentFileDate()
         do {
             try fileManager.moveItem(at: storeURL, to: destination)
         } catch {
@@ -1110,13 +1127,17 @@ final class SpeakerProfileStore: ObservableObject {
         // The backup is the file the user was already told about, not news
         // (#342): it inherits the unreadable file's announcement. Before the
         // flag flips, since that is what refreshes the notice.
+        // Only if it is still the file that was announced: one edited since
+        // (and still broken) is a new incident, and its backup is news.
         let unreadableKey = announcementKey(.unreadable(storeURL))
         var announced = settings.announcedDamagedProfiles
-        if announced.contains(unreadableKey) {
+        if announced.contains(unreadableKey), movedFileDate == lastSeenFileDate {
             announced.insert(destination.lastPathComponent)
             settings.setAnnouncedDamagedProfiles(announced)
         }
-        if shownAnnouncementKey == unreadableKey { shownAnnouncementKey = destination.lastPathComponent }
+        if shownAnnouncementKey == unreadableKey, movedFileDate == lastSeenFileDate {
+            shownAnnouncementKey = destination.lastPathComponent
+        }
         loadedFromDamagedFile = false
         profileLog.error("moved a speaker-profiles.json that could not be parsed to \(destination.lastPathComponent, privacy: .public) before writing a new one")
         return true
