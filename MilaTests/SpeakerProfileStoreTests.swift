@@ -621,6 +621,49 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.damagedProfilesAnnouncement?.fileURL.lastPathComponent, names[0])
     }
 
+    /// The banner stays up while the user edits the file in Finder and it
+    /// is still broken: that new incident is the one they are looking at,
+    /// so it is recorded too and the next launch stays quiet.
+    func test_a_file_edited_while_its_banner_is_up_is_recorded() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        try Data("not json".utf8).write(to: fileURL)
+        let settings = makeSettings(enabled: true)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        store.noteDamagedProfilesAnnouncementShown()
+
+        try Data("still not json".utf8).write(to: fileURL)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)],
+                                              ofItemAtPath: fileURL.path)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .unreadable(fileURL))
+
+        XCTAssertNil(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement)
+    }
+
+    /// A backup announcement covers every backup present, so deleting the
+    /// newest one does not raise a banner about an older one.
+    func test_deleting_the_announced_backup_does_not_announce_an_older_one() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let older = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        let newer = dir.appendingPathComponent("speaker-profiles.damaged-20260201T000000Z.json")
+        try Data("old".utf8).write(to: older)
+        try Data("newer".utf8).write(to: newer)
+        let settings = makeSettings(enabled: true)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(newer))
+        store.acknowledgeDamagedProfilesAnnouncement()
+
+        try FileManager.default.removeItem(at: newer)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.damagedProfilesNotice, .setAside(older), "Settings still says so")
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+    }
+
     /// No damaged file, no announcement.
     func test_no_announcement_without_a_damaged_file() throws {
         let dir = tempDir()

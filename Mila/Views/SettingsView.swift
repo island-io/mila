@@ -2704,6 +2704,14 @@ private struct VoiceRecognitionSection: View {
     @EnvironmentObject private var settings: VoiceRecognitionSettings
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var showDeleteConfirmation = false
+    /// Only a Settings window in front stands in for the main-window banner
+    /// (#342); one left open in the background does not.
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    private func hideAnnouncementIfInFront() {
+        guard controlActiveState == .key, profileStore.damagedProfilesAnnouncement != nil else { return }
+        profileStore.hideDamagedProfilesAnnouncement()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2735,9 +2743,10 @@ private struct VoiceRecognitionSection: View {
                     // while this is already showing, e.g. by the toggle
                     // above. Not recorded as seen: see
                     // `hideDamagedProfilesAnnouncement`.
-                    .onChange(of: profileStore.damagedProfilesAnnouncement, initial: true) { _, announcement in
-                        if announcement != nil { profileStore.hideDamagedProfilesAnnouncement() }
+                    .onChange(of: profileStore.damagedProfilesAnnouncement, initial: true) { _, _ in
+                        hideAnnouncementIfInFront()
                     }
+                    .onChange(of: controlActiveState) { _, _ in hideAnnouncementIfInFront() }
             }
 
             if profileStore.hasStoredProfilesOnDisk {

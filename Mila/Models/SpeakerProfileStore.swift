@@ -1014,6 +1014,12 @@ final class SpeakerProfileStore: ObservableObject {
             announced = announced.filter { !$0.hasPrefix(Self.unreadableKeyPrefix) }
         }
         announced.insert(key)
+        // A backup announcement covers every backup present, as Dismiss
+        // does: deleting the newest one must not turn an older one the user
+        // was never shown separately into fresh news.
+        if !key.hasPrefix(Self.unreadableKeyPrefix) {
+            announced.formUnion(damagedCopyNames() ?? [])
+        }
         settings.setAnnouncedDamagedProfiles(announced)
     }
 
@@ -1060,10 +1066,19 @@ final class SpeakerProfileStore: ObservableObject {
     private func refreshDamagedProfilesAnnouncement(presentBackups: [String]?) {
         let stored = settings.announcedDamagedProfiles
         var next: DamagedProfilesNotice?
+        // The same banner staying up under a new key — an unreadable file
+        // edited and still broken: the notice value does not change, so the
+        // view sees nothing new to record. If the old key was recorded, the
+        // user has been shown this one too.
+        var recordContinuation = false
         if settings.isEnabled, let notice = damagedProfilesNotice {
             let key = announcementKey(notice)
             if key == shownAnnouncementKey
                 || (!stored.contains(key) && !hiddenAnnouncementKeys.contains(key)) {
+                if key != shownAnnouncementKey, damagedProfilesAnnouncement == notice,
+                   let previous = shownAnnouncementKey, stored.contains(previous) {
+                    recordContinuation = true
+                }
                 next = notice
                 shownAnnouncementKey = key
             }
@@ -1074,6 +1089,7 @@ final class SpeakerProfileStore: ObservableObject {
             if kept != stored { settings.setAnnouncedDamagedProfiles(kept) }
         }
         if damagedProfilesAnnouncement != next { damagedProfilesAnnouncement = next }
+        if recordContinuation { noteDamagedProfilesAnnouncementShown() }
     }
 
     /// The copies `moveDamagedFileAside()` left next to the live file.

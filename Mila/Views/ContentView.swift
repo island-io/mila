@@ -814,8 +814,9 @@ private struct AppPickerSheet: View {
 private struct DamagedVoiceProfilesBanner: View {
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @Environment(\.openSettings) private var openSettings
-    /// `.inactive` while the window is minimised, hidden or Mila is in the
-    /// background — built into the view tree is not the same as seen.
+    /// `.key` only while this window is the one in front of the user — built
+    /// into the view tree (minimised, behind Settings, Mila in the
+    /// background) is not the same as seen.
     @Environment(\.controlActiveState) private var controlActiveState
 
     var body: some View {
@@ -841,7 +842,7 @@ private struct DamagedVoiceProfilesBanner: View {
     }
 
     private func noteIfVisible() {
-        guard controlActiveState != .inactive else { return }
+        guard controlActiveState == .key else { return }
         profileStore.noteDamagedProfilesAnnouncementShown()
     }
 
