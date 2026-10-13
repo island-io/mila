@@ -17,4 +17,3 @@ Closes #
 - [ ] Builds locally (`make build`) and tests pass (`make test`)
 - [ ] No secrets, credentials, tokens, or internal infrastructure references added
 - [ ] Follows the conventions in `CLAUDE.md`
-- [ ] User-facing change is noted in the README changelog (if applicable)
