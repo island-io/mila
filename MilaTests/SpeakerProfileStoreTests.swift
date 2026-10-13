@@ -519,6 +519,167 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertNil(store.damagedProfilesNotice, "one click dismisses every backup present")
     }
 
+    // MARK: - Main-window announcement (#342)
+
+    /// An unreadable file is announced in the main window at launch, and
+    /// only once: a relaunch with the same broken file stays quiet, while
+    /// Settings keeps its notice.
+    func test_announcement_shows_once_for_an_unreadable_file() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        try Data("not json".utf8).write(to: fileURL)
+        let settings = makeSettings(enabled: true)
+
+        let first = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(first.damagedProfilesAnnouncement, .unreadable(fileURL))
+        first.recheckDamagedProfiles()
+        XCTAssertEqual(first.damagedProfilesAnnouncement, .unreadable(fileURL),
+                       "still up for the rest of the session")
+
+        let relaunched = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertNil(relaunched.damagedProfilesAnnouncement, "no nag on the next launch")
+        XCTAssertEqual(relaunched.damagedProfilesNotice, .unreadable(fileURL))
+    }
+
+    /// No damaged file, no announcement.
+    func test_no_announcement_without_a_damaged_file() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+        XCTAssertNil(makeStore(in: dir).damagedProfilesAnnouncement)
+    }
+
+    /// Closing it takes it down for the session; it does not come back on
+    /// relaunch either.
+    func test_acknowledged_announcement_stays_down() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let settings = makeSettings(enabled: true)
+
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(backup))
+        store.acknowledgeDamagedProfilesAnnouncement()
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+        store.recheckDamagedProfiles()
+        XCTAssertNil(store.damagedProfilesAnnouncement, "a recheck does not bring it back")
+        XCTAssertEqual(store.damagedProfilesNotice, .setAside(backup), "Settings still says so")
+        XCTAssertNil(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement)
+    }
+
+    /// A backup dismissed in Settings (#337) is never announced, and
+    /// dismissing takes a showing announcement down.
+    func test_a_dismissed_backup_is_never_announced() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let settings = makeSettings(enabled: true)
+        settings.setDismissedDamagedBackups([backup.lastPathComponent])
+        XCTAssertNil(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement)
+
+        // Dismissed while the announcement is showing.
+        let other = dir.appendingPathComponent("speaker-profiles.damaged-20260201T000000Z.json")
+        try Data("newer".utf8).write(to: other)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(other))
+        store.dismissDamagedProfilesNotice()
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+    }
+
+    /// Off means the user is not expecting recognition: nothing is
+    /// announced, and nothing is recorded as announced, so opting in later
+    /// still tells them.
+    func test_no_announcement_while_voice_recognition_is_off() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let settings = makeSettings(enabled: false)
+
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertNotNil(store.damagedProfilesNotice, "Settings still shows its notice")
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+        XCTAssertNil(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement)
+
+        settings.isEnabled = true
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(backup))
+    }
+
+    /// The unreadable file and the backup it is moved to are one incident:
+    /// a showing announcement follows the file, and a closed one is not
+    /// raised again by the move or by a relaunch.
+    func test_moving_the_file_aside_is_not_a_second_announcement() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        try Data("not json".utf8).write(to: fileURL)
+        let settings = makeSettings(enabled: true)
+
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .unreadable(fileURL))
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)  // moves it aside
+        let names = try backups(in: dir)
+        XCTAssertEqual(names.count, 1)
+        XCTAssertEqual(store.damagedProfilesAnnouncement?.fileURL.lastPathComponent, names[0],
+                       "the showing announcement now points at the backup")
+        XCTAssertNil(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
+                     "the backup inherited the announcement")
+
+        // Same again, but closed before the move.
+        try FileManager.default.removeItem(at: dir.appendingPathComponent(names[0]))
+        try FileManager.default.removeItem(at: fileURL)
+        try Data("still not json".utf8).write(to: fileURL)
+        // A different modification date is what makes it a new incident;
+        // do not leave that to the clock's resolution.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(120)],
+                                              ofItemAtPath: fileURL.path)
+        let again = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(again.damagedProfilesAnnouncement, .unreadable(fileURL), "a new incident")
+        again.acknowledgeDamagedProfilesAnnouncement()
+        again.updateProfile(name: "Carol", embedding: [0, 1, 0], sampleCount: 1)
+        XCTAssertEqual(try backups(in: dir).count, 1)
+        XCTAssertNil(again.damagedProfilesAnnouncement)
+    }
+
+    /// A newer backup is a new incident even after an older one was
+    /// announced; and an announced backup removed by hand is forgotten, so
+    /// a later file reusing its name is still announced.
+    func test_a_newer_or_reused_backup_is_announced() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let settings = makeSettings(enabled: true)
+        let first = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: first)
+        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
+                       .setAside(first))
+
+        let second = dir.appendingPathComponent("speaker-profiles.damaged-20260201T000000Z.json")
+        try Data("newer".utf8).write(to: second)
+        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
+                       .setAside(second))
+
+        try FileManager.default.removeItem(at: first)
+        try FileManager.default.removeItem(at: second)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+        XCTAssertTrue(settings.announcedDamagedProfiles.isEmpty, "names of removed backups are forgotten")
+        try Data("reused".utf8).write(to: second)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(second))
+    }
+
     /// Turning the feature off does not make an unreadable file readable:
     /// the notice stays, so the user is not left believing the profiles
     /// come back on opt-in. Nothing is written over the file meanwhile.

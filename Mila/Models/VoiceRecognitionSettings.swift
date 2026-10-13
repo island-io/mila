@@ -25,6 +25,7 @@ final class VoiceRecognitionSettings: ObservableObject {
     enum Keys {
         static let enabled = "speakers.voiceRecognition.enabled"
         static let dismissedDamagedBackups = "speakers.voiceRecognition.dismissedDamagedBackups"
+        static let announcedDamagedProfiles = "speakers.voiceRecognition.announcedDamagedProfiles"
     }
 
     /// Master switch. **Off by default** and deliberately not inferred from
@@ -198,6 +199,23 @@ final class VoiceRecognitionSettings: ObservableObject {
             defaults.removeObject(forKey: Keys.dismissedDamagedBackups)
         } else {
             defaults.set(fileNames.sorted(), forKey: Keys.dismissedDamagedBackups)
+        }
+    }
+
+    /// Damaged-profile incidents the main window has already announced
+    /// (#342): backup file names, plus one key for an unreadable live file
+    /// (see `SpeakerProfileStore.announcementKey`). Separate from the
+    /// dismissals above — announced means "told once", not "hidden in
+    /// Settings". Not `@Published`, for the same reason.
+    var announcedDamagedProfiles: Set<String> {
+        Set(defaults.stringArray(forKey: Keys.announcedDamagedProfiles) ?? [])
+    }
+
+    func setAnnouncedDamagedProfiles(_ keys: Set<String>) {
+        if keys.isEmpty {
+            defaults.removeObject(forKey: Keys.announcedDamagedProfiles)
+        } else {
+            defaults.set(keys.sorted(), forKey: Keys.announcedDamagedProfiles)
         }
     }
 

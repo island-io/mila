@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import ScreenCaptureKit
 
 struct ContentView: View {
@@ -34,11 +35,16 @@ struct ContentView: View {
                 detailContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                if let progress = activeDownloadProgress() {
-                    ModelDownloadBanner(progress: progress)
-                        .padding(.top, 8)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                VStack(spacing: 8) {
+                    if let progress = activeDownloadProgress() {
+                        ModelDownloadBanner(progress: progress)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                    // A leaf view, so `ContentView` itself does not observe
+                    // the profile store (#342).
+                    DamagedVoiceProfilesBanner()
                 }
+                .padding(.top, 8)
 
                 // The floating RecordingChip used to be the only "you
                 // are recording" indicator. With the new always-on live
@@ -795,6 +801,82 @@ private struct AppPickerSheet: View {
         }
         .padding(20)
         .frame(width: 460)
+    }
+}
+
+/// Tells the user, once, that their saved voice profiles could not be read
+/// (#342). Settings → Speakers has said so since #336, but someone who
+/// never opens it would only notice speakers silently going unrecognised.
+/// Non-modal: it sits over the detail pane until closed, and
+/// `SpeakerProfileStore.damagedProfilesAnnouncement` decides when it shows
+/// (once per incident, never for a backup dismissed in Settings, not while
+/// voice recognition is off).
+private struct DamagedVoiceProfilesBanner: View {
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
+    @Environment(\.openSettings) private var openSettings
+
+    var body: some View {
+        if let notice = profileStore.damagedProfilesAnnouncement {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Saved voices are not being recognised")
+                        .font(.callout.weight(.semibold))
+                    Text(message(notice))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Open Settings") {
+                            SettingsNavigation.shared.pendingTab = .speakers
+                            SettingsNavigation.shared.pendingAnchor = .voiceRecognition
+                            openSettings()
+                            profileStore.acknowledgeDamagedProfilesAnnouncement()
+                        }
+                        .accessibilityIdentifier("main.damagedVoiceProfiles.openSettings")
+                        Button("Show in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
+                        }
+                        .accessibilityIdentifier("main.damagedVoiceProfiles.showInFinder")
+                    }
+                    .controlSize(.small)
+                }
+                Button {
+                    profileStore.acknowledgeDamagedProfilesAnnouncement()
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.borderless)
+                .help("Close")
+                .accessibilityLabel("Close")
+                .accessibilityIdentifier("main.damagedVoiceProfiles.close")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 480, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            .padding(.horizontal, 16)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("main.damagedVoiceProfiles")
+            .transition(.move(edge: .top).combined(with: .opacity))
+        }
+    }
+
+    private func message(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {
+        switch notice {
+        case .unreadable(let file):
+            return "\(file.lastPathComponent) can't be read, so nobody saved in it will be recognised in new recordings. The file is left untouched. Settings → Speakers → Voice recognition has the details."
+        case .setAside(let backup):
+            return "Your earlier voice profiles couldn't be read, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
+        }
     }
 }
 

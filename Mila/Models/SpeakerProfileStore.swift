@@ -267,6 +267,30 @@ final class SpeakerProfileStore: ObservableObject {
     /// App-level `@StateObject` (see CLAUDE.md).
     @Published private(set) var damagedProfilesNotice: DamagedProfilesNotice?
 
+    /// The same notice, for the main window (#342) — a user who never opens
+    /// Settings → Speakers would otherwise never learn their voices stopped
+    /// being recognised. Unlike `damagedProfilesNotice` it is announced
+    /// **once per incident**: it is set only for a notice whose
+    /// `announcementKey` is not yet in
+    /// `VoiceRecognitionSettings.announcedDamagedProfiles`, and that key is
+    /// recorded at the same moment, so the next launch stays quiet. The
+    /// unreadable live file and the backup it becomes count as one incident
+    /// (`moveDamagedFileAside` carries the key over). Nil while voice
+    /// recognition is off, for a backup dismissed in Settings (it derives
+    /// from `damagedProfilesNotice`, which already leaves those out), and
+    /// once the user closes it or sees the notice in Settings
+    /// (`acknowledgeDamagedProfilesAnnouncement`).
+    ///
+    /// Recomputed only alongside `damagedProfilesNotice`, so it is just as
+    /// rare a publish (CLAUDE.md, #280).
+    @Published private(set) var damagedProfilesAnnouncement: DamagedProfilesNotice?
+
+    /// Key of the announcement showing this session, so a refresh keeps it
+    /// up rather than treating it as already announced.
+    private var shownAnnouncementKey: String?
+
+    private static let unreadableKeyPrefix = "unreadable@"
+
     /// What a deletion removed, handed to the observers below.
     enum Deletion: Equatable {
         /// Every profile — `deleteAllProfiles`. Carries no names on purpose:
@@ -338,6 +362,8 @@ final class SpeakerProfileStore: ObservableObject {
                 // Whatever failed to save is gone from memory too.
                 self.hasUnsavedChanges = false
             }
+            // The main-window announcement follows the switch (#342).
+            self.refreshDamagedProfilesNotice()
         }
     }
 
@@ -955,6 +981,56 @@ final class SpeakerProfileStore: ObservableObject {
                 .map(DamagedProfilesNotice.setAside)
         }
         if damagedProfilesNotice != notice { damagedProfilesNotice = notice }
+        refreshDamagedProfilesAnnouncement()
+    }
+
+    /// The main window has shown the announcement and the user closed it,
+    /// or the user is looking at the same notice in Settings (#342). The
+    /// incident was recorded as announced when it was first shown; this
+    /// only takes it down for the rest of the session.
+    func acknowledgeDamagedProfilesAnnouncement() {
+        shownAnnouncementKey = nil
+        if damagedProfilesAnnouncement != nil { damagedProfilesAnnouncement = nil }
+    }
+
+    /// What identifies one incident across launches: a backup by its file
+    /// name (unique, never reused while it exists), an unreadable live file
+    /// by the modification date it had when it failed to load — so an edit
+    /// that leaves it broken is news again, and a relaunch is not.
+    private func announcementKey(_ notice: DamagedProfilesNotice) -> String {
+        switch notice {
+        case .setAside(let backup):
+            return backup.lastPathComponent
+        case .unreadable:
+            let stamp = lastSeenFileDate.map { String(Int64(($0.timeIntervalSince1970 * 1000).rounded())) } ?? "unknown"
+            return Self.unreadableKeyPrefix + stamp
+        }
+    }
+
+    /// See `damagedProfilesAnnouncement`. Also forgets announced backups
+    /// whose file is gone, so a later backup that reuses a name is still
+    /// announced, and keeps only the newest unreadable key.
+    private func refreshDamagedProfilesAnnouncement() {
+        let stored = settings.announcedDamagedProfiles
+        let present = Set(damagedCopies().map(\.lastPathComponent))
+        var announced = stored.filter { $0.hasPrefix(Self.unreadableKeyPrefix) || present.contains($0) }
+        var next: DamagedProfilesNotice?
+        if settings.isEnabled, let notice = damagedProfilesNotice {
+            let key = announcementKey(notice)
+            if key == shownAnnouncementKey {
+                next = notice
+            } else if !announced.contains(key) {
+                next = notice
+                shownAnnouncementKey = key
+                if key.hasPrefix(Self.unreadableKeyPrefix) {
+                    announced = announced.filter { !$0.hasPrefix(Self.unreadableKeyPrefix) }
+                }
+                announced.insert(key)
+            }
+        }
+        if next == nil { shownAnnouncementKey = nil }
+        if announced != stored { settings.setAnnouncedDamagedProfiles(announced) }
+        if damagedProfilesAnnouncement != next { damagedProfilesAnnouncement = next }
     }
 
     /// The copies `moveDamagedFileAside()` left next to the live file.
@@ -1007,6 +1083,16 @@ final class SpeakerProfileStore: ObservableObject {
             profileLog.error("could not move the damaged speaker-profiles.json aside: \(error.localizedDescription, privacy: .public)")
             return false
         }
+        // The backup is the file the user was already told about, not news
+        // (#342): it inherits the unreadable file's announcement. Before the
+        // flag flips, since that is what refreshes the notice.
+        let unreadableKey = announcementKey(.unreadable(storeURL))
+        var announced = settings.announcedDamagedProfiles
+        if announced.contains(unreadableKey) {
+            announced.insert(destination.lastPathComponent)
+            settings.setAnnouncedDamagedProfiles(announced)
+        }
+        if shownAnnouncementKey == unreadableKey { shownAnnouncementKey = destination.lastPathComponent }
         loadedFromDamagedFile = false
         profileLog.error("moved a speaker-profiles.json that could not be parsed to \(destination.lastPathComponent, privacy: .public) before writing a new one")
         return true
