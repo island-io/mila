@@ -1007,9 +1007,12 @@ final class TranscriptionService: ObservableObject {
                     (\(working.title, privacy: .private)) — too short or too quiet \
                     to be real speech
                     """)
-                // A re-run of a recording that already has a transcript must
-                // not swap it for nothing: undo the re-run as a failed one is
-                // undone, and say why (it was asked for, so it gets an answer).
+                // The exception to "silently": a re-run of a recording that
+                // already has a transcript must not swap it for nothing. It is
+                // undone as a failed re-run is undone, and reported the same
+                // way — through `lastError`, as the catch below reports a
+                // re-run that threw — since the user asked for it and would
+                // otherwise see an unchanged transcript with no explanation.
                 if settleUnusableRerun(
                     id: recordingID,
                     reason: "Re-transcription skipped: the audio is too short or too quiet to transcribe. The earlier transcript was kept."
@@ -1421,18 +1424,22 @@ final class TranscriptionService: ObservableObject {
     /// Returns false, changing nothing, unless the LIVE row is a re-run in
     /// flight whose earlier transcript is still there
     /// (`isRetranscriptionInFlight` + `hasTranscript`, the same test the
-    /// restore applies). A first transcription, or a re-run of a row with no
-    /// transcript to keep, then goes on to the caller's ordinary empty-result
-    /// handling. The check and the write share one main-actor turn.
+    /// restore applies — asked of the restore itself, on a copy, so the
+    /// predicate lives in one place). A first transcription, or a re-run of a
+    /// row with no transcript to keep, then goes on to the caller's ordinary
+    /// empty-result handling. The check and the write share one main-actor
+    /// turn. A row the user sent to Recently Deleted mid-pass is settled the
+    /// same way but raises no alert, as a finished pass skips its user-facing
+    /// completion work for one.
     private func settleUnusableRerun(id: UUID, reason: String) -> Bool {
-        guard let live = store.recordings.first(where: { $0.id == id }),
-              live.isRetranscriptionInFlight, live.hasTranscript else { return false }
+        guard var probe = store.recordings.first(where: { $0.id == id }),
+              probe.restoreRetranscriptionPriorState() else { return false }
         serviceLog.log("""
             \(id.uuidString.prefix(8), privacy: .public) re-run produced no usable \
             text — keeping the earlier transcript
             """)
         mergePassResult(id: id) { $0.settleFailedPass() }
-        lastError = reason
+        if !probe.isTrashed { lastError = reason }
         return true
     }
 

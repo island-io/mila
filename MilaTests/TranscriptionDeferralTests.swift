@@ -493,8 +493,9 @@ final class TranscriptionDeferralTests: XCTestCase {
         XCTAssertEqual(kept.modelName, "Earlier model", file: file, line: line)
         XCTAssertNil(kept.transcriptionDeferredAt, file: file, line: line)
         XCTAssertNil(kept.retranscriptionPriorState, "settled: nothing left to undo", file: file, line: line)
-        XCTAssertNotNil(service.lastError, "the user asked for this run, so it says why nothing changed",
-                        file: file, line: line)
+        XCTAssertTrue(service.lastError?.contains("earlier transcript was kept") == true,
+                      "the user asked for this run, so it says why nothing changed: \(service.lastError ?? "nil")",
+                      file: file, line: line)
         XCTAssertEqual(completions, 0, "no completion work for a transcript that did not change",
                        file: file, line: line)
         let reloaded = try XCTUnwrap(RecordingStore(rootDirectory: tempRoot).recordings.first { $0.id == id },
@@ -536,9 +537,6 @@ final class TranscriptionDeferralTests: XCTestCase {
         try nameSpeaker(id)
         var completions = 0
         service.onTranscriptionCompleted = { _, _ in completions += 1 }
-        // A re-run is never auto-dropped, but wire the gate as the app does
-        // so the test would catch a re-run reaching it.
-        service.shouldAutoDropShortEmpty = { _, _ in true }
         guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
             return XCTFail("recording vanished")
         }
@@ -548,6 +546,29 @@ final class TranscriptionDeferralTests: XCTestCase {
         let calls = await stub.transcribeCalls
         XCTAssertEqual(calls.count, 0, "precondition: the audio was rejected before whisper")
         try assertEarlierTranscriptKept(id, completions: completions)
+    }
+
+    /// Sent to Recently Deleted mid-pass: still settled back to the kept
+    /// transcript (so a restore is not empty), but no alert about a
+    /// recording the user just threw away.
+    func test_an_empty_rerun_of_a_trashed_recording_keeps_the_transcript_without_an_alert() async throws {
+        let id = try makeFinished("English meeting", language: "en")
+        await stub.setCannedQueue([[]])
+        await stub.setDefaultDelay(0.4)
+        guard let prepared = store.prepareForRetranscription(id: id, language: "he") else {
+            return XCTFail("recording vanished")
+        }
+        service.enqueue(prepared, isRetranscription: true)
+        await waitUntilWhisperStarted()
+        store.softDelete(try row(id))
+        await service.waitForIdle()
+
+        let kept = try row(id)
+        XCTAssertTrue(kept.isTrashed)
+        XCTAssertEqual(kept.fullText, "an earlier, complete transcript")
+        XCTAssertEqual(kept.status, .completed)
+        XCTAssertEqual(kept.language, "en")
+        XCTAssertNil(service.lastError)
     }
 
     /// A FIRST transcription that comes back empty is unchanged: `.failed`,
