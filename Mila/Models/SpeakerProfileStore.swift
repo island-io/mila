@@ -335,6 +335,8 @@ final class SpeakerProfileStore: ObservableObject {
                 self.load()
             } else {
                 self.profiles.removeAll()
+                // Whatever failed to save is gone from memory too.
+                self.hasUnsavedChanges = false
             }
         }
     }
@@ -532,6 +534,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// notification is what completes the cleanup.
     func deleteAllProfiles() {
         profiles.removeAll()
+        hasUnsavedChanges = false
         do {
             if fileManager.fileExists(atPath: storeURL.path) {
                 try fileManager.removeItem(at: storeURL)
@@ -882,14 +885,14 @@ final class SpeakerProfileStore: ObservableObject {
     func recheckDamagedProfiles() {
         let date = currentFileDate()
         if date == nil {
-            if loadedFromDamagedFile { loadedFromDamagedFile = false }
+            loadedFromDamagedFile = false
         } else if date != lastSeenFileDate, !hasUnsavedChanges {
             if settings.isEnabled {
                 let before = Set(profiles.map(\.name))
                 load()
                 let removed = before.subtracting(profiles.map(\.name))
                 if !removed.isEmpty { notifyDeleted(.named(removed)) }
-            } else if loadedFromDamagedFile {
+            } else {
                 loadedFromDamagedFile = false
             }
         }
@@ -1024,6 +1027,7 @@ final class SpeakerProfileStore: ObservableObject {
     private func load() {
         guard settings.isEnabled else { return }
         guard fileManager.fileExists(atPath: storeURL.path) else {
+            lastSeenFileDate = nil
             loadedFromDamagedFile = false
             return
         }
