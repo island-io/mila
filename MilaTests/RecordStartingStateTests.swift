@@ -310,6 +310,33 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertEqual(published.jobs, [.starting(.microphone), .none])
     }
 
+    /// Meeting mode brings the microphone up first and system audio second.
+    /// A cancel that arrives during the microphone's bring-up must stop the
+    /// whole start there: neither leg may open capture (#328).
+    func test_an_abandoned_meeting_start_opens_neither_capture_leg() async throws {
+        let gate = BringUpGate()
+        session.mic.bringUpOverride = { await gate.wait() }
+        let systemBringUps = BringUpCounter()
+        session.system.bringUpOverride = { await systemBringUps.increment() }
+
+        let start = Task { await controller.toggleRecord(withSystemAudio: true) }
+        let reachedStarting = await waitUntil { controller.activeJob == .starting(.meeting) }
+        XCTAssertTrue(reachedStarting)
+
+        controller.abandonStartingRecording(reason: .screenLock)
+        await gate.open()
+        await start.value
+
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertEqual(session.mic.captureStartCount, 0, "the microphone must never have started")
+        let systemCount = await systemBringUps.count
+        XCTAssertEqual(systemCount, 0, "the system-audio leg must not be brought up for an abandoned start")
+        XCTAssertFalse(session.system.isRunning)
+        XCTAssertTrue(service.lastError?.contains("did not start") ?? false,
+                      "expected the abandonment message, got \(String(describing: service.lastError))")
+    }
+
     /// Sleep can arrive while the microphone permission prompt is still up —
     /// before the bring-up has even begun. The start must stop there rather
     /// than go on to bring capture up.
@@ -420,6 +447,12 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertEqual(session.state, .idle, file: file, line: line)
         XCTAssertFalse(session.mic.isRunning, "the capture that came up must be taken down again",
                        file: file, line: line)
+        // The cancel arrived while the bring-up was still out, so it must
+        // have stopped short of opening capture — not let the microphone (and
+        // its orange indicator) come on for the cleanup to take down (#328).
+        XCTAssertEqual(session.mic.captureStartCount, 0,
+                       "a start abandoned during the bring-up must never start the engine",
+                       file: file, line: line)
         XCTAssertTrue(store.recordings.isEmpty, "nothing was recorded, so nothing may be saved",
                       file: file, line: line)
         let leftovers = (try? FileManager.default.contentsOfDirectory(
@@ -440,6 +473,9 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false), file: file, line: line)
         XCTAssertNil(service.lastError, "a fresh start must not inherit the abandoned one's request",
                      file: file, line: line)
+        XCTAssertEqual(session.mic.captureStartCount, 1,
+                       "a fresh start must not inherit the abandoned one's cancellation",
+                       file: file, line: line)
 
         await controller.stopRecording()
         await controller.awaitFinalizeTails()

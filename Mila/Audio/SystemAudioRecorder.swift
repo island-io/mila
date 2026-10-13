@@ -181,8 +181,12 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
             || desc.contains("permission")
     }
 
-    func start() async throws {
+    /// `cancellation` — see `MicrophoneRecorder.start(cancellation:)`: once
+    /// tripped, the bring-up throws `CaptureStartCancellation.Cancelled`
+    /// instead of starting the stream (#328).
+    func start(cancellation: CaptureStartCancellation? = nil) async throws {
         guard !isRunning else { return }
+        try cancellation?.throwIfCancelled()
         captureEpoch += 1
         let epoch = captureEpoch
         wantsCapture = true
@@ -190,7 +194,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         restartCount = 0
         installFreshStream()
         do {
-            try await bringUpStream(epoch: epoch)
+            try await bringUpStream(epoch: epoch, cancellation: cancellation)
         } catch {
             wantsCapture = false
             throw error
@@ -207,10 +211,12 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     /// stop/start cycle — can land in between, in which case the stream is
     /// released here rather than installed on top of a newer session's.
     @discardableResult
-    private func bringUpStream(epoch: Int) async throws -> Bool {
+    private func bringUpStream(epoch: Int,
+                               cancellation: CaptureStartCancellation? = nil) async throws -> Bool {
         if let override = bringUpOverride {
             sampleQueue.sync { audioOutput.resetConverter() }
             try await override()
+            try cancellation?.throwIfCancelled()
             guard epoch == captureEpoch else { return false }
             self.isRunning = true
             self.lastStreamError = nil
@@ -263,6 +269,10 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         // sample queue, since that's the only context that touches it;
         // it's idle until startCapture below.
         sampleQueue.sync { audioOutput.resetConverter() }
+        // Last point a start abandoned during the shareable-content wait can
+        // stop without capture opening (#328). The stream was never started,
+        // so releasing it is the whole teardown.
+        try cancellation?.throwIfCancelled()
         try await stream.startCapture()
         // Adopt only if this is still the session that asked. Assigning
         // `self.stream` unconditionally would drop a newer session's stream on

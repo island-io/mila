@@ -147,6 +147,14 @@ final class QuickActionsController: ObservableObject {
     /// `beginStarting` so a stale request can never reach the next start.
     private var pendingStartAbandonReason: StartAbandonReason?
 
+    /// The token the start in flight hands to `session.start`, tripped by
+    /// `abandonStartingRecording` alongside `pendingStartAbandonReason` so the
+    /// bring-up stops short of opening capture — the microphone and its
+    /// orange indicator never come on for an abandoned start (#328). Minted
+    /// fresh by `beginStarting` and dropped by `endStartingWithoutRecording`,
+    /// so one start's cancel can never reach the next.
+    private var startCancellation: CaptureStartCancellation?
+
     /// Silence-watch tunables — exposed on the type so tests can override
     /// (we don't want the test suite to sleep for 10 seconds).
     var silenceWatchSeconds: TimeInterval = 10
@@ -584,11 +592,14 @@ final class QuickActionsController: ObservableObject {
         }
         prepareLivePipeline()
         do {
-            try await session.start(source: source, outputURL: url)
-            // Sleep or lock arrived during the bring-up: capture is up now
-            // and the user is gone, so take it down again rather than record
-            // unattended — the same decision the guards make for an active
-            // recording (#321).
+            try await session.start(source: source, outputURL: url,
+                                    cancellation: startCancellation)
+            // Sleep or lock arrived during the bring-up, too late for the
+            // `startCancellation` check before capture opened: capture is up
+            // now and the user is gone, so take it down again rather than
+            // record unattended — the same decision the guards make for an
+            // active recording (#321). A cancel that arrived earlier made
+            // `session.start` throw instead, and is handled in the catch.
             if await abandonStartIfRequested(discarding: url) { return }
             // Guarantee a fresh, isolated Live AI session for THIS recording
             // (new Claude session UUID + cleared summary/action items) before
@@ -643,6 +654,7 @@ final class QuickActionsController: ObservableObject {
             return false
         }
         pendingStartAbandonReason = nil
+        startCancellation = CaptureStartCancellation()
         activeJob = .starting(source)
         return true
     }
@@ -655,6 +667,7 @@ final class QuickActionsController: ObservableObject {
         // An exit that returned without consulting the request (permission
         // denied after sleep) must not leave it lying around.
         pendingStartAbandonReason = nil
+        startCancellation = nil
         if case .starting = activeJob { activeJob = .none }
     }
 
@@ -799,7 +812,8 @@ final class QuickActionsController: ObservableObject {
         let url = store.freshAudioURL(suggestedName: titleBase)
         prepareLivePipeline()
         do {
-            try await session.start(source: source, outputURL: url)
+            try await session.start(source: source, outputURL: url,
+                                    cancellation: startCancellation)
             // Sleep / lock during the bring-up — see `startRecording`.
             if await abandonStartIfRequested(discarding: url) { return }
             // Fresh, isolated per-recording Live AI session — see the matching
@@ -1729,10 +1743,13 @@ final class QuickActionsController: ObservableObject {
     /// nothing CAN end it here: the bring-up runs on a detached CoreAudio
     /// worker behind a continuation (`MicrophoneRecorder.withTimeout`), out
     /// of reach of cooperative cancellation, and `stopRecording` is a no-op
-    /// in this window by design. The start path honours the request at the
-    /// first point it regains control (`abandonStartIfRequested`): it tears
-    /// down whatever came up and exits through its `defer`, which releases
-    /// the job. Until then `activeJob` stays `.starting` — releasing it
+    /// in this window by design. What it can do is trip `startCancellation`,
+    /// which the bring-up checks between its slow steps and immediately
+    /// before capture opens, so a start abandoned in time throws instead of
+    /// turning the microphone on (#328). Either way the start path honours
+    /// the request at the first point it regains control
+    /// (`abandonStartIfRequested`): it tears down whatever came up and exits
+    /// through its `defer`, which releases the job. Until then `activeJob` stays `.starting` — releasing it
     /// earlier would let a new start run a second bring-up on the same
     /// recorder, the exact hazard `.starting` exists to prevent (#293). The
     /// wait is bounded by `bringUpTimeout` once the machine is awake.
@@ -1740,6 +1757,10 @@ final class QuickActionsController: ObservableObject {
         guard case .starting = activeJob else { return }
         quickActionsLog.log("record start will be abandoned (\(String(describing: reason), privacy: .public)) — capture is still being set up")
         pendingStartAbandonReason = reason
+        // Reaches into the bring-up itself: it throws rather than open
+        // capture if it has not got that far yet (#328). One that already
+        // has is taken down by `abandonStartIfRequested` when it returns.
+        startCancellation?.cancel()
     }
 
     /// Called by `MilaAppDelegate` on `didWakeNotification`. No-op when

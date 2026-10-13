@@ -324,6 +324,14 @@ final class MicrophoneRecorder: ObservableObject {
     /// bring-up, so on its own it only says that one was decided (#279).
     private(set) var isRebuilding = false
 
+    /// How many times `start()` actually opened capture — the real engine
+    /// started, or the `bringUpOverride` path got to the point where it
+    /// would have. A start cancelled through its `CaptureStartCancellation`
+    /// before that point does not count, which is what lets a test pin that
+    /// an abandoned start never turned the microphone on (#328). Mid-session
+    /// rebuilds are not starts and do not count either.
+    private(set) var captureStartCount = 0
+
     /// Bumped by every `start()` and `stop()`. A rebuild captures the value it
     /// began with, because `isRunning` alone cannot tell "my session is still
     /// live" from "a *later* session is". A stop → start cycle inside a
@@ -360,8 +368,13 @@ final class MicrophoneRecorder: ObservableObject {
         }
     }
 
-    func start() async throws {
+    /// `cancellation`, when given, is checked after each slow step of the
+    /// bring-up and immediately before the engine starts; once tripped the
+    /// bring-up throws `CaptureStartCancellation.Cancelled` instead of
+    /// opening the microphone (#328).
+    func start(cancellation: CaptureStartCancellation? = nil) async throws {
         guard !isRunning else { return }
+        try cancellation?.throwIfCancelled()
 
         // Tear down anything that may still be alive from a previous session
         // (defensive — `stop()` should have done this, but a partially-started
@@ -397,6 +410,10 @@ final class MicrophoneRecorder: ObservableObject {
             try await Self.withTimeout(seconds: bringUpTimeout) {
                 try await override()
             }
+            // The override stands in for the slow part of the bring-up, so
+            // this is the seam's "immediately before engine.start()".
+            try cancellation?.throwIfCancelled()
+            captureStartCount += 1
             isRunning = true
             lastBringUpAt = Date()
             // Observe on the test path too, against a stand-in source: the
@@ -429,8 +446,10 @@ final class MicrophoneRecorder: ObservableObject {
 
         let result = try await bringUpRealEngine(continuation: continuationForTap,
                                                  gain: agc,
-                                                 stats: sessionStats)
+                                                 stats: sessionStats,
+                                                 cancellation: cancellation)
         self.engine = result.engine
+        captureStartCount += 1
         isRunning = true
         lastBringUpAt = Date()
         micLog.log("mic started: \(result.format.sampleRate, privacy: .public)Hz \(result.format.channelCount, privacy: .public)ch agc=\(agcEnabled ? "on" : "off", privacy: .public)")
@@ -449,7 +468,8 @@ final class MicrophoneRecorder: ObservableObject {
     private func bringUpRealEngine(
         continuation: AsyncStream<AVAudioPCMBuffer>.Continuation,
         gain: AdaptiveGainController,
-        stats: OSAllocatedUnfairLock<MicFrameStats>
+        stats: OSAllocatedUnfairLock<MicFrameStats>,
+        cancellation: CaptureStartCancellation? = nil
     ) async throws -> EngineBox {
         // The level callback hops back to the main actor for the @Published
         // mutation. Captured weakly so a deinit'd recorder doesn't keep the
@@ -477,7 +497,8 @@ final class MicrophoneRecorder: ObservableObject {
                                        onLevel: onLevel,
                                        gain: gain,
                                        stats: stats,
-                                       chosenDevice: chosenDevice)
+                                       chosenDevice: chosenDevice,
+                                       cancellation: cancellation)
         }
     }
 
@@ -769,13 +790,17 @@ final class MicrophoneRecorder: ObservableObject {
         onLevel: @escaping @Sendable (Float) -> Void,
         gain: AdaptiveGainController,
         stats: OSAllocatedUnfairLock<MicFrameStats>,
-        chosenDevice: OSAllocatedUnfairLock<String?>
+        chosenDevice: OSAllocatedUnfairLock<String?>,
+        cancellation: CaptureStartCancellation?
     ) async throws -> EngineBox {
         // Read the user's pinned input UID off the main actor — UserDefaults
         // is thread-safe and Settings writes via a @MainActor object, so the
         // value we see here is at worst one start() stale.
         let preferredUID = UserDefaults.standard.string(forKey: "audio.input.preferredUID")
         return try await Task.detached(priority: .userInitiated) { () -> EngineBox in
+            // Building the engine is itself one of the ~3 s Bluetooth format
+            // waits (#291) — no point paying it for a start already abandoned.
+            try cancellation?.throwIfCancelled()
             let engine = AVAudioEngine()
             let input = engine.inputNode
             if let device = AudioDeviceManager.preferredInputDevice(preferredUID: preferredUID) {
@@ -856,6 +881,15 @@ final class MicrophoneRecorder: ObservableObject {
                 }
             }
             engine.prepare()
+            // The last moment a cancelled start can be stopped without the
+            // microphone — and macOS's orange indicator — coming on (#328).
+            // Nothing has started yet, so dropping the tap is all the
+            // teardown this engine needs.
+            if cancellation?.isCancelled == true {
+                input.removeTap(onBus: 0)
+                micLog.log("mic bring-up cancelled before the engine started — capture never opened")
+                throw CaptureStartCancellation.Cancelled()
+            }
             try engine.start()
             micLog.log("AVAudioEngine started; tap installed, awaiting buffers")
             return EngineBox(engine: engine, format: nativeFormat)
