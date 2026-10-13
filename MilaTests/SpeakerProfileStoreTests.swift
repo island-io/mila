@@ -519,10 +519,10 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertNil(store.damagedProfilesNotice, "one click dismisses every backup present")
     }
 
-    /// Turning the feature off stops all reading and writing, so an
-    /// "unreadable, will be backed up on the next save" notice would be a
-    /// promise nothing keeps. Opting back in re-detects the damage.
-    func test_opting_out_clears_the_unreadable_notice_and_opting_in_restores_it() throws {
+    /// Turning the feature off does not make an unreadable file readable:
+    /// the notice stays, so the user is not left believing the profiles
+    /// come back on opt-in. Nothing is written over the file meanwhile.
+    func test_opting_out_keeps_the_unreadable_notice() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -532,11 +532,37 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
 
         store.settings.isEnabled = false
-        XCTAssertNil(store.damagedProfilesNotice)
-        XCTAssertEqual(try Data(contentsOf: fileURL), Data("not json".utf8))
-
+        XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
         store.settings.isEnabled = true
         XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
+        XCTAssertEqual(try Data(contentsOf: fileURL), Data("not json".utf8))
+    }
+
+    /// A backup the user repaired and put back over the file `save()` wrote
+    /// is loaded on recheck, not overwritten by the next save.
+    func test_recheck_loads_a_live_file_replaced_by_hand_after_the_move() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let writer = makeStore(in: dir)
+        writer.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        let repaired = try Data(contentsOf: fileURL)
+        try FileManager.default.removeItem(at: fileURL)
+
+        try Data("not json".utf8).write(to: fileURL)
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)  // moves it aside
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"])
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"], "an unchanged file is not re-read")
+
+        try repaired.write(to: fileURL)
+        // Make sure the date moves even on a coarse-grained clock.
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)],
+                                              ofItemAtPath: fileURL.path)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice"], "the user's repair is loaded")
     }
 
     /// The notice sends the user to Finder; what they do there is picked up

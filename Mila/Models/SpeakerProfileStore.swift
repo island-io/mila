@@ -333,11 +333,6 @@ final class SpeakerProfileStore: ObservableObject {
                 self.load()
             } else {
                 self.profiles.removeAll()
-                // Nothing is read or written while off, so the file is no
-                // longer "loaded" at all: `save()` cannot move it aside,
-                // and the notice must not promise that it will. Opting
-                // back in re-runs `load()`, which re-detects the damage.
-                self.loadedFromDamagedFile = false
             }
         }
     }
@@ -556,7 +551,10 @@ final class SpeakerProfileStore: ObservableObject {
         hasStoredProfilesOnDisk = storedFilesExist()
         // The backups are gone, so the names dismissed for them are moot —
         // and must not hide a later backup that happens to reuse one.
-        settings.setDismissedDamagedBackups([])
+        // Keep only names whose file survived a failed removal, so that one
+        // does not come back as if never dismissed.
+        let surviving = Set(damagedCopies().map(\.lastPathComponent))
+        settings.setDismissedDamagedBackups(settings.dismissedDamagedBackups.intersection(surviving))
         refreshDamagedProfilesNotice()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
@@ -835,6 +833,7 @@ final class SpeakerProfileStore: ObservableObject {
             }
             let data = try encoder.encode(profiles)
             try data.write(to: storeURL, options: .atomic)
+            lastSeenFileDate = currentFileDate()
             hasStoredProfilesOnDisk = true
             return true
         } catch {
@@ -866,16 +865,29 @@ final class SpeakerProfileStore: ObservableObject {
     /// but only while nothing else is in memory: a profile created since
     /// the failed load exists only there (its save could not move the file
     /// aside), and re-reading would drop it.
+    ///
+    /// Re-reads only when the live file is not the one this store last
+    /// read or wrote (`lastSeenFileDate`), so a still-broken file is not
+    /// re-parsed on every focus change, and a repaired one — including a
+    /// backup the user fixed and put back over the file `save()` wrote —
+    /// is loaded instead of being overwritten by the next save.
     func recheckDamagedProfiles() {
-        if loadedFromDamagedFile {
-            if !fileManager.fileExists(atPath: storeURL.path) {
-                loadedFromDamagedFile = false
-            } else if settings.isEnabled, profiles.isEmpty {
-                load()
-            }
+        if loadedFromDamagedFile, !fileManager.fileExists(atPath: storeURL.path) {
+            loadedFromDamagedFile = false
+        } else if settings.isEnabled, let date = currentFileDate(), date != lastSeenFileDate {
+            load()
         }
         refreshDamagedProfilesNotice()
-        hasStoredProfilesOnDisk = storedFilesExist()
+        let stored = storedFilesExist()
+        // Unconditional assignment would publish on every app activation.
+        if stored != hasStoredProfilesOnDisk { hasStoredProfilesOnDisk = stored }
+    }
+
+    /// Modification date of the live file this store last read or wrote.
+    private var lastSeenFileDate: Date?
+
+    private func currentFileDate() -> Date? {
+        (try? fileManager.attributesOfItem(atPath: storeURL.path))?[.modificationDate] as? Date
     }
 
     /// Order of a backup's name: `<prefix><stamp>[-<n>].json`. The stamp is
@@ -989,6 +1001,7 @@ final class SpeakerProfileStore: ObservableObject {
             return
         }
         do {
+            lastSeenFileDate = currentFileDate()
             let data = try Data(contentsOf: storeURL)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601

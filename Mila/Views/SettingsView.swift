@@ -2762,7 +2762,7 @@ private struct VoiceRecognitionSection: View {
     private func damagedProfilesMessage(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {
         switch notice {
         case .unreadable(let file):
-            return "Your saved voice profiles couldn't be loaded: \(file.lastPathComponent) can't be read, so nobody it describes will be recognised. The file is left untouched and will be kept as a backup copy the next time Mila saves a voice profile."
+            return "Your saved voice profiles couldn't be loaded: \(file.lastPathComponent) can't be read, so nobody it describes will be recognised. The file is left untouched — before Mila writes any new voice profile, it renames this one to keep it as a backup."
         case .setAside(let backup):
             return "Your previous voice profiles couldn't be loaded, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
         }
@@ -2772,6 +2772,11 @@ private struct VoiceRecognitionSection: View {
     /// parsed, so there is no count to show — only the fact that it exists.
     private var storedProfilesLabel: String {
         guard settings.isEnabled else {
+            // The file that failed to load is not "where you left off"; the
+            // notice above says what happened to it.
+            if case .unreadable = profileStore.damagedProfilesNotice {
+                return "Voice profile files are still stored on this Mac. They are only removed if you remove them."
+            }
             return "Voice profiles from an earlier session are still stored on this Mac. Turning the switch back on picks up where you left off; they are only removed if you remove them."
         }
         let n = profileStore.profiles.count
