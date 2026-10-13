@@ -273,7 +273,12 @@ struct SettingsView: View {
     // MARK: Detail
 
     private var detailPane: some View {
-        Group {
+        // The destination this pane is built for. The anchor check below
+        // compares against it, not the live `selectedTab`: a deep link that
+        // switches destination changes both at once, and the outgoing pane
+        // must not consume an anchor that belongs to the incoming one.
+        let paneTab = selectedTab
+        return Group {
             if selectedTab.providesOwnScrollView {
                 destination
                     .padding(Self.detailInset)
@@ -287,7 +292,7 @@ struct SettingsView: View {
                     // `initial`: a deep link that also switched the
                     // destination arrives before this pane exists.
                     .onChange(of: SettingsNavigation.shared.pendingAnchor, initial: true) { _, anchor in
-                        guard let anchor, anchor.tab == selectedTab else { return }
+                        guard let anchor, anchor.tab == paneTab else { return }
                         SettingsNavigation.shared.pendingAnchor = nil
                         // Next turn, once the destination has laid out.
                         DispatchQueue.main.async {
@@ -2725,9 +2730,11 @@ private struct VoiceRecognitionSection: View {
 
             if let notice = profileStore.damagedProfilesNotice {
                 damagedProfilesNotice(notice)
-                    // Seen here, so the main window need not say it too (#342).
-                    .onChange(of: notice, initial: true) { _, _ in
-                        profileStore.acknowledgeDamagedProfilesAnnouncement()
+                    // Seen here, so the main window need not say it too
+                    // (#342) — including an announcement raised while this
+                    // is already showing, e.g. by the toggle above.
+                    .onChange(of: profileStore.damagedProfilesAnnouncement, initial: true) { _, announcement in
+                        if announcement != nil { profileStore.acknowledgeDamagedProfilesAnnouncement() }
                     }
             }
 

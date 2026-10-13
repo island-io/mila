@@ -816,58 +816,78 @@ private struct DamagedVoiceProfilesBanner: View {
     @Environment(\.openSettings) private var openSettings
 
     var body: some View {
-        if let notice = profileStore.damagedProfilesAnnouncement {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(.orange)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Saved voices are not being recognised")
-                        .font(.callout.weight(.semibold))
-                    Text(message(notice))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                    HStack(spacing: 8) {
-                        Button("Open Settings") {
-                            SettingsNavigation.shared.pendingTab = .speakers
-                            SettingsNavigation.shared.pendingAnchor = .voiceRecognition
-                            openSettings()
-                            profileStore.acknowledgeDamagedProfilesAnnouncement()
-                        }
-                        .accessibilityIdentifier("main.damagedVoiceProfiles.openSettings")
-                        Button("Show in Finder") {
-                            NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
-                        }
-                        .accessibilityIdentifier("main.damagedVoiceProfiles.showInFinder")
+        Group {
+            if let notice = profileStore.damagedProfilesAnnouncement {
+                banner(notice)
+                    // On screen: this incident is now announced (#342).
+                    .onChange(of: notice, initial: true) { _, _ in
+                        profileStore.noteDamagedProfilesAnnouncementShown()
                     }
-                    .controlSize(.small)
-                }
-                Button {
-                    profileStore.acknowledgeDamagedProfilesAnnouncement()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10, weight: .semibold))
-                }
-                .buttonStyle(.borderless)
-                .help("Close")
-                .accessibilityLabel("Close")
-                .accessibilityIdentifier("main.damagedVoiceProfiles.close")
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .frame(maxWidth: 480, alignment: .leading)
-            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
-            .padding(.horizontal, 16)
-            .accessibilityElement(children: .contain)
-            .accessibilityIdentifier("main.damagedVoiceProfiles")
-            .transition(.move(edge: .top).combined(with: .opacity))
         }
+        // "Show in Finder" invites the user to fix things by hand; look
+        // again when they come back, as Settings does, so the banner does
+        // not keep describing a file that is gone or repaired. Only while
+        // it is up, so an ordinary activation does no file work.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if profileStore.damagedProfilesAnnouncement != nil {
+                profileStore.recheckDamagedProfiles()
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: profileStore.damagedProfilesAnnouncement)
+    }
+
+    private func banner(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Saved voices are not being recognised")
+                    .font(.callout.weight(.semibold))
+                Text(message(notice))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Open Settings") {
+                        SettingsNavigation.shared.pendingTab = .speakers
+                        SettingsNavigation.shared.pendingAnchor = .voiceRecognition
+                        openSettings()
+                        profileStore.acknowledgeDamagedProfilesAnnouncement()
+                    }
+                    .accessibilityIdentifier("main.damagedVoiceProfiles.openSettings")
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
+                    }
+                    .accessibilityIdentifier("main.damagedVoiceProfiles.showInFinder")
+                }
+                .controlSize(.small)
+            }
+            Button {
+                profileStore.acknowledgeDamagedProfilesAnnouncement()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("Close")
+            .accessibilityLabel("Close")
+            .accessibilityIdentifier("main.damagedVoiceProfiles.close")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 480, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .padding(.horizontal, 16)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("main.damagedVoiceProfiles")
+        .transition(.move(edge: .top).combined(with: .opacity))
     }
 
     private func message(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {

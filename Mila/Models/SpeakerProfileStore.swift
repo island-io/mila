@@ -272,8 +272,10 @@ final class SpeakerProfileStore: ObservableObject {
     /// being recognised. Unlike `damagedProfilesNotice` it is announced
     /// **once per incident**: it is set only for a notice whose
     /// `announcementKey` is not yet in
-    /// `VoiceRecognitionSettings.announcedDamagedProfiles`, and that key is
-    /// recorded at the same moment, so the next launch stays quiet. The
+    /// `VoiceRecognitionSettings.announcedDamagedProfiles`, and the main
+    /// window records the key when the banner actually appears
+    /// (`noteDamagedProfilesAnnouncementShown`) — not when it is computed,
+    /// so a launch whose window never showed it does not use it up. The
     /// unreadable live file and the backup it becomes count as one incident
     /// (`moveDamagedFileAside` carries the key over). Nil while voice
     /// recognition is off, for a backup dismissed in Settings (it derives
@@ -285,8 +287,10 @@ final class SpeakerProfileStore: ObservableObject {
     /// rare a publish (CLAUDE.md, #280).
     @Published private(set) var damagedProfilesAnnouncement: DamagedProfilesNotice?
 
-    /// Key of the announcement showing this session, so a refresh keeps it
-    /// up rather than treating it as already announced.
+    /// Key of the announcement up this session, so a refresh keeps it up
+    /// rather than treating it as already announced. Cleared only when the
+    /// user takes it down, so switching voice recognition off and on again
+    /// brings back a banner they never closed.
     private var shownAnnouncementKey: String?
 
     private static let unreadableKeyPrefix = "unreadable@"
@@ -970,25 +974,43 @@ final class SpeakerProfileStore: ObservableObject {
     /// The newest backup the user has not dismissed, unless the live file
     /// itself is unreadable right now — that is the more urgent message.
     private func refreshDamagedProfilesNotice() {
+        // One listing serves both the notice and the announcement's pruning.
+        let backupNames = damagedCopyNames()
         let notice: DamagedProfilesNotice?
         if loadedFromDamagedFile {
             notice = .unreadable(storeURL)
         } else {
             let dismissed = settings.dismissedDamagedBackups
-            notice = damagedCopies()
-                .filter { !dismissed.contains($0.lastPathComponent) }
+            let dir = storeURL.deletingLastPathComponent()
+            notice = (backupNames ?? [])
+                .filter { !dismissed.contains($0) }
+                .map { dir.appendingPathComponent($0) }
                 .max { Self.backupOrder($0) < Self.backupOrder($1) }
                 .map(DamagedProfilesNotice.setAside)
         }
         if damagedProfilesNotice != notice { damagedProfilesNotice = notice }
-        refreshDamagedProfilesAnnouncement()
+        refreshDamagedProfilesAnnouncement(presentBackups: backupNames)
     }
 
-    /// The main window has shown the announcement and the user closed it,
-    /// or the user is looking at the same notice in Settings (#342). The
-    /// incident was recorded as announced when it was first shown; this
-    /// only takes it down for the rest of the session.
+    /// The main window's banner is on screen (#342): from now on this
+    /// incident counts as announced, so the next launch stays quiet.
+    func noteDamagedProfilesAnnouncementShown() {
+        guard damagedProfilesAnnouncement != nil, let key = shownAnnouncementKey else { return }
+        var announced = settings.announcedDamagedProfiles
+        guard !announced.contains(key) else { return }
+        // Only the newest unreadable file is worth remembering.
+        if key.hasPrefix(Self.unreadableKeyPrefix) {
+            announced = announced.filter { !$0.hasPrefix(Self.unreadableKeyPrefix) }
+        }
+        announced.insert(key)
+        settings.setAnnouncedDamagedProfiles(announced)
+    }
+
+    /// The user closed the banner, followed it into Settings, or is looking
+    /// at the same notice in Settings (#342). Counts as seen, and takes it
+    /// down for the rest of the session.
     func acknowledgeDamagedProfilesAnnouncement() {
+        noteDamagedProfilesAnnouncementShown()
         shownAnnouncementKey = nil
         if damagedProfilesAnnouncement != nil { damagedProfilesAnnouncement = nil }
     }
@@ -1009,37 +1031,39 @@ final class SpeakerProfileStore: ObservableObject {
 
     /// See `damagedProfilesAnnouncement`. Also forgets announced backups
     /// whose file is gone, so a later backup that reuses a name is still
-    /// announced, and keeps only the newest unreadable key.
-    private func refreshDamagedProfilesAnnouncement() {
+    /// announced — but only from a listing that succeeded
+    /// (`presentBackups` non-nil): a failed one would otherwise forget
+    /// every backup the user has already been told about.
+    private func refreshDamagedProfilesAnnouncement(presentBackups: [String]?) {
         let stored = settings.announcedDamagedProfiles
-        let present = Set(damagedCopies().map(\.lastPathComponent))
-        var announced = stored.filter { $0.hasPrefix(Self.unreadableKeyPrefix) || present.contains($0) }
         var next: DamagedProfilesNotice?
         if settings.isEnabled, let notice = damagedProfilesNotice {
             let key = announcementKey(notice)
-            if key == shownAnnouncementKey {
-                next = notice
-            } else if !announced.contains(key) {
+            if key == shownAnnouncementKey || !stored.contains(key) {
                 next = notice
                 shownAnnouncementKey = key
-                if key.hasPrefix(Self.unreadableKeyPrefix) {
-                    announced = announced.filter { !$0.hasPrefix(Self.unreadableKeyPrefix) }
-                }
-                announced.insert(key)
             }
         }
-        if next == nil { shownAnnouncementKey = nil }
-        if announced != stored { settings.setAnnouncedDamagedProfiles(announced) }
+        if let presentBackups {
+            let present = Set(presentBackups)
+            let kept = stored.filter { $0.hasPrefix(Self.unreadableKeyPrefix) || present.contains($0) }
+            if kept != stored { settings.setAnnouncedDamagedProfiles(kept) }
+        }
         if damagedProfilesAnnouncement != next { damagedProfilesAnnouncement = next }
     }
 
     /// The copies `moveDamagedFileAside()` left next to the live file.
     private func damagedCopies() -> [URL] {
         let dir = storeURL.deletingLastPathComponent()
-        let names = (try? fileManager.contentsOfDirectory(atPath: dir.path)) ?? []
-        return names
-            .filter { $0.hasPrefix(Self.damagedPrefix) && $0.hasSuffix(".json") }
-            .map { dir.appendingPathComponent($0) }
+        return (damagedCopyNames() ?? []).map { dir.appendingPathComponent($0) }
+    }
+
+    /// Their file names, or nil when the folder could not be listed — which
+    /// is not the same as "there are none".
+    private func damagedCopyNames() -> [String]? {
+        let dir = storeURL.deletingLastPathComponent()
+        guard let names = try? fileManager.contentsOfDirectory(atPath: dir.path) else { return nil }
+        return names.filter { $0.hasPrefix(Self.damagedPrefix) && $0.hasSuffix(".json") }
     }
 
     /// Whether any voice data this store owns is on disk: the live file or

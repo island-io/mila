@@ -534,6 +534,7 @@ final class SpeakerProfileStoreTests: XCTestCase {
 
         let first = SpeakerProfileStore(directory: dir, settings: settings)
         XCTAssertEqual(first.damagedProfilesAnnouncement, .unreadable(fileURL))
+        first.noteDamagedProfilesAnnouncementShown()  // the banner appeared
         first.recheckDamagedProfiles()
         XCTAssertEqual(first.damagedProfilesAnnouncement, .unreadable(fileURL),
                        "still up for the rest of the session")
@@ -541,6 +542,42 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let relaunched = SpeakerProfileStore(directory: dir, settings: settings)
         XCTAssertNil(relaunched.damagedProfilesAnnouncement, "no nag on the next launch")
         XCTAssertEqual(relaunched.damagedProfilesNotice, .unreadable(fileURL))
+    }
+
+    /// It counts as announced only once it has been on screen: a launch
+    /// that computed it but never showed it (no main window, quit at once)
+    /// does not use it up.
+    func test_an_announcement_never_shown_comes_back_on_relaunch() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let settings = makeSettings(enabled: true)
+
+        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
+                       .setAside(backup))
+        XCTAssertTrue(settings.announcedDamagedProfiles.isEmpty)
+        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
+                       .setAside(backup))
+    }
+
+    /// Switching voice recognition off takes the banner down; switching it
+    /// back on in the same session brings back one the user never closed.
+    func test_toggling_off_and_on_keeps_an_unclosed_announcement() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let settings = makeSettings(enabled: true)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        store.noteDamagedProfilesAnnouncementShown()
+
+        settings.isEnabled = false
+        XCTAssertNil(store.damagedProfilesAnnouncement)
+        settings.isEnabled = true
+        XCTAssertEqual(store.damagedProfilesAnnouncement, .setAside(backup))
     }
 
     /// No damaged file, no announcement.
@@ -628,11 +665,13 @@ final class SpeakerProfileStoreTests: XCTestCase {
 
         let store = SpeakerProfileStore(directory: dir, settings: settings)
         XCTAssertEqual(store.damagedProfilesAnnouncement, .unreadable(fileURL))
+        store.noteDamagedProfilesAnnouncementShown()
         store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)  // moves it aside
         let names = try backups(in: dir)
         XCTAssertEqual(names.count, 1)
         XCTAssertEqual(store.damagedProfilesAnnouncement?.fileURL.lastPathComponent, names[0],
                        "the showing announcement now points at the backup")
+        store.noteDamagedProfilesAnnouncementShown()
         XCTAssertNil(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
                      "the backup inherited the announcement")
 
@@ -662,8 +701,9 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let settings = makeSettings(enabled: true)
         let first = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
         try Data("old".utf8).write(to: first)
-        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
-                       .setAside(first))
+        let shown = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(shown.damagedProfilesAnnouncement, .setAside(first))
+        shown.noteDamagedProfilesAnnouncementShown()
 
         let second = dir.appendingPathComponent("speaker-profiles.damaged-20260201T000000Z.json")
         try Data("newer".utf8).write(to: second)
