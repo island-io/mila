@@ -593,6 +593,8 @@ final class SpeakerProfileStoreTests: XCTestCase {
         let store = SpeakerProfileStore(directory: dir, settings: settings)
         store.hideDamagedProfilesAnnouncement()
         XCTAssertNil(store.damagedProfilesAnnouncement)
+        store.recheckDamagedProfiles()  // Settings does this on appear and activation
+        XCTAssertNil(store.damagedProfilesAnnouncement, "hidden for the rest of the session")
         XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesAnnouncement,
                        .setAside(backup))
     }

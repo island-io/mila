@@ -293,6 +293,12 @@ final class SpeakerProfileStore: ObservableObject {
     /// brings back a banner they never closed.
     private var shownAnnouncementKey: String?
 
+    /// Incidents taken down this session without being recorded as
+    /// announced (`hideDamagedProfilesAnnouncement`). Memory only: without
+    /// it the next refresh — Settings rechecks on appear and on every
+    /// activation — would put the banner straight back.
+    private var hiddenAnnouncementKeys: Set<String> = []
+
     private static let unreadableKeyPrefix = "unreadable@"
     private let sessionID = UUID().uuidString
 
@@ -1023,6 +1029,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// announced: the section sits below the fold, and Settings being open
     /// on Speakers does not mean the user scrolled to it.
     func hideDamagedProfilesAnnouncement() {
+        if let key = shownAnnouncementKey { hiddenAnnouncementKeys.insert(key) }
         shownAnnouncementKey = nil
         if damagedProfilesAnnouncement != nil { damagedProfilesAnnouncement = nil }
     }
@@ -1055,7 +1062,8 @@ final class SpeakerProfileStore: ObservableObject {
         var next: DamagedProfilesNotice?
         if settings.isEnabled, let notice = damagedProfilesNotice {
             let key = announcementKey(notice)
-            if key == shownAnnouncementKey || !stored.contains(key) {
+            if key == shownAnnouncementKey
+                || (!stored.contains(key) && !hiddenAnnouncementKeys.contains(key)) {
                 next = notice
                 shownAnnouncementKey = key
             }
@@ -1135,8 +1143,11 @@ final class SpeakerProfileStore: ObservableObject {
             announced.insert(destination.lastPathComponent)
             settings.setAnnouncedDamagedProfiles(announced)
         }
-        if shownAnnouncementKey == unreadableKey, movedFileDate == lastSeenFileDate {
-            shownAnnouncementKey = destination.lastPathComponent
+        if movedFileDate == lastSeenFileDate {
+            if shownAnnouncementKey == unreadableKey { shownAnnouncementKey = destination.lastPathComponent }
+            if hiddenAnnouncementKeys.contains(unreadableKey) {
+                hiddenAnnouncementKeys.insert(destination.lastPathComponent)
+            }
         }
         loadedFromDamagedFile = false
         profileLog.error("moved a speaker-profiles.json that could not be parsed to \(destination.lastPathComponent, privacy: .public) before writing a new one")
