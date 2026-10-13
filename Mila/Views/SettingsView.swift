@@ -2720,6 +2720,12 @@ private struct VoiceRecognitionSection: View {
                 }
             }
         }
+        // The notice's "Show in Finder" sends the user off to fix things by
+        // hand; look again when they come back (#336).
+        .onAppear { profileStore.recheckDamagedProfiles() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            profileStore.recheckDamagedProfiles()
+        }
     }
 
     /// The profiles file could not be read (#336). Without this the voices

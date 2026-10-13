@@ -498,6 +498,97 @@ final class SpeakerProfileStoreTests: XCTestCase {
                        .setAside(second))
     }
 
+    /// A same-second collision suffix sorts after the base name, and by
+    /// number (`-10` after `-2`); Dismiss hides every backup present.
+    func test_newest_backup_is_ordered_by_stamp_then_suffix_and_dismiss_covers_all() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let settings = makeSettings(enabled: true)
+        for suffix in ["", "-2", "-10"] {
+            try Data("x".utf8).write(to: dir.appendingPathComponent(
+                "speaker-profiles.damaged-20261013T120000Z\(suffix).json"))
+        }
+        try Data("x".utf8).write(to: dir.appendingPathComponent(
+            "speaker-profiles.damaged-20261012T120000Z-99.json"))
+
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        XCTAssertEqual(store.damagedProfilesNotice?.fileURL.lastPathComponent,
+                       "speaker-profiles.damaged-20261013T120000Z-10.json")
+        store.dismissDamagedProfilesNotice()
+        XCTAssertNil(store.damagedProfilesNotice, "one click dismisses every backup present")
+    }
+
+    /// Turning the feature off stops all reading and writing, so an
+    /// "unreadable, will be backed up on the next save" notice would be a
+    /// promise nothing keeps. Opting back in re-detects the damage.
+    func test_opting_out_clears_the_unreadable_notice_and_opting_in_restores_it() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        try Data("not json".utf8).write(to: fileURL)
+        let store = makeStore(in: dir)
+        XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
+
+        store.settings.isEnabled = false
+        XCTAssertNil(store.damagedProfilesNotice)
+        XCTAssertEqual(try Data(contentsOf: fileURL), Data("not json".utf8))
+
+        store.settings.isEnabled = true
+        XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
+    }
+
+    /// The notice sends the user to Finder; what they do there is picked up
+    /// by a recheck. A repaired live file is loaded, a deleted backup stops
+    /// being announced.
+    func test_recheck_picks_up_a_repair_or_a_deleted_backup() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        // A good file to repair with, written through the store itself.
+        let writer = makeStore(in: dir)
+        writer.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        let good = try Data(contentsOf: fileURL)
+
+        try Data("not json".utf8).write(to: fileURL)
+        let store = makeStore(in: dir)
+        XCTAssertEqual(store.damagedProfilesNotice, .unreadable(fileURL))
+        try good.write(to: fileURL)
+        store.recheckDamagedProfiles()
+        XCTAssertNil(store.damagedProfilesNotice)
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice"], "the repair takes effect")
+
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        store.recheckDamagedProfiles()
+        XCTAssertEqual(store.damagedProfilesNotice, .setAside(backup))
+        try FileManager.default.removeItem(at: backup)
+        store.recheckDamagedProfiles()
+        XCTAssertNil(store.damagedProfilesNotice)
+    }
+
+    /// Delete Voice Profiles forgets dismissed names along with the files,
+    /// so a later backup that reuses a name is still announced.
+    func test_delete_all_forgets_dismissed_backup_names() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let settings = makeSettings(enabled: true)
+        let backup = dir.appendingPathComponent("speaker-profiles.damaged-20260101T000000Z.json")
+        try Data("old".utf8).write(to: backup)
+        let store = SpeakerProfileStore(directory: dir, settings: settings)
+        store.dismissDamagedProfilesNotice()
+        XCTAssertEqual(settings.dismissedDamagedBackups, [backup.lastPathComponent])
+
+        store.deleteAllProfiles()
+        XCTAssertEqual(settings.dismissedDamagedBackups, [])
+        try Data("old".utf8).write(to: backup)
+        XCTAssertEqual(SpeakerProfileStore(directory: dir, settings: settings).damagedProfilesNotice,
+                       .setAside(backup))
+    }
+
     /// A backup is announced even while the feature is off: listing the
     /// folder reads no voice data.
     func test_backup_notice_shows_while_the_feature_is_off() throws {

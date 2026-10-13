@@ -236,7 +236,11 @@ final class SpeakerProfileStore: ObservableObject {
     /// a stale copy of `profiles`, so the next `save()` moves it aside
     /// rather than writing over it (#329). Cleared once it has been moved,
     /// deleted by the user, or loaded successfully.
-    private(set) var loadedFromDamagedFile = false
+    private(set) var loadedFromDamagedFile = false {
+        // Every change to it changes what Settings must say (#336). Not
+        // fired by `init` itself, which refreshes explicitly.
+        didSet { refreshDamagedProfilesNotice() }
+    }
 
     /// What Settings tells the user about voice profiles that could not be
     /// loaded (#336). Without it the profiles just vanish from recognition
@@ -257,8 +261,9 @@ final class SpeakerProfileStore: ObservableObject {
     }
 
     /// Recomputed only by `refreshDamagedProfilesNotice()` — on load, on a
-    /// move aside, on delete and on dismiss — so this is a once-in-a-while
-    /// publish, safe on an App-level `@StateObject` (see CLAUDE.md).
+    /// move aside, on opt-out, on delete, on dismiss and when Settings
+    /// rechecks — so this is a once-in-a-while publish, safe on an
+    /// App-level `@StateObject` (see CLAUDE.md).
     @Published private(set) var damagedProfilesNotice: DamagedProfilesNotice?
 
     /// What a deletion removed, handed to the observers below.
@@ -319,8 +324,7 @@ final class SpeakerProfileStore: ObservableObject {
         // Only read the file when the user has opted in. Off means off: no
         // embedding reaches memory, so nothing can be seeded or matched
         // even by a caller that forgot its own guard.
-        if settings.isEnabled { load() }
-        refreshDamagedProfilesNotice()
+        if settings.isEnabled { load() } else { refreshDamagedProfilesNotice() }
         // Toggling mid-session has to take effect without a relaunch:
         // opting in loads what was stored, opting out drops it again.
         settings.addEnabledObserver { [weak self] nowEnabled in
@@ -329,6 +333,11 @@ final class SpeakerProfileStore: ObservableObject {
                 self.load()
             } else {
                 self.profiles.removeAll()
+                // Nothing is read or written while off, so the file is no
+                // longer "loaded" at all: `save()` cannot move it aside,
+                // and the notice must not promise that it will. Opting
+                // back in re-runs `load()`, which re-detects the damage.
+                self.loadedFromDamagedFile = false
             }
         }
     }
@@ -545,6 +554,9 @@ final class SpeakerProfileStore: ObservableObject {
             }
         }
         hasStoredProfilesOnDisk = storedFilesExist()
+        // The backups are gone, so the names dismissed for them are moot —
+        // and must not hide a later backup that happens to reuse one.
+        settings.setDismissedDamagedBackups([])
         refreshDamagedProfilesNotice()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
@@ -834,29 +846,61 @@ final class SpeakerProfileStore: ObservableObject {
 
     private static let damagedPrefix = "speaker-profiles.damaged-"
 
-    /// Hide the notice for a set-aside backup; remembered per file name, so
-    /// a later damaged file still gets its own notice. The backup itself is
-    /// left alone. An `.unreadable` notice cannot be dismissed: it clears
-    /// on its own once the file is moved aside, repaired, or deleted.
+    /// Hide the notice for every backup present now; remembered by file
+    /// name, so a later damaged file still gets its own notice. Replacing
+    /// the whole list also forgets names whose files are gone. The backups
+    /// themselves are left alone. An `.unreadable` notice cannot be
+    /// dismissed: it clears once the file is moved aside, repaired, or
+    /// deleted (see `recheckDamagedProfiles`).
     func dismissDamagedProfilesNotice() {
-        guard case .setAside(let backup) = damagedProfilesNotice else { return }
-        settings.dismissDamagedBackup(backup.lastPathComponent)
+        guard case .setAside = damagedProfilesNotice else { return }
+        settings.setDismissedDamagedBackups(Set(damagedCopies().map(\.lastPathComponent)))
         refreshDamagedProfilesNotice()
+    }
+
+    /// Bring the notice up to date with what is on disk now. Settings calls
+    /// it when it appears and whenever Mila becomes active again — the
+    /// notice's own "Show in Finder" invites the user to delete a backup or
+    /// repair the live file there, which nothing here would otherwise see.
+    /// An unreadable live file is re-read, so a repair takes effect —
+    /// but only while nothing else is in memory: a profile created since
+    /// the failed load exists only there (its save could not move the file
+    /// aside), and re-reading would drop it.
+    func recheckDamagedProfiles() {
+        if loadedFromDamagedFile {
+            if !fileManager.fileExists(atPath: storeURL.path) {
+                loadedFromDamagedFile = false
+            } else if settings.isEnabled, profiles.isEmpty {
+                load()
+            }
+        }
+        refreshDamagedProfilesNotice()
+        hasStoredProfilesOnDisk = storedFilesExist()
+    }
+
+    /// Order of a backup's name: `<prefix><stamp>[-<n>].json`. The stamp is
+    /// fixed-width UTC, so it compares as a string; the collision suffix
+    /// does not (`-` sorts before `.`, and `-10` before `-2`), so it is
+    /// compared as a number, with no suffix meaning 1.
+    private static func backupOrder(_ url: URL) -> (String, Int) {
+        let core = url.deletingPathExtension().lastPathComponent.dropFirst(damagedPrefix.count)
+        let parts = core.split(separator: "-", maxSplits: 1)
+        let attempt = parts.count > 1 ? Int(parts[1]) ?? 1 : 1
+        return (String(parts.first ?? ""), attempt)
     }
 
     /// The newest backup the user has not dismissed, unless the live file
     /// itself is unreadable right now — that is the more urgent message.
-    /// Backup names carry a sortable UTC stamp, so the greatest is newest.
     private func refreshDamagedProfilesNotice() {
         let notice: DamagedProfilesNotice?
         if loadedFromDamagedFile {
             notice = .unreadable(storeURL)
-        } else if let backup = damagedCopies()
-            .filter({ !settings.isDamagedBackupDismissed($0.lastPathComponent) })
-            .max(by: { $0.lastPathComponent < $1.lastPathComponent }) {
-            notice = .setAside(backup)
         } else {
-            notice = nil
+            let dismissed = settings.dismissedDamagedBackups
+            notice = damagedCopies()
+                .filter { !dismissed.contains($0.lastPathComponent) }
+                .max { Self.backupOrder($0) < Self.backupOrder($1) }
+                .map(DamagedProfilesNotice.setAside)
         }
         if damagedProfilesNotice != notice { damagedProfilesNotice = notice }
     }
@@ -891,7 +935,6 @@ final class SpeakerProfileStore: ObservableObject {
         guard fileManager.fileExists(atPath: storeURL.path) else {
             // Removed by hand since launch: nothing left to protect.
             loadedFromDamagedFile = false
-            refreshDamagedProfilesNotice()
             return true
         }
         let formatter = DateFormatter()
@@ -913,7 +956,6 @@ final class SpeakerProfileStore: ObservableObject {
             return false
         }
         loadedFromDamagedFile = false
-        refreshDamagedProfilesNotice()
         profileLog.error("moved a speaker-profiles.json that could not be parsed to \(destination.lastPathComponent, privacy: .public) before writing a new one")
         return true
     }
@@ -944,10 +986,8 @@ final class SpeakerProfileStore: ObservableObject {
         guard settings.isEnabled else { return }
         guard fileManager.fileExists(atPath: storeURL.path) else {
             loadedFromDamagedFile = false
-            refreshDamagedProfilesNotice()
             return
         }
-        defer { refreshDamagedProfilesNotice() }
         do {
             let data = try Data(contentsOf: storeURL)
             let decoder = JSONDecoder()

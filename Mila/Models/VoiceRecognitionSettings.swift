@@ -189,15 +189,16 @@ final class VoiceRecognitionSettings: ObservableObject {
     /// suite, so tests never touch `.standard`. Names only — no voice data.
     /// Deliberately not `@Published`: `SpeakerProfileStore` republishes its
     /// notice when one is dismissed, and nothing else reads this.
-    func isDamagedBackupDismissed(_ fileName: String) -> Bool {
-        (defaults.stringArray(forKey: Keys.dismissedDamagedBackups) ?? []).contains(fileName)
+    var dismissedDamagedBackups: Set<String> {
+        Set(defaults.stringArray(forKey: Keys.dismissedDamagedBackups) ?? [])
     }
 
-    func dismissDamagedBackup(_ fileName: String) {
-        var names = defaults.stringArray(forKey: Keys.dismissedDamagedBackups) ?? []
-        guard !names.contains(fileName) else { return }
-        names.append(fileName)
-        defaults.set(names, forKey: Keys.dismissedDamagedBackups)
+    func setDismissedDamagedBackups(_ fileNames: Set<String>) {
+        if fileNames.isEmpty {
+            defaults.removeObject(forKey: Keys.dismissedDamagedBackups)
+        } else {
+            defaults.set(fileNames.sorted(), forKey: Keys.dismissedDamagedBackups)
+        }
     }
 
     /// **The gate.** True iff voice recognition is switched on *and* able to
