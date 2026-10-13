@@ -662,13 +662,12 @@ final class RecordingShareImporter: ObservableObject {
             // The row references the audio; the audio must stay. `load()`
             // rebuilds the text from the segments.
             log.error("imported \(recording.id, privacy: .public) but its .txt sidecar did not land")
-            if let stagedProfiles, let profileStore {
-                profileStore.commit(stagedProfiles)
-            }
         case .saved:
-            if let stagedProfiles, let profileStore {
-                profileStore.commit(stagedProfiles)
-            }
+            break
+        }
+        // The row is in the library: now, and only now, the voice profiles.
+        if let stagedProfiles, let profileStore, !profileStore.commit(stagedProfiles) {
+            log.error("imported \(recording.id, privacy: .public) but its voice profiles could not be written")
         }
 
         // The name list is autocomplete housekeeping; it follows the row for

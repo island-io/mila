@@ -366,6 +366,46 @@ final class SpeakerProfileStoreTests: XCTestCase {
             .filter { $0.hasPrefix("speaker-profiles.damaged-") }.count, 1)
     }
 
+    /// The moved-aside copy is voice data like the live file: it keeps
+    /// "Delete Voice Profiles" on offer, and that button removes it too.
+    func test_delete_all_removes_the_moved_aside_copies_as_well() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        try Data("not json".utf8).write(to: fileURL)
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+        try FileManager.default.removeItem(at: fileURL)
+        XCTAssertTrue(makeStore(in: dir).hasStoredProfilesOnDisk,
+                      "a damaged copy alone still counts as stored voice data")
+
+        store.deleteAllProfiles()
+
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("speaker-profiles") }, [])
+        XCTAssertFalse(store.hasStoredProfilesOnDisk)
+    }
+
+    /// A `StagedChanges` ends its run once: a second discard, or one after
+    /// an ordinary save already persisted the staged profiles, must not
+    /// revert memory.
+    func test_staged_changes_can_be_ended_only_once() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+
+        let (_, changes) = store.staged {
+            store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        }
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)  // persists both
+        store.discard(changes)
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice", "Bob"], "overtaken: nothing reverted")
+        XCTAssertFalse(store.commit(changes))
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Alice", "Bob"])
+    }
+
     /// If the damaged file cannot be moved, nothing is written over it.
     func test_a_damaged_file_that_cannot_be_moved_is_not_overwritten() throws {
         let dir = tempDir()

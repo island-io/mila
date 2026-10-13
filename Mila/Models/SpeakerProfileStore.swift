@@ -292,7 +292,7 @@ final class SpeakerProfileStore: ObservableObject {
     init(directory: URL, settings: VoiceRecognitionSettings) {
         self.settings = settings
         self.storeURL = directory.appendingPathComponent("speaker-profiles.json")
-        self.hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        self.hasStoredProfilesOnDisk = storedFilesExist()
         // Only read the file when the user has opted in. Off means off: no
         // embedding reaches memory, so nothing can be seeded or matched
         // even by a caller that forgot its own guard.
@@ -511,7 +511,16 @@ final class SpeakerProfileStore: ObservableObject {
         } catch {
             profileLog.log("deleteAll error: \(error.localizedDescription, privacy: .public)")
         }
-        hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+        // So are the copies `save()` moved aside: they hold voice
+        // fingerprints as much as the live file does (#329).
+        for copy in damagedCopies() {
+            do {
+                try fileManager.removeItem(at: copy)
+            } catch {
+                profileLog.log("deleteAll error: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        hasStoredProfilesOnDisk = storedFilesExist()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
         // so the file was never parsed) — that is precisely the case where
@@ -574,6 +583,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// `discard(_:)`. Opaque on purpose: only a value this store handed out
     /// can end a staging run.
     struct StagedChanges {
+        fileprivate let id: UUID
         fileprivate let profilesBefore: [VoiceProfile]
         fileprivate let needsSave: Bool
     }
@@ -583,6 +593,11 @@ final class SpeakerProfileStore: ObservableObject {
     private var isStaging = false
     /// A `save()` was asked for while staging.
     private var stagedSaveRequested = false
+    /// The one `StagedChanges` that may still be committed or discarded.
+    /// Cleared by either, and by any ordinary `save()` in between — that
+    /// write persisted the staged profiles too, so discarding them in
+    /// memory afterwards would only make memory disagree with the file.
+    private var openStagedID: UUID?
 
     /// Run `body` against this store with every write held in memory:
     /// `profiles` changes as usual, but `speaker-profiles.json` is not
@@ -610,22 +625,38 @@ final class SpeakerProfileStore: ObservableObject {
         stagedSaveRequested = false
         let result = body()
         isStaging = false
-        let changes = StagedChanges(profilesBefore: before, needsSave: stagedSaveRequested)
+        let changes = StagedChanges(id: UUID(), profilesBefore: before, needsSave: stagedSaveRequested)
         stagedSaveRequested = false
+        openStagedID = changes.id
         return (result, changes)
     }
 
     /// Persist what `staged(_:)` held back: one `speaker-profiles.json`
     /// write, through the same `save()` (and its gates) every other change
-    /// goes through. Nothing to do if the staged body wrote nothing.
-    func commit(_ changes: StagedChanges) {
-        guard changes.needsSave else { return }
-        save()
+    /// goes through. Returns whether the staged changes are on disk — true
+    /// when there was nothing to write; false when the write was refused
+    /// or failed (logged by `save()`), in which case they live in memory
+    /// only until the next successful save.
+    @discardableResult
+    func commit(_ changes: StagedChanges) -> Bool {
+        guard openStagedID == changes.id else {
+            profileLog.error("commit: these staged changes were already committed, discarded or overtaken")
+            return false
+        }
+        openStagedID = nil
+        guard changes.needsSave else { return true }
+        return save()
     }
 
     /// Take back what `staged(_:)` changed. Only memory needs putting back:
-    /// the file was never written.
+    /// the file was never written. A no-op (logged) for changes that are no
+    /// longer open, so a stale value cannot revert later edits.
     func discard(_ changes: StagedChanges) {
+        guard openStagedID == changes.id else {
+            profileLog.error("discard: these staged changes were already committed, discarded or overtaken")
+            return
+        }
+        openStagedID = nil
         profiles = changes.profilesBefore
         profileLog.log("discarded staged voice-profile changes; kept \(changes.profilesBefore.count) profiles")
     }
@@ -735,22 +766,26 @@ final class SpeakerProfileStore: ObservableObject {
     /// housekeeping — a rename or a single delete from Settings — and that
     /// must still persist when the diarization pipeline happens to be
     /// unverified, or their edit would silently revert on relaunch.
-    private func save() {
+    /// Returns whether `profiles` is now on disk; only `commit(_:)` reads it.
+    @discardableResult
+    private func save() -> Bool {
         guard settings.isEnabled else {
             profileLog.log("save skipped — voice recognition is off")
-            return
+            return false
         }
         if isStaging {
             // `staged(_:)`: the caller decides later whether this reaches disk.
             stagedSaveRequested = true
-            return
+            return false
         }
+        // An ordinary write persists whatever is staged-but-open as well.
+        openStagedID = nil
         // `profiles` does not hold what a damaged file holds, so writing
         // would destroy voice data the user could still repair by hand.
         // Move it out of the way first; if that fails, do not write at all.
         if loadedFromDamagedFile, !moveDamagedFileAside() {
             profileLog.error("save skipped — the damaged speaker-profiles.json could not be moved aside")
-            return
+            return false
         }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -764,11 +799,30 @@ final class SpeakerProfileStore: ObservableObject {
             let data = try encoder.encode(profiles)
             try data.write(to: storeURL, options: .atomic)
             hasStoredProfilesOnDisk = true
+            return true
         } catch {
             profileLog.log("save error: \(error.localizedDescription, privacy: .public)")
-            // The damaged file may have just been moved aside.
-            hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
+            hasStoredProfilesOnDisk = storedFilesExist()
+            return false
         }
+    }
+
+    private static let damagedPrefix = "speaker-profiles.damaged-"
+
+    /// The copies `moveDamagedFileAside()` left next to the live file.
+    private func damagedCopies() -> [URL] {
+        let dir = storeURL.deletingLastPathComponent()
+        let names = (try? fileManager.contentsOfDirectory(atPath: dir.path)) ?? []
+        return names
+            .filter { $0.hasPrefix(Self.damagedPrefix) && $0.hasSuffix(".json") }
+            .map { dir.appendingPathComponent($0) }
+    }
+
+    /// Whether any voice data this store owns is on disk: the live file or
+    /// a moved-aside damaged copy. Feeds `hasStoredProfilesOnDisk`, so
+    /// Settings keeps offering "Delete Voice Profiles" while either exists.
+    private func storedFilesExist() -> Bool {
+        fileManager.fileExists(atPath: storeURL.path) || !damagedCopies().isEmpty
     }
 
     /// Rename a `speaker-profiles.json` that `load()` could not parse to
@@ -793,10 +847,10 @@ final class SpeakerProfileStore: ObservableObject {
         formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
         let stamp = formatter.string(from: Date())
         let dir = storeURL.deletingLastPathComponent()
-        var destination = dir.appendingPathComponent("speaker-profiles.damaged-\(stamp).json")
+        var destination = dir.appendingPathComponent("\(Self.damagedPrefix)\(stamp).json")
         var attempt = 2
         while fileManager.fileExists(atPath: destination.path) {
-            destination = dir.appendingPathComponent("speaker-profiles.damaged-\(stamp)-\(attempt).json")
+            destination = dir.appendingPathComponent("\(Self.damagedPrefix)\(stamp)-\(attempt).json")
             attempt += 1
         }
         do {
