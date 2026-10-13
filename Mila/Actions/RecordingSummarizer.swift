@@ -175,15 +175,13 @@ final class RecordingSummarizer: ObservableObject {
     private var backfillQueue: [UUID] = []
 
     /// Runs `cancel(recordingID:)` has removed from `inFlight` whose tasks
-    /// have not unwound yet. Their child is still being killed (SIGTERM,
-    /// grace, SIGKILL, bounded reap), so `pumpBackfill` counts them against
-    /// `maxConcurrent`: otherwise another run's completion could start new
-    /// CLIs while the cancelled one is still alive. Incremented by `cancel`,
-    /// decremented by the cancelled task's `defer` — the only two places a
-    /// run leaves `inFlight` are that `defer` (for a run that still owns
-    /// its id) and `cancel`, so a `defer` that finds it no longer owns the
-    /// id is exactly a cancelled run.
-    private var cancelledUnwinding = 0
+    /// have not unwound yet, keyed by run token. Their child is still being
+    /// killed (SIGTERM, grace, SIGKILL, bounded reap), so `pumpBackfill`
+    /// counts them against `maxConcurrent`: otherwise another run's
+    /// completion could start new CLIs while the cancelled one is still
+    /// alive. Inserted by `cancel`, removed by token in the cancelled task's
+    /// own `defer`. Also what `awaitInFlight` waits on for a cancelled id.
+    private var cancelledRuns: [UUID: (recordingID: UUID, task: Task<Void, Never>)] = [:]
 
     /// Max concurrent in-flight CLI invocations the summarizer will
     /// schedule from backfill / regeneration. Starts at 2 — high enough
@@ -312,9 +310,20 @@ final class RecordingSummarizer: ObservableObject {
     /// has already happened — including a follow-up's: a stale run starts its
     /// follow-up from that same `defer`, so this keeps awaiting until no run
     /// is left for the id.
+    ///
+    /// A run `cancel(recordingID:)` took out of `inFlight` is awaited too,
+    /// until its task has unwound — otherwise a permanent delete would make
+    /// this return before the cancelled call had even started, and a test
+    /// asserting "nothing was stored / exported" would pass vacuously.
     func awaitInFlight(_ recordingID: UUID) async {
-        while let run = inFlight[recordingID] {
-            await run.task.value
+        while true {
+            if let run = inFlight[recordingID] {
+                await run.task.value
+            } else if let cancelled = cancelledRuns.values.first(where: { $0.recordingID == recordingID }) {
+                await cancelled.task.value
+            } else {
+                return
+            }
         }
     }
 
@@ -483,8 +492,8 @@ final class RecordingSummarizer: ObservableObject {
             run.task.cancel()
             inFlightIDs.remove(recordingID)
             // Still holds its slot until its task unwinds (see
-            // `cancelledUnwinding`); the task's `defer` gives it back.
-            cancelledUnwinding += 1
+            // `cancelledRuns`); the task's `defer` gives it back.
+            cancelledRuns[run.token] = (recordingID, run.task)
         }
     }
 
@@ -494,7 +503,7 @@ final class RecordingSummarizer: ObservableObject {
     /// each task's `defer` so as soon as one finishes the next one can
     /// start.
     private func pumpBackfill() {
-        while inFlight.count + cancelledUnwinding < maxConcurrent, !backfillQueue.isEmpty {
+        while inFlight.count + cancelledRuns.count < maxConcurrent, !backfillQueue.isEmpty {
             let id = backfillQueue.removeFirst()
             guard let rec = store.recordings.first(where: { $0.id == id }) else {
                 continue
@@ -515,7 +524,19 @@ final class RecordingSummarizer: ObservableObject {
         // whatever copy they hold, and the completion compares against the
         // live row, so a copy that differs from the store would make every
         // run look stale from the start.
-        let recording = latestRecording(recording.id, fallback: recording)
+        //
+        // A row that is no longer in the store gets no call at all. A
+        // request can arrive after a permanent delete with the caller's
+        // stale copy (a post-recording step still finishing after a
+        // discard, a regenerate racing the delete), and the delete's
+        // `permanentlyDeleted` cancel has already fired, so nothing would
+        // ever cancel a call started now: it would hold a slot for the
+        // whole `cliTimeout` for output with nowhere to go (#334). No
+        // signal either, as for any deleted row.
+        guard let recording = liveRecording(recording.id) else {
+            summarizerLog.log("skipped \(self.shortID(recording.id), privacy: .public): recording is gone")
+            return
+        }
         let id = recording.id
         // Dedup: a second request while one is in flight never starts a
         // second overlapping call, so a re-enqueue can't double-bill. It is
@@ -597,11 +618,11 @@ final class RecordingSummarizer: ObservableObject {
                                 self.summarizeIfNeeded(live)
                             }
                         }
-                    } else {
-                        // Cancelled: this run's slot was held for it in
-                        // `cancelledUnwinding` until now.
-                        self.cancelledUnwinding -= 1
                     }
+                    // Cancelled: this run's slot was held for it in
+                    // `cancelledRuns` until now. (A no-op for a run that
+                    // was never cancelled.)
+                    self.cancelledRuns[token] = nil
                     // After each completion, try to pull the next
                     // queued backfill candidate in.
                     self.pumpBackfill()

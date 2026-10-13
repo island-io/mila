@@ -1517,8 +1517,10 @@ enum LLMRunner {
             // `isRunning` as well as the wait: `exited` is also signalled by
             // a cancel's wake, so a cancel arriving during a timeout's grace
             // would satisfy the wait with the child still alive. And it
-            // guards the bare-pid `kill`: once Foundation has reaped the
-            // child its pid can be reused, and `isRunning` is false by then.
+            // narrows the bare-pid `kill`'s reuse window: once Foundation has
+            // reaped the child its pid can be reused, and `isRunning` is false
+            // by then (a reap between the check and the `kill` is still
+            // possible, as it always was on the timeout path).
             if exited.wait(timeout: .now() + 1) == .timedOut || process.isRunning {
                 if process.isRunning {
                     kill(process.processIdentifier, SIGKILL)

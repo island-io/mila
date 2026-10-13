@@ -1883,6 +1883,28 @@ final class RecordingSummarizerTests: XCTestCase {
                        "SUMMARY of queued transcript")
     }
 
+    /// A request that arrives AFTER a permanent delete, with the caller's
+    /// stale copy, starts no call: the delete's cancel has already fired, so
+    /// nothing would ever stop it (e.g. a post-recording step finishing after
+    /// a discard, or a regenerate racing the delete).
+    func test_a_request_for_a_permanently_deleted_recording_starts_no_call() async throws {
+        llm.tool = .claude
+        var calls = 0
+        useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
+            calls += 1
+            return "SUMMARY"
+        }
+        let rec = try addRecording(named: "Gone", text: "a transcript")
+        store.permanentlyDelete(rec)
+
+        summarizer.summarizeIfNeeded(rec)
+        summarizer.regenerate(rec)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id))
+        await summarizer.awaitInFlight(rec.id)
+        await Task.yield()
+        XCTAssertEqual(calls, 0, "a deleted recording must not cost an LLM call")
+    }
+
     /// A cancelled run keeps its slot until its call has actually unwound —
     /// in production, until `LLMRunner` has killed and reaped the child.
     /// `cancel` drops the run from `inFlight` at once, so without that
@@ -1925,11 +1947,11 @@ final class RecordingSummarizerTests: XCTestCase {
         XCTAssertEqual(started, ["a", "b", "c"],
                        "b's slot goes to c")
         // b has finished and c is running; a is still unwinding, so it
-        // still counts and d must wait. (Give a wrongly started d time to
-        // show up before asserting it did not.)
-        await waitUntil { started.count == 4 }
-        XCTAssertEqual(started, ["a", "b", "c"],
+        // still counts and d must wait. b's `defer` ran the pump in the job
+        // that started c, so a wrongly started d would already be in flight.
+        XCTAssertFalse(summarizer.isSummarizing(try XCTUnwrap(rows["d"]).id),
                        "a cancelled run that has not unwound must still hold its slot")
+        XCTAssertEqual(started, ["a", "b", "c"])
 
         gateA.open()
         await waitUntil { started.count == 4 }
