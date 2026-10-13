@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 import TranscriptionCore
 @testable import Mila
@@ -986,5 +987,79 @@ final class RecordingShareImporterTests: XCTestCase {
         XCTAssertTrue(profiles.profiles.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: profilesURL.path))
         XCTAssertFalse(profiles.hasStoredProfilesOnDisk)
+    }
+
+    /// The crash window #324's rollback could not close: if Mila dies
+    /// between the voice-profile write and the `recordings.json` write, the
+    /// profiles are merged and the bundle's tokens recorded for a recording
+    /// that is not in the library, and the retry skips every speaker as
+    /// "already imported". So `speaker-profiles.json` must still be as it
+    /// was at the moment the store takes the row (#329). Observed through
+    /// `recordings`, which `upsertImported` publishes before it writes.
+    func test_voice_profiles_reach_disk_only_after_the_recording_row() async throws {
+        let original = try makeCompletedRecording(in: storeA,
+                                                  speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "Ada"])
+        let shared = [
+            SharedSpeakerProfile(name: "Daniel", embedding: vector([1, 0]), sampleCount: 4,
+                                 embeddingModel: SpeakerEmbeddingModel.current.id),
+            SharedSpeakerProfile(name: "Ada", embedding: vector([0, 1]), sampleCount: 2,
+                                 embeddingModel: SpeakerEmbeddingModel.current.id),
+        ]
+        let bundle = try await export(original, from: storeA, profiles: shared)
+        let voice = makeVoiceSettings(enabled: true)
+        let profiles = SpeakerProfileStore(directory: rootB, settings: voice)
+        profiles.updateProfile(name: "Dan", embedding: vector([0.99, 0.01]), sampleCount: 2)
+        let profilesURL = rootB.appendingPathComponent("speaker-profiles.json")
+        let bytesBefore = try Data(contentsOf: profilesURL)
+        let importer = makeImporter(profiles: profiles, voice: voice)
+
+        var bytesWhenTheRowArrived: Data?
+        let watch = storeB.$recordings.dropFirst().sink { rows in
+            if !rows.isEmpty, bytesWhenTheRowArrived == nil {
+                bytesWhenTheRowArrived = try? Data(contentsOf: profilesURL)
+            }
+        }
+        defer { watch.cancel() }
+
+        await stage(bundle, with: importer)
+        await importer.confirm()
+
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertEqual(bytesWhenTheRowArrived, bytesBefore,
+                       "speaker-profiles.json untouched until the row is committed")
+        // ...and committed after it.
+        let reloaded = SpeakerProfileStore(directory: rootB, settings: voice)
+        XCTAssertEqual(reloaded.profile(named: "Dan")?.sampleCount, 6)
+        XCTAssertEqual(reloaded.profile(named: "Ada")?.sampleCount, 2)
+        XCTAssertEqual(reloaded.importedShareTokens.count, 2)
+    }
+
+    /// An import into a library whose `speaker-profiles.json` failed to
+    /// parse at launch must not overwrite it: the damaged file is moved
+    /// aside intact and the imported voices go to a fresh file (#329).
+    func test_an_import_moves_a_damaged_profiles_file_aside_instead_of_overwriting_it() async throws {
+        let original = try makeCompletedRecording(in: storeA)
+        let shared = [SharedSpeakerProfile(name: "Daniel", embedding: vector([1, 0]), sampleCount: 4,
+                                           embeddingModel: SpeakerEmbeddingModel.current.id)]
+        let bundle = try await export(original, from: storeA, profiles: shared)
+        try FileManager.default.createDirectory(at: rootB, withIntermediateDirectories: true)
+        let profilesURL = rootB.appendingPathComponent("speaker-profiles.json")
+        let damaged = Data("[{\"name\": \"Dan\", \"embedding\": [0.9".utf8)
+        try damaged.write(to: profilesURL)
+        let voice = makeVoiceSettings(enabled: true)
+        let profiles = SpeakerProfileStore(directory: rootB, settings: voice)
+        XCTAssertTrue(profiles.loadedFromDamagedFile, "precondition")
+        let importer = makeImporter(profiles: profiles, voice: voice)
+
+        await stage(bundle, with: importer)
+        await importer.confirm()
+
+        XCTAssertNil(importer.errorMessage)
+        XCTAssertEqual(storeB.recordings.count, 1)
+        let aside = try FileManager.default.contentsOfDirectory(atPath: rootB.path)
+            .filter { $0.hasPrefix("speaker-profiles.damaged-") }
+        XCTAssertEqual(aside.count, 1)
+        XCTAssertEqual(try Data(contentsOf: rootB.appendingPathComponent(aside[0])), damaged)
+        XCTAssertEqual(SpeakerProfileStore(directory: rootB, settings: voice).profiles.map(\.name), ["Daniel"])
     }
 }

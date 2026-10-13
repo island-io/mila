@@ -596,10 +596,11 @@ final class RecordingShareImporter: ObservableObject {
             return
         }
 
-        // From here to `upsertImported` is one synchronous main-actor run:
+        // From here to the profile commit is one synchronous main-actor run:
         // the audio appears under its final name, the voice profiles are
-        // written and the store learns about the recording without an
-        // intervening suspension point. The rename goes first so that if it
+        // staged, the store learns about the recording and the profiles are
+        // committed or discarded without an intervening suspension point
+        // (`SpeakerProfileStore.staged` requires it). The rename goes first so that if it
         // fails nothing has been written anywhere — least of all to the
         // voice profiles, which the user cannot see from the error.
         do {
@@ -612,17 +613,24 @@ final class RecordingShareImporter: ObservableObject {
 
         // Voice profiles before the row: the row's labels are rewritten
         // through the applier's `nameMapping`, so the applier has to run
-        // first. The row is the commit point, though. If its write fails
-        // the profiles go back to this snapshot — folds, new profiles and
-        // import tokens alike — so a failed import leaves no voice data
-        // behind for a recording that does not exist, and the retry is a
-        // first import again rather than one the sheet calls "already
-        // imported" (#319).
+        // first. The row is the commit point, though, so the applier runs
+        // STAGED: folds, new profiles and import tokens change memory only,
+        // and `speaker-profiles.json` is written after `recordings.json`
+        // has been — or never, if it is not. A failed write or a crash
+        // before the row therefore leaves no voice data behind for a
+        // recording that does not exist, and the retry is a first import
+        // rather than one the sheet calls "already imported" (#319, #329).
+        // A crash after the row but before the profile write loses only the
+        // profile merge; no token was persisted, so re-importing redoes it.
         var mapping: [String: String] = [:]
-        var profilesBefore: SpeakerProfileStore.Snapshot?
+        var stagedProfiles: SpeakerProfileStore.StagedChanges?
         if !pending.speakerPlan.isEmpty, let profileStore {
-            profilesBefore = profileStore.snapshot()
-            mapping = SpeakerProfileImportApplier.apply(pending.speakerPlan, to: profileStore).nameMapping
+            let plan = pending.speakerPlan
+            let applied = profileStore.staged {
+                SpeakerProfileImportApplier.apply(plan, to: profileStore)
+            }
+            mapping = applied.result.nameMapping
+            stagedProfiles = applied.changes
         }
 
         var recording = manifest.recording.makeRecording(
@@ -642,10 +650,10 @@ final class RecordingShareImporter: ObservableObject {
         case .notSaved:
             // The store rolled itself back, so the audio is unreferenced
             // and removing it leaves no trace of the attempt. Neither may
-            // the voice profiles: they were written on behalf of a
-            // recording that now does not exist.
-            if let profilesBefore, let profileStore, !profileStore.restore(profilesBefore) {
-                log.error("import of \(recording.id, privacy: .public) failed and its voice profiles could not be rolled back on disk")
+            // the voice profiles: they were staged on behalf of a recording
+            // that now does not exist, and never reached disk.
+            if let stagedProfiles, let profileStore {
+                profileStore.discard(stagedProfiles)
             }
             try? fileManager.removeItem(at: destination)
             finish(pending, error: ImportError.saveFailed)
@@ -654,8 +662,13 @@ final class RecordingShareImporter: ObservableObject {
             // The row references the audio; the audio must stay. `load()`
             // rebuilds the text from the segments.
             log.error("imported \(recording.id, privacy: .public) but its .txt sidecar did not land")
+            if let stagedProfiles, let profileStore {
+                profileStore.commit(stagedProfiles)
+            }
         case .saved:
-            break
+            if let stagedProfiles, let profileStore {
+                profileStore.commit(stagedProfiles)
+            }
         }
 
         // The name list is autocomplete housekeeping; it follows the row for

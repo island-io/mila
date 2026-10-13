@@ -264,52 +264,81 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.profiles[0].sampleCount, 5)
     }
 
-    // MARK: - Snapshot / restore
+    // MARK: - Staged writes
 
-    /// `snapshot()` / `restore(_:)` exist for `RecordingShareImporter`: it
-    /// writes a bundle's voice profiles BEFORE the recording row, and when
-    /// the row cannot be saved they have to go back — in memory, on disk
-    /// byte for byte, and with no file left behind when there was none
-    /// before (#319).
-    func test_restore_puts_the_profiles_and_the_file_back_as_the_snapshot_found_them() throws {
+    /// `staged(_:)` exists for `RecordingShareImporter`: it folds a
+    /// bundle's voice profiles in BEFORE the recording row, and the file
+    /// must not change until the row has been saved — or a crash in between
+    /// leaves voice data and import tokens for a recording that is not in
+    /// the library (#319, #329).
+    func test_staged_writes_change_memory_only_until_committed() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        let before = try Data(contentsOf: fileURL)
+
+        let (_, changes) = store.staged {
+            store.updateProfile(name: "Alice", embedding: [0, 1, 0], sampleCount: 1)
+            store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+            store.recordImport(token: ImportedShareToken(bundleKey: "bundle", sharedName: "Al"),
+                               onProfileNamed: "Alice")
+        }
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice", "Bob"], "memory sees the staged writes")
+        XCTAssertEqual(store.importedShareTokens.count, 1)
+        XCTAssertEqual(try Data(contentsOf: fileURL), before, "the file does not, yet")
+
+        store.commit(changes)
+        let reloaded = makeStore(in: dir)
+        XCTAssertEqual(reloaded.profiles.map(\.name), ["Alice", "Bob"])
+        XCTAssertEqual(reloaded.profile(named: "Alice")?.sampleCount, 2)
+        XCTAssertEqual(reloaded.importedShareTokens.count, 1)
+    }
+
+    /// Discarding puts memory back and never touches the file — including
+    /// the no-file case, where a `[]` left behind would make Settings offer
+    /// to delete voice profiles the user never stored.
+    func test_discarding_staged_writes_restores_memory_and_never_writes() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
         let fileURL = dir.appendingPathComponent("speaker-profiles.json")
         let store = makeStore(in: dir)
 
-        // No file yet: a restore removes the one written since.
-        let empty = store.snapshot()
-        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fileURL.path))
-        store.restore(empty)
+        let (_, empty) = store.staged {
+            store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        store.discard(empty)
         XCTAssertTrue(store.profiles.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
         XCTAssertFalse(store.hasStoredProfilesOnDisk)
 
-        // A file with content: a restore rewrites it byte for byte.
         store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
         let before = try Data(contentsOf: fileURL)
-        let snapshot = store.snapshot()
-        store.updateProfile(name: "Alice", embedding: [0, 1, 0], sampleCount: 1)
-        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
-        store.recordImport(token: ImportedShareToken(bundleKey: "bundle", sharedName: "Al"),
-                           onProfileNamed: "Alice")
-        XCTAssertNotEqual(try Data(contentsOf: fileURL), before)
-        store.restore(snapshot)
+        let (_, changes) = store.staged {
+            store.updateProfile(name: "Alice", embedding: [0, 1, 0], sampleCount: 1)
+            store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+        }
+        store.discard(changes)
         XCTAssertEqual(store.profiles.map(\.name), ["Alice"])
         XCTAssertEqual(store.profiles[0].embedding, [1, 0, 0])
-        XCTAssertEqual(store.profiles[0].sampleCount, 1)
-        XCTAssertTrue(store.importedShareTokens.isEmpty)
         XCTAssertEqual(try Data(contentsOf: fileURL), before)
-        XCTAssertTrue(store.hasStoredProfilesOnDisk)
+
+        // And writes after a staging run persist as usual.
+        store.updateProfile(name: "Carol", embedding: [0, 0, 1], sampleCount: 1)
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Alice", "Carol"])
     }
 
-    /// Memory is not always the file: `load()` leaves a file it cannot
-    /// parse on disk, untouched, for the user to repair. A restore must put
-    /// THOSE bytes back, not re-encode the empty list memory holds, or a
-    /// failed import would replace the user's profiles with `[]`.
-    func test_restore_puts_back_a_file_that_load_could_not_parse() throws {
+    // MARK: - Damaged file
+
+    /// A file `load()` cannot parse is the user's voice data in a state
+    /// they can still repair. The next write must not destroy it: it is
+    /// moved aside under a timestamped name, byte for byte, and the new
+    /// profiles go to a fresh `speaker-profiles.json` (#329).
+    func test_a_write_after_a_failed_load_moves_the_damaged_file_aside() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: dir) }
@@ -318,32 +347,45 @@ final class SpeakerProfileStoreTests: XCTestCase {
         try damaged.write(to: fileURL)
         let store = makeStore(in: dir)
         XCTAssertTrue(store.profiles.isEmpty, "the file does not parse")
+        XCTAssertTrue(store.loadedFromDamagedFile)
 
-        let snapshot = store.snapshot()
         store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
+
+        let aside = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("speaker-profiles.damaged-") && $0.hasSuffix(".json") }
+        XCTAssertEqual(aside.count, 1)
+        XCTAssertEqual(try Data(contentsOf: dir.appendingPathComponent(aside[0])), damaged,
+                       "every byte of the damaged file survives")
+        XCTAssertFalse(store.loadedFromDamagedFile)
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Bob"])
         XCTAssertNotEqual(try Data(contentsOf: fileURL), damaged)
-        XCTAssertTrue(store.restore(snapshot))
-        XCTAssertTrue(store.profiles.isEmpty)
-        XCTAssertEqual(try Data(contentsOf: fileURL), damaged)
-        XCTAssertTrue(store.hasStoredProfilesOnDisk)
+
+        // Once moved, later writes are ordinary ones: no second copy.
+        store.updateProfile(name: "Carol", embedding: [0, 1, 0], sampleCount: 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("speaker-profiles.damaged-") }.count, 1)
     }
 
-    /// A file the snapshot could not read cannot be put back, and the
-    /// caller has to be told rather than handed a silent success.
-    func test_restore_reports_failure_for_a_file_that_was_unreadable_at_the_snapshot() throws {
+    /// If the damaged file cannot be moved, nothing is written over it.
+    func test_a_damaged_file_that_cannot_be_moved_is_not_overwritten() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
         let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let damaged = Data("not json".utf8)
+        try damaged.write(to: fileURL)
         let store = makeStore(in: dir)
-        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
-        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fileURL.path)
-        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path) }
+        XCTAssertTrue(store.loadedFromDamagedFile)
+        // A read-only folder: neither the rename nor an atomic write can happen.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
 
-        let snapshot = store.snapshot()
         store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 3)
-        XCTAssertFalse(store.restore(snapshot))
-        XCTAssertEqual(store.profiles.map(\.name), ["Alice"], "memory is restored regardless")
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), damaged)
+        XCTAssertTrue(store.loadedFromDamagedFile, "the next write tries again")
     }
 
     // MARK: - Deletion observers

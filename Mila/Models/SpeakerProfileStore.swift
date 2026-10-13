@@ -231,6 +231,13 @@ final class SpeakerProfileStore: ObservableObject {
     private let fileManager = FileManager.default
     private let storeURL: URL
 
+    /// True when `load()` found `speaker-profiles.json` but could not read
+    /// or parse it. The file is then the user's unrecovered voice data, not
+    /// a stale copy of `profiles`, so the next `save()` moves it aside
+    /// rather than writing over it (#329). Cleared once it has been moved,
+    /// deleted by the user, or loaded successfully.
+    private(set) var loadedFromDamagedFile = false
+
     /// What a deletion removed, handed to the observers below.
     enum Deletion: Equatable {
         /// Every profile — `deleteAllProfiles`. Carries no names on purpose:
@@ -499,6 +506,8 @@ final class SpeakerProfileStore: ObservableObject {
             if fileManager.fileExists(atPath: storeURL.path) {
                 try fileManager.removeItem(at: storeURL)
             }
+            // A damaged file is gone too: the user asked for exactly that.
+            loadedFromDamagedFile = false
         } catch {
             profileLog.log("deleteAll error: \(error.localizedDescription, privacy: .public)")
         }
@@ -559,93 +568,66 @@ final class SpeakerProfileStore: ObservableObject {
         save()
     }
 
-    // MARK: - Snapshot / restore
+    // MARK: - Staged writes
 
-    /// The store's state at one moment, for `restore(_:)`. Opaque on
-    /// purpose: only a snapshot this store handed out can be restored.
-    struct Snapshot {
-        fileprivate enum File {
-            case absent
-            case bytes(Data)
-            /// It exists but could not be read; `restore` leaves it alone.
-            case unreadable
-        }
-        fileprivate let profiles: [VoiceProfile]
-        fileprivate let file: File
+    /// Changes made inside `staged(_:)`, waiting for `commit(_:)` or
+    /// `discard(_:)`. Opaque on purpose: only a value this store handed out
+    /// can end a staging run.
+    struct StagedChanges {
+        fileprivate let profilesBefore: [VoiceProfile]
+        fileprivate let needsSave: Bool
     }
 
-    /// Capture the profiles in memory and `speaker-profiles.json` as it is
-    /// on disk, so a caller that writes to this store ahead of a commit
-    /// point it does not own can take the writes back.
+    /// True while `staged(_:)`'s body runs: `save()` records that a write
+    /// is owed instead of writing.
+    private var isStaging = false
+    /// A `save()` was asked for while staging.
+    private var stagedSaveRequested = false
+
+    /// Run `body` against this store with every write held in memory:
+    /// `profiles` changes as usual, but `speaker-profiles.json` is not
+    /// touched until the caller hands the result to `commit(_:)` — or ever,
+    /// if it hands it to `discard(_:)`.
     ///
-    /// `RecordingShareImporter.confirm()` is that caller: it folds a
+    /// `RecordingShareImporter.confirm()` is the caller. It folds a
     /// `.milashare`'s voice profiles in BEFORE the recording row, because
-    /// the row's speaker labels come out of that step, and the row's
-    /// `recordings.json` write can still fail. Without this, a failed
-    /// import left centroids moved, new profiles created and import tokens
-    /// recorded for a recording that does not exist (#319).
+    /// the row's speaker labels come out of that step, but the row's
+    /// `recordings.json` write is the import's commit point. Writing the
+    /// profiles as they were folded left them on disk — merged, created and
+    /// tagged with the bundle's import tokens — for a recording that a crash
+    /// or a failed write kept out of the library, and the retry then skipped
+    /// every speaker as "already imported" (#319, #329). Staged, nothing
+    /// reaches disk until the row has.
     ///
-    /// The file is captured as raw bytes, read from disk now rather than
-    /// re-encoded from memory or inferred from `hasStoredProfilesOnDisk`:
-    /// memory is not always the file. `load()` drops entries it cannot use
-    /// and leaves a file it cannot parse on disk for the user to repair,
-    /// and a failed `save()` leaves memory ahead of it. Re-encoding would
-    /// overwrite either of those with what memory happened to hold.
-    func snapshot() -> Snapshot {
-        let file: Snapshot.File
-        if !fileManager.fileExists(atPath: storeURL.path) {
-            file = .absent
-        } else if let data = try? Data(contentsOf: storeURL) {
-            file = .bytes(data)
-        } else {
-            file = .unreadable
-        }
-        return Snapshot(profiles: profiles, file: file)
+    /// The caller must commit or discard in the same synchronous main-actor
+    /// run, with no suspension point in between: no deletion observers fire
+    /// for what `discard` takes away, which is only sound because nothing
+    /// can have seeded from the staged profiles in the meantime.
+    func staged<T>(_ body: () -> T) -> (result: T, changes: StagedChanges) {
+        precondition(!isStaging, "staged writes do not nest")
+        let before = profiles
+        isStaging = true
+        stagedSaveRequested = false
+        let result = body()
+        isStaging = false
+        let changes = StagedChanges(profilesBefore: before, needsSave: stagedSaveRequested)
+        stagedSaveRequested = false
+        return (result, changes)
     }
 
-    /// Put the store back as `snapshot()` found it: the same profiles in
-    /// memory and the same bytes on disk — or no file, if there was none
-    /// (Settings reads the file's existence as "voice profiles from an
-    /// earlier opt-in are still stored" and would offer to delete an
-    /// empty set).
-    ///
-    /// No deletion observers fire for the profiles this takes away. That
-    /// is only sound because the caller restores in the same synchronous
-    /// main-actor run that wrote them, so nothing can have seeded from
-    /// them in between; a caller that suspends between the two must not
-    /// use this.
-    ///
-    /// Returns whether the file was put back. On `false` (a failed write,
-    /// or a file that was unreadable at the snapshot) the error is logged,
-    /// memory is restored anyway, and the disk may still hold the writes
-    /// being undone.
-    @discardableResult
-    func restore(_ snapshot: Snapshot) -> Bool {
-        profiles = snapshot.profiles
-        var restored = true
-        do {
-            switch snapshot.file {
-            case .absent:
-                if fileManager.fileExists(atPath: storeURL.path) {
-                    try fileManager.removeItem(at: storeURL)
-                }
-            case .bytes(let data):
-                try data.write(to: storeURL, options: .atomic)
-            case .unreadable:
-                // Nothing to put back. Whatever was written since stays,
-                // and the caller has to hear that.
-                restored = false
-                profileLog.error("restore: speaker-profiles.json was unreadable at the snapshot, so it cannot be put back")
-            }
-        } catch {
-            restored = false
-            profileLog.error("restore: could not put speaker-profiles.json back: \(error.localizedDescription, privacy: .public)")
-        }
-        hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
-        if restored {
-            profileLog.log("restored \(snapshot.profiles.count) voice profiles from a snapshot")
-        }
-        return restored
+    /// Persist what `staged(_:)` held back: one `speaker-profiles.json`
+    /// write, through the same `save()` (and its gates) every other change
+    /// goes through. Nothing to do if the staged body wrote nothing.
+    func commit(_ changes: StagedChanges) {
+        guard changes.needsSave else { return }
+        save()
+    }
+
+    /// Take back what `staged(_:)` changed. Only memory needs putting back:
+    /// the file was never written.
+    func discard(_ changes: StagedChanges) {
+        profiles = changes.profilesBefore
+        profileLog.log("discarded staged voice-profile changes; kept \(changes.profilesBefore.count) profiles")
     }
 
     /// Rename a profile.
@@ -758,6 +740,18 @@ final class SpeakerProfileStore: ObservableObject {
             profileLog.log("save skipped — voice recognition is off")
             return
         }
+        if isStaging {
+            // `staged(_:)`: the caller decides later whether this reaches disk.
+            stagedSaveRequested = true
+            return
+        }
+        // `profiles` does not hold what a damaged file holds, so writing
+        // would destroy voice data the user could still repair by hand.
+        // Move it out of the way first; if that fails, do not write at all.
+        if loadedFromDamagedFile, !moveDamagedFileAside() {
+            profileLog.error("save skipped — the damaged speaker-profiles.json could not be moved aside")
+            return
+        }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -772,7 +766,48 @@ final class SpeakerProfileStore: ObservableObject {
             hasStoredProfilesOnDisk = true
         } catch {
             profileLog.log("save error: \(error.localizedDescription, privacy: .public)")
+            // The damaged file may have just been moved aside.
+            hasStoredProfilesOnDisk = fileManager.fileExists(atPath: storeURL.path)
         }
+    }
+
+    /// Rename a `speaker-profiles.json` that `load()` could not parse to
+    /// `speaker-profiles.damaged-<UTC timestamp>.json` next to it, so the
+    /// next write cannot destroy it. Returns whether the path is now free.
+    ///
+    /// Moving aside, rather than refusing to write, is deliberate: a
+    /// refusal would leave voice recognition unable to persist anything —
+    /// a named speaker, an imported voice — until the user repairs a file
+    /// they likely do not know is broken, and every write path, not only
+    /// a `.milashare` import, would need to carry it. The moved file keeps
+    /// every byte for a manual repair, and the log says where it went.
+    private func moveDamagedFileAside() -> Bool {
+        guard fileManager.fileExists(atPath: storeURL.path) else {
+            // Removed by hand since launch: nothing left to protect.
+            loadedFromDamagedFile = false
+            return true
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        let stamp = formatter.string(from: Date())
+        let dir = storeURL.deletingLastPathComponent()
+        var destination = dir.appendingPathComponent("speaker-profiles.damaged-\(stamp).json")
+        var attempt = 2
+        while fileManager.fileExists(atPath: destination.path) {
+            destination = dir.appendingPathComponent("speaker-profiles.damaged-\(stamp)-\(attempt).json")
+            attempt += 1
+        }
+        do {
+            try fileManager.moveItem(at: storeURL, to: destination)
+        } catch {
+            profileLog.error("could not move the damaged speaker-profiles.json aside: \(error.localizedDescription, privacy: .public)")
+            return false
+        }
+        loadedFromDamagedFile = false
+        profileLog.error("moved a speaker-profiles.json that could not be parsed to \(destination.lastPathComponent, privacy: .public) before writing a new one")
+        return true
     }
 
     /// Parses `speaker-profiles.json` into memory. Called from `init` only
@@ -799,7 +834,10 @@ final class SpeakerProfileStore: ObservableObject {
     /// catch below leaves `profiles` as it was and logs.
     private func load() {
         guard settings.isEnabled else { return }
-        guard fileManager.fileExists(atPath: storeURL.path) else { return }
+        guard fileManager.fileExists(atPath: storeURL.path) else {
+            loadedFromDamagedFile = false
+            return
+        }
         do {
             let data = try Data(contentsOf: storeURL)
             let decoder = JSONDecoder()
@@ -815,8 +853,12 @@ final class SpeakerProfileStore: ObservableObject {
                 accepted.append(profile)
             }
             profiles = accepted
+            loadedFromDamagedFile = false
             profileLog.log("loaded \(accepted.count) of \(decoded.count) voice profiles")
         } catch {
+            // Left on disk for the user to repair; `save()` moves it aside
+            // before it writes anything in its place.
+            loadedFromDamagedFile = true
             profileLog.log("load error: \(error.localizedDescription, privacy: .public)")
         }
     }
