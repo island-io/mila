@@ -195,18 +195,39 @@ struct Recording: Identifiable, Codable, Hashable {
         !segments.isEmpty || !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Whether a re-transcription of a row that already had a transcript is
+    /// queued or running, so the transcript on the row is still the EARLIER
+    /// one. Mirrors MilaKit's `StoredRecording.isRetranscriptionInFlight`.
+    var isRetranscriptionInFlight: Bool {
+        guard let before = retranscriptionPriorState else { return false }
+        return (status == .pending || status == .running)
+            && (before.status == .completed || before.status == .failed)
+    }
+
+    /// The language of the transcript the row currently holds: `language`,
+    /// except while a re-run is in flight, when `language` already names
+    /// the re-run's and the text is still the earlier transcript's
+    /// (island-io/mila#330). Mirrors MilaKit's `StoredRecording.transcriptLanguage`.
+    var transcriptLanguage: String {
+        if isRetranscriptionInFlight, let before = retranscriptionPriorState,
+           !before.language.isEmpty {
+            return before.language
+        }
+        return language
+    }
+
     /// Undo a re-transcription that never produced a transcript: put back
     /// the status, language, model and stopped marker that describe the
     /// transcript still on the row (`retranscriptionPriorState`). Returns
-    /// false — changing nothing — when there is nothing to restore: no prior
-    /// state, no transcript left for it to describe, or a prior status that
-    /// isn't a settled one (the writer only captures settled states; the
-    /// check is defence against a hand-edited file). Does not clear the
-    /// prior state; callers settle the row and clear it.
+    /// false — changing nothing — unless a re-run is in flight
+    /// (`isRetranscriptionInFlight`: the row is `.pending`/`.running` and the
+    /// prior status is a settled one, which is all the writer ever captures)
+    /// and its earlier transcript is still there. Does not clear the prior
+    /// state; callers settle the row and clear it.
     @discardableResult
     mutating func restoreRetranscriptionPriorState() -> Bool {
-        guard let before = retranscriptionPriorState, hasTranscript,
-              before.status == .completed || before.status == .failed else { return false }
+        guard isRetranscriptionInFlight, hasTranscript,
+              let before = retranscriptionPriorState else { return false }
         status = before.status
         language = before.language
         modelName = before.modelName
@@ -225,13 +246,13 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `lastError` alert. Anything else — a first transcription, or a row
     /// with no transcript left — becomes `.failed`, as before.
     ///
-    /// `passLanguage` is the language the failed pass ran in. The re-run is
-    /// undone only while the row still carries it, so a newer language
-    /// switch (`prepareForRetranscription` is `language`'s writer) is never
-    /// rolled back by an older pass failing. The prior state is consumed
-    /// either way: the row is settled.
-    mutating func settleFailedPass(passLanguage: String) {
-        if language != passLanguage || !restoreRetranscriptionPriorState() {
+    /// A second Re-transcribe picked while this run was in flight changed
+    /// `language` but queued nothing (`TranscriptionService.enqueue` refuses
+    /// a recording already in flight), so undoing to the earlier transcript
+    /// is right then too. The prior state is consumed either way: the row is
+    /// settled.
+    mutating func settleFailedPass() {
+        if !restoreRetranscriptionPriorState() {
             status = .failed
         }
         retranscriptionPriorState = nil

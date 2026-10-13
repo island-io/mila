@@ -526,7 +526,7 @@ struct RecordingDetailView: View {
                                            isActive: seg.id == activeID,
                                            showSpeaker: hasSpeakers,
                                            useSpeakerColor: hasMultipleSpeakers,
-                                           language: recording.language,
+                                           language: recording.transcriptLanguage,
                                            speakerNames: recording.speakerNames,
                                            allSpeakers: distinctSpeakers,
                                            onTap: {
@@ -558,10 +558,10 @@ struct RecordingDetailView: View {
                                                    target: target,
                                                    sourceName: source.displaySpeakerName(
                                                        names: recording.speakerNames,
-                                                       language: recording.language),
+                                                       language: recording.transcriptLanguage),
                                                    targetName: target.displaySpeakerName(
                                                        names: recording.speakerNames,
-                                                       language: recording.language))
+                                                       language: recording.transcriptLanguage))
                                            })
                                 .background {
                                     // Only the ACTIVE row publishes its frame: one
@@ -597,9 +597,11 @@ struct RecordingDetailView: View {
                         // while the speaker talked Hebrew still has `language`
                         // != "he", which left Hebrew transcripts LEFT-aligned.
                         // SegmentRow uses `.leading`, so layoutDirection mirrors
-                        // it to the right exactly once.
+                        // it to the right exactly once. `transcriptLanguage`,
+                        // not `language`: while a re-run in the other language
+                        // is in flight the text is still the earlier one (#330).
                         .environment(\.layoutDirection,
-                                     (recording.language == "he" || recording.fullText.isPredominantlyHebrew)
+                                     (recording.transcriptLanguage == "he" || recording.fullText.isPredominantlyHebrew)
                                      ? .rightToLeft : .leftToRight)
                     }
                     .contextMenu {

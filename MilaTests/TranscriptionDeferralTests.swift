@@ -471,34 +471,35 @@ final class TranscriptionDeferralTests: XCTestCase {
                      "…and the consumption is persisted")
     }
 
-    /// `settleFailedPass` undoes only a re-run whose earlier transcript is
-    /// still there, never rolls back a newer language switch, and consumes
-    /// the prior state in every case.
+    /// `settleFailedPass` undoes only an in-flight re-run whose earlier
+    /// transcript is still there, and consumes the prior state in every case.
     func test_settling_a_failed_pass_undoes_only_a_rerun_with_a_kept_transcript() {
         let before = Recording.RetranscriptionPriorState(
             status: .completed, language: "en", modelName: "Earlier model", transcriptionDeferredAt: nil)
         var rerun = Recording(title: "t", source: .microphone, audioFileName: "t.wav",
                               status: .running, language: "he", modelName: "Re-run model",
                               fullText: "an earlier transcript", retranscriptionPriorState: before)
+        XCTAssertTrue(rerun.isRetranscriptionInFlight)
+        XCTAssertEqual(rerun.transcriptLanguage, "en", "the text on the row is still the English one")
 
-        var newerSwitch = rerun
-        newerSwitch.language = "ru"
-        newerSwitch.settleFailedPass(passLanguage: "he")
-        XCTAssertEqual(newerSwitch.status, .failed)
-        XCTAssertEqual(newerSwitch.language, "ru", "a newer switch is not the failed run's to undo")
-        XCTAssertEqual(newerSwitch.modelName, "Re-run model")
-        XCTAssertNil(newerSwitch.retranscriptionPriorState)
+        // A stale prior state on a settled row describes nothing.
+        var settled = rerun
+        settled.status = .completed
+        XCTAssertFalse(settled.isRetranscriptionInFlight)
+        XCTAssertEqual(settled.transcriptLanguage, "he")
+        XCTAssertFalse(settled.restoreRetranscriptionPriorState())
+        XCTAssertEqual(settled.language, "he")
 
         var noTranscript = rerun
         noTranscript.fullText = ""
-        noTranscript.settleFailedPass(passLanguage: "he")
+        noTranscript.settleFailedPass()
         XCTAssertEqual(noTranscript.status, .failed)
         XCTAssertEqual(noTranscript.language, "he", "nothing kept for the earlier labels to describe")
         XCTAssertNil(noTranscript.retranscriptionPriorState)
 
         var firstPass = rerun
         firstPass.retranscriptionPriorState = nil
-        firstPass.settleFailedPass(passLanguage: "he")
+        firstPass.settleFailedPass()
         XCTAssertEqual(firstPass.status, .failed)
         XCTAssertEqual(firstPass.language, "he")
 
@@ -507,12 +508,12 @@ final class TranscriptionDeferralTests: XCTestCase {
         let stoppedAt = Date(timeIntervalSince1970: 1_700_000_000)
         stoppedDraft.retranscriptionPriorState = .init(
             status: .failed, language: "en", modelName: nil, transcriptionDeferredAt: stoppedAt)
-        stoppedDraft.settleFailedPass(passLanguage: "he")
+        stoppedDraft.settleFailedPass()
         XCTAssertEqual(stoppedDraft.status, .failed)
         XCTAssertEqual(stoppedDraft.transcriptionDeferredAt, stoppedAt)
         XCTAssertEqual(stoppedDraft.language, "en")
 
-        rerun.settleFailedPass(passLanguage: "he")
+        rerun.settleFailedPass()
         XCTAssertEqual(rerun.status, .completed)
         XCTAssertEqual(rerun.language, "en")
         XCTAssertEqual(rerun.modelName, "Earlier model")

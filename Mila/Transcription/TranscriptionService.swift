@@ -851,7 +851,7 @@ final class TranscriptionService: ObservableObject {
             guard remoteSettings.isConfigured,
                   let config = remoteSettings.currentConfig(for: working.language) else {
                 lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
-                markFailed(working)
+                markFailed(recording)
                 return
             }
             await remoteEngine.configure(config)
@@ -864,7 +864,7 @@ final class TranscriptionService: ObservableObject {
         } else {
             guard let model = modelManager.model(for: working.language) else {
                 lastError = "No model selected."
-                markFailed(working)
+                markFailed(recording)
                 return
             }
             guard modelManager.isInstalled(model) else {
@@ -878,7 +878,7 @@ final class TranscriptionService: ObservableObject {
                     ? "\(model.displayName) was deleted. Download it again in Settings → Models."
                     : "Whisper model is still downloading. Try again once it's ready."
                 serviceLog.log("skipped: model \(model.name, privacy: .public) not installed yet (declined=\(declined, privacy: .public))")
-                markFailed(working)
+                markFailed(recording)
                 return
             }
             localModel = model
@@ -1328,7 +1328,7 @@ final class TranscriptionService: ObservableObject {
             // transcript is still there, with its own status, language and
             // model — and reported through `lastError` below
             // (`Recording.settleFailedPass`).
-            mergePassResult(id: recording.id) { $0.settleFailedPass(passLanguage: working.language) }
+            mergePassResult(id: recording.id) { $0.settleFailedPass() }
             lastError = "Transcription failed: \(error.localizedDescription)"
         }
     }
@@ -1395,7 +1395,7 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func markFailed(_ recording: Recording) {
-        mergePassResult(id: recording.id) { $0.settleFailedPass(passLanguage: recording.language) }
+        mergePassResult(id: recording.id) { $0.settleFailedPass() }
     }
 
     /// Whether the completion hook must force-regenerate the summary. True

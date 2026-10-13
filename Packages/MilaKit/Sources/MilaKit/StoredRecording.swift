@@ -190,9 +190,14 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
 
     /// Whether a re-transcription of a row that already had a transcript is
-    /// in flight — the transcript on disk is still the EARLIER one.
+    /// in flight — the transcript on disk is still the EARLIER one. Same
+    /// definition as the app's `Recording.isRetranscriptionInFlight`: the row
+    /// is pending/running and the prior status is a settled one (all the
+    /// app ever captures).
     public var isRetranscriptionInFlight: Bool {
-        retranscriptionPriorState != nil && (status == "pending" || status == "running")
+        guard let before = retranscriptionPriorState else { return false }
+        return (status == "pending" || status == "running")
+            && (before.status == "completed" || before.status == "failed")
     }
 
     /// The language of the transcript this row currently holds. Normally

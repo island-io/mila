@@ -2138,9 +2138,8 @@ struct MilaApp: App {
                 // A re-run that can't run keeps the earlier transcript, so
                 // the row goes back to describing it; anything else becomes
                 // `.failed`. Consumes `retranscriptionPriorState` either way
-                // (`Recording.settleFailedPass`). The row's language is the
-                // one the interrupted run was set up with.
-                fixed.settleFailedPass(passLanguage: fixed.language)
+                // (`Recording.settleFailedPass`).
+                fixed.settleFailedPass()
                 statusChanged.append(fixed)
                 appLog.log("""
                     reset stale \(recording.status.rawValue, privacy: .public) \
