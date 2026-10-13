@@ -683,7 +683,7 @@ final class RecordingStore: ObservableObject {
         // run, not the transcript, and a row already in flight (the UI never
         // offers Re-transcribe on one) keeps whatever it holds.
         if before.status == .completed || before.status == .failed {
-            recordings[idx].retranscriptionPriorState = Self.hasTranscript(before)
+            recordings[idx].retranscriptionPriorState = before.hasTranscript
                 ? .init(status: before.status,
                         language: before.language,
                         modelName: before.modelName,
@@ -1132,15 +1132,7 @@ final class RecordingStore: ObservableObject {
         guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return }
         let row = recordings[idx]
         guard row.status == .pending || row.status == .running else { return }
-        // The status check is defence against a hand-edited file: the writer
-        // only ever captures a settled state.
-        if let before = row.retranscriptionPriorState, Self.hasTranscript(row),
-           before.status == .completed || before.status == .failed {
-            recordings[idx].status = before.status
-            recordings[idx].language = before.language
-            recordings[idx].modelName = before.modelName
-            recordings[idx].transcriptionDeferredAt = before.transcriptionDeferredAt
-        } else {
+        if !recordings[idx].restoreRetranscriptionPriorState() {
             recordings[idx].status = .failed
             recordings[idx].transcriptionDeferredAt = Date()
         }
@@ -1148,11 +1140,6 @@ final class RecordingStore: ObservableObject {
         // to undo.
         recordings[idx].retranscriptionPriorState = nil
         persist()
-    }
-
-    private static func hasTranscript(_ recording: Recording) -> Bool {
-        !recording.segments.isEmpty
-            || !recording.fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.

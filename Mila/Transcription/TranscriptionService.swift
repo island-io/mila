@@ -1324,8 +1324,9 @@ final class TranscriptionService: ObservableObject {
             // `speakerNames`/`segments`, which it never re-keyed. Merging onto
             // the live row also means a rename/re-file/soft-delete the user
             // made while the pass was failing survives (see `mergePassResult`).
-            // A re-run that failed keeps the earlier transcript, so it gets
-            // that transcript's language and model back
+            // A failed re-run is undone as a stop undoes it — the earlier
+            // transcript is still there, with its own status, language and
+            // model — and reported through `lastError` below
             // (`Recording.settleFailedPass`).
             mergePassResult(id: recording.id) { $0.settleFailedPass(passLanguage: working.language) }
             lastError = "Transcription failed: \(error.localizedDescription)"

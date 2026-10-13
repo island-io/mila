@@ -272,14 +272,21 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         // A stale prior state on a settled row (a crash between writes) must
         // not override the row's own language.
         settled.retranscriptionPriorState = .init(status: "completed", language: "en")
-        try seedStore([rerun, settled])
+        // A re-run of a stopped partial draft: the kept text is not finished.
+        var draftRerun = meeting("Draft", daysAgo: 2)
+        draftRerun.status = "pending"
+        draftRerun.retranscriptionPriorState = .init(status: "failed", language: "en")
+        try seedStore([rerun, settled, draftRerun])
 
         let inFlight = try call("get_transcript", ["id": rerun.id.uuidString])
         XCTAssertEqual(inFlight["language"] as? String, "en")
         XCTAssertEqual(inFlight["transcript"] as? String,
                        "SPEAKER_00: shalom everyone\nSPEAKER_01: let's begin")
-        XCTAssertTrue((inFlight["note"] as? String ?? "").contains("re-transcription"),
-                      String(describing: inFlight["note"]))
+        let note = inFlight["note"] as? String ?? ""
+        XCTAssertTrue(note.contains("re-transcription") && note.contains("finished"), note)
+
+        let draftNote = try call("get_transcript", ["id": draftRerun.id.uuidString])["note"] as? String ?? ""
+        XCTAssertTrue(draftNote.contains("may be partial") && !draftNote.contains("finished"), draftNote)
 
         XCTAssertEqual(try call("get_transcript", ["id": settled.id.uuidString])["language"] as? String,
                        "he")

@@ -169,10 +169,11 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `prepareForRetranscription` again — and a Stop after that must still
     /// know the transcript is English. In memory it didn't (island-io/mila#320).
     ///
-    /// Non-nil only while the row is `.pending`/`.running` — a stop or a
-    /// finished pass clears it. A stale value, should one survive (a crash
-    /// between the status write and the clear), is harmless: nothing but a
-    /// stop reads it, and a stop needs a `.pending`/`.running` row, which
+    /// Non-nil only while the row is `.pending`/`.running` — a stop, a
+    /// failure or a finished pass clears it. A stale value, should one
+    /// survive (a crash between the status write and the clear), is
+    /// harmless: only a stop or a failed pass reads it, and both need a
+    /// `.pending`/`.running` row, which
     /// only `prepareForRetranscription` (which overwrites it) or the launch
     /// sweep (for which it is exactly right) produces.
     struct RetranscriptionPriorState: Codable, Hashable {
@@ -188,32 +189,52 @@ struct Recording: Identifiable, Codable, Hashable {
     /// row as it always did. Mirrored in MilaKit's `StoredRecording`.
     var retranscriptionPriorState: RetranscriptionPriorState?
 
-    /// Settle a pass that FAILED (rather than being stopped) as `.failed`,
-    /// and — when it was a re-run that left the earlier transcript in
-    /// place — put back the language and model that describe that
-    /// transcript. Without this a failed "Re-transcribe in Hebrew" leaves the
-    /// English text labelled Hebrew: rendered right-to-left, reported as
-    /// Hebrew over MCP, and "Re-transcribe (current)" offers the language
-    /// that just failed (island-io/mila#330).
-    ///
-    /// Unlike a stop (`RecordingStore.markTranscriptionDeferred`), the status
-    /// is NOT restored: the run genuinely failed, and `.failed` (with no
-    /// `transcriptionDeferredAt`) is how the list and detail view say so.
-    /// The transcript itself is untouched — a failed pass produced none.
-    ///
-    /// `passLanguage` is the language the failed pass ran in. The labels go
-    /// back only while the row still carries it, so a newer language switch
-    /// (`prepareForRetranscription` is `language`'s writer) is never rolled
-    /// back by an older pass failing. The prior state is cleared by
-    /// `TranscriptionService.mergePassResult`, as for every settled row.
-    mutating func settleFailedPass(passLanguage: String) {
-        status = .failed
-        guard let before = retranscriptionPriorState, language == passLanguage,
-              !segments.isEmpty
-                || !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        else { return }
+    /// Whether the row holds any transcript text — what a re-run leaves in
+    /// place until it completes.
+    var hasTranscript: Bool {
+        !segments.isEmpty || !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Undo a re-transcription that never produced a transcript: put back
+    /// the status, language, model and stopped marker that describe the
+    /// transcript still on the row (`retranscriptionPriorState`). Returns
+    /// false — changing nothing — when there is nothing to restore: no prior
+    /// state, no transcript left for it to describe, or a prior status that
+    /// isn't a settled one (the writer only captures settled states; the
+    /// check is defence against a hand-edited file). Does not clear the
+    /// prior state; callers settle the row and clear it.
+    @discardableResult
+    mutating func restoreRetranscriptionPriorState() -> Bool {
+        guard let before = retranscriptionPriorState, hasTranscript,
+              before.status == .completed || before.status == .failed else { return false }
+        status = before.status
         language = before.language
         modelName = before.modelName
+        transcriptionDeferredAt = before.transcriptionDeferredAt
+        return true
+    }
+
+    /// Settle a pass that FAILED (rather than being stopped). A re-run that
+    /// left the earlier transcript in place is undone exactly as a stop
+    /// undoes it (`restoreRetranscriptionPriorState`), so a failed
+    /// "Re-transcribe in Hebrew" leaves the English transcript English,
+    /// `.completed` and made by the earlier model — not labelled Hebrew,
+    /// rendered right-to-left, reported as Hebrew over MCP, and demoted to
+    /// `.failed`, which would switch off everything keyed on `.completed`
+    /// (island-io/mila#330). The failure itself is reported by the caller's
+    /// `lastError` alert. Anything else — a first transcription, or a row
+    /// with no transcript left — becomes `.failed`, as before.
+    ///
+    /// `passLanguage` is the language the failed pass ran in. The re-run is
+    /// undone only while the row still carries it, so a newer language
+    /// switch (`prepareForRetranscription` is `language`'s writer) is never
+    /// rolled back by an older pass failing. The prior state is consumed
+    /// either way: the row is settled.
+    mutating func settleFailedPass(passLanguage: String) {
+        if language != passLanguage || !restoreRetranscriptionPriorState() {
+            status = .failed
+        }
+        retranscriptionPriorState = nil
     }
 
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the

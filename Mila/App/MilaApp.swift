@@ -2135,19 +2135,18 @@ struct MilaApp: App {
                     """)
                 toEnqueue.append(fixed)
             case .markFailed:
-                // A failed re-run keeps the earlier transcript, so it gets
-                // that transcript's language and model back
-                // (`Recording.settleFailedPass`).
+                // A re-run that can't run keeps the earlier transcript, so
+                // the row goes back to describing it; anything else becomes
+                // `.failed`. Consumes `retranscriptionPriorState` either way
+                // (`Recording.settleFailedPass`). The row's language is the
+                // one the interrupted run was set up with.
                 fixed.settleFailedPass(passLanguage: fixed.language)
-                // Settled, so there is no re-run left for a stop to undo
-                // (`Recording.retranscriptionPriorState` is only meaningful
-                // on a `.pending`/`.running` row).
-                fixed.retranscriptionPriorState = nil
                 statusChanged.append(fixed)
                 appLog.log("""
                     reset stale \(recording.status.rawValue, privacy: .public) \
                     recording \(recording.id, privacy: .public) \
-                    (\(recording.audioFileName, privacy: .private)) to .failed (WAV missing)
+                    (\(recording.audioFileName, privacy: .private)) to \
+                    .\(fixed.status.rawValue, privacy: .public) (WAV missing)
                     """)
             case .leaveAlone:
                 break  // unreachable given the `where` filter above

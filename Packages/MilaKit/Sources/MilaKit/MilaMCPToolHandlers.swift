@@ -345,7 +345,12 @@ public struct MilaMCPToolHandlers: Sendable {
             // but nothing failed: the user chose to transcribe it later.
             notes.append("The user stopped this recording's transcription in Mila to run it later, so it hasn't been fully transcribed — any text here is only a partial live draft.")
         } else if recording.isRetranscriptionInFlight {
-            notes.append("A re-transcription of this recording is in progress; this is the earlier, finished transcript, which it will replace when it completes.")
+            // The earlier transcript is finished only if it was `completed`:
+            // it can also be a stopped or failed partial draft.
+            let earlier = recording.retranscriptionPriorState?.status == "completed"
+                ? "the earlier, finished transcript"
+                : "the earlier transcript, which may be partial"
+            notes.append("A re-transcription of this recording is in progress; this is \(earlier), which it will replace when it completes.")
         } else if recording.status != "completed" {
             notes.append("Transcription status is \"\(recording.status)\" — the transcript may be partial.")
         }
