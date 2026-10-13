@@ -368,10 +368,7 @@ final class LLMRunnerTests: XCTestCase {
             sleep 60
             """)
         defer {
-            if let pidText = try? String(contentsOf: pidFile, encoding: .utf8),
-               let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                kill(pid, SIGKILL)
-            }
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
             try? FileManager.default.removeItem(at: pidFile)
             try? FileManager.default.removeItem(at: script)
         }
@@ -475,6 +472,84 @@ final class LLMRunnerTests: XCTestCase {
         }
         let dead = await Self.waitForExit(of: pid)
         XCTAssertTrue(dead, "a cancelled CLI's helper must be killed with it, not left running")
+    }
+
+    /// A helper that IGNORES SIGTERM is SIGKILLed by the sweep once the CLI
+    /// is gone: the group SIGTERM alone would leave it running.
+    func test_cancel_kills_a_helper_that_ignores_sigterm() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-stubborn-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sh -c "trap '' TERM; while :; do sleep 0.2; done" >/dev/null 2>&1 &
+            echo $! > "\(pidFile.path)"
+            sleep 60
+            """)
+        defer {
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude, prompt: "x", transcript: "y",
+                                    executablePathOverride: script.path, timeout: 120)
+        }
+        let pid = try await Self.awaitPID(pidFile)
+        // Let the helper's trap be installed before the cancel.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        task.cancel()
+        _ = await task.result
+        let dead = await Self.waitForExit(of: pid)
+        XCTAssertTrue(dead, "a helper that ignores SIGTERM must still be killed by the sweep")
+    }
+
+    /// A cancel that arrives after the CLI exited normally, while a helper
+    /// still holds the pipes, kills the helper and returns promptly. The
+    /// CLI is gone, so the cancel's own SIGTERM targets nothing; the run
+    /// used to sit out the whole 30s drain and leave the helper running.
+    func test_cancel_during_the_drain_after_a_normal_exit_kills_the_helper() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-drain-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 60 &
+            echo $! > "\(pidFile.path)"
+            echo done
+            """)
+        defer {
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude, prompt: "x", transcript: "y",
+                                    executablePathOverride: script.path, timeout: 120)
+        }
+        let pid = try await Self.awaitPID(pidFile)
+        // The script exits right after writing the pid; the helper (holding
+        // stdout) keeps the run in its drain.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        let cancelledAt = Date()
+        task.cancel()
+        let result = await task.result
+        let elapsed = Date().timeIntervalSince(cancelledAt)
+        if case .success(let out) = result {
+            XCTFail("Expected .cancelled, got output: \(out)")
+        }
+        XCTAssertLessThan(elapsed, 20, "a cancel during the drain must not sit out the 30s bound; took \(elapsed)s")
+        let dead = await Self.waitForExit(of: pid)
+        XCTAssertTrue(dead, "the helper holding the pipes must be killed by the cancel")
+    }
+
+    /// Wait (bounded) for a test script to park its helper's pid in `url`.
+    private static func awaitPID(_ url: URL) async throws -> pid_t {
+        for _ in 0..<400 {
+            if let pid = readPID(url) { return pid }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return try XCTUnwrap(readPID(url), "the script never started its helper")
     }
 
     /// The pid a test script parked in `url`, once it has been written.

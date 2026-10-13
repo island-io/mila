@@ -1546,26 +1546,9 @@ enum LLMRunner {
             }
             // Sweep the group once the CLI is gone. A helper it spawned got
             // the SIGTERM too but may ignore it, and the CLI exiting inside
-            // the grace (or being SIGKILLed above) does nothing to it. The
-            // helpers get a grace of their own first (a CLI that exits at
-            // once on SIGTERM would otherwise cut theirs to nothing), polled
-            // with signal 0 and BOUNDED like every other wait here; only a
-            // group that is still populated after it is SIGKILLed.
-            //
-            // Safe after the CLI has been reaped: the kernel does not hand
-            // out a pid that is still in use as a process group id, so while
-            // any helper is left this id names only that group, and once
-            // none is left the calls fail with ESRCH — unless the pid has
-            // been recycled by a new group leader within this second, which
-            // would take a full wrap of the pid space.
+            // the grace (or being SIGKILLed above) does nothing to it.
             if let childGroup {
-                let helpersDeadline = Date().addingTimeInterval(1)
-                while killpg(childGroup, 0) == 0, Date() < helpersDeadline {
-                    usleep(50_000)
-                }
-                if killpg(childGroup, 0) == 0 {
-                    killpg(childGroup, SIGKILL)
-                }
+                terminateHelpers(of: childGroup)
             }
         }
         // Drain the pipe readers once the process is known to be gone.
@@ -1600,7 +1583,27 @@ enum LLMRunner {
             // 30s clears any realistic dispatch latency while still
             // returning the (fully buffered by then) output if a
             // pipe-holding helper never lets EOF arrive.
-            if group.wait(timeout: .now() + 30) == .timedOut {
+            //
+            // Waited in short slices so a cancel arriving NOW still reaches
+            // the helpers holding the pipes. The CLI has exited, so the
+            // cancel's own SIGTERM (`ProcessHandle.terminate`) only targets a
+            // running CLI and does nothing here; without this a cancelled
+            // run (a deleted recording's summary) sat out the whole 30s and
+            // left the helper running.
+            let drainDeadline = DispatchTime.now() + 30
+            var drainResult = DispatchTimeoutResult.timedOut
+            while DispatchTime.now() < drainDeadline {
+                drainResult = group.wait(timeout: min(.now() + .milliseconds(250), drainDeadline))
+                if drainResult == .success { break }
+                if handle.wasTerminated, let childGroup {
+                    terminateHelpers(of: childGroup)
+                    // Cancelled: the output is discarded, so the kill
+                    // path's short bound applies from here.
+                    drainResult = group.wait(timeout: .now() + 3)
+                    break
+                }
+            }
+            if drainResult == .timedOut {
                 // `error`: unlike the kill path, this output IS returned to
                 // the caller and may be truncated mid-stream — a silently
                 // short summary is exactly the kind of thing that needs a
@@ -1646,6 +1649,30 @@ enum LLMRunner {
         return group
     }
 
+    /// SIGTERM whatever is left in the CLI's process group once the CLI
+    /// itself is gone, give it a grace of its own, then SIGKILL a group that
+    /// is still populated. The grace is polled with signal 0 and BOUNDED (1
+    /// s) like every other wait here; without it a CLI that exits at once
+    /// on SIGTERM would cut its helpers' shutdown to nothing.
+    ///
+    /// Safe after the CLI has been reaped: the kernel does not hand out a
+    /// pid that is still in use as a process group id, so while any helper
+    /// is left this id names only that group, and once none is left the
+    /// calls fail with ESRCH, unless the pid has been recycled by a new
+    /// group leader within this second, which would take a full wrap of the
+    /// pid space. Runs on `executeProcess`'s dedicated thread, so the short
+    /// sleeps block nothing shared.
+    static func terminateHelpers(of group: pid_t) {
+        guard killpg(group, SIGTERM) == 0 else { return }  // nobody left
+        let deadline = Date().addingTimeInterval(1)
+        while killpg(group, 0) == 0, Date() < deadline {
+            usleep(50_000)
+        }
+        if killpg(group, 0) == 0 {
+            killpg(group, SIGKILL)
+        }
+    }
+
     /// Send `signal` to the CLI's whole process group when it leads one
     /// (`processGroup(ledBy:)`), otherwise to the CLI alone, and only while
     /// the CLI is still running: once Foundation has reaped it, its pid (and
@@ -1653,7 +1680,7 @@ enum LLMRunner {
     /// unrelated process, and `Process.terminate()` on a finished process,
     /// which this replaces, was a no-op. A cancel can arrive in that window
     /// (after the reap, before `run` returns). The deliberate post-reap
-    /// group sweep in `executeProcess` is the one exception, and says why.
+    /// sweep, `terminateHelpers(of:)`, is the one exception, and says why.
     static func sendSignal(_ signal: Int32, to process: Process, group: pid_t?) {
         guard process.isRunning else { return }
         if let group {

@@ -1244,9 +1244,9 @@ final class RecordingSummarizer: ObservableObject {
     }
 
     /// The freshest copy of a recording from the store, or `fallback` when
-    /// it's no longer there. Used by the SYNCHRONOUS skip paths, where the
-    /// caller handed us the recording a moment ago and the fallback is the
-    /// same object it already holds.
+    /// it's no longer there. Used to GATE a request on the live row; never
+    /// to signal with, since the fallback can describe a row that has been
+    /// deleted (see `signalSkipped`).
     private func latestRecording(_ id: UUID, fallback: Recording) -> Recording {
         store.recordings.first(where: { $0.id == id }) ?? fallback
     }
