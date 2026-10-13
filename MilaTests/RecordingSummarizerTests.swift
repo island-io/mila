@@ -1545,9 +1545,12 @@ final class RecordingSummarizerTests: XCTestCase {
         llm.tool = .claude
         let gate = TestGate()
         var calls = 0
+        var returned = false
         useStubRunner { _, _, _, _, _, _, _, _, _, _, _ in
             calls += 1
             if calls == 1 { await gate.wait() }
+            // The completion runs in the same main-actor job as this return.
+            returned = true
             return "SUMMARY"
         }
         var finished = 0
@@ -1556,11 +1559,21 @@ final class RecordingSummarizerTests: XCTestCase {
         let rec = try addRecording(named: "Doomed", text: "a transcript")
         summarizer.summarizeIfNeeded(rec)
         summarizer.regenerate(rec)
+        // The call must be out before the delete. A permanent delete now
+        // cancels the run (#334) and drops it from `inFlight` at once, so
+        // `awaitInFlight` cannot be what waits for it: wait for the stub's
+        // own return instead (the gate ignores the cancel, standing in for
+        // a call that comes back anyway).
+        await waitUntil { calls == 1 }
         store.permanentlyDelete(rec)
+        XCTAssertFalse(summarizer.isSummarizing(rec.id), "the delete cancels the run")
 
         gate.open()
+        await waitUntil { returned }
+        await Task.yield()
         await summarizer.awaitInFlight(rec.id)
 
+        XCTAssertTrue(returned)
         XCTAssertEqual(calls, 1, "no follow-up for a deleted recording")
         XCTAssertEqual(finished, 0, "nothing to export for a deleted recording")
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
