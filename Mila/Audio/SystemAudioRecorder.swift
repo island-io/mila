@@ -270,9 +270,14 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         // it's idle until startCapture below.
         sampleQueue.sync { audioOutput.resetConverter() }
         // Last point a start abandoned during the shareable-content wait can
-        // stop without capture opening (#328). The stream was never started,
-        // so releasing it is the whole teardown.
-        try cancellation?.throwIfCancelled()
+        // stop without capture opening (#328). The stream was never started;
+        // detach the long-lived `audioOutput` from it and let it go.
+        if cancellation?.isCancelled == true {
+            try? stream.removeStreamOutput(audioOutput, type: .audio)
+            try? stream.removeStreamOutput(audioOutput, type: .screen)
+            sysLog.log("system-audio bring-up cancelled before startCapture — capture never opened")
+            throw CaptureStartCancellation.Cancelled()
+        }
         try await stream.startCapture()
         // Adopt only if this is still the session that asked. Assigning
         // `self.stream` unconditionally would drop a newer session's stream on

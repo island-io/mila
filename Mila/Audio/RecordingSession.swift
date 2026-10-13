@@ -197,12 +197,19 @@ final class RecordingSession: ObservableObject {
             // here (Screen Recording permission denied) is fully described by
             // the source + domain + code, which stay public. (Issue #213.)
             let ns = error as NSError
-            recLog.error("""
-                start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
-                — tearing down partial session \
-                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
-                \(error.localizedDescription, privacy: .private)
-                """)
+            if error is CaptureStartCancellation.Cancelled {
+                // Deliberate (sleep / lock during Starting…, #328), not a
+                // bring-up failure — keep it out of the error-level lines a
+                // diagnostic report is triaged by.
+                recLog.log("start(\(source.rawValue, privacy: .public)) cancelled before capture opened — tearing down partial session")
+            } else {
+                recLog.error("""
+                    start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
+                    — tearing down partial session \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                    \(error.localizedDescription, privacy: .private)
+                    """)
+            }
             micTask?.cancel(); micTask = nil
             systemTask?.cancel(); systemTask = nil
             await mic.stop()

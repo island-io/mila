@@ -826,6 +826,10 @@ final class MicrophoneRecorder: ObservableObject {
                 micLog.error("input format reports \(nativeFormat.sampleRate, privacy: .public)Hz \(nativeFormat.channelCount, privacy: .public)ch — no usable input device; throwing noInputDevice")
                 throw MicrophoneError.noInputDevice
             }
+            // Binding the device and reading its format can wait on
+            // Bluetooth too; skip the tap and prepare for a start abandoned
+            // meanwhile.
+            try cancellation?.throwIfCancelled()
             // One converter for the whole session: resampling is stateful,
             // and a fresh converter per tap buffer put a small discontinuity
             // at every ~85ms boundary (see StreamingWhisperConverter). Tap
@@ -883,10 +887,11 @@ final class MicrophoneRecorder: ObservableObject {
             engine.prepare()
             // The last moment a cancelled start can be stopped without the
             // microphone — and macOS's orange indicator — coming on (#328).
-            // Nothing has started yet, so dropping the tap is all the
-            // teardown this engine needs.
+            // Nothing has started yet; drop the tap and release what
+            // `prepare()` allocated, as every other teardown here does.
             if cancellation?.isCancelled == true {
                 input.removeTap(onBus: 0)
+                engine.stop()
                 micLog.log("mic bring-up cancelled before the engine started — capture never opened")
                 throw CaptureStartCancellation.Cancelled()
             }

@@ -337,6 +337,37 @@ final class RecordStartingStateTests: XCTestCase {
                       "expected the abandonment message, got \(String(describing: service.lastError))")
     }
 
+    /// The more common meeting-mode timing: the microphone is already up and
+    /// the lock arrives while system audio is still being brought up. The
+    /// system leg must stop short of starting its stream, and the microphone
+    /// that did come up must be taken down by the partial-bring-up teardown.
+    func test_a_meeting_start_abandoned_during_the_system_leg_never_opens_it() async throws {
+        session.mic.bringUpOverride = { }
+        let gate = BringUpGate()
+        session.system.bringUpOverride = { await gate.wait() }
+        var systemRunningValues: [Bool] = []
+        let systemRunning = session.system.$isRunning.sink { systemRunningValues.append($0) }
+        defer { systemRunning.cancel() }
+
+        let start = Task { await controller.toggleRecord(withSystemAudio: true) }
+        let micUp = await waitUntil { self.session.mic.isRunning }
+        XCTAssertTrue(micUp, "the mic leg comes up first, then the system leg waits on the gate")
+        XCTAssertEqual(controller.activeJob, .starting(.meeting))
+
+        controller.abandonStartingRecording(reason: .screenLock)
+        await gate.open()
+        await start.value
+
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertEqual(session.mic.captureStartCount, 1)
+        XCTAssertFalse(session.mic.isRunning, "the mic that came up must be taken down again")
+        XCTAssertFalse(systemRunningValues.contains(true),
+                       "the system-audio stream must never have started, saw \(systemRunningValues)")
+        XCTAssertTrue(service.lastError?.contains("did not start") ?? false,
+                      "expected the abandonment message, got \(String(describing: service.lastError))")
+    }
+
     /// Sleep can arrive while the microphone permission prompt is still up —
     /// before the bring-up has even begun. The start must stop there rather
     /// than go on to bring capture up.

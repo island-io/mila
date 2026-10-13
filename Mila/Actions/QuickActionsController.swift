@@ -1749,10 +1749,11 @@ final class QuickActionsController: ObservableObject {
     /// turning the microphone on (#328). Either way the start path honours
     /// the request at the first point it regains control
     /// (`abandonStartIfRequested`): it tears down whatever came up and exits
-    /// through its `defer`, which releases the job. Until then `activeJob` stays `.starting` — releasing it
-    /// earlier would let a new start run a second bring-up on the same
-    /// recorder, the exact hazard `.starting` exists to prevent (#293). The
-    /// wait is bounded by `bringUpTimeout` once the machine is awake.
+    /// through its `defer`, which releases the job. Until then `activeJob`
+    /// stays `.starting` — releasing it earlier would let a new start run a
+    /// second bring-up on the same recorder, the exact hazard `.starting`
+    /// exists to prevent (#293). The wait is bounded by `bringUpTimeout` once
+    /// the machine is awake.
     func abandonStartingRecording(reason: StartAbandonReason) {
         guard case .starting = activeJob else { return }
         quickActionsLog.log("record start will be abandoned (\(String(describing: reason), privacy: .public)) — capture is still being set up")
