@@ -1513,8 +1513,16 @@ enum LLMRunner {
             // SIGTERM first; if the CLI ignores it, hard-kill after a short
             // grace period so we don't read half-drained pipes or remove the
             // sandbox out from under a still-running child.
-            if exited.wait(timeout: .now() + 1) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
+            //
+            // `isRunning` as well as the wait: `exited` is also signalled by
+            // a cancel's wake, so a cancel arriving during a timeout's grace
+            // would satisfy the wait with the child still alive. And it
+            // guards the bare-pid `kill`: once Foundation has reaped the
+            // child its pid can be reused, and `isRunning` is false by then.
+            if exited.wait(timeout: .now() + 1) == .timedOut || process.isRunning {
+                if process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                }
                 // BOUNDED: `waitUntilExit` has been observed never returning
                 // even after a SIGKILL (macOS 26, sampled live — likely a
                 // reaping race inside NSTask). The child is dead-or-dying
@@ -1572,16 +1580,22 @@ enum LLMRunner {
 
         let stdout = String(data: outBox.withLock { $0 }, encoding: .utf8) ?? ""
         let stderr = String(data: errBox.withLock { $0 }, encoding: .utf8) ?? ""
+        let cancelled = handle.wasTerminated
 
         return ProcessOutcome(stdout: stdout,
                               stderr: stderr,
-                              // After a timeout the process was terminated, so
-                              // its status is meaningless — report the standard
-                              // SIGTERM-ish code so callers don't treat it as a
-                              // clean exit.
-                              exitCode: timedOut ? -1 : process.terminationStatus,
+                              // After a timeout or a cancel the process was
+                              // terminated, so its status is meaningless —
+                              // report the standard SIGTERM-ish code so callers
+                              // don't treat it as a clean exit. It must not be
+                              // READ either: on the killed path the bounded
+                              // reap can give up with the child unreaped (the
+                              // macOS 26 race above), and `terminationStatus`
+                              // raises on a process Foundation still thinks
+                              // is running.
+                              exitCode: (timedOut || cancelled) ? -1 : process.terminationStatus,
                               timedOut: timedOut,
-                              cancelled: handle.wasTerminated)
+                              cancelled: cancelled)
     }
 
     /// The ONE working directory every LLM CLI invocation is chdir'd into.

@@ -174,6 +174,17 @@ final class RecordingSummarizer: ObservableObject {
     /// once.
     private var backfillQueue: [UUID] = []
 
+    /// Runs `cancel(recordingID:)` has removed from `inFlight` whose tasks
+    /// have not unwound yet. Their child is still being killed (SIGTERM,
+    /// grace, SIGKILL, bounded reap), so `pumpBackfill` counts them against
+    /// `maxConcurrent`: otherwise another run's completion could start new
+    /// CLIs while the cancelled one is still alive. Incremented by `cancel`,
+    /// decremented by the cancelled task's `defer` — the only two places a
+    /// run leaves `inFlight` are that `defer` (for a run that still owns
+    /// its id) and `cancel`, so a `defer` that finds it no longer owns the
+    /// id is exactly a cancelled run.
+    private var cancelledUnwinding = 0
+
     /// Max concurrent in-flight CLI invocations the summarizer will
     /// schedule from backfill / regeneration. Starts at 2 — high enough
     /// that two recordings get summarized at app launch in parallel but
@@ -462,16 +473,18 @@ final class RecordingSummarizer: ObservableObject {
     ///
     /// NOT called when a recording is moved to Recently Deleted. That is
     /// reversible, and nothing re-queues a restored recording's summary
-    /// until the next launch's backfill, so cancelling would leave a
-    /// restored row without one; letting the call finish costs only the
-    /// call the recording was already owed. A trashed row that has not
-    /// started yet is skipped by `pumpBackfill`, and emptying the bin
-    /// cancels whatever is still running.
+    /// until the next launch's backfill, so cancelling (or dropping it from
+    /// the queue) would leave a restored row without one; letting the call
+    /// happen costs only the call the recording was already owed. Emptying
+    /// the bin cancels whatever is still running or queued.
     func cancel(recordingID: UUID) {
         backfillQueue.removeAll { $0 == recordingID }
         if let run = inFlight.removeValue(forKey: recordingID) {
             run.task.cancel()
             inFlightIDs.remove(recordingID)
+            // Still holds its slot until its task unwinds (see
+            // `cancelledUnwinding`); the task's `defer` gives it back.
+            cancelledUnwinding += 1
         }
     }
 
@@ -481,18 +494,15 @@ final class RecordingSummarizer: ObservableObject {
     /// each task's `defer` so as soon as one finishes the next one can
     /// start.
     private func pumpBackfill() {
-        while inFlight.count < maxConcurrent, !backfillQueue.isEmpty {
+        while inFlight.count + cancelledUnwinding < maxConcurrent, !backfillQueue.isEmpty {
             let id = backfillQueue.removeFirst()
             guard let rec = store.recordings.first(where: { $0.id == id }) else {
                 continue
             }
             // Re-check the gate — the recording may have been trashed,
             // re-transcribed, or summarized via another code path
-            // between scan time and now. The trash check is spelled out
-            // because `shouldSummarize` does not look at `isTrashed`: the
-            // scan excludes trashed rows, and a row trashed while queued
-            // must not start a call either.
-            guard !rec.isTrashed, shouldSummarize(rec) else { continue }
+            // between scan time and now.
+            guard shouldSummarize(rec) else { continue }
             runSummary(for: rec, force: false)
         }
     }
@@ -587,6 +597,10 @@ final class RecordingSummarizer: ObservableObject {
                                 self.summarizeIfNeeded(live)
                             }
                         }
+                    } else {
+                        // Cancelled: this run's slot was held for it in
+                        // `cancelledUnwinding` until now.
+                        self.cancelledUnwinding -= 1
                     }
                     // After each completion, try to pull the next
                     // queued backfill candidate in.

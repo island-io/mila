@@ -1870,32 +1870,62 @@ final class RecordingSummarizerTests: XCTestCase {
                        "SUMMARY of queued transcript")
     }
 
-    /// A backfill candidate moved to Recently Deleted while it waited in the
-    /// queue does not start a call when its turn comes: the scan skips
-    /// trashed rows, and the pump has to agree with it.
-    func test_a_queued_recording_trashed_before_its_turn_is_skipped() async throws {
+    /// A cancelled run keeps its slot until its call has actually unwound —
+    /// in production, until `LLMRunner` has killed and reaped the child.
+    /// `cancel` drops the run from `inFlight` at once, so without that
+    /// accounting another run's completion would start new CLIs while the
+    /// cancelled one was still alive, briefly running more than
+    /// `maxConcurrent`. The stub for "a" ignores the cancel until its gate
+    /// opens, standing in for a child that takes a while to die.
+    func test_a_cancelled_run_holds_its_slot_until_it_unwinds() async throws {
         llm.tool = .claude
+        let gateA = TestGate(), gateB = TestGate(), gateC = TestGate()
         var started: [String] = []
-        useParkingRunner { started.append($0); return started.count }
-        summarizer.maxConcurrent = 1
+        useStubRunner { _, _, transcript, _, _, _, _, _, _, _, _ in
+            started.append(transcript)
+            switch transcript {
+            case "a": await gateA.wait(); throw CancellationError()
+            case "b": await gateB.wait()
+            case "c": await gateC.wait()
+            default: break
+            }
+            return "SUMMARY of \(transcript)"
+        }
+        summarizer.maxConcurrent = 2
 
-        // Queue order (newest first): running, trashed, last.
-        var last = try addRecording(named: "Last", text: "last transcript")
-        last.status = .completed
-        store.update(last)
-        let (running, trashed) = try addQueuedPair()
+        // `add` inserts at the front and the scan is newest-first, so the
+        // queue order is a, b, c, d.
+        var rows: [String: Recording] = [:]
+        for name in ["d", "c", "b", "a"] {
+            var rec = try addRecording(named: name, text: name)
+            rec.status = .completed
+            store.update(rec)
+            rows[name] = rec
+        }
         summarizer.backfillIfNeeded()
-        await waitUntil { started.count == 1 }
-        XCTAssertEqual(started, ["running transcript"])
-
-        store.softDelete(trashed)
-        store.permanentlyDelete(running)
-
         await waitUntil { started.count == 2 }
-        XCTAssertEqual(started, ["running transcript", "last transcript"],
-                       "the trashed candidate must be skipped, not summarized")
-        await summarizer.awaitInFlight(last.id)
-        XCTAssertNil(store.recordings.first { $0.id == trashed.id }?.summary)
+        XCTAssertEqual(started, ["a", "b"])
+
+        store.permanentlyDelete(try XCTUnwrap(rows["a"]))
+        gateB.open()
+        await waitUntil { started.count == 3 }
+        XCTAssertEqual(started, ["a", "b", "c"],
+                       "b's slot goes to c")
+        // b has finished and c is running; a is still unwinding, so it
+        // still counts and d must wait. (Give a wrongly started d time to
+        // show up before asserting it did not.)
+        await waitUntil { started.count == 4 }
+        XCTAssertEqual(started, ["a", "b", "c"],
+                       "a cancelled run that has not unwound must still hold its slot")
+
+        gateA.open()
+        await waitUntil { started.count == 4 }
+        XCTAssertEqual(started, ["a", "b", "c", "d"],
+                       "the slot is handed on once the cancelled run unwinds")
+        gateC.open()
+        await summarizer.awaitInFlight(try XCTUnwrap(rows["c"]).id)
+        await summarizer.awaitInFlight(try XCTUnwrap(rows["d"]).id)
+        XCTAssertEqual(store.recordings.first { $0.id == rows["d"]?.id }?.summary, "SUMMARY of d")
     }
 
     /// The other half of #318: when the row's FIRST summary finishes while a
