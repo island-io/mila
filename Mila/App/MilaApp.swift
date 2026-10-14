@@ -387,6 +387,24 @@ struct MilaApp: App {
     /// read, nothing written — until the setting above is turned on.
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
+    /// UI-test seam for the auto-save preference (issue #288). The end-to-end
+    /// check must persist the preference across a relaunch without touching
+    /// the user's real defaults, so `--ui-test-auto-save-suite=<UUID>` returns
+    /// a `UserDefaults` for a TEST-OWNED suite built from a fixed prefix plus
+    /// the validated UUID. The fixed prefix keeps the suite inside the test
+    /// namespace and the UUID validation stops an arbitrary string being used
+    /// as a suite name; the test process removes exactly this suite in
+    /// teardown. `nil` means normal production behaviour.
+    static func autoSaveUITestDefaults(arguments: [String] = CommandLine.arguments) -> UserDefaults? {
+        guard let arg = arguments.first(where: {
+            $0.hasPrefix("--ui-test-auto-save-suite=")
+        }) else { return nil }
+        let raw = String(arg.dropFirst("--ui-test-auto-save-suite=".count))
+        guard let id = UUID(uuidString: raw) else { return nil }
+        // A valid test flag must never fall back to personal defaults.
+        return UserDefaults(suiteName: "Mila.AutoSaveUITests.\(id.uuidString)")!
+    }
+
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
@@ -394,7 +412,12 @@ struct MilaApp: App {
         // resolution; we apply any user override by calling
         // `relocateRecordings(to:)` once both are constructed.
         let store = RecordingStore()
-        let storage = RecordingStorageSettings()
+        // The auto-save end-to-end check needs its preference to persist
+        // across a relaunch without ever touching the user's real defaults.
+        // `--ui-test-auto-save-suite=<UUID>` redirects just this object at a
+        // test-owned suite; anything malformed — or the flag absent — keeps
+        // normal production behaviour (`.standard`).
+        let storage = RecordingStorageSettings(defaults: Self.autoSaveUITestDefaults() ?? .standard)
         if let custom = storage.customDirectory {
             store.relocateRecordings(to: custom)
         }
