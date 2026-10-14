@@ -478,7 +478,7 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
                 of type: SCStreamOutputType) {
         guard type == .audio,
               CMSampleBufferIsValid(sampleBuffer),
-              let buffer = sampleBuffer.toPCMBuffer() else { return }
+              let buffer = SystemAudioPCM.buffer(from: sampleBuffer) else { return }
         deliver(buffer)
     }
 
@@ -491,8 +491,10 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
             }
             let converted = try converter?.convert(buffer)
                 ?? AudioConvert.toWhisperFormat(buffer)
-            continuation?.yield(converted)
+            // Finish all producer-side access before handing this mutable
+            // AVAudioPCMBuffer to the asynchronous recording consumer.
             let level = AudioMeter.level(from: converted)
+            continuation?.yield(converted)
             Task { @MainActor [weak parent] in
                 parent?.publishLevel(level)
             }
@@ -502,51 +504,25 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
     }
 }
 
-private extension CMSampleBuffer {
-    /// Convert a CMSampleBuffer carrying audio (interleaved or planar) into an AVAudioPCMBuffer.
-    func toPCMBuffer() -> AVAudioPCMBuffer? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(self),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
-            return nil
-        }
-
-        var asbdMutable = asbd.pointee
-        guard let avFormat = AVAudioFormat(streamDescription: &asbdMutable) else { return nil }
-
-        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(self))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: avFormat, frameCapacity: frameCount) else { return nil }
-        buffer.frameLength = frameCount
-
-        var blockBuffer: CMBlockBuffer?
-        var audioBufferList = AudioBufferList(mNumberBuffers: 1,
-                                              mBuffers: AudioBuffer(mNumberChannels: avFormat.channelCount,
-                                                                    mDataByteSize: 0,
-                                                                    mData: nil))
-
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            self,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer)
-
+/// Copy ScreenCaptureKit PCM into owned storage before asynchronous delivery.
+/// Core Media handles planar/interleaved lists and checks the source extent;
+/// never trust a source byte count as the capacity of a destination buffer.
+enum SystemAudioPCM {
+    static func buffer(from sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        guard CMSampleBufferIsValid(sample), CMSampleBufferDataIsReady(sample),
+              let description = CMSampleBufferGetFormatDescription(sample),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description),
+              asbd.pointee.mFormatID == kAudioFormatLinearPCM else { return nil }
+        let frames = CMSampleBufferGetNumSamples(sample)
+        guard frames > 0, frames <= Int(Int32.max) else { return nil }
+        var streamDescription = asbd.pointee
+        guard let format = AVAudioFormat(streamDescription: &streamDescription),
+              let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(frames)) else { return nil }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sample, at: 0, frameCount: Int32(frames), into: buffer.mutableAudioBufferList)
         guard status == noErr else { return nil }
-
-        let dest = buffer.mutableAudioBufferList
-        let srcList = UnsafeMutableAudioBufferListPointer(&audioBufferList)
-        let dstList = UnsafeMutableAudioBufferListPointer(dest)
-        for i in 0..<min(srcList.count, dstList.count) {
-            let src = srcList[i]
-            var dst = dstList[i]
-            dst.mDataByteSize = src.mDataByteSize
-            if let s = src.mData, let d = dst.mData {
-                memcpy(d, s, Int(src.mDataByteSize))
-            }
-            dstList[i] = dst
-        }
         return buffer
     }
 }
