@@ -1366,8 +1366,24 @@ struct MilaApp: App {
         // .recording before there's a listener to react.
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         let sessionRef = session
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mila-fake-recording-\(UUID().uuidString).wav")
+        // Throughput fixtures only need a live stream. The isolated auto-save
+        // check also exercises Stop and reopening, so give that fake capture
+        // a real synthetic WAV inside its test-owned recordings directory.
+        let savesAutoSaveFixture = Self.autoSaveUITestDefaults() != nil
+            && CommandLine.arguments.contains("--ui-test-clean-store")
+        let outputURL = savesAutoSaveFixture
+            ? store.freshAudioURL(suggestedName: "Auto-save fixture")
+            : FileManager.default.temporaryDirectory
+                .appendingPathComponent("mila-fake-recording-\(UUID().uuidString).wav")
+        if savesAutoSaveFixture {
+            do {
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: wavPath), to: outputURL)
+            } catch {
+                os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                    .error("auto-save fixture: could not prepare synthetic recording audio")
+                return
+            }
+        }
         // Start through QuickActionsController, NOT session directly. Routing
         // via `startFakeRecordingForTesting` sets `activeJob = .recording` so
         // `actions.isRecording` flips true — which is what
@@ -1611,14 +1627,14 @@ struct MilaApp: App {
         var dataLen = 0
         while idx + 8 <= data.count {
             let id = String(data: data[idx..<idx+4], encoding: .ascii) ?? ""
-            let size = Int(data[idx+4..<idx+8].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
+            let size = Int(data[idx+4..<idx+8].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian })
             let payloadStart = idx + 8
             switch id {
             case "fmt ":
-                fmtTag = data[payloadStart..<payloadStart+2].withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
-                channels = data[payloadStart+2..<payloadStart+4].withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
-                sampleRate = data[payloadStart+4..<payloadStart+8].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-                bitsPerSample = data[payloadStart+14..<payloadStart+16].withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
+                fmtTag = data[payloadStart..<payloadStart+2].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
+                channels = data[payloadStart+2..<payloadStart+4].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
+                sampleRate = data[payloadStart+4..<payloadStart+8].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+                bitsPerSample = data[payloadStart+14..<payloadStart+16].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
             case "data":
                 dataStart = payloadStart
                 dataLen = size
