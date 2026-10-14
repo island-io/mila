@@ -71,6 +71,7 @@ final class QuickActionsController: ObservableObject {
     static let maxLiveSpeakersToSkipRediarize = 3
 
     @Published private(set) var activeJob: ActiveJob = .none
+    private(set) var captureStartInFlight = false
     @Published private(set) var availableApps: [SCRunningApplication] = []
     @Published var isAppPickerShown = false
     /// Set when system-audio capture fails because the user hasn't granted
@@ -544,7 +545,21 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
-    private func startRecording(withSystemAudio: Bool) async {
+    /// Starts only while the meeting request remains valid; never toggles an
+    /// existing recording off. Permission and capture awaits recheck the request.
+    func startMeetingRecording(isStillValid: @escaping () -> Bool) async -> URL? {
+        guard canStartMeetingRecording, isStillValid() else { return nil }
+        await startRecording(withSystemAudio: true, isStillValid: isStillValid)
+        guard isStillValid(), isRecording else { return nil }
+        return session.fileURL
+    }
+
+    private func startRecording(withSystemAudio: Bool,
+                                isStillValid: () -> Bool = { true }) async {
+        guard activeJob == .none, !isFinalizingRecording, !captureStartInFlight,
+              isStillValid() else { return }
+        captureStartInFlight = true
+        defer { captureStartInFlight = false }
         // Controller-side counterpart to HomeView's
         // `.disabled(... transcription.isPreparingModel)`. The button
         // greys out during the first-time Neural Engine compile, but
@@ -581,8 +596,15 @@ final class QuickActionsController: ObservableObject {
         // not surface a vague "operation couldn't be completed" error
         // from deep inside AVAudioEngine.
         guard await ensureMicrophonePermission() else { return }
-        // Sleep or lock can arrive while the permission prompt is up.
+        // Sleep or lock can arrive while the permission prompt is up; so can a
+        // consent revocation that supersedes this attempt (the meeting ended,
+        // or the user flipped the app Off / to Ask).
         if await abandonStartIfRequested(discarding: nil) { return }
+        // This attempt still owns the `.starting` job — nothing else can claim
+        // it while it is held — and its consent must still be valid. This
+        // replaces the old `activeJob == .none` ownership check, which the
+        // `.starting` reservation makes meaningless.
+        guard isStillValid(), case .starting = activeJob else { return }
         let prefix = withSystemAudio ? "Recording" : "Voice Memo"
         let url = store.freshAudioURL(suggestedName: prefix)
         // For system-audio-inclusive captures, the SystemAudioRecorder
@@ -593,6 +615,19 @@ final class QuickActionsController: ObservableObject {
         prepareLivePipeline()
         do {
             try await session.start(source: source, outputURL: url,
+                                    isStillValid: {
+                                        // Bridge the coordinator's start-task
+                                        // cancellation (consent revoked, prompt
+                                        // superseded) to this attempt's capture
+                                        // token, so a bring-up still suspended
+                                        // in a capture leg stops short of
+                                        // opening it.
+                                        guard isStillValid() else {
+                                            startCancellation?.cancel()
+                                            return false
+                                        }
+                                        return true
+                                    },
                                     cancellation: startCancellation)
             // Sleep or lock arrived during the bring-up, too late for the
             // `startCancellation` check before capture opened: capture is up
@@ -601,6 +636,15 @@ final class QuickActionsController: ObservableObject {
             // active recording (#321). A cancel that arrived earlier made
             // `session.start` throw instead, and is handled in the catch.
             if await abandonStartIfRequested(discarding: url) { return }
+            // Consent can also lapse after the last in-leg check. `session.start`
+            // verified it on the way out, but this closes the window between its
+            // return and here: a superseded attempt must never publish a
+            // recording, be handed back as the meeting recording URL, or acquire
+            // automatic stop ownership.
+            guard isStillValid() else {
+                await cancelOwnedStart(discarding: url)
+                return
+            }
             // Guarantee a fresh, isolated Live AI session for THIS recording
             // (new Claude session UUID + cleared summary/action items) before
             // any transcript can be fed. This is the single deterministic
@@ -614,6 +658,19 @@ final class QuickActionsController: ObservableObject {
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
+        } catch is RecordingSession.StartCancelled {
+            // Consent revoked / superseded during the bring-up. If sleep or
+            // lock also abandoned this start, that is the outcome the user
+            // needs to see; otherwise finish silently — no error, no recording,
+            // no Stop. The `defer` above releases `.starting`.
+            if await abandonStartIfRequested(discarding: url) { return }
+            return
+        } catch is CaptureStartCancellation.Cancelled {
+            // The capture token was tripped without a recorded abandon reason
+            // (e.g. a superseded attempt bridged its cancellation to it).
+            // Classify exactly like `StartCancelled`: silent, no error.
+            if await abandonStartIfRequested(discarding: url) { return }
+            return
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             if await abandonStartIfRequested(discarding: url) { return }
             screenRecordingPermissionMissing = true
@@ -689,6 +746,22 @@ final class QuickActionsController: ObservableObject {
     private func abandonStartIfRequested(discarding outputURL: URL?) async -> Bool {
         guard let reason = pendingStartAbandonReason else { return false }
         pendingStartAbandonReason = nil
+        if let outputURL { await cancelOwnedStart(discarding: outputURL) }
+        let cause: String
+        switch reason {
+        case .systemSleep: cause = "the Mac went to sleep"
+        case .screenLock: cause = "the screen was locked"
+        }
+        quickActionsLog.log("record start abandoned — \(cause, privacy: .public) while capture was being set up")
+        transcription.lastError = "Recording did not start — \(cause) while capture was being set up."
+        return true
+    }
+
+    /// Tear down only this attempt, keeping the start reservation until its
+    /// briefly-live pipeline has drained. Consent cancellation and sleep/lock
+    /// use the same hold so an old drain cannot cancel a replacement session.
+    private func cancelOwnedStart(discarding outputURL: URL) async {
+        guard session.fileURL == outputURL else { return }
         await session.cancelAll()
         // A bring-up that succeeded had already published `.recording`, so
         // `wireLiveAIPipeline` wired the live pipeline and now runs its
@@ -700,18 +773,18 @@ final class QuickActionsController: ObservableObject {
         // clearing `onLiveSamples`; bounded, as in
         // `discardFakeRecordingForTesting`, because the observer is not
         // installed in every host.
-        for _ in 0..<200 where session.onLiveSamples != nil {   // ≤ 10 s
-            try? await Task.sleep(nanoseconds: 50_000_000)
-        }
-        if let outputURL { try? FileManager.default.removeItem(at: outputURL) }
-        let cause: String
-        switch reason {
-        case .systemSleep: cause = "the Mac went to sleep"
-        case .screenLock: cause = "the screen was locked"
-        }
-        quickActionsLog.log("record start abandoned — \(cause, privacy: .public) while capture was being set up")
-        transcription.lastError = "Recording did not start — \(cause) while capture was being set up."
-        return true
+        // An automatic-start task may already be cancelled. This unstructured
+        // task does not inherit that cancellation, so its sleeps still yield
+        // to the idle observer instead of exhausting the loop immediately.
+        await Task { @MainActor [session] in
+            for _ in 0..<200 where session.onLiveSamples != nil {   // ≤ 10 s
+                try? await Task.sleep(nanoseconds: 50_000_000)
+            }
+        }.value
+        // cancelAll cleared this attempt's URL. Do not remove its path if
+        // another session was adopted while the observer was draining.
+        guard session.state == .idle, session.fileURL == nil else { return }
+        try? FileManager.default.removeItem(at: outputURL)
     }
 
     // Back-compat shim so existing call sites + tests that toggle a
@@ -771,6 +844,9 @@ final class QuickActionsController: ObservableObject {
 
     func startAppRecording(app: SCRunningApplication?, includeMic: Bool) async {
         isAppPickerShown = false
+        guard activeJob == .none, !isFinalizingRecording, !captureStartInFlight else { return }
+        captureStartInFlight = true
+        defer { captureStartInFlight = false }
         // Same Neural-Engine-preparing guard as `startRecording` — the
         // app-audio entry point isn't behind the gated Home button.
         guard !transcription.isPreparingModel else {
@@ -823,6 +899,15 @@ final class QuickActionsController: ObservableObject {
             sleepGuard.preventIdleSleep(reason: "Mila is recording")
             startSilenceWatch(watching: source)
             armRemoteProbe()
+        } catch is RecordingSession.StartCancelled {
+            if await abandonStartIfRequested(discarding: url) { return }
+            return
+        } catch is CaptureStartCancellation.Cancelled {
+            // The capture token was tripped without a recorded abandon reason:
+            // silent, no error, no recording. The `defer` above releases
+            // `.starting`.
+            if await abandonStartIfRequested(discarding: url) { return }
+            return
         } catch SystemAudioRecorder.CaptureError.permissionDenied {
             if await abandonStartIfRequested(discarding: url) { return }
             screenRecordingPermissionMissing = true

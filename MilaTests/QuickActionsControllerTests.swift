@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import TranscriptionCore
 import MilaKit
 @testable import Mila
@@ -55,6 +56,34 @@ final class QuickActionsControllerTests: XCTestCase {
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
         languageDefaults?.removePersistentDomain(forName: languageSuite)
         try await super.tearDown()
+    }
+
+    func test_meeting_start_never_toggles_an_existing_manual_recording() async throws {
+        let url = store.freshAudioURL(suggestedName: "Manual meeting safeguard")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        let result = await controller.startMeetingRecording(isStillValid: { true })
+        XCTAssertNil(result)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertEqual(session.fileURL, url)
+        await controller.discardFakeRecordingForTesting()
+    }
+
+    func test_revoked_meeting_start_does_not_request_capture() async {
+        let result = await controller.startMeetingRecording(isStillValid: { false })
+        XCTAssertNil(result)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertNil(session.fileURL)
+    }
+
+    func test_busy_app_capture_dismisses_picker_without_replacing_recording() async {
+        let url = store.freshAudioURL(suggestedName: "Manual picker safeguard")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        controller.isAppPickerShown = true
+        await controller.startAppRecording(app: nil, includeMic: false)
+        XCTAssertFalse(controller.isAppPickerShown)
+        XCTAssertEqual(session.fileURL, url)
+        XCTAssertTrue(controller.isRecording)
+        await controller.discardFakeRecordingForTesting()
     }
 
     // MARK: - Pause / resume
@@ -900,6 +929,203 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertEqual(storedA.status, .completed)
         XCTAssertEqual(storedB.status, .completed)
     }
+
+    /// Revoke consent immediately after capture publishes recording, then
+    /// cancel the caller. A delayed idle drain must still hold the start slot.
+    func test_revoked_cancelled_start_holds_reservation_until_live_pipeline_drains() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { }
+        session.system.bringUpOverride = { }
+        let drainGate = CaptureStartGate()
+        var consent = true
+        var publishedRecording = false
+        var drainStarted = false
+        var finished = false
+        var ownedURL: URL?
+        var start: Task<URL?, Never>?
+        let observation = session.$state.sink { [self] state in
+            if state == .recording {
+                publishedRecording = true
+                ownedURL = session.fileURL
+                session.onLiveSamples = { _ in }
+                consent = false
+                start?.cancel()
+            } else if state == .idle, publishedRecording {
+                drainStarted = true
+                Task { @MainActor [self] in
+                    await drainGate.wait()
+                    session.onLiveSamples = nil
+                }
+            }
+        }
+        defer { observation.cancel() }
+        start = Task { @MainActor [self] in
+            let url = await controller.startMeetingRecording(isStillValid: { consent })
+            finished = true
+            return url
+        }
+        let reachedDrain = await waitUntil { drainStarted }
+        XCTAssertTrue(reachedDrain)
+        XCTAssertFalse(finished, "A cancelled caller must wait for the old idle drain")
+        XCTAssertTrue(controller.isStartingRecording)
+        XCTAssertFalse(controller.canStartMeetingRecording)
+        await drainGate.open()
+        let task = try XCTUnwrap(start)
+        let result = await task.value
+        XCTAssertNil(result)
+        XCTAssertTrue(finished)
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertNil(service.lastError)
+        XCTAssertTrue(store.recordings.isEmpty)
+        if let ownedURL { XCTAssertFalse(FileManager.default.fileExists(atPath: ownedURL.path)) }
+    }
+
+    // MARK: - Capture-start cancellation (merged `.starting` + token)
+
+    /// The capture token can be tripped without a sleep/lock abandon reason
+    /// being recorded (a superseded attempt bridges its cancellation to it).
+    /// That is not a bring-up failure: the start must finish silently, release
+    /// `.starting`, leave `lastError` untouched, and save nothing.
+    func test_cancelled_capture_token_without_abandon_is_silent_on_the_microphone_path() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { throw CaptureStartCancellation.Cancelled() }
+
+        await controller.toggleRecord(microphone: true, appAudio: false)
+
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertFalse(controller.isStartingRecording)
+        XCTAssertNil(service.lastError)
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(session.mic.isRunning)
+    }
+
+    /// Same contract on the app-audio start path — the second merged catch
+    /// chain. No permission alert, no error text, no recording.
+    func test_cancelled_capture_token_without_abandon_is_silent_on_the_app_audio_path() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        session.system.bringUpOverride = { throw CaptureStartCancellation.Cancelled() }
+
+        await controller.startAppRecording(app: nil, includeMic: false)
+
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertFalse(controller.isStartingRecording)
+        XCTAssertNil(service.lastError)
+        XCTAssertFalse(controller.screenRecordingPermissionMissing)
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertEqual(session.state, .idle)
+    }
+
+    /// A cancelled attempt must not wedge the button or leak its token into the
+    /// next attempt: a fresh click afterwards records normally.
+    func test_a_fresh_start_succeeds_after_a_cancelled_attempt() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { throw CaptureStartCancellation.Cancelled() }
+
+        await controller.toggleRecord(microphone: true, appAudio: false)
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertNil(service.lastError)
+
+        session.mic.bringUpOverride = { }
+        await controller.toggleRecord(microphone: true, appAudio: false)
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false))
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertNil(service.lastError)
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
+    /// Sleep can arrive while the bring-up is suspended. When the token is also
+    /// tripped (the abandonment cancels it), the abandonment is the outcome the
+    /// user sees — a source-aware "did not start … sleep" message — never a
+    /// generic bring-up error, and never a saved recording.
+    func test_sleep_abandonment_wins_over_a_cancelled_bring_up() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        controller.microphonePermissionOverride = { true }
+        let gate = CaptureStartGate()
+        session.mic.bringUpOverride = { await gate.wait() }
+        session.mic.bringUpTimeout = 30
+
+        let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
+        let reachedStarting = await waitUntil { self.controller.activeJob == .starting(.microphone) }
+        XCTAssertTrue(reachedStarting)
+
+        controller.abandonStartingRecording(reason: .systemSleep)
+        await gate.open()
+        await start.value
+
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertFalse(controller.isStartingRecording)
+        XCTAssertTrue(store.recordings.isEmpty)
+        let message = service.lastError ?? ""
+        XCTAssertTrue(message.contains("did not start") && message.contains("sleep"),
+                      "the abandonment must win and name sleep, got \(message)")
+    }
+
+    /// An automatic meeting start is a dedicated start-if-idle that carries the
+    /// `.meeting` source (mic + system audio) and hands back the exact URL the
+    /// session published — the identity the coordinator owns for auto-stop.
+    func test_automatic_meeting_recording_uses_the_meeting_source() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { }
+        session.system.bringUpOverride = { }
+
+        let url = await controller.startMeetingRecording(isStillValid: { true })
+
+        XCTAssertNotNil(url)
+        XCTAssertEqual(url, session.fileURL)
+        XCTAssertEqual(session.source, .meeting)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: true))
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
+    private func waitUntil(timeout: TimeInterval = 5,
+                           _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if condition() { return true }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
+    }
+}
+
+/// Holds a fake bring-up open until the test opens it. The override runs on a
+/// detached task, so the gate is an actor rather than main-actor state.
+private actor CaptureStartGate {
+    private var opened = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        let pending = waiters
+        waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
 }
 
 /// The short-capture policy that turns "capture died 25 seconds into a
@@ -956,4 +1182,5 @@ final class ShortCapturePolicyTests: XCTestCase {
         XCTAssertTrue(QuickActionsController.capturedAudioFellShort(
             source: .meeting, wallClock: wall, captured: wall * ratio - 0.5))
     }
+
 }
