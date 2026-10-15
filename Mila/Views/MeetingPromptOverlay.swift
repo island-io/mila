@@ -86,6 +86,15 @@ final class MeetingPromptCoordinator: ObservableObject {
     private var subscriptions: Set<AnyCancellable> = []
     private var running = false
     private var meetings: [String: UUID] = [:]
+
+    /// Declines survive detector blips for this app/meeting identity. A confirmed
+    /// end, lifecycle reset, or fresh opt-in retires them.
+    private struct DeclinedStart: Hashable {
+        let appID: String
+        let meetingID: UUID
+    }
+    private var declinedStarts: Set<DeclinedStart> = []
+
     private var owner: Ownership?
     private var starting: Prompt?
     private var startTask: Task<Void, Never>?
@@ -130,9 +139,16 @@ final class MeetingPromptCoordinator: ObservableObject {
             self.invalidatePendingActions()
             self.owner = nil
             self.meetings.removeAll()
+            self.declinedStarts.removeAll()
         }.store(in: &subscriptions)
         settings.$autoStartBundleIDs.sink { [weak self] ids in
-            self?.revokeAutomation(except: ids)
+            guard let self else { return }
+            // @Published delivers before willSet, so the stored value is the
+            // previous set. Re-arm only the app newly opted in; republishing
+            // unchanged IDs or changing another app must preserve declines.
+            let newlyEnabledIDs = ids.subtracting(self.settings.autoStartBundleIDs)
+            self.declinedStarts = Set(self.declinedStarts.filter { !newlyEnabledIDs.contains($0.appID) })
+            self.revokeAutomation(except: ids)
         }.store(in: &subscriptions)
         settings.$disabledBundleIDs.sink { [weak self] ids in
             guard let self else { return }
@@ -157,6 +173,7 @@ final class MeetingPromptCoordinator: ObservableObject {
         subscriptions.removeAll()
         invalidatePendingActions()
         meetings.removeAll()
+        declinedStarts.removeAll()
         owner = nil
         if pollsDetector { detector.stop() }
     }
@@ -192,6 +209,14 @@ final class MeetingPromptCoordinator: ObservableObject {
         if pending?.kind == .stop, pending?.automatic == true { dismissPrompt() }
         guard pending == nil, starting == nil, actions.meetingRecordingURL == nil,
               allowed(app.bundleID) else { return }
+        // The detector re-fires `meetingStarted` after any brief inactive poll,
+        // before it has confirmed an end, so the SAME `meetings` UUID can arrive
+        // again. A generation the user explicitly declined must not re-present a
+        // countdown (or, in Auto, capture) — only a confirmed end/rejoin may.
+        if let meetingID = meetings[app.bundleID],
+           declinedStarts.contains(DeclinedStart(appID: app.bundleID, meetingID: meetingID)) {
+            return
+        }
         let wantsAuto = settings.mode(forBundleID: app.bundleID) == .auto
         let automatic = wantsAuto && actions.canStartMeetingRecording
         present(Prompt(app: app, kind: .start, automatic: automatic,
@@ -201,6 +226,11 @@ final class MeetingPromptCoordinator: ObservableObject {
 
     private func meetingEnded(_ app: MeetingDetector.App) {
         let endedMeetingID = meetings.removeValue(forKey: app.bundleID)
+        // The generation is over: retire its decline so a genuine rejoin (which
+        // mints a fresh UUID anyway) and the bounded set both stay clean.
+        if let endedMeetingID {
+            declinedStarts.remove(DeclinedStart(appID: app.bundleID, meetingID: endedMeetingID))
+        }
         if pending?.kind == .start, pending?.app.bundleID == app.bundleID { dismissPrompt() }
         if starting?.app.bundleID == app.bundleID { cancelStarting() }
         guard allowed(app.bundleID), pending == nil, let url = actions.meetingRecordingURL else { return }
@@ -238,12 +268,28 @@ final class MeetingPromptCoordinator: ObservableObject {
             if pollsDetector { detector.start() }
         } else {
             meetings.removeAll()
+            declinedStarts.removeAll()
             if pollsDetector { detector.stop() }
         }
     }
 
-    func cancelPrompt(id: UUID) {
+    /// Explicit user cancellation of the current prompt ("Cancel start",
+    /// "Not now", Escape, or "Keep recording"). Cancelling a START is
+    /// remembered as a declined generation so a flickering detector cannot
+    /// re-present it; cancelling a STOP ("Keep recording") is not, and never
+    /// touches the active recording.
+    func cancelPrompt(id: UUID) { cancelPrompt(id: id, userInitiated: true) }
+
+    /// The countdown's own dismissal — an unattended timeout or a long
+    /// delivery gap. Identical to a cancel except that it is NOT a user
+    /// decline: the generation stays eligible if the detector re-fires it.
+    func expirePrompt(id: UUID) { cancelPrompt(id: id, userInitiated: false) }
+
+    private func cancelPrompt(id: UUID, userInitiated: Bool) {
         guard let prompt = pending, prompt.id == id else { return }
+        if userInitiated, prompt.kind == .start, let meetingID = prompt.meetingID {
+            declinedStarts.insert(DeclinedStart(appID: prompt.app.bundleID, meetingID: meetingID))
+        }
         if prompt.kind == .stop {
             announce("Recording will continue.")
         } else {
@@ -313,10 +359,13 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
 
     private func cancelStarting() {
-        // Cancelling the in-flight start task makes the controller's
-        // `isStillValid` predicate return false at its next checkpoint, which
-        // bridges to the attempt's `CaptureStartCancellation` token so a
-        // bring-up still suspended in a capture leg stops short of opening it.
+        // Cancelling the in-flight start task does two things: the controller
+        // bridges the Swift task cancellation to the attempt's
+        // `CaptureStartCancellation` synchronously (see `startRecording`), so a
+        // capture leg still suspended stops short of opening; and the
+        // controller's `isStillValid` predicate returns false at its next
+        // checkpoint, covering a bring-up that has already passed its last
+        // in-leg check.
         starting = nil
         startTask?.cancel()
         startTask = nil
@@ -335,6 +384,7 @@ final class MeetingPromptCoordinator: ObservableObject {
             autoAct: prompt.automatic, startUnavailable: prompt.startUnavailable, interaction: interaction,
             onPrimary: { [weak self] in self?.performPrompt(id: prompt.id) },
             onDismiss: { [weak self] in self?.cancelPrompt(id: prompt.id) },
+            onTimeout: { [weak self] in self?.expirePrompt(id: prompt.id) },
             onSilenceApp: { [weak self] in
                 guard let self, self.pending?.id == prompt.id else { return }
                 self.settings.setMode(.off, forBundleID: prompt.app.bundleID)
@@ -413,6 +463,11 @@ private struct MeetingPromptView: View {
     @ObservedObject var interaction: MeetingPromptInteraction
     let onPrimary: () -> Void
     let onDismiss: () -> Void
+    /// Countdown expiry for an unattended prompt. Kept separate from
+    /// `onDismiss` so the coordinator can tell an explicit user cancellation
+    /// (which must suppress the rest of this meeting generation) from the
+    /// timer's own dismissal, which must not.
+    var onTimeout: (() -> Void)? = nil
     let onSilenceApp: () -> Void
     /// Enable auto-start/stop and present a fresh cancellable countdown.
     var onEnableAuto: (() -> Void)? = nil
@@ -672,7 +727,7 @@ private struct MeetingPromptView: View {
         switch countdown.advance(by: dt, paused: isPaused, automatic: autoAct) {
         case .waiting: break
         case .primary: triggerPrimary()
-        case .dismiss: triggerDismiss()
+        case .dismiss: triggerTimeout()
         }
     }
 
@@ -680,6 +735,15 @@ private struct MeetingPromptView: View {
         guard !dismissed else { return }
         dismissed = true
         onPrimary()
+    }
+
+    /// The timer's own dismissal — distinct from a user clicking the dismiss
+    /// button, so the coordinator does not record a declined generation for a
+    /// prompt the user never touched.
+    private func triggerTimeout() {
+        guard !dismissed else { return }
+        dismissed = true
+        (onTimeout ?? onDismiss)()
     }
 
     private func triggerDismiss() {

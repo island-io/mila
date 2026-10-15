@@ -98,6 +98,17 @@ final class MeetingAutoRecordingUITests: XCTestCase {
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
         XCTAssertEqual(cancel.label, "Cancel start")
         cancel.click()
+        waitUntilGone(element(app, "meetingPrompt.primary"))
+        // A repeated start without a confirmed end represents a detector blip
+        // in the same meeting. Cancel must remain effective past the grace period.
+        element(app, "meetingTest.start").click()
+        XCTAssertFalse(element(app, "meetingPrompt.primary").waitForExistence(timeout: 1))
+        let noRestart = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == 'Recording' OR value == 'Recording'"),
+            object: element(app, "meetingTest.state"))
+        noRestart.isInverted = true
+        XCTAssertEqual(XCTWaiter.wait(for: [noRestart], timeout: 11), .completed)
+        waitForLabel(element(app, "meetingTest.counts"), "Starts: 0, stops: 0")
         element(app, "meetingTest.end").click()
         element(app, "meetingTest.start").click()
         waitForLabel(element(app, "meetingTest.state"), "Recording")

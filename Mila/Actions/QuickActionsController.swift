@@ -613,22 +613,32 @@ final class QuickActionsController: ObservableObject {
             session.selectApp(nil)
         }
         prepareLivePipeline()
+        // Cancellation must reach the capture leg while its bring-up is still
+        // suspended. Freeze this attempt's token so a later cancellation can
+        // never trip a replacement attempt's token.
+        let cancellation = startCancellation
         do {
-            try await session.start(source: source, outputURL: url,
-                                    isStillValid: {
-                                        // Bridge the coordinator's start-task
-                                        // cancellation (consent revoked, prompt
-                                        // superseded) to this attempt's capture
-                                        // token, so a bring-up still suspended
-                                        // in a capture leg stops short of
-                                        // opening it.
-                                        guard isStillValid() else {
-                                            startCancellation?.cancel()
-                                            return false
-                                        }
-                                        return true
-                                    },
-                                    cancellation: startCancellation)
+            try await withTaskCancellationHandler {
+                try await session.start(source: source, outputURL: url,
+                                        isStillValid: {
+                                            // Bridge the coordinator's start-task
+                                            // cancellation (consent revoked, prompt
+                                            // superseded) to this attempt's capture
+                                            // token, so a bring-up still suspended
+                                            // in a capture leg stops short of
+                                            // opening it.
+                                            guard isStillValid() else {
+                                                cancellation?.cancel()
+                                                return false
+                                            }
+                                            return true
+                                        },
+                                        cancellation: cancellation)
+            } onCancel: {
+                // onCancel can run off the main actor and for an already-cancelled
+                // task. Touch only the immutable, thread-safe attempt token.
+                cancellation?.cancel()
+            }
             // Sleep or lock arrived during the bring-up, too late for the
             // `startCancellation` check before capture opened: capture is up
             // now and the user is gone, so take it down again rather than
