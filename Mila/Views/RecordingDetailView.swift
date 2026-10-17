@@ -1263,6 +1263,15 @@ private struct SpeakerNameSuggestionsBanner: View {
     let onAccept: (SpeakerNameSuggestion) -> Void
     let onDismiss: (SpeakerNameSuggestion) -> Void
 
+    /// Rows shown at their natural height. Beyond this the list scrolls
+    /// inside a fixed slot, so a recording with many speakers can never push
+    /// the transcript or the playback bar off-screen — the same guarantee
+    /// `AIOverviewBanner` gives the summary. Each row is at most three lines
+    /// (`lineLimit(2)` on the reason), so up to this many stay small.
+    static let maxUnscrolledRows = 3
+    /// Height of the scrolling slot once there are more rows than that.
+    static let scrollingHeight: CGFloat = 150
+
     var body: some View {
         if !suggestions.isEmpty {
             VStack(alignment: .leading, spacing: 0) {
@@ -1270,8 +1279,13 @@ private struct SpeakerNameSuggestionsBanner: View {
                     Label("Suggested speaker names", systemImage: "person.crop.circle.badge.questionmark")
                         .font(.callout.weight(.semibold))
                         .foregroundStyle(.secondary)
-                    ForEach(suggestions) { suggestion in
-                        row(suggestion)
+                    if suggestions.count > Self.maxUnscrolledRows {
+                        ScrollView {
+                            rows
+                        }
+                        .frame(height: Self.scrollingHeight)
+                    } else {
+                        rows
                     }
                 }
                 .padding(.horizontal)
@@ -1280,6 +1294,14 @@ private struct SpeakerNameSuggestionsBanner: View {
             }
             .accessibilityElement(children: .contain)
             .accessibilityIdentifier("detail.speakerNameSuggestions")
+        }
+    }
+
+    private var rows: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(suggestions) { suggestion in
+                row(suggestion)
+            }
         }
     }
 

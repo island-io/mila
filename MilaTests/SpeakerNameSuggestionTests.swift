@@ -219,11 +219,11 @@ final class SpeakerNameSuggestionTests: XCTestCase {
 
     func test_one_speaker_given_two_names_keeps_neither() {
         let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00",
-                                               text: "My name is Dana, but everyone calls me Bob.")]
+                                               text: "My name is Dana, but just call me Bob.")]
         let raw = """
             {"speakers": [
               {"speaker": "SPEAKER_00", "name": "Dana", "quote": "My name is Dana"},
-              {"speaker": "SPEAKER_00", "name": "Bob", "quote": "everyone calls me Bob"}
+              {"speaker": "SPEAKER_00", "name": "Bob", "quote": "just call me Bob"}
             ]}
             """
         XCTAssertEqual(SpeakerNameSuggester.parseSuggestions(from: raw, unnamedSpeakers: ["SPEAKER_00"],
@@ -247,6 +247,56 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         XCTAssertEqual(parse(right).map(\.speaker), ["SPEAKER_02"])
     }
 
+    func test_a_previous_speakers_self_introduction_does_not_name_the_next_speaker() {
+        let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00", text: "Hi, I'm Dana, nice to meet you."),
+                     SpeakerNameSuggester.Turn(speaker: "SPEAKER_01", text: "Nice to meet you too.")]
+        func suggest(_ speaker: String, _ quote: String) -> [String] {
+            let raw = #"{"speakers": [{"speaker": "\#(speaker)", "name": "Dana", "quote": "\#(quote)"}]}"#
+            return SpeakerNameSuggester.parseSuggestions(from: raw,
+                                                         unnamedSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+                                                         turns: turns).map(\.speaker)
+        }
+        XCTAssertEqual(suggest("SPEAKER_01", "I'm Dana"), [],
+                       "the line before SPEAKER_01 is SPEAKER_00 introducing herself")
+        XCTAssertEqual(suggest("SPEAKER_01", "I'm Dana, nice to meet you"), [])
+        XCTAssertEqual(suggest("SPEAKER_00", "I'm Dana"), ["SPEAKER_00"],
+                       "the same quote does name the speaker who said it")
+    }
+
+    func test_being_addressed_names_whoever_answers_and_not_the_asker() {
+        let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00", text: "Dana, can you share your screen?"),
+                     SpeakerNameSuggester.Turn(speaker: "SPEAKER_01", text: "Sure, one second.")]
+        func suggest(_ speaker: String, _ quote: String) -> [String] {
+            let raw = #"{"speakers": [{"speaker": "\#(speaker)", "name": "Dana", "quote": "\#(quote)"}]}"#
+            return SpeakerNameSuggester.parseSuggestions(from: raw,
+                                                         unnamedSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+                                                         turns: turns).map(\.speaker)
+        }
+        XCTAssertEqual(suggest("SPEAKER_01", "Dana, can you share your screen?"), ["SPEAKER_01"])
+        XCTAssertEqual(suggest("SPEAKER_00", "Dana, can you share your screen?"), [],
+                       "the speaker who said it was talking TO Dana")
+    }
+
+    func test_self_introduction_and_address_patterns() {
+        func intro(_ quote: String, _ name: String) -> Bool {
+            SpeakerNameSuggester.isSelfIntroduction(
+                normalizedQuote: SpeakerNameSuggester.normalizedForMatching(quote), name: name)
+        }
+        XCTAssertTrue(intro("Hi, my name is Dana", "Dana"))
+        XCTAssertTrue(intro("I\u{2019}m Dana", "Dana"))
+        XCTAssertTrue(intro("This is Dana speaking", "Dana Cohen"))
+        XCTAssertTrue(intro("קוראים לי דנה", "דנה"))
+        XCTAssertTrue(intro("שלום, אני דנה", "דנה"))
+        XCTAssertFalse(intro("This is Dana, our new PM", "Dana"), "introducing someone else")
+        XCTAssertFalse(intro("Dana, what do you think?", "Dana"))
+
+        XCTAssertTrue(SpeakerNameSuggester.addressesByName(quote: "Dana, what do you think?", name: "Dana"))
+        XCTAssertTrue(SpeakerNameSuggester.addressesByName(quote: "Hey Dana, go ahead", name: "Dana"))
+        XCTAssertTrue(SpeakerNameSuggester.addressesByName(quote: "What do you think, Dana?", name: "Dana"))
+        XCTAssertTrue(SpeakerNameSuggester.addressesByName(quote: "דנה, מה דעתך?", name: "דנה"))
+        XCTAssertFalse(SpeakerNameSuggester.addressesByName(quote: "I sent it to Dana yesterday", name: "Dana"))
+    }
+
     func test_a_one_word_quote_that_is_just_the_name_is_dropped() {
         let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "Dana", "quote": "Dana."}]}"#
         XCTAssertEqual(parse(raw), [])
@@ -259,13 +309,23 @@ final class SpeakerNameSuggestionTests: XCTestCase {
     }
 
     func test_one_name_given_to_two_speakers_keeps_neither() {
+        let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00", text: "Hi, my name is Dana."),
+                     SpeakerNameSuggester.Turn(speaker: "SPEAKER_01", text: "Funny, I'm Dana too.")]
         let raw = """
             {"speakers": [
               {"speaker": "SPEAKER_00", "name": "Dana", "quote": "my name is Dana"},
-              {"speaker": "SPEAKER_01", "name": "dana", "quote": "Thanks Dana"}
+              {"speaker": "SPEAKER_01", "name": "dana", "quote": "I'm Dana too"}
             ]}
             """
-        XCTAssertEqual(parse(raw), [])
+        XCTAssertEqual(SpeakerNameSuggester.parseSuggestions(from: raw,
+                                                             unnamedSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+                                                             turns: turns), [])
+    }
+
+    func test_thanking_someone_by_name_does_not_name_the_speaker() {
+        // "Thanks Dana!" is SPEAKER_01 talking TO Dana, in their own turn.
+        let raw = #"{"speakers": [{"speaker": "SPEAKER_01", "name": "Dana", "quote": "Thanks Dana"}]}"#
+        XCTAssertEqual(parse(raw, unnamed: ["SPEAKER_01", "SPEAKER_02"]), [])
     }
 
     func test_same_answer_twice_for_one_speaker_is_one_suggestion() {

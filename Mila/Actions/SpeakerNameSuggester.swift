@@ -456,11 +456,12 @@ final class SpeakerNameSuggester {
     ///    and not already the name of another speaker here (`takenNames`);
     ///  * `quote` is at least two words, STATES the name as a whole word
     ///    (`quoteStatesName`), and is evidence about THIS speaker
-    ///    (`quoteIsEvidence`): it occurs in one of the speaker's own turns
-    ///    ("I'm Dana"), or in the turn immediately before one of theirs
-    ///    ("Dana, what do you think?" — then they answer). A quote that is
-    ///    merely somewhere in the transcript proves nothing about who it
-    ///    names.
+    ///    (`quoteIsEvidence`): a self-introduction in one of the speaker's
+    ///    own turns ("I'm Dana"), or the name ADDRESSED in the turn
+    ///    immediately before one of theirs ("Dana, what do you think?" —
+    ///    then they answer). A quote that is merely somewhere in the
+    ///    transcript, or the previous speaker introducing THEMSELVES, proves
+    ///    nothing about who the next speaker is.
     /// Then ambiguity is resolved by dropping: a speaker given two different
     /// names, or one name given to two speakers, keeps neither.
     static func parseSuggestions(from raw: String,
@@ -490,7 +491,7 @@ final class SpeakerNameSuggester {
             // One word is at most the bare name — that names nobody.
             guard normalizedQuote.split(separator: " ").count >= 2,
                   quoteStatesName(normalizedQuote: normalizedQuote, name: name),
-                  quoteIsEvidence(normalizedQuote: normalizedQuote, for: speaker,
+                  quoteIsEvidence(quote: quote, name: name, for: speaker,
                                   turns: normalizedTurns)
             else { continue }
             let stored = quote.count > maxStoredQuoteLength
@@ -517,20 +518,80 @@ final class SpeakerNameSuggester {
         }
     }
 
-    /// Whether `normalizedQuote` is evidence about `speaker`: it occurs, as
-    /// whole words, in one of the speaker's own turns, or in the turn right
-    /// before one of the speaker's turns (they were addressed, then answered).
-    /// `turns` must already be collapsed, so the next turn is always another
-    /// speaker's.
-    static func quoteIsEvidence(normalizedQuote: String,
+    /// Whether `quote` is evidence that `speaker` is called `name`. The two
+    /// places a quote may sit say different things, so each needs its own
+    /// kind of quote:
+    ///  * in one of the speaker's OWN turns, it must be a self-introduction
+    ///    ("my name is Dana", "I'm Dana", "Dana speaking") — a speaker saying
+    ///    "Thanks, Dana" is talking TO Dana, not claiming to be her;
+    ///  * in the turn right BEFORE one of theirs, it must ADDRESS the name
+    ///    ("Dana, what do you think?", "…, Dana?") and must not be the
+    ///    previous speaker introducing themselves — "Hi, I'm Dana" followed
+    ///    by someone else's reply says the PREVIOUS speaker is Dana.
+    /// `turns` must already be collapsed (and normalized), so the next turn
+    /// is always another speaker's.
+    static func quoteIsEvidence(quote: String,
+                                name: String,
                                 for speaker: String,
                                 turns: [(speaker: String?, text: String)]) -> Bool {
+        let normalizedQuote = normalizedForMatching(quote)
+        guard !normalizedQuote.isEmpty else { return false }
         let needle = " \(normalizedQuote) "
+        let claimsName = isSelfIntroduction(normalizedQuote: normalizedQuote, name: name)
+        let addressesName = addressesByName(quote: quote, name: name)
         for (i, turn) in turns.enumerated() where " \(turn.text) ".contains(needle) {
-            if turn.speaker == speaker { return true }
-            if i + 1 < turns.count, turns[i + 1].speaker == speaker { return true }
+            if turn.speaker == speaker, claimsName { return true }
+            if turn.speaker != speaker, i + 1 < turns.count, turns[i + 1].speaker == speaker,
+               addressesName, !claimsName {
+                return true
+            }
         }
         return false
+    }
+
+    /// The normalized forms a name can be stated in: the whole name, and
+    /// each of its words of two or more letters ("Dana" for "Dana Cohen").
+    static func nameVariants(_ name: String) -> [String] {
+        let full = normalizedForMatching(name)
+        guard !full.isEmpty else { return [] }
+        let words = full.split(separator: " ").map(String.init).filter { $0.count >= 2 }
+        return [full] + words.filter { $0 != full }
+    }
+
+    /// First-person ways of stating one's own name, matched on normalized
+    /// text (so "I'm" is "i m"). Deliberately narrow: "this is Dana" is NOT
+    /// here, because it is just as often someone introducing a colleague —
+    /// "this is Dana speaking" is caught by the suffix list instead.
+    static let selfIntroductionPrefixes = [
+        "my name is", "my name s", "i m", "im", "i am", "call me",
+        "שמי", "קוראים לי", "השם שלי", "אני",
+    ]
+    static let selfIntroductionSuffixes = ["here", "speaking", "מדבר", "מדברת"]
+
+    /// Whether the (normalized) quote is someone stating `name` as their own.
+    static func isSelfIntroduction(normalizedQuote: String, name: String) -> Bool {
+        let haystack = " \(normalizedQuote) "
+        return nameVariants(name).contains { variant in
+            selfIntroductionPrefixes.contains { haystack.contains(" \($0) \(variant) ") }
+                || selfIntroductionSuffixes.contains { haystack.contains(" \(variant) \($0) ") }
+        }
+    }
+
+    /// Whether the quote ADDRESSES `name` — the name set off by a comma as a
+    /// vocative: at the start ("Dana, what do you think?", "Hey Dana, …") or
+    /// as the whole last clause ("What do you think, Dana?"). Read from the
+    /// raw quote, because the comma is exactly what normalizing removes.
+    static func addressesByName(quote: String, name: String) -> Bool {
+        let clauses = quote.split(whereSeparator: { $0 == "," || $0 == "\u{060C}" })
+            .map { normalizedForMatching(String($0)) }
+            .filter { !$0.isEmpty }
+        guard clauses.count >= 2, let first = clauses.first, let last = clauses.last else { return false }
+        let variants = nameVariants(name)
+        // "dana" / "hey dana" / "ok so dana": a short lead-in ending on the name.
+        let leadIn = first.split(separator: " ").count <= 3
+            && variants.contains { first == $0 || first.hasSuffix(" \($0)") }
+        let tail = variants.contains(last)
+        return leadIn || tail
     }
 
     /// Placeholders a model writes when told not to guess, plus anything
