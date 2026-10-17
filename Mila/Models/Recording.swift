@@ -39,6 +39,46 @@ enum TranscriptionStatus: String, Codable {
     case failed
 }
 
+/// A stretch of a recording's audio, in seconds from the start of the audio
+/// file, that is NOT in its transcript because transcribing it failed —
+/// the remote server was unreachable (or refused) for that utterance during
+/// the recording and still was when the recording was finalized (#355). The
+/// audio itself is on disk; "Retry missing parts" in the detail view
+/// transcribes just these spans and inserts the result in time order.
+struct UntranscribedSpan: Codable, Hashable, Sendable {
+    var start: Double
+    var end: Double
+    /// True once the span's audio could not be read back from the file (past
+    /// its end, unreadable, or digital silence where the live path heard
+    /// sound). No upload can fix that, so the span is shown but never offered
+    /// for retry again. Nil — and omitted from recordings.json — otherwise.
+    var unreadable: Bool?
+
+    init(start: Double, end: Double, unreadable: Bool? = nil) {
+        self.start = start
+        self.end = end
+        self.unreadable = unreadable == true ? true : nil
+    }
+
+    /// Whether "Retry missing parts" can still do anything for this span.
+    var isRetryable: Bool { isValid && unreadable != true }
+
+    /// Finite, non-negative and non-empty. recordings.json is user-editable
+    /// and synced; a NaN, infinite or inverted span would trap the first time
+    /// it is turned into a frame count or a displayed duration, so invalid
+    /// ones are dropped at decode and never written (`Recording.init(from:)`).
+    var isValid: Bool {
+        start.isFinite && end.isFinite && start >= 0 && end > start
+            && end <= Self.maxSeconds
+    }
+
+    /// No recording is longer than a day; anything past it is a corrupt row.
+    static let maxSeconds: Double = 24 * 60 * 60
+
+    /// Zero for an invalid span, so a sum over spans can never go NaN.
+    var duration: Double { isValid ? end - start : 0 }
+}
+
 struct Recording: Identifiable, Codable, Hashable {
     var id: UUID
     var title: String
@@ -204,6 +244,25 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `ShareManifestTests`): both expose confirmed names only.
     var speakerNameSuggestions: [SpeakerNameSuggestion]
 
+    /// Audio the transcript is missing because transcribing it failed during
+    /// the recording and again at finalize — see `UntranscribedSpan`. Nil (and
+    /// omitted from recordings.json, so every complete row encodes exactly as
+    /// before) when the transcript covers the whole recording. Cleared by a
+    /// successful full pass (which re-transcribes everything) and shrunk by
+    /// `TranscriptionService.retryUntranscribedSpans`. Mirrored in MilaKit's
+    /// `StoredRecording`.
+    var untranscribedSpans: [UntranscribedSpan]?
+
+    /// Total seconds of audio missing from the transcript.
+    var untranscribedSeconds: Double {
+        (untranscribedSpans ?? []).reduce(0) { $0 + $1.duration }
+    }
+
+    /// The part of `untranscribedSeconds` "Retry missing parts" can still try.
+    var retryableUntranscribedSeconds: Double {
+        (untranscribedSpans ?? []).filter(\.isRetryable).reduce(0) { $0 + $1.duration }
+    }
+
     /// Whether the row holds any transcript text — what a re-run leaves in
     /// place until it completes.
     var hasTranscript: Bool {
@@ -305,7 +364,8 @@ struct Recording: Identifiable, Codable, Hashable {
          sharedAt: Date? = nil,
          transcriptionDeferredAt: Date? = nil,
          retranscriptionPriorState: RetranscriptionPriorState? = nil,
-         speakerNameSuggestions: [SpeakerNameSuggestion] = []) {
+         speakerNameSuggestions: [SpeakerNameSuggestion] = [],
+         untranscribedSpans: [UntranscribedSpan]? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -332,6 +392,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.transcriptionDeferredAt = transcriptionDeferredAt
         self.retranscriptionPriorState = retranscriptionPriorState
         self.speakerNameSuggestions = speakerNameSuggestions
+        self.untranscribedSpans = untranscribedSpans
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -375,7 +436,8 @@ struct Recording: Identifiable, Codable, Hashable {
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
              speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt,
-             retranscriptionPriorState, speakerNameSuggestions
+             retranscriptionPriorState, speakerNameSuggestions,
+             untranscribedSpans
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -417,6 +479,11 @@ struct Recording: Identifiable, Codable, Hashable {
         // are the cheapest thing on the row to lose.
         self.speakerNameSuggestions = (try? c.decodeIfPresent([SpeakerNameSuggestion].self,
                                                               forKey: .speakerNameSuggestions)) ?? []
+        // `try?` for the same all-or-nothing reason: losing this costs only
+        // the "Retry missing parts" note, never the library.
+        let spans = try? c.decodeIfPresent([UntranscribedSpan].self, forKey: .untranscribedSpans)
+        let validSpans = (spans ?? []).filter(\.isValid)
+        self.untranscribedSpans = validSpans.isEmpty ? nil : validSpans
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -458,6 +525,10 @@ struct Recording: Identifiable, Codable, Hashable {
         // suggestion is byte-identical to what the previous release wrote.
         if !speakerNameSuggestions.isEmpty {
             try c.encode(speakerNameSuggestions, forKey: .speakerNameSuggestions)
+        }
+        let validSpans = (untranscribedSpans ?? []).filter(\.isValid)
+        if !validSpans.isEmpty {
+            try c.encode(validSpans, forKey: .untranscribedSpans)
         }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }

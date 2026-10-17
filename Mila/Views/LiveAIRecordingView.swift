@@ -40,6 +40,16 @@ struct LiveAIRecordingView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
+            // Non-blocking, self-clearing: the remote server is unreachable
+            // but the recording carries on, and the live transcript catches
+            // up once the connection is back (#355). This used to be the
+            // modal "Transcription error" alert. Off the Home screen the
+            // floating recording chip carries the same state
+            // (`ConnectionDropIndicator`).
+            if transcriber.isConnectionInterrupted {
+                ConnectionInterruptedBanner()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             // Action items pane is rendered only when Live AI is on +
             // a CLI is configured. When AI is off the live transcript
             // takes the whole detail pane so the user still sees what
@@ -636,6 +646,30 @@ struct LiveAIRecordingView: View {
         } catch {
             NSAlert(error: error).runModal()
         }
+    }
+}
+
+/// Inline warning shown while the remote transcription server is unreachable
+/// mid-recording (`LiveTranscriber.isConnectionInterrupted`, #355). Purely
+/// informational — nothing to dismiss: it goes away by itself once the server
+/// answers again, or when the recording stops.
+private struct ConnectionInterruptedBanner: View {
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+            Text("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("liveTranscript.connectionInterrupted")
     }
 }
 

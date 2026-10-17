@@ -131,6 +131,31 @@ enum AudioConvert {
         return samples(from: converted)
     }
 
+    /// Read only `[start, end)` seconds of a wav/aiff/m4a file and convert
+    /// them to Whisper format, without decoding the rest of the recording.
+    /// Used to re-transcribe the spans the live path missed (#355). Clamped
+    /// to the file; an empty range returns `[]`.
+    static func loadAsWhisperSamples(url: URL, from start: TimeInterval, to end: TimeInterval) throws -> [Float] {
+        // A NaN or infinite bound would trap in the frame-count conversion.
+        guard start.isFinite, end.isFinite, end > start else { return [] }
+        let file = try AVAudioFile(forReading: url)
+        let rate = file.processingFormat.sampleRate
+        // Clamp in Double space BEFORE converting: a huge-but-finite bound
+        // (seconds × rate past Int64) would trap in the integer conversion.
+        let length = Double(file.length)
+        let startFrame = AVAudioFramePosition(min(length, max(0, start * rate).rounded(.down)))
+        let endFrame = AVAudioFramePosition(min(length, max(0, end * rate).rounded(.up)))
+        guard endFrame > startFrame,
+              let inputBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                                 frameCapacity: AVAudioFrameCount(endFrame - startFrame)) else {
+            return []
+        }
+        file.framePosition = startFrame
+        try file.read(into: inputBuffer, frameCount: AVAudioFrameCount(endFrame - startFrame))
+        let converted = try toWhisperFormat(inputBuffer)
+        return samples(from: converted)
+    }
+
     /// Write 16 kHz mono float32 samples as an IEEE-float WAV. Used to
     /// hand the Python diarizer (soundfile/libsndfile) a readable file
     /// when the recording is a compressed .m4a it can't open.

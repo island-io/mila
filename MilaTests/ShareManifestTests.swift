@@ -239,7 +239,9 @@ final class ShareManifestTests: XCTestCase {
             speakerNameSuggestions: [
                 SpeakerNameSuggestion(speaker: "SPEAKER_01", name: "John",
                                       evidence: "hi there, John here", origin: .transcript),
-            ])
+            ],
+            // Local repair bookkeeping; set so the key-set test sees the key.
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)])
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -338,6 +340,11 @@ final class ShareManifestTests: XCTestCase {
             // confirmed names (`speakerNames`); a pending guess arriving on
             // the receiver's side would read as the sender's decision.
             "speakerNameSuggestions",
+            // Which spans of the SENDER's audio its transcript is missing
+            // (#355) — bookkeeping for the sender's own "Retry missing parts".
+            // The receiver imports the transcript as sent; a full
+            // re-transcription on their side covers the whole audio anyway.
+            "untranscribedSpans",
         ]
         let storeEncoder = JSONEncoder()
         storeEncoder.dateEncodingStrategy = .iso8601

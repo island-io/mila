@@ -540,6 +540,7 @@ private struct RecordingChip: View {
             Text(formatDuration(meters.elapsed))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(paused ? .orange : .primary)
+            ConnectionDropIndicator()
             // `RecordingPauseButton` applies its own `.buttonStyle(.plain)`
             // internally (closest-to-the-Button wins), so don't restate a
             // style here — it would read as doing something and do nothing.
@@ -560,6 +561,25 @@ private struct RecordingChip: View {
             Capsule().strokeBorder((paused ? Color.orange : Color.red).opacity(0.4), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+    }
+}
+
+/// The floating recording chip's half of the "can't reach the transcription
+/// server" warning (#355): the full banner lives in `LiveAIRecordingView`,
+/// which is only on screen on Home, and the chip is what shows everywhere
+/// else. Its own leaf so only this icon observes `LiveTranscriber`, not the
+/// chip or anything above it. Renders nothing while the server is reachable.
+private struct ConnectionDropIndicator: View {
+    @EnvironmentObject private var transcriber: LiveTranscriber
+
+    var body: some View {
+        if transcriber.isConnectionInterrupted {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+                .help("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
+                .accessibilityLabel("Can't reach the transcription server; recording continues")
+                .accessibilityIdentifier("recordingChip.connectionInterrupted")
+        }
     }
 }
 
