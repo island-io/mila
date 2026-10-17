@@ -208,6 +208,55 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
         }
     }
 
+    /// The user cut lines out of a saved recording's transcript
+    /// (island-io/mila#357). If the completed snapshot still on disk is THAT
+    /// recording's, replace its lines with what the recording now holds, so
+    /// the deleted text is not left readable through `live/current.json`
+    /// until the next meeting overwrites it
+    /// (`bugbot-rules/deleted-data-stays-deleted.md`).
+    ///
+    /// The removal is stamped in `segmentsRemovedAtRevision`, as a live-pane
+    /// delete is, so a poller holding an older cursor gets the full set
+    /// instead of keeping the lines it already had.
+    ///
+    /// Fails safe in the same way `attachHandoff` does: no-op while a live
+    /// recording owns the file, and unless the snapshot on disk provably
+    /// belongs to `recordingID` — its published handoff id, or the handoff
+    /// still awaited for that exact session.
+    func replaceCompletedTranscript(forRecording recordingID: UUID,
+                                    segments: [TranscriptSegment],
+                                    speakerNames: [String: String]) {
+        guard snapshot == nil,
+              var onDisk = LiveTranscriptSnapshot.read(root: root),
+              onDisk.state == .completed else { return }
+        let isThisRecording: Bool
+        if let published = onDisk.finalRecordingID {
+            isThisRecording = published == recordingID
+        } else if let awaited = awaitingBatchHandoff {
+            isThisRecording = awaited.recordingID == recordingID && awaited.session == onDisk.sessionID
+        } else {
+            isThisRecording = false
+        }
+        guard isThisRecording else { return }
+        onDisk.segments = segments.map {
+            LiveTranscriptSnapshot.Segment(start: $0.start, end: $0.end,
+                                           text: $0.text, speaker: $0.speaker)
+        }
+        onDisk.speakerNames = speakerNames
+        onDisk.revision += 1
+        onDisk.segmentsRemovedAtRevision = onDisk.revision
+        onDisk.updatedAt = Date()
+        do {
+            try onDisk.write(root: root)
+            sidecarLog.log("""
+                replaced completed live snapshot lines for \(recordingID, privacy: .public) \
+                after a transcript edit (\(onDisk.segments.count, privacy: .public) remain)
+                """)
+        } catch {
+            sidecarLog.error("transcript-edit snapshot write failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     // MARK: - Write scheduling
 
     private func scheduleWrite() {

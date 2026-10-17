@@ -623,6 +623,14 @@ struct MilaApp: App {
         // `store`; the `actions` wiring stays further down with the rest.
         let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
         sidecarWriter.cleanupAtLaunch()
+        // Lines the user cut from a saved transcript (#357) must not stay
+        // readable in the completed live snapshot mila-mcp serves; a no-op
+        // unless that snapshot is this recording's.
+        store.onTranscriptLinesRemoved = { [weak sidecarWriter] rec in
+            sidecarWriter?.replaceCompletedTranscript(forRecording: rec.id,
+                                                      segments: rec.segments,
+                                                      speakerNames: rec.speakerNames)
+        }
         svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
             // A recording whose live transcript wasn't final closed its live
             // sidecar WITHOUT a handoff id, because at Stop the batch worker

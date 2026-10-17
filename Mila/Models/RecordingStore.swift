@@ -51,6 +51,17 @@ final class RecordingStore: ObservableObject {
     /// those two agree.
     var onSpeakerIDAbsorbed: ((_ recordingID: UUID, _ sourceRawID: String, _ targetRawID: String) -> Void)?
 
+    /// Called after the user removed lines from a recording's transcript
+    /// ("Delete Segment(s)" / "End Conversation Here", island-io/mila#357),
+    /// with the row as it now stands. The recording's own files are already
+    /// rewritten by then; this is for copies of the transcript the store
+    /// does not own — in production the completed live sidecar
+    /// (`live/current.json`), which keeps the meeting's live lines on disk
+    /// until the next recording starts and is served to mila-mcp. Deleted
+    /// lines must not stay readable there
+    /// (`bugbot-rules/deleted-data-stays-deleted.md`).
+    var onTranscriptLinesRemoved: ((Recording) -> Void)?
+
     /// Emits the ids of recordings that were just permanently deleted, from
     /// both removal primitives — `permanentlyDelete(_:)` and `emptyTrash()`
     /// — after the rows have left `recordings`. Every caller that throws a
@@ -361,7 +372,9 @@ final class RecordingStore: ObservableObject {
         // first `await`, so it's atomic — otherwise the loser would delete
         // the winner's freshly-written .m4a in its stale-metadata branch
         // below, leaving the recording with no audio on disk.
-        guard !compressingIDs.contains(id) else { return }
+        // Nor overlap an "End Conversation Here" audio trim: this would read
+        // the untrimmed WAV and then swap the full-length audio back in.
+        guard !compressingIDs.contains(id), !trimmingAudioIDs.contains(id) else { return }
         compressingIDs.insert(id)
         defer { compressingIDs.remove(id) }
         let dstName = (rec.audioFileName as NSString).deletingPathExtension + ".m4a"
@@ -983,6 +996,183 @@ final class RecordingStore: ObservableObject {
         if recordings[recIdx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
         }
+    }
+
+    // MARK: - Transcript trimming (island-io/mila#357)
+
+    /// Whether the user may cut lines out of `recording`'s transcript now.
+    /// Not while a transcription pass is queued or running: that pass writes
+    /// its own segments back when it finishes, which would silently undo the
+    /// edit — and an "End Conversation Here" audio trim must not swap the
+    /// file out from under a pass that is reading it.
+    nonisolated static func canEditTranscript(_ recording: Recording) -> Bool {
+        recording.status != .pending && recording.status != .running
+            && !recording.segments.isEmpty
+    }
+
+    /// Remove the lines `segmentIDs` from a recording's transcript. Returns
+    /// the updated row, or nil when nothing changed (unknown recording, a
+    /// pass in flight, no matching line, or an edit that would empty the
+    /// transcript — see `Recording.removingSegments`).
+    ///
+    /// The audio is kept, so a later re-transcription brings the lines back;
+    /// the confirmation in the detail view says so.
+    @discardableResult
+    func deleteSegments(_ segmentIDs: Set<UUID>, recordingID: UUID) -> Recording? {
+        applyTranscriptEdit(recordingID: recordingID) { $0.removingSegments(segmentIDs) }
+    }
+
+    /// What "End Conversation Here" did: the row after the transcript edit
+    /// (and the audio trim, when one happened), and what became of the audio.
+    struct EndConversationResult {
+        let recording: Recording
+        let audio: AudioTrimOutcome
+    }
+
+    /// Remove every line after `segmentID` and cut the audio just past it
+    /// (`TranscriptTrim.audioCutTime`). The transcript edit lands before the
+    /// first suspension point, so the row and its sidecars are trimmed before
+    /// the audio work starts. A failed or skipped audio trim leaves the
+    /// original audio untouched and is reported in `audio` — the transcript
+    /// edit stands either way.
+    ///
+    /// Returns nil when the transcript edit did not happen (unknown
+    /// recording or line, the last line, or a pass in flight).
+    @discardableResult
+    func endConversation(afterSegment segmentID: UUID, recordingID: UUID) async -> EndConversationResult? {
+        guard let live = recordings.first(where: { $0.id == recordingID }),
+              let cut = TranscriptTrim.audioCutTime(endingAt: segmentID, in: live.segments),
+              let edited = applyTranscriptEdit(recordingID: recordingID, { $0.endingConversation(at: segmentID) })
+        else { return nil }
+        let audio = await trimAudio(recordingID: recordingID, toSeconds: cut)
+        let current = recordings.first(where: { $0.id == recordingID }) ?? edited
+        return EndConversationResult(recording: current, audio: audio)
+    }
+
+    /// Apply a pure transcript edit to the LIVE row — never to a snapshot a
+    /// view captured, which can carry a stale `audioFileName` (see
+    /// `prepareForRetranscription`) — and write everything derived from the
+    /// segments: `recordings.json` and the `.txt` sidecar (both via
+    /// `update`), the `.srt`, and copies outside the store
+    /// (`onTranscriptLinesRemoved`).
+    private func applyTranscriptEdit(recordingID: UUID,
+                                     _ edit: (Recording) -> Recording?) -> Recording? {
+        guard let live = recordings.first(where: { $0.id == recordingID }),
+              Self.canEditTranscript(live),
+              let edited = edit(live) else { return nil }
+        update(edited)
+        writeSRTIfCompleted(recordingID)
+        // Resolved again rather than handing `edited` on, so the hook sees
+        // exactly what the store holds.
+        guard let stored = recordings.first(where: { $0.id == recordingID }) else { return nil }
+        recStoreLog.log("""
+            transcript edit on \(recordingID, privacy: .public): \
+            \(live.segments.count, privacy: .public) → \(stored.segments.count, privacy: .public) segments
+            """)
+        onTranscriptLinesRemoved?(stored)
+        return stored
+    }
+
+    /// What became of an audio trim. Every case but `.trimmed` leaves the
+    /// audio file exactly as it was.
+    enum AudioTrimOutcome: Equatable {
+        /// The audio now ends at `duration` seconds, and so does the row.
+        case trimmed(duration: Double)
+        /// The audio already ends at or before the cut.
+        case unchanged
+        /// No audio file, or a container this build does not rewrite
+        /// (`AudioTrimmer.supportedExtensions`).
+        case unsupported
+        /// The row changed while the new file was being written — deleted,
+        /// a transcription pass queued, or its audio renamed by a
+        /// compression — so the result no longer describes it.
+        case abandoned
+        /// Reading or writing the audio failed.
+        case failed
+    }
+
+    /// Recordings with an audio trim in flight. Mutually exclusive with
+    /// `compressingIDs`: both replace the audio file, and whichever finished
+    /// second would put back what the first had removed.
+    private var trimmingAudioIDs: Set<UUID> = []
+
+    /// Whether `trimAudio` can rewrite this recording's audio at all — the
+    /// detail view words its confirmation on it.
+    func canTrimAudio(for recording: Recording) -> Bool {
+        let url = audioURL(for: recording)
+        return AudioTrimmer.supports(url) && fileManager.fileExists(atPath: url.path)
+    }
+
+    /// Cut a recording's audio at `seconds` and shorten its `duration` to
+    /// match. The trimmed audio is written to a hidden temporary file beside
+    /// the original — hidden so `recoverOrphanRecordings` (which skips hidden
+    /// files) can never resurrect a crash's leftover as a recording, and in
+    /// the same directory so the swap stays on one volume — and replaces the
+    /// original only once complete.
+    func trimAudio(recordingID: UUID, toSeconds seconds: Double) async -> AudioTrimOutcome {
+        // A post-transcription compression may still be running (it starts
+        // when a pass completes). Let it land rather than refuse: the trim
+        // then works on the `.m4a` it produced. Bounded (~60 s), because a
+        // wait that never ends is worse than a reported failure.
+        var waits = 0
+        while compressingIDs.contains(recordingID), waits < 600 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waits += 1
+        }
+        guard !compressingIDs.contains(recordingID),
+              !trimmingAudioIDs.contains(recordingID) else { return .abandoned }
+        guard let rec = recordings.first(where: { $0.id == recordingID }),
+              rec.status != .pending, rec.status != .running else { return .abandoned }
+        guard canTrimAudio(for: rec) else { return .unsupported }
+        trimmingAudioIDs.insert(recordingID)
+        defer { trimmingAudioIDs.remove(recordingID) }
+
+        let source = audioURL(for: rec)
+        let temp = recordingsDirectory.appendingPathComponent(
+            ".mila-trim-\(UUID().uuidString).\(source.pathExtension)")
+        let written: Double
+        do {
+            guard let length = try await AudioTrimmer.writePrefix(of: source, seconds: seconds, to: temp) else {
+                return .unchanged
+            }
+            written = length
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            logTrimFailure(recordingID, stage: "write", error)
+            return .failed
+        }
+        // Re-resolve after the off-main write: the row may have been deleted,
+        // re-queued for transcription, or had its audio renamed meanwhile.
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
+              recordings[idx].audioFileName == rec.audioFileName,
+              recordings[idx].status != .pending,
+              recordings[idx].status != .running else {
+            try? fileManager.removeItem(at: temp)
+            return .abandoned
+        }
+        do {
+            _ = try fileManager.replaceItemAt(source, withItemAt: temp)
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            logTrimFailure(recordingID, stage: "replace", error)
+            return .failed
+        }
+        recordings[idx].duration = written
+        persist()
+        recStoreLog.log("trimmed audio of \(recordingID, privacy: .public) to \(written, privacy: .public)s")
+        return .trimmed(duration: written)
+    }
+
+    /// The audio file name is title-derived and Cocoa quotes it (and its
+    /// folder) in `localizedDescription`, so only the domain and code are
+    /// public (`bugbot-rules/no-user-content-in-logs.md`).
+    private func logTrimFailure(_ recordingID: UUID, stage: String, _ error: Error) {
+        let ns = error as NSError
+        recStoreLog.error("""
+            audio trim \(stage, privacy: .public) failed for \(recordingID, privacy: .public) \
+            (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+            \(error.localizedDescription, privacy: .private)
+            """)
     }
 
     /// Move a recording into a folder (or unfile it with nil). Auto-creates
