@@ -1043,8 +1043,8 @@ final class RecordingStore: ObservableObject {
     /// Remove the lines `segmentIDs` from a recording's transcript. Returns
     /// the updated row, or nil when nothing changed (unknown recording, a
     /// pass in flight, no matching line, or an edit that would empty the
-    /// transcript — see `Recording.removingSegments`), and also when the edit
-    /// could not be saved to disk (`trimNotice` then says so).
+    /// transcript — see `Recording.removingSegments`), and also when
+    /// recordings.json could not be saved (`trimNotice` then says so).
     ///
     /// The audio is kept, so a later re-transcription brings the lines back;
     /// the confirmation in the detail view says so.
@@ -1162,28 +1162,30 @@ final class RecordingStore: ObservableObject {
         // Resolved again rather than handing `edited` on, so the hook sees
         // exactly what the store holds.
         guard let stored = recordings.first(where: { $0.id == recordingID }) else { return nil }
-        if !saved {
-            settleUnsavedTranscriptEdit(stored)
-        }
+        let durable = saved || settleUnsavedTranscriptEdit(stored)
         recStoreLog.log("""
             transcript edit on \(recordingID, privacy: .public): \
             \(live.segments.count, privacy: .public) → \(stored.segments.count, privacy: .public) segments
             """)
         onTranscriptLinesRemoved?(stored)
-        // Not a success when it did not reach disk: the caller then skips
-        // what follows a saved edit (the audio cut, the summary refresh), and
-        // the user has already been told through `trimNotice`.
-        return saved ? stored : nil
+        // Not a success when recordings.json did not take it: the caller then
+        // skips what follows a saved edit (the audio cut, the summary
+        // refresh), and the user has already been told through `trimNotice`.
+        // A sidecar-only failure is NOT that case — the edit stands.
+        return durable ? stored : nil
     }
 
-    /// A transcript edit changed the row in memory but `update` could not
-    /// write all of it. Make sure no reader keeps getting the removed lines
-    /// from the stale `.txt` sidecar: retry the write, then fall back to
-    /// deleting the sidecar — every reader (the app's `load`, mila-mcp's
-    /// `MilaStoreReader`) then rebuilds the text from the segments — and if
-    /// even that fails, queue a retry on every later `persist()`. Tell the
-    /// user in all cases, since the edit is not durable.
-    private func settleUnsavedTranscriptEdit(_ recording: Recording) {
+    /// `update` reported that the edit did not fully land. Find out which
+    /// half failed by retrying each, and return whether recordings.json —
+    /// the record of the edit itself — now holds it.
+    ///
+    /// The `.txt` sidecar is retried, then deleted if it cannot be written
+    /// (every reader — the app's `load`, mila-mcp's `MilaStoreReader` — then
+    /// rebuilds the text from the segments), and if even that fails it is
+    /// queued for a retry on every later `persist()`. The user is told only
+    /// when something is still wrong after the retries: recordings.json did
+    /// not save, or a stale sidecar is still on disk.
+    private func settleUnsavedTranscriptEdit(_ recording: Recording) -> Bool {
         let url = transcriptURL(for: recording)
         if !writeTranscript(for: recording) {
             try? fileManager.removeItem(at: url)
@@ -1191,8 +1193,16 @@ final class RecordingStore: ObservableObject {
                 transcriptRewritesPending.insert(recording.id)
             }
         }
-        recStoreLog.error("transcript edit on \(recording.id, privacy: .public) was not fully saved")
-        trimNotice = "Mila removed the lines, but couldn't save the change to disk. Check that the recordings folder is available and has free space; until it saves, the lines may come back after Mila restarts."
+        let persisted = persist()
+        let sidecarStale = transcriptRewritesPending.contains(recording.id)
+        if !persisted {
+            recStoreLog.error("transcript edit on \(recording.id, privacy: .public): recordings.json not saved")
+            trimNotice = "Mila removed the lines, but couldn't save the change to disk. Check that the recordings folder is available and has free space; until it saves, the lines may come back after Mila restarts."
+        } else if sidecarStale {
+            recStoreLog.error("transcript edit on \(recording.id, privacy: .public): .txt sidecar still stale")
+            trimNotice = "Mila removed the lines, but couldn't update the transcript's text file, so tools reading that file may still see them. Mila will keep retrying."
+        }
+        return persisted
     }
 
     /// `persist()`'s retry of sidecars `settleUnsavedTranscriptEdit` could

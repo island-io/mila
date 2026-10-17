@@ -442,10 +442,12 @@ final class TranscriptTrimTests: XCTestCase {
 
     // MARK: - Unsaved edits
 
-    /// The `.txt` sidecar is what mila-mcp serves first, so an edit that
-    /// could not rewrite it must not count as done, must be reported, and
-    /// must be retried on a later write.
-    func test_an_edit_whose_sidecar_cannot_be_written_is_reported_and_retried() throws {
+    /// The `.txt` sidecar is what mila-mcp serves first, so a stale one must
+    /// be reported and retried on a later write. The edit itself is in
+    /// recordings.json, so it still stands — End Conversation Here must
+    /// still go on to cut the audio, or it never could (the clicked line is
+    /// now the last one, where the action is disabled).
+    func test_an_edit_whose_sidecar_cannot_be_written_stands_is_reported_and_retried() throws {
         let store = RecordingStore(rootDirectory: tempRoot)
         let segs = fourLines()
         let rec = recording(segments: segs)
@@ -456,15 +458,32 @@ final class TranscriptTrimTests: XCTestCase {
         try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory)
         defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory) }
 
-        XCTAssertNil(store.deleteSegments([segs[2].id], recordingID: rec.id),
-                     "an edit that did not reach disk is not a success")
-        XCTAssertNotNil(store.trimNotice)
+        XCTAssertNotNil(store.deleteSegments([segs[2].id], recordingID: rec.id),
+                        "recordings.json holds the edit, so it stands")
+        XCTAssertNotNil(store.trimNotice, "a stale sidecar is still reported")
 
         try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory)
         store.rename(rec, to: "Call, renamed")  // any later write
 
         XCTAssertEqual(try String(contentsOf: sidecar, encoding: .utf8), "one two four",
                        "the stale sidecar still served the removed line")
+    }
+
+    /// When recordings.json itself does not take the edit, it is a real
+    /// failure: not returned as done (so no audio cut follows) and reported.
+    func test_an_edit_that_recordings_json_did_not_take_is_not_a_success() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let segs = fourLines()
+        let rec = recording(segments: segs)
+        store.add(rec)
+        // recordings.json lives at the root; the sidecars in `Recordings/`.
+        let root = tempRoot.path
+        let fm = FileManager.default
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: root)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: root) }
+
+        XCTAssertNil(store.deleteSegments([segs[2].id], recordingID: rec.id))
+        XCTAssertNotNil(store.trimNotice)
     }
 
     // MARK: - Crash leftovers
