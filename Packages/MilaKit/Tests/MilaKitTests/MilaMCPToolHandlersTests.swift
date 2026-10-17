@@ -13,9 +13,9 @@ final class MilaMCPToolHandlersTests: XCTestCase {
             withIntermediateDirectories: true)
         // Every test below exercises the granted path, so open the gate the
         // same way the app does — through the real file — rather than by
-        // injecting a stub. `test_tools_are_refused_when_access_is_disabled`
-        // covers the closed path.
-        try MCPAccessGate.set(true, root: root)
+        // injecting a stub. File export is granted too, for the
+        // save_transcript tests; MCPAccessGateTests covers both closed paths.
+        try MCPAccessGate.set(true, fileExport: true, root: root)
     }
 
     override func tearDownWithError() throws {
@@ -487,6 +487,337 @@ final class MilaMCPToolHandlersTests: XCTestCase {
         XCTAssertTrue(stoppedNote?.contains("stopped") == true, String(describing: stoppedNote))
         let failedNote = try call("get_transcript", ["id": failed.id.uuidString])["note"] as? String
         XCTAssertTrue(failedNote?.contains("\"failed\"") == true, String(describing: failedNote))
+    }
+
+    // MARK: save_transcript
+
+    private func exportDirectory() throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MCPExport-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: dir) }
+        return dir
+    }
+
+    private func assertInvalid(_ args: [String: Any], mentions needle: String,
+                               file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertThrowsError(try call("save_transcript", args), file: file, line: line) { error in
+            let message = String(describing: error)
+            XCTAssertTrue(message.contains(needle), message, file: file, line: line)
+        }
+    }
+
+    /// The point of `save_transcript`: the file is written by the helper and
+    /// the reply carries no transcript text for the client to re-emit.
+    func test_save_transcript_writes_the_file_and_omits_the_transcript_from_the_reply() throws {
+        try seedStore([meeting("Latest", daysAgo: 0,
+                               speakerNames: ["SPEAKER_00": "דנה", "SPEAKER_01": "John Doe"],
+                               summary: "Quick sync.")])
+        let target = try exportDirectory().appendingPathComponent("out.txt")
+        let result = try call("save_transcript", ["path": target.path])
+
+        let written = try String(contentsOf: target, encoding: .utf8)
+        XCTAssertEqual(written, "דנה: shalom everyone\nJohn Doe: let's begin")
+        XCTAssertNil(result["transcript"])
+        XCTAssertEqual(result["bytes"] as? Int, Data(written.utf8).count)
+        XCTAssertEqual(result["characters"] as? Int, written.count)
+        let savedTo = try XCTUnwrap(result["saved_to"] as? String)
+        XCTAssertEqual(URL(fileURLWithPath: savedTo).resolvingSymlinksInPath(),
+                       target.resolvingSymlinksInPath())
+        XCTAssertNil(result["summary"], "the write reply stays small; get_transcript has the summary")
+    }
+
+    func test_save_transcript_srt_writes_the_same_bytes_the_reply_would_carry() throws {
+        try seedStore([meeting("Subtitled", daysAgo: 0)])
+        let inline = try XCTUnwrap(try call("get_transcript", ["format": "srt"])["transcript"] as? String)
+        let target = try exportDirectory().appendingPathComponent("subs.srt")
+        _ = try call("save_transcript", ["format": "srt", "path": target.path])
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), inline)
+    }
+
+    /// An existing folder gets a dated, title-derived name with the format's
+    /// extension, with path separators in the title neutralised.
+    func test_save_transcript_a_folder_names_the_file_from_date_and_title() throws {
+        try seedStore([meeting("Q3 / planning: kickoff", daysAgo: 0)])
+        let dir = try exportDirectory()
+        let result = try call("save_transcript", ["format": "srt", "path": dir.path])
+        let savedTo = URL(fileURLWithPath: try XCTUnwrap(result["saved_to"] as? String))
+        XCTAssertEqual(savedTo.deletingLastPathComponent().resolvingSymlinksInPath(),
+                       dir.resolvingSymlinksInPath())
+        XCTAssertTrue(savedTo.lastPathComponent.hasSuffix(" Q3 - planning- kickoff.srt"),
+                      savedTo.lastPathComponent)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: savedTo.path))
+    }
+
+    /// APFS caps a name at 255 UTF-8 bytes. A long Hebrew or emoji title
+    /// must still produce a name that fits, cut between characters.
+    func test_save_transcript_to_a_folder_keeps_long_titles_under_the_byte_limit() throws {
+        let titles = [String(repeating: "פגישה ", count: 60), String(repeating: "🎙️", count: 100)]
+        try seedStore(titles.enumerated().map { meeting($1, daysAgo: Double($0)) })
+        let recordings = try MilaStoreReader(root: root).loadRecordings()
+        let dir = try exportDirectory()
+        for recording in recordings {
+            let result = try call("save_transcript", ["id": recording.id.uuidString, "path": dir.path])
+            let name = URL(fileURLWithPath: try XCTUnwrap(result["saved_to"] as? String)).lastPathComponent
+            XCTAssertLessThanOrEqual(name.utf8.count, 255, name)
+            XCTAssertTrue(name.hasSuffix(".txt"), name)
+        }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path).count, 2)
+    }
+
+    /// Writing is its own tool so a client asks permission for it
+    /// separately — `get_transcript` must stay read-only.
+    func test_get_transcript_has_no_write_arguments() throws {
+        let specs = Dictionary(uniqueKeysWithValues: MilaMCPToolHandlers.toolSpecs.map { ($0.name, $0) })
+        let getProps = try XCTUnwrap(specs["get_transcript"]?.inputSchema["properties"] as? [String: Any])
+        XCTAssertNil(getProps["path"]); XCTAssertNil(getProps["save_to"]); XCTAssertNil(getProps["overwrite"])
+        XCTAssertNotNil(specs["save_transcript"])
+    }
+
+    func test_save_transcript_refuses_an_existing_file_unless_overwrite() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let target = try exportDirectory().appendingPathComponent("out.txt")
+        try "keep me".write(to: target, atomically: true, encoding: .utf8)
+
+        assertInvalid(["path": target.path], mentions: "already exists")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "keep me")
+
+        _ = try call("save_transcript", ["path": target.path, "overwrite": true])
+        XCTAssertNotEqual(try String(contentsOf: target, encoding: .utf8), "keep me")
+    }
+
+    func test_save_transcript_rejects_relative_and_missing_paths() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let dir = try exportDirectory()
+        assertInvalid(["path": "out.txt"], mentions: "absolute")
+        assertInvalid(["path": dir.appendingPathComponent("nope/out.txt").path],
+                      mentions: "does not exist")
+        assertInvalid([:], mentions: "path is required")
+        assertInvalid(["path": ""], mentions: "path is required")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [],
+                       "a refused call leaves nothing behind")
+    }
+
+    /// Writing transcript text over recordings.json (or anything else in
+    /// Mila's app-support root) would corrupt the library.
+    func test_save_transcript_refuses_mila_own_data_directories() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let store = root.appendingPathComponent("recordings.json")
+        let before = try Data(contentsOf: store)
+        assertInvalid(["path": store.path, "overwrite": true], mentions: "Mila's own data")
+        assertInvalid(["path": root.appendingPathComponent("Recordings").path],
+                      mentions: "Mila's own data")
+        assertInvalid(["path": root.appendingPathComponent("Recordings/new.txt").path],
+                      mentions: "Mila's own data")
+        XCTAssertEqual(try Data(contentsOf: store), before)
+    }
+
+    /// APFS is case-insensitive by default, so a differently-cased spelling
+    /// of the root IS the root. A string-prefix check let this through and
+    /// overwrote recordings.json; containment is now decided by filesystem
+    /// identity.
+    func test_save_transcript_refuses_a_differently_cased_spelling_of_the_root() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let store = root.appendingPathComponent("recordings.json")
+        let before = try Data(contentsOf: store)
+        let variant = root.deletingLastPathComponent()
+            .appendingPathComponent(root.lastPathComponent.lowercased(), isDirectory: true)
+        XCTAssertNotEqual(variant.path, root.path, "precondition: a different spelling")
+        let target = variant.appendingPathComponent("RECORDINGS.JSON").path
+        if FileManager.default.fileExists(atPath: variant.path) {
+            // Case-insensitive volume (the macOS default): the same folder.
+            assertInvalid(["path": target, "overwrite": true], mentions: "Mila's own data")
+        } else {
+            // Case-sensitive volume: a different, missing folder.
+            assertInvalid(["path": target, "overwrite": true], mentions: "does not exist")
+        }
+        XCTAssertEqual(try Data(contentsOf: store), before)
+    }
+
+    /// A symlinked folder spells the root under another name entirely.
+    func test_save_transcript_refuses_a_symlinked_folder_into_mila_data() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let store = root.appendingPathComponent("recordings.json")
+        let before = try Data(contentsOf: store)
+        let link = try exportDirectory().appendingPathComponent("mila-link")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: root)
+
+        assertInvalid(["path": link.appendingPathComponent("recordings.json").path, "overwrite": true],
+                      mentions: "Mila's own data")
+        assertInvalid(["path": link.path], mentions: "Mila's own data")
+        XCTAssertEqual(try Data(contentsOf: store), before)
+    }
+
+    /// `~/Desktop/notes.txt -> recordings.json` with overwrite used to write
+    /// straight through the link. A destination that is a symlink is refused,
+    /// with or without overwrite, and the link itself is left alone.
+    func test_save_transcript_refuses_a_destination_that_is_a_symlink() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let store = root.appendingPathComponent("recordings.json")
+        let before = try Data(contentsOf: store)
+        let dir = try exportDirectory()
+        let link = dir.appendingPathComponent("notes.txt")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: store)
+        let dangling = dir.appendingPathComponent("dangling.txt")
+        try FileManager.default.createSymbolicLink(
+            at: dangling, withDestinationURL: dir.appendingPathComponent("nowhere.txt"))
+
+        assertInvalid(["path": link.path, "overwrite": true], mentions: "symbolic link")
+        assertInvalid(["path": link.path], mentions: "symbolic link")
+        assertInvalid(["path": dangling.path, "overwrite": true], mentions: "symbolic link")
+        XCTAssertEqual(try Data(contentsOf: store), before)
+        XCTAssertEqual(try FileManager.default.destinationOfSymbolicLink(atPath: link.path), store.path)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir.appendingPathComponent("nowhere.txt").path),
+                       "a dangling link must not be followed to create its target")
+    }
+
+    /// A relocated recordings folder can be somewhere ordinary, so it is not
+    /// off limits as a whole: a new export may be created there. What is
+    /// protected is Mila's own files in it.
+    func test_save_transcript_into_a_relocated_recordings_folder_protects_only_milas_files() throws {
+        let relocated = try exportDirectory()
+        let store = relocated.appendingPathComponent("recordings.json")
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode([meeting("Latest", daysAgo: 0)]).write(to: store)
+        try StoreLocationPointer(recordingsDirectory: relocated.path,
+                                 storeFile: store.path, updatedAt: Date()).write(to: root)
+        // A recording's audio, whose `.txt` sidecar is not written yet, and
+        // an unrelated file the user keeps in the same folder.
+        try Data("RIFF".utf8).write(to: relocated.appendingPathComponent("Latest.wav"))
+        try "user's own notes".write(to: relocated.appendingPathComponent("notes.txt"),
+                                     atomically: true, encoding: .utf8)
+        let storeBefore = try Data(contentsOf: store)
+
+        let result = try call("save_transcript",
+                              ["path": relocated.appendingPathComponent("Export.txt").path])
+        XCTAssertNotNil(result["saved_to"], "a new export in the relocated folder is allowed")
+        let viaFolder = try call("save_transcript", ["path": relocated.path])
+        XCTAssertNotNil(viaFolder["saved_to"], "so is the default name in it")
+
+        // Nothing already there is replaced, overwrite or not.
+        assertInvalid(["path": store.path, "overwrite": true], mentions: "recordings folder")
+        assertInvalid(["path": relocated.appendingPathComponent("notes.txt").path, "overwrite": true],
+                      mentions: "recordings folder")
+        // Mila's names are reserved even before they exist, in any case.
+        assertInvalid(["path": relocated.appendingPathComponent("Folders.JSON").path],
+                      mentions: "Mila uses that name")
+        // Audio would be imported as a recording by the orphan sweep.
+        assertInvalid(["path": relocated.appendingPathComponent("export.wav").path],
+                      mentions: "extension")
+        // `Latest.txt` / `.srt` / `.summary.txt` are that recording's sidecars.
+        for name in ["latest.txt", "Latest.srt", "Latest.summary.txt"] {
+            assertInvalid(["path": relocated.appendingPathComponent(name).path],
+                          mentions: "belongs to one of Mila's recordings")
+        }
+        XCTAssertEqual(try Data(contentsOf: store), storeBefore)
+        XCTAssertEqual(try String(contentsOf: relocated.appendingPathComponent("notes.txt"), encoding: .utf8),
+                       "user's own notes")
+    }
+
+    /// `~/Exports/` names a folder. When it does not exist that is an error —
+    /// it used to become a FILE called `Exports` in the parent.
+    func test_save_transcript_trailing_slash_means_a_folder() throws {
+        try seedStore([meeting("Latest", daysAgo: 0)])
+        let dir = try exportDirectory()
+        assertInvalid(["path": dir.path + "/Exports/"], mentions: "does not exist")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), [],
+                       "no file named after the missing folder")
+
+        let result = try call("save_transcript", ["path": dir.path + "/"])
+        let savedTo = URL(fileURLWithPath: try XCTUnwrap(result["saved_to"] as? String))
+        XCTAssertEqual(savedTo.deletingLastPathComponent().resolvingSymlinksInPath(),
+                       dir.resolvingSymlinksInPath())
+        XCTAssertTrue(savedTo.lastPathComponent.hasSuffix(" Latest.txt"), savedTo.lastPathComponent)
+    }
+
+    /// A file carries no "partial" note. Pending, failed and deferred rows are
+    /// refused — and with overwrite, a good export must survive the attempt.
+    func test_save_transcript_refuses_recordings_without_a_finished_transcript() throws {
+        var pending = meeting("Fresh", daysAgo: 0)
+        pending.status = "pending"
+        pending.segments = []
+        var failed = meeting("Broken", daysAgo: 1)
+        failed.status = "failed"
+        var deferred = meeting("Later", daysAgo: 2)
+        deferred.status = "failed"
+        deferred.transcriptionDeferredAt = Date(timeIntervalSince1970: 1_700_000_000)
+        var rerun = meeting("Rerun", daysAgo: 3)
+        rerun.status = "running"
+        rerun.retranscriptionPriorState = .init(status: "completed", language: "en")
+        try seedStore([pending, failed, deferred, rerun])
+
+        let dir = try exportDirectory()
+        let target = dir.appendingPathComponent("good.txt")
+        try "a good export".write(to: target, atomically: true, encoding: .utf8)
+        for recording in [pending, failed, deferred] {
+            for format in ["text", "srt"] {
+                assertInvalid(["id": recording.id.uuidString, "path": target.path,
+                               "overwrite": true, "format": format],
+                              mentions: "no finished transcript")
+            }
+        }
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "a good export")
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir.path), ["good.txt"])
+
+        // A re-run in flight still holds the earlier FINISHED transcript.
+        let saved = try call("save_transcript", ["id": rerun.id.uuidString,
+                                                 "path": dir.appendingPathComponent("rerun.txt").path])
+        XCTAssertNotNil(saved["saved_to"])
+        XCTAssertTrue((saved["note"] as? String ?? "").contains("re-transcription"))
+    }
+
+    /// A completed row whose transcript renders empty must not produce (or,
+    /// with overwrite, leave behind) an empty file.
+    func test_save_transcript_refuses_an_empty_transcript() throws {
+        var empty = meeting("Silent", daysAgo: 0)
+        empty.segments = []
+        try seedStore([empty])
+        let target = try exportDirectory().appendingPathComponent("good.txt")
+        try "a good export".write(to: target, atomically: true, encoding: .utf8)
+        assertInvalid(["id": empty.id.uuidString, "path": target.path, "overwrite": true],
+                      mentions: "empty transcript")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "a good export")
+    }
+
+    /// The path is checked before the store is loaded: with no store at all,
+    /// a bad path still reports the path, not "store could not be read".
+    func test_save_transcript_validates_the_path_before_touching_the_store() throws {
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("recordings.json").path), "precondition: no store")
+        let dir = try exportDirectory()
+        assertInvalid(["path": "out.txt"], mentions: "absolute")
+        assertInvalid(["path": dir.appendingPathComponent("missing/out.txt").path],
+                      mentions: "does not exist")
+        assertInvalid(["path": root.appendingPathComponent("out.txt").path],
+                      mentions: "Mila's own data")
+        // A good path does reach the store, and reports it.
+        XCTAssertThrowsError(try call("save_transcript",
+                                      ["path": dir.appendingPathComponent("out.txt").path])) { error in
+            XCTAssertTrue(String(describing: error).contains("could not be read"),
+                          String(describing: error))
+        }
+    }
+
+    /// Format controls are not all hostile: ZWJ holds composed emoji
+    /// together and RLM/LRM keep a mixed Hebrew/English title in order. Only
+    /// the bidi override/isolate controls (which can make a name read as
+    /// something else) and real control characters are replaced.
+    func test_default_file_name_keeps_joiners_and_marks_but_not_overrides() {
+        let date = Date(timeIntervalSince1970: 1_700_000_000)
+        func name(_ title: String) -> String {
+            TranscriptFileWriter.defaultFileName(title: title, createdAt: date, fileExtension: "txt")
+        }
+        let family = "👨\u{200D}👩\u{200D}👧 sync"
+        XCTAssertTrue(name(family).hasSuffix(" \(family).txt"), name(family))
+        let mixed = "פגישה\u{200F} Q3\u{200E} review\u{200C}"
+        XCTAssertTrue(name(mixed).hasSuffix(" \(mixed).txt"), name(mixed))
+        for override in ["\u{202E}", "\u{202A}", "\u{2066}", "\u{2069}"] {
+            XCTAssertFalse(name("a\(override)b").unicodeScalars.contains { $0 == override.unicodeScalars.first! },
+                           "bidi control U+\(String(override.unicodeScalars.first!.value, radix: 16)) must be replaced")
+        }
+        XCTAssertTrue(name("a\u{0007}b\nc/d:e\\f").hasSuffix(" a-b-c-d-e-f.txt"),
+                      name("a\u{0007}b\nc/d:e\\f"))
     }
 
     func test_get_transcript_unknown_id_throws_not_found() throws {

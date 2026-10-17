@@ -58,6 +58,68 @@ final class MCPAccessSettingsTests: XCTestCase {
         XCTAssertFalse(s.revocationFailed)
     }
 
+    // MARK: - File export is its own consent
+
+    /// Users who turned MCP access on before `save_transcript` existed have
+    /// `mcp.enabled` and no file-export key. Their next launch must mirror
+    /// reads only.
+    func test_existing_read_consent_does_not_grant_file_export() {
+        UserDefaults(suiteName: suite)!.set(true, forKey: MCPAccessSettings.Keys.enabled)
+        let s = settings()
+        XCTAssertTrue(s.enabled)
+        XCTAssertFalse(s.fileExportEnabled, "off by default")
+        XCTAssertTrue(MCPAccessGate.isEnabled(root: root))
+        XCTAssertFalse(MCPAccessGate.isFileExportEnabled(root: root))
+    }
+
+    func test_file_export_toggle_mirrors_in_both_directions() {
+        let s = settings()
+        s.enabled = true
+        s.fileExportEnabled = true
+        XCTAssertTrue(MCPAccessGate.isFileExportEnabled(root: root))
+
+        s.fileExportEnabled = false
+        XCTAssertFalse(MCPAccessGate.isFileExportEnabled(root: root))
+        XCTAssertTrue(MCPAccessGate.isEnabled(root: root), "reads are untouched")
+        XCTAssertFalse(s.revocationFailed)
+    }
+
+    /// Withdrawing read consent withdraws write consent with it, so turning
+    /// reads back on later never silently restores writes.
+    func test_turning_access_off_clears_file_export() {
+        let s = settings()
+        s.enabled = true
+        s.fileExportEnabled = true
+
+        s.enabled = false
+        XCTAssertFalse(s.fileExportEnabled)
+        XCTAssertFalse(MCPAccessGate.isFileExportEnabled(root: root))
+
+        s.enabled = true
+        XCTAssertFalse(s.fileExportEnabled)
+        XCTAssertFalse(MCPAccessGate.isFileExportEnabled(root: root))
+        XCTAssertEqual(UserDefaults(suiteName: suite)?.bool(forKey: MCPAccessSettings.Keys.fileExportEnabled),
+                       false)
+    }
+
+    /// Same fail-closed rule as reads: when file export can't be revoked,
+    /// its toggle is put back ON instead of claiming an off state.
+    func test_failed_file_export_revocation_keeps_its_toggle_honest() {
+        let s = settings()
+        s.enabled = true
+        s.fileExportEnabled = true
+
+        setRootWritable(false)
+        s.fileExportEnabled = false
+
+        XCTAssertTrue(MCPAccessGate.isFileExportEnabled(root: root),
+                      "precondition: the gate really is still granting writes")
+        XCTAssertTrue(s.fileExportEnabled)
+        XCTAssertTrue(s.revocationFailed)
+        XCTAssertEqual(UserDefaults(suiteName: suite)?.bool(forKey: MCPAccessSettings.Keys.fileExportEnabled),
+                       true)
+    }
+
     // MARK: - Revocation fails closed
 
     /// REGRESSION: when the atomic write failed while DISABLING, the existing

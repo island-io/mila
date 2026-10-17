@@ -12,8 +12,9 @@ description: >
 
 Mila is the user's local macOS transcription app. The `mila` MCP server
 exposes its recordings. If its tools (`list_recordings`,
-`get_transcript`, `search_transcripts`, `get_live_transcript`) are not
-available, tell the user to register the server once:
+`get_transcript`, `save_transcript`, `search_transcripts`,
+`get_live_transcript`) are not available, tell the user to register the
+server once:
 `claude mcp add mila -- '/Applications/Mila.app/Contents/MacOS/mila-mcp'`
 (the path is wherever Mila.app actually lives — Settings ▸ Storage shows
 the exact command with a Copy button)
@@ -32,15 +33,25 @@ the exact command with a Copy button)
   returns a stored `summary` when one exists — read it before deciding
   to re-summarize from the raw transcript. Transcripts may be in any
   language (often Hebrew); answer in the user's language.
-- "Subtitles" / "an .srt for this recording" → `get_transcript(id: …,
-  format: "srt")` and WRITE the result to a `.srt` file (next to the
-  user's video if they named one); do not paste cues into chat. It is the
-  same output as Mila's Export Subtitles. Do not pass `max_chars` here:
-  with `srt` it drops whole cues from the end, so a capped result is a
-  subtitle file that stops early — if `transcript_truncated` comes back
-  true, tell the user rather than writing a partial file. If the tool
-  refuses because the recording has no timed segments, say so and offer
-  the text transcript.
+- **Any time the transcript should end up in a file** (export, save,
+  upload somewhere, attach) → `save_transcript(id: …, path: …)` with an
+  absolute path or an existing folder, and Mila writes the complete file
+  itself. NEVER fetch
+  the transcript and write it out yourself: re-emitting it costs about one
+  output token per character (Hebrew especially), i.e. minutes per
+  meeting, where `save_transcript` takes milliseconds. The reply has `saved_to`
+  and `bytes` instead of the text; hand that path to whatever comes next
+  (an upload tool, the user). An existing file is refused unless you pass
+  `overwrite: true` — ask the user before replacing one. If it refuses
+  because saving files is turned off, tell the user it is a separate
+  setting in Mila (Settings ▸ Storage ▸ "Also allow saving transcripts to
+  files") — do not fall back to writing the transcript out yourself
+  unless they ask for that. Only finished transcripts are saved.
+- "Subtitles" / "an .srt for this recording" → `save_transcript(id: …,
+  format: "srt", path: …)` (next to the user's video if they named
+  one); do not paste cues into chat. It is the same output as Mila's
+  Export Subtitles. If the tool refuses because the recording has no
+  timed segments, say so and offer the text transcript.
 - Action items from `get_transcript` carry a `source`. `voice_command`
   means the speaker dictated the item out loud; `inferred` means Live AI
   derived it from the conversation. Do not report an inferred item as

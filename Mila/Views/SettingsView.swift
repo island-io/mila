@@ -2618,13 +2618,31 @@ private struct DiarizationSettingsTabContent: View {
 /// popover) are offered in every future recording's rename list.
 private struct KnownSpeakersSection: View {
     @EnvironmentObject private var directory: SpeakerDirectory
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var newName = ""
+
+    /// A ✕ that found a voice profile behind the name, or could not tell:
+    /// the removal waits on the confirmation below. A plain name is removed
+    /// at once — nothing irreversible goes with it.
+    private struct PendingRemoval {
+        let name: String
+        let voice: SpeakerProfileStore.StoredVoice
+    }
+    @State private var pendingRemoval: PendingRemoval?
+    /// Why a voice profile was not (fully) deleted, shown under the list
+    /// until dismissed — never a claim that it was.
+    @State private var removalProblem: String?
+
+    private var isConfirmingRemoval: Binding<Bool> {
+        Binding(get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Known speakers")
                 .font(.callout.weight(.semibold))
-            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here doesn't change recordings it's already assigned to.")
+            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here also deletes its voice profile, so it stops being recognised in new recordings; recordings it's already assigned to are unchanged.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2637,13 +2655,13 @@ private struct KnownSpeakersSection: View {
                                 Text(name)
                                 Spacer()
                                 Button {
-                                    directory.remove(name)
+                                    requestRemoval(of: name)
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
                                         .foregroundStyle(.secondary)
                                 }
                                 .buttonStyle(.borderless)
-                                .help("Remove \"\(name)\" from the list")
+                                .help("Remove \"\(name)\" from the list, and delete its voice profile if it has one")
                                 .accessibilityIdentifier("speakers.known.remove.\(name)")
                             }
                             .padding(.horizontal, 10)
@@ -2656,6 +2674,23 @@ private struct KnownSpeakersSection: View {
                 }
                 .frame(maxHeight: 120)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .alert(removalTitle, isPresented: isConfirmingRemoval, presenting: pendingRemoval) { pending in
+                    // An unreadable file means only the name can go, so the
+                    // button says what it does and is not destructive.
+                    let deletesVoice = pending.voice != .unknown
+                    Button(deletesVoice ? "Delete" : "Remove",
+                           role: deletesVoice ? .destructive : nil) {
+                        confirmRemoval(pending)
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: { pending in
+                    Text(removalMessage(pending))
+                }
+            }
+
+            if let removalProblem {
+                VoiceDeletionProblemNote(message: removalProblem) { self.removalProblem = nil }
+                    .accessibilityIdentifier("speakers.known.voiceDeletionProblem")
             }
 
             HStack(spacing: 8) {
@@ -2675,11 +2710,98 @@ private struct KnownSpeakersSection: View {
             newName = ""
         }
     }
+
+    private var removalTitle: String {
+        guard let pending = pendingRemoval else { return "" }
+        switch pending.voice {
+        case .unknown: return "Remove “\(pending.name)”?"
+        case .stored, .notStored: return "Delete the voice profile for “\(pending.name)”?"
+        }
+    }
+
+    private func removalMessage(_ pending: PendingRemoval) -> String {
+        switch pending.voice {
+        case .unknown:
+            return "Mila can't read speaker-profiles.json right now, so it can't tell whether “\(pending.name)” has a voice profile, and can't delete one if it does. Only the name is removed; the file is left untouched. Delete Voice Profiles below removes every voice profile."
+        case .stored, .notStored:
+            return "Mila has a voice fingerprint for “\(pending.name)” and uses it to recognise them in new recordings. Removing the name deletes the fingerprint too. Speaker names already on your recordings are untouched. This can't be undone."
+        }
+    }
+
+    /// The ✕. The name list and the voice profiles are separate stores, and
+    /// recognition reads only the profiles, so dropping just the name left
+    /// the voice labelling speakers (#358). Deleting a trained voice is
+    /// irreversible, so that — and only that — asks first.
+    private func requestRemoval(of name: String) {
+        removalProblem = nil
+        let voice = profileStore.storedVoice(forSpeakerNamed: name)
+        switch voice {
+        case .notStored:
+            directory.remove(name)
+        case .stored, .unknown:
+            pendingRemoval = PendingRemoval(name: name, voice: voice)
+        }
+    }
+
+    /// The name always goes — that is what the user asked for, and it
+    /// cannot fail. What happened to the voice is reported as it is: a
+    /// profile that is gone only until relaunch, or could not be touched,
+    /// is never presented as deleted.
+    private func confirmRemoval(_ pending: PendingRemoval) {
+        let outcome = profileStore.forgetSpeaker(named: pending.name)
+        directory.remove(pending.name)
+        // The confirmation already said an unreadable file stops the delete.
+        if pending.voice == .unknown, outcome == .profileFileUnreadable { return }
+        removalProblem = voiceDeletionProblem(outcome, name: pending.name)
+    }
+}
+
+/// What to tell the user when a single voice-profile delete did not fully
+/// happen, or nil when it did (or there was nothing to delete).
+private func voiceDeletionProblem(_ outcome: SpeakerProfileStore.ProfileDeletionOutcome,
+                                  name: String) -> String? {
+    switch outcome {
+    case .deleted, .nothingToDelete:
+        return nil
+    case .deletedForThisSessionOnly:
+        return "Mila has stopped recognising “\(name)” for now, but couldn't save the change to speaker-profiles.json, so their voice profile will be back the next time Mila starts."
+    case .profileFileUnreadable:
+        return "The voice profile for “\(name)” couldn't be deleted from speaker-profiles.json: the file can't be read, so it was left untouched. Delete Voice Profiles below removes every voice profile."
+    case .notDeleted:
+        return "The voice profile for “\(name)” couldn't be deleted: speaker-profiles.json couldn't be written. It is still stored on this Mac."
+    }
+}
+
+/// The orange callout Settings → Speakers uses for a voice-profile delete
+/// that did not fully happen — the same look as the damaged-profiles notice.
+private struct VoiceDeletionProblemNote: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Dismiss", action: dismiss)
+                    .font(.caption)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+    }
 }
 
 /// Settings → Speakers → voice recognition: the opt-in switch for
-/// cross-recording recognition, plus the delete path for whatever it has
-/// already stored. Sits below the known-speakers list.
+/// cross-recording recognition, plus the delete paths for whatever it has
+/// already stored: all of it at once, or (while on) one voice at a time,
+/// including voices whose name is not in Known speakers. Sits below the
+/// known-speakers list.
 ///
 /// The off-state footprint is deliberately one toggle and one caption — the
 /// shape `ObsidianSettingsSection.enableCard` uses, in the flat,
@@ -2704,6 +2826,10 @@ private struct VoiceRecognitionSection: View {
     @EnvironmentObject private var settings: VoiceRecognitionSettings
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var showDeleteConfirmation = false
+    /// The single voice profile whose delete is waiting on confirmation.
+    @State private var pendingProfileDeletion: VoiceProfile?
+    /// Why the last single-profile delete did not fully happen.
+    @State private var profileDeletionProblem: String?
     /// Only a Settings window in front stands in for the main-window banner
     /// (#342); one left open in the background does not.
     @Environment(\.controlActiveState) private var controlActiveState
@@ -2771,6 +2897,19 @@ private struct VoiceRecognitionSection: View {
                 } message: {
                     Text("This deletes speaker-profiles.json and every voice fingerprint in it. Speaker names already on your recordings are untouched, but nobody will be recognised in new ones. This can't be undone.")
                 }
+
+                // One voice at a time — including voices whose name is not
+                // (or no longer) in Known speakers, which the ✕ there cannot
+                // reach. Only while on: while off the file is never loaded,
+                // so there is nothing to list.
+                if settings.isEnabled, !profileStore.profiles.isEmpty {
+                    storedProfilesList
+                }
+            }
+
+            if let profileDeletionProblem {
+                VoiceDeletionProblemNote(message: profileDeletionProblem) { self.profileDeletionProblem = nil }
+                    .accessibilityIdentifier("speakers.voiceRecognition.deletionProblem")
             }
         }
         // The notice's "Show in Finder" sends the user off to fix things by
@@ -2778,6 +2917,62 @@ private struct VoiceRecognitionSection: View {
         .onAppear { profileStore.recheckDamagedProfiles() }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             profileStore.recheckDamagedProfiles()
+        }
+    }
+
+    private var profileDeletionTitle: String {
+        guard let profile = pendingProfileDeletion else { return "" }
+        return "Delete the voice profile for “\(profile.name)”?"
+    }
+
+    private var isConfirmingProfileDeletion: Binding<Bool> {
+        Binding(get: { pendingProfileDeletion != nil },
+                set: { if !$0 { pendingProfileDeletion = nil } })
+    }
+
+    /// Every stored voice, each with its own delete — the same confirmation
+    /// Known speakers' ✕ asks for a trained voice.
+    private var storedProfilesList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(profileStore.profiles.sorted {
+                    $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }) { profile in
+                    HStack {
+                        Text(profile.name)
+                            .font(.caption)
+                        Spacer()
+                        Button {
+                            profileDeletionProblem = nil
+                            pendingProfileDeletion = profile
+                        } label: {
+                            Image(systemName: "trash")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Delete the voice profile for \"\(profile.name)\"")
+                        .accessibilityIdentifier("speakers.voiceRecognition.profile.delete.\(profile.name)")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("speakers.voiceRecognition.profile.row.\(profile.name)")
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .frame(maxHeight: 120)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .alert(profileDeletionTitle,
+               isPresented: isConfirmingProfileDeletion,
+               presenting: pendingProfileDeletion) { profile in
+            Button("Delete", role: .destructive) {
+                let outcome = profileStore.deleteProfile(id: profile.id)
+                profileDeletionProblem = voiceDeletionProblem(outcome, name: profile.name)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { profile in
+            Text("Mila uses this voice fingerprint to recognise “\(profile.name)” in new recordings. Deleting it means they won't be recognised again until you name them and Mila learns their voice anew. Known speakers and the speaker names already on your recordings are unchanged. This can't be undone.")
         }
     }
 
@@ -2822,7 +3017,7 @@ private struct VoiceRecognitionSection: View {
     }
 
     /// While the feature is off the profiles file is deliberately never
-    /// parsed, so there is no count to show — only the fact that it exists.
+    /// loaded, so there is no count to show — only the fact that it exists.
     private var storedProfilesLabel: String {
         guard settings.isEnabled else {
             // The file that failed to load is not "where you left off"; the

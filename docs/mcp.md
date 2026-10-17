@@ -7,7 +7,9 @@ live transcript of a meeting **while it's still happening**.
 
 Everything stays local: the server reads Mila's own on-disk store; no
 audio or text leaves your Mac unless you ask Claude to do something
-with it.
+with it. Its one write is `save_transcript`, which saves a transcript to
+a file you (or Claude, on your behalf) name — it never changes Mila's own
+data, and it needs a second opt-in of its own (below).
 
 ## Turn it on first
 
@@ -16,6 +18,15 @@ Storage → "Allow MCP access to transcriptions"**. Until you do, every tool
 call is refused with a message pointing back at that toggle, and the
 setting takes effect immediately — turning it off cuts access to an
 already-running Claude session without restarting anything.
+
+**Saving files is a separate opt-in, also off by default.** Beneath the
+first toggle, **"Also allow saving transcripts to files"** lets
+`save_transcript` create files. Turning on read access — including
+having turned it on before `save_transcript` existed — does not turn this
+on, and turning read access off turns it off too. While it is off,
+`save_transcript` is refused with a message naming the toggle, and every
+other tool works as before. Like the first toggle it is re-checked on
+every call.
 
 The toggle is a consent control, not a security boundary, and it's worth
 being straight about the difference. `mila-mcp` runs as you, and so does
@@ -69,6 +80,7 @@ cp -R skills/mila-meetings ~/.claude/skills/
 |---|---|
 | `list_recordings` | List/filter recordings — by speaker display name, title/app/folder text, source, date range; sortable by date/duration/title. A row whose transcription the user stopped to run later carries `transcription_stopped: true` (its `status` reads `failed`, but nothing failed). |
 | `get_transcript` | One recording's full speaker-named transcript + summary + action items. Omit `id` for the latest completed recording. Trashed recordings are not reachable, by id or otherwise. `format: "srt"` returns SubRip subtitles instead (one timed cue per segment, speaker names as cue prefixes — byte-identical to the app's **Export Subtitles (.srt)**); it is refused for recordings that have no timed segments, and `max_chars` then drops whole cues rather than cutting one. Each action item carries a `source` — `voice_command` (the speaker dictated it out loud) or `inferred` (Live AI derived it from the conversation). Those are not the same claim, so a client should not present the second as the first. |
+| `save_transcript` | Writes one recording's complete transcript (`text` or `srt`) to a file and replies with `saved_to` / `bytes` instead of the text. The only tool that writes: it needs the separate "Also allow saving transcripts to files" opt-in, and is kept separate from `get_transcript` so a client asks for permission to use it on its own. See [Saving to a file](#saving-to-a-file-save_transcript). |
 | `search_transcripts` | Full-text search over titles + transcripts with context snippets; relevance or date sort. |
 | `get_live_transcript` | The in-progress recording's transcript, with a polling cursor for cheap deltas. |
 
@@ -106,8 +118,50 @@ Claude calls `list_recordings(speaker: "john doe", limit: 1)` and then
 assigned in Mila's rename popover — unnamed speakers stay `SPEAKER_NN`.
 
 For subtitles — "export my last meeting as an .srt next to the video" —
-Claude calls `get_transcript(id: …, format: "srt")` and writes the result
-to a file. The cues are the same ones the app's own export produces.
+Claude calls `save_transcript(id: …, format: "srt", path: "<folder>")`.
+The cues are the same ones the app's own export produces.
+
+### Saving to a file (`save_transcript`)
+
+`save_transcript(path: …)` writes the complete transcript (text or SRT)
+to disk from the helper itself and replies with `saved_to`, `bytes` and
+`characters` in place of the transcript text. Use it whenever the end
+product is a file. The alternative — fetch the text, have the model write
+it out — makes the model re-generate every character as output tokens;
+Hebrew runs close to one token per character, so a 40 KB transcript of a
+20-minute meeting took about three minutes per file that way, against
+milliseconds here.
+
+- `path` is an absolute path (`~` is expanded) or an existing folder,
+  which gets `<date> <title>.txt` / `.srt`. A path ending in `/` always
+  means a folder. The folder must exist; nothing is created on a guess.
+- An existing file is refused unless `overwrite: true`; the refusal is
+  atomic, so a file that appears mid-write is not replaced either. On
+  volumes without an exclusive rename (exFAT, FAT, some network shares)
+  the helper falls back to `link(2)`, then to an exclusive create, so the
+  default still works there.
+- A destination that is a symbolic link (or a folder, or anything but a
+  regular file) is refused, and a replace swaps the directory entry —
+  it never writes through a link.
+- Only finished transcripts are saved. A recording that is still
+  transcribing, failed, or was stopped to transcribe later is refused
+  (`get_transcript` shows its draft), and so is an empty transcript — a
+  file carries no "this is partial" note, and with `overwrite` it would
+  replace a good export.
+- There is no `max_chars`: a saved file is always complete.
+- It is a separate tool from `get_transcript` on purpose. Clients ask
+  permission per tool, so having always-allowed reading transcripts does
+  not also allow writing files.
+- Mila's app-support folder is off limits, however it is spelled:
+  containment is decided by the folder's identity on disk, not by
+  comparing path strings, so a differently-cased path or a symlinked
+  folder lands on the same refusal. A **relocated** recordings folder
+  may be somewhere ordinary like `~/Documents`, so new exports may be
+  created there — but no file already in it is ever replaced, Mila's own
+  names (`recordings.json`, `folders.json`, …) and audio extensions are
+  refused, and so is a name that is one of a recording's sidecars
+  (`<audio name>.txt` / `.srt`). Like the access toggles, these checks
+  prevent accidents; the helper runs as you and is not a sandbox.
 
 ## Following a live meeting
 
@@ -165,8 +219,12 @@ How the polling works under the hood:
   publishes the handoff last.
 
 - `~/Library/Application Support/Mila/mcp-access.json` — the consent
-  flag, written by the app whenever the setting changes and re-mirrored
-  on every launch. Missing or unreadable means **denied**.
+  flags, written by the app whenever a setting changes and re-mirrored
+  on every launch. Missing or unreadable means **denied**. `enabled`
+  grants the read tools; `fileExportEnabled` additionally grants
+  `save_transcript` and counts only alongside `enabled`. A file without
+  `fileExportEnabled` — every file written before it existed — grants
+  reads only.
 
   Two things have to be true for it to say yes: you turned the toggle on,
   **and** Mila could confirm that `store-location.json` names the store it
@@ -175,9 +233,10 @@ How the polling works under the hood:
   paused instead, and Settings says so. It comes back by itself once the
   pointer is written again (every launch rewrites it).
 
-  Turning access off also fails closed: if the file can't be rewritten,
-  Mila deletes it, and if it can't do that either the toggle stays ON
-  rather than showing an off state it never achieved.
+  Turning access off also fails closed, for either flag: if the file
+  can't be rewritten, Mila deletes it, and if it can't do that either the
+  toggle concerned stays ON rather than showing an off state it never
+  achieved.
 
 If the app has never run (no pointer file), the server falls back to
 the default layout. Changes to the `recordings.json` schema must be
