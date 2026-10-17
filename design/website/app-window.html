@@ -4,7 +4,7 @@
   (sidebar + recording detail) with sample Hebrew/English data, laid out after
   SidebarView, RecordingDetailView and AIOverviewSection. Render it with:
 
-    python3 scripts/render-site-screenshot.py
+    NODE_PATH=$(npm root -g) node design/website/render.mjs [fonts-dir]
 
   Replace site/app-screenshot.png with a real capture of the app at any time;
   the site only references the PNG.
@@ -61,7 +61,7 @@
   .muted { color: var(--secondary); }
   .rtl { direction: rtl; unicode-bidi: plaintext; }
   /* Detail */
-  .detail { display: grid; grid-template-rows: auto auto 1fr auto; min-width: 0; }
+  .detail { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
   .toolbar { height: 52px; border-bottom: 1px solid var(--sep); display: flex; align-items: center; justify-content: flex-end; gap: 14px; padding: 0 18px; color: var(--secondary); }
   .pill { border: 1px solid var(--sep); border-radius: 7px; padding: 4px 10px; font-size: 12px; color: var(--text); background: #fafafa; }
   .pill.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
@@ -70,24 +70,17 @@
   .meta { display: flex; align-items: center; gap: 8px; color: var(--secondary); font-size: 12.5px; }
   .badge { width: 18px; height: 18px; border-radius: 5px; background: #2d8cff; display: grid; place-items: center; }
   .badge svg { width: 12px; height: 12px; color: #fff; }
-  .chips { display: flex; gap: 6px; margin-top: 10px; }
-  .chip { font-size: 11.5px; border-radius: 999px; padding: 2px 9px; font-weight: 600; }
-  .body { overflow: hidden; padding: 0 22px; display: grid; grid-template-columns: 1fr 330px; gap: 18px; }
-  .transcript { overflow: hidden; }
+  .transcript { overflow: hidden; padding: 6px 22px 0; }
   .row { display: flex; align-items: baseline; gap: 8px; padding: 7px 8px; border-radius: 6px; }
   .row.active { background: var(--sel); }
   .row .text { flex: 1; font-size: 14px; line-height: 1.5; }
   .row .spk { font-weight: 650; white-space: nowrap; font-size: 14px; }
   .row .ts { font-size: 11px; color: var(--secondary); font-variant-numeric: tabular-nums; }
   .a { color: var(--spk-a); } .b { color: var(--spk-b); } .c { color: var(--spk-c); } .dd { color: var(--spk-d); }
-  .ai { border: 1px solid var(--sep); border-radius: 10px; padding: 12px 14px; background: #f7f9f8; align-self: start; }
-  .ai h4 { margin: 0 0 6px; font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
+  .ai { border-top: 1px solid var(--sep); border-bottom: 1px solid var(--sep); padding: 12px 22px 14px; display: grid; gap: 10px; }
+  .ai h4 { margin: 0 0 3px; font-size: 13px; font-weight: 600; display: flex; gap: 6px; align-items: center; }
   .ai h4 svg { width: 14px; height: 14px; color: var(--accent); }
-  .ai ul { margin: 0 0 12px; padding: 0 18px 0 0; font-size: 13px; line-height: 1.55; }
-  .ai li { margin: 2px 0; }
-  .ai .check { list-style: none; padding: 0; }
-  .ai .check li { display: flex; gap: 7px; align-items: baseline; }
-  .ai .check li::before { content: ""; width: 11px; height: 11px; border: 1.5px solid var(--secondary); border-radius: 3px; flex: none; transform: translateY(2px); }
+  .ai p { margin: 0; font-size: 13px; line-height: 1.55; }
   .player { border-top: 1px solid var(--sep); padding: 10px 22px; display: flex; align-items: center; gap: 14px; }
   .play { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); display: grid; place-items: center; }
   .play svg { width: 12px; height: 12px; color: #fff; }
@@ -128,45 +121,35 @@
         <span class="badge"><svg viewBox="0 0 16 16"><rect x="1.5" y="4.5" width="9" height="7" rx="1.5" fill="currentColor"/><path d="m11 7 3.5-2v6L11 9z" fill="currentColor"/></svg></span>
         Zoom <span>·</span> Oct 17, 2026, 10:02 <span>·</span> 42:18 <span>·</span> All Transcriptions
       </div>
-      <div class="chips">
-        <span class="chip a" style="background:rgba(21,114,96,.12)">דנה</span>
-        <span class="chip b" style="background:rgba(176,90,10,.12)">יוסי</span>
-        <span class="chip c" style="background:rgba(91,63,168,.12)">מאיה</span>
-        <span class="chip dd" style="background:rgba(192,57,43,.12)">Alex</span>
+    </div>
+
+    <div class="ai">
+      <div>
+        <h4><svg viewBox="0 0 16 16"><path d="M8 1.5 9.4 6.6 14.5 8 9.4 9.4 8 14.5 6.6 9.4 1.5 8 6.6 6.6z" fill="currentColor"/></svg>Summary</h4>
+        <p class="rtl">ההשקה מתוכננת ל-19 לחודש, עם החלטת go/no-go ביום שישי. באג הסנכרון ייסגר עד יום רביעי, והשיווק צריך שבועיים התראה לפני ההשקה.</p>
+        <p class="rtl">הלקוח Acme רוצה להריץ את המודל העברי על שרת משלו.</p>
+      </div>
+      <div>
+        <h4><svg viewBox="0 0 16 16"><path d="M3 4.5l1.3 1.3L6.8 3.3M3 10.5l1.3 1.3 2.5-2.5M9 5h5M9 11h5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>Action items</h4>
+        <p dir="rtl">• יוסי: לסגור את באג הסנכרון עד יום רביעי</p>
+        <p dir="rtl">• מאיה: לעדכן את לוח הזמנים בשקופית</p>
+        <p dir="rtl">• Alex: לשלוח ל-Acme את קובץ ההגדרות</p>
       </div>
     </div>
 
-    <div class="body">
-      <div class="transcript">
-        <div class="row"><span class="ts">00:04</span><span class="text rtl">בואו נתחיל מתאריך ההשקה. איפה עומד הפיתוח?</span><span class="spk a">:דנה</span></div>
-        <div class="row"><span class="ts">00:09</span><span class="text rtl">אנחנו בזמנים. הבאג בסנכרון ייסגר עד יום רביעי, נשאר רק לעבור על הבדיקות.</span><span class="spk b">:יוסי</span></div>
-        <div class="row active"><span class="ts">00:17</span><span class="text rtl">השיווק צריך שבועיים התראה אחרי זה, כדי להכין את הקמפיין והדף באתר.</span><span class="spk c">:מאיה</span></div>
-        <div class="row"><span class="ts">00:26</span><span class="text">Quick note from the US side – the Acme pilot wants the Hebrew model on their own server.</span><span class="spk dd">Alex:</span></div>
-        <div class="row"><span class="ts">00:34</span><span class="text rtl">מעולה, זה בדיוק המצב שבו השרת של החברה נכנס לתמונה. אני אשלח להם את הקונפיג.</span><span class="spk b">:יוסי</span></div>
-        <div class="row"><span class="ts">00:41</span><span class="text rtl">אז מכוונים ל-19 לחודש, עם החלטת go/no-go ביום שישי.</span><span class="spk a">:דנה</span></div>
-        <div class="row"><span class="ts">00:48</span><span class="text rtl">מסכימה. אני מעדכנת את לוח הזמנים בשקופית.</span><span class="spk c">:מאיה</span></div>
-        <div class="row"><span class="ts">00:53</span><span class="text">Sounds good. I'll loop in their IT team today.</span><span class="spk dd">Alex:</span></div>
-        <div class="row"><span class="ts">01:02</span><span class="text rtl">עוד דבר קטן: הלקוחות שואלים אם אפשר לתמלל בלי שהאודיו יוצא מהמחשב.</span><span class="spk c">:מאיה</span></div>
-        <div class="row"><span class="ts">01:09</span><span class="text rtl">כן, ברירת המחדל היא תמלול מקומי על המק. השרת הארגוני הוא רק אופציה.</span><span class="spk b">:יוסי</span></div>
-        <div class="row"><span class="ts">01:16</span><span class="text rtl">מצוין. אז נכניס את זה גם לדף ההשקה. תודה לכולם, נתראה בשישי.</span><span class="spk a">:דנה</span></div>
-        <div class="row"><span class="ts">01:21</span><span class="text">Thanks all, talk Friday.</span><span class="spk dd">Alex:</span></div>
-      </div>
-
-      <div class="ai rtl">
-        <h4><svg viewBox="0 0 16 16"><path d="M8 1.5 9.4 6.6 14.5 8 9.4 9.4 8 14.5 6.6 9.4 1.5 8 6.6 6.6z" fill="currentColor"/></svg>Summary</h4>
-        <ul>
-          <li>ההשקה מתוכננת ל-19 לחודש; החלטת go/no-go ביום שישי.</li>
-          <li>באג הסנכרון ייסגר עד יום רביעי.</li>
-          <li>השיווק צריך שבועיים התראה לפני ההשקה.</li>
-          <li>Acme רוצים להריץ את המודל העברי על שרת משלהם.</li>
-        </ul>
-        <h4><svg viewBox="0 0 16 16"><path d="M3 4.5l1.3 1.3L6.8 3.3M3 10.5l1.3 1.3 2.5-2.5M9 5h5M9 11h5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>Action items</h4>
-        <ul class="check">
-          <li>יוסי – לסגור את באג הסנכרון (רביעי)</li>
-          <li>מאיה – לעדכן את לוח הזמנים</li>
-          <li>Alex – send Acme the team config</li>
-        </ul>
-      </div>
+    <div class="transcript">
+      <div class="row"><span class="ts">00:04</span><span class="text rtl">בואו נתחיל מתאריך ההשקה. איפה עומד הפיתוח?</span><span class="spk a">:דנה</span></div>
+      <div class="row"><span class="ts">00:09</span><span class="text rtl">אנחנו בזמנים. הבאג בסנכרון ייסגר עד יום רביעי, נשאר רק לעבור על הבדיקות.</span><span class="spk b">:יוסי</span></div>
+      <div class="row active"><span class="ts">00:17</span><span class="text rtl">השיווק צריך שבועיים התראה אחרי זה, כדי להכין את הקמפיין והדף באתר.</span><span class="spk c">:מאיה</span></div>
+      <div class="row"><span class="ts">00:26</span><span class="text">Quick note from the US side – the Acme pilot wants the Hebrew model on their own server.</span><span class="spk dd">Alex:</span></div>
+      <div class="row"><span class="ts">00:34</span><span class="text rtl">מעולה, זה בדיוק המצב שבו השרת של החברה נכנס לתמונה. אני אשלח להם את הקונפיג.</span><span class="spk b">:יוסי</span></div>
+      <div class="row"><span class="ts">00:41</span><span class="text rtl">אז מכוונים ל-19 לחודש, עם החלטת go/no-go ביום שישי.</span><span class="spk a">:דנה</span></div>
+      <div class="row"><span class="ts">00:48</span><span class="text rtl">מסכימה. אני מעדכנת את לוח הזמנים בשקופית.</span><span class="spk c">:מאיה</span></div>
+      <div class="row"><span class="ts">00:53</span><span class="text">Sounds good. I'll loop in their IT team today.</span><span class="spk dd">Alex:</span></div>
+      <div class="row"><span class="ts">01:02</span><span class="text rtl">עוד דבר קטן: הלקוחות שואלים אם אפשר לתמלל בלי שהאודיו יוצא מהמחשב.</span><span class="spk c">:מאיה</span></div>
+      <div class="row"><span class="ts">01:09</span><span class="text rtl">כן, ברירת המחדל היא תמלול מקומי על המק. השרת הארגוני הוא רק אופציה.</span><span class="spk b">:יוסי</span></div>
+      <div class="row"><span class="ts">01:16</span><span class="text rtl">מצוין. אז נכניס את זה גם לדף ההשקה. תודה לכולם, נתראה בשישי.</span><span class="spk a">:דנה</span></div>
+      <div class="row"><span class="ts">01:21</span><span class="text">Thanks all, talk Friday.</span><span class="spk dd">Alex:</span></div>
     </div>
 
     <div class="player">
