@@ -50,6 +50,11 @@ These patches live in `SpeakerDiarizer.swift`'s inline diarize script. If upgrad
 - For verification/setup state that should survive app restarts, persist a `verified` flag alongside the verified parameter values (path). On launch, restore only if current values match the persisted ones.
 - Computed `status` properties must check `verificationStatus` before `lastVerifyResult` -- the persisted verified state should take precedence over nil in-memory verify results on launch.
 
+### MDM-managed settings (`ManagedSettings`)
+- A configuration profile can force the `.milaconfig` keys for the `io.island.whisper.IslandWhisper` domain (docs/mdm.md, #360). `ManagedSettings.loadFromSystem()` reads them once in `MilaApp.init()` (only **forced** values, via `CFPreferencesAppValueIsForced`) and the snapshot is passed as `managed:` to each settings object that owns a `.milaconfig` field. Tests inject a `ManagedPreferencesSource` fake or build a `ManagedSettings` by hand — never read the real domain.
+- Precedence is managed > `.milaconfig` > user. A managed field's `didSet` puts the forced value back and persists nothing, so the user's own value survives underneath and returns when the profile is removed. Keep that shape for any new manageable field; don't write the managed value into `UserDefaults`. A managed `apiKey` never touches the Keychain.
+- `MilaConfigImporter` drops managed fields (`unmanagedFields(of:)`) before both the diff and the apply, and lists them in the sheet. A new `MilaConfig` field must be mirrored in `ManagedSettings` — `test_everyMilaconfigField_isManageable` is the tripwire — and Settings must disable its control and show `ManagedSettingNote` when it is managed.
+
 ### MCP server (mila-mcp) and MilaKit
 
 - The app persists two cross-process contracts for the embedded MCP helper: `store-location.json` (written by `RecordingStore` on init + relocate — where recordings.json currently lives) and `live/current.json` (the live-transcript sidecar written during recording by `LiveTranscriptSidecarWriter`). Both live at the DEFAULT app-support root and deliberately do not travel with a relocated recordings folder.

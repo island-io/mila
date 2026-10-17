@@ -34,6 +34,10 @@ final class MilaConfigImporter: ObservableObject {
         let id = UUID()
         let config: MilaConfig
         let changes: [PlannedChange]
+        /// Labels of settings the file sets but a configuration profile
+        /// locks — listed in the sheet as "managed by your organization" and
+        /// left alone by `apply`. Managed settings outrank a `.milaconfig`.
+        var managedSkipped: [String] = []
         /// The file name it came from, shown in the sheet.
         let sourceName: String
     }
@@ -77,6 +81,7 @@ final class MilaConfigImporter: ObservableObject {
             let config = try MilaConfig.load(from: url)
             pending = PendingImport(config: config,
                                     changes: plannedChanges(for: config),
+                                    managedSkipped: managedSkipped(for: config),
                                     sourceName: url.lastPathComponent)
             // The FILENAME is user-chosen — a `.milaconfig` handed round a
             // team is commonly named for the org or the server it configures
@@ -123,58 +128,134 @@ final class MilaConfigImporter: ObservableObject {
 
     /// The human-readable changes a config would make against the *current*
     /// settings, skipping fields that already match — so the sheet lists only
-    /// genuine changes. A present-but-equal field is a no-op.
+    /// genuine changes. A present-but-equal field is a no-op, and so is a
+    /// field a configuration profile manages (see `managedSkipped(for:)`).
     func plannedChanges(for config: MilaConfig) -> [PlannedChange] {
         var out: [PlannedChange] = []
+        let config = unmanagedFields(of: config)
 
         if let r = config.remoteTranscription {
             if let enabled = r.enabled {
                 let target: TranscriptionBackend = enabled ? .remote : .local
                 if target != remote.backend {
-                    out.append(.init(label: "Transcription", value: target.displayName))
+                    out.append(.init(label: Label.backend, value: target.displayName))
                 }
             }
             if let endpoint = r.endpoint, endpoint != remote.endpoint {
-                out.append(.init(label: "Server URL", value: endpoint))
+                out.append(.init(label: Label.endpoint, value: endpoint))
             }
             if let model = r.model, model != remote.model {
-                out.append(.init(label: "Model", value: model))
+                out.append(.init(label: Label.model, value: model))
             }
             if let englishModel = r.englishModel, englishModel != remote.englishModel {
-                out.append(.init(label: "English model",
+                out.append(.init(label: Label.englishModel,
                                  value: englishModel.isEmpty ? "Same as Model" : englishModel))
             }
             if let apiKey = r.apiKey, apiKey != remote.apiKey {
-                out.append(.init(label: "API key", value: Self.mask(apiKey)))
+                out.append(.init(label: Label.apiKey, value: Self.mask(apiKey)))
             }
         }
         if let langCode = config.recordingLanguage {
             let target = RecordingLanguage.fromCode(langCode)
             if target != language.current {
-                out.append(.init(label: "Recording language", value: target.displayName))
+                out.append(.init(label: Label.language, value: target.displayName))
             }
         }
         if let live = config.liveAI {
             if let enabled = live.enabled, enabled != liveAI.enabled {
-                out.append(.init(label: "Live AI", value: enabled ? "On" : "Off"))
+                out.append(.init(label: Label.liveAI, value: enabled ? "On" : "Off"))
             }
             if let model = live.model, model != liveAI.model {
-                out.append(.init(label: "Live AI model", value: model))
+                out.append(.init(label: Label.liveAIModel, value: model))
             }
         }
         if let d = config.diarization, let enabled = d.enabled, enabled != diarization.isEnabled {
-            out.append(.init(label: "Speaker diarization", value: enabled ? "On" : "Off"))
+            out.append(.init(label: Label.diarization, value: enabled ? "On" : "Off"))
         }
         if let m = config.meetingDetection, let enabled = m.enabled, enabled != meetingDetection.enabled {
-            out.append(.init(label: "Meeting detection", value: enabled ? "On" : "Off"))
+            out.append(.init(label: Label.meetingDetection, value: enabled ? "On" : "Off"))
         }
         return out
     }
 
+    // MARK: - Managed settings (configuration profile)
+
+    /// Labels of the settings `config` sets that a configuration profile
+    /// manages. Those are not applied — managed outranks `.milaconfig` — and
+    /// the sheet says so rather than letting them vanish silently. Listed
+    /// whether or not the value differs: the user should learn that the file's
+    /// value for that setting is not one they control.
+    func managedSkipped(for config: MilaConfig) -> [String] {
+        var out: [String] = []
+        if let r = config.remoteTranscription {
+            if r.enabled != nil, remote.managed.backend != nil { out.append(Label.backend) }
+            if r.endpoint != nil, remote.managed.endpoint != nil { out.append(Label.endpoint) }
+            if r.model != nil, remote.managed.model != nil { out.append(Label.model) }
+            if r.englishModel != nil, remote.managed.englishModel != nil { out.append(Label.englishModel) }
+            if r.apiKey != nil, remote.managed.apiKey != nil { out.append(Label.apiKey) }
+        }
+        if config.recordingLanguage != nil, language.managed.recordingLanguage != nil {
+            out.append(Label.language)
+        }
+        if let live = config.liveAI {
+            if live.enabled != nil, liveAI.managed.liveAIEnabled != nil { out.append(Label.liveAI) }
+            if live.model != nil, liveAI.managed.liveAIModel != nil { out.append(Label.liveAIModel) }
+        }
+        if config.diarization?.enabled != nil, diarization.managed.diarizationEnabled != nil {
+            out.append(Label.diarization)
+        }
+        if config.meetingDetection?.enabled != nil, meetingDetection.managed.meetingDetectionEnabled != nil {
+            out.append(Label.meetingDetection)
+        }
+        return out
+    }
+
+    /// `config` with every field a configuration profile manages removed, so
+    /// the diff and the apply both act only on what the user may change. One
+    /// filter feeding both keeps the sheet and the outcome from disagreeing.
+    func unmanagedFields(of config: MilaConfig) -> MilaConfig {
+        var out = config
+        if var r = out.remoteTranscription {
+            if remote.managed.backend != nil { r.enabled = nil }
+            if remote.managed.endpoint != nil { r.endpoint = nil }
+            if remote.managed.model != nil { r.model = nil }
+            if remote.managed.englishModel != nil { r.englishModel = nil }
+            if remote.managed.apiKey != nil { r.apiKey = nil }
+            out.remoteTranscription = r
+        }
+        if language.managed.recordingLanguage != nil { out.recordingLanguage = nil }
+        if var live = out.liveAI {
+            if liveAI.managed.liveAIEnabled != nil { live.enabled = nil }
+            if liveAI.managed.liveAIModel != nil { live.model = nil }
+            out.liveAI = live
+        }
+        if diarization.managed.diarizationEnabled != nil { out.diarization = nil }
+        if meetingDetection.managed.meetingDetectionEnabled != nil { out.meetingDetection = nil }
+        return out
+    }
+
+    /// Row labels, shared by the change list and the managed list.
+    private enum Label {
+        static let backend = "Transcription"
+        static let endpoint = "Server URL"
+        static let model = "Model"
+        static let englishModel = "English model"
+        static let apiKey = "API key"
+        static let language = "Recording language"
+        static let liveAI = "Live AI"
+        static let liveAIModel = "Live AI model"
+        static let diarization = "Speaker diarization"
+        static let meetingDetection = "Meeting detection"
+    }
+
     // MARK: - Apply
 
-    /// Override every present field; leave absent fields untouched.
+    /// Override every present field; leave absent fields untouched. Fields a
+    /// configuration profile manages are dropped first — the settings objects
+    /// would refuse them anyway, but skipping them here keeps a managed API
+    /// key's slot from ever seeing the file's value.
     func apply(_ config: MilaConfig) {
+        let config = unmanagedFields(of: config)
         if let r = config.remoteTranscription {
             // Set endpoint/model/key BEFORE flipping the backend. Switching to
             // `.remote` triggers `RemoteTranscriptionSettings`' lazy Keychain

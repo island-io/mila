@@ -5,6 +5,11 @@ import Combine
 final class DiarizationSettings: ObservableObject {
     @Published var isEnabled: Bool {
         didSet {
+            // Forced by a configuration profile: put it back and persist
+            // nothing (see `ManagedSettings`). Nothing changed, so none of the
+            // enable side effects below apply either.
+            if let forced = managed.diarizationEnabled, isEnabled != forced { isEnabled = forced; return }
+            guard managed.diarizationEnabled == nil else { return }
             defaults.set(isEnabled, forKey: "diarization.enabled")
             if isEnabled && pythonFound && lastVerifyResult == nil && !isVerified {
                 Task { await checkDeps() }
@@ -49,10 +54,20 @@ final class DiarizationSettings: ObservableObject {
     private let defaults: UserDefaults
     @Published private(set) var pythonFound: Bool
 
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
+    /// `MilaApp` passes the system's managed preferences. Only `isEnabled` is
+    /// manageable — the same field a `.milaconfig` carries.
+    let managed: ManagedSettings
+
+    /// Whether `isEnabled` is locked by a configuration profile.
+    var isEnabledManaged: Bool { managed.diarizationEnabled != nil }
+
     init(defaults: UserDefaults = .standard,
          bootstrap: DiarizationBootstrap? = nil,
-         defaultEnabledIfUnset: Bool = false) {
+         defaultEnabledIfUnset: Bool = false,
+         managed: ManagedSettings = .empty) {
         self.defaults = defaults
+        self.managed = managed
         // Build the default bootstrap inside the init rather than via a
         // default-argument expression — `DiarizationBootstrap.init` is
         // `@MainActor`-isolated, and Swift evaluates default arguments in
@@ -67,7 +82,9 @@ final class DiarizationSettings: ObservableObject {
         // checkDeps subprocess on every test run, starving timing-sensitive
         // tests of the cooperative thread pool. MilaApp passes `true`; tests
         // omit the argument and get the historical `false`.
-        self.isEnabled = (defaults.object(forKey: "diarization.enabled") as? Bool) ?? defaultEnabledIfUnset
+        // A managed value wins over both the stored choice and the default.
+        self.isEnabled = managed.diarizationEnabled
+            ?? (defaults.object(forKey: "diarization.enabled") as? Bool) ?? defaultEnabledIfUnset
         let path = defaults.string(forKey: "diarization.pythonPath") ?? "/usr/bin/python3"
         self.pythonPath = path
         self._pythonFound = Published(initialValue: FileManager.default.fileExists(atPath: path))

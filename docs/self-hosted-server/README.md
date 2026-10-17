@@ -244,6 +244,17 @@ To distribute it:
 > The `.milaconfig` file contains your API key in plaintext — share it over a
 > trusted channel, the same way you'd share any credential.
 
+### Or push it with MDM
+
+A `.milaconfig` is applied once, by each user, who can change the settings
+afterwards. If you manage your Macs with an MDM and want **every** Mila locked
+to this server, deploy the same keys as a configuration profile for the
+`io.island.whisper.IslandWhisper` preference domain instead. Managed settings
+take precedence over a `.milaconfig` and over the user's own choice, and show
+as "Managed by your organization" in Settings. See
+[`docs/mdm.md`](../mdm.md) for the payload, an example `.mobileconfig`, how to
+test it locally, and the caveats of putting the API key in a profile.
+
 ---
 
 ## Notes & operational tips

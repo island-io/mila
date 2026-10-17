@@ -22,7 +22,13 @@ import Combine
 @MainActor
 final class MeetingDetectionSettings: ObservableObject {
     @Published var enabled: Bool {
-        didSet { defaults.set(enabled, forKey: Keys.enabled) }
+        didSet {
+            // Forced by a configuration profile: put it back and persist
+            // nothing (see `ManagedSettings`).
+            if let forced = managed.meetingDetectionEnabled, enabled != forced { enabled = forced; return }
+            guard managed.meetingDetectionEnabled == nil else { return }
+            defaults.set(enabled, forKey: Keys.enabled)
+        }
     }
     @Published private(set) var disabledBundleIDs: Set<String> {
         didSet {
@@ -31,16 +37,25 @@ final class MeetingDetectionSettings: ObservableObject {
         }
     }
 
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
+    /// `MilaApp` passes the system's managed preferences. Only `enabled` is
+    /// manageable; the per-app silence list stays the user's.
+    let managed: ManagedSettings
+
+    /// Whether `enabled` is locked by a configuration profile.
+    var isEnabledManaged: Bool { managed.meetingDetectionEnabled != nil }
+
     private let defaults: UserDefaults
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, managed: ManagedSettings = .empty) {
         self.defaults = defaults
+        self.managed = managed
         // ON by default — first launch should surface the feature so
         // users discover it. The toggle in Settings flips it.
         if defaults.object(forKey: Keys.enabled) == nil {
             defaults.set(true, forKey: Keys.enabled)
         }
-        self.enabled = defaults.bool(forKey: Keys.enabled)
+        self.enabled = managed.meetingDetectionEnabled ?? defaults.bool(forKey: Keys.enabled)
         let raw = defaults.string(forKey: Keys.disabledBundleIDs) ?? ""
         self.disabledBundleIDs = Set(
             raw.split(separator: ",").map(String.init).filter { !$0.isEmpty }

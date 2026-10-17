@@ -58,6 +58,11 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     @Published var backend: TranscriptionBackend {
         didSet {
+            // Managed by a configuration profile: put the forced value back
+            // and persist nothing (see `ManagedSettings`). Every managed field
+            // below opens with the same two lines.
+            if let forced = managed.backend, backend != forced { backend = forced; return }
+            guard managed.backend == nil else { return }
             guard backend != oldValue else { return }
             defaults.set(backend.rawValue, forKey: Keys.backend)
             // Defer the Keychain read until the user actually switches to the
@@ -70,6 +75,8 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     @Published var endpoint: String {
         didSet {
+            if let forced = managed.endpoint, endpoint != forced { endpoint = forced; return }
+            guard managed.endpoint == nil else { return }
             guard endpoint != oldValue else { return }
             defaults.set(endpoint, forKey: Keys.endpoint)
             testStatus = .idle
@@ -78,6 +85,8 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     @Published var model: String {
         didSet {
+            if let forced = managed.model, model != forced { model = forced; return }
+            guard managed.model == nil else { return }
             guard model != oldValue else { return }
             defaults.set(model, forKey: Keys.model)
             // Reconcile in BOTH directions. Pointing at a Hebrew-only model is
@@ -116,6 +125,8 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// stops being Hebrew-only.
     @Published var englishModel: String {
         didSet {
+            if let forced = managed.englishModel, englishModel != forced { englishModel = forced; return }
+            guard managed.englishModel == nil else { return }
             guard englishModel != oldValue else { return }
             defaults.set(englishModel, forKey: Keys.englishModel)
             guard !isProgrammaticWrite else { return }
@@ -136,6 +147,10 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// edit writes through to the Keychain.
     @Published var apiKey: String {
         didSet {
+            // A managed token is held in memory only: never written to the
+            // Keychain, so removing the profile removes the token too.
+            if let forced = managed.apiKey, apiKey != forced { apiKey = forced; return }
+            guard managed.apiKey == nil else { return }
             guard apiKey != oldValue else { return }
             // Skip the write-back when we're just adopting the value we read
             // from the Keychain — re-saving it would be a redundant write that
@@ -200,7 +215,9 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// gets the English prefill — and picking anything else gets the matching
     /// withdrawal — through the one code path that owns that rule.
     func apply(_ preset: RemoteModelPreset) {
-        if shouldAdoptEndpoint(of: preset) {
+        // A managed endpoint stays put — the preset's model id is all that can
+        // change (and Settings disables the picker when the model is managed).
+        if managed.endpoint == nil, shouldAdoptEndpoint(of: preset) {
             endpoint = preset.endpoint
         }
         model = preset.id
@@ -217,6 +234,9 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     private let defaults: UserDefaults
     private let urlSession: URLSession
+    /// Fields an administrator has locked via a configuration profile. Empty
+    /// (`ManagedSettings.empty`) unless `MilaApp` passes the system's managed preferences.
+    let managed: ManagedSettings
     /// Keychain item the API token is stored under. Injectable so tests /
     /// previews / alternate instances don't read or clobber the real app's
     /// `remote.apiKey` item (mirrors how `defaults` is injected).
@@ -228,22 +248,32 @@ final class RemoteTranscriptionSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard,
          urlSession: URLSession = .shared,
-         apiKeyKeychainKey: String = Keys.apiKey) {
+         apiKeyKeychainKey: String = Keys.apiKey,
+         managed: ManagedSettings = .empty) {
         self.defaults = defaults
         self.urlSession = urlSession
         self.apiKeyKeychainKey = apiKeyKeychainKey
-        self.backend = TranscriptionBackend(rawValue: defaults.string(forKey: Keys.backend) ?? "")
+        self.managed = managed
+        // Managed values win; the user's stored values stay in `defaults`
+        // untouched underneath, so removing the profile restores them.
+        self.backend = managed.backend
+            ?? TranscriptionBackend(rawValue: defaults.string(forKey: Keys.backend) ?? "")
             ?? .local
-        self.endpoint = defaults.string(forKey: Keys.endpoint) ?? Self.defaultEndpoint
-        self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
-        self.englishModel = defaults.string(forKey: Keys.englishModel) ?? ""
+        self.endpoint = managed.endpoint
+            ?? defaults.string(forKey: Keys.endpoint) ?? Self.defaultEndpoint
+        self.model = managed.model ?? defaults.string(forKey: Keys.model) ?? Self.defaultModel
+        self.englishModel = managed.englishModel ?? defaults.string(forKey: Keys.englishModel) ?? ""
         // Start empty and defer the Keychain read. Reading the token at launch
         // unconditionally pops the macOS "Mila wants to use confidential
         // information stored in your keychain" prompt for *every* user — even
         // the local-only majority who never configure a remote endpoint. We
         // only read once the user actually selects the remote backend (here if
         // it's the restored choice, otherwise lazily in `backend.didSet`).
-        self.apiKey = ""
+        //
+        // A managed token replaces the Keychain entirely: adopt it and mark the
+        // lazy load done, so the stored one is never read (and never prompts).
+        self.apiKey = managed.apiKey ?? ""
+        if managed.apiKey != nil { hasLoadedAPIKey = true }
         if backend == .remote { loadAPIKeyIfNeeded() }
         // Upgrade path: everyone already pointed at an ivrit.ai endpoint before
         // per-language routing existed has a blank English model, and a blank
@@ -265,6 +295,9 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// about sequencing them. Every entry point (`init`, `model.didSet`) goes
     /// through here so a third one can't arrive with only half the rule.
     private func reconcileEnglishModelForCurrentPrimary() {
+        // A managed English model is the administrator's, like a typed one:
+        // neither half of the rule may touch it.
+        guard managed.englishModel == nil else { return }
         clearAutoFilledEnglishModelIfNeeded()
         prefillEnglishModelIfNeeded()
     }

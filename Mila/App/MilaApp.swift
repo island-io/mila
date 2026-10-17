@@ -426,17 +426,23 @@ struct MilaApp: App {
             UserDefaults.standard.set(false, forKey: "diarization.enabled")
             UserDefaults.standard.set(true, forKey: diarForceOffKey)
         }
-        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false)
+        // Settings an administrator locked via a configuration profile (MDM),
+        // read once here and handed to every settings object that carries a
+        // `.milaconfig` field. Precedence: managed > `.milaconfig` > the
+        // user's own choice. See `ManagedSettings` and docs/mdm.md (#360).
+        let managedSettings = ManagedSettings.loadFromSystem()
+        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false,
+                                               managed: managedSettings)
         // Remote transcription backend (opt-in, off by default). Constructed
         // here so the same instance backs both the Settings UI and the
         // transcription router.
-        let remoteSettings = RemoteTranscriptionSettings()
+        let remoteSettings = RemoteTranscriptionSettings(managed: managedSettings)
         let svc = TranscriptionService(store: store,
                                        modelManager: mgr,
                                        diarizationSettings: diarSettings,
                                        remoteSettings: remoteSettings)
         let session = RecordingSession()
-        let langSettings = RecordingLanguageSettings()
+        let langSettings = RecordingLanguageSettings(managed: managedSettings)
         let audioSettings = AudioInputSettings()
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
@@ -479,7 +485,7 @@ struct MilaApp: App {
                 performanceCoreCount: SystemCapabilities.live.performanceCoreCount
             )
             : .live
-        let liveAI = LiveAISettings(capabilities: liveAICapabilities)
+        let liveAI = LiveAISettings(capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
         // a dictation overlay while a meeting recording is in flight
@@ -893,7 +899,7 @@ struct MilaApp: App {
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
-        let meetingSettings = MeetingDetectionSettings()
+        let meetingSettings = MeetingDetectionSettings(managed: managedSettings)
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
             detector: detector,

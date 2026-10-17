@@ -72,18 +72,35 @@ final class RecordingLanguageSettings: ObservableObject {
     /// Language to use for the next voice memo / app-audio recording.
     @Published var current: RecordingLanguage {
         didSet {
+            // Forced by a configuration profile: put it back and persist
+            // nothing (see `ManagedSettings`). The toolbar picker is disabled
+            // then, so this only catches programmatic writes.
+            if let forced = managed.recordingLanguage, current != forced { current = forced; return }
+            guard managed.recordingLanguage == nil else { return }
             guard current != oldValue else { return }
             defaults.set(current.rawValue, forKey: Self.key)
         }
     }
 
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
+    /// `MilaApp` passes the system's managed preferences.
+    let managed: ManagedSettings
+
+    /// Whether `current` is locked by a configuration profile.
+    var isManaged: Bool { managed.recordingLanguage != nil }
+
     private let defaults: UserDefaults
     private static let key = "recording.language"
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, managed: ManagedSettings = .empty) {
         self.defaults = defaults
+        self.managed = managed
         let raw = defaults.string(forKey: Self.key)
-        if let raw, let stored = RecordingLanguage(rawValue: raw) {
+        if let forced = managed.recordingLanguage {
+            // The user's stored choice stays in `defaults` untouched, so
+            // removing the profile brings it back.
+            self.current = forced
+        } else if let raw, let stored = RecordingLanguage(rawValue: raw) {
             self.current = stored
         } else {
             // Unrecognised — a fresh install, or the retired `"auto"` left in
