@@ -2641,6 +2641,11 @@ private struct DiarizationSettingsTabContent: View {
 private struct YourNameSection: View {
     @EnvironmentObject private var identity: SpeakerIdentitySettings
     @EnvironmentObject private var directory: SpeakerDirectory
+    /// Edited locally and written to `identity` only on Return / focus loss.
+    /// `identity` is an App-level `@StateObject`, so binding the field to it
+    /// directly would publish — and re-diff every scene — on each keystroke
+    /// (the CLAUDE.md #280 rule), plus write UserDefaults each time.
+    @State private var draft = ""
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -2651,7 +2656,7 @@ private struct YourNameSection: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            TextField("Your name", text: $identity.myName)
+            TextField("Your name", text: $draft)
                 .textFieldStyle(.roundedBorder)
                 .focused($focused)
                 .onSubmit(commit)
@@ -2661,11 +2666,18 @@ private struct YourNameSection: View {
                 .frame(maxWidth: 280)
                 .accessibilityIdentifier("speakers.myName.field")
         }
+        .onAppear { draft = identity.myName }
+        // Closing Settings with the field still focused must not lose the edit.
+        .onDisappear(perform: commit)
     }
 
     private func commit() {
-        guard let name = identity.resolvedName else { return }
-        directory.add(name)
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only on a real change: `@Published` announces every assignment,
+        // equal or not, so a blur with nothing edited must not write.
+        if identity.myName != trimmed { identity.myName = trimmed }
+        draft = trimmed
+        if !trimmed.isEmpty { directory.add(trimmed) }
     }
 }
 

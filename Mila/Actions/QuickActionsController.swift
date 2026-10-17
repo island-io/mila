@@ -1635,8 +1635,14 @@ final class QuickActionsController: ObservableObject {
                     && (self.obsidianSettings?.vaultURL != nil)
                 // Likewise before the summarizer: its completion hook is what
                 // runs the speaker-name suggester, and a skip fires it
-                // synchronously. Speakers are final at this point.
-                self.speakerNameSuggester?.markPending(updated.id)
+                // synchronously. Speakers are final at this point. Without a
+                // summarizer nothing would ever consume the mark, so run the
+                // suggester directly instead.
+                if self.summarizer != nil {
+                    self.speakerNameSuggester?.markPending(updated.id)
+                } else {
+                    self.speakerNameSuggester?.suggest(recordingID: updated.id)
+                }
                 if self.liveAISettings?.enabled == true,
                    self.llmSettings?.isConfigured == true {
                     if obsidianOn { self.obsidianExporter?.markPending(updated.id) }

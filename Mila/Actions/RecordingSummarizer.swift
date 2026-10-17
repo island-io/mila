@@ -774,9 +774,9 @@ final class RecordingSummarizer: ObservableObject {
         // (issue celarent7/mila#4 — previously this always sent
         // `liveAISettings.model`, e.g. "claude-sonnet-4-6", to the OpenAI
         // endpoint, which 404'd on model-not-found).
-        let model = (tool == .openaiCompatible)
-            ? llmSettings.openAIModelName
-            : liveAISettings.model
+        let model = LLMSettings.backgroundModelName(tool: tool,
+                                                    openAIModelName: llmSettings.openAIModelName,
+                                                    liveAIModel: liveAISettings.model)
         // Per-recording override first, then the global setting (with Auto
         // resolved against the transcript text). Resolved ONCE per run; a
         // pick while the call is out is caught by the completion.

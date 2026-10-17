@@ -79,20 +79,21 @@ struct SpeakerNameSuggestion: Codable, Hashable, Identifiable {
 }
 
 extension Recording {
-    /// The suggestions that can still be acted on: the speaker still has
-    /// lines in the transcript and has not been named since (by the user, by
-    /// voice recognition, or by accepting). A merge, a split or a reassign
-    /// can empty a speaker out, and a name can arrive from another path at
-    /// any time, so this is re-derived on every read rather than trusted
-    /// from the stored list.
+    /// Whether a name suggestion for `rawID` can still be acted on: the
+    /// speaker still has lines in the transcript and has not been named since
+    /// (by the user, by voice recognition, or by accepting). A merge, a split
+    /// or a reassign can empty a speaker out, and a name can arrive from
+    /// another path at any time. The one definition of the rule — both the UI
+    /// filter below and `RecordingStore.mergeSpeakerNameSuggestions` use it.
+    func acceptsSpeakerNameSuggestion(for rawID: String) -> Bool {
+        let assigned = speakerNames[rawID]?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return assigned.isEmpty && segments.contains { $0.speaker == rawID }
+    }
+
+    /// The suggestions that can still be acted on — re-derived on every read
+    /// rather than trusted from the stored list.
     var actionableSpeakerNameSuggestions: [SpeakerNameSuggestion] {
-        guard !speakerNameSuggestions.isEmpty else { return [] }
-        let present = Set(segments.compactMap(\.speaker))
-        return speakerNameSuggestions.filter { suggestion in
-            guard present.contains(suggestion.speaker) else { return false }
-            let assigned = speakerNames[suggestion.speaker]?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            return assigned.isEmpty
-        }
+        speakerNameSuggestions.filter { acceptsSpeakerNameSuggestion(for: $0.speaker) }
     }
 }

@@ -817,13 +817,10 @@ final class RecordingStore: ObservableObject {
         guard !suggestions.isEmpty,
               let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return false }
         let row = recordings[idx]
-        let present = Set(row.segments.compactMap(\.speaker))
         var merged = row.speakerNameSuggestions
-        for suggestion in suggestions {
-            guard present.contains(suggestion.speaker),
-                  (row.speakerNames[suggestion.speaker]?
-                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
-            else { continue }
+        // Same rule the UI filters on (`actionableSpeakerNameSuggestions`),
+        // from the one place it is defined.
+        for suggestion in suggestions where row.acceptsSpeakerNameSuggestion(for: suggestion.speaker) {
             if let existing = merged.firstIndex(where: { $0.speaker == suggestion.speaker }) {
                 merged[existing] = suggestion
             } else {
@@ -1010,6 +1007,10 @@ final class RecordingStore: ObservableObject {
                                into targetRawID: String,
                                at idx: Int,
                                recordingID: UUID) {
+        // A pending name suggestion for the retired id goes with it. Left
+        // behind, it would resurface on whatever voice `splitSegmentSpeaker`
+        // next hands this number to (#348).
+        recordings[idx].speakerNameSuggestions.removeAll { $0.speaker == sourceRawID }
         let previousName = recordings[idx].speakerNames.removeValue(forKey: sourceRawID)
         let targetName = recordings[idx].speakerNames[targetRawID]
         // Same name on both sides (the shape the old auto-merge always had):
@@ -1058,6 +1059,9 @@ final class RecordingStore: ObservableObject {
         else { return }
         var used = Set(recordings[recIdx].segments.compactMap(\.speaker))
         used.formUnion(recordings[recIdx].speakerNames.keys)
+        // Same reason as the names: a pending suggestion keyed to a number
+        // must never attach to the new, unrelated voice (#348).
+        used.formUnion(recordings[recIdx].speakerNameSuggestions.map(\.speaker))
         var next = 0
         while used.contains(String(format: "SPEAKER_%02d", next)) { next += 1 }
         let newRawID = String(format: "SPEAKER_%02d", next)

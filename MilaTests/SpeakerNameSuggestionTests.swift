@@ -81,10 +81,13 @@ final class SpeakerNameSuggestionTests: XCTestCase {
 
     private let allUnnamed: Set<String> = ["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"]
 
-    private func parse(_ raw: String, unnamed: Set<String>? = nil) -> [SpeakerNameSuggestion] {
+    private func parse(_ raw: String,
+                       unnamed: Set<String>? = nil,
+                       taken: [String] = []) -> [SpeakerNameSuggestion] {
         SpeakerNameSuggester.parseSuggestions(from: raw,
                                               unnamedSpeakers: unnamed ?? allUnnamed,
-                                              transcript: transcript)
+                                              turns: SpeakerNameSuggester.turns(for: meeting()),
+                                              takenNames: taken)
     }
 
     // MARK: - Parsing: what is accepted
@@ -123,13 +126,26 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         XCTAssertEqual(parse(raw).map(\.speaker), ["SPEAKER_00"])
     }
 
-    func test_hebrew_quote_with_a_prefixed_name_is_accepted() {
-        let hebrew = "שלום לכולם, קוראים לי דנה. תודה לדנה!"
+    func test_hebrew_self_introduction_is_accepted() {
+        let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00", text: "שלום לכולם, קוראים לי דנה."),
+                     SpeakerNameSuggester.Turn(speaker: "SPEAKER_01", text: "תודה לדנה!")]
         let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "דנה", "quote": "קוראים לי דנה"}]}"#
         let result = SpeakerNameSuggester.parseSuggestions(from: raw,
-                                                           unnamedSpeakers: ["SPEAKER_00"],
-                                                           transcript: hebrew)
+                                                           unnamedSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+                                                           turns: turns)
         XCTAssertEqual(result.map(\.name), ["דנה"])
+    }
+
+    func test_the_name_must_be_a_whole_word_of_the_quote() {
+        func states(_ quote: String, _ name: String) -> Bool {
+            SpeakerNameSuggester.quoteStatesName(
+                normalizedQuote: SpeakerNameSuggester.normalizedForMatching(quote), name: name)
+        }
+        XCTAssertFalse(states("I edited the deck", "Ed"), "a name inside another word is not stated")
+        XCTAssertTrue(states("Thanks, Ed. Go ahead", "Ed"))
+        XCTAssertTrue(states("This is Dana speaking", "Dana Cohen"), "a word of the name counts")
+        XCTAssertTrue(states("קוראים לי דנה", "דנה"))
+        XCTAssertFalse(states("תודה לדנה", "דנה"), "Hebrew is matched on whole words too")
     }
 
     func test_an_empty_answer_is_no_suggestions() {
@@ -202,13 +218,44 @@ final class SpeakerNameSuggestionTests: XCTestCase {
     }
 
     func test_one_speaker_given_two_names_keeps_neither() {
+        let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00",
+                                               text: "My name is Dana, but everyone calls me Bob.")]
         let raw = """
             {"speakers": [
-              {"speaker": "SPEAKER_00", "name": "Dana", "quote": "my name is Dana"},
-              {"speaker": "SPEAKER_00", "name": "Bob", "quote": "Bob, what do you think?"}
+              {"speaker": "SPEAKER_00", "name": "Dana", "quote": "My name is Dana"},
+              {"speaker": "SPEAKER_00", "name": "Bob", "quote": "everyone calls me Bob"}
             ]}
             """
+        XCTAssertEqual(SpeakerNameSuggester.parseSuggestions(from: raw, unnamedSpeakers: ["SPEAKER_00"],
+                                                             turns: turns), [])
+    }
+
+    // MARK: - Parsing: the evidence must be about THIS speaker
+
+    func test_a_self_introduction_by_someone_else_is_not_evidence() {
+        // "my name is Dana" is SPEAKER_00's line; SPEAKER_02 never said it and
+        // does not answer right after it.
+        let raw = #"{"speakers": [{"speaker": "SPEAKER_02", "name": "Dana", "quote": "my name is Dana"}]}"#
         XCTAssertEqual(parse(raw), [])
+    }
+
+    func test_being_addressed_counts_only_for_whoever_answers_next() {
+        // "Bob, what do you think?" is followed by SPEAKER_02, not SPEAKER_00.
+        let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "Bob", "quote": "Bob, what do you think?"}]}"#
+        XCTAssertEqual(parse(raw), [])
+        let right = #"{"speakers": [{"speaker": "SPEAKER_02", "name": "Bob", "quote": "Bob, what do you think?"}]}"#
+        XCTAssertEqual(parse(right).map(\.speaker), ["SPEAKER_02"])
+    }
+
+    func test_a_one_word_quote_that_is_just_the_name_is_dropped() {
+        let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "Dana", "quote": "Dana."}]}"#
+        XCTAssertEqual(parse(raw), [])
+    }
+
+    func test_a_name_another_speaker_already_has_is_dropped() {
+        let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "Dana", "quote": "my name is Dana"}]}"#
+        XCTAssertEqual(parse(raw, unnamed: ["SPEAKER_00", "SPEAKER_02"], taken: ["dana"]), [],
+                       "Dana is already SPEAKER_01's name in this recording")
     }
 
     func test_one_name_given_to_two_speakers_keeps_neither() {
@@ -358,6 +405,44 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         XCTAssertFalse(named)
     }
 
+    func test_merging_a_speaker_away_drops_its_suggestion() throws {
+        let rec = meeting()
+        store.add(rec)
+        store.mergeSpeakerNameSuggestions([
+            .init(speaker: "SPEAKER_02", name: "Bob", evidence: "Bob, what do you think?", origin: .transcript),
+        ], recordingID: rec.id)
+
+        store.mergeSpeakers(from: "SPEAKER_02", into: "SPEAKER_01", recordingID: rec.id)
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(row.speakerNameSuggestions, [],
+                       "a retired id's suggestion must not wait for split to hand the number out again")
+    }
+
+    func test_split_never_reuses_an_id_that_still_carries_a_suggestion() throws {
+        // A stale suggestion for SPEAKER_02, which has no lines: the next free
+        // number by segments and names alone.
+        let rec = Recording(
+            title: "Split", source: .meeting, audioFileName: "split.wav",
+            status: .completed, language: "en",
+            segments: [
+                TranscriptSegment(start: 0, end: 1, text: "First line.", speaker: "SPEAKER_00"),
+                TranscriptSegment(start: 1, end: 2, text: "Reply.", speaker: "SPEAKER_01"),
+                TranscriptSegment(start: 2, end: 3, text: "Second line.", speaker: "SPEAKER_00"),
+            ],
+            fullText: "First line. Reply. Second line.",
+            speakerNameSuggestions: [.init(speaker: "SPEAKER_02", name: "Bob",
+                                           evidence: "Bob, over to you", origin: .transcript)])
+        store.add(rec)
+
+        store.splitSegmentSpeaker(segmentID: rec.segments[2].id, recordingID: rec.id)
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(row.segments[2].speaker, "SPEAKER_03")
+        XCTAssertEqual(row.actionableSpeakerNameSuggestions, [],
+                       "the split-off voice must not inherit Bob")
+    }
+
     func test_a_merged_away_speaker_has_no_actionable_suggestion() {
         var rec = meeting()
         rec.speakerNameSuggestions = [.init(speaker: "SPEAKER_02", name: "Bob",
@@ -409,16 +494,31 @@ final class SpeakerNameSuggestionTests: XCTestCase {
 
     // MARK: - Settings gate
 
-    func test_transcript_suggestions_default_follows_auto_summary() {
+    func test_transcript_suggestions_default_follows_auto_summary_live() {
         XCTAssertTrue(llm.speakerNameSuggestionsEnabled, "fresh install: auto-summary is on, so this is on")
         llm.summaryEnabled = false
-        let optedOut = LLMSettings(defaults: llmDefaults, apiKeyKeychainKey: "SpeakerNameSuggestionTests.\(UUID())")
-        XCTAssertFalse(optedOut.speakerNameSuggestionsEnabled,
-                       "a user who turned automatic sending off does not start sending on upgrade")
-        optedOut.speakerNameSuggestionsEnabled = true
+        XCTAssertFalse(llm.speakerNameSuggestionsEnabled,
+                       "follows auto-summary within the session, not a copy taken at launch")
+        XCTAssertNil(llmDefaults.object(forKey: "llm.speakerNames.enabled"),
+                     "following the default writes nothing")
+        let relaunched = LLMSettings(defaults: llmDefaults, apiKeyKeychainKey: "SpeakerNameSuggestionTests.\(UUID())")
+        XCTAssertFalse(relaunched.speakerNameSuggestionsEnabled, "and agrees after a relaunch")
+
+        relaunched.speakerNameSuggestionsEnabled = true
+        relaunched.summaryEnabled = false
+        XCTAssertTrue(relaunched.speakerNameSuggestionsEnabled, "an explicit choice wins")
         let explicit = LLMSettings(defaults: llmDefaults, apiKeyKeychainKey: "SpeakerNameSuggestionTests.\(UUID())")
-        XCTAssertTrue(explicit.speakerNameSuggestionsEnabled, "an explicit choice wins")
+        XCTAssertTrue(explicit.speakerNameSuggestionsEnabled, "and is persisted")
         XCTAssertEqual(llmDefaults.object(forKey: "llm.speakerNames.enabled") as? Bool, true)
+    }
+
+    func test_background_model_choice_is_shared_and_tool_conditional() {
+        XCTAssertEqual(LLMSettings.backgroundModelName(tool: .openaiCompatible,
+                                                       openAIModelName: "gpt-4o-mini",
+                                                       liveAIModel: "claude-sonnet"), "gpt-4o-mini")
+        XCTAssertEqual(LLMSettings.backgroundModelName(tool: .claude,
+                                                       openAIModelName: "gpt-4o-mini",
+                                                       liveAIModel: "claude-sonnet"), "claude-sonnet")
     }
 
     func test_ready_requires_a_configured_provider() {
@@ -569,6 +669,55 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         let row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
         XCTAssertEqual(row.speakerNameSuggestions.map(\.name), ["Dana"])
         XCTAssertEqual(row.speakerNameSuggestions.map(\.origin), [.transcript])
+    }
+
+    func test_a_request_during_a_call_runs_again_after_it() async throws {
+        llm.tool = .claude
+        let rec = meeting()
+        store.add(rec)
+        let log = CallLog()
+        let store = self.store!
+        var suggesterRef: SpeakerNameSuggester?
+        let suggester = makeSuggester(answer: danaAnswer, log: log, during: {
+            guard log.calls.count == 1 else { return }
+            // A new pass lands while the first call is out, and asks again.
+            if var row = store.recordings.first(where: { $0.id == rec.id }) {
+                row.fullText += " "
+                store.update(row)
+            }
+            suggesterRef?.suggest(recordingID: rec.id)
+        })
+        suggesterRef = suggester
+
+        suggester.suggest(recordingID: rec.id)
+        await suggester.awaitIdle()
+
+        XCTAssertEqual(log.calls.count, 2, "the request is not dropped: it runs after the first call")
+        let row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(row.speakerNameSuggestions.map(\.name), ["Dana"],
+                       "the first answer (stale transcript) was discarded, the re-run's was kept")
+    }
+
+    func test_a_mark_on_a_trashed_recording_does_not_survive_a_restore() async {
+        llm.tool = .claude
+        let rec = meeting()
+        store.add(rec)
+        let log = CallLog()
+        let suggester = makeSuggester(answer: danaAnswer, log: log)
+
+        suggester.markPending(rec.id)
+        // Trashed mid-summary: the summarizer never signals for it.
+        store.softDelete(rec)
+        if let trashed = store.recordings.first(where: { $0.id == rec.id }) {
+            store.restore(trashed)
+        }
+        // A later manual "Regenerate summary" settles a summary attempt.
+        if let live = store.recordings.first(where: { $0.id == rec.id }) {
+            suggester.suggestIfPending(live)
+        }
+        await suggester.awaitIdle()
+
+        XCTAssertEqual(log.calls.count, 0, "only a fresh completion may trigger a call")
     }
 
     func test_permanent_delete_cancels_and_writes_nothing_back() async {

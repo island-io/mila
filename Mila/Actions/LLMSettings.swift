@@ -330,18 +330,41 @@ final class LLMSettings: ObservableObject {
     /// who switched automatic sending off (auto-summary off) does not start
     /// sending them because of an upgrade. Nothing is sent at all unless the
     /// provider is configured (`isSpeakerNameSuggestionReady`). Until the user
-    /// touches this switch the default is re-derived at each launch, so it
-    /// keeps following their auto-summary choice; the first explicit flip is
+    /// touches this switch it reads the CURRENT auto-summary value — live, in
+    /// this session and after a relaunch alike; the first explicit flip is
     /// persisted and wins from then on.
-    @Published var speakerNameSuggestionsEnabled: Bool {
-        didSet { defaults.set(speakerNameSuggestionsEnabled, forKey: Keys.speakerNameSuggestionsEnabled) }
+    var speakerNameSuggestionsEnabled: Bool {
+        get { speakerNameSuggestionsChoice ?? summaryEnabled }
+        set {
+            speakerNameSuggestionsChoice = newValue
+            defaults.set(newValue, forKey: Keys.speakerNameSuggestionsEnabled)
+        }
     }
+
+    /// The user's explicit choice for `speakerNameSuggestionsEnabled`, or nil
+    /// while they have never touched the switch — in which case the effective
+    /// value is the CURRENT `summaryEnabled`, live, not a copy taken at
+    /// launch. `@Published` so a flip re-renders the switch; `summaryEnabled`
+    /// already publishes for the follow-along case.
+    @Published private var speakerNameSuggestionsChoice: Bool?
 
     /// "Enabled AND ready" for speaker-name suggestions, per
     /// `.claude/rules/feature-gates.md`: the switch is on and the provider
     /// can actually be called. The one gate `SpeakerNameSuggester` consults.
     var isSpeakerNameSuggestionReady: Bool {
         speakerNameSuggestionsEnabled && isConfigured
+    }
+
+    /// The model name a background call should pass for `tool`: the
+    /// OpenAI-compatible endpoint's own model name, or Live AI's model
+    /// override for a CLI. One definition for every caller that makes this
+    /// choice (`LiveAISession.kick`, `RecordingSummarizer`,
+    /// `SpeakerNameSuggester`) — sending a CLI model name such as
+    /// "claude-sonnet-4-6" to an OpenAI endpoint 404s (celarent7/mila#4).
+    nonisolated static func backgroundModelName(tool: LLMTool,
+                                                openAIModelName: String,
+                                                liveAIModel: String) -> String {
+        tool == .openaiCompatible ? openAIModelName : liveAIModel
     }
 
     /// Free-text extra CLI arguments appended to EVERY post-recording
@@ -599,16 +622,11 @@ final class LLMSettings: ObservableObject {
         // Default-on: a bare `defaults.bool` would read false for users who
         // have never seen this key, silently disabling summaries for
         // everyone on upgrade. Treat "key absent" as true.
-        let summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
-        self.summaryEnabled = summaryEnabled
-        // Absent → follow auto-summary (see the property): a fresh install
-        // gets `true`, a user who opted out of auto-summary gets `false`.
-        // Resolved from the local above, not `self.summaryEnabled` — a
-        // `@Published` getter needs a fully initialised `self`. Not written
-        // back here: assigning in `init` does not run `didSet`, which is what
-        // keeps an untouched switch tracking auto-summary across launches.
-        self.speakerNameSuggestionsEnabled =
-            (defaults.object(forKey: Keys.speakerNameSuggestionsEnabled) as? Bool) ?? summaryEnabled
+        self.summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
+        // Absent → nil → the switch follows auto-summary, live (see
+        // `speakerNameSuggestionsEnabled`).
+        self.speakerNameSuggestionsChoice =
+            defaults.object(forKey: Keys.speakerNameSuggestionsEnabled) as? Bool
         self.cliTimeout = (defaults.object(forKey: Keys.cliTimeout) as? Double) ?? Self.defaultTimeout
         self.extraArgs = defaults.string(forKey: Keys.extraArgs) ?? ""
 

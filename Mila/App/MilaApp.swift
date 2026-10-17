@@ -643,8 +643,14 @@ struct MilaApp: App {
         sidecarWriter.cleanupAtLaunch()
         svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester] rec, wasRetranscription in
             // Speaker-name suggestions for this pass's (re-keyed) speakers,
-            // once the summary attempt below settles.
-            nameSuggester?.markPending(rec.id)
+            // once the summary attempt below settles. With no summarizer
+            // there is no settle signal to wait for, so run them now rather
+            // than leave a mark nothing will consume.
+            if summarizer != nil {
+                nameSuggester?.markPending(rec.id)
+            } else {
+                nameSuggester?.suggest(recordingID: rec.id)
+            }
             // A recording whose live transcript wasn't final closed its live
             // sidecar WITHOUT a handoff id, because at Stop the batch worker
             // hadn't produced the transcript yet. It just did — so publish the

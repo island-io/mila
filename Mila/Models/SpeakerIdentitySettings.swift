@@ -25,9 +25,10 @@ import Combine
 @MainActor
 final class SpeakerIdentitySettings: ObservableObject {
 
-    /// The user's own display name as typed. Not trimmed on write — a text
-    /// field bound to it must be able to hold the space between a first and
-    /// last name while the user is typing. Readers use `resolvedName`.
+    /// The user's own display name. Settings writes it once per committed
+    /// edit (Return / focus loss), never per keystroke: this is an App-level
+    /// `@StateObject`, so every publish re-diffs every scene. Readers use
+    /// `resolvedName`, which also covers a hand-edited untrimmed value.
     @Published var myName: String {
         didSet {
             guard myName != oldValue else { return }

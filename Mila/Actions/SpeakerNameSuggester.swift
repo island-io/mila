@@ -15,9 +15,10 @@ private let suggesterLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 ///    (`localUserSuggestion`). Local, no LLM.
 /// 2. **The transcript** — one LLM call asking which unnamed speakers state
 ///    their own name ("Hi, I'm Dana") or are addressed by name right before
-///    they answer. Every mapping must come with a quote; mappings whose quote
-///    is missing, is not in the transcript, or does not contain the name are
-///    dropped (`parseSuggestions`).
+///    they answer. Every mapping must come with a quote, and the quote must
+///    be about THAT speaker: in their own turn, or in the turn right before
+///    they answer, stating the name as a whole word. Anything else — and any
+///    ambiguous or already-taken name — is dropped (`parseSuggestions`).
 ///
 /// **Everything it produces is a suggestion.** It writes only
 /// `Recording.speakerNameSuggestions` (`RecordingStore.mergeSpeakerNameSuggestions`),
@@ -81,6 +82,12 @@ final class SpeakerNameSuggester {
     /// not unwound yet; they still hold a slot (their child is still being
     /// killed), exactly as in `RecordingSummarizer.cancelledRuns`.
     private var cancelledRuns: [UUID: Task<Void, Never>] = [:]
+    /// Recordings that asked again while their call was out — a
+    /// re-transcription completing mid-call, say. That call's answer is
+    /// about the OLD speakers and is discarded by the snapshot check, so the
+    /// request must not be dropped either: it runs once the call in flight
+    /// has finished (`runEnded`), like the summarizer's follow-up.
+    private var rerunRequested: Set<UUID> = []
 
     /// One call at a time. This is a background nicety, not something the
     /// user is waiting on, and it already runs next to the summarizer's own
@@ -122,6 +129,19 @@ final class SpeakerNameSuggester {
                 for id in ids { self.cancel(recordingID: id) }
             }
             .store(in: &cancellables)
+        // A mark only means something until that recording's summary attempt
+        // settles, and the summarizer does not signal for a row that was
+        // trashed or deleted meanwhile. Drop such marks the moment the row
+        // leaves the live list, so a later manual "Regenerate summary" (after
+        // a restore, say) cannot consume a stale mark and trigger a call that
+        // no fresh completion asked for.
+        store.$recordings
+            .sink { [weak self] recordings in
+                guard let self, !self.pending.isEmpty else { return }
+                let live = Set(recordings.lazy.filter { !$0.isTrashed }.map(\.id))
+                self.pending.formIntersection(live)
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Triggers
@@ -157,7 +177,12 @@ final class SpeakerNameSuggester {
             return
         }
         guard !Self.unnamedSpeakers(in: live).isEmpty else { return }
-        guard inFlight[id] == nil, !queue.contains(id) else { return }
+        if inFlight[id] != nil {
+            rerunRequested.insert(id)
+            suggesterLog.log("\(Self.shortID(id), privacy: .public): already in flight — re-running after it")
+            return
+        }
+        guard !queue.contains(id) else { return }
         queue.append(id)
         pump()
     }
@@ -167,6 +192,7 @@ final class SpeakerNameSuggester {
     /// SIGTERM/SIGKILL for a CLI child).
     func cancel(recordingID: UUID) {
         pending.remove(recordingID)
+        rerunRequested.remove(recordingID)
         queue.removeAll { $0 == recordingID }
         if let run = inFlight.removeValue(forKey: recordingID) {
             run.task.cancel()
@@ -198,8 +224,9 @@ final class SpeakerNameSuggester {
         guard !unnamed.isEmpty else { return }
 
         let tool = llmSettings.tool
-        // Same tool-conditional model choice as `RecordingSummarizer`.
-        let model = (tool == .openaiCompatible) ? llmSettings.openAIModelName : liveAISettings.model
+        let model = LLMSettings.backgroundModelName(tool: tool,
+                                                    openAIModelName: llmSettings.openAIModelName,
+                                                    liveAIModel: liveAISettings.model)
         let call = Call(
             tool: tool,
             prompt: Self.prompt(unnamedSpeakers: unnamed),
@@ -235,8 +262,15 @@ final class SpeakerNameSuggester {
     /// Every run's last step, whatever became of it: release this run's own
     /// slot (never a newer run's for the same id) and start the next one.
     private func runEnded(id: UUID, token: UUID) {
-        if inFlight[id]?.token == token { inFlight[id] = nil }
+        let ownedSlot = inFlight[id]?.token == token
+        if ownedSlot { inFlight[id] = nil }
         cancelledRuns[token] = nil
+        // A request that arrived while this run was out gets its own run now,
+        // built from the row as it is. Not for a cancelled run: `cancel`
+        // already cleared the request with everything else.
+        if ownedSlot, rerunRequested.remove(id) != nil {
+            suggest(recordingID: id)
+        }
         pump()
     }
 
@@ -274,7 +308,8 @@ final class SpeakerNameSuggester {
         }
         let suggestions = Self.parseSuggestions(from: raw,
                                                 unnamedSpeakers: Set(Self.unnamedSpeakers(in: live)),
-                                                transcript: Self.evidenceText(for: live))
+                                                turns: Self.turns(for: live),
+                                                takenNames: Array(live.speakerNames.values))
         let changed = store.mergeSpeakerNameSuggestions(suggestions, recordingID: id)
         // Counts only: names and quotes are user content.
         suggesterLog.log("succeeded \(Self.shortID(id), privacy: .public) output=\(raw.count, privacy: .public)c accepted=\(suggestions.count, privacy: .public) changed=\(changed, privacy: .public)")
@@ -345,12 +380,29 @@ final class SpeakerNameSuggester {
                                       names: recording.speakerNames)
     }
 
-    /// The text a returned quote is checked against: every segment's words,
-    /// with no speaker labels in between, so a quote that runs across a turn
-    /// boundary ("Dana, what do you think? I think…") still matches.
-    static func evidenceText(for recording: Recording) -> String {
-        let joined = TranscriptFormatter.joinedFullText(segments: recording.segments)
-        return joined.isEmpty ? recording.fullText : joined
+    /// One speaker turn: consecutive segments of the same speaker joined, as
+    /// `labeledTranscript` renders them. The unit a quote is checked against.
+    struct Turn: Equatable {
+        let speaker: String?
+        let text: String
+    }
+
+    /// The recording's turns in order, blank segments skipped. Collapsing
+    /// same-speaker segments means a quote that runs over a segment break
+    /// inside one person's turn still matches, and that the turn after any
+    /// turn is always a DIFFERENT speaker's.
+    static func turns(for recording: Recording) -> [Turn] {
+        var result: [Turn] = []
+        for seg in recording.segments {
+            let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            if let last = result.last, last.speaker == seg.speaker {
+                result[result.count - 1] = Turn(speaker: last.speaker, text: last.text + " " + text)
+            } else {
+                result.append(Turn(speaker: seg.speaker, text: text))
+            }
+        }
+        return result
     }
 
     static func prompt(unnamedSpeakers: [String]) -> String {
@@ -400,22 +452,29 @@ final class SpeakerNameSuggester {
     ///  * `speaker` is one of `unnamedSpeakers` (a named speaker, an invented
     ///    label or a friendly "Speaker A" is dropped);
     ///  * `name` is a plausible name — non-empty, one line, at most
-    ///    `maxNameLength`, not a placeholder ("Unknown", "Speaker B", …);
-    ///  * `quote` is non-empty, OCCURS in `transcript` (compared after
-    ///    `normalizedForMatching`, so case and punctuation do not matter but
-    ///    words do), and CONTAINS the name (or a word of it), i.e. the
-    ///    evidence actually states it.
+    ///    `maxNameLength`, not a placeholder ("Unknown", "Speaker B", …) —
+    ///    and not already the name of another speaker here (`takenNames`);
+    ///  * `quote` is at least two words, STATES the name as a whole word
+    ///    (`quoteStatesName`), and is evidence about THIS speaker
+    ///    (`quoteIsEvidence`): it occurs in one of the speaker's own turns
+    ///    ("I'm Dana"), or in the turn immediately before one of theirs
+    ///    ("Dana, what do you think?" — then they answer). A quote that is
+    ///    merely somewhere in the transcript proves nothing about who it
+    ///    names.
     /// Then ambiguity is resolved by dropping: a speaker given two different
     /// names, or one name given to two speakers, keeps neither.
     static func parseSuggestions(from raw: String,
                                  unnamedSpeakers: Set<String>,
-                                 transcript: String) -> [SpeakerNameSuggestion] {
+                                 turns: [Turn],
+                                 takenNames: [String] = []) -> [SpeakerNameSuggestion] {
         guard let entries = wireEntries(in: raw), !entries.isEmpty else { return [] }
-        let haystack = normalizedForMatching(transcript)
-        guard !haystack.isEmpty else { return [] }
+        let normalizedTurns = turns.map { (speaker: $0.speaker, text: normalizedForMatching($0.text)) }
+        guard normalizedTurns.contains(where: { !$0.text.isEmpty }) else { return [] }
         // Upper-cased lookup so "speaker_01" still resolves to the raw id.
         let byUpper = Dictionary(unnamedSpeakers.map { ($0.uppercased(), $0) },
                                  uniquingKeysWith: { first, _ in first })
+        func key(_ name: String) -> String { normalizedForMatching(name) }
+        let taken = Set(takenNames.map(key).filter { !$0.isEmpty })
 
         var candidates: [SpeakerNameSuggestion] = []
         for entry in entries {
@@ -423,13 +482,16 @@ final class SpeakerNameSuggester {
                   let speaker = byUpper[rawSpeaker.uppercased()],
                   let name = entry.name?.trimmingCharacters(in: .whitespacesAndNewlines),
                   isPlausibleName(name),
+                  !taken.contains(key(name)),
                   let quote = entry.quote?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !quote.isEmpty
             else { continue }
             let normalizedQuote = normalizedForMatching(quote)
-            guard !normalizedQuote.isEmpty,
-                  haystack.contains(normalizedQuote),
-                  quoteStatesName(normalizedQuote: normalizedQuote, name: name)
+            // One word is at most the bare name — that names nobody.
+            guard normalizedQuote.split(separator: " ").count >= 2,
+                  quoteStatesName(normalizedQuote: normalizedQuote, name: name),
+                  quoteIsEvidence(normalizedQuote: normalizedQuote, for: speaker,
+                                  turns: normalizedTurns)
             else { continue }
             let stored = quote.count > maxStoredQuoteLength
                 ? String(quote.prefix(maxStoredQuoteLength)) + "…"
@@ -440,7 +502,6 @@ final class SpeakerNameSuggester {
 
         // Ambiguity → drop. Compare names case-insensitively so "Dana" twice
         // for one speaker (two quotes) is one answer, not a conflict.
-        func key(_ name: String) -> String { normalizedForMatching(name) }
         var namesBySpeaker: [String: Set<String>] = [:]
         var speakersByName: [String: Set<String>] = [:]
         for c in candidates {
@@ -454,6 +515,22 @@ final class SpeakerNameSuggester {
             // First quote per speaker wins.
             return seenSpeakers.insert(c.speaker).inserted
         }
+    }
+
+    /// Whether `normalizedQuote` is evidence about `speaker`: it occurs, as
+    /// whole words, in one of the speaker's own turns, or in the turn right
+    /// before one of the speaker's turns (they were addressed, then answered).
+    /// `turns` must already be collapsed, so the next turn is always another
+    /// speaker's.
+    static func quoteIsEvidence(normalizedQuote: String,
+                                for speaker: String,
+                                turns: [(speaker: String?, text: String)]) -> Bool {
+        let needle = " \(normalizedQuote) "
+        for (i, turn) in turns.enumerated() where " \(turn.text) ".contains(needle) {
+            if turn.speaker == speaker { return true }
+            if i + 1 < turns.count, turns[i + 1].speaker == speaker { return true }
+        }
+        return false
     }
 
     /// Placeholders a model writes when told not to guess, plus anything
@@ -478,14 +555,19 @@ final class SpeakerNameSuggester {
     }
 
     /// Whether the (normalized) quote states the name: the whole name, or
-    /// one of its words of two or more letters ("Dana" in "Dana Cohen"), as
-    /// a substring — so a Hebrew prefix letter ("לדנה") still counts.
+    /// one of its words of two or more letters ("Dana" in "Dana Cohen"), as a
+    /// WHOLE WORD — "Ed" must not match "edited". Word boundaries come from
+    /// `normalizedForMatching`, which splits on every non-alphanumeric
+    /// Unicode scalar, so this holds for Hebrew as for Latin script. (A
+    /// Hebrew prefix letter glued to the name, "לדנה", therefore does not
+    /// count; a quote that states the name plainly is required.)
     static func quoteStatesName(normalizedQuote: String, name: String) -> Bool {
         let normalizedName = normalizedForMatching(name)
         guard !normalizedName.isEmpty else { return false }
-        if normalizedQuote.contains(normalizedName) { return true }
+        let haystack = " \(normalizedQuote) "
+        if haystack.contains(" \(normalizedName) ") { return true }
         return normalizedName.split(separator: " ")
-            .contains { $0.count >= 2 && normalizedQuote.contains($0) }
+            .contains { $0.count >= 2 && haystack.contains(" \($0) ") }
     }
 
     /// Lower-cased, diacritics folded, every run of non-alphanumerics
