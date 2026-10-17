@@ -370,6 +370,9 @@ struct MilaApp: App {
     /// Persistent, app-wide list of speaker names — the pick-list behind
     /// the transcript's speaker rename popover.
     @StateObject private var speakerDirectory: SpeakerDirectory
+    /// Settings → Speakers → "Your name" (issue #348). Read by the speaker
+    /// name suggester; one publish per edit, never per audio buffer.
+    @StateObject private var speakerIdentitySettings: SpeakerIdentitySettings
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
     /// Imports double-clicked `.milashare` bundles — a recording another Mila
@@ -557,6 +560,18 @@ struct MilaApp: App {
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
                                              liveAISettings: liveAI)
+        // Speaker-name SUGGESTIONS (issue #348): "Your name" for the one voice
+        // on a mic-only recording, and names the transcript states, offered
+        // for one-click accept. Runs once per fresh completion, after that
+        // recording's summary attempt settles (`markPending` below and in
+        // `finalizeTail`, `suggestIfPending` in `onSummaryFinished`). Owned
+        // by `actions` (strong, like its other late-bound collaborators);
+        // every closure here holds it weakly.
+        let speakerIdentity = SpeakerIdentitySettings()
+        let nameSuggester = SpeakerNameSuggester(store: store,
+                                                 llmSettings: llm,
+                                                 liveAISettings: liveAI,
+                                                 identity: speakerIdentity)
         // Obsidian vault destination. When enabled, a completed recording is
         // written into the vault as a Markdown note (summary + action items,
         // transcript fallback) once its summary is ready, then optionally
@@ -599,7 +614,10 @@ struct MilaApp: App {
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
-        summarizer.onSummaryFinished = { [weak obsidian] rec in
+        summarizer.onSummaryFinished = { [weak obsidian, weak nameSuggester] rec in
+            // First, and independent of Obsidian: a no-op unless a fresh
+            // completion marked this recording (never for backfill).
+            nameSuggester?.suggestIfPending(rec)
             guard let obsidian, obsidian.isPending(rec.id) else { return }
             obsidian.export(rec)
             obsidian.clearPending(rec.id)
@@ -623,7 +641,16 @@ struct MilaApp: App {
         // `store`; the `actions` wiring stays further down with the rest.
         let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
         sidecarWriter.cleanupAtLaunch()
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester] rec, wasRetranscription in
+            // Speaker-name suggestions for this pass's (re-keyed) speakers,
+            // once the summary attempt below settles. With no summarizer
+            // there is no settle signal to wait for, so run them now rather
+            // than leave a mark nothing will consume.
+            if summarizer != nil {
+                nameSuggester?.markPending(rec.id)
+            } else {
+                nameSuggester?.suggest(recordingID: rec.id)
+            }
             // A recording whose live transcript wasn't final closed its live
             // sidecar WITHOUT a handoff id, because at Stop the batch worker
             // hadn't produced the transcript yet. It just did — so publish the
@@ -645,6 +672,9 @@ struct MilaApp: App {
                     // No summary will be regenerated — export immediately with
                     // the transcript fallback (no summarizer hook to wait for).
                     if obsidianOn { obsidian?.export(rec) }
+                    // No summarizer hook here either, so settle the pending
+                    // speaker-name suggestions now.
+                    nameSuggester?.suggestIfPending(rec)
                     return
                 }
                 if obsidianOn { obsidian?.markPending(rec.id) }
@@ -889,6 +919,7 @@ struct MilaApp: App {
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings
         actions.obsidianExporter = obsidian
+        actions.speakerNameSuggester = nameSuggester
         // Discard un-exports: the note can already be in the vault by the time
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
@@ -964,6 +995,7 @@ struct MilaApp: App {
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
         _speakerDirectory = StateObject(wrappedValue: speakerDirectory)
+        _speakerIdentitySettings = StateObject(wrappedValue: speakerIdentity)
         _configImporter = StateObject(wrappedValue: configImporter)
         _shareImporter = StateObject(wrappedValue: shareImporter)
         _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
@@ -1014,6 +1046,7 @@ struct MilaApp: App {
                 .of("obsidianExporter", obsidian),
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
+                .of("speakerIdentitySettings", speakerIdentity),
                 .of("configImporter", configImporter),
                 .of("shareImporter", shareImporter),
                 .of("liveSidecarWriter", sidecarWriter),
@@ -1075,6 +1108,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(speakerIdentitySettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
@@ -1195,6 +1229,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(speakerIdentitySettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)

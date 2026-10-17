@@ -1257,6 +1257,11 @@ final class TranscriptionService: ObservableObject {
                 if !enrichedSegments.isEmpty {
                     clearedSpeakerNames = $0.speakerNames
                     $0.speakerNames = working.speakerNames
+                    // Pending name suggestions are keyed by the same old IDs
+                    // and would now point at a different voice. Unlike the
+                    // names they fold nothing into a profile, so they are
+                    // simply dropped; the post-pass suggester asks again.
+                    $0.speakerNameSuggestions = []
                 }
             }) else {
                 serviceLog.log("""

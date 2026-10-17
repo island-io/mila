@@ -1813,6 +1813,7 @@ private struct AIFeaturesSettingsTab: View {
     // and flip every feature without expanding a thing.
     @State private var showSummary = false
     @State private var showName = false
+    @State private var showSpeakerNames = false
     @State private var showAction = false
     @State private var showLiveAI = false
 
@@ -1863,6 +1864,21 @@ private struct AIFeaturesSettingsTab: View {
                             settings.namePrompt = $0
                         }
                     }
+                }
+                Divider()
+
+                AIFeatureRow(title: "Speaker names",
+                             caption: "Suggest who's speaking when someone says their name.",
+                             help: "After a recording finishes, Mila asks your provider which unnamed speakers say their own name (\u{201C}Hi, I'm Dana\u{201D}) or are addressed by name right before they answer. Each answer must quote the transcript; anything without a quote is dropped. Names appear as suggestions above the transcript — nothing is renamed, and no voice profile learns anything, until you accept one.",
+                             isOn: $settings.speakerNameSuggestionsEnabled,
+                             toggleIdentifier: "llm.speakerNames.enabled.toggle",
+                             identifier: "ai.section.speakerNames",
+                             isExpanded: $showSpeakerNames) {
+                    Text("Sends the transcript, with its speaker labels, to your provider once per recording that has an unnamed speaker. Suggestions only: you accept or dismiss each one from the recording. Your own name is set in Settings → Speakers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: aiCaptionWidth, alignment: .leading)
                 }
                 Divider()
 
@@ -2473,6 +2489,10 @@ private struct DiarizationSettingsTabContent: View {
 
             Divider()
 
+            YourNameSection()
+
+            Divider()
+
             KnownSpeakersSection()
 
             Divider()
@@ -2610,6 +2630,54 @@ private struct DiarizationSettingsTabContent: View {
             return "Speaker detection blocked by macOS code signing — reinstall Mila from the official download"
         }
         return "Speaker detection unavailable"
+    }
+}
+
+/// Settings → Speakers → "Your name" (issue #348): who "me" is. Used only to
+/// SUGGEST a name for the single voice in a recording made from this Mac's
+/// microphone (or a Voice Memo) — see `SpeakerIdentitySettings` for why
+/// meetings are not covered. Committing the field also adds the name to the
+/// known-speakers list so it is one click away in every rename popover.
+private struct YourNameSection: View {
+    @EnvironmentObject private var identity: SpeakerIdentitySettings
+    @EnvironmentObject private var directory: SpeakerDirectory
+    /// Edited locally and written to `identity` only on Return / focus loss.
+    /// `identity` is an App-level `@StateObject`, so binding the field to it
+    /// directly would publish — and re-diff every scene — on each keystroke
+    /// (the CLAUDE.md #280 rule), plus write UserDefaults each time.
+    @State private var draft = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Your name")
+                .font(.callout.weight(.semibold))
+            Text("When a recording from your microphone has a single voice, Mila suggests your name for it. Accept it once with voice recognition on and Mila recognises you in later recordings, meetings included.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("Your name", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused)
+                .onSubmit(commit)
+                .onChange(of: focused) { _, isFocused in
+                    if !isFocused { commit() }
+                }
+                .frame(maxWidth: 280)
+                .accessibilityIdentifier("speakers.myName.field")
+        }
+        .onAppear { draft = identity.myName }
+        // Closing Settings with the field still focused must not lose the edit.
+        .onDisappear(perform: commit)
+    }
+
+    private func commit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only on a real change: `@Published` announces every assignment,
+        // equal or not, so a blur with nothing edited must not write.
+        if identity.myName != trimmed { identity.myName = trimmed }
+        draft = trimmed
+        if !trimmed.isEmpty { directory.add(trimmed) }
     }
 }
 

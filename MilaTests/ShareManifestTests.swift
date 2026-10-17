@@ -233,7 +233,13 @@ final class ShareManifestTests: XCTestCase {
             // Mid-re-run bookkeeping; set so the key-set test below sees the
             // key and can hold it to the allowlist.
             retranscriptionPriorState: .init(status: .completed, language: "he",
-                                             modelName: "Earlier model"))
+                                             modelName: "Earlier model"),
+            // Pending, unaccepted suggestion; set so the key-set test below
+            // sees the key and can hold it to the allowlist.
+            speakerNameSuggestions: [
+                SpeakerNameSuggestion(speaker: "SPEAKER_01", name: "John",
+                                      evidence: "hi there, John here", origin: .transcript),
+            ])
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -327,6 +333,11 @@ final class ShareManifestTests: XCTestCase {
             // completed transcript in the language the manifest states; the
             // sender's in-flight run is not its concern.
             "retranscriptionPriorState",
+            // Unaccepted speaker-name suggestions (#348) — the sender's
+            // provider's guesses about the sender's recording. A share carries
+            // confirmed names (`speakerNames`); a pending guess arriving on
+            // the receiver's side would read as the sender's decision.
+            "speakerNameSuggestions",
         ]
         let storeEncoder = JSONEncoder()
         storeEncoder.dateEncodingStrategy = .iso8601

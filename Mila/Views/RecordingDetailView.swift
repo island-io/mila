@@ -15,6 +15,9 @@ struct RecordingDetailView: View {
     @EnvironmentObject private var liveAI: LiveAISettings
     @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
     @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
+    /// Accepting a suggested speaker name routes it through the directory,
+    /// exactly as the rename popover does (issue #348).
+    @EnvironmentObject private var speakerDirectory: SpeakerDirectory
 
     /// Non-nil while the `.milashare` export sheet is up (see
     /// `recordingShareSheet`).
@@ -81,6 +84,21 @@ struct RecordingDetailView: View {
                     ? { summarizer.setSummaryLanguage($0, for: recording.id) }
                     : nil,
                 isTranscribing: isTranscriptionBusy
+            )
+            SpeakerNameSuggestionsBanner(
+                suggestions: recording.actionableSpeakerNameSuggestions,
+                language: recording.transcriptLanguage,
+                onAccept: { suggestion in
+                    // The normal rename path: directory first (canonical
+                    // spelling, future pick-lists), then `setSpeakerName`.
+                    _ = store.acceptSpeakerNameSuggestion(forSpeaker: suggestion.speaker,
+                                                          recordingID: recording.id,
+                                                          canonicalName: { speakerDirectory.add($0) })
+                },
+                onDismiss: { suggestion in
+                    store.dismissSpeakerNameSuggestion(forSpeaker: suggestion.speaker,
+                                                       recordingID: recording.id)
+                }
             )
             transcriptArea
                 // Force the transcript area to take the remaining
@@ -979,6 +997,80 @@ private struct AIOverviewBanner: View {
                 .frame(maxHeight: 240)
                 Divider()
             }
+        }
+    }
+}
+
+/// Pending speaker-name suggestions (issue #348), one row each, with a
+/// one-click Accept and a Dismiss. Renders nothing when there are none, so a
+/// recording without suggestions looks exactly as before.
+///
+/// Each row shows WHY: the transcript quote the model pointed at (verified to
+/// be in the transcript), or, for "Your name", that it is the only voice on a
+/// recording from this Mac's microphone. A suggestion is never applied on its
+/// own — see `SpeakerNameSuggestion`.
+private struct SpeakerNameSuggestionsBanner: View {
+    let suggestions: [SpeakerNameSuggestion]
+    /// Transcript language, for the "Speaker A" / "דובר א׳" label.
+    let language: String
+    let onAccept: (SpeakerNameSuggestion) -> Void
+    let onDismiss: (SpeakerNameSuggestion) -> Void
+
+    var body: some View {
+        if !suggestions.isEmpty {
+            VStack(alignment: .leading, spacing: 0) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Suggested speaker names", systemImage: "person.crop.circle.badge.questionmark")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(suggestions) { suggestion in
+                        row(suggestion)
+                    }
+                }
+                .padding(.horizontal)
+                .padding(.vertical, 10)
+                Divider()
+            }
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("detail.speakerNameSuggestions")
+        }
+    }
+
+    private func row(_ suggestion: SpeakerNameSuggestion) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("\(suggestion.speaker.friendlySpeakerLabel(language: language)) \u{2192} \(suggestion.name)")
+                    .font(.callout)
+                Text(reason(for: suggestion))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button("Accept") { onAccept(suggestion) }
+                .controlSize(.small)
+                .help("Name this speaker \u{201C}\(suggestion.name)\u{201D}")
+                .accessibilityIdentifier("detail.speakerNameSuggestion.accept.\(suggestion.speaker)")
+            Button {
+                onDismiss(suggestion)
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .controlSize(.small)
+            .help("Dismiss this suggestion")
+            .accessibilityLabel(Text("Dismiss"))
+            .accessibilityIdentifier("detail.speakerNameSuggestion.dismiss.\(suggestion.speaker)")
+        }
+    }
+
+    private func reason(for suggestion: SpeakerNameSuggestion) -> String {
+        switch suggestion.origin {
+        case .localUser:
+            return "Your name \u{2014} the only voice in a recording from your microphone."
+        case .transcript:
+            return "\u{201C}\(suggestion.evidence)\u{201D}"
         }
     }
 }

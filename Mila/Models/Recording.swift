@@ -189,6 +189,21 @@ struct Recording: Identifiable, Codable, Hashable {
     /// row as it always did. Mirrored in MilaKit's `StoredRecording`.
     var retranscriptionPriorState: RetranscriptionPriorState?
 
+    /// Names proposed for still-unnamed speakers, waiting for the user to
+    /// accept or dismiss them (issue #348) — see `SpeakerNameSuggestion`.
+    /// Never applied on their own: accepting one goes through
+    /// `RecordingStore.setSpeakerName`.
+    ///
+    /// Keyed by raw speaker id like `speakerNames`, so every pass that
+    /// re-keys the ids clears it alongside the names (`TranscriptionService`'s
+    /// pass merge, `QuickActionsController.applyRediarizedSpeakers`). Omitted
+    /// from recordings.json when empty, so a row with none encodes
+    /// byte-identically to before the field existed. Deliberately NOT
+    /// mirrored in MilaKit's `StoredRecording` nor carried in a `.milashare`
+    /// (see the allowlists in `StoredRecordingDriftTests` and
+    /// `ShareManifestTests`): both expose confirmed names only.
+    var speakerNameSuggestions: [SpeakerNameSuggestion]
+
     /// Whether the row holds any transcript text — what a re-run leaves in
     /// place until it completes.
     var hasTranscript: Bool {
@@ -289,7 +304,8 @@ struct Recording: Identifiable, Codable, Hashable {
          sharedBy: String? = nil,
          sharedAt: Date? = nil,
          transcriptionDeferredAt: Date? = nil,
-         retranscriptionPriorState: RetranscriptionPriorState? = nil) {
+         retranscriptionPriorState: RetranscriptionPriorState? = nil,
+         speakerNameSuggestions: [SpeakerNameSuggestion] = []) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -315,6 +331,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.sharedAt = sharedAt
         self.transcriptionDeferredAt = transcriptionDeferredAt
         self.retranscriptionPriorState = retranscriptionPriorState
+        self.speakerNameSuggestions = speakerNameSuggestions
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -358,7 +375,7 @@ struct Recording: Identifiable, Codable, Hashable {
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
              speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt,
-             retranscriptionPriorState
+             retranscriptionPriorState, speakerNameSuggestions
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -396,6 +413,10 @@ struct Recording: Identifiable, Codable, Hashable {
         // stopped transcription instead of restoring it.
         self.retranscriptionPriorState = try? c.decodeIfPresent(RetranscriptionPriorState.self,
                                                                 forKey: .retranscriptionPriorState)
+        // `try?` for the same all-or-nothing reason: unconfirmed suggestions
+        // are the cheapest thing on the row to lose.
+        self.speakerNameSuggestions = (try? c.decodeIfPresent([SpeakerNameSuggestion].self,
+                                                              forKey: .speakerNameSuggestions)) ?? []
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -433,6 +454,11 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
         try c.encodeIfPresent(transcriptionDeferredAt, forKey: .transcriptionDeferredAt)
         try c.encodeIfPresent(retranscriptionPriorState, forKey: .retranscriptionPriorState)
+        // Omitted when empty — the common case — so a row with no pending
+        // suggestion is byte-identical to what the previous release wrote.
+        if !speakerNameSuggestions.isEmpty {
+            try c.encode(speakerNameSuggestions, forKey: .speakerNameSuggestions)
+        }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 
