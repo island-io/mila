@@ -1213,6 +1213,10 @@ final class QuickActionsController: ObservableObject {
         // emptied live transcript apart from one that never existed. See
         // `liveTranscriptIsAuthoritative`.
         let userDeletedLiveLines = runsLivePipeline && (liveTranscriber?.hasUserDeletedSegments ?? false)
+        // Same snapshot rule: whether the remote server stayed unreachable
+        // long enough that some utterance never made it into the live
+        // transcript (#355). See `isLiveTranscriptAuthoritative(...)`.
+        let liveTranscriptHasGap = runsLivePipeline && (liveTranscriber?.hasUntranscribedAudio ?? false)
         let finalSummary = (runsLivePipeline ? (liveAISession?.summary ?? "") : "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = runsLivePipeline ? (liveAISession?.actionItems ?? []) : []
@@ -1276,7 +1280,18 @@ final class QuickActionsController: ObservableObject {
         // recorded, so a deliberate emptying stays authoritative and saves
         // empty. (Cursor Bugbot on #229.)
         let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
-        let liveTranscriptIsAuthoritative = (hasLiveSegments || userEmptiedLiveTranscript) && vadActive
+        let liveTranscriptIsAuthoritative = Self.isLiveTranscriptAuthoritative(
+            vadActive: vadActive,
+            hasLiveSegments: hasLiveSegments,
+            userDeletedLiveLines: userDeletedLiveLines,
+            hasUntranscribedAudio: liveTranscriptHasGap)
+        if liveTranscriptHasGap {
+            quickActionsLog.log("""
+                live transcript has untranscribed audio (remote server unreachable at Stop) — \
+                authoritative=\(liveTranscriptIsAuthoritative, privacy: .public) \
+                userDeletedLines=\(userDeletedLiveLines, privacy: .public)
+                """)
+        }
         let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
 
         guard var updated = store.recordings.first(where: { $0.id == recording.id }) else {
@@ -1458,6 +1473,35 @@ final class QuickActionsController: ObservableObject {
         isFinalizingRecording = false
 
         finalizeTail(for: updated, liveTranscriptIsAuthoritative: liveTranscriptIsAuthoritative)
+    }
+
+    /// Whether the live transcript is the recording's FINAL transcript, or
+    /// the WAV still owes a batch pass. Decided once, in `stopRecording`.
+    ///
+    ///  * Only the VAD path can be authoritative — chunk mode has no speaker
+    ///    labels, so it always gets the batch pass.
+    ///  * No live segments means the live path produced nothing, so the batch
+    ///    pass is the fallback — EXCEPT when the user emptied the transcript
+    ///    by deleting every line, which must stay empty (Cursor Bugbot on
+    ///    #229; `bugbot-rules/deleted-data-stays-deleted.md`).
+    ///  * Untranscribed audio (#355): the remote server stayed unreachable
+    ///    through the end-of-recording drain, so an utterance never made it
+    ///    into the live text. Saving that as final would quietly lose what was
+    ///    said during the outage, so the WAV goes to the batch pass instead —
+    ///    unless the user deleted live lines: the batch pass re-transcribes
+    ///    the whole WAV and would write every deleted line back. A deletion is
+    ///    a privacy action and wins over completeness; the audio is still on
+    ///    disk, and the user can re-transcribe deliberately.
+    ///
+    /// Pure + `static` so the decision is testable without a recording.
+    static func isLiveTranscriptAuthoritative(vadActive: Bool,
+                                              hasLiveSegments: Bool,
+                                              userDeletedLiveLines: Bool,
+                                              hasUntranscribedAudio: Bool) -> Bool {
+        let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
+        guard vadActive, hasLiveSegments || userEmptiedLiveTranscript else { return false }
+        if hasUntranscribedAudio && !userDeletedLiveLines { return false }
+        return true
     }
 
     /// Whether the offline re-diarize pass is worth running given how many

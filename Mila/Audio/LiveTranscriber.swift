@@ -48,6 +48,45 @@ final class LiveTranscriber: ObservableObject {
     @Published private(set) var isTranscribing: Bool = false
     @Published private(set) var lastError: String?
 
+    /// True while the remote transcription server cannot be reached
+    /// mid-recording (the network dropped, the connection was lost, the
+    /// upload timed out). Drives the NON-blocking "connection lost —
+    /// still recording" banner in the live pane, and clears itself the
+    /// moment an upload gets through again (#355). Recording is never
+    /// affected: capture writes the WAV whatever the network does, and the
+    /// utterances that failed are kept and retried (see
+    /// `transcribeUtterance`).
+    ///
+    /// Published only on a TRANSITION (`noteConnectionInterrupted` /
+    /// `noteConnectionRestored` compare first), so an outage costs two
+    /// publishes, not one per failed upload — `LiveTranscriber` is an
+    /// App-level `@StateObject`, and see CLAUDE.md on what a high-frequency
+    /// publish there costs. Always `false` for the on-device backend.
+    @Published private(set) var isConnectionInterrupted: Bool = false
+
+    /// Whether some of THIS recording's audio never made it into the live
+    /// transcript because the server stayed unreachable through the
+    /// end-of-recording drain (VAD path), or a fixed-window tick was lost to
+    /// it (chunk path). Read at Stop by `QuickActionsController.stopRecording`,
+    /// which then hands the recording to the batch pass instead of saving a
+    /// live transcript with a hole in it. Reset by `reset()` / `start()`;
+    /// deliberately NOT by `stop()`, which runs after Stop has read it — the
+    /// same lifecycle as `segments`.
+    private(set) var hasUntranscribedAudio: Bool = false
+
+    /// Backoff for re-sending an utterance whose upload could not reach the
+    /// server: `connectionRetryBaseDelay` doubling per attempt, capped at
+    /// `connectionRetryMaxDelay`. Small enough that the transcript catches up
+    /// within seconds of the connection coming back. Settable for tests.
+    var connectionRetryBaseDelay: TimeInterval = 2
+    var connectionRetryMaxDelay: TimeInterval = 10
+
+    /// Set by `transcribeNow()` for the end-of-recording drain. While it is
+    /// set, an utterance that cannot reach the server gives up after one
+    /// attempt (and marks `hasUntranscribedAudio`) instead of waiting for the
+    /// connection — otherwise Stop would hang for as long as the outage lasts.
+    private var isDraining = false
+
     /// Number of currently-running transcribe invocations. Always
     /// mutated alongside `isTranscribing = (count > 0)` via
     /// `beginTranscribe()` / `endTranscribe()` so the published
@@ -169,6 +208,7 @@ final class LiveTranscriber: ObservableObject {
         self.segments = []
         self.speakerNames = [:]
         self.lastError = nil
+        self.hasUntranscribedAudio = false
     }
 
     func start(language: String) {
@@ -227,7 +267,49 @@ final class LiveTranscriber: ObservableObject {
         // `stopRecording` snapshots `hasUserDeletedSegments` before its own
         // `stop()` — the same ordering it already relies on for `segments`.
         deletedRanges = []
+        // The recording is over, so is any "connection lost" warning about
+        // it. `hasUntranscribedAudio` is left for `reset()` — Stop has
+        // already read it by the time it calls this.
+        isDraining = false
+        noteConnectionRestored()
         return fullText
+    }
+
+    /// Flip the connection banner on. Compares first, so it publishes once
+    /// per outage — see `isConnectionInterrupted`.
+    private func noteConnectionInterrupted() {
+        guard !isConnectionInterrupted else { return }
+        liveLog.log("LiveTranscriber: remote server unreachable — recording continues, live transcription will retry")
+        isConnectionInterrupted = true
+    }
+
+    /// Flip the connection banner off. Called on every answer from the
+    /// backend, so it compares first — see `isConnectionInterrupted`.
+    private func noteConnectionRestored() {
+        guard isConnectionInterrupted else { return }
+        liveLog.log("LiveTranscriber: remote server reachable again")
+        isConnectionInterrupted = false
+    }
+
+    /// Sleep out a retry backoff, but wake early when the end-of-recording
+    /// drain starts (so Stop waits for one more attempt, not for the rest of
+    /// a 10 s backoff) or when the recording is torn down. Sliced into short
+    /// sleeps because the drain cannot cancel this task: it is usually not
+    /// `lastUtteranceTask` but an earlier link of the chain.
+    private func waitBeforeRetry(_ delay: TimeInterval, scheduledEpoch: Int) async {
+        let deadline = Date().addingTimeInterval(delay)
+        while !isDraining, scheduledEpoch == epoch, !Task.isCancelled {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { return }
+            try? await Task.sleep(nanoseconds: UInt64(Swift.min(remaining, 0.25) * 1_000_000_000))
+        }
+    }
+
+    /// Seconds to wait before the `attempt`-th re-send (1-based) of an
+    /// utterance that could not reach the server.
+    nonisolated static func connectionRetryDelay(attempt: Int, base: TimeInterval, max maxDelay: TimeInterval) -> TimeInterval {
+        let exponent = Double(Swift.max(0, attempt - 1))
+        return Swift.min(base * pow(2, exponent), maxDelay)
     }
 
     /// Bump the in-flight counter and publish `isTranscribing = true`.
@@ -335,6 +417,10 @@ final class LiveTranscriber: ObservableObject {
     }
 
     func transcribeNow() async {
+        // End of recording: an utterance that can't reach the server gets
+        // one more attempt, not an open-ended wait. See `isDraining`.
+        isDraining = true
+        defer { isDraining = false }
         if let detector {
             // End-of-recording flush: force-emit any in-progress
             // utterance (which schedules onto lastUtteranceTask), then
@@ -507,25 +593,65 @@ final class LiveTranscriber: ObservableObject {
             padded = samples
         }
         let startedAt = Date()
-        // VAD-bounded short utterances: use the WhisperEngine.computeAudioCtx
-        // formula (`audioCtx: nil`). This is the path the labelled-fixture
-        // sweep validated — see WhisperEngine.swift's `params.audio_ctx` block.
-        let whisperSegs = await transcription.transcribeOnceSegments(
-            samples: padded, language: language, audioCtx: nil
-        )
+        // A remote upload that cannot reach the server is RETRIED, not
+        // dropped (#355): this utterance's audio is kept and re-sent with
+        // backoff until the connection is back. Utterances spoken meanwhile
+        // queue up behind it on the `lastUtteranceTask` chain, so once it
+        // goes through they drain in order and the live transcript fills
+        // the gap by itself — no reordering, no insertion. The live
+        // diarizer was already fed above, exactly once.
+        var whisperSegs: [TranscriptSegment] = []
+        var failedAttempts = 0
+        attempts: while true {
+            // VAD-bounded short utterances: use the WhisperEngine.computeAudioCtx
+            // formula (`audioCtx: nil`). This is the path the labelled-fixture
+            // sweep validated — see WhisperEngine.swift's `params.audio_ctx` block.
+            let outcome = await transcription.transcribeLiveSegments(
+                samples: padded, language: language, audioCtx: nil
+            )
+            // Second epoch check post-whisper: the entry check covered the
+            // diarizer feed, but the user could still have started a new
+            // recording between then and now (whisper takes seconds), in
+            // which case we must drop the segment to avoid bleeding the
+            // previous conversation into the fresh transcript. It also
+            // keeps a stale failure from raising the NEXT recording's
+            // connection banner.
+            guard scheduledEpoch == self.epoch else {
+                liveLog.log("LiveTranscriber utterance dropped post-whisper — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
+                return
+            }
+            switch outcome {
+            case .transcribed(let segs):
+                noteConnectionRestored()
+                whisperSegs = segs
+                break attempts
+            case .skipped:
+                break attempts
+            case .connectionUnavailable:
+                noteConnectionInterrupted()
+                failedAttempts += 1
+                // End of recording (or a torn-down chain): stop waiting.
+                // Stop sees `hasUntranscribedAudio` and sends the WAV to
+                // the batch pass, which covers this utterance.
+                if isDraining || Task.isCancelled {
+                    hasUntranscribedAudio = true
+                    liveLog.log("LiveTranscriber utterance left untranscribed — server unreachable at end of recording (startSec=\(startSec, privacy: .public) attempts=\(failedAttempts, privacy: .public))")
+                    return
+                }
+                let delay = Self.connectionRetryDelay(attempt: failedAttempts,
+                                                      base: connectionRetryBaseDelay,
+                                                      max: connectionRetryMaxDelay)
+                liveLog.log("LiveTranscriber utterance: server unreachable, retrying in \(delay, privacy: .public)s (startSec=\(startSec, privacy: .public) attempt=\(failedAttempts, privacy: .public))")
+                await waitBeforeRetry(delay, scheduledEpoch: scheduledEpoch)
+                guard scheduledEpoch == self.epoch else {
+                    liveLog.log("LiveTranscriber utterance retry abandoned — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
+                    return
+                }
+            }
+        }
         let elapsed = Date().timeIntervalSince(startedAt)
         liveLog.log("LiveTranscriber utterance: samples=\(samples.count) padded=\(padded.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) startSec=\(startSec, privacy: .public) epoch=\(scheduledEpoch, privacy: .public) currentEpoch=\(self.epoch, privacy: .public)")
         guard !whisperSegs.isEmpty else { return }
-
-        // Second epoch check post-whisper: the entry check covered the
-        // diarizer feed, but the user could still have started a new
-        // recording between then and now (whisper takes seconds), in
-        // which case we must drop the segment to avoid bleeding the
-        // previous conversation into the fresh transcript.
-        guard scheduledEpoch == self.epoch else {
-            liveLog.log("LiveTranscriber utterance dropped post-whisper — epoch changed (scheduled=\(scheduledEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
-            return
-        }
 
         // VAD utterances are non-overlapping by construction, so we
         // just append — no merge dedup needed. Drop segments that
@@ -596,11 +722,10 @@ final class LiveTranscriber: ObservableObject {
         // utterance, so the labelled-fixture sweep doesn't cover it. Opt out
         // of the audio_ctx truncation; whisper's default 1500-token ctx
         // applies.
-        let whisperSegs = await transcription.transcribeOnceSegments(
+        let outcome = await transcription.transcribeLiveSegments(
             samples: slice, language: language, audioCtx: 0
         )
         let elapsed = Date().timeIntervalSince(startedAt)
-        liveLog.log("LiveTranscriber tick: samples=\(slice.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) lang=\(self.language, privacy: .public)")
         // The pipeline was torn down — or a new recording begun — while
         // whisper ran. Not even `trimBuffer()`: the buffer is the new
         // recording's now.
@@ -608,6 +733,25 @@ final class LiveTranscriber: ObservableObject {
             liveLog.log("LiveTranscriber tick dropped post-whisper — epoch changed (run=\(runEpoch, privacy: .public) current=\(self.epoch, privacy: .public))")
             return
         }
+        let whisperSegs: [TranscriptSegment]
+        switch outcome {
+        case .transcribed(let segs):
+            noteConnectionRestored()
+            whisperSegs = segs
+        case .skipped:
+            whisperSegs = []
+        case .connectionUnavailable:
+            // No retry here: the next tick re-sends the trailing window
+            // anyway, and the buffer is left untrimmed. Audio that slides
+            // out of the window meanwhile is covered by the batch pass —
+            // which a fixed-window recording always gets at Stop — so the
+            // flag is belt and braces on this path (#355).
+            noteConnectionInterrupted()
+            hasUntranscribedAudio = true
+            liveLog.log("LiveTranscriber tick: server unreachable — samples=\(slice.count) elapsed=\(elapsed, privacy: .public)s")
+            return
+        }
+        liveLog.log("LiveTranscriber tick: samples=\(slice.count) elapsed=\(elapsed, privacy: .public)s segments=\(whisperSegs.count) lang=\(self.language, privacy: .public)")
         guard !whisperSegs.isEmpty else { return }
 
         let absoluteSegs: [LiveSegment] = whisperSegs.compactMap { s in

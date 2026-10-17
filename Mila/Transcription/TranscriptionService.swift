@@ -458,7 +458,80 @@ final class TranscriptionService: ObservableObject {
     }
 
     func transcribeOnceSegments(samples: [Float], language: String, audioCtx: Int32?) async -> [TranscriptSegment] {
-        guard !cancellation.isStopped else { return [] }
+        switch await transcribeLiveSegments(samples: samples, language: language, audioCtx: audioCtx) {
+        case .transcribed(let segments):
+            return segments
+        case .skipped:
+            return []
+        case .connectionUnavailable(let message):
+            // A one-shot caller (dictation) has nothing to retry with — the
+            // audio it handed over is gone once this returns — so a lost
+            // connection is still a failure the user has to hear about here.
+            // Only `LiveTranscriber`, which keeps the audio and retries, goes
+            // through `transcribeLiveSegments` directly and skips the alert.
+            if lastError == nil {
+                lastError = "Live transcription failed: \(message)"
+            }
+            return []
+        }
+    }
+
+    /// What one live-path transcription attempt came to. See
+    /// `transcribeLiveSegments`.
+    enum LiveTranscriptionOutcome {
+        /// The backend answered. Empty when it heard no speech. For the
+        /// remote backend this is also proof that the connection is up.
+        case transcribed([TranscriptSegment])
+        /// Nothing was transcribed and sending the same audio again would not
+        /// help: the service is stopping, the capture was silent, the backend
+        /// is not configured / the model is not installed, or the remote
+        /// server REJECTED the request (bad key, bad model, HTTP error). The
+        /// hard cases are already reported through `lastError`.
+        case skipped
+        /// The remote backend could not be REACHED — the network dropped, the
+        /// connection was lost mid-upload, the request timed out
+        /// (`isTransientConnectivityError`). Nothing is wrong with the audio
+        /// or the configuration, and the same request should succeed once
+        /// connectivity returns. NOT reported through `lastError`: a short
+        /// Wi-Fi drop mid-meeting used to pop a blocking "Transcription error"
+        /// alert while the recording carried on fine underneath it (#355).
+        /// The associated value is the error's user-facing text.
+        case connectionUnavailable(String)
+    }
+
+    /// Whether `error` says the remote server could not be reached, as
+    /// opposed to the server answering with a refusal.
+    ///
+    /// Deliberately narrow: only transport failures where no HTTP response
+    /// came back at all. Every `RemoteError` — an HTTP status (401, 404, 429,
+    /// 5xx), an unparseable body, an empty result, a missing configuration —
+    /// means the server WAS reached and said no, and those stay loud. A
+    /// mistyped host (`cannotFindHost`) is indistinguishable from DNS being
+    /// down, so it counts as transient here; the record-start probe
+    /// (`probeRemoteBackendIfActive`) is what reports a host that never
+    /// resolves, and the post-stop batch pass reports it again.
+    nonisolated static func isTransientConnectivityError(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet,
+             .networkConnectionLost,
+             .timedOut,
+             .cannotConnectToHost,
+             .cannotFindHost,
+             .dnsLookupFailed:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// The live transcriber's entry point: the same routing as
+    /// `transcribeOnceSegments`, but a remote connectivity failure comes back
+    /// as `.connectionUnavailable` instead of an alert, so the caller can keep
+    /// the audio and retry it once the connection is back (#355). Hard
+    /// failures are surfaced through `lastError` exactly as before.
+    func transcribeLiveSegments(samples: [Float], language: String, audioCtx: Int32?) async -> LiveTranscriptionOutcome {
+        guard !cancellation.isStopped else { return .skipped }
         // Nothing was captured: don't hand it to any backend. The remote one
         // uploads a header-only file and gets back `HTTP 500: Failed to decode
         // audio.`, which the user reads as "the transcription server is down"
@@ -470,7 +543,7 @@ final class TranscriptionService: ObservableObject {
             if lastError == nil {
                 lastError = Self.noAudioCapturedMessage
             }
-            return []
+            return .skipped
         }
         // Remote backend: route dictation/live utterances to the configured
         // endpoint too, so the user's "global backend" choice holds for every
@@ -480,20 +553,20 @@ final class TranscriptionService: ObservableObject {
             guard remoteSettings.isConfigured,
                   let config = remoteSettings.currentConfig(for: language) else {
                 serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
-                return []
+                return .skipped
             }
             await remoteEngine.configure(config)
-            guard !cancellation.isStopped else { return [] }
+            guard !cancellation.isStopped else { return .skipped }
             do {
                 let segs = try await remoteEngine.transcribe(samples: samples,
                                                              language: language,
                                                              audioCtx: audioCtx,
                                                              progress: nil,
                                                              isCancelled: { [cancellation] in cancellation.isStopped })
-                guard !cancellation.isStopped else { return [] }
-                return segs
+                guard !cancellation.isStopped else { return .skipped }
+                return .transcribed(segs)
             } catch {
-                if cancellation.isStopped || error is CancellationError { return [] }
+                if cancellation.isStopped || error is CancellationError { return .skipped }
                 // Log at .error: a remote failure (401/transport/server) repeats
                 // on every utterance for the whole recording and silently empties
                 // the live pane. Error level so it's visible in `log show`
@@ -511,8 +584,16 @@ final class TranscriptionService: ObservableObject {
                 // for the banner. (Issue #213, CWE-532.)
                 serviceLog.error("""
                     transcribeOnceSegments(remote): FAILED \
+                    transient=\(Self.isTransientConnectivityError(error), privacy: .public) \
                     error=\(RemoteWhisperEngine.RemoteError.logMessage(for: error), privacy: .public)
                     """)
+                // The server could not be reached — not a configuration or
+                // server problem. Hand it back to the caller instead of the
+                // blocking alert: the live transcriber keeps the audio and
+                // retries it, and shows a non-blocking banner meanwhile (#355).
+                if Self.isTransientConnectivityError(error) {
+                    return .connectionUnavailable(error.localizedDescription)
+                }
                 // Surface the failure instead of returning a silently-empty
                 // result that's indistinguishable from "no speech". Set once
                 // (only when nothing is already showing) so a per-utterance
@@ -522,14 +603,14 @@ final class TranscriptionService: ObservableObject {
                 if lastError == nil {
                     lastError = "Live transcription failed: \(error.localizedDescription)"
                 }
-                return []
+                return .skipped
             }
         }
         let candidate = modelManager.model(for: language)
         guard let model = candidate,
               modelManager.isInstalled(model) else {
             serviceLog.log("transcribeOnceSegments: SKIP — model not installed for lang=\(language, privacy: .public) candidate=\(candidate?.name ?? "nil", privacy: .public) installed=\(self.modelManager.installed, privacy: .public)")
-            return []
+            return .skipped
         }
         let modelURL = modelManager.url(for: model)
         let startedAt = Date()
@@ -537,23 +618,23 @@ final class TranscriptionService: ObservableObject {
         // Bugbot #3: make sure the preparation observer is installed
         // before `loadIfNeeded` — see `init` for the race.
         await observerSetupTask.value
-        guard !cancellation.isStopped else { return [] }
+        guard !cancellation.isStopped else { return .skipped }
         do {
             try await engine.loadIfNeeded(modelURL: modelURL,
                                           displayName: model.displayName)
-            guard !cancellation.isStopped else { return [] }
+            guard !cancellation.isStopped else { return .skipped }
             let segs = try await engine.transcribe(samples: samples,
                                                    language: language,
                                                    audioCtx: audioCtx,
                                                    progress: nil,
                                                    isCancelled: { [cancellation] in cancellation.isStopped })
-            guard !cancellation.isStopped else { return [] }
+            guard !cancellation.isStopped else { return .skipped }
             serviceLog.log("transcribeOnceSegments: model=\(model.name, privacy: .public) lang=\(language, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(Date().timeIntervalSince(startedAt), privacy: .public)s segs=\(segs.count, privacy: .public)")
-            return segs
+            return .transcribed(segs)
         } catch {
-            if cancellation.isStopped || error is CancellationError { return [] }
+            if cancellation.isStopped || error is CancellationError { return .skipped }
             serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            return []
+            return .skipped
         }
     }
 
