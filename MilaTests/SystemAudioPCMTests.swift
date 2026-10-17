@@ -137,8 +137,13 @@ final class SystemAudioPCMTests: XCTestCase {
     /// on channel 0 (and a different value on channel 1) pins order and stride.
     func test_interleaved_channel_zero_is_extracted_in_frame_order() throws {
         for channels: AVAudioChannelCount in [2, 3] {
-            let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
-                                                     channels: channels, interleaved: true))
+            // More than two channels needs an explicit layout:
+            // `AVAudioFormat(commonFormat:sampleRate:channels:interleaved:)`
+            // returns nil above stereo.
+            let layout = try XCTUnwrap(AVAudioChannelLayout(
+                layoutTag: kAudioChannelLayoutTag_DiscreteInOrder | AudioChannelLayoutTag(channels)))
+            let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                                       interleaved: true, channelLayout: layout)
             let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 64))
             buffer.frameLength = 50
             let storage = try XCTUnwrap(buffer.audioBufferList.pointee.mBuffers.mData)
