@@ -507,7 +507,16 @@ private struct LanguagePickerToolbarItem: View {
             .padding(.horizontal, 8)
         }
         .menuStyle(.borderlessButton)
-        .help("Language used for new voice memos and app-audio recordings")
+        // Locked by a configuration profile (issue #360): still shows the
+        // language, but can't be changed here.
+        .disabled(languageSettings.isManaged(.recordingLanguage))
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        languageSettings.isManaged(.recordingLanguage)
+            ? "Language used for new recordings — \(ManagedSettings.note.lowercased())"
+            : "Language used for new voice memos and app-audio recordings"
     }
 }
 
