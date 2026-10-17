@@ -45,8 +45,9 @@ struct LiveAIRecordingView: View {
             // up once the connection is back (#355). This used to be the
             // modal "Transcription error" alert. Off the Home screen the
             // floating recording chip carries the same state
-            // (`ConnectionDropIndicator`).
-            if transcriber.isConnectionInterrupted {
+            // (`ConnectionDropIndicator`). Not during the hand-over below:
+            // until then the transcriber is still the previous meeting's.
+            if transcriber.isConnectionInterrupted, !actions.isAwaitingLivePipeline {
                 ConnectionInterruptedBanner()
                     .transition(.move(edge: .top).combined(with: .opacity))
             }

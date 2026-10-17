@@ -571,9 +571,12 @@ private struct RecordingChip: View {
 /// chip or anything above it. Renders nothing while the server is reachable.
 private struct ConnectionDropIndicator: View {
     @EnvironmentObject private var transcriber: LiveTranscriber
+    @EnvironmentObject private var actions: QuickActionsController
 
     var body: some View {
-        if transcriber.isConnectionInterrupted {
+        // Until the previous recording's Stop hands over the live pipeline
+        // (#356), the transcriber's state is that meeting's, not this one's.
+        if transcriber.isConnectionInterrupted, !actions.isAwaitingLivePipeline {
             Image(systemName: "wifi.exclamationmark")
                 .foregroundStyle(.orange)
                 .help("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
