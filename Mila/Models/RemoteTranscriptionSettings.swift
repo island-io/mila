@@ -230,13 +230,19 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// half alone would leave a model paired with the wrong server.
     @discardableResult
     func apply(_ preset: RemoteModelPreset) -> Bool {
-        let movesEndpoint = shouldAdoptEndpoint(of: preset)
-        guard !isManaged(.model), !(movesEndpoint && isManaged(.endpoint)) else { return false }
-        if movesEndpoint {
+        guard canApply(preset) else { return false }
+        if shouldAdoptEndpoint(of: preset) {
             endpoint = preset.endpoint
         }
         model = preset.id
         return true
+    }
+
+    /// Whether `apply(_:)` would accept `preset` given what a configuration
+    /// profile manages. The one rule both `apply(_:)` and the Settings model
+    /// picker use, so the picker never offers a preset it can't take.
+    func canApply(_ preset: RemoteModelPreset) -> Bool {
+        !isManaged(.model) && !(shouldAdoptEndpoint(of: preset) && isManaged(.endpoint))
     }
 
     /// Whether `apply(_:)` may replace the configured endpoint. True when the

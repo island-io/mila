@@ -1077,6 +1077,9 @@ private struct RemoteBackendSection: View {
                     Section(group.displayName) {
                         ForEach(RemoteModelPreset.presets(in: group)) { preset in
                             Text(preset.displayName).tag(preset.id)
+                                // A preset on another server can't be taken
+                                // while the endpoint is managed (#360).
+                                .disabled(!remote.canApply(preset))
                         }
                     }
                 }
@@ -1126,7 +1129,12 @@ private struct RemoteBackendSection: View {
                     showAdvanced = true
                     return
                 }
-                remote.apply(preset)
+                // A refused preset changes nothing, so nothing publishes and
+                // the menu would keep showing the rejected choice. Nudge a
+                // re-render so `get` puts the stored model back.
+                if !remote.apply(preset) {
+                    remote.objectWillChange.send()
+                }
             }
         )
     }

@@ -538,6 +538,43 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
         XCTAssertEqual(remote.model, modelBefore, "No half-applied preset: the model stays too")
     }
 
+    /// `canApply` is what the Settings picker uses to disable presets, so it
+    /// must agree with what `apply` actually does for every preset.
+    func test_canApply_matchesApply_forEveryPreset() {
+        let scenarios: [(String, ManagedSettings)] = [
+            ("nothing", .empty),
+            ("model", { var m = ManagedSettings.empty; m.model = "org-model"; return m }()),
+            ("presetEndpoint", { var m = ManagedSettings.empty
+                                 m.endpoint = RemoteTranscriptionSettings.defaultEndpoint; return m }()),
+            ("customEndpoint", { var m = ManagedSettings.empty
+                                 m.endpoint = "https://org.example.com/v1"; return m }()),
+        ]
+        for (name, managed) in scenarios {
+            for preset in RemoteModelPreset.all {
+                let label = "canApply.\(name).\(preset.id)"
+                let remote = RemoteTranscriptionSettings(defaults: freshDefaults(label),
+                                                         apiKeyKeychainKey: "ManagedSettingsTests.\(label).apiKey",
+                                                         managed: managed)
+                let predicted = remote.canApply(preset)
+                XCTAssertEqual(remote.apply(preset), predicted, "\(name) / \(preset.id)")
+            }
+        }
+
+        // Only-endpoint-managed on a preset server: presets on that server stay
+        // available, presets elsewhere are not offered.
+        var managed = ManagedSettings.empty
+        managed.endpoint = RemoteTranscriptionSettings.defaultEndpoint
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults("canApply.split"),
+                                                 apiKeyKeychainKey: "ManagedSettingsTests.canApply.split.apiKey",
+                                                 managed: managed)
+        let home = RemoteModelPreset.normalizeEndpoint(RemoteTranscriptionSettings.defaultEndpoint)
+        for preset in RemoteModelPreset.all {
+            XCTAssertEqual(remote.canApply(preset),
+                           RemoteModelPreset.normalizeEndpoint(preset.endpoint) == home,
+                           preset.id)
+        }
+    }
+
     func test_preset_appliesTheModel_whenAManagedCustomEndpointWouldNotMove() {
         // A non-preset endpoint is never moved by a preset (it may be a gateway
         // serving any id), so only the model changes — no mismatch to refuse.
