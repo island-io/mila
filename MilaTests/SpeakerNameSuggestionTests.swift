@@ -443,6 +443,32 @@ final class SpeakerNameSuggestionTests: XCTestCase {
                        "the split-off voice must not inherit Bob")
     }
 
+    func test_deleting_transcript_lines_drops_suggestions_they_backed() throws {
+        let rec = meeting()
+        store.add(rec)
+        store.mergeSpeakerNameSuggestions([
+            .init(speaker: "SPEAKER_00", name: "Dana", evidence: "my name is Dana", origin: .transcript),
+            .init(speaker: "SPEAKER_02", name: "Bob", evidence: "Bob, what do you think?", origin: .transcript),
+        ], recordingID: rec.id)
+
+        // Remove Dana's introduction (her only line): her speaker and the
+        // quote are both gone. Bob's quote is on a line that stays.
+        XCTAssertNotNil(store.deleteSegments([rec.segments[0].id], recordingID: rec.id))
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == rec.id })
+        XCTAssertEqual(row.speakerNameSuggestions.map(\.speaker), ["SPEAKER_02"])
+    }
+
+    func test_a_suggestion_whose_quoted_line_was_deleted_is_dropped() {
+        var rec = meeting()
+        rec.speakerNameSuggestions = [.init(speaker: "SPEAKER_02", name: "Bob",
+                                            evidence: "Bob, what do you think?", origin: .transcript)]
+        // SPEAKER_02 still speaks, but the line that addressed Bob is gone.
+        rec.segments.remove(at: 1)
+        XCTAssertEqual(rec.speakerNameSuggestionsSurvivingEdit, [],
+                       "a deleted line must not live on as a suggestion's quote")
+    }
+
     func test_a_merged_away_speaker_has_no_actionable_suggestion() {
         var rec = meeting()
         rec.speakerNameSuggestions = [.init(speaker: "SPEAKER_02", name: "Bob",

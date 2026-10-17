@@ -641,6 +641,17 @@ struct MilaApp: App {
         // `store`; the `actions` wiring stays further down with the rest.
         let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
         sidecarWriter.cleanupAtLaunch()
+        // Lines the user cut from a saved transcript (#357) must not stay
+        // readable in the completed live snapshot mila-mcp serves; a no-op
+        // unless that snapshot is this recording's.
+        store.onTranscriptLinesRemoved = { [weak sidecarWriter] rec in
+            sidecarWriter?.dropRetainedLines(afterEditOf: rec.id)
+        }
+        // The post-stop speaker pass writes a stop-time copy of the segments
+        // back when it finishes, so a trim must wait for it (#357).
+        store.isTranscriptEditBlocked = { [weak svc] id in
+            svc?.isAwaitingSpeakerFinalization(id) ?? false
+        }
         svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester] rec, wasRetranscription in
             // Speaker-name suggestions for this pass's (re-keyed) speakers,
             // once the summary attempt below settles. With no summarizer
@@ -1868,7 +1879,7 @@ struct MilaApp: App {
                 // Seed the embedding pool with known voices only when the
                 // user opted in. `seedEntries()` refuses on its own too, and
                 // while off it has nothing to hand over regardless (the
-                // profiles file is never parsed) — three independent reasons
+                // profiles file is never loaded) — three independent reasons
                 // an opted-out recording starts from a blank pool.
                 if voiceRecognitionSettings.isConfigured {
                     diarizer.seedPool(with: speakerProfileStore.seedEntries())

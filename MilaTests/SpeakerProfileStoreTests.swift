@@ -190,10 +190,287 @@ final class SpeakerProfileStoreTests: XCTestCase {
         store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
         store.updateProfile(name: "Bob", embedding: [2], sampleCount: 1)
 
-        store.deleteProfile(name: "Alice")
+        XCTAssertEqual(store.deleteProfile(name: "Alice"), .deleted)
 
         XCTAssertEqual(store.profiles.count, 1)
         XCTAssertEqual(store.profiles[0].name, "Bob")
+    }
+
+    /// Removing a name from Settings → Known speakers used to leave its voice
+    /// profile behind, and recognition kept labelling that voice with the
+    /// removed name in every new recording. Case-insensitive, like
+    /// `SpeakerDirectory.remove`, and persisted.
+    func test_forgetSpeaker_deletes_the_profile_and_persists() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Daniel Solomon (from Daniel)", embedding: [1], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [2], sampleCount: 1)
+
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "daniel solomon (FROM daniel)"), .stored)
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "Nobody"), .notStored)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        XCTAssertEqual(store.forgetSpeaker(named: "daniel solomon (FROM daniel)"), .deleted)
+
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(seen, [.named(["Daniel Solomon (from Daniel)"])])
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Bob"])
+    }
+
+    /// While the feature is off the profiles aren't in memory, so the delete
+    /// has to reach the file — otherwise turning recognition back on would
+    /// bring the forgotten voice back.
+    func test_forgetSpeaker_while_off_deletes_from_disk() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        do {
+            let store = makeStore(in: dir)
+            store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+            store.updateProfile(name: "Bob", embedding: [2], sampleCount: 3)
+        }
+
+        let off = makeStore(in: dir, enabled: false)
+        XCTAssertEqual(off.storedVoice(forSpeakerNamed: "alice"), .stored)
+        XCTAssertEqual(off.storedVoice(forSpeakerNamed: "Nobody"), .notStored)
+        XCTAssertTrue(off.profiles.isEmpty, "asking loads nothing into memory")
+        var seen: [SpeakerProfileStore.Deletion] = []
+        off.addDeletionObserver { seen.append($0) }
+        XCTAssertEqual(off.forgetSpeaker(named: "Alice"), .deleted)
+
+        XCTAssertTrue(off.profiles.isEmpty, "nothing is loaded into memory while off")
+        XCTAssertTrue(off.hasStoredProfilesOnDisk, "Bob is still stored")
+        XCTAssertEqual(seen, [.named(["Alice"])])
+        let reloaded = makeStore(in: dir)
+        XCTAssertEqual(reloaded.profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(reloaded.profiles.first?.sampleCount, 3, "the surviving row is intact")
+    }
+
+    func test_forgetSpeaker_without_a_profile_is_a_no_op() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        XCTAssertEqual(store.forgetSpeaker(named: "Nobody"), .nothingToDelete)
+        XCTAssertEqual(makeStore(in: dir, enabled: false).forgetSpeaker(named: "Nobody"), .nothingToDelete)
+
+        XCTAssertTrue(seen.isEmpty)
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Alice"])
+    }
+
+    /// With recognition on and `speaker-profiles.json` unreadable, the
+    /// voices it holds are not in memory, so there is nothing to delete
+    /// there — and the file is the user's unrecovered data, never written
+    /// over. The delete must say it could not happen, not report success.
+    func test_forgetSpeaker_with_an_unreadable_file_reports_it_and_leaves_the_file_alone() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let damaged = Data("[{\"name\": \"Alice\", \"embedding\": [1, 0,".utf8)
+        try damaged.write(to: fileURL)
+        let store = makeStore(in: dir)
+        XCTAssertTrue(store.loadedFromDamagedFile)
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "Alice"), .unknown)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .profileFileUnreadable)
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), damaged, "not rewritten")
+        XCTAssertEqual(try backups(in: dir), [], "not moved aside either: nothing was written")
+        XCTAssertTrue(store.loadedFromDamagedFile)
+        XCTAssertTrue(seen.isEmpty, "nothing was in memory to drop")
+    }
+
+    /// A voice still in memory from an earlier good read stops being used
+    /// even though the now-unreadable file cannot be touched.
+    func test_forgetSpeaker_with_an_unreadable_file_still_drops_the_voice_from_memory() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 1)
+        let damaged = Data("not json".utf8)
+        try damaged.write(to: fileURL)
+        try FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(5)],
+                                              ofItemAtPath: fileURL.path)
+        store.recheckDamagedProfiles()
+        XCTAssertTrue(store.loadedFromDamagedFile)
+        XCTAssertEqual(store.profiles.map(\.name), ["Alice", "Bob"], "precondition: a failed re-read keeps memory")
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+
+        XCTAssertEqual(store.forgetSpeaker(named: "alice"), .profileFileUnreadable)
+
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(seen, [.named(["Alice"])])
+        XCTAssertEqual(try Data(contentsOf: fileURL), damaged)
+        XCTAssertEqual(try backups(in: dir), [])
+    }
+
+    /// While off, a file that does not parse is left exactly as it is.
+    func test_forgetSpeaker_while_off_leaves_an_unreadable_file_alone() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let damaged = Data("not json".utf8)
+        try damaged.write(to: fileURL)
+        let off = makeStore(in: dir, enabled: false)
+
+        XCTAssertEqual(off.storedVoice(forSpeakerNamed: "Alice"), .unknown)
+        XCTAssertEqual(off.forgetSpeaker(named: "Alice"), .profileFileUnreadable)
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), damaged)
+        XCTAssertEqual(try backups(in: dir), [])
+        XCTAssertTrue(off.hasStoredProfilesOnDisk)
+    }
+
+    /// The off-state delete must read the file exactly as `load()` does. This
+    /// one is valid JSON that `JSONSerialization` takes happily, but Bob's
+    /// date is not ISO 8601, so `load()` rejects the whole file as damaged.
+    /// A more lenient reader would rewrite it — dropping Alice and keeping a
+    /// Bob that still cannot load — where `load()` had left it for repair.
+    func test_forgetSpeaker_while_off_reads_the_file_as_load_does() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let json = """
+        [
+          {"id": "\(UUID().uuidString)", "name": "Alice", "embedding": [1], "sampleCount": 1,
+           "createdAt": "2026-01-01T00:00:00Z", "lastSeenAt": "2026-01-01T00:00:00Z"},
+          {"id": "\(UUID().uuidString)", "name": "Bob", "embedding": [2], "sampleCount": 1,
+           "createdAt": "last tuesday", "lastSeenAt": "2026-01-01T00:00:00Z"}
+        ]
+        """
+        let original = Data(json.utf8)
+        try original.write(to: fileURL)
+        XCTAssertNotNil(try? JSONSerialization.jsonObject(with: original), "precondition: valid JSON")
+        XCTAssertTrue(makeStore(in: dir).loadedFromDamagedFile, "precondition: load() rejects it")
+
+        let off = makeStore(in: dir, enabled: false)
+        XCTAssertEqual(off.forgetSpeaker(named: "Alice"), .profileFileUnreadable)
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), original, "left for repair, byte for byte")
+    }
+
+    /// While off, forgetting the last voice removes the file rather than
+    /// leaving `[]` behind — as `deleteAllProfiles` does — so Settings stops
+    /// offering to delete stored voice data that is no longer there.
+    func test_forgetSpeaker_while_off_removes_the_file_with_its_last_voice() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        do {
+            let store = makeStore(in: dir)
+            store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+        }
+        let off = makeStore(in: dir, enabled: false)
+        XCTAssertTrue(off.hasStoredProfilesOnDisk)
+
+        XCTAssertEqual(off.forgetSpeaker(named: "alice"), .deleted)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertFalse(off.hasStoredProfilesOnDisk)
+    }
+
+    /// While off, a file that cannot be rewritten keeps the voice — and the
+    /// delete says so instead of reporting it gone.
+    func test_forgetSpeaker_while_off_reports_a_failed_write() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        do {
+            let store = makeStore(in: dir)
+            store.updateProfile(name: "Alice", embedding: [1], sampleCount: 1)
+            store.updateProfile(name: "Bob", embedding: [2], sampleCount: 1)
+        }
+        let before = try Data(contentsOf: fileURL)
+        let off = makeStore(in: dir, enabled: false)
+        var seen: [SpeakerProfileStore.Deletion] = []
+        off.addDeletionObserver { seen.append($0) }
+        // A read-only folder: the atomic write cannot replace the file.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+
+        XCTAssertEqual(off.forgetSpeaker(named: "Alice"), .notDeleted)
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), before)
+        XCTAssertTrue(seen.isEmpty)
+    }
+
+    /// With recognition on, a delete whose save fails still takes the voice
+    /// out of the running session (and tells a recording in flight), but
+    /// reports that it did not persist — it would otherwise undo itself on
+    /// the next launch while the UI said it was gone.
+    func test_forgetSpeaker_reports_a_failed_save_but_keeps_the_in_memory_removal() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let fileURL = dir.appendingPathComponent("speaker-profiles.json")
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 1)
+        let before = try Data(contentsOf: fileURL)
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        // A read-only folder: the atomic write cannot replace the file.
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deletedForThisSessionOnly)
+
+        XCTAssertEqual(store.profiles.map(\.name), ["Bob"], "the running session stops using the voice")
+        XCTAssertEqual(seen, [.named(["Alice"])])
+        XCTAssertEqual(try Data(contentsOf: fileURL), before, "nothing persisted")
+    }
+
+    /// A voice whose delete did not persist is still on disk, so Known
+    /// speakers must still see it — not drop the name in one click — and
+    /// asking again must retry the save rather than find nothing in memory
+    /// and write nothing, leaving the voice to be reseeded on next launch.
+    func test_a_delete_whose_save_failed_is_still_reported_and_a_retry_persists_it() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 1)
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deletedForThisSessionOnly)
+
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "alice"), .stored, "still on disk")
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deletedForThisSessionOnly, "still failing")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deleted, "the retry is the save")
+
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "Alice"), .notStored)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .nothingToDelete)
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(seen, [.named(["Alice"])], "observers are told once")
     }
 
     func test_renameProfile() throws {
@@ -1073,8 +1350,8 @@ final class SpeakerProfileStoreTests: XCTestCase {
 
         var seen: [SpeakerProfileStore.Deletion] = []
         store.addDeletionObserver { seen.append($0) }
-        store.deleteProfile(name: "Nobody")
-        store.deleteProfile(id: UUID())
+        XCTAssertEqual(store.deleteProfile(name: "Nobody"), .nothingToDelete)
+        XCTAssertEqual(store.deleteProfile(id: UUID()), .nothingToDelete)
 
         XCTAssertTrue(seen.isEmpty)
         XCTAssertEqual(store.profiles.count, 1)

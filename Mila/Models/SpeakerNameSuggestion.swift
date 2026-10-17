@@ -91,6 +91,25 @@ extension Recording {
         return assigned.isEmpty && segments.contains { $0.speaker == rawID }
     }
 
+    /// The stored suggestions that still hold after a transcript edit
+    /// removed lines (`RecordingStore.applyTranscriptEdit`): the speaker has
+    /// lines left, and a transcript suggestion's quote is still in the
+    /// transcript. The quote is matched as plain text after normalizing (it
+    /// may have been stored truncated), which can only keep too little, never
+    /// a quote from a removed line that appears nowhere else.
+    var speakerNameSuggestionsSurvivingEdit: [SpeakerNameSuggestion] {
+        guard !speakerNameSuggestions.isEmpty else { return [] }
+        let present = Set(segments.compactMap(\.speaker))
+        let remaining = SpeakerNameSuggester.normalizedForMatching(
+            segments.map(\.text).joined(separator: " "))
+        return speakerNameSuggestions.filter { suggestion in
+            guard present.contains(suggestion.speaker) else { return false }
+            guard suggestion.origin == .transcript else { return true }
+            let quote = SpeakerNameSuggester.normalizedForMatching(suggestion.evidence)
+            return !quote.isEmpty && remaining.contains(quote)
+        }
+    }
+
     /// The suggestions that can still be acted on — re-derived on every read
     /// rather than trusted from the stored list.
     var actionableSpeakerNameSuggestions: [SpeakerNameSuggestion] {

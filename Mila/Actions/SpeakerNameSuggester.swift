@@ -573,7 +573,7 @@ final class SpeakerNameSuggester {
     /// Lower-cased, diacritics folded, every run of non-alphanumerics
     /// collapsed to one space, trimmed. Used ONLY to compare a quote against
     /// the transcript — never stored or shown.
-    static func normalizedForMatching(_ text: String) -> String {
+    nonisolated static func normalizedForMatching(_ text: String) -> String {
         let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive],
                                   locale: nil)
         var out = ""
