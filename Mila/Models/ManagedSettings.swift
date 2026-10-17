@@ -171,6 +171,13 @@ struct ManagedSettings: Equatable, Sendable {
     var liveAIModel: String?
     var diarizationEnabled: Bool?
     var meetingDetectionEnabled: Bool?
+    /// Fields a profile forces under at least one recognised key, but with no
+    /// value Mila can use (wrong type, unknown language). Still **locked**: the
+    /// administrator meant to manage them, and a forced flat key overrides the
+    /// setting for every reader whatever Mila thinks of it — so treating them
+    /// as unmanaged would show an editable control whose edits never stick.
+    /// The setting keeps the value it already had; writes are refused.
+    var lockedWithoutValue: Set<ManagedField> = []
 
     /// Nothing managed — the default for every settings object, so tests and
     /// previews behave exactly as before unless they opt in.
@@ -184,6 +191,10 @@ struct ManagedSettings: Equatable, Sendable {
     /// Whether `field` is locked. The one question every setter, view and the
     /// importer ask.
     func isManaged(_ field: ManagedField) -> Bool {
+        lockedWithoutValue.contains(field) || hasValue(for: field)
+    }
+
+    private func hasValue(for field: ManagedField) -> Bool {
         switch field {
         case .backend: return backend != nil
         case .endpoint: return endpoint != nil
@@ -231,7 +242,8 @@ extension ManagedSettings {
             // Key names only — they're Mila's own schema. Values (a server URL,
             // a token) never reach the log.
             Self.log.error("""
-                ignored managed preference(s) with a wrong type or unknown value: \
+                ignored managed preference value(s) with a wrong type or unknown value \
+                (the setting stays locked at its current value): \
                 \(ignored.joined(separator: ", "), privacy: .public)
                 """)
         }
@@ -242,9 +254,10 @@ extension ManagedSettings {
     ///
     /// For each field, in order: the nested `.milaconfig`-shaped key
     /// (`liveAI` → `enabled`), then the dotted path forced as one flat key
-    /// (`liveAI.enabled`), then Mila's own storage key. Field by field and
-    /// type-checked: one bad value drops only that field, rather than a whole
-    /// section — or the whole profile — silently going unmanaged.
+    /// (`liveAI.enabled`), then Mila's own storage key — the first VALID one
+    /// wins. Field by field and type-checked, so one bad value affects only
+    /// its own field. A field forced only with unusable values is still locked
+    /// (`lockedWithoutValue`), and every rejected key is reported.
     static func parse(_ source: ManagedPreferencesSource) -> (ManagedSettings, ignored: [String]) {
         var settings = ManagedSettings()
         var ignored: [String] = []
@@ -272,9 +285,21 @@ extension ManagedSettings {
             if let storageKey = field.storageKey, storageKey != field.rawValue {
                 candidates.append((key: storageKey, value: source.forcedValue(forKey: storageKey), isStorageKey: true))
             }
-            guard let hit = candidates.first(where: { $0.value != nil }), let raw = hit.value else { continue }
-            if !settings.assign(field, raw: raw, fromStorageKey: hit.isStorageKey) {
-                ignored.append(hit.key)
+            // Try every forced candidate in order: a mistyped nested value must
+            // not hide a valid flat key that cfprefsd is forcing anyway.
+            var anyForced = false
+            var assigned = false
+            for candidate in candidates {
+                guard let raw = candidate.value else { continue }
+                anyForced = true
+                if settings.assign(field, raw: raw, fromStorageKey: candidate.isStorageKey) {
+                    assigned = true
+                    break
+                }
+                ignored.append(candidate.key)
+            }
+            if anyForced && !assigned {
+                settings.lockedWithoutValue.insert(field)
             }
         }
         return (settings, ignored)

@@ -294,7 +294,7 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // A managed token replaces the Keychain entirely: adopt it and mark the
         // lazy load done, so the stored one is never read (and never prompts).
         self.storedAPIKey = managed.apiKey ?? ""
-        if managed.apiKey != nil { hasLoadedAPIKey = true }
+        if managed.isManaged(.apiKey) { hasLoadedAPIKey = true }
         if backend == .remote { loadAPIKeyIfNeeded() }
         // Upgrade path: everyone already pointed at an ivrit.ai endpoint before
         // per-language routing existed has a blank English model, and a blank

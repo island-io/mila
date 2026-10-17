@@ -71,8 +71,9 @@ Notes on individual keys:
 - `englishModel`: for servers whose main model is Hebrew-only (an ivrit.ai
   finetune, for example). An empty string means `model` handles every language.
 - `recordingLanguage`: must be `he`, `iw` or `en`, or a regional form of one
-  (`en-US`, `he_IL`). **Any other value is ignored** (and logged), rather than
-  silently locking everyone to a default. **Locking it disables the language
+  (`en-US`, `he_IL`). **Any other value is not applied** (and is logged):
+  rather than guessing a language, the setting stays locked at whatever each
+  user already had. **Locking it disables the language
   picker in the toolbar**, so users can no longer switch language per recording
   — leave it out unless that is what you want.
 
@@ -90,9 +91,12 @@ Notes on individual keys:
 
 Values must have the right plist type — `<true/>`/`<false/>` for booleans,
 `<string>` for strings. A value of the wrong type (for example the *string*
-`"true"`), or a `recordingLanguage` Mila doesn't recognise, is ignored: only
-that one field is dropped, it stays under the user's control, and Mila logs the
-key name (see [Troubleshooting](#troubleshooting)).
+`"true"`), or a `recordingLanguage` Mila doesn't recognise, is not applied and
+Mila logs the key name (see [Troubleshooting](#troubleshooting)). Mila then
+tries the other spellings of that field (the flat keys below); if none of the
+forced keys holds a usable value, the setting is still **locked** — you clearly
+meant to manage it — but keeps the value it already had. Only that one field is
+affected.
 
 Settings that are machine-specific — the audio input device, the recordings
 folder, hotkeys — are not manageable, for the same reasons they are not part of
@@ -241,7 +245,8 @@ log show --last 10m --predicate \
 You should see `managed by configuration profile: …` followed by the managed
 fields (written as paths, e.g. `remoteTranscription.endpoint` for the
 `endpoint` key inside the `remoteTranscription` dictionary). A line starting
-`ignored managed preference(s) with a wrong type or unknown value` names keys
-whose value had the wrong plist type or wasn't recognised. No line at all means no forced keys
+`ignored managed preference value(s)` names keys whose value had the wrong
+plist type or wasn't recognised (those settings stay locked at their current
+value). No line at all means no forced keys
 were found — check the preference domain, that the payload is *Forced*, and
 that Mila was relaunched after the profile was installed.

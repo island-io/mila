@@ -70,7 +70,7 @@ final class ManagedSettingsParsingTests: XCTestCase {
         XCTAssertEqual(managed.backend, .local)
     }
 
-    func test_wrongTypes_dropOnlyThatField_andAreReportedByKeyName() {
+    func test_wrongTypes_lockWithoutAValue_andAreReportedByKeyName() {
         let source = FakeManagedPreferences(forced: [
             "remoteTranscription": [
                 "enabled": "true",                         // string, not bool
@@ -82,7 +82,15 @@ final class ManagedSettingsParsingTests: XCTestCase {
             "meetingDetection": ["enabled": true] as [String: Any], // fine
         ])
         let (managed, ignored) = ManagedSettings.parse(source)
-        XCTAssertEqual(managed.managedFields, [.endpoint, .meetingDetectionEnabled])
+        XCTAssertNil(managed.backend)
+        XCTAssertNil(managed.model)
+        XCTAssertNil(managed.recordingLanguage)
+        // Forced but unusable: still locked, so the control can't pretend the
+        // user is in charge of it. The malformed `diarization` section names no
+        // field, so it locks nothing.
+        XCTAssertEqual(managed.lockedWithoutValue, [.backend, .model, .recordingLanguage])
+        XCTAssertEqual(managed.managedFields,
+                       [.backend, .endpoint, .model, .recordingLanguage, .meetingDetectionEnabled])
         XCTAssertEqual(Set(ignored), ["remoteTranscription.enabled", "remoteTranscription.model",
                                       "diarization", "recordingLanguage"])
     }
@@ -120,7 +128,37 @@ final class ManagedSettingsParsingTests: XCTestCase {
             "transcription.backend": "cloud",
         ]))
         XCTAssertNil(bogus.backend)
+        XCTAssertTrue(bogus.isManaged(.backend), "Forced, so locked even though the value is unusable")
         XCTAssertEqual(bogusIgnored, ["transcription.backend"])
+    }
+
+    /// Bugbot on #369: the first forced candidate used to win even when it was
+    /// rejected, so a mistyped nested value hid a valid flat key that cfprefsd
+    /// forces anyway — the field read as unmanaged while edits never stuck.
+    func test_rejectedCandidate_fallsThroughToTheNextForcedKey() {
+        let (managed, ignored) = ManagedSettings.parse(FakeManagedPreferences(forced: [
+            "remoteTranscription": ["enabled": "yes", "model": 7] as [String: Any],
+            "transcription.backend": "remote",
+            "remote.model": "org-model",
+        ]))
+        XCTAssertEqual(managed.backend, .remote)
+        XCTAssertEqual(managed.model, "org-model")
+        XCTAssertTrue(managed.lockedWithoutValue.isEmpty)
+        XCTAssertEqual(Set(ignored), ["remoteTranscription.enabled", "remoteTranscription.model"])
+    }
+
+    func test_everyCandidateRejected_stillLocksTheField() {
+        let (managed, ignored) = ManagedSettings.parse(FakeManagedPreferences(forced: [
+            "liveAI": ["enabled": "yes"] as [String: Any],
+            "remoteTranscription.endpoint": 42,
+            "remote.endpoint": false,
+        ]))
+        XCTAssertNil(managed.liveAIEnabled)
+        XCTAssertNil(managed.endpoint)
+        XCTAssertTrue(managed.isManaged(.liveAIEnabled))
+        XCTAssertTrue(managed.isManaged(.endpoint))
+        XCTAssertEqual(managed.managedFields, [.endpoint, .liveAIEnabled])
+        XCTAssertEqual(Set(ignored), ["liveAI.enabled", "remoteTranscription.endpoint", "remote.endpoint"])
     }
 
     func test_nestedKeyWinsOverAFlatOne() {
@@ -147,7 +185,8 @@ final class ManagedSettingsParsingTests: XCTestCase {
         let (managed, ignored) = ManagedSettings.parse(FakeManagedPreferences(forced: [
             "recordingLanguage": "englsh",
         ]))
-        XCTAssertNil(managed.recordingLanguage, "An unknown language must not lock anything")
+        XCTAssertNil(managed.recordingLanguage, "An unknown language must not be guessed")
+        XCTAssertTrue(managed.isManaged(.recordingLanguage), "…but the field stays locked")
         XCTAssertEqual(ignored, ["recordingLanguage"])
     }
 
@@ -176,8 +215,9 @@ final class ManagedSettingsParsingTests: XCTestCase {
 
         XCTAssertEqual(Set(ManagedField.allCases.map(\.rawValue)), Set(expected),
                        "ManagedField must list exactly the .milaconfig fields, by their paths")
-        XCTAssertEqual(fields(ManagedSettings.empty).count, ManagedField.allCases.count,
-                       "ManagedSettings needs one stored field per ManagedField")
+        XCTAssertEqual(fields(ManagedSettings.empty).filter { $0 != "lockedWithoutValue" }.count,
+                       ManagedField.allCases.count,
+                       "ManagedSettings needs one stored value field per ManagedField")
 
         let everything = MilaConfig(
             version: 1,
@@ -346,6 +386,21 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
                                   "\(field): an unmanaged write must persist under its storage key")
             }
         }
+    }
+
+    /// A field locked without a usable value keeps the value it had and
+    /// refuses writes, like any other managed field.
+    func test_lockedWithoutValue_refusesWrites() {
+        let defaults = freshDefaults(#function)
+        var managed = ManagedSettings.empty
+        managed.lockedWithoutValue = [.liveAIEnabled]
+        let liveAI = LiveAISettings(defaults: defaults, managed: managed)
+        XCTAssertTrue(liveAI.isManaged(.liveAIEnabled))
+        XCTAssertTrue(liveAI.enabled, "Keeps the value it already had (the default here)")
+
+        liveAI.enabled = false
+        XCTAssertTrue(liveAI.enabled)
+        XCTAssertNil(defaults.object(forKey: "liveAI.enabled"))
     }
 
     // MARK: Remote transcription specifics
