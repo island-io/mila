@@ -44,7 +44,16 @@ struct LiveAIRecordingView: View {
             // a CLI is configured. When AI is off the live transcript
             // takes the whole detail pane so the user still sees what
             // Mila is hearing in real time.
-            if aiActive {
+            //
+            // Neither pane is shown while this recording waits for the
+            // previous one's Stop to hand over the live pipeline (#356): until
+            // then the transcriber and Live AI session still hold the LAST
+            // meeting, which is being saved — showing it here would present
+            // it as this one, and renaming a speaker, deleting a line or
+            // editing the notes would change the recording being saved.
+            if actions.isAwaitingLivePipeline {
+                livePipelineHandoffPlaceholder
+            } else if aiActive {
                 VSplitView {
                     actionItemsPane
                         .frame(minHeight: 140)
@@ -195,6 +204,31 @@ struct LiveAIRecordingView: View {
                     .font(.callout)
             }
         }
+    }
+
+    // MARK: - Live pipeline hand-over
+
+    /// Stands in for both panes for the second or two between this
+    /// recording's capture coming up and the previous recording's Stop
+    /// releasing the live pipeline (`QuickActionsController.
+    /// isAwaitingLivePipeline`). The audio of that window is not lost: it is
+    /// held and transcribed the moment the hand-over happens.
+    private var livePipelineHandoffPlaceholder: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Finishing the previous recording…")
+                .font(.callout.weight(.semibold))
+            Text("This recording is already capturing. Its live transcript appears in a moment, from the start.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("liveTranscript.awaitingPipeline")
     }
 
     // MARK: - Action items pane

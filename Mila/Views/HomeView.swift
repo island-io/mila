@@ -98,7 +98,7 @@ struct HomeView: View {
         HeroRecordButton(
             isRecording: isRecording,
             startingSource: actions.startingSource,
-            isFinalizing: actions.isFinalizingRecording,
+            isFinalizing: actions.isStoppingRecording,
             isPreparingModel: transcription.isPreparingModel,
             preparationStatus: transcription.preparationStatus,
             languageFlag: languageSettings.current.flagEmoji,
@@ -115,8 +115,11 @@ struct HomeView: View {
         .frame(maxWidth: 460)
         // Belt-and-suspenders with the controller-side guard: greying
         // out the button gives the user immediate visual feedback that
-        // a tap during the drain won't do anything, instead of just
-        // silently swallowing it.
+        // a tap while the previous recording's WAV is being closed won't
+        // do anything, instead of just silently swallowing it. Only that
+        // brief stop blocks a new recording — the previous recording's
+        // live-transcript drain, summary, speaker pass and transcode all
+        // carry on in the background while the next one records (#356).
         //
         // Same idea for the first-time CoreML compile: a record press
         // during the compile window would start a recording the encoder
@@ -129,7 +132,7 @@ struct HomeView: View {
         // controller's "click accepted, capture not up yet" — the button
         // shows a spinner + "Starting…" and refuses the second click that
         // used to run a second bring-up (#293).
-        .disabled(actions.isFinalizingRecording || actions.isStartingRecording
+        .disabled(actions.isStoppingRecording || actions.isStartingRecording
                   || transcription.isPreparingModel || !canRecord)
     }
 
@@ -280,10 +283,13 @@ private struct HeroRecordButton: View {
     /// controller publishes exactly one job state at a time.
     let startingSource: RecordingSource?
     private var isStarting: Bool { startingSource != nil }
-    /// True while `stopRecording`'s inline drain is running. The button
-    /// is `.disabled` in this state (set by the caller) but we also want
-    /// the visible title/caption to say "Finalizing…" so the user
-    /// understands why pressing it again doesn't do anything.
+    /// True while `stopRecording` is closing the previous recording's WAV
+    /// and saving its row (`QuickActionsController.isStoppingRecording`) —
+    /// a fraction of a second, not the live-pipeline drain or anything
+    /// after it (#356). The button is `.disabled` in this state (set by the
+    /// caller) but we also want the visible title/caption to say
+    /// "Finalizing…" so the user understands why pressing it again doesn't
+    /// do anything.
     let isFinalizing: Bool
     /// True while the whisper engine is doing a noticeable first-time
     /// load — currently only the first CoreML compile of a sibling
@@ -446,7 +452,7 @@ private struct HeroRecordButton: View {
             return preparationStatus ?? "One-time setup (about 15 seconds)…"
         }
         if isFinalizing {
-            return "Saving transcript…"
+            return "Saving recording…"
         }
         if let startingSource {
             // The slow leg is the microphone (Bluetooth format negotiation,

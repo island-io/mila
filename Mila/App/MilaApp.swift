@@ -1726,6 +1726,40 @@ struct MilaApp: App {
                 // `start()`, so it cannot be fooled that way.
                 if wiredCaptureEpoch == sessionRef.captureEpoch { break }
                 wiredCaptureEpoch = sessionRef.captureEpoch
+                // Recording started while the PREVIOUS recording's Stop is
+                // still draining the live pipeline (issue #356 — a new
+                // recording no longer waits for that drain). The transcriber,
+                // diarizer, Live AI session and sidecar below all still
+                // belong to the drain, which is reading them to save the last
+                // meeting: wiring them now would reset that meeting's
+                // transcript under it. So hold this recording's live audio
+                // instead, wait for the drain to release the singletons
+                // (`QuickActionsController.releaseLivePipeline()` clears them
+                // and starts the fresh Live AI session before resuming us),
+                // then wire as usual and replay what was held. Capture itself
+                // was never waiting — the WAV has had every sample.
+                var heldLiveSamples: [Float] = []
+                if let actionsRef, actionsRef.isFinalizingRecording {
+                    let hold = LiveSampleHold()
+                    sessionRef.onLiveSamples = { samples in hold.append(samples) }
+                    os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                        .log("wireLiveAIPipeline: .recording — previous recording still draining; holding live audio until it releases the live pipeline")
+                    await actionsRef.awaitLivePipelineAvailable()
+                    heldLiveSamples = hold.samples
+                    // The capture may have ended while we waited (quit, or a
+                    // start abandoned by sleep / lock). Nothing to wire then;
+                    // the `.idle` that ended it is delivered next.
+                    let stillCapturing = sessionRef.state == .recording || sessionRef.state == .paused
+                    guard stillCapturing, wiredCaptureEpoch == sessionRef.captureEpoch else {
+                        sessionRef.onLiveSamples = nil
+                        os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                            .log("wireLiveAIPipeline: held recording ended before the live pipeline was released — not wiring it")
+                        continue
+                    }
+                    let heldCount = heldLiveSamples.count
+                    os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                        .log("wireLiveAIPipeline: live pipeline released — wiring and replaying \(heldCount, privacy: .public) held samples")
+                }
                 // Decided once, at record start, by the controller (see
                 // `recordingRunsLivePipeline`) — re-reading the settings here
                 // could disagree with the recording view, which keys on the
@@ -1820,6 +1854,16 @@ struct MilaApp: App {
                     // hopping through a detached Task here was dropping
                     // the ArraySlice on some Swift-concurrency edge.
                     transcriber?.ingest(samples)
+                }
+                // Audio held while the previous recording's drain owned the
+                // pipeline (see the top of this case). Replayed straight after
+                // `start()` and before anything new can be ingested — no
+                // suspension point between here and the install above — so
+                // the transcriber sees this recording's audio in order and the
+                // VAD's sample clock (which dates every utterance) starts at
+                // the recording's true zero.
+                if !heldLiveSamples.isEmpty {
+                    transcriber.ingest(ArraySlice(heldLiveSamples))
                 }
                 // NOTE: the Live AI session is reset deterministically at
                 // record-start in QuickActionsController (`liveAISession?.start()`),
@@ -2671,5 +2715,23 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // breathing room. Cost: quit takes ~half a second longer.
         try? await Task.sleep(nanoseconds: 500_000_000)
         HotkeyManager.shared.shutdown()
+    }
+}
+
+/// The live audio of a recording that started while the PREVIOUS recording's
+/// Stop was still draining the live pipeline (issue #356). `wireLiveAIPipeline`
+/// points `RecordingSession.onLiveSamples` here until the drain releases the
+/// live singletons, then replays it into the freshly started transcriber.
+///
+/// Unbounded on purpose: it holds 16 kHz mono floats (~3.8 MB a minute) for
+/// the length of a drain, which is seconds; capping it would mean dropping
+/// audio from the middle of the recording's live clock, and every later
+/// utterance's timestamp is counted from that clock.
+@MainActor
+private final class LiveSampleHold {
+    private(set) var samples: [Float] = []
+
+    func append(_ chunk: ArraySlice<Float>) {
+        samples.append(contentsOf: chunk)
     }
 }
