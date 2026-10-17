@@ -539,11 +539,66 @@ final class SpeakerNameSuggester {
         let needle = " \(normalizedQuote) "
         let claimsName = isSelfIntroduction(normalizedQuote: normalizedQuote, name: name)
         let addressesName = addressesByName(quote: quote, name: name)
-        for (i, turn) in turns.enumerated() where " \(turn.text) ".contains(needle) {
-            if turn.speaker == speaker, claimsName { return true }
+        for (i, turn) in turns.enumerated() {
+            let padded = " \(turn.text) "
+            guard let found = padded.range(of: needle) else { continue }
+            if turn.speaker == speaker, claimsName {
+                // Judge the claim with the turn's words on either side, not
+                // the model's cut of it: "I'm Dana" out of "I'm Dana's
+                // manager", or "Dana here" out of "I left Dana here", reads
+                // as an introduction only once the context is gone. Every
+                // occurrence, since the first one may be the cut-off one.
+                var from = found.lowerBound
+                while let range = padded.range(of: needle, range: from..<padded.endIndex) {
+                    let before = padded[..<range.lowerBound].split(separator: " ").last.map { String($0) }
+                    let after = padded[range.upperBound...].split(separator: " ").first.map { String($0) }
+                    let words = [before].compactMap { $0 }
+                        + normalizedQuote.split(separator: " ").map(String.init)
+                        + [after].compactMap { $0 }
+                    if statesOwnName(words: words, name: name) { return true }
+                    from = padded.index(after: range.lowerBound)
+                }
+            }
             if turn.speaker != speaker, i + 1 < turns.count, turns[i + 1].speaker == speaker,
                addressesName, !claimsName {
                 return true
+            }
+        }
+        return false
+    }
+
+    /// Words that may come right before "<name> here" / "<name> speaking" in
+    /// a genuine introduction ("Hi, Dana here", "this is Dana speaking"). Any
+    /// other word makes it part of a longer sentence: "I left Dana here".
+    static let introductionLeadIns: Set<String> = [
+        "hi", "hey", "hello", "ok", "okay", "so", "well", "yes", "yeah", "and",
+        "is", "s", "morning", "afternoon", "evening", "all", "everyone", "everybody",
+        "folks", "guys", "team",
+        "היי", "הי", "שלום", "כן", "אז", "טוב", "זה", "זו", "בוקר", "ערב", "לכולם",
+    ]
+
+    /// Whether `words` (normalized, one word of the turn's own context on
+    /// each side of the quote) state `name` as the speaker's own. Stricter
+    /// than `isSelfIntroduction`, which sees only the quote: "my name is
+    /// Dana" must not go on into a possessive ("I'm Dana's manager" is
+    /// "i m dana s manager" once normalized), and "Dana here" must open the
+    /// sentence or follow a greeting.
+    static func statesOwnName(words: [String], name: String) -> Bool {
+        let prefixes = selfIntroductionPrefixes.map { $0.split(separator: " ").map(String.init) }
+        for variant in nameVariants(name) {
+            let v = variant.split(separator: " ").map(String.init)
+            guard !v.isEmpty, words.count >= v.count else { continue }
+            for start in 0...(words.count - v.count) where Array(words[start..<start + v.count]) == v {
+                let before = Array(words[..<start])
+                let after = start + v.count < words.count ? words[start + v.count] : nil
+                let prefixed = prefixes.contains { p in
+                    before.count >= p.count && Array(before.suffix(p.count)) == p
+                }
+                if prefixed, after != "s" { return true }
+                if let after, selfIntroductionSuffixes.contains(after),
+                   before.last.map({ introductionLeadIns.contains($0) }) ?? true {
+                    return true
+                }
             }
         }
         return false
@@ -587,12 +642,24 @@ final class SpeakerNameSuggester {
             .filter { !$0.isEmpty }
         guard clauses.count >= 2, let first = clauses.first, let last = clauses.last else { return false }
         let variants = nameVariants(name)
-        // "dana" / "hey dana" / "ok so dana": a short lead-in ending on the name.
-        let leadIn = first.split(separator: " ").count <= 3
-            && variants.contains { first == $0 || first.hasSuffix(" \($0)") }
+        // "dana" / "hey dana" / "ok so dana": the name, after nothing but
+        // greeting words — "I told Dana, …" is about Dana, not to her.
+        let leadIn = variants.contains { variant in
+            guard first == variant || first.hasSuffix(" \(variant)") else { return false }
+            let rest = first.dropLast(variant.count).split(separator: " ")
+            return rest.count <= 3 && rest.allSatisfy { vocativeLeadIns.contains(String($0)) }
+        }
         let tail = variants.contains(last)
         return leadIn || tail
     }
+
+    /// Words that may come before a name being called out at the start of a
+    /// sentence ("Hey Dana, …", "OK so Dana, …").
+    static let vocativeLeadIns: Set<String> = [
+        "hey", "hi", "hello", "ok", "okay", "so", "and", "well", "right", "yes",
+        "yeah", "thanks", "thank", "you", "sorry", "good", "morning",
+        "היי", "הי", "שלום", "אז", "טוב", "כן", "תודה", "יאללה", "בסדר", "סליחה", "בוקר",
+    ]
 
     /// Placeholders a model writes when told not to guess, plus anything
     /// that is just a diarizer label again.

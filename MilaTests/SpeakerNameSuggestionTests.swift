@@ -303,6 +303,30 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         XCTAssertFalse(SpeakerNameSuggester.addressesByName(quote: "I sent it to Dana yesterday", name: "Dana"))
     }
 
+    func test_a_quote_cut_out_of_a_longer_sentence_is_not_an_introduction() {
+        func suggest(_ line: String, _ quote: String) -> [String] {
+            let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00", text: line),
+                         SpeakerNameSuggester.Turn(speaker: "SPEAKER_01", text: "OK.")]
+            let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "Dana", "quote": "\#(quote)"}]}"#
+            return SpeakerNameSuggester.parseSuggestions(from: raw,
+                                                         unnamedSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+                                                         turns: turns).map(\.speaker)
+        }
+        XCTAssertEqual(suggest("Hi, I'm Dana's manager.", "I'm Dana"), [],
+                       "a possessive is not a name")
+        XCTAssertEqual(suggest("I left Dana here last week.", "Dana here"), [])
+        XCTAssertEqual(suggest("Hi all, Dana here.", "Dana here"), ["SPEAKER_00"])
+        XCTAssertEqual(suggest("Dana here, can everyone hear me?", "Dana here"), ["SPEAKER_00"])
+        XCTAssertEqual(suggest("Sorry, I'm Dana, I'm late.", "I'm Dana"), ["SPEAKER_00"])
+    }
+
+    func test_mentioning_a_name_before_a_comma_does_not_address_it() {
+        XCTAssertFalse(SpeakerNameSuggester.addressesByName(quote: "I told Dana, it's fine", name: "Dana"))
+        XCTAssertFalse(SpeakerNameSuggester.addressesByName(quote: "Ask Dana, she knows", name: "Dana"))
+        XCTAssertTrue(SpeakerNameSuggester.addressesByName(quote: "OK so Dana, your turn", name: "Dana"))
+        XCTAssertTrue(SpeakerNameSuggester.addressesByName(quote: "היי דנה, מה דעתך?", name: "דנה"))
+    }
+
     func test_a_one_word_quote_that_is_just_the_name_is_dropped() {
         let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "Dana", "quote": "Dana."}]}"#
         XCTAssertEqual(parse(raw), [])
