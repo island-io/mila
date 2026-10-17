@@ -11,8 +11,8 @@
   <!-- Repository whose latest release download.js offers. -->
   <meta name="mila-repo" content="island-io/mila">
 
-  <title>Mila: private, local transcription for Mac</title>
-  <meta name="description" content="Mila records meetings, dictation and voice memos and transcribes them on your Mac with whisper.cpp. Speaker labels, live transcripts, English and Hebrew. Free and open source. Your audio never leaves your Mac.">
+  <title>Mila: Hebrew and English transcription for Mac</title>
+  <meta name="description" content="Mila transcribes Hebrew and English meetings, dictation and voice memos on your Mac, or on your company's own transcription server. Speaker labels, live transcripts, AI summaries. Free and open source.">
 
   <!-- Absolute URLs below are the only place the site's address appears.
        The publish workflow rewrites https://island-io.github.io/mila/ to the
@@ -21,16 +21,16 @@
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="Mila">
-  <meta property="og:title" content="Mila: private, local transcription for Mac">
-  <meta property="og:description" content="Record meetings, dictate and transcribe on your Mac. Free, open source, and your audio never leaves the device.">
+  <meta property="og:title" content="Mila: Hebrew and English transcription for Mac">
+  <meta property="og:description" content="Transcribe Hebrew and English meetings on your Mac, or on your company's own server. Free and open source.">
   <meta property="og:url" content="https://island-io.github.io/mila/">
   <meta property="og:image" content="https://island-io.github.io/mila/og-image.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:image:alt" content="The Mila app icon next to the words: Private transcription for your Mac.">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Mila: private, local transcription for Mac">
-  <meta name="twitter:description" content="Record meetings, dictate and transcribe on your Mac. Free, open source, and your audio never leaves the device.">
+  <meta name="twitter:title" content="Mila: Hebrew and English transcription for Mac">
+  <meta name="twitter:description" content="Transcribe Hebrew and English meetings on your Mac, or on your company's own server. Free and open source.">
   <meta name="twitter:image" content="https://island-io.github.io/mila/og-image.png">
 
   <meta name="color-scheme" content="light dark">
@@ -48,7 +48,8 @@
     "name": "Mila",
     "operatingSystem": "macOS 14 or later",
     "applicationCategory": "BusinessApplication",
-    "description": "Private, local transcription for Mac: record meetings, dictate and transcribe on-device with whisper.cpp.",
+    "description": "Hebrew and English transcription for Mac: record meetings, dictate and transcribe on your Mac or on your company's own server.",
+    "inLanguage": ["he", "en"],
     "license": "https://www.apache.org/licenses/LICENSE-2.0",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "downloadUrl": "https://github.com/island-io/mila/releases/latest",
@@ -69,7 +70,7 @@
       <nav aria-label="Primary">
         <ul class="nav">
           <li><a href="#features">Features</a></li>
-          <li><a href="#teams">For teams</a></li>
+          <li><a href="#teams">On-prem</a></li>
           <li><a href="https://github.com/island-io/mila">GitHub</a></li>
         </ul>
       </nav>
@@ -80,8 +81,14 @@
     <section class="hero" aria-labelledby="hero-title">
       <div class="wrap hero-inner">
         <img class="hero-icon" src="icon-256.png" width="128" height="128" alt="Mila app icon: a microphone badge on a green and white circle">
-        <h1 id="hero-title">Private transcription<br class="br-wide"> for your Mac.</h1>
-        <p class="lede">Mila records your meetings, dictation and voice memos and turns them into text right on your Mac. Your audio never leaves the device.</p>
+        <p class="langs" aria-label="Languages">
+          <span class="lang" lang="he" dir="rtl">עברית</span>
+          <span class="lang-amp" aria-hidden="true">+</span>
+          <span class="lang">English</span>
+        </p>
+        <h1 id="hero-title">Hebrew and English transcription<br class="br-wide"> for your Mac.</h1>
+        <p class="lede">Mila records your meetings, dictation and voice memos and turns them into text in Hebrew and English. It runs on your Mac, or on your company's own server. Your audio never goes to a third party.</p>
+        <p class="lede-he" lang="he" dir="rtl">תמלול בעברית ובאנגלית, על המק שלך או על השרתים של הארגון.</p>
 
         <a id="download" class="download-button"
            href="https://github.com/island-io/mila/releases/latest">
@@ -98,31 +105,46 @@
         <p class="download-alt"><a href="https://github.com/island-io/mila/releases">Release notes and earlier versions</a></p>
       </div>
 
-      <figure class="wrap demo" aria-label="Example of a Mila transcript">
-        <div class="demo-card">
-          <div class="demo-bar" aria-hidden="true"><span></span><span></span><span></span></div>
-          <div class="demo-body">
-            <p class="demo-title">Weekly sync <span class="demo-tag">Zoom</span></p>
-            <ol class="demo-lines">
-              <li><span class="who who-a">Dana</span> <span class="t">00:04</span> Let's start with the launch date. Where is engineering?</li>
-              <li><span class="who who-b">Yossi</span> <span class="t">00:09</span> On track. The sync bug should be closed by Wednesday.</li>
-              <li><span class="who who-c">Maya</span> <span class="t">00:15</span> Marketing needs two weeks of lead time after that.</li>
-              <li><span class="who who-a">Dana</span> <span class="t">00:21</span> Then we aim for the 19th, with a go/no-go on Friday.</li>
-            </ol>
-          </div>
-        </div>
-        <figcaption>Illustration: a meeting transcript with each speaker labelled.</figcaption>
+      <figure class="wrap shot">
+        <img src="app-screenshot.png" width="1280" height="800" fetchpriority="high"
+             alt="The Mila window showing a Hebrew and English team meeting: speaker-labelled transcript lines with timestamps, and a Hebrew summary with action items next to it.">
       </figure>
     </section>
 
-    <section id="features" class="section" aria-labelledby="features-title">
+    <section id="languages" class="section" aria-labelledby="languages-title">
+      <div class="wrap">
+        <h2 id="languages-title">Made for Hebrew. Just as good in English.</h2>
+        <p class="section-lede">Most transcription tools treat Hebrew as an afterthought. Mila was built for teams that talk in both languages every day.</p>
+        <ul class="lang-cards">
+          <li>
+            <p class="lang-card-title"><span lang="he" dir="rtl">עברית</span> Hebrew</p>
+            <ul>
+              <li>The ivrit.ai <code>large-v3</code> model, trained on Hebrew speech</li>
+              <li>Right-to-left transcripts, summaries and action items</li>
+              <li><kbd>⌘3</kbd> dictates Hebrew into any app</li>
+            </ul>
+          </li>
+          <li>
+            <p class="lang-card-title">English</p>
+            <ul>
+              <li>OpenAI's Whisper <code>large-v3-turbo</code></li>
+              <li>Speaker labels, live transcript and summaries</li>
+              <li><kbd>⌘2</kbd> dictates English into any app</li>
+            </ul>
+          </li>
+        </ul>
+        <p class="lang-note">Pick the language per recording from the toolbar. Both models download on first launch and run on the Mac, or on your server.</p>
+      </div>
+    </section>
+
+    <section id="features" class="section section-alt" aria-labelledby="features-title">
       <div class="wrap">
         <h2 id="features-title">Everything happens on your Mac</h2>
-        <p class="section-lede">No account, no subscription, no upload. Mila runs Whisper models locally on the Mac's GPU.</p>
+        <p class="section-lede">No account and no subscription. By default Mila runs Whisper on the Mac's own GPU and nothing is uploaded.</p>
         <ul class="features">
           <li>
             <h3>On-device transcription</h3>
-            <p>Whisper runs through whisper.cpp on Apple's Metal GPU: OpenAI's large-v3-turbo for English and other languages, and the ivrit.ai large-v3 model for Hebrew.</p>
+            <p>Whisper runs through whisper.cpp on Apple's Metal GPU. No internet needed once the models are downloaded.</p>
           </li>
           <li>
             <h3>Record any meeting</h3>
@@ -156,26 +178,41 @@
       </div>
     </section>
 
-    <section id="teams" class="section section-alt" aria-labelledby="teams-title">
-      <div class="wrap teams">
-        <div class="teams-copy">
-          <p class="eyebrow">For teams and IT</p>
-          <h2 id="teams-title">Transcription for your whole company, for free</h2>
-          <p>Mila is open source under the Apache 2.0 license. There are no seats, no per-minute fees and no vendor holding your recordings. Your only cost is the hardware you choose to run it on.</p>
-          <ul class="checks">
-            <li><strong>Nothing to run at all.</strong> On Apple Silicon Macs every recording is transcribed locally, so there is no server to buy or maintain.</li>
-            <li><strong>Or one shared GPU server.</strong> Point everyone's Mila at a transcription server you host. Any OpenAI-compatible <code>/v1/audio/transcriptions</code> endpoint works, and audio stays on infrastructure you control.</li>
-            <li><strong>Ready-made deployment.</strong> The repository ships Kubernetes manifests for a speaches server on a single GPU node, a Docker image with the ivrit.ai Hebrew model built in, and a single-machine quickstart.</li>
-            <li><strong>One-click rollout.</strong> Hand teammates a <code>.milaconfig</code> file. Double-clicking it sets the server, models and language in one step.</li>
-          </ul>
-          <p class="teams-links">
-            <a class="button-secondary" href="https://github.com/island-io/mila/tree/main/docs/self-hosted-server">Team server guide</a>
-            <a class="text-link" href="https://github.com/island-io/mila/blob/main/docs/REMOTE_TRANSCRIPTION_SERVER.md">Single-machine quickstart</a>
-            <a class="text-link" href="https://github.com/island-io/mila">Source code</a>
-          </p>
-        </div>
-        <figure class="config">
-          <figcaption>team.milaconfig</figcaption>
+    <section id="teams" class="section" aria-labelledby="teams-title">
+      <div class="wrap">
+        <p class="eyebrow">For companies</p>
+        <h2 id="teams-title">Your own transcription service, on-prem</h2>
+        <p class="section-lede">Run Mila's transcription on every Mac, or on your company's own GPU servers. Either way, recordings stay inside your organization. No vendor, no per-seat or per-minute fees.</p>
+        <ul class="modes">
+          <li>
+            <p class="mode-label">Option 1</p>
+            <h3>On each Mac</h3>
+            <p>Apple Silicon Macs transcribe locally. Nothing to deploy, and audio never leaves the laptop.</p>
+          </li>
+          <li class="mode-main">
+            <p class="mode-label">Option 2</p>
+            <h3>On your company's server</h3>
+            <p>Run one transcription server for the whole company. Every Mila sends audio to it instead of a cloud service. Faster on older Macs, same Hebrew and English models.</p>
+          </li>
+        </ul>
+
+        <div class="teams">
+          <div class="teams-copy">
+            <ul class="checks">
+              <li><strong>Ready to deploy.</strong> Kubernetes manifests for a speaches server on a single GPU node, a Docker image with the ivrit.ai Hebrew model built in, and a single-machine quickstart.</li>
+              <li><strong>Works with what you have.</strong> Any OpenAI-compatible <code>/v1/audio/transcriptions</code> endpoint will do.</li>
+              <li><strong>Roll out with MDM.</strong> Push the server address and settings to every Mac through Jamf, Kandji, Intune or any MDM. Managed settings are locked in the app.</li>
+              <li><strong>Or one file.</strong> Hand a teammate a <code>.milaconfig</code>. Double-click it and Mila is set up.</li>
+              <li><strong>Open source, Apache 2.0.</strong> Read the code, run it yourself, no license fees.</li>
+            </ul>
+            <p class="teams-links">
+              <a class="button-secondary" href="https://github.com/island-io/mila/tree/main/docs/self-hosted-server">Company server guide</a>
+              <a class="text-link" href="https://github.com/island-io/mila/blob/main/docs/mdm.md">MDM setup</a>
+              <a class="text-link" href="https://github.com/island-io/mila/blob/main/docs/REMOTE_TRANSCRIPTION_SERVER.md">Single-machine quickstart</a>
+            </p>
+          </div>
+          <figure class="config">
+            <figcaption>team.milaconfig</figcaption>
 <pre><code>{
   "version": 1,
   "remoteTranscription": {
@@ -187,12 +224,13 @@
   },
   "recordingLanguage": "he"
 }</code></pre>
-          <p class="config-note">From <a href="https://github.com/island-io/mila/blob/main/docs/self-hosted-server/example.milaconfig">example.milaconfig</a>: <code>model</code> serves Hebrew, <code>englishModel</code> serves English.</p>
-        </figure>
+            <p class="config-note">From <a href="https://github.com/island-io/mila/blob/main/docs/self-hosted-server/example.milaconfig">example.milaconfig</a>: <code>model</code> serves Hebrew, <code>englishModel</code> serves English. An MDM profile takes the same keys.</p>
+          </figure>
+        </div>
       </div>
     </section>
 
-    <section id="requirements" class="section" aria-labelledby="req-title">
+    <section id="requirements" class="section section-alt" aria-labelledby="req-title">
       <div class="wrap">
         <h2 id="req-title">System requirements</h2>
         <dl class="reqs">
@@ -220,7 +258,7 @@
   <footer class="site-footer">
     <div class="wrap footer-row">
       <p>Mila is free and open source under the <a href="https://github.com/island-io/mila/blob/main/LICENSE">Apache License 2.0</a>. Originally developed at Island.</p>
-      <p>Privacy: Mila transcribes on your Mac, needs no account and collects no telemetry. This page sets no cookies and runs no analytics.</p>
+      <p>Privacy: Mila transcribes on your Mac or on a server you choose, needs no account and collects no telemetry. This page sets no cookies and runs no analytics.</p>
       <p><a href="https://github.com/island-io/mila">GitHub</a> <span aria-hidden="true">·</span> <a href="https://github.com/island-io/mila/releases">Releases</a> <span aria-hidden="true">·</span> <a href="https://github.com/island-io/mila/blob/main/SECURITY.md">Security</a></p>
     </div>
   </footer>
