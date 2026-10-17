@@ -689,6 +689,10 @@ final class TranscriptionService: ObservableObject {
     struct SpanTranscription {
         var segments: [TranscriptSegment]
         var unresolved: [UntranscribedSpan]
+        /// Whether the BACKEND failed for at least one span (unreachable or
+        /// refused). False when every unresolved span was only unreadable
+        /// audio — no server problem to report.
+        var backendFailed = false
     }
 
     /// Transcribe ONLY `spans` of the audio at `audioURL` — the utterances the
@@ -716,8 +720,9 @@ final class TranscriptionService: ObservableObject {
         var recovered: [TranscriptSegment] = []
         var unresolved: [UntranscribedSpan] = []
         var gaveUp = false
+        var backendFailed = false
         for span in spans {
-            if gaveUp || cancellation.isStopped || !span.isValid {
+            if gaveUp || cancellation.isStopped || !span.isRetryable {
                 unresolved.append(span)
                 continue
             }
@@ -730,7 +735,7 @@ final class TranscriptionService: ObservableObject {
                     transcribeSpans: could not read span \(span.start, privacy: .public)–\(span.end, privacy: .public)s \
                     [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]
                     """)
-                unresolved.append(span)
+                unresolved.append(UntranscribedSpan(start: span.start, end: span.end, unreadable: true))
                 continue
             }
             // Nothing on disk for this span, or nothing audible in it. The
@@ -744,7 +749,9 @@ final class TranscriptionService: ObservableObject {
                     transcribeSpans: span \(span.start, privacy: .public)–\(span.end, privacy: .public)s \
                     read \(samples.count, privacy: .public) samples with no signal — kept as missing
                     """)
-                unresolved.append(span)
+                // Permanent: re-reading the same file gives the same answer,
+                // so it stays visible but is never retried.
+                unresolved.append(UntranscribedSpan(start: span.start, end: span.end, unreadable: true))
                 continue
             }
             let duration = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
@@ -762,10 +769,14 @@ final class TranscriptionService: ObservableObject {
                                                        end: span.start + min(seg.end, duration),
                                                        text: text))
                 }
-            case .skipped, .failed:
+            case .skipped:
                 unresolved.append(span)
+            case .failed:
+                unresolved.append(span)
+                backendFailed = true
             case .connectionUnavailable:
                 unresolved.append(span)
+                backendFailed = true
                 gaveUp = true
             }
         }
@@ -774,7 +785,8 @@ final class TranscriptionService: ObservableObject {
             \(recovered.count, privacy: .public) segments, \(unresolved.count, privacy: .public) still missing \
             gaveUp=\(gaveUp, privacy: .public)
             """)
-        return SpanTranscription(segments: recovered, unresolved: unresolved)
+        return SpanTranscription(segments: recovered, unresolved: unresolved,
+                                 backendFailed: backendFailed)
     }
 
     /// `incoming` merged into `existing` by start time. Ties keep `existing`
@@ -802,7 +814,7 @@ final class TranscriptionService: ObservableObject {
         guard !spanRetryIDs.contains(recordingID),
               !isQueuedOrActive(recordingID),
               let row = store.recordings.first(where: { $0.id == recordingID }),
-              let spans = row.untranscribedSpans, !spans.isEmpty else { return }
+              let spans = row.untranscribedSpans, spans.contains(where: \.isRetryable) else { return }
         spanRetryIDs.insert(recordingID)
         defer { spanRetryIDs.remove(recordingID) }
         let result = await transcribeSpans(spans,
@@ -827,8 +839,10 @@ final class TranscriptionService: ObservableObject {
         if !recovered.isEmpty, !live.isTrashed {
             TranscriptExporter.writeSRT(for: live, in: store.recordingsDirectory)
         }
-        if result.unresolved.count == spans.count, lastError == nil {
-            // A user-initiated retry that changed nothing must say so.
+        // A user-initiated retry that recovered nothing because of the SERVER
+        // must say so. Unreadable audio is not a server problem: it is now
+        // marked on the span and shown in the note instead.
+        if result.backendFailed, recovered.isEmpty, lastError == nil {
             lastError = "Couldn't transcribe the missing parts — the transcription server is still unreachable or refused them. They're kept on the recording; try again later."
         }
     }

@@ -140,18 +140,23 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public struct UntranscribedSpan: Codable, Equatable, Sendable {
         public var start: Double
         public var end: Double
+        /// True when the app could not read this span's audio back from the
+        /// file, so no retry can recover it.
+        public var unreadable: Bool?
 
-        public init(start: Double, end: Double) {
+        public init(start: Double, end: Double, unreadable: Bool? = nil) {
             self.start = start
             self.end = end
+            self.unreadable = unreadable
         }
 
-        private enum CodingKeys: String, CodingKey { case start, end }
+        private enum CodingKeys: String, CodingKey { case start, end, unreadable }
 
         public init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             start = try c.decodeIfPresent(Double.self, forKey: .start) ?? 0
             end = try c.decodeIfPresent(Double.self, forKey: .end) ?? 0
+            unreadable = try? c.decodeIfPresent(Bool.self, forKey: .unreadable)
         }
     }
 

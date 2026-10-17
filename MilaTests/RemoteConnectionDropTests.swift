@@ -464,10 +464,20 @@ final class RemoteConnectionDropTests: XCTestCase {
         await service.retryUntranscribedSpans(of: recording.id)
 
         let row = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
-        XCTAssertEqual(row.untranscribedSpans, [beyond],
+        XCTAssertEqual(row.untranscribedSpans, [UntranscribedSpan(start: 2, end: 3, unreadable: true)],
                        "an unreadable slice is not proof of silence — the gap must stay visible")
+        XCTAssertEqual(row.retryableUntranscribedSeconds, 0, "…but no retry can fix it")
+        XCTAssertEqual(row.untranscribedSeconds, 1, accuracy: 0.0001)
         let calls = await engine.transcribeCalls
         XCTAssertEqual(calls, 0, "nothing to send")
+        XCTAssertNil(service.lastError,
+                     "unreadable audio is not a server failure and must not raise the server alert")
+
+        // A second retry has nothing retryable left and changes nothing.
+        await service.retryUntranscribedSpans(of: recording.id)
+        let again = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(again.untranscribedSpans, row.untranscribedSpans)
+        XCTAssertNil(service.lastError)
     }
 
     func test_invalid_spans_are_dropped_at_decode() throws {

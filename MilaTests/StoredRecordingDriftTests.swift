@@ -71,7 +71,8 @@ final class StoredRecordingDriftTests: XCTestCase {
             retranscriptionPriorState: .init(status: .completed, language: "he",
                                              modelName: "Earlier model",
                                              transcriptionDeferredAt: fixtureDeferred),
-            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)]
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5),
+                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)]
         )
     }
 
@@ -122,9 +123,11 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(prior.modelName, "Earlier model")
         XCTAssertEqual(prior.transcriptionDeferredAt, fixtureDeferred)
         let span = try XCTUnwrap(s.untranscribedSpans?.first)
-        XCTAssertEqual(s.untranscribedSpans?.count, 1)
+        XCTAssertEqual(s.untranscribedSpans?.count, 2)
         XCTAssertEqual(span.start, 12, accuracy: 0.001)
         XCTAssertEqual(span.end, 15.5, accuracy: 0.001)
+        XCTAssertNil(span.unreadable)
+        XCTAssertEqual(s.untranscribedSpans?.last?.unreadable, true)
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
@@ -324,8 +327,9 @@ final class StoredRecordingDriftTests: XCTestCase {
                        + "and decide whether the new key belongs in "
                        + "StoredRecording.RetranscriptionPriorState")
 
-        let span = try XCTUnwrap((appJSON["untranscribedSpans"] as? [[String: Any]])?.first)
-        XCTAssertEqual(Set(span.keys), ["start", "end"],
+        let spans = try XCTUnwrap(appJSON["untranscribedSpans"] as? [[String: Any]])
+        let spanKeys = spans.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
+        XCTAssertEqual(spanKeys, ["start", "end", "unreadable"],
                        "UntranscribedSpan's persisted shape changed — update the fixture and "
                        + "decide whether the new key belongs in StoredRecording.UntranscribedSpan")
     }

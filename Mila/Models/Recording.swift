@@ -48,6 +48,20 @@ enum TranscriptionStatus: String, Codable {
 struct UntranscribedSpan: Codable, Hashable, Sendable {
     var start: Double
     var end: Double
+    /// True once the span's audio could not be read back from the file (past
+    /// its end, unreadable, or digital silence where the live path heard
+    /// sound). No upload can fix that, so the span is shown but never offered
+    /// for retry again. Nil — and omitted from recordings.json — otherwise.
+    var unreadable: Bool?
+
+    init(start: Double, end: Double, unreadable: Bool? = nil) {
+        self.start = start
+        self.end = end
+        self.unreadable = unreadable == true ? true : nil
+    }
+
+    /// Whether "Retry missing parts" can still do anything for this span.
+    var isRetryable: Bool { isValid && unreadable != true }
 
     /// Finite, non-negative and non-empty. recordings.json is user-editable
     /// and synced; a NaN, infinite or inverted span would trap the first time
@@ -223,6 +237,11 @@ struct Recording: Identifiable, Codable, Hashable {
     /// Total seconds of audio missing from the transcript.
     var untranscribedSeconds: Double {
         (untranscribedSpans ?? []).reduce(0) { $0 + $1.duration }
+    }
+
+    /// The part of `untranscribedSeconds` "Retry missing parts" can still try.
+    var retryableUntranscribedSeconds: Double {
+        (untranscribedSpans ?? []).filter(\.isRetryable).reduce(0) { $0 + $1.duration }
     }
 
     /// Whether the row holds any transcript text — what a re-run leaves in

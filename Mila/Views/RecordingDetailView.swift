@@ -392,12 +392,23 @@ struct RecordingDetailView: View {
     private var missingPartsNote: some View {
         // `untranscribedSeconds` sums only valid spans, so it is finite; the
         // clamp keeps `Int(_:)` safe whatever a hand-edited store holds.
-        let total = recording.untranscribedSeconds
-        let seconds = total.isFinite ? Int(min(total, 24 * 60 * 60).rounded(.up)) : 0
+        func clampedSeconds(_ value: Double) -> Int {
+            value.isFinite ? Int(min(max(0, value), 24 * 60 * 60).rounded(.up)) : 0
+        }
+        let retryable = clampedSeconds(recording.retryableUntranscribedSeconds)
+        let unreadable = clampedSeconds(recording.untranscribedSeconds - recording.retryableUntranscribedSeconds)
         let isRetrying = transcription.spanRetryIDs.contains(recording.id)
+        var message = ""
+        if retryable > 0 {
+            message = "\(formatDuration(Double(retryable))) of this recording isn't in the transcript — the transcription server couldn't be reached or refused it."
+        }
+        if unreadable > 0 {
+            if !message.isEmpty { message += " " }
+            message += "\(formatDuration(Double(unreadable))) of audio couldn't be read back, so it can't be transcribed."
+        }
         return HStack(spacing: 8) {
             Label {
-                Text("\(formatDuration(Double(max(1, seconds)))) of this recording isn't in the transcript — the transcription server couldn't be reached or refused it.")
+                Text(message)
             } icon: {
                 Image(systemName: "wifi.exclamationmark")
                     .foregroundStyle(.orange)
@@ -406,7 +417,7 @@ struct RecordingDetailView: View {
             .foregroundStyle(.secondary)
             if isRetrying {
                 ProgressView().controlSize(.small)
-            } else {
+            } else if retryable > 0 {
                 Button("Retry missing parts") {
                     let id = recording.id
                     Task { await transcription.retryUntranscribedSpans(of: id) }
