@@ -53,6 +53,9 @@ public struct MilaMCPToolHandlers: Sendable {
     /// Injectable so tests can drive both sides of the gate without writing
     /// to the real app-support directory.
     private let isAccessEnabled: @Sendable (URL) -> Bool
+    /// The separate consent `save_transcript` needs on top of read access.
+    /// Same contract as `isAccessEnabled`: consulted on every call.
+    private let isFileExportEnabled: @Sendable (URL) -> Bool
 
     /// The two defaults are written as closure literals rather than the
     /// tidier unapplied references (`Date.init`,
@@ -64,11 +67,15 @@ public struct MilaMCPToolHandlers: Sendable {
                 source: (any MilaDataSource)? = nil,
                 isAccessEnabled: @escaping @Sendable (URL) -> Bool = {
                     MCPAccessGate.isEnabled(root: $0)
+                },
+                isFileExportEnabled: @escaping @Sendable (URL) -> Bool = {
+                    MCPAccessGate.isFileExportEnabled(root: $0)
                 }) {
         self.root = root
         self.now = now
         self.source = source ?? FileBackedDataSource(root: root)
         self.isAccessEnabled = isAccessEnabled
+        self.isFileExportEnabled = isFileExportEnabled
     }
 
     // MARK: - Tool definitions
@@ -152,13 +159,15 @@ public struct MilaMCPToolHandlers: Sendable {
             speaker-named transcript; "srt" is SubRip subtitles, the same bytes as \
             get_transcript's srt and Mila's Export Subtitles. path may name a file or an \
             existing folder (the file is then named "<date> <title>.txt" or ".srt"). An \
-            existing file is refused unless overwrite is true — ask the user first.
+            existing file is refused unless overwrite is true — ask the user first. Only \
+            finished transcripts are saved. Writing files is a separate opt-in in Mila's \
+            settings; if it is off this tool says so, and get_transcript still works.
             """,
             inputSchema: [
                 "type": "object",
                 "properties": [
                     "path": ["type": "string",
-                             "description": "Absolute path (~ allowed) of the file to write, or of an existing folder to write into. The parent folder must exist. Paths inside Mila's own data are refused."],
+                             "description": "Absolute path (~ allowed) of the file to write, or of an existing folder to write into (a path ending in / always means a folder). The folder must exist. Paths inside Mila's own data, and symbolic links, are refused."],
                     "id": ["type": "string",
                            "description": "Recording UUID. Omit for the latest completed recording."],
                     "format": ["type": "string", "enum": ["text", "srt"],
@@ -232,12 +241,19 @@ public struct MilaMCPToolHandlers: Sendable {
     /// revoking access should take effect immediately, not at the client's
     /// next restart. It costs one small file read per tool call, and tool
     /// calls are rare.
+    ///
+    /// `save_transcript` needs a second consent on top: the user's grant of
+    /// read access predates file writes and did not agree to them, so
+    /// writing is its own opt-in (`MCPAccessGate.isFileExportEnabled`),
+    /// re-read per call for the same reason.
     public func handle(tool: String, arguments: [String: Any]) throws -> String {
         guard isAccessEnabled(root) else { throw MCPAccessDisabledError() }
         switch tool {
         case "list_recordings": return try listRecordings(arguments)
         case "get_transcript": return try getTranscript(arguments)
-        case "save_transcript": return try saveTranscript(arguments)
+        case "save_transcript":
+            guard isFileExportEnabled(root) else { throw MCPFileExportDisabledError() }
+            return try saveTranscript(arguments)
         case "search_transcripts": return try searchTranscripts(arguments)
         case "get_live_transcript": return try getLiveTranscript(arguments)
         default: throw ToolError.unknownTool(tool)
@@ -323,34 +339,75 @@ public struct MilaMCPToolHandlers: Sendable {
     /// replace files on their Mac. Folding writes into that tool would have
     /// extended the standing approval silently; as its own tool, the first
     /// write prompts on its own.
+    ///
+    /// Reached only through `handle(tool:)`, after BOTH gates: read access,
+    /// and the separate file-export consent.
     private func saveTranscript(_ args: [String: Any]) throws -> String {
+        // Everything that depends only on the arguments is checked before
+        // the store is touched, as in `getTranscript`: a relative path or a
+        // missing folder should surface on its own, not behind an unknown
+        // `id` or the cost of a recordings.json load.
         let format = try enumArg(args, "format", TranscriptFormat.self) ?? .text
         guard let path = args["path"] as? String, !path.isEmpty else {
             throw ToolError.invalidArguments("path is required")
         }
         let overwrite = (args["overwrite"] as? Bool) ?? false
+        let writer = TranscriptFileWriter(protected: protectedLocations())
+        let plan = try writeStep { try writer.plan(for: path) }
+
         let recording = try resolveRecording(args)
+        // A file is a finished artifact: it gets attached, uploaded, handed
+        // on, and nothing about it says "partial". `get_transcript` can
+        // carry a note beside a draft; a file cannot — and with `overwrite`
+        // a pending row would replace a good export with an empty one. So
+        // only a finished transcript is written: a completed row, or the
+        // earlier finished transcript a re-run in flight still holds.
+        let hasFinishedTranscript = recording.status == "completed"
+            || (recording.isRetranscriptionInFlight
+                && recording.retranscriptionPriorState?.status == "completed")
+        guard hasFinishedTranscript, !recording.isTranscriptionDeferred else {
+            let state = recording.isTranscriptionDeferred
+                ? "the user stopped its transcription to run it later"
+                : "transcription status is \"\(recording.status)\""
+            throw ToolError.notFound(
+                "Recording \(recording.id.uuidString) has no finished transcript to save (\(state)). "
+                + "Nothing was written. get_transcript shows whatever text exists so far.")
+        }
         // No `max_chars`: a file is only useful complete, and a truncated
         // `.srt` is a subtitle track that silently stops early.
         let rendered = try renderTranscript(recording, format: format, maxChars: nil)
+        guard !rendered.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ToolError.notFound(
+                "Recording \(recording.id.uuidString) has an empty transcript; nothing was written.")
+        }
 
-        let writer = TranscriptFileWriter(protectedDirectories: protectedDirectories())
         let defaultName = TranscriptFileWriter.defaultFileName(
             title: recording.title, createdAt: recording.createdAt,
             fileExtension: format == .srt ? "srt" : "txt")
         var result = summaryObject(for: recording)
         result["format"] = format.rawValue
-        do {
-            let destination = try writer.destination(for: path, defaultFileName: defaultName)
-            result["bytes"] = try writer.write(rendered.text, to: destination, overwrite: overwrite)
-            result["saved_to"] = destination.path
-        } catch let error as TranscriptFileWriter.WriteError {
-            throw ToolError.invalidArguments(error.description)
+        let destination = try writeStep {
+            try writer.destination(for: plan, defaultFileName: defaultName)
         }
+        let bytes: Int = try writeStep {
+            try writer.write(rendered.text, to: destination, overwrite: overwrite)
+        }
+        result["bytes"] = bytes
+        result["saved_to"] = destination.path
         result["characters"] = rendered.text.count
         let notes = statusNotes(for: recording)
         if !notes.isEmpty { result["note"] = notes.joined(separator: " ") }
         return try json(result)
+    }
+
+    /// `TranscriptFileWriter`'s refusals are the caller's to fix (another
+    /// path, another name, `overwrite`), so they surface as invalid arguments.
+    private func writeStep<T>(_ body: () throws -> T) throws -> T {
+        do {
+            return try body()
+        } catch let error as TranscriptFileWriter.WriteError {
+            throw ToolError.invalidArguments(error.description)
+        }
     }
 
     /// `id` → that recording (trashed ones are unreachable, via the reader);
@@ -474,13 +531,30 @@ public struct MilaMCPToolHandlers: Sendable {
         return []
     }
 
-    /// Where `save_transcript` may not write: the app-support root (consent
-    /// and pointer files, the live sidecar, the default store) and the store
-    /// the pointer resolves to, which a relocation can put anywhere.
-    private func protectedDirectories() -> [URL] {
+    /// Where `save_transcript` may not write.
+    ///
+    /// The app-support root is off limits as a whole: consent and pointer
+    /// files, the live sidecar, and the default store all live there, and no
+    /// export belongs in it.
+    ///
+    /// A relocated store is different: the user picked that folder, and it
+    /// can be somewhere ordinary like `~/Documents`, where refusing every
+    /// export would be absurd. So it is a MANAGED folder — new files may be
+    /// created in it, but nothing already there may be replaced and Mila's
+    /// own names are reserved (see `TranscriptFileWriter`). The recordings
+    /// folder and the folder holding `recordings.json` are the same folder in
+    /// every layout the app writes; listed once either way.
+    private func protectedLocations() -> TranscriptFileWriter.ProtectedLocations {
         let location = MilaStoreReader.resolvedLocation(root: root)
-        return [root, location.recordingsDirectory,
-                location.storeFileURL.deletingLastPathComponent()]
+        var managed: [URL] = []
+        for folder in [location.recordingsDirectory,
+                       location.storeFileURL.deletingLastPathComponent()] {
+            let key = folder.standardizedFileURL.path
+            if !managed.contains(where: { $0.standardizedFileURL.path == key }) {
+                managed.append(folder)
+            }
+        }
+        return .init(roots: [root], managedFolders: managed)
     }
 
     private func searchTranscripts(_ args: [String: Any]) throws -> String {

@@ -42,7 +42,11 @@ the exact command with a Copy button)
   meeting, where `save_transcript` takes milliseconds. The reply has `saved_to`
   and `bytes` instead of the text; hand that path to whatever comes next
   (an upload tool, the user). An existing file is refused unless you pass
-  `overwrite: true` — ask the user before replacing one.
+  `overwrite: true` — ask the user before replacing one. If it refuses
+  because saving files is turned off, tell the user it is a separate
+  setting in Mila (Settings ▸ Storage ▸ "Also allow saving transcripts to
+  files") — do not fall back to writing the transcript out yourself
+  unless they ask for that. Only finished transcripts are saved.
 - "Subtitles" / "an .srt for this recording" → `save_transcript(id: …,
   format: "srt", path: …)` (next to the user's video if they named
   one); do not paste cues into chat. It is the same output as Mila's

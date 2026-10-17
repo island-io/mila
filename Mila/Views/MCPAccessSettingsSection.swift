@@ -48,7 +48,7 @@ struct MCPAccessSettingsSection: View {
             // honest option, and it tells the user to act rather than
             // assuming they're covered.
             if settings.revocationFailed {
-                Text("Mila couldn't turn MCP access off — the permission file can't be written or removed, so the helper still has access. Check that \(settings.gateFilePath) is writable, then try again.")
+                Text("Mila couldn't turn MCP access off — the permission file can't be written or removed, so the helper still has the access shown above. Check that \(settings.gateFilePath) is writable, then try again.")
                     .font(.callout)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
@@ -82,12 +82,13 @@ struct MCPAccessSettingsSection: View {
                 Spacer()
             }
             if settings.enabled {
-                Text("An MCP client on this Mac — Claude Code or Claude Desktop — can list your recordings, read their transcripts, search them, follow a recording as it happens, and save a transcript to a file you name. Nothing is sent anywhere by Mila; the client you register decides what it does with the text.")
+                Text("An MCP client on this Mac — Claude Code or Claude Desktop — can list your recordings, read their transcripts, search them, and follow a recording as it happens. Nothing is sent anywhere by Mila; the client you register decides what it does with the text.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                fileExportToggle
             } else {
-                Text("Off. Turn this on to let an MCP client on this Mac read your transcriptions and save them to files.")
+                Text("Off. Turn this on to let an MCP client on this Mac read your transcriptions.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -95,6 +96,23 @@ struct MCPAccessSettingsSection: View {
         }
         .padding(12)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Writing files is its own consent, nested under read access: granting
+    /// reads (which earlier versions offered alone) never implies writes.
+    private var fileExportToggle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle("Also allow saving transcripts to files", isOn: $settings.fileExportEnabled)
+                .accessibilityIdentifier("mcp.fileExport.toggle")
+            Text(settings.fileExportEnabled
+                 ? "The client can save a transcript to a file you (or it, on your behalf) name. Mila refuses to write inside its own data or to replace files in your recordings folder."
+                 : "Off. The client can read transcripts but not create or replace files on this Mac.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.leading, 24)
+        .padding(.top, 4)
     }
 
     private var registrationCard: some View {
