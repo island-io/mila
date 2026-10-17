@@ -329,7 +329,7 @@ final class TranscriptTrimTests: XCTestCase {
         XCTAssertEqual(result.recording.duration, rec.duration,
                        "the audio was not cut, so the duration must not claim it was")
         XCTAssertNotNil(RecordingStore.audioTrimProblem(result.audio))
-        XCTAssertNotNil(store.audioTrimNotice,
+        XCTAssertNotNil(store.trimNotice,
                         "the user is told the audio was kept, through the store so it survives navigation")
     }
 
@@ -347,7 +347,7 @@ final class TranscriptTrimTests: XCTestCase {
 
         XCTAssertEqual(result.recording.segments.map(\.text), ["kept"])
         XCTAssertEqual(result.audio, .noCutPoint)
-        XCTAssertNotNil(store.audioTrimNotice)
+        XCTAssertNotNil(store.trimNotice)
     }
 
     func test_end_conversation_reports_audio_that_ends_before_the_cut() async throws {
@@ -364,7 +364,7 @@ final class TranscriptTrimTests: XCTestCase {
 
         XCTAssertEqual(result.audio, .audioEndsBeforeCut,
                        "the user was promised a cut; nothing happening must not read as success")
-        XCTAssertNotNil(store.audioTrimNotice)
+        XCTAssertNotNil(store.trimNotice)
         XCTAssertNil(store.audioRevisions[rec.id], "the file was not replaced, so players need not reload")
         assertNoTrimLeftovers(in: store.recordingsDirectory)
     }
@@ -380,7 +380,7 @@ final class TranscriptTrimTests: XCTestCase {
         _ = await store.endConversation(afterSegment: segs[2].id, recordingID: rec.id)
 
         XCTAssertEqual(store.audioRevisions[rec.id], 1)
-        XCTAssertNil(store.audioTrimNotice)
+        XCTAssertNil(store.trimNotice)
     }
 
     // MARK: - Post-stop speaker finalization
@@ -405,6 +405,66 @@ final class TranscriptTrimTests: XCTestCase {
         pending.removeAll()
         XCTAssertTrue(store.canEditTranscriptNow(rec))
         XCTAssertNotNil(store.deleteSegments([segs[0].id], recordingID: rec.id))
+    }
+
+    // MARK: - Re-transcription during the audio cut
+
+    /// A re-run started between the transcript edit and the audio cut would
+    /// make the trim give up and transcribe the FULL audio, writing the
+    /// removed lines back.
+    func test_retranscription_is_refused_while_the_audio_cut_is_in_flight() async throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let segs = fourLines()
+        let rec = recording(segments: segs)
+        try TestSupport.writeSineWav(at: store.recordingsDirectory.appendingPathComponent(rec.audioFileName),
+                                     durationSeconds: 8)
+        store.add(rec)
+
+        let trim = Task { await store.endConversation(afterSegment: segs[1].id, recordingID: rec.id) }
+        // The task runs on the main actor up to the off-main audio write, so
+        // it is observable mid-flight after a yield.
+        var spins = 0
+        while !store.audioTrimPendingIDs.contains(rec.id), spins < 1000 {
+            await Task.yield()
+            spins += 1
+        }
+        XCTAssertTrue(store.audioTrimPendingIDs.contains(rec.id), "never observed the trim in flight")
+        XCTAssertNil(store.prepareForRetranscription(id: rec.id))
+        XCTAssertEqual(store.recordings.first?.status, .completed, "the refused re-run must not touch the row")
+
+        let result = await trim.value
+        guard case .trimmed = result?.audio else {
+            return XCTFail("the trim must not give up: \(String(describing: result?.audio))")
+        }
+        XCTAssertFalse(store.audioTrimPendingIDs.contains(rec.id))
+        XCTAssertNotNil(store.prepareForRetranscription(id: rec.id), "allowed again once the cut is done")
+    }
+
+    // MARK: - Unsaved edits
+
+    /// The `.txt` sidecar is what mila-mcp serves first, so an edit that
+    /// could not rewrite it must not count as done, must be reported, and
+    /// must be retried on a later write.
+    func test_an_edit_whose_sidecar_cannot_be_written_is_reported_and_retried() throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let segs = fourLines()
+        let rec = recording(segments: segs)
+        store.add(rec)
+        let sidecar = store.transcriptURL(for: rec)
+        let directory = store.recordingsDirectory.path
+        let fm = FileManager.default
+        try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: directory)
+        defer { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory) }
+
+        XCTAssertNil(store.deleteSegments([segs[2].id], recordingID: rec.id),
+                     "an edit that did not reach disk is not a success")
+        XCTAssertNotNil(store.trimNotice)
+
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: directory)
+        store.rename(rec, to: "Call, renamed")  // any later write
+
+        XCTAssertEqual(try String(contentsOf: sidecar, encoding: .utf8), "one two four",
+                       "the stale sidecar still served the removed line")
     }
 
     // MARK: - Crash leftovers

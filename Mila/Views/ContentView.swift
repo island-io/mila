@@ -104,13 +104,13 @@ struct ContentView: View {
         // (#357). Shown here rather than in the detail view because the audio
         // work can finish after the user has navigated elsewhere.
         .alert(
-            "Audio not trimmed",
+            "Transcript trim",
             isPresented: Binding(
-                get: { store.audioTrimNotice != nil },
-                set: { if !$0 { store.audioTrimNotice = nil } }
+                get: { store.trimNotice != nil },
+                set: { if !$0 { store.trimNotice = nil } }
             ),
-            actions: { Button("OK") { store.audioTrimNotice = nil } },
-            message: { Text(store.audioTrimNotice ?? "") }
+            actions: { Button("OK") { store.trimNotice = nil } },
+            message: { Text(store.trimNotice ?? "") }
         )
         .alert(
             "Recording stopped because your Mac slept",

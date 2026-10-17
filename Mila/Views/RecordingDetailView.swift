@@ -350,6 +350,10 @@ struct RecordingDetailView: View {
     private var isTranscriptionBusy: Bool {
         transcription.activeRecordingID == recording.id
             || transcription.pendingIDs.contains(recording.id)
+            // An "End Conversation Here" audio cut is still running: a
+            // re-transcription now would read the full audio and write the
+            // removed lines back (#357). The store refuses it as well.
+            || store.audioTrimPendingIDs.contains(recording.id)
     }
 
     /// Human-readable name of the whisper model that will run for the
@@ -894,7 +898,7 @@ struct RecordingDetailView: View {
             selection = TranscriptSelection()
             // Touches no view state, so it is safe to outlive this view. An
             // audio cut that did not happen is reported by the store itself
-            // (`audioTrimNotice`, shown by ContentView), not from here.
+            // (`trimNotice`, shown by ContentView), not from here.
             Task { @MainActor in
                 guard let result = await store.endConversation(afterSegment: segmentID,
                                                                recordingID: recordingID) else { return }
