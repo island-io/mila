@@ -233,7 +233,9 @@ final class ShareManifestTests: XCTestCase {
             // Mid-re-run bookkeeping; set so the key-set test below sees the
             // key and can hold it to the allowlist.
             retranscriptionPriorState: .init(status: .completed, language: "he",
-                                             modelName: "Earlier model"))
+                                             modelName: "Earlier model"),
+            // Local repair bookkeeping; set so the key-set test sees the key.
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)])
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -327,6 +329,11 @@ final class ShareManifestTests: XCTestCase {
             // completed transcript in the language the manifest states; the
             // sender's in-flight run is not its concern.
             "retranscriptionPriorState",
+            // Which spans of the SENDER's audio its transcript is missing
+            // (#355) — bookkeeping for the sender's own "Retry missing parts".
+            // The receiver imports the transcript as sent; a full
+            // re-transcription on their side covers the whole audio anyway.
+            "untranscribedSpans",
         ]
         let storeEncoder = JSONEncoder()
         storeEncoder.dateEncodingStrategy = .iso8601

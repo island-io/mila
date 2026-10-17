@@ -408,6 +408,51 @@ struct RecordingDetailView: View {
         .accessibilityIdentifier("recording.stopTranscribing")
     }
 
+    /// Says the transcript is knowingly incomplete — some of the recording
+    /// could not be transcribed because the transcription server was
+    /// unreachable (or refused it) during the recording and again when it was
+    /// saved — and offers to transcribe just those parts now (#355).
+    private var missingPartsNote: some View {
+        // `untranscribedSeconds` sums only valid spans, so it is finite; the
+        // clamp keeps `Int(_:)` safe whatever a hand-edited store holds.
+        func clampedSeconds(_ value: Double) -> Int {
+            value.isFinite ? Int(min(max(0, value), 24 * 60 * 60).rounded(.up)) : 0
+        }
+        let retryable = clampedSeconds(recording.retryableUntranscribedSeconds)
+        let unreadable = clampedSeconds(recording.untranscribedSeconds - recording.retryableUntranscribedSeconds)
+        let isRetrying = transcription.spanRetryIDs.contains(recording.id)
+        var message = ""
+        if retryable > 0 {
+            message = "\(formatDuration(Double(retryable))) of this recording isn't in the transcript — the transcription server couldn't be reached or refused it."
+        }
+        if unreadable > 0 {
+            if !message.isEmpty { message += " " }
+            message += "\(formatDuration(Double(unreadable))) of audio couldn't be read back, so it can't be transcribed."
+        }
+        return HStack(spacing: 8) {
+            Label {
+                Text(message)
+            } icon: {
+                Image(systemName: "wifi.exclamationmark")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            if isRetrying {
+                ProgressView().controlSize(.small)
+            } else if retryable > 0 {
+                Button("Retry missing parts") {
+                    let id = recording.id
+                    Task { await transcription.retryUntranscribedSpans(of: id) }
+                }
+                .controlSize(.small)
+                .help("Transcribe just the missing parts of the audio and add them to the transcript in place.")
+                .accessibilityIdentifier("recording.retryMissingParts")
+            }
+        }
+        .accessibilityIdentifier("recording.untranscribedNote")
+    }
+
     @ViewBuilder
     private var transcriptArea: some View {
         // Queued wins over "Stopping…" and over the progress view: a row
@@ -506,6 +551,8 @@ struct RecordingDetailView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("recording.transcriptionStopped")
+                    } else if recording.untranscribedSpans?.isEmpty == false {
+                        missingPartsNote
                     }
                     Spacer()
                     Button {

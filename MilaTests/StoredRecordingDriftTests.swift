@@ -70,7 +70,9 @@ final class StoredRecordingDriftTests: XCTestCase {
             // prior state) — this fixture is about every key being present.
             retranscriptionPriorState: .init(status: .completed, language: "he",
                                              modelName: "Earlier model",
-                                             transcriptionDeferredAt: fixtureDeferred)
+                                             transcriptionDeferredAt: fixtureDeferred),
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5),
+                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)]
         )
     }
 
@@ -120,6 +122,12 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(prior.language, "he")
         XCTAssertEqual(prior.modelName, "Earlier model")
         XCTAssertEqual(prior.transcriptionDeferredAt, fixtureDeferred)
+        let span = try XCTUnwrap(s.untranscribedSpans?.first)
+        XCTAssertEqual(s.untranscribedSpans?.count, 2)
+        XCTAssertEqual(span.start, 12, accuracy: 0.001)
+        XCTAssertEqual(span.end, 15.5, accuracy: 0.001)
+        XCTAssertNil(span.unreadable)
+        XCTAssertEqual(s.untranscribedSpans?.last?.unreadable, true)
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
@@ -209,6 +217,8 @@ final class StoredRecordingDriftTests: XCTestCase {
             "actionItems": [],
             // Nothing. `RetranscriptionPriorState` is mirrored in full.
             "retranscriptionPriorState": [],
+            // Nothing. `UntranscribedSpan` is mirrored in full.
+            "untranscribedSpans": [],
         ]
         // Object-valued keys whose KEYS are data, not schema: the mirror
         // decodes them as a dictionary, so there is no element type to drift.
@@ -255,7 +265,8 @@ final class StoredRecordingDriftTests: XCTestCase {
                   let elements = elements(of: value), !elements.isEmpty else { return nil }
             return key
         }.sorted()
-        XCTAssertEqual(containers, ["actionItems", "retranscriptionPriorState", "segments"],
+        XCTAssertEqual(containers, ["actionItems", "retranscriptionPriorState", "segments",
+                                    "untranscribedSpans"],
                        "Recording gained (or lost) a nested container. Populate it in "
                        + "fullyPopulatedRecording(), mirror its element type in "
                        + "StoredRecording, and pin its shape in "
@@ -315,6 +326,12 @@ final class StoredRecordingDriftTests: XCTestCase {
                        "RetranscriptionPriorState's persisted shape changed — update the fixture "
                        + "and decide whether the new key belongs in "
                        + "StoredRecording.RetranscriptionPriorState")
+
+        let spans = try XCTUnwrap(appJSON["untranscribedSpans"] as? [[String: Any]])
+        let spanKeys = spans.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
+        XCTAssertEqual(spanKeys, ["start", "end", "unreadable"],
+                       "UntranscribedSpan's persisted shape changed — update the fixture and "
+                       + "decide whether the new key belongs in StoredRecording.UntranscribedSpan")
     }
 
     /// The recovered fields must actually arrive, not merely have a key.
@@ -342,6 +359,7 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertNil(s.actionItems)
         XCTAssertNil(s.summaryLanguage)
         XCTAssertNil(s.retranscriptionPriorState, "omitted when nil, so a never re-transcribed row has no key")
+        XCTAssertNil(s.untranscribedSpans, "omitted when nil, so a complete transcript has no key")
     }
 
     func test_legacy_inline_fulltext_decodes() throws {
