@@ -7,6 +7,8 @@ of Whisper, English by
 [OpenAI's `large-v3-turbo`](https://huggingface.co/ggerganov/whisper.cpp), both
 running through `whisper.cpp` (GPU via Metal).
 
+**Download:** [island-io.github.io/mila](https://island-io.github.io/mila/)
+
 ## Features
 
 - **Record from the microphone** at any time.

@@ -1,0 +1,145 @@
+name: Website
+
+# Publishes site/ (the mila one-pager) to GitHub Pages.
+#
+# GitHub Pages for this repo is served from the gh-pages BRANCH, and that
+# branch already carries the Sparkle update feed: the release pipeline commits
+# appcast.xml there, and every installed copy of Mila polls
+# https://island-io.github.io/mila/appcast.xml (SUFeedURL in project.yml).
+# So this workflow does not use the artifact-based Pages deploy
+# (configure-pages / upload-pages-artifact / deploy-pages): that needs Settings
+# -> Pages -> Source switched to "GitHub Actions", after which pushes to
+# gh-pages stop being served and the update feed would silently freeze.
+# Instead it copies site/ into gh-pages next to the feed and never touches the
+# feed's files. See docs/website.md.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One publish at a time, and never cancel one half-way through a push.
+concurrency:
+  group: website-publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the site into the gh-pages branch
+    env:
+      # The address written into site/'s canonical, Open Graph, robots.txt and
+      # sitemap.xml URLs. Set the SITE_URL repository variable (Settings ->
+      # Secrets and variables -> Actions -> Variables) to publish under a
+      # custom domain without editing site/.
+      DEFAULT_SITE_URL: https://island-io.github.io/mila/
+      SITE_URL: ${{ vars.SITE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          sparse-checkout: site
+          persist-credentials: false
+
+      - name: Check the site's links
+        run: |
+          python3 - <<'PY'
+          import pathlib, re, sys
+          site = pathlib.Path("src/site")
+          bad = []
+          for page in site.glob("*.html"):
+              html = page.read_text(encoding="utf-8")
+              for ref in re.findall(r'(?:href|src)="([^"#]+)"', html):
+                  if re.match(r"^[a-z]+:", ref):
+                      continue  # absolute URL
+                  if ref.startswith("/"):
+                      # Root-relative breaks under /mila/ on github.io.
+                      bad.append(f"{page.name}: root-relative URL {ref!r}")
+                  elif ref not in ("./",) and not (site / ref).is_file():
+                      bad.append(f"{page.name}: missing file {ref!r}")
+          for msg in bad:
+              print(f"::error::{msg}")
+          sys.exit(1 if bad else 0)
+          PY
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: pages
+          # Kept so the final step can push; nothing else runs in this job.
+          persist-credentials: true
+
+      - name: Copy site/ into gh-pages
+        run: |
+          set -euo pipefail
+          # Files this workflow must never write or delete: the update feed
+          # (release pipeline), Pages' own markers, and our manifest.
+          reserved='^(appcast\.xml|\.nojekyll|CNAME|\.site-files)$'
+
+          (cd src/site && find . -type f | sed 's|^\./||' | LC_ALL=C sort) > new-files
+          if grep -E "$reserved" new-files; then
+            echo "::error::site/ contains a file name reserved for gh-pages (listed above)"
+            exit 1
+          fi
+
+          # Remove files a previous run published that site/ no longer has.
+          # Only names in our own manifest are candidates, so files other
+          # tools put on gh-pages are never deleted.
+          if [ -f pages/.site-files ]; then
+            LC_ALL=C sort pages/.site-files | comm -23 - new-files > stale-files
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if grep -qE "$reserved" <<<"$f"; then continue; fi
+              case "$f" in /*|*..*) echo "::error::refusing to delete $f"; exit 1 ;; esac
+              rm -f -- "pages/$f"
+            done < stale-files
+          fi
+
+          (cd src/site && tar cf - .) | (cd pages && tar xf -)
+          cp new-files pages/.site-files
+
+          if [ -n "$SITE_URL" ]; then
+            url="${SITE_URL%/}/"
+            if ! grep -qE '^https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~-]+)*/$' <<<"$url"; then
+              echo "::error::SITE_URL must look like https://host/ or https://host/path/"
+              exit 1
+            fi
+            while IFS= read -r f; do
+              case "$f" in
+                *.html|*.xml|*.txt) sed -i "s#${DEFAULT_SITE_URL}#${url}#g" "pages/$f" ;;
+              esac
+            done < new-files
+            echo "Site URL: $url"
+          fi
+
+      - name: Commit and push
+        working-directory: pages
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "gh-pages already matches site/; nothing to publish."
+            exit 0
+          fi
+          git status --short
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "Publish website from ${GITHUB_SHA::12}"
+          # The release pipeline also pushes to gh-pages. It only ever changes
+          # appcast.xml and we never do, so a rebase onto its commit is
+          # always clean.
+          for delay in 2 4 8 16; do
+            if git push origin HEAD:gh-pages; then exit 0; fi
+            echo "Push rejected; retrying in ${delay}s"
+            sleep "$delay"
+            git pull --rebase -q origin gh-pages
+          done
+          git push origin HEAD:gh-pages
