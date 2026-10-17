@@ -7,11 +7,19 @@
 //
 // /releases/latest never returns drafts or pre-releases, so beta builds are
 // never offered here.
+//
+// The repository comes from <meta name="mila-repo"> in index.html, which the
+// publish workflow rewrites for a fork, so a fork's site offers the fork's
+// own releases.
 (function () {
   "use strict";
 
-  var API = "https://api.github.com/repos/island-io/mila/releases/latest";
-  var ASSET_PREFIX = "https://github.com/island-io/mila/releases/download/";
+  var meta = document.querySelector('meta[name="mila-repo"]');
+  var repo = meta ? meta.getAttribute("content") || "" : "";
+  if (!/^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(repo)) return;
+
+  var API = "https://api.github.com/repos/" + repo + "/releases/latest";
+  var ASSET_PREFIX = "https://github.com/" + repo + "/releases/download/";
 
   function apply(release) {
     var assets = (release && release.assets) || [];

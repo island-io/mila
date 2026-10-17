@@ -8,6 +8,8 @@
        latest release, and the button works without it. -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src https://api.github.com; base-uri 'none'; form-action 'none'; object-src 'none'">
   <meta name="referrer" content="strict-origin-when-cross-origin">
+  <!-- Repository whose latest release download.js offers. -->
+  <meta name="mila-repo" content="island-io/mila">
 
   <title>Mila: private, local transcription for Mac</title>
   <meta name="description" content="Mila records meetings, dictation and voice memos and transcribes them on your Mac with whisper.cpp. Speaker labels, live transcripts, English and Hebrew. Free and open source. Your audio never leaves your Mac.">
@@ -128,7 +130,7 @@
           </li>
           <li>
             <h3>Know who said what</h3>
-            <p>Speaker diarization labels each voice. Name a speaker once and Mila keeps the name for later recordings.</p>
+            <p>Speaker diarization labels each voice. Name a speaker once and Mila keeps the name for later recordings. Needs an Apple Silicon Mac.</p>
           </li>
           <li>
             <h3>Live transcript</h3>
@@ -178,12 +180,14 @@
   "version": 1,
   "remoteTranscription": {
     "enabled": true,
-    "endpoint": "https://asr.your-company.example/v1",
+    "endpoint": "https://mila-asr.your-org.example/v1",
     "model": "ivrit-ai/whisper-large-v3-turbo-ct2",
-    "apiKey": "YOUR_API_KEY"
+    "englishModel": "deepdml/faster-whisper-large-v3-turbo-ct2",
+    "apiKey": "YOUR_API_KEY_HERE"
   },
   "recordingLanguage": "he"
 }</code></pre>
+          <p class="config-note">From <a href="https://github.com/island-io/mila/blob/main/docs/self-hosted-server/example.milaconfig">example.milaconfig</a>: <code>model</code> serves Hebrew, <code>englishModel</code> serves English.</p>
         </figure>
       </div>
     </section>
@@ -193,7 +197,7 @@
         <h2 id="req-title">System requirements</h2>
         <dl class="reqs">
           <div><dt>macOS</dt><dd>macOS 14 Sonoma or later.</dd></div>
-          <div><dt>Mac</dt><dd>Apple Silicon (M-series) strongly recommended. Intel Macs work but transcribe on the CPU and are much slower.</dd></div>
+          <div><dt>Mac</dt><dd>Apple Silicon (M-series) strongly recommended. Intel Macs can transcribe, on the CPU and much more slowly, but speaker labels and voice recognition need Apple Silicon.</dd></div>
           <div><dt>Memory</dt><dd>16 GB recommended. 8 GB is workable for plain transcription.</dd></div>
           <div><dt>Disk</dt><dd>About 4.6 GB for the English and Hebrew models, downloaded on first launch. About 1 GB more for speaker labels.</dd></div>
         </dl>
