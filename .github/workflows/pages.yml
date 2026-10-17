@@ -1,0 +1,196 @@
+name: Website
+
+# Publishes site/ (the Mila one-pager) to GitHub Pages.
+#
+# GitHub Pages for this repo is served from the gh-pages BRANCH, and that
+# branch already carries the Sparkle update feed: the release pipeline commits
+# appcast.xml there, and every installed copy of Mila polls
+# https://island-io.github.io/mila/appcast.xml (SUFeedURL in project.yml).
+# So this workflow does not use the artifact-based Pages deploy
+# (configure-pages / upload-pages-artifact / deploy-pages): that needs Settings
+# -> Pages -> Source switched to "GitHub Actions", after which pushes to
+# gh-pages stop being served and the update feed would silently freeze.
+# Instead it copies site/ into gh-pages next to the feed and never touches the
+# feed's files. gh-pages therefore has two writers; see docs/website.md for
+# the rules both must follow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "scripts/check-site.py"
+      - ".github/workflows/pages.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "site/**"
+      - "scripts/check-site.py"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Pull requests: newer pushes cancel older checks. Publishes: one at a time,
+# never cancelled half-way through a push.
+concurrency:
+  group: website-${{ github.event_name == 'pull_request' && github.ref || 'publish' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            site
+            scripts
+          persist-credentials: false
+
+      # Regular files and directories only, no names reserved for gh-pages,
+      # and every local href/src/srcset/url() resolves inside site/.
+      - name: Check site/
+        run: python3 scripts/check-site.py site
+
+  publish:
+    needs: validate
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the site into the gh-pages branch
+    env:
+      # Absolute URLs in site/ (canonical, Open Graph, robots.txt, sitemap.xml)
+      # are written for the upstream repository. The copy step rewrites them:
+      # to the SITE_URL repository variable when set (a custom domain), and
+      # for a fork to that fork's own github.io address and repository.
+      UPSTREAM_REPO: island-io/mila
+      UPSTREAM_SITE_URL: https://island-io.github.io/mila/
+      SITE_URL: ${{ vars.SITE_URL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src
+          sparse-checkout: |
+            site
+            scripts
+          persist-credentials: false
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: gh-pages
+          path: pages
+          # Kept so the final step can push; nothing else runs in this job.
+          persist-credentials: true
+
+      - name: Copy site/ into gh-pages
+        run: |
+          set -euo pipefail
+          # Same checks as the validate job, re-run on exactly what is
+          # copied: after this, site/ holds only regular files and
+          # directories, and no reserved name.
+          python3 src/scripts/check-site.py src/site
+
+          # The manifest and the copy come from one list of regular files.
+          (cd src/site && find . -type f | sed 's|^\./||' | LC_ALL=C sort) > new-files
+
+          # Remove files a previous run published that site/ no longer has.
+          # Only names in our own manifest are candidates, so files other
+          # writers put on gh-pages are never deleted.
+          if [ -f pages/.site-files ]; then
+            LC_ALL=C sort pages/.site-files | LC_ALL=C comm -23 - new-files > stale-files
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              case "$f" in
+                appcast.xml|.nojekyll|CNAME|.site-files|.git|.git/*|*/.git/*|/*|*..*)
+                  echo "::error::refusing to delete $f"; exit 1 ;;
+              esac
+              rm -f -- "pages/$f"
+            done < stale-files
+          fi
+
+          (cd src/site && tar cf - --no-recursion -T ../../new-files) | (cd pages && tar xf -)
+          cp new-files pages/.site-files
+
+          # Literal (not regex) rewrite of the upstream URLs.
+          python3 - <<'PY'
+          import os, re, sys
+          repo = os.environ["GITHUB_REPOSITORY"]
+          upstream_repo = os.environ["UPSTREAM_REPO"]
+          upstream_url = os.environ["UPSTREAM_SITE_URL"]
+          site_url = os.environ.get("SITE_URL", "").strip()
+          if site_url:
+              site_url = site_url.rstrip("/") + "/"
+              if not re.fullmatch(r"https://[A-Za-z0-9.-]+(/[A-Za-z0-9._~-]+)*/", site_url):
+                  print("::error::SITE_URL must look like https://host/ or https://host/path/")
+                  sys.exit(1)
+          elif repo != upstream_repo:
+              owner, name = repo.split("/")
+              site_url = f"https://{owner.lower()}.github.io/{name}/"
+          else:
+              site_url = upstream_url
+          pairs = [(upstream_url, site_url)]
+          if repo != upstream_repo:
+              pairs += [
+                  (f"https://github.com/{upstream_repo}", f"https://github.com/{repo}"),
+                  (f'name="mila-repo" content="{upstream_repo}"', f'name="mila-repo" content="{repo}"'),
+              ]
+          for rel in open("new-files").read().splitlines():
+              if not rel.endswith((".html", ".xml", ".txt")):
+                  continue
+              path = os.path.join("pages", rel)
+              text = open(path, encoding="utf-8").read()
+              for old, new in pairs:
+                  text = text.replace(old, new)
+              open(path, "w", encoding="utf-8").write(text)
+          print(f"Site URL: {site_url}  Repository: {repo}")
+          PY
+
+      - name: Commit and push
+        working-directory: pages
+        run: |
+          set -euo pipefail
+          git config core.quotepath false
+          git add -A
+          if git diff --cached --quiet; then
+            echo "gh-pages already matches site/; nothing to publish."
+            exit 0
+          fi
+          git status --short
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "Publish website from ${GITHUB_SHA::12}"
+
+          # gh-pages has a second writer, the release pipeline (appcast.xml).
+          # Never force-push. If our push is rejected, rebase onto the new
+          # tip only when that is provably safe: the branch moved forward
+          # (not rewritten) and nothing it changed is a file we are writing.
+          # Anything else fails the job loudly for a human to look at.
+          # --no-renames: list both sides of a rename, so neither path can
+          # slip past the overlap check below.
+          git diff --no-renames --name-only HEAD~1 HEAD | LC_ALL=C sort > ../ours
+          base=$(git rev-parse HEAD~1)
+          for delay in 2 4 8 16 0; do
+            if git push origin HEAD:gh-pages; then exit 0; fi
+            if [ "$delay" = 0 ]; then
+              echo "::error::gh-pages push still rejected after retries; nothing was overwritten."
+              exit 1
+            fi
+            sleep "$delay"
+            git fetch -q origin gh-pages
+            upstream=$(git rev-parse FETCH_HEAD)
+            if ! git merge-base --is-ancestor "$base" "$upstream"; then
+              echo "::error::gh-pages was rewritten (force-push or rebuild) since this run checked it out. Refusing to publish on top of it; see docs/website.md."
+              exit 1
+            fi
+            git diff --no-renames --name-only "$base" "$upstream" | LC_ALL=C sort > ../theirs
+            if LC_ALL=C comm -12 ../ours ../theirs | grep .; then
+              echo "::error::Another writer changed the files listed above on gh-pages. Refusing to overwrite them."
+              exit 1
+            fi
+            git rebase -q "$upstream"
+            base=$upstream
+          done

@@ -33,6 +33,16 @@ import MilaKit
 /// The readiness half is late-bound by `MilaApp` (the store is constructed
 /// first) and re-consulted on every mirror, so it can never latch: it is
 /// recomputed, not remembered.
+///
+/// ## Writing files is a second, separate consent
+///
+/// `fileExportEnabled` (`mcp.fileExportEnabled`) lets `save_transcript`
+/// create files. It is off by default, independent of `enabled` — users who
+/// granted read access before the tool existed agreed to reads only — and
+/// meaningless without it: the mirror is `enabled && reachable &&
+/// fileExportEnabled`, and turning `enabled` off clears it so that turning
+/// reads back on later never silently restores writes. Revocation fails
+/// closed for each flag on its own (see `mirrorToDisk`).
 @MainActor
 final class MCPAccessSettings: ObservableObject {
 
@@ -43,6 +53,24 @@ final class MCPAccessSettings: ObservableObject {
             // already written defaults and must not recurse.
             guard !isReconcilingEnabled else { return }
             defaults.set(enabled, forKey: Keys.enabled)
+            if !enabled, fileExportEnabled {
+                // Write consent rides on read consent; withdrawing the one
+                // withdraws the other, in the same mirror.
+                isReconcilingEnabled = true
+                fileExportEnabled = false
+                isReconcilingEnabled = false
+                defaults.set(false, forKey: Keys.fileExportEnabled)
+            }
+            mirrorToDisk()
+        }
+    }
+
+    /// Whether `save_transcript` may write files. Shown, and meaningful, only
+    /// while `enabled` is on.
+    @Published var fileExportEnabled: Bool {
+        didSet {
+            guard !isReconcilingEnabled else { return }
+            defaults.set(fileExportEnabled, forKey: Keys.fileExportEnabled)
             mirrorToDisk()
         }
     }
@@ -58,9 +86,10 @@ final class MCPAccessSettings: ObservableObject {
     @Published private(set) var storeUnreachable: Bool = false
 
     /// Set when a revocation could not be carried out — the gate file could
-    /// be neither overwritten nor deleted, so it is still granting access.
-    /// The toggle is forced back ON in that case: an off switch that hasn't
-    /// actually turned anything off is the one state this UI must never show.
+    /// be neither overwritten nor deleted, so it is still granting access
+    /// (to reads, file writes, or both). The toggle concerned is forced back
+    /// ON in that case: an off switch that hasn't actually turned anything
+    /// off is the one state this UI must never show.
     @Published private(set) var revocationFailed: Bool = false
 
     private var isReconcilingEnabled = false
@@ -81,6 +110,7 @@ final class MCPAccessSettings: ObservableObject {
 
     enum Keys {
         static let enabled = "mcp.enabled"
+        static let fileExportEnabled = "mcp.fileExportEnabled"
     }
 
     init(defaults: UserDefaults = .standard,
@@ -93,6 +123,7 @@ final class MCPAccessSettings: ObservableObject {
         // default we want. Opt-in features shouldn't need a first-launch
         // special case.
         self.enabled = defaults.bool(forKey: Keys.enabled)
+        self.fileExportEnabled = defaults.bool(forKey: Keys.fileExportEnabled)
         mirrorToDisk()
     }
 
@@ -106,30 +137,38 @@ final class MCPAccessSettings: ObservableObject {
 
     private func mirrorToDisk() {
         let reachable = storeIsDiscoverable()
-        let desired = enabled && reachable
+        let desiredRead = enabled && reachable
+        let desiredWrite = desiredRead && fileExportEnabled
         do {
-            try MCPAccessGate.set(desired, root: root)
+            try MCPAccessGate.set(desiredRead, fileExport: desiredWrite, root: root)
             mirrorError = nil
             revocationFailed = false
         } catch {
             mirrorError = error.localizedDescription
-            // `MCPAccessGate.set(false, …)` only throws when it could neither
-            // overwrite nor delete the file — i.e. access is STILL granted.
-            // Failing to publish `true` is harmless by comparison (the gate
-            // keeps denying), so only the deny direction escalates here.
-            if !desired {
-                revocationFailed = true
+            // Judge the END STATE, per flag. `MCPAccessGate.set` throws both
+            // when a grant didn't land (harmless: the gate keeps denying) and
+            // when a revocation couldn't be carried out even by deleting the
+            // file (the gate is STILL granting). Only the second escalates,
+            // and reading the gate back is what tells them apart.
+            let stillReads = MCPAccessGate.isEnabled(root: root) && !desiredRead
+            let stillWrites = MCPAccessGate.isFileExportEnabled(root: root) && !desiredWrite
+            revocationFailed = stillReads || stillWrites
+            // The user turned something off and we couldn't make that true.
+            // Put the toggle back rather than let it claim otherwise.
+            isReconcilingEnabled = true
+            if stillReads, !enabled {
+                enabled = true
+                defaults.set(true, forKey: Keys.enabled)
+            }
+            if stillWrites, !fileExportEnabled {
                 if !enabled {
-                    // The user turned it off and we couldn't make that true.
-                    // Put the toggle back rather than let it claim otherwise.
-                    isReconcilingEnabled = true
                     enabled = true
-                    isReconcilingEnabled = false
                     defaults.set(true, forKey: Keys.enabled)
                 }
-            } else {
-                revocationFailed = false
+                fileExportEnabled = true
+                defaults.set(true, forKey: Keys.fileExportEnabled)
             }
+            isReconcilingEnabled = false
         }
         // After any reconciliation above, so it reflects the toggle the user
         // is actually looking at.
