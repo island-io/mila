@@ -1833,7 +1833,7 @@ struct MilaApp: App {
                 // Seed the embedding pool with known voices only when the
                 // user opted in. `seedEntries()` refuses on its own too, and
                 // while off it has nothing to hand over regardless (the
-                // profiles file is never parsed) — three independent reasons
+                // profiles file is never loaded) — three independent reasons
                 // an opted-out recording starts from a blank pool.
                 if voiceRecognitionSettings.isConfigured {
                     diarizer.seedPool(with: speakerProfileStore.seedEntries())
