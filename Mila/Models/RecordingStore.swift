@@ -51,6 +51,17 @@ final class RecordingStore: ObservableObject {
     /// those two agree.
     var onSpeakerIDAbsorbed: ((_ recordingID: UUID, _ sourceRawID: String, _ targetRawID: String) -> Void)?
 
+    /// Called after the user removed lines from a recording's transcript
+    /// ("Delete Segment(s)" / "End Conversation Here", island-io/mila#357),
+    /// with the row as it now stands. The recording's own files are already
+    /// rewritten by then; this is for copies of the transcript the store
+    /// does not own — in production the completed live sidecar
+    /// (`live/current.json`), which keeps the meeting's live lines on disk
+    /// until the next recording starts and is served to mila-mcp. Deleted
+    /// lines must not stay readable there
+    /// (`bugbot-rules/deleted-data-stays-deleted.md`).
+    var onTranscriptLinesRemoved: ((Recording) -> Void)?
+
     /// Emits the ids of recordings that were just permanently deleted, from
     /// both removal primitives — `permanentlyDelete(_:)` and `emptyTrash()`
     /// — after the rows have left `recordings`. Every caller that throws a
@@ -361,6 +372,13 @@ final class RecordingStore: ObservableObject {
         // first `await`, so it's atomic — otherwise the loser would delete
         // the winner's freshly-written .m4a in its stale-metadata branch
         // below, leaving the recording with no audio on disk.
+        // Nor overlap an "End Conversation Here" audio trim: this would read
+        // the untrimmed WAV and then swap the full-length audio back in. Not
+        // dropped, though — `trimAudio` re-runs it once the trim is done.
+        if trimmingAudioIDs.contains(id) {
+            compressionDeferredByTrim.insert(id)
+            return
+        }
         guard !compressingIDs.contains(id) else { return }
         compressingIDs.insert(id)
         defer { compressingIDs.remove(id) }
@@ -687,6 +705,15 @@ final class RecordingStore: ObservableObject {
     /// the store-owned `audioFileName` intact. Returns nil if the recording is
     /// gone.
     func prepareForRetranscription(id: UUID, language: String? = nil) -> Recording? {
+        // Not while "End Conversation Here" is still cutting this recording's
+        // audio (#357): the trim would give up on a `.pending` row and the
+        // pass would transcribe the FULL audio, writing the lines the user
+        // just removed straight back. Every UI entry point is disabled in
+        // that window; this is the chokepoint behind them.
+        guard !audioTrimPendingIDs.contains(id) else {
+            recStoreLog.log("re-transcription of \(id, privacy: .public) refused — an audio trim is in flight")
+            return nil
+        }
         guard let idx = recordings.firstIndex(where: { $0.id == id }) else { return nil }
         let before = recordings[idx]
         // Remember what the kept transcript looked like, so a stop
@@ -983,6 +1010,353 @@ final class RecordingStore: ObservableObject {
         if recordings[recIdx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[recIdx], in: recordingsDirectory)
         }
+    }
+
+    // MARK: - Transcript trimming (island-io/mila#357)
+
+    /// Whether the user may cut lines out of `recording`'s transcript now.
+    /// Not while a transcription pass is queued or running: that pass writes
+    /// its own segments back when it finishes, which would silently undo the
+    /// edit — and an "End Conversation Here" audio trim must not swap the
+    /// file out from under a pass that is reading it.
+    nonisolated static func canEditTranscript(_ recording: Recording) -> Bool {
+        recording.status != .pending && recording.status != .running
+            && !recording.segments.isEmpty
+    }
+
+    /// A "not now" for transcript edits that the row itself cannot show.
+    /// Wired in `MilaApp` to `TranscriptionService.isAwaitingSpeakerFinalization`:
+    /// after a live recording stops, `QuickActionsController.finalizeTail`
+    /// re-diarizes a stop-time COPY of the segments while the row already
+    /// reads `.completed`, then writes that copy back
+    /// (`applyRediarizedSpeakers`) along with an `.srt` — so lines deleted in
+    /// that window would come straight back. nil (tests, previews) blocks
+    /// nothing.
+    var isTranscriptEditBlocked: ((UUID) -> Bool)?
+
+    /// `canEditTranscript` plus the out-of-row blocker above. What both the
+    /// store's own guards and the detail view consult.
+    func canEditTranscriptNow(_ recording: Recording) -> Bool {
+        Self.canEditTranscript(recording) && !(isTranscriptEditBlocked?(recording.id) ?? false)
+    }
+
+    /// Remove the lines `segmentIDs` from a recording's transcript. Returns
+    /// the updated row, or nil when nothing changed (unknown recording, a
+    /// pass in flight, no matching line, or an edit that would empty the
+    /// transcript — see `Recording.removingSegments`), and also when
+    /// recordings.json could not be saved (`trimNotice` then says so).
+    ///
+    /// The audio is kept, so a later re-transcription brings the lines back;
+    /// the confirmation in the detail view says so.
+    @discardableResult
+    func deleteSegments(_ segmentIDs: Set<UUID>, recordingID: UUID) -> Recording? {
+        applyTranscriptEdit(recordingID: recordingID) { $0.removingSegments(segmentIDs) }
+    }
+
+    /// What "End Conversation Here" did: the row after the transcript edit
+    /// (and the audio trim, when one happened), and what became of the audio.
+    struct EndConversationResult {
+        let recording: Recording
+        let audio: AudioTrimOutcome
+    }
+
+    /// Remove every line after `segmentID` and cut the audio just past it
+    /// (`TranscriptTrim.audioCutTime`). The transcript edit lands before the
+    /// first suspension point, so the row and its sidecars are trimmed before
+    /// the audio work starts. A failed or skipped audio trim leaves the
+    /// original audio untouched — the transcript edit stands either way — and
+    /// is reported both in `audio` and through `trimNotice`, which the
+    /// main window shows even if the user has navigated away by then.
+    ///
+    /// Returns nil when the transcript edit did not happen (unknown
+    /// recording or line, the last line, or an edit that is blocked now).
+    @discardableResult
+    func endConversation(afterSegment segmentID: UUID, recordingID: UUID) async -> EndConversationResult? {
+        guard let live = recordings.first(where: { $0.id == recordingID }),
+              !audioTrimPendingIDs.contains(recordingID) else { return nil }
+        // From the transcript edit until the audio is cut, no re-transcription
+        // may start (`prepareForRetranscription`): it would read the full
+        // audio and bring the removed lines back. Published so the menus
+        // that offer Re-transcribe disable themselves for the duration.
+        audioTrimPendingIDs.insert(recordingID)
+        defer { audioTrimPendingIDs.remove(recordingID) }
+        // Resolved from the row BEFORE the edit removes the lines it is
+        // measured against. nil only for unusable timestamps; the transcript
+        // edit goes ahead regardless and the audio is reported as not cut.
+        let cut = TranscriptTrim.audioCutTime(endingAt: segmentID, in: live.segments)
+        guard let edited = applyTranscriptEdit(recordingID: recordingID,
+                                               { $0.endingConversation(at: segmentID) })
+        else { return nil }
+        let audio: AudioTrimOutcome
+        if let cut {
+            audio = await trimAudio(recordingID: recordingID, toSeconds: cut)
+        } else {
+            audio = .noCutPoint
+        }
+        if let problem = Self.audioTrimProblem(audio) {
+            trimNotice = problem
+        }
+        let current = recordings.first(where: { $0.id == recordingID }) ?? edited
+        return EndConversationResult(recording: current, audio: audio)
+    }
+
+    /// Set when "End Conversation Here" trimmed a transcript but not its
+    /// audio. Lives on the store, not the detail view, because the audio
+    /// work can outlive the view that started it; `ContentView` presents it
+    /// and clears it. Published once per trim, so it is no load on the App
+    /// scene (see the `@StateObject` note in CLAUDE.md).
+    @Published var trimNotice: String?
+
+    /// Recordings between an "End Conversation Here" transcript edit and the
+    /// end of its audio cut. See `endConversation`.
+    @Published private(set) var audioTrimPendingIDs: Set<UUID> = []
+
+    /// Recordings whose `.txt` sidecar could not be rewritten (nor removed)
+    /// after a transcript edit, so it may still hold removed lines.
+    /// `persist()` retries them on every later write until one lands.
+    private var transcriptRewritesPending: Set<UUID> = []
+
+    /// Bumped each time a recording's audio file is replaced in place by a
+    /// trim (same file name, shorter content), so a player holding the old
+    /// file open knows to reload. An explicit signal rather than a shrinking
+    /// `duration`, which a transcription pass also produces.
+    @Published private(set) var audioRevisions: [UUID: Int] = [:]
+
+    /// What to tell the user when the transcript was trimmed but the audio
+    /// was not; nil when there is nothing to report.
+    nonisolated static func audioTrimProblem(_ outcome: AudioTrimOutcome) -> String? {
+        switch outcome {
+        case .trimmed:
+            return nil
+        case .unsupported:
+            return "The transcript was trimmed, but this recording's audio file can't be trimmed, so the full audio is kept."
+        case .noCutPoint:
+            return "The transcript was trimmed, but the line's timing couldn't be used to find where to cut, so the full audio is kept."
+        case .audioEndsBeforeCut:
+            return "The transcript was trimmed, but the audio file ends before that point, so nothing was cut from it."
+        case .abandoned:
+            return "The transcript was trimmed, but the recording changed while its audio was being cut, so the full audio is kept."
+        case .failed:
+            return "The transcript was trimmed, but cutting the audio failed, so the full audio is kept."
+        }
+    }
+
+    /// Apply a pure transcript edit to the LIVE row — never to a snapshot a
+    /// view captured, which can carry a stale `audioFileName` (see
+    /// `prepareForRetranscription`) — and write everything derived from the
+    /// segments: `recordings.json` and the `.txt` sidecar (both via
+    /// `update`), the `.srt`, and copies outside the store
+    /// (`onTranscriptLinesRemoved`).
+    private func applyTranscriptEdit(recordingID: UUID,
+                                     _ edit: (Recording) -> Recording?) -> Recording? {
+        guard let live = recordings.first(where: { $0.id == recordingID }),
+              canEditTranscriptNow(live),
+              let edited = edit(live) else { return nil }
+        // `update` reports whether BOTH the `.txt` sidecar and
+        // recordings.json landed. The sidecar is what mila-mcp reads first
+        // (`MilaStoreReader.transcriptText`), so a write that failed there
+        // would leave the removed lines being served while the app shows
+        // them gone.
+        let saved = update(edited)
+        writeSRTIfCompleted(recordingID)
+        // Resolved again rather than handing `edited` on, so the hook sees
+        // exactly what the store holds.
+        guard let stored = recordings.first(where: { $0.id == recordingID }) else { return nil }
+        let durable = saved || settleUnsavedTranscriptEdit(stored)
+        recStoreLog.log("""
+            transcript edit on \(recordingID, privacy: .public): \
+            \(live.segments.count, privacy: .public) → \(stored.segments.count, privacy: .public) segments
+            """)
+        onTranscriptLinesRemoved?(stored)
+        // Not a success when recordings.json did not take it: the caller then
+        // skips what follows a saved edit (the audio cut, the summary
+        // refresh), and the user has already been told through `trimNotice`.
+        // A sidecar-only failure is NOT that case — the edit stands.
+        return durable ? stored : nil
+    }
+
+    /// `update` reported that the edit did not fully land. Find out which
+    /// half failed by retrying each, and return whether recordings.json —
+    /// the record of the edit itself — now holds it.
+    ///
+    /// The `.txt` sidecar is retried, then deleted if it cannot be written
+    /// (every reader — the app's `load`, mila-mcp's `MilaStoreReader` — then
+    /// rebuilds the text from the segments), and if even that fails it is
+    /// queued for a retry on every later `persist()`. The user is told only
+    /// when something is still wrong after the retries: recordings.json did
+    /// not save, or a stale sidecar is still on disk.
+    private func settleUnsavedTranscriptEdit(_ recording: Recording) -> Bool {
+        let url = transcriptURL(for: recording)
+        if !writeTranscript(for: recording) {
+            try? fileManager.removeItem(at: url)
+            if fileManager.fileExists(atPath: url.path) {
+                transcriptRewritesPending.insert(recording.id)
+            }
+        }
+        let persisted = persist()
+        let sidecarStale = transcriptRewritesPending.contains(recording.id)
+        if !persisted {
+            recStoreLog.error("transcript edit on \(recording.id, privacy: .public): recordings.json not saved")
+            trimNotice = "Mila removed the lines, but couldn't save the change to disk. Check that the recordings folder is available and has free space; until it saves, the lines may come back after Mila restarts."
+        } else if sidecarStale {
+            recStoreLog.error("transcript edit on \(recording.id, privacy: .public): .txt sidecar still stale")
+            trimNotice = "Mila removed the lines, but couldn't update the transcript's text file, so tools reading that file may still see them. Mila will keep retrying."
+        }
+        return persisted
+    }
+
+    /// `persist()`'s retry of sidecars `settleUnsavedTranscriptEdit` could
+    /// neither rewrite nor remove. Empty in the normal case.
+    private func retryPendingTranscriptRewrites() {
+        guard !transcriptRewritesPending.isEmpty else { return }
+        for id in transcriptRewritesPending {
+            guard let recording = recordings.first(where: { $0.id == id }) else {
+                transcriptRewritesPending.remove(id)
+                continue
+            }
+            if writeTranscript(for: recording) {
+                transcriptRewritesPending.remove(id)
+            }
+        }
+    }
+
+    /// What became of an audio trim. Every case but `.trimmed` leaves the
+    /// audio file exactly as it was.
+    enum AudioTrimOutcome: Equatable {
+        /// The audio now ends at `duration` seconds, and so does the row.
+        case trimmed(duration: Double)
+        /// No audio file, or a container this build does not rewrite
+        /// (`AudioTrimmer.supportedExtensions`).
+        case unsupported
+        /// The kept lines' timestamps gave no usable cut point.
+        case noCutPoint
+        /// The audio file, as decoded, already ends at or before the cut —
+        /// even though transcribed lines ran past it. Reported rather than
+        /// passed off as success: the user was told the audio would be cut.
+        case audioEndsBeforeCut
+        /// The row changed while the new file was being written — deleted,
+        /// a transcription pass queued, or its audio renamed by a
+        /// compression — so the result no longer describes it.
+        case abandoned
+        /// Reading or writing the audio failed.
+        case failed
+    }
+
+    /// Recordings with an audio trim in flight. Mutually exclusive with
+    /// `compressingIDs`: both replace the audio file, and whichever finished
+    /// second would put back what the first had removed.
+    private var trimmingAudioIDs: Set<UUID> = []
+
+    /// Whether `trimAudio` can rewrite this recording's audio at all — the
+    /// detail view words its confirmation on it.
+    func canTrimAudio(for recording: Recording) -> Bool {
+        let url = audioURL(for: recording)
+        return AudioTrimmer.supports(url) && fileManager.fileExists(atPath: url.path)
+    }
+
+    /// Cut a recording's audio at `seconds` and shorten its `duration` to
+    /// match. The trimmed audio is written to a hidden temporary file beside
+    /// the original — hidden so `recoverOrphanRecordings` (which skips hidden
+    /// files) can never resurrect a crash's leftover as a recording, and in
+    /// the same directory so the swap stays on one volume — and replaces the
+    /// original only once complete.
+    ///
+    /// A compression requested while the trim ran was turned away (the two
+    /// must not overlap); it is re-run here once the trim is done, so the
+    /// recording does not stay an uncompressed WAV until the next
+    /// "Compress existing recordings".
+    func trimAudio(recordingID: UUID, toSeconds seconds: Double) async -> AudioTrimOutcome {
+        let outcome = await performAudioTrim(recordingID: recordingID, toSeconds: seconds)
+        if compressionDeferredByTrim.remove(recordingID) != nil {
+            Task { [weak self] in await self?.compressRecordingAudio(id: recordingID) }
+        }
+        return outcome
+    }
+
+    /// Compressions that arrived while a trim held the audio file.
+    private var compressionDeferredByTrim: Set<UUID> = []
+
+    /// File-name prefix of the in-progress trim output. Hidden (leading dot)
+    /// so orphan recovery skips it; swept at load by
+    /// `removeAudioTrimLeftovers` in case a crash left one behind.
+    static let audioTrimTempPrefix = ".mila-trim-"
+
+    /// Delete trim outputs a crash or force-quit left in the recordings
+    /// folder. Nothing else writes files with this prefix, and no trim can
+    /// be in flight while the store is loading.
+    private func removeAudioTrimLeftovers() {
+        guard let names = try? fileManager.contentsOfDirectory(atPath: recordingsDirectory.path) else { return }
+        for name in names where name.hasPrefix(Self.audioTrimTempPrefix) {
+            try? fileManager.removeItem(at: recordingsDirectory.appendingPathComponent(name))
+        }
+    }
+
+    private func performAudioTrim(recordingID: UUID, toSeconds seconds: Double) async -> AudioTrimOutcome {
+        // A post-transcription compression may still be running (it starts
+        // when a pass completes). Let it land rather than refuse: the trim
+        // then works on the `.m4a` it produced. Bounded (~60 s), because a
+        // wait that never ends is worse than a reported failure.
+        var waits = 0
+        while compressingIDs.contains(recordingID), waits < 600 {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            waits += 1
+        }
+        guard !compressingIDs.contains(recordingID),
+              !trimmingAudioIDs.contains(recordingID) else { return .abandoned }
+        guard let rec = recordings.first(where: { $0.id == recordingID }),
+              rec.status != .pending, rec.status != .running,
+              !(isTranscriptEditBlocked?(recordingID) ?? false) else { return .abandoned }
+        guard canTrimAudio(for: rec) else { return .unsupported }
+        trimmingAudioIDs.insert(recordingID)
+        defer { trimmingAudioIDs.remove(recordingID) }
+
+        let source = audioURL(for: rec)
+        let temp = recordingsDirectory.appendingPathComponent(
+            "\(Self.audioTrimTempPrefix)\(UUID().uuidString).\(source.pathExtension)")
+        let written: Double
+        do {
+            guard let length = try await AudioTrimmer.writePrefix(of: source, seconds: seconds, to: temp) else {
+                return .audioEndsBeforeCut
+            }
+            written = length
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            logTrimFailure(recordingID, stage: "write", error)
+            return .failed
+        }
+        // Re-resolve after the off-main write: the row may have been deleted,
+        // re-queued for transcription, or had its audio renamed meanwhile.
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }),
+              recordings[idx].audioFileName == rec.audioFileName,
+              recordings[idx].status != .pending,
+              recordings[idx].status != .running else {
+            try? fileManager.removeItem(at: temp)
+            return .abandoned
+        }
+        do {
+            _ = try fileManager.replaceItemAt(source, withItemAt: temp)
+        } catch {
+            try? fileManager.removeItem(at: temp)
+            logTrimFailure(recordingID, stage: "replace", error)
+            return .failed
+        }
+        recordings[idx].duration = written
+        persist()
+        audioRevisions[recordingID, default: 0] += 1
+        recStoreLog.log("trimmed audio of \(recordingID, privacy: .public) to \(written, privacy: .public)s")
+        return .trimmed(duration: written)
+    }
+
+    /// The audio file name is title-derived and Cocoa quotes it (and its
+    /// folder) in `localizedDescription`, so only the domain and code are
+    /// public (`bugbot-rules/no-user-content-in-logs.md`).
+    private func logTrimFailure(_ recordingID: UUID, stage: String, _ error: Error) {
+        let ns = error as NSError
+        recStoreLog.error("""
+            audio trim \(stage, privacy: .public) failed for \(recordingID, privacy: .public) \
+            (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
+            \(error.localizedDescription, privacy: .private)
+            """)
     }
 
     /// Move a recording into a folder (or unfile it with nil). Auto-creates
@@ -1357,6 +1731,7 @@ final class RecordingStore: ObservableObject {
     }
 
     private func load() {
+        removeAudioTrimLeftovers()
         guard let data = try? Data(contentsOf: storeURL) else { return }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
@@ -1480,6 +1855,7 @@ final class RecordingStore: ObservableObject {
     /// contents — see `update(_:)` for why that has to be reportable.
     @discardableResult
     private func persist() -> Bool {
+        retryPendingTranscriptRewrites()
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
