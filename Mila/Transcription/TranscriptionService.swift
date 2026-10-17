@@ -698,10 +698,18 @@ final class TranscriptionService: ObservableObject {
     /// whole-WAV batch pass would re-key every speaker and drop the user's
     /// names, and re-transcribe lines the user deleted.
     ///
-    /// The first span that fails — the server unreachable, or refusing —
-    /// ends the attempt: every remaining span is returned unresolved without
-    /// its own upload, so an outage costs one request timeout, and a bad key
-    /// one refusal, not one per span.
+    /// A span is resolved only when the backend actually ANSWERED for its
+    /// audio — an empty answer for real audio is silence, and fine. A slice
+    /// that cannot be read, reads empty or reads as digital silence is a
+    /// mismatch between the span and the file, not proof there was nothing
+    /// said, so it stays unresolved (and visible) rather than being dropped.
+    ///
+    /// The first span the server cannot be REACHED for ends the attempt:
+    /// every remaining span is returned unresolved without its own upload, so
+    /// an outage costs one request timeout, not one per span. A refusal is
+    /// per span (a 500 on one slice says nothing about the next), so it keeps
+    /// that span and moves on — otherwise "Retry missing parts" would hit the
+    /// same bad span first, forever, and never reach the others.
     func transcribeSpans(_ spans: [UntranscribedSpan],
                          audioURL: URL,
                          language: String) async -> SpanTranscription {
@@ -709,7 +717,7 @@ final class TranscriptionService: ObservableObject {
         var unresolved: [UntranscribedSpan] = []
         var gaveUp = false
         for span in spans {
-            if gaveUp || cancellation.isStopped {
+            if gaveUp || cancellation.isStopped || !span.isValid {
                 unresolved.append(span)
                 continue
             }
@@ -725,11 +733,20 @@ final class TranscriptionService: ObservableObject {
                 unresolved.append(span)
                 continue
             }
-            // Nothing on disk for this span, or nothing audible in it: there
-            // is no speech to recover, and the silence guard in
+            // Nothing on disk for this span, or nothing audible in it. The
+            // live path only ever records spans of audio it heard, so this is
+            // the file and the span disagreeing — keep the gap visible rather
+            // than declaring it resolved. Not sent: the silence guard in
             // `transcribeLiveSegments` would raise the "no audio was
             // captured" alert for what is a perfectly good recording.
-            if samples.isEmpty || AudioSignal.isSilent(samples) { continue }
+            if samples.isEmpty || AudioSignal.isSilent(samples) {
+                serviceLog.error("""
+                    transcribeSpans: span \(span.start, privacy: .public)–\(span.end, privacy: .public)s \
+                    read \(samples.count, privacy: .public) samples with no signal — kept as missing
+                    """)
+                unresolved.append(span)
+                continue
+            }
             let duration = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
             let outcome = await transcribeLiveSegments(
                 samples: LiveTranscriber.paddedUtterance(samples),
@@ -745,9 +762,9 @@ final class TranscriptionService: ObservableObject {
                                                        end: span.start + min(seg.end, duration),
                                                        text: text))
                 }
-            case .skipped:
+            case .skipped, .failed:
                 unresolved.append(span)
-            case .failed, .connectionUnavailable:
+            case .connectionUnavailable:
                 unresolved.append(span)
                 gaveUp = true
             }

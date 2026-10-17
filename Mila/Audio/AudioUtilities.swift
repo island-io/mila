@@ -79,6 +79,8 @@ enum AudioConvert {
     /// Used to re-transcribe the spans the live path missed (#355). Clamped
     /// to the file; an empty range returns `[]`.
     static func loadAsWhisperSamples(url: URL, from start: TimeInterval, to end: TimeInterval) throws -> [Float] {
+        // A NaN or infinite bound would trap in the frame-count conversion.
+        guard start.isFinite, end.isFinite, end > start else { return [] }
         let file = try AVAudioFile(forReading: url)
         let rate = file.processingFormat.sampleRate
         let startFrame = min(file.length, AVAudioFramePosition((max(0, start) * rate).rounded(.down)))

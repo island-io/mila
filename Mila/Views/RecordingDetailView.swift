@@ -390,7 +390,10 @@ struct RecordingDetailView: View {
     /// unreachable (or refused it) during the recording and again when it was
     /// saved — and offers to transcribe just those parts now (#355).
     private var missingPartsNote: some View {
-        let seconds = Int(recording.untranscribedSeconds.rounded(.up))
+        // `untranscribedSeconds` sums only valid spans, so it is finite; the
+        // clamp keeps `Int(_:)` safe whatever a hand-edited store holds.
+        let total = recording.untranscribedSeconds
+        let seconds = total.isFinite ? Int(min(total, 24 * 60 * 60).rounded(.up)) : 0
         let isRetrying = transcription.spanRetryIDs.contains(recording.id)
         return HStack(spacing: 8) {
             Label {

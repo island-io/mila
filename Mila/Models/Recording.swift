@@ -49,7 +49,16 @@ struct UntranscribedSpan: Codable, Hashable, Sendable {
     var start: Double
     var end: Double
 
-    var duration: Double { max(0, end - start) }
+    /// Finite, non-negative and non-empty. recordings.json is user-editable
+    /// and synced; a NaN, infinite or inverted span would trap the first time
+    /// it is turned into a frame count or a displayed duration, so invalid
+    /// ones are dropped at decode and never written (`Recording.init(from:)`).
+    var isValid: Bool {
+        start.isFinite && end.isFinite && start >= 0 && end > start
+    }
+
+    /// Zero for an invalid span, so a sum over spans can never go NaN.
+    var duration: Double { isValid ? end - start : 0 }
 }
 
 struct Recording: Identifiable, Codable, Hashable {
@@ -428,7 +437,8 @@ struct Recording: Identifiable, Codable, Hashable {
         // `try?` for the same all-or-nothing reason: losing this costs only
         // the "Retry missing parts" note, never the library.
         let spans = try? c.decodeIfPresent([UntranscribedSpan].self, forKey: .untranscribedSpans)
-        self.untranscribedSpans = spans.flatMap { $0.isEmpty ? nil : $0 }
+        let validSpans = (spans ?? []).filter(\.isValid)
+        self.untranscribedSpans = validSpans.isEmpty ? nil : validSpans
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -466,8 +476,9 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
         try c.encodeIfPresent(transcriptionDeferredAt, forKey: .transcriptionDeferredAt)
         try c.encodeIfPresent(retranscriptionPriorState, forKey: .retranscriptionPriorState)
-        if let untranscribedSpans, !untranscribedSpans.isEmpty {
-            try c.encode(untranscribedSpans, forKey: .untranscribedSpans)
+        let validSpans = (untranscribedSpans ?? []).filter(\.isValid)
+        if !validSpans.isEmpty {
+            try c.encode(validSpans, forKey: .untranscribedSpans)
         }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }

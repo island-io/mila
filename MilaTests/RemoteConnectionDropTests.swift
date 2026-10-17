@@ -424,6 +424,70 @@ final class RemoteConnectionDropTests: XCTestCase {
         XCTAssertTrue(service.spanRetryIDs.isEmpty)
     }
 
+    func test_a_refused_span_does_not_block_the_ones_after_it() async throws {
+        let audioURL = store.freshAudioURL(suggestedName: "Refused")
+        try TestSupport.writeSineWav(at: audioURL, durationSeconds: 4)
+        let first = UntranscribedSpan(start: 0.5, end: 1.5)
+        let second = UntranscribedSpan(start: 2, end: 2.8)
+        let recording = Recording(
+            title: "Refused", duration: 4, source: .meeting,
+            audioFileName: audioURL.lastPathComponent, status: .completed, language: "en",
+            segments: [TranscriptSegment(start: 3, end: 4, text: "later")],
+            fullText: "later",
+            untranscribedSpans: [first, second])
+        store.add(recording)
+        await engine.failNextCall(with: RemoteWhisperEngine.RemoteError.http(status: 500, body: "bad slice"))
+
+        await service.retryUntranscribedSpans(of: recording.id)
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(row.untranscribedSpans, [first], "only the refused span is still missing")
+        XCTAssertEqual(row.segments.map(\.text), ["reply 2", "later"],
+                       "a refusal of one span must not stop the next from being filled")
+        let calls = await engine.transcribeCalls
+        XCTAssertEqual(calls, 2)
+    }
+
+    func test_a_span_with_no_audio_on_disk_stays_missing() async throws {
+        let audioURL = store.freshAudioURL(suggestedName: "Short")
+        try TestSupport.writeSineWav(at: audioURL, durationSeconds: 1)
+        // Past the end of the file: nothing can be read for it.
+        let beyond = UntranscribedSpan(start: 2, end: 3)
+        let recording = Recording(
+            title: "Short", duration: 1, source: .meeting,
+            audioFileName: audioURL.lastPathComponent, status: .completed, language: "en",
+            segments: [TranscriptSegment(start: 0, end: 1, text: "only")],
+            fullText: "only",
+            untranscribedSpans: [beyond])
+        store.add(recording)
+
+        await service.retryUntranscribedSpans(of: recording.id)
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(row.untranscribedSpans, [beyond],
+                       "an unreadable slice is not proof of silence — the gap must stay visible")
+        let calls = await engine.transcribeCalls
+        XCTAssertEqual(calls, 0, "nothing to send")
+    }
+
+    func test_invalid_spans_are_dropped_at_decode() throws {
+        let json = """
+        {"id":"\(UUID().uuidString)","title":"R","createdAt":0,"duration":1,"source":"microphone",
+         "audioFileName":"r.wav","status":"completed","language":"en","segments":[],
+         "untranscribedSpans":[{"start":2,"end":1},{"start":-1,"end":1},{"start":1,"end":2}]}
+        """
+        let decoded = try JSONDecoder().decode(Recording.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.untranscribedSpans, [UntranscribedSpan(start: 1, end: 2)],
+                       "inverted or negative spans would trap later; they must not survive decode")
+        XCTAssertFalse(UntranscribedSpan(start: .nan, end: 1).isValid)
+        XCTAssertFalse(UntranscribedSpan(start: 0, end: .infinity).isValid)
+        XCTAssertEqual(UntranscribedSpan(start: 0, end: .infinity).duration, 0)
+
+        let samples = try AudioConvert.loadAsWhisperSamples(
+            url: tempRoot.appendingPathComponent("missing.wav"), from: .nan, to: 1)
+        XCTAssertTrue(samples.isEmpty, "a non-finite bound is refused before touching the file")
+    }
+
     func test_untranscribed_spans_round_trip_and_are_omitted_when_empty() throws {
         var recording = Recording(title: "R", source: .microphone, audioFileName: "r.wav")
         let encoder = JSONEncoder()
@@ -473,10 +537,13 @@ final class RemoteConnectionDropTests: XCTestCase {
 /// produced which line.
 private actor FlakyRemoteEngine: RemoteTranscribing {
     private var failure: (any Error)?
+    /// Thrown by the next call only, then cleared — a refusal of one clip.
+    private var nextCallFailure: (any Error)?
     private(set) var transcribeCalls = 0
     private(set) var requestTimeouts: [TimeInterval] = []
 
     func setFailure(_ error: (any Error)?) { failure = error }
+    func failNextCall(with error: any Error) { nextCallFailure = error }
 
     func configure(_ config: RemoteTranscriptionConfig) async {}
     func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
@@ -498,6 +565,10 @@ private actor FlakyRemoteEngine: RemoteTranscribing {
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         transcribeCalls += 1
+        if let nextCallFailure {
+            self.nextCallFailure = nil
+            throw nextCallFailure
+        }
         if let failure { throw failure }
         return [TranscriptSegment(start: 0, end: 1, text: "reply \(transcribeCalls)")]
     }
