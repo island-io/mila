@@ -140,8 +140,11 @@ enum AudioConvert {
         guard start.isFinite, end.isFinite, end > start else { return [] }
         let file = try AVAudioFile(forReading: url)
         let rate = file.processingFormat.sampleRate
-        let startFrame = min(file.length, AVAudioFramePosition((max(0, start) * rate).rounded(.down)))
-        let endFrame = min(file.length, AVAudioFramePosition((max(0, end) * rate).rounded(.up)))
+        // Clamp in Double space BEFORE converting: a huge-but-finite bound
+        // (seconds × rate past Int64) would trap in the integer conversion.
+        let length = Double(file.length)
+        let startFrame = AVAudioFramePosition(min(length, max(0, start * rate).rounded(.down)))
+        let endFrame = AVAudioFramePosition(min(length, max(0, end * rate).rounded(.up)))
         guard endFrame > startFrame,
               let inputBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
                                                  frameCapacity: AVAudioFrameCount(endFrame - startFrame)) else {

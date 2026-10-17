@@ -69,7 +69,11 @@ struct UntranscribedSpan: Codable, Hashable, Sendable {
     /// ones are dropped at decode and never written (`Recording.init(from:)`).
     var isValid: Bool {
         start.isFinite && end.isFinite && start >= 0 && end > start
+            && end <= Self.maxSeconds
     }
+
+    /// No recording is longer than a day; anything past it is a corrupt row.
+    static let maxSeconds: Double = 24 * 60 * 60
 
     /// Zero for an invalid span, so a sum over spans can never go NaN.
     var duration: Double { isValid ? end - start : 0 }

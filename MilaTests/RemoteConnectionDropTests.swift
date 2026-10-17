@@ -496,6 +496,16 @@ final class RemoteConnectionDropTests: XCTestCase {
         let samples = try AudioConvert.loadAsWhisperSamples(
             url: tempRoot.appendingPathComponent("missing.wav"), from: .nan, to: 1)
         XCTAssertTrue(samples.isEmpty, "a non-finite bound is refused before touching the file")
+
+        XCTAssertFalse(UntranscribedSpan(start: 0, end: 1e300).isValid, "past a day is a corrupt row")
+        // Huge but finite bounds must clamp to the file, not trap converting
+        // seconds × sample rate to a frame index.
+        let wav = store.freshAudioURL(suggestedName: "Huge")
+        try TestSupport.writeSineWav(at: wav, durationSeconds: 1)
+        let tail = try AudioConvert.loadAsWhisperSamples(url: wav, from: 0.5, to: 1e300)
+        XCTAssertEqual(tail.count, 8_000, "clamped to the end of the 1 s file")
+        let beyond = try AudioConvert.loadAsWhisperSamples(url: wav, from: 1e300, to: 2e300)
+        XCTAssertTrue(beyond.isEmpty)
     }
 
     func test_untranscribed_spans_round_trip_and_are_omitted_when_empty() throws {
