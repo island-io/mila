@@ -328,56 +328,156 @@ final class TranscriptTrimTests: XCTestCase {
         XCTAssertEqual(result.recording.segments.count, 1)
         XCTAssertEqual(result.recording.duration, rec.duration,
                        "the audio was not cut, so the duration must not claim it was")
-        XCTAssertNotNil(RecordingDetailView.audioTrimProblem(result.audio),
-                        "the user is told the audio was kept")
+        XCTAssertNotNil(RecordingStore.audioTrimProblem(result.audio))
+        XCTAssertNotNil(store.audioTrimNotice,
+                        "the user is told the audio was kept, through the store so it survives navigation")
     }
 
-    // MARK: - Completed live snapshot
+    func test_end_conversation_with_unusable_timings_still_trims_the_transcript() async throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        // Zero-length timings (as a hand-edited or degenerate store can hold)
+        // give no cut point.
+        let segs = [TranscriptSegment(start: 0, end: 0, text: "kept"),
+                    TranscriptSegment(start: 0, end: 0, text: "dropped")]
+        let rec = recording(segments: segs)
+        store.add(rec)
 
-    func test_completed_live_snapshot_loses_the_deleted_lines() throws {
-        let writer = LiveTranscriptSidecarWriter(root: tempRoot, minWriteInterval: 0)
+        let outcome = await store.endConversation(afterSegment: segs[0].id, recordingID: rec.id)
+        let result = try XCTUnwrap(outcome, "the transcript edit must not depend on the audio cut")
+
+        XCTAssertEqual(result.recording.segments.map(\.text), ["kept"])
+        XCTAssertEqual(result.audio, .noCutPoint)
+        XCTAssertNotNil(store.audioTrimNotice)
+    }
+
+    func test_end_conversation_reports_audio_that_ends_before_the_cut() async throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
         let segs = fourLines()
+        let rec = recording(segments: segs)
+        // Two seconds of audio under eight seconds of lines.
+        try TestSupport.writeSineWav(at: store.recordingsDirectory.appendingPathComponent(rec.audioFileName),
+                                     durationSeconds: 2)
+        store.add(rec)
+
+        let outcome = await store.endConversation(afterSegment: segs[1].id, recordingID: rec.id)
+        let result = try XCTUnwrap(outcome)
+
+        XCTAssertEqual(result.audio, .audioEndsBeforeCut,
+                       "the user was promised a cut; nothing happening must not read as success")
+        XCTAssertNotNil(store.audioTrimNotice)
+        XCTAssertNil(store.audioRevisions[rec.id], "the file was not replaced, so players need not reload")
+        assertNoTrimLeftovers(in: store.recordingsDirectory)
+    }
+
+    func test_successful_trim_bumps_the_audio_revision_only() async throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let segs = fourLines()
+        let rec = recording(segments: segs)
+        try TestSupport.writeSineWav(at: store.recordingsDirectory.appendingPathComponent(rec.audioFileName),
+                                     durationSeconds: 8)
+        store.add(rec)
+
+        _ = await store.endConversation(afterSegment: segs[2].id, recordingID: rec.id)
+
+        XCTAssertEqual(store.audioRevisions[rec.id], 1)
+        XCTAssertNil(store.audioTrimNotice)
+    }
+
+    // MARK: - Post-stop speaker finalization
+
+    /// After a live recording stops, `finalizeTail` re-diarizes a stop-time
+    /// copy of the segments while the row already reads `.completed`, then
+    /// writes that copy back — so an edit in that window would be undone.
+    func test_edits_are_refused_while_speaker_finalization_is_pending() async throws {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let segs = fourLines()
+        let rec = recording(segments: segs)
+        store.add(rec)
+        var pending: Set<UUID> = [rec.id]
+        store.isTranscriptEditBlocked = { pending.contains($0) }
+
+        XCTAssertFalse(store.canEditTranscriptNow(rec))
+        XCTAssertNil(store.deleteSegments([segs[0].id], recordingID: rec.id))
+        let ended = await store.endConversation(afterSegment: segs[0].id, recordingID: rec.id)
+        XCTAssertNil(ended)
+        XCTAssertEqual(store.recordings.first?.segments.count, 4)
+
+        pending.removeAll()
+        XCTAssertTrue(store.canEditTranscriptNow(rec))
+        XCTAssertNotNil(store.deleteSegments([segs[0].id], recordingID: rec.id))
+    }
+
+    // MARK: - Crash leftovers
+
+    func test_trim_leftovers_are_swept_at_load() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        let leftover = first.recordingsDirectory
+            .appendingPathComponent("\(RecordingStore.audioTrimTempPrefix)\(UUID().uuidString).wav")
+        try TestSupport.writeSineWav(at: leftover, durationSeconds: 1)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: leftover.path))
+        XCTAssertTrue(relaunched.recordings.isEmpty)
+    }
+
+    // MARK: - Retained live snapshot lines
+
+    func test_completed_live_snapshot_drops_its_lines_after_an_edit() throws {
+        let writer = LiveTranscriptSidecarWriter(root: tempRoot, minWriteInterval: 0)
         let recordingID = UUID()
         writer.begin(title: nil, source: "meeting", liveAvailable: true)
-        writer.update(segments: segs, speakerNames: [:])
+        writer.update(segments: fourLines(), speakerNames: ["SPEAKER_00": "Dana"])
         writer.finish(recordingID: recordingID)
         let before = try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot))
 
-        writer.replaceCompletedTranscript(forRecording: recordingID,
-                                          segments: Array(segs.prefix(2)),
-                                          speakerNames: [:])
+        writer.dropRetainedLines(afterEditOf: recordingID)
 
         let after = try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot))
-        XCTAssertEqual(after.segments.map(\.text), [" one", " two"])
-        XCTAssertEqual(after.revision, before.revision + 1)
-        XCTAssertEqual(after.segmentsRemovedAtRevision, after.revision,
-                       "pollers holding the removed lines must be sent the full set")
-        XCTAssertEqual(after.finalRecordingID, recordingID)
+        XCTAssertTrue(after.segments.isEmpty, "the deleted text must not stay on disk")
+        XCTAssertTrue(after.speakerNames.isEmpty)
         XCTAssertEqual(after.state, .completed)
+        XCTAssertEqual(after.finalRecordingID, recordingID, "the handoff is untouched")
+        XCTAssertEqual(after.revision, before.revision, "nothing a poller reads changed")
     }
 
-    func test_live_snapshot_of_another_recording_is_left_alone() throws {
+    func test_completed_live_snapshot_of_another_recording_is_left_alone() throws {
         let writer = LiveTranscriptSidecarWriter(root: tempRoot, minWriteInterval: 0)
-        let segs = fourLines()
         writer.begin(title: nil, source: "meeting", liveAvailable: true)
-        writer.update(segments: segs, speakerNames: [:])
+        writer.update(segments: fourLines(), speakerNames: [:])
         writer.finish(recordingID: UUID())
-        let before = try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot))
 
-        writer.replaceCompletedTranscript(forRecording: UUID(), segments: [], speakerNames: [:])
+        writer.dropRetainedLines(afterEditOf: UUID())
+
+        XCTAssertEqual(try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot)).segments.count, 4)
+    }
+
+    func test_interrupted_live_snapshot_drops_its_lines_after_any_edit() throws {
+        // What a crash mid-meeting leaves: a `recording` snapshot nobody
+        // closed. Written directly — a live writer would keep heartbeating.
+        let lines = fourLines().map {
+            LiveTranscriptSnapshot.Segment(start: $0.start, end: $0.end, text: $0.text, speaker: $0.speaker)
+        }
+        try LiveTranscriptSnapshot(recordingStartedAt: Date(), updatedAt: Date(), segments: lines)
+            .write(root: tempRoot)
+        // Next launch: the leftover `recording` snapshot becomes `interrupted`.
+        let relaunched = LiveTranscriptSidecarWriter(root: tempRoot, minWriteInterval: 0)
+        relaunched.cleanupAtLaunch()
+        XCTAssertEqual(try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot)).state, .interrupted)
+
+        relaunched.dropRetainedLines(afterEditOf: UUID())
 
         let after = try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot))
-        XCTAssertEqual(after.revision, before.revision)
-        XCTAssertEqual(after.segments.count, 4)
+        XCTAssertEqual(after.state, .interrupted)
+        XCTAssertTrue(after.segments.isEmpty)
     }
 
     func test_live_snapshot_of_a_recording_in_progress_is_left_alone() throws {
         let writer = LiveTranscriptSidecarWriter(root: tempRoot, minWriteInterval: 0)
-        let segs = fourLines()
         writer.begin(title: nil, source: "meeting", liveAvailable: true)
-        writer.update(segments: segs, speakerNames: [:])
+        writer.update(segments: fourLines(), speakerNames: [:])
 
-        writer.replaceCompletedTranscript(forRecording: UUID(), segments: [], speakerNames: [:])
+        writer.dropRetainedLines(afterEditOf: UUID())
 
         let after = try XCTUnwrap(LiveTranscriptSnapshot.read(root: tempRoot))
         XCTAssertEqual(after.state, .recording)

@@ -38,11 +38,19 @@ enum AudioTrimmer {
     /// the caller moves the file into place.
     private static func writePrefixSync(of source: URL, seconds: Double, to destination: URL) throws -> Double? {
         guard supports(source), seconds.isFinite, seconds > 0 else { throw TrimError.unsupportedFormat }
+        // A WAV recovered after a crash can still carry an unfinalized header
+        // (`data` size 0), which AVAudioFile reads as an empty file — the cut
+        // would then look like "nothing to trim". Repair it first, as the
+        // launch recovery sweep does; a finalized header is left untouched.
+        if source.pathExtension.lowercased() == "wav" {
+            _ = WAVHeaderRepair.repairIfNeeded(at: source)
+        }
         let input = try AVAudioFile(forReading: source)
         let format = input.processingFormat
         guard format.sampleRate > 0 else { throw TrimError.unsupportedFormat }
         let requested = (seconds * format.sampleRate).rounded(.down)
-        // Nothing to cut: the audio already ends at or before `seconds`.
+        // The audio, as decoded, already ends at or before `seconds`. The
+        // caller reports this to the user rather than treating it as done.
         guard requested < Double(input.length) else { return nil }
         let endFrame = AVAudioFramePosition(requested)
 

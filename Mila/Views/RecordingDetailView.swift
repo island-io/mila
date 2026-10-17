@@ -48,9 +48,6 @@ struct RecordingDetailView: View {
     /// A trim the user asked for and has not yet confirmed. Like a merge,
     /// it is destructive and has no undo, so it is always confirmed.
     @State private var pendingTrim: PendingTranscriptEdit?
-    /// Set when "End Conversation Here" trimmed the transcript but could not
-    /// trim the audio, so the user is told rather than left assuming it did.
-    @State private var audioTrimProblem: String?
 
     @FocusState private var titleFieldFocused: Bool
 
@@ -101,14 +98,6 @@ struct RecordingDetailView: View {
                 // user with a blank window. Reproduced via accessibility
                 // tree inspection.
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .alert("Audio not trimmed",
-                       isPresented: Binding(get: { audioTrimProblem != nil },
-                                            set: { if !$0 { audioTrimProblem = nil } }),
-                       presenting: audioTrimProblem) { _ in
-                    Button("OK", role: .cancel) { audioTrimProblem = nil }
-                } message: { problem in
-                    Text(problem)
-                }
             Divider()
             playbackBar
         }
@@ -123,10 +112,11 @@ struct RecordingDetailView: View {
         // is gone.
         .onChange(of: recording.audioFileName) { _, _ in configurePlayer() }
         // "End Conversation Here" swaps in a shorter audio file under the SAME
-        // name, and the player still holds the old one open. A shorter
-        // duration is the signal; re-point the player at the trimmed file.
-        .onChange(of: recording.duration) { old, new in
-            guard new < old else { return }
+        // name, and the player still holds the old one open. The store bumps
+        // an explicit per-recording revision for exactly that swap — not
+        // `duration`, which a transcription pass also changes — so re-point
+        // the player at the trimmed file only then.
+        .onChange(of: store.audioRevisions[recording.id] ?? 0) { _, _ in
             configurePlayer()
             currentTime = 0
         }
@@ -550,10 +540,14 @@ struct RecordingDetailView: View {
                             // One active id per render drives BOTH the highlight and
                             // the scroll target, so they can never disagree.
                             let activeID = activeSegmentID
-                            // Hoisted for the same reason: read once per render,
-                            // not once per row's context menu.
-                            let canTrim = canEditTranscript
-                            let lastID = recording.segments.last?.id
+                            // Hoisted for the same reason: the row menus below
+                            // are built on every render (≈30 Hz during
+                            // playback), so each one may only do O(1) work.
+                            let rowMenu = RowMenuContext(
+                                canTrim: canEditTranscript,
+                                lastID: recording.segments.last?.id,
+                                lineCount: recording.segments.count,
+                                selectionCount: selection.ids.count)
                             ForEach(recording.segments) { seg in
                                 SegmentRow(segment: seg,
                                            isActive: seg.id == activeID,
@@ -612,8 +606,7 @@ struct RecordingDetailView: View {
                                 // lands on a line, so it repeats that menu's
                                 // entries too.
                                 .contextMenu {
-                                    segmentContextMenu(for: seg, canTrim: canTrim,
-                                                       isLast: seg.id == lastID)
+                                    segmentContextMenu(for: seg.id, context: rowMenu)
                                 }
                             }
                         }
@@ -641,14 +634,7 @@ struct RecordingDetailView: View {
                                      (recording.transcriptLanguage == "he" || recording.fullText.isPredominantlyHebrew)
                                      ? .rightToLeft : .leftToRight)
                     }
-                    .contextMenu {
-                        let other = RecordingLanguage.fromCode(recording.language).other
-                        Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
-                            retranscribe(in: other)
-                        }
-                        Button("Copy transcript") { copyTranscript() }
-                            .disabled(recording.fullText.isEmpty)
-                    }
+                    .contextMenu { transcriptMenuItems }
                     .coordinateSpace(name: Self.transcriptSpace)
                     .onPreferenceChange(ActiveRowFrameKey.self) { rect in
                         // Written to the coordinator, not @State: this fires on
@@ -755,10 +741,25 @@ struct RecordingDetailView: View {
     // MARK: - Transcript selection and trimming (#357)
 
     /// Whether the transcript can be trimmed right now: not while a
-    /// transcription pass is queued or running for it (its result would put
-    /// the lines back), and only with lines to trim.
+    /// transcription pass is queued or running for it, nor while the
+    /// post-stop speaker pass is still to write its labels back — either
+    /// would put the deleted lines back — and only with lines to trim.
+    /// `isAwaitingSpeakerFinalization` is read here (not only through the
+    /// store's blocker) so the published marker re-renders the menus when
+    /// it clears.
     private var canEditTranscript: Bool {
-        !isTranscriptionBusy && RecordingStore.canEditTranscript(recording)
+        !isTranscriptionBusy
+            && !transcription.isAwaitingSpeakerFinalization(recording.id)
+            && store.canEditTranscriptNow(recording)
+    }
+
+    /// Everything a row's context menu needs that is the same for every row,
+    /// resolved once per render.
+    struct RowMenuContext {
+        let canTrim: Bool
+        let lastID: TranscriptSegment.ID?
+        let lineCount: Int
+        let selectionCount: Int
     }
 
     /// Click = select this line (and, as before, seek to it); shift-click =
@@ -788,21 +789,37 @@ struct RecordingDetailView: View {
         selection = selection.pruned(to: recording.segments.map(\.id))
     }
 
+    /// A line's context menu. Built on every render for every loaded row, so
+    /// it does only O(1) work here: the deletion target (a set) is resolved
+    /// inside the action, when the item is actually picked.
     @ViewBuilder
-    private func segmentContextMenu(for seg: TranscriptSegment, canTrim: Bool, isLast: Bool) -> some View {
-        let target = selection.deletionTarget(forContextClickOn: seg.id)
-        let deleteLabel: String = target.count > 1 ? "Delete \(target.count) Segments" : "Delete Segment"
-        Button("End Conversation Here") { requestEndConversation(after: seg.id) }
-            .disabled(!canTrim || isLast)
+    private func segmentContextMenu(for segmentID: TranscriptSegment.ID,
+                                    context: RowMenuContext) -> some View {
+        // Right-clicking a line inside the selection acts on the selection;
+        // any other line acts on itself (`deletionTarget`).
+        let count = selection.contains(segmentID) ? context.selectionCount : 1
+        let deleteLabel: String = count > 1 ? "Delete \(count) Segments" : "Delete Segment"
+        Button("End Conversation Here") { requestEndConversation(after: segmentID) }
+            .disabled(!context.canTrim || segmentID == context.lastID)
         Button(deleteLabel) {
-            requestDelete(target)
+            requestDelete(selection.deletionTarget(forContextClickOn: segmentID))
         }
-        .disabled(!canTrim || target.count >= recording.segments.count)
+        .disabled(!context.canTrim || count >= context.lineCount)
         Divider()
+        transcriptMenuItems
+    }
+
+    /// The transcript-wide entries, shared by the menu on the transcript's
+    /// background and every line's menu (which replaces it under the
+    /// pointer). Re-transcribe is gated on a pass being queued or running,
+    /// as the header's Re-transcribe menu is.
+    @ViewBuilder
+    private var transcriptMenuItems: some View {
         let other = RecordingLanguage.fromCode(recording.language).other
         Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
             retranscribe(in: other)
         }
+        .disabled(isTranscriptionBusy)
         Button("Copy transcript") { copyTranscript() }
             .disabled(recording.fullText.isEmpty)
     }
@@ -875,29 +892,14 @@ struct RecordingDetailView: View {
             if regenerate { summarizer.regenerate(updated) }
         case .endHere(let segmentID, _):
             selection = TranscriptSelection()
+            // Touches no view state, so it is safe to outlive this view. An
+            // audio cut that did not happen is reported by the store itself
+            // (`audioTrimNotice`, shown by ContentView), not from here.
             Task { @MainActor in
                 guard let result = await store.endConversation(afterSegment: segmentID,
                                                                recordingID: recordingID) else { return }
                 if regenerate { summarizer.regenerate(result.recording) }
-                if let problem = Self.audioTrimProblem(result.audio) {
-                    audioTrimProblem = problem
-                }
             }
-        }
-    }
-
-    /// What to tell the user when the transcript was trimmed but the audio
-    /// was not; nil when there is nothing to report.
-    static func audioTrimProblem(_ outcome: RecordingStore.AudioTrimOutcome) -> String? {
-        switch outcome {
-        case .trimmed, .unchanged:
-            return nil
-        case .unsupported:
-            return "The transcript was trimmed, but this recording's audio format can't be trimmed, so the full audio is kept."
-        case .abandoned:
-            return "The transcript was trimmed, but the recording changed while its audio was being cut, so the full audio is kept."
-        case .failed:
-            return "The transcript was trimmed, but cutting the audio failed, so the full audio is kept."
         }
     }
 

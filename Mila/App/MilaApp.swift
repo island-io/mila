@@ -627,9 +627,12 @@ struct MilaApp: App {
         // readable in the completed live snapshot mila-mcp serves; a no-op
         // unless that snapshot is this recording's.
         store.onTranscriptLinesRemoved = { [weak sidecarWriter] rec in
-            sidecarWriter?.replaceCompletedTranscript(forRecording: rec.id,
-                                                      segments: rec.segments,
-                                                      speakerNames: rec.speakerNames)
+            sidecarWriter?.dropRetainedLines(afterEditOf: rec.id)
+        }
+        // The post-stop speaker pass writes a stop-time copy of the segments
+        // back when it finishes, so a trim must wait for it (#357).
+        store.isTranscriptEditBlocked = { [weak svc] id in
+            svc?.isAwaitingSpeakerFinalization(id) ?? false
         }
         svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
             // A recording whose live transcript wasn't final closed its live
