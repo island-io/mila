@@ -551,10 +551,12 @@ final class SpeakerNameSuggester {
                 var from = found.lowerBound
                 while let range = padded.range(of: needle, range: from..<padded.endIndex) {
                     let before = padded[..<range.lowerBound].split(separator: " ").last.map { String($0) }
-                    let after = padded[range.upperBound...].split(separator: " ").first.map { String($0) }
+                    // Two words after: enough to see past a last name the
+                    // quote stopped short of ("I'm Dana" | "Cohen's manager").
+                    let after = padded[range.upperBound...].split(separator: " ").prefix(2).map { String($0) }
                     let words = [before].compactMap { $0 }
                         + normalizedQuote.split(separator: " ").map(String.init)
-                        + [after].compactMap { $0 }
+                        + after
                     if statesOwnName(words: words, name: name) { return true }
                     from = padded.index(after: range.lowerBound)
                 }
@@ -577,24 +579,31 @@ final class SpeakerNameSuggester {
         "היי", "הי", "שלום", "כן", "אז", "טוב", "זה", "זו", "בוקר", "ערב", "לכולם",
     ]
 
-    /// Whether `words` (normalized, one word of the turn's own context on
-    /// each side of the quote) state `name` as the speaker's own. Stricter
+    /// Whether `words` (normalized, the turn's own context around the
+    /// quote: one word before, two after) state `name` as the speaker's own. Stricter
     /// than `isSelfIntroduction`, which sees only the quote: "my name is
     /// Dana" must not go on into a possessive ("I'm Dana's manager" is
     /// "i m dana s manager" once normalized), and "Dana here" must open the
     /// sentence or follow a greeting.
     static func statesOwnName(words: [String], name: String) -> Bool {
         let prefixes = selfIntroductionPrefixes.map { $0.split(separator: " ").map(String.init) }
+        let nameWords = Set(normalizedForMatching(name).split(separator: " ").map(String.init))
         for variant in nameVariants(name) {
             let v = variant.split(separator: " ").map(String.init)
             guard !v.isEmpty, words.count >= v.count else { continue }
             for start in 0...(words.count - v.count) where Array(words[start..<start + v.count]) == v {
                 let before = Array(words[..<start])
                 let after = start + v.count < words.count ? words[start + v.count] : nil
+                // The first word past the rest of the name: "Dana" in
+                // "i m dana cohen s manager" is followed by "cohen", and the
+                // possessive comes after that.
+                var end = start + v.count
+                while end < words.count, nameWords.contains(words[end]) { end += 1 }
+                let afterName = end < words.count ? words[end] : nil
                 let prefixed = prefixes.contains { p in
                     before.count >= p.count && Array(before.suffix(p.count)) == p
                 }
-                if prefixed, after != "s" { return true }
+                if prefixed, afterName != "s" { return true }
                 if let after, selfIntroductionSuffixes.contains(after),
                    before.last.map({ introductionLeadIns.contains($0) }) ?? true {
                     return true

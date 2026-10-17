@@ -320,6 +320,22 @@ final class SpeakerNameSuggestionTests: XCTestCase {
         XCTAssertEqual(suggest("Sorry, I'm Dana, I'm late.", "I'm Dana"), ["SPEAKER_00"])
     }
 
+    func test_a_possessive_after_the_last_name_is_not_an_introduction() {
+        func suggest(_ line: String, _ name: String, _ quote: String) -> [String] {
+            let turns = [SpeakerNameSuggester.Turn(speaker: "SPEAKER_00", text: line),
+                         SpeakerNameSuggester.Turn(speaker: "SPEAKER_01", text: "OK.")]
+            let raw = #"{"speakers": [{"speaker": "SPEAKER_00", "name": "\#(name)", "quote": "\#(quote)"}]}"#
+            return SpeakerNameSuggester.parseSuggestions(from: raw,
+                                                         unnamedSpeakers: ["SPEAKER_00", "SPEAKER_01"],
+                                                         turns: turns).map(\.speaker)
+        }
+        XCTAssertEqual(suggest("I'm Dana Cohen's manager.", "Dana Cohen", "I'm Dana Cohen"), [])
+        XCTAssertEqual(suggest("I'm Dana Cohen's manager.", "Dana Cohen", "I'm Dana"), [],
+                       "the quote stops short of the last name")
+        XCTAssertEqual(suggest("Hi, I'm Dana Cohen from sales.", "Dana Cohen", "I'm Dana Cohen"),
+                       ["SPEAKER_00"])
+    }
+
     func test_mentioning_a_name_before_a_comma_does_not_address_it() {
         XCTAssertFalse(SpeakerNameSuggester.addressesByName(quote: "I told Dana, it's fine", name: "Dana"))
         XCTAssertFalse(SpeakerNameSuggester.addressesByName(quote: "Ask Dana, she knows", name: "Dana"))
