@@ -635,8 +635,11 @@ final class SpeakerNameSuggester {
     /// collapsed to one space, trimmed. Used ONLY to compare a quote against
     /// the transcript — never stored or shown.
     nonisolated static func normalizedForMatching(_ text: String) -> String {
+        // A fixed POSIX locale, never the user's: a locale-sensitive fold
+        // (Turkish dotted/dotless i) would turn "I'm Dana" into something
+        // the English self-introduction patterns no longer match.
         let folded = text.folding(options: [.caseInsensitive, .diacriticInsensitive],
-                                  locale: nil)
+                                  locale: Locale(identifier: "en_US_POSIX"))
         var out = ""
         out.reserveCapacity(folded.count)
         var pendingSpace = false

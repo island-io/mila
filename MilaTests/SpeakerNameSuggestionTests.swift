@@ -277,6 +277,12 @@ final class SpeakerNameSuggestionTests: XCTestCase {
                        "the speaker who said it was talking TO Dana")
     }
 
+    func test_normalizing_is_locale_independent() {
+        XCTAssertEqual(SpeakerNameSuggester.normalizedForMatching("I'M DANA!"), "i m dana")
+        XCTAssertEqual(SpeakerNameSuggester.normalizedForMatching("I\u{2019}m  Dana"), "i m dana")
+        XCTAssertEqual(SpeakerNameSuggester.normalizedForMatching("קוראים לי דנה."), "קוראים לי דנה")
+    }
+
     func test_self_introduction_and_address_patterns() {
         func intro(_ quote: String, _ name: String) -> Bool {
             SpeakerNameSuggester.isSelfIntroduction(
