@@ -30,6 +30,14 @@ final class MeetingDetectionSettings: ObservableObject {
             defaults.set(joined, forKey: Keys.disabledBundleIDs)
         }
     }
+    /// Apps that auto-start/stop recording with a countdown prompt
+    /// instead of waiting for user action.
+    @Published private(set) var autoStartBundleIDs: Set<String> {
+        didSet {
+            let joined = autoStartBundleIDs.sorted().joined(separator: ",")
+            defaults.set(joined, forKey: Keys.autoStartBundleIDs)
+        }
+    }
 
     private let defaults: UserDefaults
 
@@ -44,6 +52,10 @@ final class MeetingDetectionSettings: ObservableObject {
         let raw = defaults.string(forKey: Keys.disabledBundleIDs) ?? ""
         self.disabledBundleIDs = Set(
             raw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
+        )
+        let autoRaw = defaults.string(forKey: Keys.autoStartBundleIDs) ?? ""
+        self.autoStartBundleIDs = Set(
+            autoRaw.split(separator: ",").map(String.init).filter { !$0.isEmpty }
         )
     }
 
@@ -69,8 +81,69 @@ final class MeetingDetectionSettings: ObservableObject {
         disabledBundleIDs = copy
     }
 
+    func isAutoStart(forBundleID bundleID: String) -> Bool {
+        autoStartBundleIDs.contains(bundleID)
+    }
+
+    func setAutoStart(bundleID: String, enabled: Bool) {
+        guard !bundleID.isEmpty else { return }
+        var copy = autoStartBundleIDs
+        if enabled { copy.insert(bundleID) }
+        else { copy.remove(bundleID) }
+        autoStartBundleIDs = copy
+    }
+
+    /// How Mila should treat a supported app when it detects a meeting.
+    ///
+    /// The three states are stored across the two sets above (`Off` is the
+    /// silenced set, `Auto` is the auto-start set, `Ask` is neither) so older
+    /// builds keep reading the same defaults. `mode(forBundleID:)` is the
+    /// single readable projection of that storage, used by both the Settings
+    /// picker and `MeetingPromptCoordinator` — the coordinator must see a
+    /// revocation (`Auto` → `Ask`/`Off`) as exactly the same event the user
+    /// clicked, not as a pair of set mutations it has to re-derive.
+    enum AppMode: String, CaseIterable, Identifiable {
+        case ask, auto, off
+
+        var id: String { rawValue }
+
+        var displayName: String {
+            switch self {
+            case .ask: return "Ask"
+            case .auto: return "Auto"
+            case .off: return "Off"
+            }
+        }
+    }
+
+    func mode(forBundleID bundleID: String) -> AppMode {
+        if disabledBundleIDs.contains(bundleID) { return .off }
+        if autoStartBundleIDs.contains(bundleID) { return .auto }
+        return .ask
+    }
+
+    /// Set the whole mode in one call. `Auto` implicitly un-silences the app;
+    /// `Off` implicitly revokes auto-start — the states are mutually
+    /// exclusive, and going through one setter keeps the two backing sets
+    /// from ever disagreeing (an app in both would read as `Off` and silently
+    /// ignore a "turn on auto" click).
+    func setMode(_ mode: AppMode, forBundleID bundleID: String) {
+        switch mode {
+        case .ask:
+            reenable(bundleID: bundleID)
+            setAutoStart(bundleID: bundleID, enabled: false)
+        case .auto:
+            reenable(bundleID: bundleID)
+            setAutoStart(bundleID: bundleID, enabled: true)
+        case .off:
+            setAutoStart(bundleID: bundleID, enabled: false)
+            disable(bundleID: bundleID)
+        }
+    }
+
     private enum Keys {
         static let enabled = "meetingDetection.enabled"
         static let disabledBundleIDs = "meetingDetection.disabledBundleIDs"
+        static let autoStartBundleIDs = "meetingDetection.autoStartBundleIDs"
     }
 }

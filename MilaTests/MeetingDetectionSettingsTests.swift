@@ -44,4 +44,32 @@ final class MeetingDetectionSettingsTests: XCTestCase {
         XCTAssertFalse(s.isDisabled(forBundleID: ""))
         XCTAssertTrue(s.disabledBundleIDs.isEmpty)
     }
+
+    // MARK: - Auto-start
+
+    func test_autoStart_defaults_to_empty() {
+        let s = MeetingDetectionSettings(defaults: freshDefaults())
+        XCTAssertFalse(s.isAutoStart(forBundleID: "us.zoom.xos"))
+        XCTAssertTrue(s.autoStartBundleIDs.isEmpty)
+    }
+
+    func test_autoStart_toggle_on_off() {
+        let s = MeetingDetectionSettings(defaults: freshDefaults())
+        s.setAutoStart(bundleID: "us.zoom.xos", enabled: true)
+        XCTAssertTrue(s.isAutoStart(forBundleID: "us.zoom.xos"))
+
+        s.setAutoStart(bundleID: "us.zoom.xos", enabled: false)
+        XCTAssertFalse(s.isAutoStart(forBundleID: "us.zoom.xos"))
+    }
+
+    func test_autoStart_persists_across_reinit() {
+        let defaults = freshDefaults()
+        do {
+            let s = MeetingDetectionSettings(defaults: defaults)
+            s.setAutoStart(bundleID: "us.zoom.xos", enabled: true)
+        }
+        let reloaded = MeetingDetectionSettings(defaults: defaults)
+        XCTAssertTrue(reloaded.isAutoStart(forBundleID: "us.zoom.xos"),
+                      "Auto-start should survive a relaunch")
+    }
 }
