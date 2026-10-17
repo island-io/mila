@@ -69,25 +69,29 @@ enum RecordingLanguage: String, CaseIterable, Identifiable, Codable {
 
 @MainActor
 final class RecordingLanguageSettings: ObservableObject {
+    @Published private var storedCurrent: RecordingLanguage
+
     /// Language to use for the next voice memo / app-audio recording.
-    @Published var current: RecordingLanguage {
-        didSet {
-            // Forced by a configuration profile: put it back and persist
-            // nothing (see `ManagedSettings`). The toolbar picker is disabled
-            // then, so this only catches programmatic writes.
-            if let forced = managed.recordingLanguage, current != forced { current = forced; return }
-            guard managed.recordingLanguage == nil else { return }
-            guard current != oldValue else { return }
-            defaults.set(current.rawValue, forKey: Self.key)
+    ///
+    /// When a configuration profile locks it (`ManagedSettings`), every write
+    /// is refused before anything is stored, published or persisted. The
+    /// toolbar picker is disabled then, so this only catches programmatic
+    /// writes.
+    var current: RecordingLanguage {
+        get { storedCurrent }
+        set {
+            guard !isManaged(.recordingLanguage), newValue != storedCurrent else { return }
+            storedCurrent = newValue
+            defaults.set(newValue.rawValue, forKey: Self.key)
         }
     }
 
-    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
-    /// `MilaApp` passes the system's managed preferences.
-    let managed: ManagedSettings
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`)
+    /// unless `MilaApp` passes the system's managed preferences.
+    private let managed: ManagedSettings
 
-    /// Whether `current` is locked by a configuration profile.
-    var isManaged: Bool { managed.recordingLanguage != nil }
+    /// Whether a configuration profile locks `field` (see `ManagedSettings`).
+    func isManaged(_ field: ManagedField) -> Bool { managed.isManaged(field) }
 
     private let defaults: UserDefaults
     private static let key = "recording.language"
@@ -99,16 +103,16 @@ final class RecordingLanguageSettings: ObservableObject {
         if let forced = managed.recordingLanguage {
             // The user's stored choice stays in `defaults` untouched, so
             // removing the profile brings it back.
-            self.current = forced
+            self.storedCurrent = forced
         } else if let raw, let stored = RecordingLanguage(rawValue: raw) {
-            self.current = stored
+            self.storedCurrent = stored
         } else {
             // Unrecognised — a fresh install, or the retired `"auto"` left in
             // defaults by an older build. Fall back to Hebrew and rewrite the
-            // key: `current`'s `didSet` doesn't fire from `init`, so without
+            // key: `init` doesn't go through `current`'s setter, so without
             // this the stale value would sit in the plist until the user
             // touched the picker.
-            self.current = .hebrew
+            self.storedCurrent = .hebrew
             if raw != nil {
                 defaults.set(RecordingLanguage.hebrew.rawValue, forKey: Self.key)
             }

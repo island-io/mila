@@ -52,18 +52,24 @@ final class MilaConfigImporter: ObservableObject {
     private let liveAI: LiveAISettings
     private let diarization: DiarizationSettings
     private let meetingDetection: MeetingDetectionSettings
+    /// The configuration profile's locked fields — the same snapshot
+    /// `MilaApp` hands the settings objects. Managed fields outrank a
+    /// `.milaconfig`: they are left out of the diff and the apply.
+    private let managed: ManagedSettings
     private let log = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaConfig")
 
     init(remote: RemoteTranscriptionSettings,
          language: RecordingLanguageSettings,
          liveAI: LiveAISettings,
          diarization: DiarizationSettings,
-         meetingDetection: MeetingDetectionSettings) {
+         meetingDetection: MeetingDetectionSettings,
+         managed: ManagedSettings = .empty) {
         self.remote = remote
         self.language = language
         self.liveAI = liveAI
         self.diarization = diarization
         self.meetingDetection = meetingDetection
+        self.managed = managed
     }
 
     // MARK: - Open / confirm / cancel
@@ -138,42 +144,42 @@ final class MilaConfigImporter: ObservableObject {
             if let enabled = r.enabled {
                 let target: TranscriptionBackend = enabled ? .remote : .local
                 if target != remote.backend {
-                    out.append(.init(label: Label.backend, value: target.displayName))
+                    out.append(.init(label: ManagedField.backend.label, value: target.displayName))
                 }
             }
             if let endpoint = r.endpoint, endpoint != remote.endpoint {
-                out.append(.init(label: Label.endpoint, value: endpoint))
+                out.append(.init(label: ManagedField.endpoint.label, value: endpoint))
             }
             if let model = r.model, model != remote.model {
-                out.append(.init(label: Label.model, value: model))
+                out.append(.init(label: ManagedField.model.label, value: model))
             }
             if let englishModel = r.englishModel, englishModel != remote.englishModel {
-                out.append(.init(label: Label.englishModel,
+                out.append(.init(label: ManagedField.englishModel.label,
                                  value: englishModel.isEmpty ? "Same as Model" : englishModel))
             }
             if let apiKey = r.apiKey, apiKey != remote.apiKey {
-                out.append(.init(label: Label.apiKey, value: Self.mask(apiKey)))
+                out.append(.init(label: ManagedField.apiKey.label, value: Self.mask(apiKey)))
             }
         }
         if let langCode = config.recordingLanguage {
             let target = RecordingLanguage.fromCode(langCode)
             if target != language.current {
-                out.append(.init(label: Label.language, value: target.displayName))
+                out.append(.init(label: ManagedField.recordingLanguage.label, value: target.displayName))
             }
         }
         if let live = config.liveAI {
             if let enabled = live.enabled, enabled != liveAI.enabled {
-                out.append(.init(label: Label.liveAI, value: enabled ? "On" : "Off"))
+                out.append(.init(label: ManagedField.liveAIEnabled.label, value: enabled ? "On" : "Off"))
             }
             if let model = live.model, model != liveAI.model {
-                out.append(.init(label: Label.liveAIModel, value: model))
+                out.append(.init(label: ManagedField.liveAIModel.label, value: model))
             }
         }
         if let d = config.diarization, let enabled = d.enabled, enabled != diarization.isEnabled {
-            out.append(.init(label: Label.diarization, value: enabled ? "On" : "Off"))
+            out.append(.init(label: ManagedField.diarizationEnabled.label, value: enabled ? "On" : "Off"))
         }
         if let m = config.meetingDetection, let enabled = m.enabled, enabled != meetingDetection.enabled {
-            out.append(.init(label: Label.meetingDetection, value: enabled ? "On" : "Off"))
+            out.append(.init(label: ManagedField.meetingDetectionEnabled.label, value: enabled ? "On" : "Off"))
         }
         return out
     }
@@ -186,66 +192,22 @@ final class MilaConfigImporter: ObservableObject {
     /// whether or not the value differs: the user should learn that the file's
     /// value for that setting is not one they control.
     func managedSkipped(for config: MilaConfig) -> [String] {
-        var out: [String] = []
-        if let r = config.remoteTranscription {
-            if r.enabled != nil, remote.managed.backend != nil { out.append(Label.backend) }
-            if r.endpoint != nil, remote.managed.endpoint != nil { out.append(Label.endpoint) }
-            if r.model != nil, remote.managed.model != nil { out.append(Label.model) }
-            if r.englishModel != nil, remote.managed.englishModel != nil { out.append(Label.englishModel) }
-            if r.apiKey != nil, remote.managed.apiKey != nil { out.append(Label.apiKey) }
-        }
-        if config.recordingLanguage != nil, language.managed.recordingLanguage != nil {
-            out.append(Label.language)
-        }
-        if let live = config.liveAI {
-            if live.enabled != nil, liveAI.managed.liveAIEnabled != nil { out.append(Label.liveAI) }
-            if live.model != nil, liveAI.managed.liveAIModel != nil { out.append(Label.liveAIModel) }
-        }
-        if config.diarization?.enabled != nil, diarization.managed.diarizationEnabled != nil {
-            out.append(Label.diarization)
-        }
-        if config.meetingDetection?.enabled != nil, meetingDetection.managed.meetingDetectionEnabled != nil {
-            out.append(Label.meetingDetection)
-        }
-        return out
+        lockedFields(in: config).map(\.label)
     }
 
     /// `config` with every field a configuration profile manages removed, so
-    /// the diff and the apply both act only on what the user may change. One
-    /// filter feeding both keeps the sheet and the outcome from disagreeing.
+    /// the diff and the apply both act only on what the user may change. Both
+    /// this and `managedSkipped(for:)` come from `lockedFields(in:)`, so the
+    /// sheet and the outcome can't disagree.
     func unmanagedFields(of config: MilaConfig) -> MilaConfig {
         var out = config
-        if var r = out.remoteTranscription {
-            if remote.managed.backend != nil { r.enabled = nil }
-            if remote.managed.endpoint != nil { r.endpoint = nil }
-            if remote.managed.model != nil { r.model = nil }
-            if remote.managed.englishModel != nil { r.englishModel = nil }
-            if remote.managed.apiKey != nil { r.apiKey = nil }
-            out.remoteTranscription = r
-        }
-        if language.managed.recordingLanguage != nil { out.recordingLanguage = nil }
-        if var live = out.liveAI {
-            if liveAI.managed.liveAIEnabled != nil { live.enabled = nil }
-            if liveAI.managed.liveAIModel != nil { live.model = nil }
-            out.liveAI = live
-        }
-        if diarization.managed.diarizationEnabled != nil { out.diarization = nil }
-        if meetingDetection.managed.meetingDetectionEnabled != nil { out.meetingDetection = nil }
+        for field in lockedFields(in: config) { field.remove(from: &out) }
         return out
     }
 
-    /// Row labels, shared by the change list and the managed list.
-    private enum Label {
-        static let backend = "Transcription"
-        static let endpoint = "Server URL"
-        static let model = "Model"
-        static let englishModel = "English model"
-        static let apiKey = "API key"
-        static let language = "Recording language"
-        static let liveAI = "Live AI"
-        static let liveAIModel = "Live AI model"
-        static let diarization = "Speaker diarization"
-        static let meetingDetection = "Meeting detection"
+    /// The fields `config` sets that `managed` locks, in `ManagedField` order.
+    private func lockedFields(in config: MilaConfig) -> [ManagedField] {
+        ManagedField.allCases.filter { managed.isManaged($0) && $0.isPresent(in: config) }
     }
 
     // MARK: - Apply

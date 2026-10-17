@@ -34,30 +34,65 @@ value into the user's preferences.
   "Application & Custom Settings" / "Preference domain + plist" equivalent.
   Mila only honours **forced** values; "set once" / "often" (non-forced) MCX
   settings are ignored.
-- **Keys:** the same as a `.milaconfig`, with the same nesting. `version` is
-  not needed and is ignored.
+- **Keys:** the same as a `.milaconfig`, **with the same nesting** — four
+  top-level *dictionaries* plus one top-level string. `version` is not needed
+  and is ignored. Write them as nested dictionaries, exactly as shown here;
+  don't flatten them into one key with a dot in its name (see the note below
+  the table).
 
-| Key | Type | Meaning |
+```text
+remoteTranscription        dictionary   the remote (OpenAI-compatible) transcription backend
+├─ enabled                 boolean      true = use the remote backend, false = on-device whisper.cpp
+├─ endpoint                string       base URL, e.g. https://mila-asr.your-org.example/v1
+├─ model                   string       model id the server expects
+├─ englishModel            string       model id for English recordings ("" = use model for all)
+└─ apiKey                  string       bearer token — read "Secrets" below first
+recordingLanguage          string       he or en (regional forms like en-US accepted)
+liveAI                     dictionary
+├─ enabled                 boolean      Live AI mode on/off
+└─ model                   string       model passed to the AI CLI for the live loop
+diarization                dictionary
+└─ enabled                 boolean      speaker diarization on/off
+meetingDetection           dictionary
+└─ enabled                 boolean      the "meeting detected — start transcribing?" prompt on/off
+```
+
+| Top-level key | Type | Keys inside it |
 |---|---|---|
-| `remoteTranscription` | dictionary | The remote (OpenAI-compatible) transcription backend. |
-| `remoteTranscription.enabled` | boolean | `true` = use the remote backend, `false` = on-device whisper.cpp. |
-| `remoteTranscription.endpoint` | string | Base URL, e.g. `https://mila-asr.your-org.example/v1`. Mila appends `audio/transcriptions`. |
-| `remoteTranscription.model` | string | Model id the server expects, e.g. `ivrit-ai/whisper-large-v3-turbo-ct2`. |
-| `remoteTranscription.englishModel` | string | Model id for English recordings, for servers whose main model is Hebrew-only. Empty string = use `model` for every language. |
-| `remoteTranscription.apiKey` | string | Bearer token. See [Secrets](#secrets) before using it. |
-| `recordingLanguage` | string | `he` or `en` (regional forms like `en-US` work; anything else is read as Hebrew). **Locking it disables the language picker in the toolbar**, so users can no longer switch language per recording — leave it out unless that is what you want. |
-| `liveAI` | dictionary | |
-| `liveAI.enabled` | boolean | Live AI mode on/off. |
-| `liveAI.model` | string | Model passed to the AI CLI for the live loop. |
-| `diarization` | dictionary | |
-| `diarization.enabled` | boolean | Speaker diarization on/off. |
-| `meetingDetection` | dictionary | |
-| `meetingDetection.enabled` | boolean | The "meeting detected — start transcribing?" prompt on/off. |
+| `remoteTranscription` | dictionary | `enabled` (boolean), `endpoint` (string), `model` (string), `englishModel` (string), `apiKey` (string) |
+| `recordingLanguage` | string | — (`he` or `en`) |
+| `liveAI` | dictionary | `enabled` (boolean), `model` (string) |
+| `diarization` | dictionary | `enabled` (boolean) |
+| `meetingDetection` | dictionary | `enabled` (boolean) |
+
+Notes on individual keys:
+
+- `endpoint`: Mila appends `audio/transcriptions` to it.
+- `englishModel`: for servers whose main model is Hebrew-only (an ivrit.ai
+  finetune, for example). An empty string means `model` handles every language.
+- `recordingLanguage`: must be `he`, `iw` or `en`, or a regional form of one
+  (`en-US`, `he_IL`). **Any other value is ignored** (and logged), rather than
+  silently locking everyone to a default. **Locking it disables the language
+  picker in the toolbar**, so users can no longer switch language per recording
+  — leave it out unless that is what you want.
+
+> **Flat keys.** Some MDM consoles make it easy to enter a key like
+> `diarization.enabled` as a single flat key. That name happens to be the key
+> Mila itself stores the setting under, so forcing it really does override the
+> setting — and Mila therefore recognises it and treats it as managed (locked
+> control, note in Settings), as it does for its other internal keys
+> (`transcription.backend` = `"remote"`/`"local"`, `remote.endpoint`,
+> `remote.model`, `remote.model.en`, `recording.language`, `liveAI.enabled`,
+> `liveAI.model`, `meetingDetection.enabled`) and for the dotted form of every
+> field above (`remoteTranscription.endpoint`, …). It is still a fallback: use
+> the nested dictionaries, which are the documented format and what a
+> `.milaconfig` uses. When both are present the nested value wins.
 
 Values must have the right plist type — `<true/>`/`<false/>` for booleans,
 `<string>` for strings. A value of the wrong type (for example the *string*
-`"true"`) is ignored, only that one field is dropped, and Mila logs the key
-name (see [Troubleshooting](#troubleshooting)).
+`"true"`), or a `recordingLanguage` Mila doesn't recognise, is ignored: only
+that one field is dropped, it stays under the user's control, and Mila logs the
+key name (see [Troubleshooting](#troubleshooting)).
 
 Settings that are machine-specific — the audio input device, the recordings
 folder, hotkeys — are not manageable, for the same reasons they are not part of
@@ -203,8 +238,10 @@ log show --last 10m --predicate \
   'subsystem == "io.island.whisper.IslandWhisper" AND category == "ManagedSettings"'
 ```
 
-You should see `managed by configuration profile: remoteTranscription.endpoint,
-…`. A line starting `ignored managed preference(s) with the wrong type` names
-keys whose value had the wrong plist type. No line at all means no forced keys
+You should see `managed by configuration profile: …` followed by the managed
+fields (written as paths, e.g. `remoteTranscription.endpoint` for the
+`endpoint` key inside the `remoteTranscription` dictionary). A line starting
+`ignored managed preference(s) with a wrong type or unknown value` names keys
+whose value had the wrong plist type or wasn't recognised. No line at all means no forced keys
 were found — check the preference domain, that the payload is *Forced*, and
 that Mila was relaunched after the profile was installed.

@@ -913,7 +913,8 @@ struct MilaApp: App {
             language: langSettings,
             liveAI: liveAI,
             diarization: diarSettings,
-            meetingDetection: meetingSettings
+            meetingDetection: meetingSettings,
+            managed: managedSettings
         )
         let speakerDirectory = SpeakerDirectory()
         // Imports `.milashare` bundles. Given the store it writes to, the
@@ -1863,7 +1864,7 @@ struct MilaApp: App {
                 // anything. Mirror the feed-loop's gate here so an
                 // immediate feed runs the moment the toggle flips.
                 aiEnabledCancellable?.cancel()
-                aiEnabledCancellable = aiSettings.$enabled
+                aiEnabledCancellable = aiSettings.enabledPublisher
                     .dropFirst()
                     .filter { $0 }
                     .sink { [weak transcriber, weak aiSession] _ in

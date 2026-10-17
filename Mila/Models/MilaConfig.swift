@@ -22,9 +22,10 @@ import Foundation
 /// **The same schema is the MDM payload.** A configuration profile can force
 /// these keys for the `io.island.whisper.IslandWhisper` domain
 /// (`ManagedSettings`, docs/mdm.md), and a forced field outranks a
-/// `.milaconfig`. A new field here must be added to `ManagedSettings` too —
+/// `.milaconfig`. A new field here needs a `ManagedField` case and a field
+/// on `ManagedSettings` too —
 /// `ManagedSettingsParsingTests.test_everyMilaconfigField_isManageable` fails
-/// until it is.
+/// until it has them.
 struct MilaConfig: Codable, Equatable {
     /// Bump when the schema changes in a way older apps couldn't safely apply.
     static let currentVersion = 1

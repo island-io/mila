@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import Mila
 
 /// A stand-in for the system's managed-preferences domain. Holds only what a
@@ -17,10 +18,10 @@ final class ManagedSettingsParsingTests: XCTestCase {
         let managed = ManagedSettings(source: FakeManagedPreferences())
         XCTAssertTrue(managed.isEmpty)
         XCTAssertEqual(managed, .empty)
-        XCTAssertTrue(managed.managedFieldNames.isEmpty)
+        XCTAssertTrue(managed.managedFields.isEmpty)
     }
 
-    func test_readsEveryMilaconfigKey_withTheSameNames() {
+    func test_readsEveryMilaconfigKey_nestedLikeAMilaconfig() {
         // Shaped exactly like a `.milaconfig` (minus `version`), with values as
         // a profile delivers them: CFBoolean/NSNumber and NSString, not Swift
         // literals.
@@ -49,7 +50,7 @@ final class ManagedSettingsParsingTests: XCTestCase {
         XCTAssertEqual(managed.liveAIModel, "claude-haiku")
         XCTAssertEqual(managed.diarizationEnabled, true)
         XCTAssertEqual(managed.meetingDetectionEnabled, false)
-        XCTAssertEqual(managed.managedFieldNames.count, 10)
+        XCTAssertEqual(managed.managedFields, ManagedField.allCases)
     }
 
     func test_partialSection_managesOnlyThePresentFields() {
@@ -59,10 +60,7 @@ final class ManagedSettingsParsingTests: XCTestCase {
         let managed = ManagedSettings(source: source)
         XCTAssertEqual(managed.endpoint, "https://asr.example.com/v1")
         XCTAssertNil(managed.backend, "Absent `enabled` must leave the backend to the user")
-        XCTAssertNil(managed.model)
-        XCTAssertNil(managed.apiKey)
-        XCTAssertNil(managed.recordingLanguage)
-        XCTAssertEqual(managed.managedFieldNames, ["remoteTranscription.endpoint"])
+        XCTAssertEqual(managed.managedFields, [.endpoint])
     }
 
     func test_enabledFalse_managesTheBackendAsLocal() {
@@ -72,7 +70,7 @@ final class ManagedSettingsParsingTests: XCTestCase {
         XCTAssertEqual(managed.backend, .local)
     }
 
-    func test_wrongTypes_dropOnlyThatField() {
+    func test_wrongTypes_dropOnlyThatField_andAreReportedByKeyName() {
         let source = FakeManagedPreferences(forced: [
             "remoteTranscription": [
                 "enabled": "true",                         // string, not bool
@@ -83,19 +81,80 @@ final class ManagedSettingsParsingTests: XCTestCase {
             "recordingLanguage": 1,                         // not a string
             "meetingDetection": ["enabled": true] as [String: Any], // fine
         ])
-        let managed = ManagedSettings(source: source)
-        XCTAssertNil(managed.backend)
-        XCTAssertEqual(managed.endpoint, "https://asr.example.com/v1")
-        XCTAssertNil(managed.model)
-        XCTAssertNil(managed.diarizationEnabled)
-        XCTAssertNil(managed.recordingLanguage)
-        XCTAssertEqual(managed.meetingDetectionEnabled, true)
+        let (managed, ignored) = ManagedSettings.parse(source)
+        XCTAssertEqual(managed.managedFields, [.endpoint, .meetingDetectionEnabled])
+        XCTAssertEqual(Set(ignored), ["remoteTranscription.enabled", "remoteTranscription.model",
+                                      "diarization", "recordingLanguage"])
     }
 
-    /// Drift tripwire: the MDM payload IS the `.milaconfig` schema (#360), so
-    /// a field added to `MilaConfig` must become manageable too. Mirror lists
-    /// stored properties even when they're nil, so a new field fails this
-    /// whether or not anyone remembered to populate it below.
+    /// A key forced flat — the dotted path as one key, or Mila's own storage
+    /// key — overrides the setting for every reader of the domain, so it must
+    /// count as managed; otherwise the control stays enabled and the user's
+    /// edits silently don't stick.
+    func test_flatDottedKeys_areManagedToo() {
+        let managed = ManagedSettings(source: FakeManagedPreferences(forced: [
+            "diarization.enabled": true,
+            "liveAI.model": "org-live",
+            "remoteTranscription.endpoint": "https://asr.example.com/v1",
+        ]))
+        XCTAssertEqual(managed.diarizationEnabled, true)
+        XCTAssertEqual(managed.liveAIModel, "org-live")
+        XCTAssertEqual(managed.endpoint, "https://asr.example.com/v1")
+        XCTAssertEqual(managed.managedFields, [.endpoint, .liveAIModel, .diarizationEnabled])
+    }
+
+    func test_milasOwnStorageKeys_areManagedToo() {
+        let (managed, ignored) = ManagedSettings.parse(FakeManagedPreferences(forced: [
+            "transcription.backend": "remote",
+            "remote.endpoint": "https://asr.example.com/v1",
+            "remote.model.en": "",
+            "recording.language": "he",
+        ]))
+        XCTAssertEqual(managed.backend, .remote)
+        XCTAssertEqual(managed.endpoint, "https://asr.example.com/v1")
+        XCTAssertEqual(managed.englishModel, "")
+        XCTAssertEqual(managed.recordingLanguage, .hebrew)
+        XCTAssertTrue(ignored.isEmpty)
+
+        let (bogus, bogusIgnored) = ManagedSettings.parse(FakeManagedPreferences(forced: [
+            "transcription.backend": "cloud",
+        ]))
+        XCTAssertNil(bogus.backend)
+        XCTAssertEqual(bogusIgnored, ["transcription.backend"])
+    }
+
+    func test_nestedKeyWinsOverAFlatOne() {
+        let managed = ManagedSettings(source: FakeManagedPreferences(forced: [
+            "liveAI": ["model": "nested"] as [String: Any],
+            "liveAI.model": "flat",
+        ]))
+        XCTAssertEqual(managed.liveAIModel, "nested")
+    }
+
+    /// `RecordingLanguage.fromCode` reads anything unknown as Hebrew — fine for
+    /// legacy recordings, wrong for a lock: a typo would pin everyone to Hebrew.
+    func test_recordingLanguage_isValidatedStrictly() {
+        XCTAssertEqual(ManagedSettings.strictLanguage("en"), .english)
+        XCTAssertEqual(ManagedSettings.strictLanguage("en-US"), .english)
+        XCTAssertEqual(ManagedSettings.strictLanguage(" EN "), .english)
+        XCTAssertEqual(ManagedSettings.strictLanguage("he_IL"), .hebrew)
+        XCTAssertEqual(ManagedSettings.strictLanguage("iw"), .hebrew)
+        XCTAssertNil(ManagedSettings.strictLanguage("auto"))
+        XCTAssertNil(ManagedSettings.strictLanguage("enochian"))
+        XCTAssertNil(ManagedSettings.strictLanguage("eng"))
+        XCTAssertNil(ManagedSettings.strictLanguage(""))
+
+        let (managed, ignored) = ManagedSettings.parse(FakeManagedPreferences(forced: [
+            "recordingLanguage": "englsh",
+        ]))
+        XCTAssertNil(managed.recordingLanguage, "An unknown language must not lock anything")
+        XCTAssertEqual(ignored, ["recordingLanguage"])
+    }
+
+    /// Drift tripwire: the MDM payload IS the `.milaconfig` schema (#360), and
+    /// `ManagedField` is the single list every managed code path iterates.
+    /// Mirror lists stored properties even when they're nil, so a field added to
+    /// `MilaConfig` fails this whether or not anyone populated it below.
     func test_everyMilaconfigField_isManageable() {
         func fields(_ value: Any) -> [String] { Mirror(reflecting: value).children.compactMap(\.label) }
 
@@ -111,12 +170,14 @@ final class ManagedSettingsParsingTests: XCTestCase {
             case "recordingLanguage":
                 expected.append(top)
             default:
-                XCTFail("New .milaconfig section `\(top)` — make it manageable in ManagedSettings and docs/mdm.md")
+                XCTFail("New .milaconfig section `\(top)` — add ManagedField cases for it and document it in docs/mdm.md")
             }
         }
 
-        XCTAssertEqual(fields(ManagedSettings.empty).count, expected.count,
-                       "ManagedSettings needs one field per .milaconfig field")
+        XCTAssertEqual(Set(ManagedField.allCases.map(\.rawValue)), Set(expected),
+                       "ManagedField must list exactly the .milaconfig fields, by their paths")
+        XCTAssertEqual(fields(ManagedSettings.empty).count, ManagedField.allCases.count,
+                       "ManagedSettings needs one stored field per ManagedField")
 
         let everything = MilaConfig(
             version: 1,
@@ -126,16 +187,16 @@ final class ManagedSettingsParsingTests: XCTestCase {
             liveAI: .init(enabled: true, model: "l"),
             diarization: .init(enabled: true),
             meetingDetection: .init(enabled: true))
-        XCTAssertEqual(Set(ManagedSettings(config: everything).managedFieldNames), Set(expected))
-    }
+        XCTAssertEqual(ManagedSettings(config: everything).managedFields, ManagedField.allCases)
 
-    func test_languageCode_readTheSameWayAsMilaconfig() {
-        // `RecordingLanguage.fromCode`: regional forms count, anything else is
-        // Hebrew — identical to a `.milaconfig`'s `recordingLanguage`.
-        XCTAssertEqual(ManagedSettings(config: MilaConfig(version: 1, recordingLanguage: "en-US")).recordingLanguage,
-                       .english)
-        XCTAssertEqual(ManagedSettings(config: MilaConfig(version: 1, recordingLanguage: "auto")).recordingLanguage,
-                       .hebrew)
+        for field in ManagedField.allCases {
+            XCTAssertTrue(field.isPresent(in: everything), "\(field)")
+            var stripped = everything
+            field.remove(from: &stripped)
+            XCTAssertEqual(ManagedField.allCases.filter { $0.isPresent(in: stripped) },
+                           ManagedField.allCases.filter { $0 != field },
+                           "remove(from:) must clear exactly \(field)")
+        }
     }
 }
 
@@ -144,17 +205,153 @@ final class ManagedSettingsParsingTests: XCTestCase {
 @MainActor
 final class ManagedSettingsEnforcementTests: XCTestCase {
 
-    private func freshDefaults(_ label: String = #function) -> UserDefaults {
+    private func freshDefaults(_ label: String) -> UserDefaults {
         let suite = "ManagedSettingsTests.\(label)"
         let d = UserDefaults(suiteName: suite)!
         d.removePersistentDomain(forName: suite)
         return d
     }
 
-    // MARK: Remote transcription
+    /// One setting, reached through the object that owns it.
+    private struct Probe {
+        let object: AnyObject
+        let objectWillChange: AnyPublisher<Void, Never>
+        let read: () -> String
+        /// Writes a value different from the current one.
+        let write: () -> Void
+    }
+
+    /// `ManagedSettings` with only `field` locked.
+    private func managedOnly(_ field: ManagedField) -> ManagedSettings {
+        var m = ManagedSettings.empty
+        switch field {
+        case .backend: m.backend = .remote
+        case .endpoint: m.endpoint = "https://org.example.com/v1"
+        case .model: m.model = "org-model"
+        case .englishModel: m.englishModel = "org-english"
+        case .apiKey: m.apiKey = "org-token"
+        case .recordingLanguage: m.recordingLanguage = .english
+        case .liveAIEnabled: m.liveAIEnabled = false
+        case .liveAIModel: m.liveAIModel = "org-live"
+        // `true`, so the refused write is to `false` — no diarization side
+        // effects (dependency checks, bootstrap) can start in either leg.
+        case .diarizationEnabled: m.diarizationEnabled = true
+        case .meetingDetectionEnabled: m.meetingDetectionEnabled = false
+        }
+        return m
+    }
+
+    /// Exhaustive on purpose: a new `ManagedField` doesn't compile here until
+    /// its owning object and setter are wired into the enforcement check.
+    private func probe(_ field: ManagedField, managed: ManagedSettings,
+                       defaults: UserDefaults, keychainKey: String) -> Probe {
+        @MainActor func publisher<O: ObservableObject>(_ o: O) -> AnyPublisher<Void, Never>
+        where O.ObjectWillChangePublisher == ObservableObjectPublisher {
+            o.objectWillChange.map { _ in () }.eraseToAnyPublisher()
+        }
+        @MainActor func remote() -> RemoteTranscriptionSettings {
+            RemoteTranscriptionSettings(defaults: defaults, apiKeyKeychainKey: keychainKey, managed: managed)
+        }
+        switch field {
+        case .backend:
+            let o = remote()
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.backend.rawValue },
+                         write: { o.backend = o.backend == .remote ? .local : .remote })
+        case .endpoint:
+            let o = remote()
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.endpoint },
+                         write: { o.endpoint += "/changed" })
+        case .model:
+            let o = remote()
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.model },
+                         write: { o.model += "-changed" })
+        case .englishModel:
+            let o = remote()
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.englishModel },
+                         write: { o.englishModel += "-changed" })
+        case .apiKey:
+            let o = remote()
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.apiKey },
+                         write: { o.apiKey += "-changed" })
+        case .recordingLanguage:
+            let o = RecordingLanguageSettings(defaults: defaults, managed: managed)
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.current.rawValue },
+                         write: { o.current = o.current.other })
+        case .liveAIEnabled:
+            let o = LiveAISettings(defaults: defaults, managed: managed)
+            return Probe(object: o, objectWillChange: publisher(o), read: { "\(o.enabled)" },
+                         write: { o.enabled.toggle() })
+        case .liveAIModel:
+            let o = LiveAISettings(defaults: defaults, managed: managed)
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.model },
+                         write: { o.model += "-changed" })
+        case .diarizationEnabled:
+            let o = DiarizationSettings(defaults: defaults, managed: managed)
+            return Probe(object: o, objectWillChange: publisher(o), read: { "\(o.isEnabled)" },
+                         write: { o.isEnabled.toggle() })
+        case .meetingDetectionEnabled:
+            let o = MeetingDetectionSettings(defaults: defaults, managed: managed)
+            return Probe(object: o, objectWillChange: publisher(o), read: { "\(o.enabled)" },
+                         write: { o.enabled.toggle() })
+        }
+    }
+
+    private func stored(_ field: ManagedField, _ defaults: UserDefaults, keychainKey: String) -> String {
+        if let key = field.storageKey { return String(describing: defaults.object(forKey: key)) }
+        return String(describing: KeychainHelper.load(key: keychainKey))
+    }
+
+    /// The tripwire for enforcement (not just parsing): for EVERY field, a
+    /// write while managed changes nothing — not the value, not the stored
+    /// preference, and no `objectWillChange` — while the same write unmanaged
+    /// does change and persist it, which also proves `ManagedField.storageKey`
+    /// names the key the object really writes.
+    func test_everyManagedField_refusesWritesAndPersistsNothing() {
+        for field in ManagedField.allCases {
+            let keychainKey = "ManagedSettingsTests.enforcement.\(field.rawValue).apiKey"
+            KeychainHelper.delete(key: keychainKey)
+            defer { KeychainHelper.delete(key: keychainKey) }
+
+            // Managed: refused before anything is stored or published.
+            do {
+                let defaults = freshDefaults("managed.\(field.rawValue)")
+                let managed = managedOnly(field)
+                XCTAssertEqual(managed.managedFields, [field])
+                let p = probe(field, managed: managed, defaults: defaults, keychainKey: keychainKey)
+                let before = p.read()
+                let storedBefore = stored(field, defaults, keychainKey: keychainKey)
+                var publishes = 0
+                let sink = p.objectWillChange.sink { _ in publishes += 1 }
+                p.write()
+                sink.cancel()
+                XCTAssertEqual(p.read(), before, "\(field): a managed value must not change")
+                XCTAssertEqual(stored(field, defaults, keychainKey: keychainKey), storedBefore,
+                               "\(field): a refused write must persist nothing")
+                XCTAssertEqual(publishes, 0, "\(field): a refused write must not publish")
+            }
+
+            // Unmanaged: the same write lands and persists.
+            do {
+                let defaults = freshDefaults("unmanaged.\(field.rawValue)")
+                if field == .diarizationEnabled {
+                    // Start from ON so the write turns it OFF (no side effects).
+                    defaults.set(true, forKey: "diarization.enabled")
+                }
+                let p = probe(field, managed: .empty, defaults: defaults, keychainKey: keychainKey)
+                let before = p.read()
+                let storedBefore = stored(field, defaults, keychainKey: keychainKey)
+                p.write()
+                XCTAssertNotEqual(p.read(), before, "\(field): an unmanaged write must land")
+                XCTAssertNotEqual(stored(field, defaults, keychainKey: keychainKey), storedBefore,
+                                  "\(field): an unmanaged write must persist under its storage key")
+            }
+        }
+    }
+
+    // MARK: Remote transcription specifics
 
     func test_remote_managedValuesWinOverStoredOnes_andUserValuesSurviveUnderneath() {
-        let defaults = freshDefaults()
+        let defaults = freshDefaults(#function)
         let keychainKey = "ManagedSettingsTests.\(#function).apiKey"
         KeychainHelper.delete(key: keychainKey)
         defer { KeychainHelper.delete(key: keychainKey) }
@@ -163,7 +360,7 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
         do {
             let user = RemoteTranscriptionSettings(defaults: defaults, apiKeyKeychainKey: keychainKey)
             user.endpoint = "https://user.example.com/v1"
-            user.model = "whisper-1"
+            user.model = "user-model"
         }
 
         var managed = ManagedSettings.empty
@@ -174,7 +371,7 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
                                                  managed: managed)
         XCTAssertEqual(remote.backend, .remote)
         XCTAssertEqual(remote.endpoint, "https://org.example.com/v1")
-        XCTAssertEqual(remote.model, "whisper-1", "An unmanaged field keeps the user's value")
+        XCTAssertEqual(remote.model, "user-model", "An unmanaged field keeps the user's value")
 
         // Removing the profile restores what the user had: nothing managed was
         // ever written over it.
@@ -183,54 +380,7 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
         XCTAssertEqual(afterProfileRemoved.backend, .local)
     }
 
-    func test_remote_writesToManagedFieldsAreRefused_andNotPersisted() {
-        let defaults = freshDefaults()
-        let keychainKey = "ManagedSettingsTests.\(#function).apiKey"
-        KeychainHelper.delete(key: keychainKey)
-        defer { KeychainHelper.delete(key: keychainKey) }
-
-        var managed = ManagedSettings.empty
-        managed.backend = .remote
-        managed.endpoint = "https://org.example.com/v1"
-        managed.model = "org-model"
-        let remote = RemoteTranscriptionSettings(defaults: defaults,
-                                                 apiKeyKeychainKey: keychainKey,
-                                                 managed: managed)
-
-        remote.backend = .local
-        remote.endpoint = "https://elsewhere.example.com/v1"
-        remote.model = "other-model"
-        remote.englishModel = "user-english"   // not managed: allowed
-
-        XCTAssertEqual(remote.backend, .remote)
-        XCTAssertEqual(remote.endpoint, "https://org.example.com/v1")
-        XCTAssertEqual(remote.model, "org-model")
-        XCTAssertEqual(remote.englishModel, "user-english")
-        XCTAssertNil(defaults.string(forKey: "transcription.backend"), "A managed backend is never persisted")
-        XCTAssertNil(defaults.string(forKey: "remote.endpoint"), "A managed endpoint is never persisted")
-        XCTAssertNil(defaults.string(forKey: "remote.model"), "A managed model is never persisted")
-        XCTAssertEqual(defaults.string(forKey: "remote.model.en"), "user-english")
-    }
-
-    func test_remote_presetKeepsAManagedEndpoint() {
-        let defaults = freshDefaults()
-        var managed = ManagedSettings.empty
-        managed.endpoint = "https://org.example.com/v1"
-        let remote = RemoteTranscriptionSettings(defaults: defaults,
-                                                 apiKeyKeychainKey: "ManagedSettingsTests.\(#function).apiKey",
-                                                 managed: managed)
-        guard let preset = RemoteModelPreset.all.first(where: {
-            RemoteModelPreset.normalizeEndpoint($0.endpoint)
-                != RemoteModelPreset.normalizeEndpoint(managed.endpoint!)
-        }) else { return XCTFail("Expected a preset with a different endpoint") }
-
-        remote.apply(preset)
-        XCTAssertEqual(remote.endpoint, "https://org.example.com/v1")
-        XCTAssertEqual(remote.model, preset.id, "The unmanaged model still follows the preset")
-    }
-
     func test_remote_managedAPIKey_bypassesTheKeychainBothWays() {
-        let defaults = freshDefaults()
         let keychainKey = "ManagedSettingsTests.\(#function).apiKey"
         KeychainHelper.save(key: keychainKey, value: "user-token")
         defer { KeychainHelper.delete(key: keychainKey) }
@@ -238,7 +388,7 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
         var managed = ManagedSettings.empty
         managed.backend = .remote
         managed.apiKey = "org-token"
-        let remote = RemoteTranscriptionSettings(defaults: defaults,
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
                                                  apiKeyKeychainKey: keychainKey,
                                                  managed: managed)
         XCTAssertEqual(remote.apiKey, "org-token", "The managed token wins over the stored one")
@@ -253,85 +403,81 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
         var managed = ManagedSettings.empty
         managed.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
         managed.englishModel = ""   // the admin says: one model for everything
-        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(),
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
                                                  apiKeyKeychainKey: "ManagedSettingsTests.\(#function).apiKey",
                                                  managed: managed)
         XCTAssertEqual(remote.englishModel, "",
                        "The ivrit prefill must not override an administrator's English model")
     }
 
-    // MARK: Language, Live AI, diarization, meeting detection
+    // MARK: Presets
 
-    func test_language_forced_andNotPersisted() {
-        let defaults = freshDefaults()
+    func test_preset_isRefused_whenTheModelIsManaged() {
+        var managed = ManagedSettings.empty
+        managed.model = "org-model"
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
+                                                 apiKeyKeychainKey: "ManagedSettingsTests.\(#function).apiKey",
+                                                 managed: managed)
+        let endpointBefore = remote.endpoint
+        let preset = RemoteModelPreset.all.first { $0.endpoint != endpointBefore } ?? RemoteModelPreset.all[0]
+
+        XCTAssertFalse(remote.apply(preset))
+        XCTAssertEqual(remote.model, "org-model")
+        XCTAssertEqual(remote.endpoint, endpointBefore,
+                       "The endpoint must not move to a preset whose model can't follow")
+    }
+
+    func test_preset_isRefused_whenItWouldMoveAManagedEndpoint() {
+        // A managed endpoint that is a preset's own (OpenAI's), so a preset on a
+        // different server would have to move it.
+        var managed = ManagedSettings.empty
+        managed.endpoint = RemoteTranscriptionSettings.defaultEndpoint
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
+                                                 apiKeyKeychainKey: "ManagedSettingsTests.\(#function).apiKey",
+                                                 managed: managed)
+        guard let elsewhere = RemoteModelPreset.all.first(where: {
+            RemoteModelPreset.normalizeEndpoint($0.endpoint)
+                != RemoteModelPreset.normalizeEndpoint(RemoteTranscriptionSettings.defaultEndpoint)
+        }) else { return XCTFail("Expected a preset on another endpoint") }
+        let modelBefore = remote.model
+
+        XCTAssertFalse(remote.apply(elsewhere))
+        XCTAssertEqual(remote.endpoint, RemoteTranscriptionSettings.defaultEndpoint)
+        XCTAssertEqual(remote.model, modelBefore, "No half-applied preset: the model stays too")
+    }
+
+    func test_preset_appliesTheModel_whenAManagedCustomEndpointWouldNotMove() {
+        // A non-preset endpoint is never moved by a preset (it may be a gateway
+        // serving any id), so only the model changes — no mismatch to refuse.
+        var managed = ManagedSettings.empty
+        managed.endpoint = "https://org.example.com/v1"
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
+                                                 apiKeyKeychainKey: "ManagedSettingsTests.\(#function).apiKey",
+                                                 managed: managed)
+        let preset = RemoteModelPreset.all[0]
+
+        XCTAssertTrue(remote.apply(preset))
+        XCTAssertEqual(remote.endpoint, "https://org.example.com/v1")
+        XCTAssertEqual(remote.model, preset.id)
+    }
+
+    // MARK: Language
+
+    func test_language_forced_userChoiceSurvivesUnderneath() {
+        let defaults = freshDefaults(#function)
         defaults.set("he", forKey: "recording.language")
         var managed = ManagedSettings.empty
         managed.recordingLanguage = .english
 
         let language = RecordingLanguageSettings(defaults: defaults, managed: managed)
-        XCTAssertTrue(language.isManaged)
+        XCTAssertTrue(language.isManaged(.recordingLanguage))
         XCTAssertEqual(language.current, .english)
 
         language.current = .hebrew
         XCTAssertEqual(language.current, .english)
-        XCTAssertEqual(defaults.string(forKey: "recording.language"), "he",
-                       "The user's own choice is left untouched underneath")
-    }
-
-    func test_liveAI_forced_andNotPersisted() {
-        let defaults = freshDefaults()
-        var managed = ManagedSettings.empty
-        managed.liveAIEnabled = false
-        managed.liveAIModel = "org-model"
-
-        let liveAI = LiveAISettings(defaults: defaults, managed: managed)
-        XCTAssertFalse(liveAI.enabled)
-        XCTAssertEqual(liveAI.model, "org-model")
-
-        liveAI.enabled = true
-        liveAI.model = "user-model"
-        XCTAssertFalse(liveAI.enabled)
-        XCTAssertEqual(liveAI.model, "org-model")
-        XCTAssertNil(defaults.object(forKey: "liveAI.enabled"))
-        XCTAssertNil(defaults.object(forKey: "liveAI.model"))
-    }
-
-    func test_diarization_forced_andNotPersisted() {
-        let defaults = freshDefaults()
-        var managed = ManagedSettings.empty
-        managed.diarizationEnabled = false
-
-        let diarization = DiarizationSettings(defaults: defaults, managed: managed)
-        XCTAssertTrue(diarization.isEnabledManaged)
-        XCTAssertFalse(diarization.isEnabled)
-
-        diarization.isEnabled = true
-        XCTAssertFalse(diarization.isEnabled)
-        XCTAssertNil(defaults.object(forKey: "diarization.enabled"))
-    }
-
-    func test_meetingDetection_forced_andNotPersisted() {
-        let defaults = freshDefaults()
-        var managed = ManagedSettings.empty
-        managed.meetingDetectionEnabled = false
-
-        let meetings = MeetingDetectionSettings(defaults: defaults, managed: managed)
-        XCTAssertTrue(meetings.isEnabledManaged)
-        XCTAssertFalse(meetings.enabled)
-
-        meetings.enabled = true
-        XCTAssertFalse(meetings.enabled)
-        // init seeds the user's own default (ON); the managed OFF never lands there.
-        XCTAssertEqual(defaults.object(forKey: "meetingDetection.enabled") as? Bool, true)
-    }
-
-    func test_unmanagedObjects_behaveAsBefore() {
-        let defaults = freshDefaults()
-        let meetings = MeetingDetectionSettings(defaults: defaults)
-        XCTAssertFalse(meetings.isEnabledManaged)
-        meetings.enabled = false
-        XCTAssertFalse(meetings.enabled)
-        XCTAssertEqual(defaults.object(forKey: "meetingDetection.enabled") as? Bool, false)
+        XCTAssertEqual(defaults.string(forKey: "recording.language"), "he")
+        XCTAssertEqual(RecordingLanguageSettings(defaults: defaults).current, .hebrew,
+                       "Without the profile the user's own choice comes back")
     }
 }
 
@@ -344,7 +490,6 @@ final class ManagedSettingsMilaConfigPrecedenceTests: XCTestCase {
         let importer: MilaConfigImporter
         let remote: RemoteTranscriptionSettings
         let language: RecordingLanguageSettings
-        let diarization: DiarizationSettings
         let keychainKey: String
     }
 
@@ -358,15 +503,14 @@ final class ManagedSettingsMilaConfigPrecedenceTests: XCTestCase {
         let remote = RemoteTranscriptionSettings(defaults: suite, apiKeyKeychainKey: keychainKey,
                                                  managed: managed)
         let language = RecordingLanguageSettings(defaults: suite, managed: managed)
-        let diarization = DiarizationSettings(defaults: suite, managed: managed)
         let importer = MilaConfigImporter(remote: remote,
                                           language: language,
                                           liveAI: LiveAISettings(defaults: suite, managed: managed),
-                                          diarization: diarization,
+                                          diarization: DiarizationSettings(defaults: suite, managed: managed),
                                           meetingDetection: MeetingDetectionSettings(defaults: suite,
-                                                                                     managed: managed))
-        return Harness(importer: importer, remote: remote, language: language,
-                       diarization: diarization, keychainKey: keychainKey)
+                                                                                     managed: managed),
+                                          managed: managed)
+        return Harness(importer: importer, remote: remote, language: language, keychainKey: keychainKey)
     }
 
     private var orgManaged: ManagedSettings {
@@ -392,10 +536,9 @@ final class ManagedSettingsMilaConfigPrecedenceTests: XCTestCase {
         defer { KeychainHelper.delete(key: h.keychainKey) }
 
         let labels = h.importer.plannedChanges(for: teammateConfig).map(\.label)
-        XCTAssertEqual(Set(labels), ["Model"],
+        XCTAssertEqual(labels, ["Model"],
                        "Only the unmanaged field that differs is offered as a change")
-
-        XCTAssertEqual(Set(h.importer.managedSkipped(for: teammateConfig)),
+        XCTAssertEqual(h.importer.managedSkipped(for: teammateConfig),
                        ["Transcription", "Server URL", "API key", "Recording language"])
     }
 

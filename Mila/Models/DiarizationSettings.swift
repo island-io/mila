@@ -3,13 +3,16 @@ import Combine
 
 @MainActor
 final class DiarizationSettings: ObservableObject {
-    @Published var isEnabled: Bool {
-        didSet {
-            // Forced by a configuration profile: put it back and persist
-            // nothing (see `ManagedSettings`). Nothing changed, so none of the
-            // enable side effects below apply either.
-            if let forced = managed.diarizationEnabled, isEnabled != forced { isEnabled = forced; return }
-            guard managed.diarizationEnabled == nil else { return }
+    @Published private var storedIsEnabled: Bool
+
+    /// When a configuration profile locks it (`ManagedSettings`), every write
+    /// is refused before anything is stored, published or persisted — and so
+    /// before any of the enable side effects below.
+    var isEnabled: Bool {
+        get { storedIsEnabled }
+        set {
+            guard !isManaged(.diarizationEnabled) else { return }
+            storedIsEnabled = newValue
             defaults.set(isEnabled, forKey: "diarization.enabled")
             if isEnabled && pythonFound && lastVerifyResult == nil && !isVerified {
                 Task { await checkDeps() }
@@ -57,10 +60,10 @@ final class DiarizationSettings: ObservableObject {
     /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
     /// `MilaApp` passes the system's managed preferences. Only `isEnabled` is
     /// manageable — the same field a `.milaconfig` carries.
-    let managed: ManagedSettings
+    private let managed: ManagedSettings
 
-    /// Whether `isEnabled` is locked by a configuration profile.
-    var isEnabledManaged: Bool { managed.diarizationEnabled != nil }
+    /// Whether a configuration profile locks `field` (see `ManagedSettings`).
+    func isManaged(_ field: ManagedField) -> Bool { managed.isManaged(field) }
 
     init(defaults: UserDefaults = .standard,
          bootstrap: DiarizationBootstrap? = nil,
@@ -83,13 +86,13 @@ final class DiarizationSettings: ObservableObject {
         // tests of the cooperative thread pool. MilaApp passes `true`; tests
         // omit the argument and get the historical `false`.
         // A managed value wins over both the stored choice and the default.
-        self.isEnabled = managed.diarizationEnabled
+        self.storedIsEnabled = managed.diarizationEnabled
             ?? (defaults.object(forKey: "diarization.enabled") as? Bool) ?? defaultEnabledIfUnset
         let path = defaults.string(forKey: "diarization.pythonPath") ?? "/usr/bin/python3"
         self.pythonPath = path
         self._pythonFound = Published(initialValue: FileManager.default.fileExists(atPath: path))
         restoreVerifiedState()
-        // didSet on `isEnabled` doesn't fire from `init`, so when the user
+        // `init` doesn't go through `isEnabled`'s setter, so when the user
         // had previously enabled diarization AND torch is already installed
         // in the user-writable site-packages, `bootstrap.isReady` would
         // stay at its default `false`. That made `isConfigured` silently

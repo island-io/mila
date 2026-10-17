@@ -16,20 +16,33 @@ import Combine
 /// per N seconds.
 @MainActor
 final class LiveAISettings: ObservableObject {
-    @Published var enabled: Bool {
-        didSet {
-            // Forced by a configuration profile: put it back and persist
-            // nothing (see `ManagedSettings`).
-            if let forced = managed.liveAIEnabled, enabled != forced { enabled = forced; return }
-            guard managed.liveAIEnabled == nil else { return }
-            defaults.set(enabled, forKey: Keys.enabled)
+    // `enabled` and `model` are manageable by a configuration profile
+    // (`ManagedSettings`): computed over private `@Published` storage so a
+    // locked write is refused before anything is stored, published or
+    // persisted.
+    @Published private var storedEnabled: Bool
+    @Published private var storedModel: String
+
+    var enabled: Bool {
+        get { storedEnabled }
+        set {
+            guard !isManaged(.liveAIEnabled) else { return }
+            storedEnabled = newValue
+            defaults.set(newValue, forKey: Keys.enabled)
         }
     }
 
-    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`) unless
-    /// `MilaApp` passes the system's managed preferences. Only `enabled` and
-    /// `model` are manageable — the same two a `.milaconfig` carries.
-    let managed: ManagedSettings
+    /// `enabled`'s change publisher (fires on willSet, like `$enabled` did).
+    var enabledPublisher: Published<Bool>.Publisher { $storedEnabled }
+
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`)
+    /// unless `MilaApp` passes the system's managed preferences. Only
+    /// `enabled` and `model` are manageable — the same two a `.milaconfig`
+    /// carries.
+    private let managed: ManagedSettings
+
+    /// Whether a configuration profile locks `field` (see `ManagedSettings`).
+    func isManaged(_ field: ManagedField) -> Bool { managed.isManaged(field) }
 
     /// Snapshot of the host Mac's hardware identity. Injected in tests
     /// (so `isLiveAIAvailable` can be exercised without a real
@@ -41,11 +54,12 @@ final class LiveAISettings: ObservableObject {
     /// Model name passed to the CLI as `--model <value>`. Empty string ==
     /// "let the CLI pick" — typically the CLI's last-configured model. The
     /// UI nudges the user toward a cheap model via the placeholder.
-    @Published var model: String {
-        didSet {
-            if let forced = managed.liveAIModel, model != forced { model = forced; return }
-            guard managed.liveAIModel == nil else { return }
-            defaults.set(model, forKey: Keys.model)
+    var model: String {
+        get { storedModel }
+        set {
+            guard !isManaged(.liveAIModel) else { return }
+            storedModel = newValue
+            defaults.set(newValue, forKey: Keys.model)
         }
     }
 
@@ -267,8 +281,8 @@ final class LiveAISettings: ObservableObject {
         // the LLM summary/action-items pane. If their LLM CLI isn't
         // configured, `isLiveAIReady` still gates everything down to
         // a no-op, so this is safe. A managed value wins over both.
-        self.enabled = managed.liveAIEnabled ?? (defaults.object(forKey: Keys.enabled) as? Bool) ?? true
-        self.model = managed.liveAIModel ?? defaults.string(forKey: Keys.model) ?? Self.defaultModel
+        self.storedEnabled = managed.liveAIEnabled ?? (defaults.object(forKey: Keys.enabled) as? Bool) ?? true
+        self.storedModel = managed.liveAIModel ?? defaults.string(forKey: Keys.model) ?? Self.defaultModel
         // Migrate pre-1.6.1 persisted values (default was 5s, range 3-20s).
         // 5s windows cut words mid-utterance and made the trailing-window
         // merge stitch together inconsistent segments. Only values below
