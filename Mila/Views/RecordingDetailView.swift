@@ -385,6 +385,37 @@ struct RecordingDetailView: View {
         .accessibilityIdentifier("recording.stopTranscribing")
     }
 
+    /// Says the transcript is knowingly incomplete — some of the recording
+    /// could not be transcribed because the transcription server was
+    /// unreachable (or refused it) during the recording and again when it was
+    /// saved — and offers to transcribe just those parts now (#355).
+    private var missingPartsNote: some View {
+        let seconds = Int(recording.untranscribedSeconds.rounded(.up))
+        let isRetrying = transcription.spanRetryIDs.contains(recording.id)
+        return HStack(spacing: 8) {
+            Label {
+                Text("\(formatDuration(Double(max(1, seconds)))) of this recording isn't in the transcript — the transcription server couldn't be reached or refused it.")
+            } icon: {
+                Image(systemName: "wifi.exclamationmark")
+                    .foregroundStyle(.orange)
+            }
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            if isRetrying {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("Retry missing parts") {
+                    let id = recording.id
+                    Task { await transcription.retryUntranscribedSpans(of: id) }
+                }
+                .controlSize(.small)
+                .help("Transcribe just the missing parts of the audio and add them to the transcript in place.")
+                .accessibilityIdentifier("recording.retryMissingParts")
+            }
+        }
+        .accessibilityIdentifier("recording.untranscribedNote")
+    }
+
     @ViewBuilder
     private var transcriptArea: some View {
         // Queued wins over "Stopping…" and over the progress view: a row
@@ -483,6 +514,8 @@ struct RecordingDetailView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("recording.transcriptionStopped")
+                    } else if recording.untranscribedSpans?.isEmpty == false {
+                        missingPartsNote
                     }
                     Spacer()
                     Button {

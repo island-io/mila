@@ -1186,6 +1186,14 @@ final class QuickActionsController: ObservableObject {
         // recording's.
         if runsLivePipeline {
             await liveTranscriber?.transcribeNow()
+            // Utterances the live path gave up on (the remote server was
+            // unreachable through the drain, or refused them): transcribe just
+            // those spans of the WAV and slot the text in by time, BEFORE the
+            // diarizer labels are applied so the recovered lines get speakers
+            // too. Bounded: `transcribeSpans` stops at the first failure and
+            // uses the short live request timeout, and it is skipped outright
+            // when the drain has just found the server unreachable (#355).
+            await liveTranscriber?.recoverUntranscribedAudio(from: outputURL)
             await liveDiarizer?.awaitPending()
             if let diar = liveDiarizer {
                 liveTranscriber?.applySpeakerLabels(diar.intervals)
@@ -1213,10 +1221,9 @@ final class QuickActionsController: ObservableObject {
         // emptied live transcript apart from one that never existed. See
         // `liveTranscriptIsAuthoritative`.
         let userDeletedLiveLines = runsLivePipeline && (liveTranscriber?.hasUserDeletedSegments ?? false)
-        // Same snapshot rule: whether the remote server stayed unreachable
-        // long enough that some utterance never made it into the live
-        // transcript (#355). See `isLiveTranscriptAuthoritative(...)`.
-        let liveTranscriptHasGap = runsLivePipeline && (liveTranscriber?.hasUntranscribedAudio ?? false)
+        // Same snapshot rule: audio the live transcript is still missing after
+        // the span pass in the drain above (#355). Saved on the row below.
+        let untranscribedSpans = runsLivePipeline ? (liveTranscriber?.untranscribedSpans ?? []) : []
         let finalSummary = (runsLivePipeline ? (liveAISession?.summary ?? "") : "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = runsLivePipeline ? (liveAISession?.actionItems ?? []) : []
@@ -1280,16 +1287,17 @@ final class QuickActionsController: ObservableObject {
         // recorded, so a deliberate emptying stays authoritative and saves
         // empty. (Cursor Bugbot on #229.)
         let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
-        let liveTranscriptIsAuthoritative = Self.isLiveTranscriptAuthoritative(
-            vadActive: vadActive,
-            hasLiveSegments: hasLiveSegments,
-            userDeletedLiveLines: userDeletedLiveLines,
-            hasUntranscribedAudio: liveTranscriptHasGap)
-        if liveTranscriptHasGap {
+        let liveTranscriptIsAuthoritative = (hasLiveSegments || userEmptiedLiveTranscript) && vadActive
+        // Spans the transcript is still missing are only worth recording on a
+        // final live transcript that has text: a non-authoritative row gets
+        // the full batch pass (which covers them), and a transcript the user
+        // deliberately emptied stays empty — offering to "retry" text into it
+        // would undo that.
+        let missingSpansToSave = (liveTranscriptIsAuthoritative && hasLiveSegments) ? untranscribedSpans : []
+        if !untranscribedSpans.isEmpty {
             quickActionsLog.log("""
-                live transcript has untranscribed audio (remote server unreachable at Stop) — \
-                authoritative=\(liveTranscriptIsAuthoritative, privacy: .public) \
-                userDeletedLines=\(userDeletedLiveLines, privacy: .public)
+                live transcript still missing \(untranscribedSpans.count, privacy: .public) spans after \
+                the span pass — saved on the row: \(missingSpansToSave.count, privacy: .public)
                 """)
         }
         let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
@@ -1319,6 +1327,9 @@ final class QuickActionsController: ObservableObject {
             return
         }
         updated.segments = finalTranscriptSegments
+        // Not silently complete: the detail view says how much is missing and
+        // offers "Retry missing parts" (#355).
+        updated.untranscribedSpans = missingSpansToSave.isEmpty ? nil : missingSpansToSave
         // Mid-recording speaker renames from the live pane are NOT copied
         // onto the row here — see the note at `store.add` above. They are
         // handed to `onRecordingFinalized` below (still before
@@ -1473,35 +1484,6 @@ final class QuickActionsController: ObservableObject {
         isFinalizingRecording = false
 
         finalizeTail(for: updated, liveTranscriptIsAuthoritative: liveTranscriptIsAuthoritative)
-    }
-
-    /// Whether the live transcript is the recording's FINAL transcript, or
-    /// the WAV still owes a batch pass. Decided once, in `stopRecording`.
-    ///
-    ///  * Only the VAD path can be authoritative — chunk mode has no speaker
-    ///    labels, so it always gets the batch pass.
-    ///  * No live segments means the live path produced nothing, so the batch
-    ///    pass is the fallback — EXCEPT when the user emptied the transcript
-    ///    by deleting every line, which must stay empty (Cursor Bugbot on
-    ///    #229; `bugbot-rules/deleted-data-stays-deleted.md`).
-    ///  * Untranscribed audio (#355): the remote server stayed unreachable
-    ///    through the end-of-recording drain, so an utterance never made it
-    ///    into the live text. Saving that as final would quietly lose what was
-    ///    said during the outage, so the WAV goes to the batch pass instead —
-    ///    unless the user deleted live lines: the batch pass re-transcribes
-    ///    the whole WAV and would write every deleted line back. A deletion is
-    ///    a privacy action and wins over completeness; the audio is still on
-    ///    disk, and the user can re-transcribe deliberately.
-    ///
-    /// Pure + `static` so the decision is testable without a recording.
-    static func isLiveTranscriptAuthoritative(vadActive: Bool,
-                                              hasLiveSegments: Bool,
-                                              userDeletedLiveLines: Bool,
-                                              hasUntranscribedAudio: Bool) -> Bool {
-        let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
-        guard vadActive, hasLiveSegments || userEmptiedLiveTranscript else { return false }
-        if hasUntranscribedAudio && !userDeletedLiveLines { return false }
-        return true
     }
 
     /// Whether the offline re-diarize pass is worth running given how many

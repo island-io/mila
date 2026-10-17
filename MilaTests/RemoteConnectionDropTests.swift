@@ -9,16 +9,19 @@ import TranscriptionCore
 /// live transcript is saved as final and no batch pass runs over the WAV.
 ///
 /// What these pin:
-///   * the transient-vs-hard classification (`isTransientConnectivityError`):
-///     only "could not reach the server" is transient; anything the server
-///     ANSWERED with stays a loud error;
+///   * the transient-vs-hard classification (`isTransientRemoteFailure`):
+///     "could not reach the server" and "temporarily unavailable" are
+///     retryable; any other answer from the server stays a loud error;
 ///   * the live path reports a transient failure as an outcome, not an alert,
 ///     while dictation (which cannot retry) still alerts;
 ///   * the live transcriber keeps a failed utterance, shows the non-blocking
-///     warning, retries, and clears the warning by itself once the connection
-///     is back — with the utterance in the transcript;
-///   * Stop does not hang on an outage, and audio still untranscribed at Stop
-///     sends the recording to the batch pass (unless the user deleted lines).
+///     warning, retries, and clears the warning by itself once the server
+///     answers again — with the utterance in the transcript;
+///   * Stop's drain makes ONE upload attempt for a whole backlog when the
+///     server is still unreachable, and records the rest as missing spans;
+///   * missing spans are filled from the recorded audio and inserted in time
+///     order — at finalize and by "Retry missing parts" — and kept on the
+///     recording when they still fail.
 @MainActor
 final class RemoteConnectionDropTests: XCTestCase {
 
@@ -77,7 +80,7 @@ final class RemoteConnectionDropTests: XCTestCase {
 
     // MARK: - Classification
 
-    func test_unreachable_server_errors_are_transient() {
+    func test_unreachable_or_temporarily_unavailable_server_is_transient() {
         let codes: [URLError.Code] = [
             .notConnectedToInternet,
             .networkConnectionLost,
@@ -85,22 +88,38 @@ final class RemoteConnectionDropTests: XCTestCase {
             .cannotConnectToHost,
             .cannotFindHost,
             .dnsLookupFailed,
+            .secureConnectionFailed,
+            .cannotLoadFromNetwork,
+            .resourceUnavailable,
+            .dataNotAllowed,
+            .internationalRoamingOff,
+            .callIsActive,
         ]
         for code in codes {
-            XCTAssertTrue(TranscriptionService.isTransientConnectivityError(URLError(code)),
+            XCTAssertTrue(TranscriptionService.isTransientRemoteFailure(URLError(code)),
                           "URLError \(code.rawValue) means the server could not be reached")
         }
         // URLSession's completion handler hands over a bridged NSError.
         let bridged = NSError(domain: NSURLErrorDomain, code: NSURLErrorNetworkConnectionLost)
-        XCTAssertTrue(TranscriptionService.isTransientConnectivityError(bridged))
+        XCTAssertTrue(TranscriptionService.isTransientRemoteFailure(bridged))
+
+        for status in [408, 429, 502, 503, 504] {
+            XCTAssertTrue(TranscriptionService.isTransientRemoteFailure(
+                RemoteWhisperEngine.RemoteError.http(status: status, body: "")),
+                "HTTP \(status) says 'try again shortly'")
+        }
     }
 
     func test_server_refusals_and_configuration_errors_are_not_transient() {
         let hard: [any Error] = [
             RemoteWhisperEngine.RemoteError.http(status: 401, body: #"{"error":{"message":"bad key"}}"#),
+            RemoteWhisperEngine.RemoteError.http(status: 403, body: ""),
             RemoteWhisperEngine.RemoteError.http(status: 404, body: ""),
-            RemoteWhisperEngine.RemoteError.http(status: 429, body: ""),
-            RemoteWhisperEngine.RemoteError.http(status: 500, body: ""),
+            RemoteWhisperEngine.RemoteError.http(status: 400, body: ""),
+            RemoteWhisperEngine.RemoteError.http(status: 500, body: #"{"detail":"Failed to decode audio."}"#),
+            // Out of credit is a 429 too, and no amount of waiting fixes it.
+            RemoteWhisperEngine.RemoteError.http(
+                status: 429, body: #"{"error":{"code":"insufficient_quota","type":"insufficient_quota"}}"#),
             RemoteWhisperEngine.RemoteError.notConfigured,
             RemoteWhisperEngine.RemoteError.badResponse,
             RemoteWhisperEngine.RemoteError.emptyResult,
@@ -113,9 +132,18 @@ final class RemoteConnectionDropTests: XCTestCase {
             CancellationError(),
         ]
         for error in hard {
-            XCTAssertFalse(TranscriptionService.isTransientConnectivityError(error),
+            XCTAssertFalse(TranscriptionService.isTransientRemoteFailure(error),
                            "\(error) must stay a hard, visible error")
         }
+    }
+
+    func test_short_clips_get_a_short_request_timeout() {
+        let rate = Int(WhisperAudioFormat.sampleRate)
+        XCTAssertEqual(TranscriptionService.shortClipRequestTimeout(sampleCount: rate * 5), 30,
+                       "a padded live utterance must fail in seconds, not in an hour")
+        XCTAssertEqual(TranscriptionService.shortClipRequestTimeout(sampleCount: rate * 25), 50)
+        XCTAssertEqual(TranscriptionService.shortClipRequestTimeout(sampleCount: rate * 60 * 60 * 3),
+                       RemoteWhisperEngine.wholeRecordingTimeout)
     }
 
     func test_retry_backoff_doubles_and_is_capped() {
@@ -124,6 +152,16 @@ final class RemoteConnectionDropTests: XCTestCase {
         XCTAssertEqual(LiveTranscriber.connectionRetryDelay(attempt: 3, base: 2, max: 10), 8)
         XCTAssertEqual(LiveTranscriber.connectionRetryDelay(attempt: 4, base: 2, max: 10), 10)
         XCTAssertEqual(LiveTranscriber.connectionRetryDelay(attempt: 40, base: 2, max: 10), 10)
+    }
+
+    func test_insertion_keeps_time_order_and_existing_lines_first_on_ties() {
+        let merged = TranscriptionService.insertedInTimeOrder(
+            [TranscriptSegment(start: 1, end: 2, text: "recovered"),
+             TranscriptSegment(start: 5, end: 6, text: "tie")],
+            into: [TranscriptSegment(start: 0, end: 1, text: "a"),
+                   TranscriptSegment(start: 5, end: 6, text: "existing"),
+                   TranscriptSegment(start: 9, end: 10, text: "z")]) { $0.start }
+        XCTAssertEqual(merged.map(\.text), ["a", "recovered", "existing", "tie", "z"])
     }
 
     // MARK: - Service outcome
@@ -139,15 +177,32 @@ final class RemoteConnectionDropTests: XCTestCase {
                      "a transient network drop must not raise the blocking Transcription error alert")
     }
 
+    func test_live_path_treats_service_unavailable_as_transient() async {
+        await engine.setFailure(RemoteWhisperEngine.RemoteError.http(status: 503, body: "busy"))
+        let outcome = await service.transcribeLiveSegments(
+            samples: Self.speech(seconds: 1), language: "en", audioCtx: nil)
+        guard case .connectionUnavailable = outcome else {
+            return XCTFail("expected .connectionUnavailable, got \(outcome)")
+        }
+        XCTAssertNil(service.lastError)
+    }
+
     func test_live_path_still_alerts_on_a_server_refusal() async {
         await engine.setFailure(RemoteWhisperEngine.RemoteError.http(
             status: 401, body: #"{"error":{"message":"Incorrect API key provided"}}"#))
         let outcome = await service.transcribeLiveSegments(
             samples: Self.speech(seconds: 1), language: "en", audioCtx: nil)
-        guard case .skipped = outcome else {
-            return XCTFail("a refusal is not retryable, got \(outcome)")
+        guard case .failed = outcome else {
+            return XCTFail("a refusal is a failure, not a skip and not retryable, got \(outcome)")
         }
         XCTAssertNotNil(service.lastError, "a bad key must still be surfaced")
+    }
+
+    func test_live_requests_carry_the_short_timeout() async {
+        _ = await service.transcribeLiveSegments(
+            samples: Self.speech(seconds: 1), language: "en", audioCtx: nil)
+        let timeouts = await engine.requestTimeouts
+        XCTAssertEqual(timeouts, [30], "live clips must not inherit the whole-recording hour")
     }
 
     func test_one_shot_dictation_still_alerts_on_a_dropped_connection() async {
@@ -164,6 +219,8 @@ final class RemoteConnectionDropTests: XCTestCase {
 
     func test_vad_utterance_is_retried_and_warning_clears_when_connection_returns() async {
         await engine.setFailure(URLError(.networkConnectionLost))
+        transcriber.connectionRetryBaseDelay = 0.05
+        transcriber.connectionRetryMaxDelay = 0.05
         transcriber.useVAD = true
         transcriber.start(language: "en")
         transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2)))
@@ -173,26 +230,23 @@ final class RemoteConnectionDropTests: XCTestCase {
         XCTAssertTrue(warned, "a dropped connection must raise the non-blocking warning")
         XCTAssertNil(service.lastError, "…and not the blocking alert")
         XCTAssertTrue(transcriber.segments.isEmpty)
-        XCTAssertFalse(transcriber.hasUntranscribedAudio,
-                       "the utterance is still being retried, not given up on")
+        XCTAssertTrue(transcriber.untranscribedSpans.isEmpty,
+                      "the utterance is still being retried, not given up on")
 
         await engine.setFailure(nil)
         let recovered = await waitUntil { !self.transcriber.segments.isEmpty }
         XCTAssertTrue(recovered, "the utterance spoken during the outage must reach the transcript")
-        XCTAssertEqual(transcriber.segments.map(\.text), ["back online"])
+        XCTAssertEqual(transcriber.segments.count, 1)
         XCTAssertFalse(transcriber.isConnectionInterrupted,
                        "the warning must clear by itself once an upload gets through")
-        XCTAssertFalse(transcriber.hasUntranscribedAudio)
+        XCTAssertTrue(transcriber.untranscribedSpans.isEmpty)
         XCTAssertNil(service.lastError)
         let calls = await engine.transcribeCalls
         XCTAssertGreaterThanOrEqual(calls, 2, "the failed utterance must have been re-sent")
     }
 
-    func test_stop_drain_does_not_wait_out_an_outage_and_flags_the_gap() async {
+    func test_warning_clears_when_the_server_answers_even_with_a_refusal() async {
         await engine.setFailure(URLError(.notConnectedToInternet))
-        // A long backoff: the drain has to cut it short, not sleep through it.
-        transcriber.connectionRetryBaseDelay = 30
-        transcriber.connectionRetryMaxDelay = 30
         transcriber.useVAD = true
         transcriber.start(language: "en")
         transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2)))
@@ -200,20 +254,57 @@ final class RemoteConnectionDropTests: XCTestCase {
         let warned = await waitUntil { self.transcriber.isConnectionInterrupted }
         XCTAssertTrue(warned)
 
+        // The server is reachable again — it just refuses this request.
+        await engine.setFailure(RemoteWhisperEngine.RemoteError.http(status: 401, body: ""))
+        let cleared = await waitUntil { !self.transcriber.isConnectionInterrupted }
+        XCTAssertTrue(cleared, "a refusal is still an answer: the connection banner must go")
+        let marked = await waitUntil { !self.transcriber.untranscribedSpans.isEmpty }
+        XCTAssertTrue(marked, "a refused utterance must be recorded as missing, not dropped")
+        XCTAssertNotNil(service.lastError, "the refusal itself stays loud")
+    }
+
+    func test_stop_drain_makes_one_attempt_for_a_whole_backlog() async throws {
+        await engine.setFailure(URLError(.notConnectedToInternet))
+        // A long backoff: the drain has to cut it short, not sleep through it.
+        transcriber.connectionRetryBaseDelay = 30
+        transcriber.connectionRetryMaxDelay = 30
+        transcriber.useVAD = true
+        transcriber.start(language: "en")
+        // Two utterances: the second queues behind the first, which is stuck
+        // in its backoff.
+        transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2) + Self.silence(seconds: 1)
+                                      + Self.speech(seconds: 1.2)))
+        transcriber.pauseBoundary()
+        let warned = await waitUntil { self.transcriber.isConnectionInterrupted }
+        XCTAssertTrue(warned)
+        XCTAssertFalse(transcriber.isTranscribing,
+                       "nothing is being transcribed during the backoff, so no spinner")
+        let callsBeforeStop = await engine.transcribeCalls
+
         let startedAt = Date()
         await transcriber.transcribeNow()   // what stopRecording awaits
         XCTAssertLessThan(Date().timeIntervalSince(startedAt), 10,
-                          "Stop must not hang for the length of the outage")
-        XCTAssertTrue(transcriber.hasUntranscribedAudio,
-                      "an utterance still unsent at Stop must be reported, so the batch pass covers it")
+                          "Stop must not wait out the backoff")
+        let callsDuringDrain = await engine.transcribeCalls - callsBeforeStop
+        XCTAssertEqual(callsDuringDrain, 1,
+                       "once the drain finds the server unreachable, the rest of the backlog must not each pay a timeout")
+        XCTAssertEqual(transcriber.untranscribedSpans.count, 2,
+                       "both utterances are kept as missing spans, not dropped")
         XCTAssertNil(service.lastError)
+
+        // Stop's span pass right after: no second upload, so no second
+        // request timeout at Stop.
+        let audio = try writeAudio(Self.speech(seconds: 3.4))
+        await transcriber.recoverUntranscribedAudio(from: audio)
+        let callsAfterRecover = await engine.transcribeCalls - callsBeforeStop
+        XCTAssertEqual(callsAfterRecover, 1)
 
         _ = transcriber.stop()
         XCTAssertFalse(transcriber.isConnectionInterrupted, "the warning ends with the recording")
-        XCTAssertTrue(transcriber.hasUntranscribedAudio,
-                      "Stop reads the gap after its drain; stop() must not erase it first")
+        XCTAssertEqual(transcriber.untranscribedSpans.count, 2,
+                       "Stop reads the spans after its drain; stop() must not erase them first")
         transcriber.reset()
-        XCTAssertFalse(transcriber.hasUntranscribedAudio, "the next recording starts clean")
+        XCTAssertTrue(transcriber.untranscribedSpans.isEmpty, "the next recording starts clean")
     }
 
     func test_fixed_window_tick_warns_and_recovers_on_the_next_tick() async {
@@ -227,43 +318,122 @@ final class RemoteConnectionDropTests: XCTestCase {
         await engine.setFailure(nil)
         await transcriber.transcribeNow()
         XCTAssertFalse(transcriber.isConnectionInterrupted)
-        XCTAssertEqual(transcriber.segments.map(\.text), ["back online"])
+        XCTAssertEqual(transcriber.segments.count, 1)
     }
 
-    // MARK: - Stop: is the live transcript final?
+    // MARK: - Filling the gaps from the recorded audio
 
-    func test_untranscribed_audio_sends_the_recording_to_the_batch_pass() {
-        XCTAssertTrue(QuickActionsController.isLiveTranscriptAuthoritative(
-            vadActive: true, hasLiveSegments: true,
-            userDeletedLiveLines: false, hasUntranscribedAudio: false),
-            "baseline: a complete VAD transcript is final")
-        XCTAssertFalse(QuickActionsController.isLiveTranscriptAuthoritative(
-            vadActive: true, hasLiveSegments: true,
-            userDeletedLiveLines: false, hasUntranscribedAudio: true),
-            "a transcript with an outage-shaped hole must not be saved as final")
-        XCTAssertFalse(QuickActionsController.isLiveTranscriptAuthoritative(
-            vadActive: true, hasLiveSegments: false,
-            userDeletedLiveLines: false, hasUntranscribedAudio: true))
+    func test_finalize_fills_a_missing_span_from_the_audio_in_time_order() async throws {
+        let audio = Self.speech(seconds: 1.2) + Self.silence(seconds: 1) + Self.speech(seconds: 1.2)
+        let audioURL = try writeAudio(audio)
+        transcriber.useVAD = true
+        transcriber.start(language: "en")
+
+        // The first utterance is refused; the second goes through.
+        await engine.setFailure(RemoteWhisperEngine.RemoteError.http(status: 500, body: "hiccup"))
+        transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2) + Self.silence(seconds: 1)))
+        let marked = await waitUntil { self.transcriber.untranscribedSpans.count == 1 }
+        XCTAssertTrue(marked)
+        service.lastError = nil
+        await engine.setFailure(nil)
+        transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2)))
+        transcriber.pauseBoundary()
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["reply 2"])
+        let liveLine = try XCTUnwrap(transcriber.segments.first)
+
+        await transcriber.recoverUntranscribedAudio(from: audioURL)
+
+        XCTAssertEqual(transcriber.segments.count, 2, "the missing utterance is back")
+        XCTAssertEqual(transcriber.segments.last?.id, liveLine.id,
+                       "the recovered line goes BEFORE the later live line, and the live line is untouched")
+        XCTAssertEqual(transcriber.segments.first?.text, "reply 3")
+        XCTAssertLessThan(transcriber.segments[0].startSeconds, transcriber.segments[1].startSeconds)
+        XCTAssertTrue(transcriber.untranscribedSpans.isEmpty)
+        XCTAssertEqual(transcriber.fullText, "reply 3 reply 2")
+        XCTAssertNil(service.lastError)
     }
 
-    func test_user_deletions_win_over_the_gap_fallback() {
-        // The batch pass re-transcribes the whole WAV and would write every
-        // deleted line back (bugbot-rules/deleted-data-stays-deleted.md).
-        XCTAssertTrue(QuickActionsController.isLiveTranscriptAuthoritative(
-            vadActive: true, hasLiveSegments: true,
-            userDeletedLiveLines: true, hasUntranscribedAudio: true))
-        XCTAssertTrue(QuickActionsController.isLiveTranscriptAuthoritative(
-            vadActive: true, hasLiveSegments: false,
-            userDeletedLiveLines: true, hasUntranscribedAudio: true),
-            "an emptied transcript stays empty")
+    func test_finalize_keeps_spans_that_still_fail() async throws {
+        let audioURL = try writeAudio(Self.speech(seconds: 1.2) + Self.silence(seconds: 1)
+                                      + Self.speech(seconds: 1.2))
+        transcriber.useVAD = true
+        transcriber.start(language: "en")
+        await engine.setFailure(RemoteWhisperEngine.RemoteError.http(status: 500, body: "hiccup"))
+        transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2) + Self.silence(seconds: 1)))
+        let marked = await waitUntil { self.transcriber.untranscribedSpans.count == 1 }
+        XCTAssertTrue(marked)
+        await engine.setFailure(nil)
+        transcriber.ingest(ArraySlice(Self.speech(seconds: 1.2)))
+        transcriber.pauseBoundary()
+        await transcriber.transcribeNow()
+
+        await engine.setFailure(URLError(.notConnectedToInternet))
+        await transcriber.recoverUntranscribedAudio(from: audioURL)
+        XCTAssertEqual(transcriber.segments.count, 1, "nothing invented, nothing lost")
+        XCTAssertEqual(transcriber.untranscribedSpans.count, 1,
+                       "a span that still fails stays recorded, so Stop saves it on the recording")
     }
 
-    func test_fixed_window_mode_is_never_authoritative() {
-        for gap in [false, true] {
-            XCTAssertFalse(QuickActionsController.isLiveTranscriptAuthoritative(
-                vadActive: false, hasLiveSegments: true,
-                userDeletedLiveLines: false, hasUntranscribedAudio: gap))
-        }
+    func test_retry_missing_parts_fills_the_stored_recording_and_keeps_names() async throws {
+        let audioURL = store.freshAudioURL(suggestedName: "Gap")
+        try TestSupport.writeSineWav(at: audioURL, durationSeconds: 4)
+        let recording = Recording(
+            title: "Gap", duration: 4, source: .meeting,
+            audioFileName: audioURL.lastPathComponent, status: .completed, language: "en",
+            segments: [TranscriptSegment(start: 3, end: 4, text: "later", speaker: "SPEAKER_00")],
+            fullText: "later",
+            speakerNames: ["SPEAKER_00": "Dana"],
+            untranscribedSpans: [UntranscribedSpan(start: 0.5, end: 1.5)])
+        store.add(recording)
+
+        await service.retryUntranscribedSpans(of: recording.id)
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertNil(row.untranscribedSpans, "the gap is filled")
+        XCTAssertEqual(row.segments.map(\.text), ["reply 1", "later"])
+        XCTAssertEqual(row.segments.first?.start ?? -1, 0.5, accuracy: 0.001)
+        XCTAssertEqual(row.speakerNames, ["SPEAKER_00": "Dana"],
+                       "filling a gap must not re-key speakers the way a full pass does")
+        XCTAssertEqual(row.segments.last?.speaker, "SPEAKER_00")
+        XCTAssertEqual(row.fullText, "reply 1 later")
+        XCTAssertEqual(row.status, .completed)
+    }
+
+    func test_retry_missing_parts_while_offline_keeps_the_gap_and_says_so() async throws {
+        let audioURL = store.freshAudioURL(suggestedName: "Offline")
+        try TestSupport.writeSineWav(at: audioURL, durationSeconds: 4)
+        let spans = [UntranscribedSpan(start: 0.5, end: 1.5), UntranscribedSpan(start: 2, end: 2.8)]
+        let recording = Recording(
+            title: "Offline", duration: 4, source: .meeting,
+            audioFileName: audioURL.lastPathComponent, status: .completed, language: "en",
+            segments: [TranscriptSegment(start: 3, end: 4, text: "later")],
+            fullText: "later",
+            untranscribedSpans: spans)
+        store.add(recording)
+        await engine.setFailure(URLError(.notConnectedToInternet))
+
+        await service.retryUntranscribedSpans(of: recording.id)
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(row.untranscribedSpans, spans)
+        XCTAssertEqual(row.segments.map(\.text), ["later"])
+        let calls = await engine.transcribeCalls
+        XCTAssertEqual(calls, 1, "the first unreachable span ends the attempt")
+        XCTAssertNotNil(service.lastError, "a retry the user asked for must say it did nothing")
+        XCTAssertTrue(service.spanRetryIDs.isEmpty)
+    }
+
+    func test_untranscribed_spans_round_trip_and_are_omitted_when_empty() throws {
+        var recording = Recording(title: "R", source: .microphone, audioFileName: "r.wav")
+        let encoder = JSONEncoder()
+        let bare = try JSONSerialization.jsonObject(with: encoder.encode(recording)) as? [String: Any]
+        XCTAssertNil(bare?["untranscribedSpans"], "a complete transcript encodes exactly as before")
+
+        recording.untranscribedSpans = [UntranscribedSpan(start: 1, end: 2.5)]
+        let decoded = try JSONDecoder().decode(Recording.self, from: encoder.encode(recording))
+        XCTAssertEqual(decoded.untranscribedSpans, [UntranscribedSpan(start: 1, end: 2.5)])
+        XCTAssertEqual(decoded.untranscribedSeconds, 1.5, accuracy: 0.0001)
     }
 
     // MARK: - Helpers
@@ -272,6 +442,18 @@ final class RemoteConnectionDropTests: XCTestCase {
     /// silence guard lets it through.
     private static func speech(seconds: Double) -> [Float] {
         Array(repeating: Float(0.05), count: Int(16_000 * seconds))
+    }
+
+    private static func silence(seconds: Double) -> [Float] {
+        Array(repeating: Float(0), count: Int(16_000 * seconds))
+    }
+
+    /// The "recorded WAV": live time and file time are the same clock,
+    /// because the session feeds the live transcriber exactly what it writes.
+    private func writeAudio(_ samples: [Float]) throws -> URL {
+        let url = tempRoot.appendingPathComponent("recorded-\(UUID().uuidString).wav")
+        try AudioConvert.writeWhisperWAV(samples: samples, to: url)
+        return url
     }
 
     private func waitUntil(timeout: TimeInterval = 5,
@@ -286,16 +468,30 @@ final class RemoteConnectionDropTests: XCTestCase {
 }
 
 /// A remote engine whose "network" the test switches off and on. While a
-/// failure is set every call throws it; otherwise it answers with one segment.
+/// failure is set every call throws it; otherwise it answers with one segment
+/// whose text names the call ("reply N"), so a test can tell which upload
+/// produced which line.
 private actor FlakyRemoteEngine: RemoteTranscribing {
     private var failure: (any Error)?
     private(set) var transcribeCalls = 0
+    private(set) var requestTimeouts: [TimeInterval] = []
 
     func setFailure(_ error: (any Error)?) { failure = error }
 
     func configure(_ config: RemoteTranscriptionConfig) async {}
     func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
     func shutdown() async {}
+
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        requestTimeouts.append(requestTimeout)
+        return try await transcribe(samples: samples, language: language, audioCtx: audioCtx,
+                                    progress: nil, isCancelled: isCancelled)
+    }
+
     func transcribe(samples: [Float],
                     language: String,
                     audioCtx: Int32?,
@@ -303,6 +499,6 @@ private actor FlakyRemoteEngine: RemoteTranscribing {
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         transcribeCalls += 1
         if let failure { throw failure }
-        return [TranscriptSegment(start: 0, end: 1, text: "back online")]
+        return [TranscriptSegment(start: 0, end: 1, text: "reply \(transcribeCalls)")]
     }
 }

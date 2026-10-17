@@ -461,7 +461,7 @@ final class TranscriptionService: ObservableObject {
         switch await transcribeLiveSegments(samples: samples, language: language, audioCtx: audioCtx) {
         case .transcribed(let segments):
             return segments
-        case .skipped:
+        case .skipped, .failed:
             return []
         case .connectionUnavailable(let message):
             // A one-shot caller (dictation) has nothing to retry with — the
@@ -480,37 +480,61 @@ final class TranscriptionService: ObservableObject {
     /// `transcribeLiveSegments`.
     enum LiveTranscriptionOutcome {
         /// The backend answered. Empty when it heard no speech. For the
-        /// remote backend this is also proof that the connection is up.
+        /// remote backend this is also proof that the server is reachable.
         case transcribed([TranscriptSegment])
-        /// Nothing was transcribed and sending the same audio again would not
-        /// help: the service is stopping, the capture was silent, the backend
-        /// is not configured / the model is not installed, or the remote
-        /// server REJECTED the request (bad key, bad model, HTTP error). The
-        /// hard cases are already reported through `lastError`.
+        /// There was nothing to transcribe, or nobody wants the result: the
+        /// service is shutting down, the call was cancelled, or the capture
+        /// was silent. Not a gap in the transcript.
         case skipped
-        /// The remote backend could not be REACHED — the network dropped, the
-        /// connection was lost mid-upload, the request timed out
-        /// (`isTransientConnectivityError`). Nothing is wrong with the audio
-        /// or the configuration, and the same request should succeed once
-        /// connectivity returns. NOT reported through `lastError`: a short
+        /// Transcription SHOULD have happened and did not, and sending the
+        /// same audio straight back would not help: the server refused the
+        /// request (bad key, bad model, a non-retryable HTTP error), the
+        /// backend is not configured, or the local model is missing / threw.
+        /// Remote refusals are reported through `lastError`. The live
+        /// transcriber records the audio as a gap so it can be retried at
+        /// finalize (#355).
+        case failed
+        /// The remote server could not be REACHED, or said it is temporarily
+        /// unavailable (`isTransientRemoteFailure`). Nothing is wrong with the
+        /// audio or the configuration, and the same request should succeed
+        /// once the server is back. NOT reported through `lastError`: a short
         /// Wi-Fi drop mid-meeting used to pop a blocking "Transcription error"
         /// alert while the recording carried on fine underneath it (#355).
         /// The associated value is the error's user-facing text.
         case connectionUnavailable(String)
     }
 
-    /// Whether `error` says the remote server could not be reached, as
-    /// opposed to the server answering with a refusal.
+    /// Whether `error` means "try again shortly" rather than "this request is
+    /// wrong".
     ///
-    /// Deliberately narrow: only transport failures where no HTTP response
-    /// came back at all. Every `RemoteError` — an HTTP status (401, 404, 429,
-    /// 5xx), an unparseable body, an empty result, a missing configuration —
-    /// means the server WAS reached and said no, and those stay loud. A
-    /// mistyped host (`cannotFindHost`) is indistinguishable from DNS being
+    /// Two families:
+    ///  * transport failures where no HTTP response came back at all — no
+    ///    network, the connection dropped or timed out, the host could not be
+    ///    resolved or connected to, the TLS handshake failed (a captive portal
+    ///    or a network switch mid-handshake), cellular data not allowed;
+    ///  * an answer that itself says "temporarily": 408, 502, 503, 504, and a
+    ///    429 rate limit — but NOT OpenAI's `insufficient_quota` 429, which no
+    ///    amount of waiting fixes.
+    ///
+    /// Everything else the server answered stays a hard, visible error: 401,
+    /// 403, 404, 400, 500 (a self-hosted server's "Failed to decode audio",
+    /// #147), an unparseable body, an empty result, a missing configuration.
+    /// A mistyped host (`cannotFindHost`) is indistinguishable from DNS being
     /// down, so it counts as transient here; the record-start probe
     /// (`probeRemoteBackendIfActive`) is what reports a host that never
-    /// resolves, and the post-stop batch pass reports it again.
-    nonisolated static func isTransientConnectivityError(_ error: Error) -> Bool {
+    /// resolves.
+    nonisolated static func isTransientRemoteFailure(_ error: Error) -> Bool {
+        if let remote = error as? RemoteWhisperEngine.RemoteError {
+            guard case .http(let status, let body) = remote else { return false }
+            switch status {
+            case 408, 502, 503, 504:
+                return true
+            case 429:
+                return !body.contains("insufficient_quota")
+            default:
+                return false
+            }
+        }
         guard let urlError = error as? URLError else { return false }
         switch urlError.code {
         case .notConnectedToInternet,
@@ -518,11 +542,27 @@ final class TranscriptionService: ObservableObject {
              .timedOut,
              .cannotConnectToHost,
              .cannotFindHost,
-             .dnsLookupFailed:
+             .dnsLookupFailed,
+             .secureConnectionFailed,
+             .cannotLoadFromNetwork,
+             .resourceUnavailable,
+             .dataNotAllowed,
+             .internationalRoamingOff,
+             .callIsActive:
             return true
         default:
             return false
         }
+    }
+
+    /// Per-request idle timeout for a short clip: twice the audio's length,
+    /// at least 30 s, never more than the whole-recording hour. A live
+    /// utterance (≤ ~30 s, padded to 5 s) gets 30–60 s instead of the hour a
+    /// whole-recording upload needs — that hour is what let one stalled
+    /// connection hold the live queue and Stop's drain (#355).
+    nonisolated static func shortClipRequestTimeout(sampleCount: Int) -> TimeInterval {
+        let seconds = Double(sampleCount) / Double(WhisperAudioFormat.sampleRate)
+        return min(RemoteWhisperEngine.wholeRecordingTimeout, max(30, seconds * 2))
     }
 
     /// The live transcriber's entry point: the same routing as
@@ -553,16 +593,17 @@ final class TranscriptionService: ObservableObject {
             guard remoteSettings.isConfigured,
                   let config = remoteSettings.currentConfig(for: language) else {
                 serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
-                return .skipped
+                return .failed
             }
             await remoteEngine.configure(config)
             guard !cancellation.isStopped else { return .skipped }
             do {
-                let segs = try await remoteEngine.transcribe(samples: samples,
-                                                             language: language,
-                                                             audioCtx: audioCtx,
-                                                             progress: nil,
-                                                             isCancelled: { [cancellation] in cancellation.isStopped })
+                let segs = try await remoteEngine.transcribe(
+                    samples: samples,
+                    language: language,
+                    audioCtx: audioCtx,
+                    requestTimeout: Self.shortClipRequestTimeout(sampleCount: samples.count),
+                    isCancelled: { [cancellation] in cancellation.isStopped })
                 guard !cancellation.isStopped else { return .skipped }
                 return .transcribed(segs)
             } catch {
@@ -584,14 +625,15 @@ final class TranscriptionService: ObservableObject {
                 // for the banner. (Issue #213, CWE-532.)
                 serviceLog.error("""
                     transcribeOnceSegments(remote): FAILED \
-                    transient=\(Self.isTransientConnectivityError(error), privacy: .public) \
+                    transient=\(Self.isTransientRemoteFailure(error), privacy: .public) \
                     error=\(RemoteWhisperEngine.RemoteError.logMessage(for: error), privacy: .public)
                     """)
-                // The server could not be reached — not a configuration or
-                // server problem. Hand it back to the caller instead of the
-                // blocking alert: the live transcriber keeps the audio and
-                // retries it, and shows a non-blocking banner meanwhile (#355).
-                if Self.isTransientConnectivityError(error) {
+                // The server could not be reached, or is temporarily
+                // unavailable — not a configuration problem. Hand it back to
+                // the caller instead of the blocking alert: the live
+                // transcriber keeps the audio and retries it, and shows a
+                // non-blocking banner meanwhile (#355).
+                if Self.isTransientRemoteFailure(error) {
                     return .connectionUnavailable(error.localizedDescription)
                 }
                 // Surface the failure instead of returning a silently-empty
@@ -603,14 +645,14 @@ final class TranscriptionService: ObservableObject {
                 if lastError == nil {
                     lastError = "Live transcription failed: \(error.localizedDescription)"
                 }
-                return .skipped
+                return .failed
             }
         }
         let candidate = modelManager.model(for: language)
         guard let model = candidate,
               modelManager.isInstalled(model) else {
             serviceLog.log("transcribeOnceSegments: SKIP — model not installed for lang=\(language, privacy: .public) candidate=\(candidate?.name ?? "nil", privacy: .public) installed=\(self.modelManager.installed, privacy: .public)")
-            return .skipped
+            return .failed
         }
         let modelURL = modelManager.url(for: model)
         let startedAt = Date()
@@ -634,7 +676,143 @@ final class TranscriptionService: ObservableObject {
         } catch {
             if cancellation.isStopped || error is CancellationError { return .skipped }
             serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            return .skipped
+            return .failed
+        }
+    }
+
+
+    // MARK: - Untranscribed spans (#355)
+
+    /// What `transcribeSpans` came back with: the recovered segments, in
+    /// absolute recording time, unlabelled and with trimmed text; and the
+    /// spans that are still missing.
+    struct SpanTranscription {
+        var segments: [TranscriptSegment]
+        var unresolved: [UntranscribedSpan]
+    }
+
+    /// Transcribe ONLY `spans` of the audio at `audioURL` — the utterances the
+    /// live path gave up on — through the same backend routing as the live
+    /// path. Used at finalize (`LiveTranscriber.recoverUntranscribedAudio`)
+    /// and by "Retry missing parts" (`retryUntranscribedSpans`); the
+    /// whole-WAV batch pass would re-key every speaker and drop the user's
+    /// names, and re-transcribe lines the user deleted.
+    ///
+    /// The first span that fails — the server unreachable, or refusing —
+    /// ends the attempt: every remaining span is returned unresolved without
+    /// its own upload, so an outage costs one request timeout, and a bad key
+    /// one refusal, not one per span.
+    func transcribeSpans(_ spans: [UntranscribedSpan],
+                         audioURL: URL,
+                         language: String) async -> SpanTranscription {
+        var recovered: [TranscriptSegment] = []
+        var unresolved: [UntranscribedSpan] = []
+        var gaveUp = false
+        for span in spans {
+            if gaveUp || cancellation.isStopped {
+                unresolved.append(span)
+                continue
+            }
+            let samples: [Float]
+            do {
+                samples = try AudioConvert.loadAsWhisperSamples(url: audioURL, from: span.start, to: span.end)
+            } catch {
+                let ns = error as NSError
+                serviceLog.error("""
+                    transcribeSpans: could not read span \(span.start, privacy: .public)–\(span.end, privacy: .public)s \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]
+                    """)
+                unresolved.append(span)
+                continue
+            }
+            // Nothing on disk for this span, or nothing audible in it: there
+            // is no speech to recover, and the silence guard in
+            // `transcribeLiveSegments` would raise the "no audio was
+            // captured" alert for what is a perfectly good recording.
+            if samples.isEmpty || AudioSignal.isSilent(samples) { continue }
+            let duration = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
+            let outcome = await transcribeLiveSegments(
+                samples: LiveTranscriber.paddedUtterance(samples),
+                language: language, audioCtx: nil)
+            switch outcome {
+            case .transcribed(let segs):
+                for seg in segs {
+                    let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Same rules as the live VAD path: drop text hallucinated
+                    // into the padding, clamp the end to the real audio.
+                    guard !text.isEmpty, seg.start < duration else { continue }
+                    recovered.append(TranscriptSegment(start: span.start + seg.start,
+                                                       end: span.start + min(seg.end, duration),
+                                                       text: text))
+                }
+            case .skipped:
+                unresolved.append(span)
+            case .failed, .connectionUnavailable:
+                unresolved.append(span)
+                gaveUp = true
+            }
+        }
+        serviceLog.log("""
+            transcribeSpans: \(spans.count, privacy: .public) spans → \
+            \(recovered.count, privacy: .public) segments, \(unresolved.count, privacy: .public) still missing \
+            gaveUp=\(gaveUp, privacy: .public)
+            """)
+        return SpanTranscription(segments: recovered, unresolved: unresolved)
+    }
+
+    /// `incoming` merged into `existing` by start time. Ties keep `existing`
+    /// first, so the result is deterministic.
+    nonisolated static func insertedInTimeOrder<T>(_ incoming: [T],
+                                                   into existing: [T],
+                                                   start: (T) -> Double) -> [T] {
+        guard !incoming.isEmpty else { return existing }
+        return (existing + incoming).enumerated()
+            .sorted { (start($0.element), $0.offset) < (start($1.element), $1.offset) }
+            .map(\.element)
+    }
+
+    /// Recordings whose "Retry missing parts" is running. Changes only on a
+    /// user action, so it is safe on this App-level object.
+    @Published private(set) var spanRetryIDs: Set<UUID> = []
+
+    /// "Retry missing parts": transcribe the recording's `untranscribedSpans`
+    /// from its audio and insert what comes back into the transcript in time
+    /// order, keeping every existing line, speaker label and name. Spans that
+    /// still fail stay on the row. Does nothing while a full pass for the
+    /// recording is queued or running — that pass replaces the transcript
+    /// (and clears the spans) anyway.
+    func retryUntranscribedSpans(of recordingID: UUID) async {
+        guard !spanRetryIDs.contains(recordingID),
+              !isQueuedOrActive(recordingID),
+              let row = store.recordings.first(where: { $0.id == recordingID }),
+              let spans = row.untranscribedSpans, !spans.isEmpty else { return }
+        spanRetryIDs.insert(recordingID)
+        defer { spanRetryIDs.remove(recordingID) }
+        let result = await transcribeSpans(spans,
+                                           audioURL: store.audioURL(for: row),
+                                           language: row.transcriptLanguage)
+        // Re-read: the user kept working while the uploads ran. Apply only if
+        // the row still has the same gaps — a full pass that ran meanwhile
+        // already replaced the whole transcript.
+        guard var live = store.recordings.first(where: { $0.id == recordingID }),
+              live.untranscribedSpans == spans,
+              !isQueuedOrActive(recordingID) else { return }
+        let recovered = result.segments
+        if !recovered.isEmpty {
+            live.segments = Self.insertedInTimeOrder(recovered, into: live.segments) { $0.start }
+            live.fullText = live.segments
+                .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        }
+        live.untranscribedSpans = result.unresolved.isEmpty ? nil : result.unresolved
+        store.update(live)
+        if !recovered.isEmpty, !live.isTrashed {
+            TranscriptExporter.writeSRT(for: live, in: store.recordingsDirectory)
+        }
+        if result.unresolved.count == spans.count, lastError == nil {
+            // A user-initiated retry that changed nothing must say so.
+            lastError = "Couldn't transcribe the missing parts — the transcription server is still unreachable or refused them. They're kept on the recording; try again later."
         }
     }
 
@@ -1329,6 +1507,9 @@ final class TranscriptionService: ObservableObject {
                 $0.fullText = working.fullText
                 $0.duration = working.duration
                 $0.modelName = working.modelName
+                // A full pass transcribed the whole audio, so no part of it
+                // is missing any more (#355).
+                $0.untranscribedSpans = nil
                 // Only a pass that actually produced segments owns this. Such a
                 // pass re-keyed every SPEAKER_NN, so names bound to the old IDs
                 // would now label a different voice — hence the reset above. A

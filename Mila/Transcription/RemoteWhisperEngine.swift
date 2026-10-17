@@ -14,6 +14,29 @@ private let remoteLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 /// the live transcript). `RemoteWhisperEngine` is the only production conformer.
 protocol RemoteTranscribing: TranscribingEngine {
     func configure(_ config: RemoteTranscriptionConfig) async
+
+    /// One short clip (a live utterance, a dictation, a missing span) with
+    /// an explicit per-request idle timeout. The plain `transcribe` keeps the
+    /// 1-hour timeout a whole-recording upload needs; a live clip must fail
+    /// in seconds instead, or a connection that silently stops answering
+    /// holds the live queue — and Stop's drain — for an hour (#355).
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment]
+}
+
+extension RemoteTranscribing {
+    /// Test doubles have no network, so the timeout means nothing to them.
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await transcribe(samples: samples, language: language, audioCtx: audioCtx,
+                             progress: nil, isCancelled: isCancelled)
+    }
 }
 
 /// A `TranscribingEngine` that offloads transcription to an OpenAI-compatible
@@ -238,6 +261,27 @@ actor RemoteWhisperEngine: RemoteTranscribing {
                     audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await upload(samples: samples, language: language, progress: progress,
+                         isCancelled: isCancelled, requestTimeout: Self.wholeRecordingTimeout)
+    }
+
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await upload(samples: samples, language: language, progress: nil,
+                         isCancelled: isCancelled, requestTimeout: requestTimeout)
+    }
+
+    /// See the per-request override in `upload`.
+    static let wholeRecordingTimeout: TimeInterval = 60 * 60
+
+    private func upload(samples: [Float],
+                        language: String,
+                        progress: (@Sendable (Float) -> Void)?,
+                        isCancelled: (@Sendable () -> Bool)?,
+                        requestTimeout: TimeInterval) async throws -> [TranscriptSegment] {
         try checkCancellation(isCancelled)
         guard let config else { throw RemoteError.notConfigured }
 
@@ -266,8 +310,10 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         // well past 120s of server-side processing, which failed the whole
         // transcription with "The request timed out". Override per-request so
         // only the 1-hour resource timeout bounds the wait; the short idle
-        // timeout still applies to everything else on this session.
-        request.timeoutInterval = 60 * 60
+        // timeout still applies to everything else on this session. Short
+        // clips (`transcribe(…requestTimeout:)`) pass their own, much shorter
+        // bound: a live utterance is answered in seconds or not at all.
+        request.timeoutInterval = requestTimeout
         request.setValue("multipart/form-data; boundary=\(boundary)",
                          forHTTPHeaderField: "Content-Type")
         if !config.apiKey.isEmpty {

@@ -43,7 +43,9 @@ struct LiveAIRecordingView: View {
             // Non-blocking, self-clearing: the remote server is unreachable
             // but the recording carries on, and the live transcript catches
             // up once the connection is back (#355). This used to be the
-            // modal "Transcription error" alert.
+            // modal "Transcription error" alert. Off the Home screen the
+            // floating recording chip carries the same state
+            // (`ConnectionDropIndicator`).
             if transcriber.isConnectionInterrupted {
                 ConnectionInterruptedBanner()
                     .transition(.move(edge: .top).combined(with: .opacity))
@@ -649,14 +651,14 @@ struct LiveAIRecordingView: View {
 
 /// Inline warning shown while the remote transcription server is unreachable
 /// mid-recording (`LiveTranscriber.isConnectionInterrupted`, #355). Purely
-/// informational — nothing to dismiss: it goes away by itself once an upload
-/// gets through again, or when the recording stops.
+/// informational — nothing to dismiss: it goes away by itself once the server
+/// answers again, or when the recording stops.
 private struct ConnectionInterruptedBanner: View {
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "wifi.exclamationmark")
                 .foregroundStyle(.orange)
-            Text("Connection to the transcription server lost. Recording continues — the live transcript will catch up when the connection is back.")
+            Text("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
                 .font(.caption)
                 .foregroundStyle(.primary)
                 .fixedSize(horizontal: false, vertical: true)
