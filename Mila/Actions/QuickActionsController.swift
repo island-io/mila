@@ -299,9 +299,19 @@ final class QuickActionsController: ObservableObject {
     /// transcriber + diarizer because a drain still owned them;
     /// `releaseLivePipeline()` does that clear instead.
     private var livePipelineResetDeferred = false
-    /// Set by `claimLivePipeline(startingLiveAISession:)` when the Live AI
-    /// session start it would have made had to wait for the drain.
+    /// Set by `prepareLivePipeline(startingLiveAISession:)` — BEFORE capture
+    /// is brought up — when the Live AI session start this recording needs
+    /// has to wait for the drain. Decided there rather than when capture is
+    /// confirmed (`claimLivePipeline`) because a bring-up can take seconds
+    /// (Bluetooth, #291) and the drain can release the pipeline inside that
+    /// window: the release must already know to start the session, or the
+    /// live wiring would feed a session nobody started.
     private var liveAISessionStartDeferred = false
+    /// The release started this recording's Live AI session while its
+    /// capture was still coming up, so `claimLivePipeline` must not start it
+    /// again — a second `start()` would wipe the summary and the transcript
+    /// the feed loop has already sent. Reset by every `prepareLivePipeline`.
+    private var liveAISessionStartedByRelease = false
 
     /// Late-bound by MilaApp. Called once per finished recording, **with
     /// that recording's id**, from inside the finalize drain: after
@@ -552,7 +562,7 @@ final class QuickActionsController: ObservableObject {
             return
         }
         guard activeJob == .none else { return }
-        prepareLivePipeline()
+        prepareLivePipeline(startingLiveAISession: false)
         await session.startFakeForTesting(outputURL: outputURL)
         claimLivePipeline(startingLiveAISession: false)
         activeJob = .recording(withSystemAudio: false)
@@ -571,7 +581,7 @@ final class QuickActionsController: ObservableObject {
     ///     in `wireLiveAIPipeline` also covers a stop that beats that async
     ///     observer. When the pipeline does run, the observer's own
     ///     `transcriber.start()` / `diarizer.reset()` repeat this harmlessly.
-    private func prepareLivePipeline() {
+    private func prepareLivePipeline(startingLiveAISession: Bool) {
         // No settings object means no gate to apply: a host that never
         // injected `LiveAISettings` (the unit-test seams) gets the historical
         // behaviour — the live pipeline is whatever got wired, and Stop
@@ -580,6 +590,7 @@ final class QuickActionsController: ObservableObject {
         // the live transcript and speaker names of a recording whose pipeline
         // did run. In the app the settings are always injected.
         recordingRunsLivePipeline = liveAISettings?.runsLivePipeline ?? true
+        liveAISessionStartedByRelease = false
         // The previous recording's drain is still reading these (issue #356):
         // clearing them now would hand it an empty transcript and pool to save
         // as that recording's. `releaseLivePipeline()` clears them the moment
@@ -588,8 +599,10 @@ final class QuickActionsController: ObservableObject {
         // drain read its own copy before its first await.)
         if isFinalizingRecording {
             livePipelineResetDeferred = true
+            liveAISessionStartDeferred = startingLiveAISession
             return
         }
+        liveAISessionStartDeferred = false
         liveTranscriber?.reset()
         liveDiarizer?.reset()
     }
@@ -607,20 +620,26 @@ final class QuickActionsController: ObservableObject {
     /// drain still reads `liveAISession.summary` / `actionItems` for the
     /// recording it is saving, and `start()` clears both.
     private func claimLivePipeline(startingLiveAISession: Bool) {
-        guard isFinalizingRecording else {
-            if startingLiveAISession { liveAISession?.start() }
+        if isFinalizingRecording {
+            // The session start (if any) was queued by `prepareLivePipeline`;
+            // the release makes it.
+            quickActionsLog.log("record start during the previous recording's live drain — capturing now, live pipeline follows when the drain releases it")
+            isAwaitingLivePipeline = true
             return
         }
-        quickActionsLog.log("record start during the previous recording's live drain — capturing now, live pipeline follows when the drain releases it")
-        liveAISessionStartDeferred = startingLiveAISession
-        isAwaitingLivePipeline = true
+        // The drain released the pipeline while capture was still coming up,
+        // and the release already started this recording's session.
+        if liveAISessionStartedByRelease {
+            liveAISessionStartedByRelease = false
+            return
+        }
+        if startingLiveAISession { liveAISession?.start() }
     }
 
     /// Runs when a drain lets go of the live singletons (the
     /// `isFinalizingRecording` `didSet`). Completes whatever a record start
-    /// made during the drain had to defer — the clear `prepareLivePipeline()`
-    /// skipped, the Live AI session start `claimLivePipeline` skipped. The
-    /// live WIRING (`MilaApp.wireLiveAIPipeline`) observes the flag clearing
+    /// made during the drain had to defer — the clear and the Live AI session
+    /// start `prepareLivePipeline` queued. The live WIRING (`MilaApp.wireLiveAIPipeline`) observes the flag clearing
     /// and runs after this, so it always finds the singletons cleared and the
     /// session fresh.
     ///
@@ -634,11 +653,16 @@ final class QuickActionsController: ObservableObject {
             liveTranscriber?.reset()
             liveDiarizer?.reset()
         }
-        if isAwaitingLivePipeline {
-            isAwaitingLivePipeline = false
-            if liveAISessionStartDeferred { liveAISession?.start() }
+        // Started whether or not capture has been confirmed yet: a start
+        // whose bring-up is still running when the drain ends is wired as
+        // soon as its `.recording` is observed, and must find its session
+        // fresh — `claimLivePipeline` then knows not to start it twice.
+        if liveAISessionStartDeferred {
+            liveAISessionStartDeferred = false
+            liveAISession?.start()
+            liveAISessionStartedByRelease = !isAwaitingLivePipeline
         }
-        liveAISessionStartDeferred = false
+        isAwaitingLivePipeline = false
     }
 
     /// The recording that was waiting for the hand-over has ended before it
@@ -748,7 +772,7 @@ final class QuickActionsController: ObservableObject {
         if withSystemAudio {
             session.selectApp(nil)
         }
-        prepareLivePipeline()
+        prepareLivePipeline(startingLiveAISession: true)
         do {
             try await session.start(source: source, outputURL: url,
                                     cancellation: startCancellation)
@@ -830,7 +854,12 @@ final class QuickActionsController: ObservableObject {
         // denied after sleep) must not leave it lying around.
         pendingStartAbandonReason = nil
         startCancellation = nil
-        if case .starting = activeJob { activeJob = .none }
+        if case .starting = activeJob {
+            activeJob = .none
+            // Nothing came up, so a Live AI session start queued for the
+            // drain's release (`prepareLivePipeline`) is owed to no one.
+            liveAISessionStartDeferred = false
+        }
     }
 
     /// The check every start path runs when it regains control after an
@@ -973,7 +1002,7 @@ final class QuickActionsController: ObservableObject {
         session.selectApp(app)
         let titleBase = app?.applicationName ?? "System Audio"
         let url = store.freshAudioURL(suggestedName: titleBase)
-        prepareLivePipeline()
+        prepareLivePipeline(startingLiveAISession: true)
         do {
             try await session.start(source: source, outputURL: url,
                                     cancellation: startCancellation)

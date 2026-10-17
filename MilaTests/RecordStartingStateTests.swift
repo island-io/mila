@@ -194,6 +194,68 @@ final class RecordStartingStateTests: XCTestCase {
         XCTAssertEqual(published.jobs, [.starting(.microphone), .none])
     }
 
+    // MARK: - Previous recording's drain ends during the bring-up (#356)
+
+    /// A start made while the previous recording's live drain still owns the
+    /// live singletons defers this recording's Live AI session start to the
+    /// drain's release. The bring-up can take seconds (Bluetooth, #291), so
+    /// the release can land INSIDE it, before the start path has confirmed
+    /// capture. The release must start the session then — the live wiring
+    /// runs as soon as `.recording` is observed and feeds it — and the start
+    /// path must not start it a second time afterwards, which would wipe
+    /// what the feed loop already produced. (Cursor Bugbot on #371: the
+    /// session start used to be queued only once capture was confirmed, so a
+    /// release during the bring-up started nothing, and the late `start()`
+    /// cleared the summary.)
+    func test_a_drain_released_during_a_slow_bring_up_starts_the_live_session_exactly_once() async throws {
+        let suite = "RecordStartingStateTests.liveSession"
+        UserDefaults().removePersistentDomain(forName: suite)
+        defer { UserDefaults().removePersistentDomain(forName: suite) }
+        let aiSession = LiveAISession(
+            llmSettings: LLMSettings(defaults: UserDefaults(suiteName: suite)!),
+            liveAISettings: LiveAISettings(defaults: UserDefaults(suiteName: suite)!))
+        controller.liveAISession = aiSession
+        // The previous recording's drain owns the pipeline and is still
+        // reading its session's summary.
+        aiSession.seedForTesting(summary: "previous meeting")
+        controller.isFinalizingRecording = true
+
+        let gate = BringUpGate()
+        let entered = BringUpCounter()
+        session.mic.bringUpOverride = {
+            await entered.increment()
+            await gate.wait()
+        }
+        let start = Task { await controller.toggleRecord(microphone: true, appAudio: false) }
+        // The bring-up is reached only after `prepareLivePipeline` ran.
+        var inBringUp = false
+        for _ in 0..<500 {
+            if await entered.count > 0 { inBringUp = true; break }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(inBringUp)
+        XCTAssertEqual(aiSession.summary, "previous meeting",
+                       "the start must not touch the session the drain is still reading")
+
+        // The drain ends while capture is still coming up.
+        controller.isFinalizingRecording = false
+        XCTAssertEqual(aiSession.summary, "",
+                       "the release must start this recording's session even though capture is not confirmed yet")
+        // Stands in for what the live feed loop produces once wired.
+        aiSession.seedForTesting(summary: "this meeting so far")
+
+        await gate.open()
+        await start.value
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false))
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+        XCTAssertEqual(aiSession.summary, "this meeting so far",
+                       "confirming capture must not start the session a second time")
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
     // MARK: - Nothing to stop yet
 
     /// `stopRecording` is unguarded by the UI in this window only because every
