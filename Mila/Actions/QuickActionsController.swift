@@ -307,6 +307,12 @@ final class QuickActionsController: ObservableObject {
     var obsidianSettings: ObsidianVaultSettings?
     var obsidianExporter: ObsidianExporter?
 
+    /// Late-bound by MilaApp, which hands ownership here. Same reason as the
+    /// summarizer above: the live-transcript save path never reaches
+    /// `TranscriptionService.onTranscriptionCompleted`, so it marks its fresh
+    /// completion for speaker-name suggestions itself (issue #348).
+    var speakerNameSuggester: SpeakerNameSuggester?
+
     /// Active silence-watch task — cancelled when the recording stops so
     /// we never fire the warning for a recording that's already over.
     private var silenceWatchTask: Task<Void, Never>?
@@ -1627,6 +1633,10 @@ final class QuickActionsController: ObservableObject {
                 // the completion hook synchronously.
                 let obsidianOn = (self.obsidianSettings?.enabled == true)
                     && (self.obsidianSettings?.vaultURL != nil)
+                // Likewise before the summarizer: its completion hook is what
+                // runs the speaker-name suggester, and a skip fires it
+                // synchronously. Speakers are final at this point.
+                self.speakerNameSuggester?.markPending(updated.id)
                 if self.liveAISettings?.enabled == true,
                    self.llmSettings?.isConfigured == true {
                     if obsidianOn { self.obsidianExporter?.markPending(updated.id) }
@@ -1700,6 +1710,11 @@ final class QuickActionsController: ObservableObject {
         current.segments = rediarized
         current.speakerNames = SpeakerNameRemapper.remap(names: namesBeforeRekey,
                                                          dominantOldIDs: newToOld)
+        // Pending name suggestions are keyed to the OLD ids. They carry no
+        // profile contribution, so nothing needs retiring — they are just
+        // dropped rather than left pointing at whoever the number now
+        // denotes. The suggester runs after this pass anyway (#348).
+        current.speakerNameSuggestions = []
         store.update(current,
                      retiringSpeakerNames: SpeakerNameRemapper.retiredNames(
                         names: namesBeforeRekey, dominantOldIDs: newToOld))

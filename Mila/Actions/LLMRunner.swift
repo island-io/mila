@@ -30,6 +30,8 @@ enum LLMFeature: String {
     case summary
     /// The user-triggered "Send to <tool>" post-recording action.
     case action
+    /// Post-recording speaker-name suggestions (`SpeakerNameSuggester`).
+    case speakerNames = "speaker-names"
     /// Live AI's periodic in-meeting tick.
     case liveAI = "live-ai"
     /// Settings → AI Provider's "Test" button (the `diagnose` path).

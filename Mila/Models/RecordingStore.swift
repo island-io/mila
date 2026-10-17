@@ -785,10 +785,93 @@ final class RecordingStore: ObservableObject {
             recordings[idx].speakerNames.removeValue(forKey: rawID)
             onSpeakerUnnamed?(recordingID, rawID, previousName)
         }
+        // Whatever was suggested for this speaker is settled by an explicit
+        // name either way: accepted, overruled, or the user resetting to the
+        // default label — which must not resurrect a suggestion they already
+        // looked past. Re-resolved by id: the hooks above ran caller code.
+        if let i = recordings.firstIndex(where: { $0.id == recordingID }) {
+            recordings[i].speakerNameSuggestions.removeAll { $0.speaker == rawID }
+        }
         persist()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
+    }
+
+    // MARK: - Speaker name suggestions (issue #348)
+
+    /// Add `suggestions` to a recording's pending speaker-name suggestions,
+    /// replacing any existing suggestion for the same speaker. Returns whether
+    /// anything changed (and was persisted).
+    ///
+    /// Only suggestions that can still be acted on are kept — the speaker has
+    /// lines in the transcript and no name yet — so a name that landed from
+    /// another path while the suggestion was being produced wins. Writes ONE
+    /// field on the LIVE row, never a caller's snapshot, for the same reason
+    /// `setSummaryLanguage` does.
+    ///
+    /// This never names anyone. Accepting is `acceptSpeakerNameSuggestion`.
+    @discardableResult
+    func mergeSpeakerNameSuggestions(_ suggestions: [SpeakerNameSuggestion],
+                                     recordingID: UUID) -> Bool {
+        guard !suggestions.isEmpty,
+              let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return false }
+        let row = recordings[idx]
+        let present = Set(row.segments.compactMap(\.speaker))
+        var merged = row.speakerNameSuggestions
+        for suggestion in suggestions {
+            guard present.contains(suggestion.speaker),
+                  (row.speakerNames[suggestion.speaker]?
+                    .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+            else { continue }
+            if let existing = merged.firstIndex(where: { $0.speaker == suggestion.speaker }) {
+                merged[existing] = suggestion
+            } else {
+                merged.append(suggestion)
+            }
+        }
+        guard merged != row.speakerNameSuggestions else { return false }
+        recordings[idx].speakerNameSuggestions = merged
+        persist()
+        return true
+    }
+
+    /// Drop the pending suggestion for `rawID` without naming anyone — the
+    /// user's "no, that's not them". No-op when there is none.
+    func dismissSpeakerNameSuggestion(forSpeaker rawID: String, recordingID: UUID) {
+        guard let idx = recordings.firstIndex(where: { $0.id == recordingID }) else { return }
+        let before = recordings[idx].speakerNameSuggestions.count
+        recordings[idx].speakerNameSuggestions.removeAll { $0.speaker == rawID }
+        guard recordings[idx].speakerNameSuggestions.count != before else { return }
+        persist()
+    }
+
+    /// Accept the pending suggestion for `rawID`: name the speaker through
+    /// `setSpeakerName` — the normal rename path, so the voice-profile hooks
+    /// fire exactly as they do for a name the user typed — and drop the
+    /// suggestion. Returns the name assigned, or nil when there was nothing
+    /// to accept (no suggestion, the speaker has gone, or it was named
+    /// meanwhile — an existing name is never replaced from here).
+    ///
+    /// `canonicalName` lets the caller route the name through the
+    /// `SpeakerDirectory` exactly as the rename popover does
+    /// (`directory.add`), so an accepted "dana" lands as the "Dana" the user
+    /// already has and appears in future pick-lists. Returning nil from it
+    /// cancels the accept.
+    @discardableResult
+    func acceptSpeakerNameSuggestion(forSpeaker rawID: String,
+                                     recordingID: UUID,
+                                     canonicalName: (String) -> String? = { $0 }) -> String? {
+        guard let row = recordings.first(where: { $0.id == recordingID }),
+              let suggestion = row.actionableSpeakerNameSuggestions
+                .first(where: { $0.speaker == rawID }),
+              let name = canonicalName(suggestion.name)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty
+        else { return nil }
+        // Removes the suggestion too (see the tail of `setSpeakerName`).
+        setSpeakerName(name, forSpeaker: rawID, recordingID: recordingID)
+        return name
     }
 
     /// Put a name back on a raw id a pass re-keyed, **without firing
