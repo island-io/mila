@@ -244,12 +244,15 @@ final class QuickActionsController: ObservableObject {
     /// clear, the `.idle` handler runs its own drain — covers the
     /// lock-screen / sleep / app-quit paths that don't reach
     /// `stopRecording`. Its `.recording` handler reads it too, to hold a new
-    /// recording's live wiring until the drain is over.
+    /// recording's live wiring until the drain is over, and it observes the
+    /// flag clearing to do that wiring.
     ///
     /// Clearing it (true → false) is what hands the singletons on: the
     /// `didSet` runs `releaseLivePipeline()`, so every path that ends a drain
     /// — the normal one, the failed stop, the row-removed exit — releases
-    /// them the same way.
+    /// them the same way. Only a stop that OWNS the live pipeline ever sets
+    /// it; a stop of a recording still waiting for the hand-over leaves it
+    /// to the drain that does (see `stopRecording`).
     @Published var isFinalizingRecording: Bool = false {
         didSet {
             if oldValue && !isFinalizingRecording { releaseLivePipeline() }
@@ -267,7 +270,10 @@ final class QuickActionsController: ObservableObject {
     /// Also the re-entry guard for `stopRecording` itself: a second Stop
     /// (double-click, ⌘↩ plus the meeting prompt, sleep during a stop) while
     /// one is already in progress is dropped rather than saving the same
-    /// capture twice.
+    /// capture twice. And the Pause gate: pausing a session that is being
+    /// stopped would move it out from under the stop. (It is deliberately
+    /// NOT `isFinalizingRecording`, which since #356 can belong to the
+    /// PREVIOUS recording's drain while a new one records.)
     @Published var isStoppingRecording: Bool = false
 
     /// True while a recording that started during the PREVIOUS recording's
@@ -275,6 +281,11 @@ final class QuickActionsController: ObservableObject {
     /// live singletons yet. Its audio is going to the WAV as normal, and the
     /// live samples are held by `MilaApp.wireLiveAIPipeline` and replayed into
     /// the transcriber once the drain releases it. Typically a second or two.
+    ///
+    /// Cleared synchronously by `releaseLivePipeline()`, so it is also the
+    /// signal `stopRecording` decides ownership on: a recording stopped while
+    /// this is still set never had the live pipeline and is stopped without
+    /// touching it.
     ///
     /// `LiveAIRecordingView` shows a placeholder instead of the live panes
     /// while this is set: until the hand-over, `liveTranscriber` /
@@ -291,8 +302,6 @@ final class QuickActionsController: ObservableObject {
     /// Set by `claimLivePipeline(startingLiveAISession:)` when the Live AI
     /// session start it would have made had to wait for the drain.
     private var liveAISessionStartDeferred = false
-    /// Callers parked in `awaitLivePipelineAvailable()`.
-    private var livePipelineWaiters: [CheckedContinuation<Void, Never>] = []
 
     /// Late-bound by MilaApp. Called once per finished recording, **with
     /// that recording's id**, from inside the finalize drain: after
@@ -610,13 +619,15 @@ final class QuickActionsController: ObservableObject {
     /// Runs when a drain lets go of the live singletons (the
     /// `isFinalizingRecording` `didSet`). Completes whatever a record start
     /// made during the drain had to defer — the clear `prepareLivePipeline()`
-    /// skipped, the Live AI session start `claimLivePipeline` skipped — and
-    /// only then resumes `awaitLivePipelineAvailable()` callers, so the live
-    /// wiring in `MilaApp.wireLiveAIPipeline` (one of those callers) always
-    /// finds the singletons cleared and the session fresh.
+    /// skipped, the Live AI session start `claimLivePipeline` skipped. The
+    /// live WIRING (`MilaApp.wireLiveAIPipeline`) observes the flag clearing
+    /// and runs after this, so it always finds the singletons cleared and the
+    /// session fresh.
     ///
     /// Synchronous on purpose: nothing can observe the singletons between the
-    /// drain's last read and the clear here.
+    /// drain's last read and the clear here, and `stopRecording` decides
+    /// whether a recording owns the live pipeline on `isAwaitingLivePipeline`,
+    /// which flips here in the same turn.
     private func releaseLivePipeline() {
         if livePipelineResetDeferred {
             livePipelineResetDeferred = false
@@ -628,24 +639,34 @@ final class QuickActionsController: ObservableObject {
             if liveAISessionStartDeferred { liveAISession?.start() }
         }
         liveAISessionStartDeferred = false
-        let waiters = livePipelineWaiters
-        livePipelineWaiters.removeAll()
-        for waiter in waiters { waiter.resume() }
     }
 
-    /// Suspends until no `stopRecording` drain owns the live singletons
-    /// (`isFinalizingRecording` is false). Returns at once when none does.
-    ///
-    /// Used by `MilaApp.wireLiveAIPipeline` to hold a new recording's live
-    /// wiring, and by `stopRecording` so a recording started during the
-    /// previous drain is not stopped (and snapshotted) before it has been
-    /// handed the live pipeline. Re-checks after every wake-up: a waiter
-    /// resumed by one drain's release must not run inside the next drain.
-    func awaitLivePipelineAvailable() async {
-        while isFinalizingRecording {
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                livePipelineWaiters.append(continuation)
-            }
+    /// The recording that was waiting for the hand-over has ended before it
+    /// got it: nothing is owed to it any more. The deferred clear stays
+    /// pending — the singletons still have to be cleared for whatever records
+    /// next — but the Live AI session start is dropped, so the drain's
+    /// release doesn't start a session for a recording that is over.
+    private func abandonLivePipelineClaim() {
+        isAwaitingLivePipeline = false
+        liveAISessionStartDeferred = false
+    }
+
+    /// End-of-drain disposal of the live diarizer. Normally its daemon is
+    /// shut down with the recording. When a recording is waiting for the
+    /// hand-over, a ready daemon is kept running and only the pool is cleared:
+    /// that recording's held audio is replayed the moment it is wired, and a
+    /// cold daemon (3–5 s of pyannote init) would skip every one of those
+    /// utterances (`process` requires `isReady`), leaving its opening with no
+    /// speaker labels. Its wiring's `start()` finds the daemon running and
+    /// reuses it. Only while diarization is still configured — the
+    /// "already running" path in `start()` does not re-check that.
+    private func retireLiveDiarizerAfterDrain() {
+        if isAwaitingLivePipeline,
+           transcription.isDiarizationConfigured,
+           liveDiarizer?.isReady == true {
+            liveDiarizer?.reset()
+        } else {
+            liveDiarizer?.stop()
         }
     }
 
@@ -669,6 +690,7 @@ final class QuickActionsController: ObservableObject {
     /// waited for (bounded — the observer is not installed in every host).
     func discardFakeRecordingForTesting() async {
         guard case .recording = activeJob else { return }
+        abandonLivePipelineClaim()
         silenceWatchTask?.cancel()
         silenceWatchTask = nil
         remoteProbeTask?.cancel()
@@ -1029,6 +1051,14 @@ final class QuickActionsController: ObservableObject {
         // used to fall through to `session.stop()`, which returns the still-
         // assigned `fileURL` mid-teardown, and save the same capture twice.
         if isStoppingRecording {
+            // A sleep that lands during a stop already in progress arrives
+            // here via `stopBecauseOfSleep`, which set the reason before
+            // calling. This call is dropped, so the reason must go with it —
+            // left set, the NEXT recording's ordinary Stop would consume it,
+            // suppress its rename sheet and raise a false "stopped because
+            // your Mac went to sleep" alert. (The stop in progress read its
+            // own reason before its first suspension.)
+            pendingSleepStopReason = nil
             quickActionsLog.log("stopRecording ignored — a stop is already in progress")
             return
         }
@@ -1036,28 +1066,20 @@ final class QuickActionsController: ObservableObject {
         // recording may start — not by a `defer`: the live-pipeline drain
         // after that must not hold record starts off (issue #356).
         isStoppingRecording = true
-        // A recording started while the PREVIOUS recording's drain still owned
-        // the live singletons has not been handed them yet
-        // (`isAwaitingLivePipeline`): the transcriber still holds the previous
-        // meeting's transcript. Stopping it now would snapshot that transcript
-        // as this recording's, and our own drain would collide with the one
-        // in flight. Wait for that drain to release them — usually a second or
-        // two; capture keeps running meanwhile, so nothing is lost, the stop
-        // just lands a little later. Returns at once in the ordinary case.
-        if isFinalizingRecording {
-            quickActionsLog.log("stopRecording waiting for the previous recording's live drain")
-            await awaitLivePipelineAvailable()
-            // Let the live wiring the release just resumed run first, so this
-            // recording is stopped with its live pipeline armed rather than
-            // half-way through being handed it.
-            await Task.yield()
-            if case .starting = activeJob {
-                // Unreachable through the UI (every start path refuses while
-                // `isStoppingRecording`), but the guard above must hold after
-                // a suspension too.
-                isStoppingRecording = false
-                return
-            }
+        // Does this recording own the live singletons? Not if it started
+        // during the PREVIOUS recording's drain and has not been handed them
+        // yet (`isAwaitingLivePipeline`, cleared synchronously by the
+        // release): they still hold the previous meeting, which that drain is
+        // saving. Such a stop must neither wait for that drain — a slow or
+        // hung one would keep the mic open on a recording the user stopped —
+        // nor read or tear down what it is using. So it closes the capture
+        // now and saves the row with no live transcript, which sends it to
+        // the batch pass: the WAV has every sample, so nothing is lost but
+        // the live preview.
+        let ownsLivePipeline = !isAwaitingLivePipeline
+        if !ownsLivePipeline {
+            quickActionsLog.log("stopRecording — recording never received the live pipeline; stopping without it (batch transcription)")
+            abandonLivePipelineClaim()
         }
         let captured = activeJob
         // Pinned at record start by `prepareLivePipeline()`. Every read of
@@ -1068,7 +1090,7 @@ final class QuickActionsController: ObservableObject {
         // `reset()` and the transcriber's epoch guard are the first line of
         // defence; this is the second, so a snapshot can never promote stray
         // live text into a final transcript and skip the batch pass.
-        let runsLivePipeline = recordingRunsLivePipeline
+        let runsLivePipeline = ownsLivePipeline && recordingRunsLivePipeline
         let durationBeforeStop = session.elapsed
         let sleepReason = pendingSleepStopReason
         pendingSleepStopReason = nil
@@ -1101,8 +1123,22 @@ final class QuickActionsController: ObservableObject {
         // tail (re-diarize / summarize / transcode) runs. Each early-return
         // path clears it explicitly; clearing it is what releases the
         // singletons (`releaseLivePipeline()`).
-        isFinalizingRecording = true
+        //
+        // Not set by a stop that does not own the live pipeline: the flag is
+        // the PREVIOUS recording's drain's, and setting or clearing it here
+        // would release the singletons under that drain.
+        if ownsLivePipeline { isFinalizingRecording = true }
         guard let outputURL = await session.stop() else {
+            // Same one-shot rule as the successful path: a failed stop
+            // must not leave title/folder selected for the next recording.
+            nextRecordingTitle = ""
+            nextRecordingFolder = nil
+            guard ownsLivePipeline else {
+                // Nothing of the live pipeline is ours to tear down.
+                activeJob = .none
+                isStoppingRecording = false
+                return
+            }
             // Failed stop: still tear down the live pipelines since
             // wireLiveAIPipeline's `.idle` handler skipped its
             // teardown because of the flag. Without this, the
@@ -1118,10 +1154,6 @@ final class QuickActionsController: ObservableObject {
             // over either way, so its notes must not carry into the next
             // recording.
             liveAISettings?.meetingContext = ""
-            // Same one-shot rule as the successful path: a failed stop
-            // must not leave title/folder selected for the next recording.
-            nextRecordingTitle = ""
-            nextRecordingFolder = nil
             liveSidecarWriter?.finish(recordingID: nil)
             isFinalizingRecording = false
             activeJob = .none
@@ -1322,6 +1354,18 @@ final class QuickActionsController: ObservableObject {
             postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
         }
 
+        // A recording that never had the live pipeline has nothing to drain,
+        // no live sidecar of its own (it was never `begin`-ed, and the one on
+        // disk belongs to the drain still running), and no live diarizer pool
+        // to hand to voice recognition — the pool is the previous meeting's.
+        // Its row was saved `.pending` with no live text above; the batch pass
+        // transcribes the WAV.
+        guard ownsLivePipeline else {
+            let saved = store.recordings.first(where: { $0.id == recording.id }) ?? recording
+            finalizeTail(for: saved, liveTranscriptIsAuthoritative: false)
+            return
+        }
+
         // ---- INLINE LIVE-PIPELINE DRAIN: finalize whatever was still
         // in-flight in the live singletons, then update the Recording in
         // the store so the sheet re-renders with final data.
@@ -1474,7 +1518,7 @@ final class QuickActionsController: ObservableObject {
             // more to update, but we still need to clean up the live
             // pipelines below before returning.
             liveTranscriber?.stop()
-            liveDiarizer?.stop()
+            retireLiveDiarizerAfterDrain()
             // The row this snapshot belonged to is gone, so there is
             // nothing left to read `summary` / `actionItems` for.
             liveAISession?.cancel()
@@ -1605,7 +1649,7 @@ final class QuickActionsController: ObservableObject {
         //
         // Cleanup: `.idle` handler skipped these because the flag was set.
         liveTranscriber?.stop()
-        liveDiarizer?.stop()
+        retireLiveDiarizerAfterDrain()
         // Shut the Live AI session down too — deliberately AFTER the
         // snapshot above, because `cancel()` clears `summary` /
         // `actionItems` and those are what we just saved.
@@ -2210,9 +2254,16 @@ final class QuickActionsController: ObservableObject {
     /// pre-pause audio and reaches the transcriber through `onLiveSamples`,
     /// so the detector's pause boundary has to come after it.
     func pauseRecording() async {
-        guard isRecording, !isFinalizingRecording, !isPaused else { return }
+        // Gated on THIS recording's stop, not on `isFinalizingRecording`:
+        // since #356 that flag can belong to the previous recording's drain
+        // while this one records, and must not stop it being paused.
+        guard isRecording, !isStoppingRecording, !isPaused else { return }
         await session.pause()
-        liveTranscriber?.pauseBoundary()
+        // Until the hand-over the transcriber is the previous recording's
+        // (still draining); the pause boundary of a recording whose live
+        // audio is being held is marked in the hold instead
+        // (`MilaApp.wireLiveAIPipeline`).
+        if !isAwaitingLivePipeline { liveTranscriber?.pauseBoundary() }
     }
 
     /// Resume a paused recording. Capture picks back up where it left off;

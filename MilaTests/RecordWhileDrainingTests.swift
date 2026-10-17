@@ -21,9 +21,11 @@ import MilaKit
 /// `isFinalizingRecording` (`releaseLivePipeline()`), and `MilaApp`'s live
 /// wiring holds the new recording's audio until then and replays it.
 ///
-/// These tests pin both halves: the new recording really starts during the
-/// drain, and the drain still saves the PREVIOUS recording's transcript — the
-/// thing the old gate existed to protect.
+/// These tests pin: the new recording really starts during the drain; the
+/// drain still saves the PREVIOUS recording's transcript (the thing the old
+/// gate existed to protect); the new recording can be stopped, and paused,
+/// without waiting for that drain; and a dropped Stop does not leave a sleep
+/// reason behind for the next recording.
 @MainActor
 final class RecordWhileDrainingTests: XCTestCase {
 
@@ -34,8 +36,11 @@ final class RecordWhileDrainingTests: XCTestCase {
     private var service: TranscriptionService!
     private var session: RecordingSession!
     private var languageSettings: RecordingLanguageSettings!
+    private var postRecording: PostRecordingCoordinator!
     private var controller: QuickActionsController!
     private var transcriber: LiveTranscriber!
+    private var sidecarRoot: URL!
+    private var sidecar: LiveTranscriptSidecarWriter!
 
     private let suitePrefix = "RecordWhileDrainingTests"
 
@@ -63,15 +68,25 @@ final class RecordWhileDrainingTests: XCTestCase {
         session = RecordingSession()
         languageSettings = RecordingLanguageSettings(
             defaults: UserDefaults(suiteName: "\(suitePrefix).language")!)
+        postRecording = PostRecordingCoordinator(
+            store: store,
+            transcription: service,
+            llm: LLMSettings(defaults: UserDefaults(suiteName: "\(suitePrefix).llm")!))
         controller = QuickActionsController(
             session: session,
             store: store,
             transcription: service,
             languageSettings: languageSettings,
-            postRecording: PostRecordingCoordinator(
-                store: store,
-                transcription: service,
-                llm: LLMSettings(defaults: UserDefaults(suiteName: "\(suitePrefix).llm")!)))
+            postRecording: postRecording)
+        // The live sidecar is single-recording; only the drain that owns it
+        // may close it. A long heartbeat keeps the timer out of the
+        // assertions.
+        sidecarRoot = tempRoot.appendingPathComponent("SidecarRoot", isDirectory: true)
+        try FileManager.default.createDirectory(at: sidecarRoot, withIntermediateDirectories: true)
+        sidecar = LiveTranscriptSidecarWriter(root: sidecarRoot,
+                                              minWriteInterval: 0,
+                                              heartbeatInterval: 3600)
+        controller.liveSidecarWriter = sidecar
         // The live transcriber `MilaApp` hands the controller. Fixed-window
         // mode (no VAD), so `transcribeNow()` is one whisper pass over the
         // buffered audio — a drain whose length the stub's delay controls.
@@ -183,18 +198,27 @@ final class RecordWhileDrainingTests: XCTestCase {
         XCTAssertEqual(store.recordings.count, 2)
     }
 
-    /// Stopping a recording that started during the previous drain, before
-    /// that drain has released the live pipeline to it, must wait for the
-    /// release. Proceeding would snapshot the transcriber — which still holds
-    /// the PREVIOUS meeting — as this recording's transcript.
-    func test_stopping_a_recording_still_waiting_for_the_live_pipeline_waits_for_the_release() async throws {
-        // Stand-in for a previous recording's drain still owning the live
-        // singletons, with its transcript still in the transcriber.
+    /// Stand-in for a previous recording whose drain still owns the live
+    /// singletons: its transcript is in the transcriber and its sidecar is
+    /// open.
+    private func simulatePreviousRecordingDraining() {
         transcriber.seedForTesting([
             LiveSegment(id: UUID(), startSeconds: 0, endSeconds: 1,
                         text: "previous meeting", speaker: nil, stable: true)
         ])
+        sidecar.begin(title: "Previous", source: "microphone", liveAvailable: true)
         controller.isFinalizingRecording = true
+    }
+
+    /// Stopping a recording that started during the previous drain, before
+    /// that drain has handed it the live pipeline, must NOT wait for the
+    /// drain: a slow or hung drain would otherwise keep the mic open on a
+    /// recording the user (or sleep / lock) stopped. It closes the capture at
+    /// once and is saved for the batch pass — and it must not touch what the
+    /// other drain is using: the transcriber's text, the
+    /// `isFinalizingRecording` ownership, or the sidecar.
+    func test_stopping_a_recording_still_waiting_for_the_live_pipeline_does_not_wait_for_the_other_drain() async throws {
+        simulatePreviousRecordingDraining()
 
         let url = try freshWAV("StopBeforeHandover")
         await controller.startFakeRecordingForTesting(outputURL: url)
@@ -202,31 +226,86 @@ final class RecordWhileDrainingTests: XCTestCase {
         XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"],
                        "the start must not clear the transcriber the drain is still reading")
 
-        let stop = Task { await controller.stopRecording() }
-        let accepted = await waitUntil { controller.isStoppingRecording }
-        XCTAssertTrue(accepted)
-        // Give the stop every chance to run ahead if it were going to.
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertTrue(store.recordings.isEmpty,
-                      "the stop must not save anything until the drain has released the live pipeline")
-        XCTAssertEqual(session.state, .recording, "capture keeps running while the stop waits")
-
-        // A second Stop while the first is pending is dropped, not queued.
+        // Called directly: if it waited for the other drain this would hang,
+        // because nothing clears the flag before it returns.
         await controller.stopRecording()
-        XCTAssertTrue(store.recordings.isEmpty)
 
-        // The drain ends: the singletons are cleared and handed over, and the
-        // stop proceeds.
-        controller.isFinalizingRecording = false
-        XCTAssertTrue(transcriber.segments.isEmpty)
-        await stop.value
-
-        XCTAssertEqual(store.recordings.count, 1, "exactly one row for one capture")
-        let saved = try XCTUnwrap(row(for: url))
-        XCTAssertFalse(saved.fullText.contains("previous meeting"),
-                       "the recording must not be saved with the previous meeting's transcript")
+        XCTAssertEqual(session.state, .idle, "the capture must be closed immediately")
         XCTAssertEqual(controller.activeJob, .none)
         XCTAssertFalse(controller.isStoppingRecording)
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+        XCTAssertEqual(store.recordings.count, 1, "exactly one row for one capture")
+        let saved = try XCTUnwrap(row(for: url))
+        XCTAssertTrue(saved.fullText.isEmpty,
+                      "it never had the live pipeline, so it has no live transcript — certainly not the previous meeting's")
+        XCTAssertTrue(saved.segments.isEmpty)
+        XCTAssertEqual(saved.status, .pending, "it goes to the batch pass, which has the whole WAV")
+
+        // The other drain's state is untouched.
+        XCTAssertTrue(controller.isFinalizingRecording,
+                      "a stop that never owned the live pipeline must not end another drain's ownership")
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"],
+                       "nor tear down the transcriber that drain is reading")
+        XCTAssertEqual(LiveTranscriptSnapshot.read(root: sidecarRoot)?.state, .recording,
+                       "nor close the sidecar — its handoff belongs to that drain, after its store.update")
+
+        // The drain ends: the deferred clear still happens, for whatever
+        // records next.
+        controller.isFinalizingRecording = false
+        XCTAssertTrue(transcriber.segments.isEmpty)
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
+    /// Pause used to be gated on `isFinalizingRecording`, which since #356
+    /// can be the PREVIOUS recording's drain — so a recording started right
+    /// after a Stop could not be paused until that drain finished. It is
+    /// gated on this recording's own stop now.
+    func test_a_recording_started_during_the_previous_drain_can_be_paused() async throws {
+        simulatePreviousRecordingDraining()
+
+        let url = try freshWAV("PauseDuringDrain")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isRecording)
+
+        await controller.pauseRecording()
+        XCTAssertTrue(controller.isPaused,
+                      "the previous recording's drain must not block pausing this one")
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"],
+                       "pausing must not touch the transcriber the other drain is reading")
+
+        controller.resumeRecording()
+        XCTAssertFalse(controller.isPaused)
+
+        controller.isFinalizingRecording = false
+        _ = await session.stop()
+    }
+
+    /// `stopBecauseOfSleep` sets the sleep reason and then calls
+    /// `stopRecording`. If a stop is already in progress that call is dropped
+    /// — and the reason must be dropped with it. Left behind, the next
+    /// recording's ORDINARY Stop consumed it: no rename sheet, and a "stopped
+    /// because your Mac went to sleep" alert for a sleep that never
+    /// interrupted it.
+    func test_a_dropped_sleep_stop_does_not_leak_its_reason_into_the_next_stop() async throws {
+        let url = try freshWAV("SleepDuringStop")
+        await controller.startFakeRecordingForTesting(outputURL: url)
+
+        // A stop is in progress when the sleep notification arrives.
+        controller.isStoppingRecording = true
+        await controller.stopBecauseOfSleep()
+        XCTAssertEqual(session.state, .recording, "the dropped call must not have stopped anything")
+        controller.isStoppingRecording = false
+
+        // The next Stop is an ordinary one.
+        await controller.stopRecording()
+        let saved = try XCTUnwrap(row(for: url))
+        XCTAssertNil(controller.sleepInterruption,
+                     "an ordinary Stop must not raise the sleep alert")
+        XCTAssertEqual(postRecording.pending?.id, saved.id,
+                       "an ordinary Stop presents the rename sheet")
 
         await controller.awaitFinalizeTails()
         await service.waitForIdle()
@@ -247,7 +326,5 @@ final class RecordWhileDrainingTests: XCTestCase {
         XCTAssertTrue(transcriber.segments.isEmpty,
                       "with nothing draining, the previous recording's live state is cleared at record start as before")
 
-        // Nothing parks here either.
-        await controller.awaitLivePipelineAvailable()
     }
 }

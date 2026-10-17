@@ -94,18 +94,18 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertTrue(session.state == .idle)
     }
 
-    /// Pause is refused while the previous recording is finalizing. The
-    /// finalize window tears the live pipeline down; letting a Pause land in
-    /// it would move the session out from under `stopRecording`.
-    func test_pause_is_refused_while_finalizing() async {
-        let url = store.freshAudioURL(suggestedName: "PauseFinalizing")
+    /// Pause is refused while THIS recording is being stopped
+    /// (`isStoppingRecording`): letting a Pause land in it would move the
+    /// session out from under `stopRecording`.
+    func test_pause_is_refused_while_stopping() async {
+        let url = store.freshAudioURL(suggestedName: "PauseStopping")
         await controller.startFakeRecordingForTesting(outputURL: url)
-        controller.isFinalizingRecording = true
+        controller.isStoppingRecording = true
         await controller.pauseRecording()
         XCTAssertFalse(controller.isPaused,
-                       "pause must not fire while stopRecording owns the lifecycle")
+                       "pause must not fire while stopRecording owns the session")
         XCTAssertTrue(session.state == .recording)
-        controller.isFinalizingRecording = false
+        controller.isStoppingRecording = false
         _ = await session.stop()
     }
 

@@ -831,7 +831,9 @@ struct RecordingPauseButton: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(actions.isFinalizingRecording)
+        // This recording's own stop, not `isFinalizingRecording` — since #356
+        // that can be the PREVIOUS recording's drain while this one records.
+        .disabled(actions.isStoppingRecording)
         .help(paused ? "Resume recording" : "Pause recording (audio during the pause isn't recorded)")
         .accessibilityLabel(paused ? "Resume recording" : "Pause recording")
         .accessibilityIdentifier(paused ? "recording.resume" : "recording.pause")
