@@ -16,9 +16,33 @@ import Combine
 /// per N seconds.
 @MainActor
 final class LiveAISettings: ObservableObject {
-    @Published var enabled: Bool {
-        didSet { defaults.set(enabled, forKey: Keys.enabled) }
+    // `enabled` and `model` are manageable by a configuration profile
+    // (`ManagedSettings`): computed over private `@Published` storage so a
+    // locked write is refused before anything is stored, published or
+    // persisted.
+    @Published private var storedEnabled: Bool
+    @Published private var storedModel: String
+
+    var enabled: Bool {
+        get { storedEnabled }
+        set {
+            guard !isManaged(.liveAIEnabled) else { return }
+            storedEnabled = newValue
+            defaults.set(newValue, forKey: Keys.enabled)
+        }
     }
+
+    /// `enabled`'s change publisher (fires on willSet, like `$enabled` did).
+    var enabledPublisher: Published<Bool>.Publisher { $storedEnabled }
+
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`)
+    /// unless `MilaApp` passes the system's managed preferences. Only
+    /// `enabled` and `model` are manageable — the same two a `.milaconfig`
+    /// carries.
+    private let managed: ManagedSettings
+
+    /// Whether a configuration profile locks `field` (see `ManagedSettings`).
+    func isManaged(_ field: ManagedField) -> Bool { managed.isManaged(field) }
 
     /// Snapshot of the host Mac's hardware identity. Injected in tests
     /// (so `isLiveAIAvailable` can be exercised without a real
@@ -30,8 +54,13 @@ final class LiveAISettings: ObservableObject {
     /// Model name passed to the CLI as `--model <value>`. Empty string ==
     /// "let the CLI pick" — typically the CLI's last-configured model. The
     /// UI nudges the user toward a cheap model via the placeholder.
-    @Published var model: String {
-        didSet { defaults.set(model, forKey: Keys.model) }
+    var model: String {
+        get { storedModel }
+        set {
+            guard !isManaged(.liveAIModel) else { return }
+            storedModel = newValue
+            defaults.set(newValue, forKey: Keys.model)
+        }
     }
 
     /// Tick frequency in seconds. The Live transcriber + LLM run on this
@@ -243,15 +272,17 @@ final class LiveAISettings: ObservableObject {
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard,
-         capabilities: SystemCapabilities = .live) {
+         capabilities: SystemCapabilities = .live,
+         managed: ManagedSettings = .empty) {
         self.defaults = defaults
         self.capabilities = capabilities
+        self.managed = managed
         // Default ON: users who never touched the toggle should get
         // the LLM summary/action-items pane. If their LLM CLI isn't
         // configured, `isLiveAIReady` still gates everything down to
-        // a no-op, so this is safe.
-        self.enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
-        self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
+        // a no-op, so this is safe. A managed value wins over both.
+        self.storedEnabled = managed.liveAIEnabled ?? (defaults.object(forKey: Keys.enabled) as? Bool) ?? true
+        self.storedModel = managed.liveAIModel ?? defaults.string(forKey: Keys.model) ?? Self.defaultModel
         // Migrate pre-1.6.1 persisted values (default was 5s, range 3-20s).
         // 5s windows cut words mid-utterance and made the trailing-window
         // merge stitch together inconsistent segments. Only values below

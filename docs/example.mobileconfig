@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Example configuration profile that locks Mila's transcription settings for
+  everyone it is installed for. See docs/mdm.md.
+
+  Before deploying:
+    * replace the endpoint / model ids with your own server's,
+    * give both PayloadUUIDs fresh values (`uuidgen`) and change the
+      PayloadIdentifiers to your organization's reverse-DNS prefix,
+    * delete any key you do NOT want to lock - a key that is absent here is
+      left to the user (or to a .milaconfig).
+
+  The keys inside mcx_preference_settings are the same as a .milaconfig's,
+  minus "version". An API key can go in remoteTranscription as "apiKey", but
+  read the "Secrets" section of docs/mdm.md first: profile contents are
+  readable by local users.
+-->
+<plist version="1.0">
+<dict>
+	<key>PayloadContent</key>
+	<array>
+		<dict>
+			<key>PayloadType</key>
+			<string>com.apple.ManagedClient.preferences</string>
+			<key>PayloadVersion</key>
+			<integer>1</integer>
+			<key>PayloadIdentifier</key>
+			<string>com.example.mila.preferences</string>
+			<key>PayloadUUID</key>
+			<string>39EB5838-4BBE-4840-BB3A-D9256519E32B</string>
+			<key>PayloadDisplayName</key>
+			<string>Mila transcription settings</string>
+			<key>PayloadEnabled</key>
+			<true/>
+			<key>PayloadContent</key>
+			<dict>
+				<key>io.island.whisper.IslandWhisper</key>
+				<dict>
+					<key>Forced</key>
+					<array>
+						<dict>
+							<key>mcx_preference_settings</key>
+							<dict>
+								<key>remoteTranscription</key>
+								<dict>
+									<key>enabled</key>
+									<true/>
+									<key>endpoint</key>
+									<string>https://mila-asr.your-org.example/v1</string>
+									<key>model</key>
+									<string>ivrit-ai/whisper-large-v3-turbo-ct2</string>
+									<key>englishModel</key>
+									<string>deepdml/faster-whisper-large-v3-turbo-ct2</string>
+								</dict>
+								<key>diarization</key>
+								<dict>
+									<key>enabled</key>
+									<true/>
+								</dict>
+							</dict>
+						</dict>
+					</array>
+				</dict>
+			</dict>
+		</dict>
+	</array>
+	<key>PayloadDisplayName</key>
+	<string>Mila - organization settings</string>
+	<key>PayloadDescription</key>
+	<string>Points Mila at the organization's transcription server.</string>
+	<key>PayloadIdentifier</key>
+	<string>com.example.mila</string>
+	<key>PayloadOrganization</key>
+	<string>Example Org</string>
+	<key>PayloadScope</key>
+	<string>System</string>
+	<key>PayloadType</key>
+	<string>Configuration</string>
+	<key>PayloadUUID</key>
+	<string>71D7D26F-7D8C-4A44-8032-DEB6128384DF</string>
+	<key>PayloadVersion</key>
+	<integer>1</integer>
+</dict>
+</plist>
