@@ -442,6 +442,37 @@ final class SpeakerProfileStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: fileURL), before, "nothing persisted")
     }
 
+    /// A voice whose delete did not persist is still on disk, so Known
+    /// speakers must still see it — not drop the name in one click — and
+    /// asking again must retry the save rather than find nothing in memory
+    /// and write nothing, leaving the voice to be reseeded on next launch.
+    func test_a_delete_whose_save_failed_is_still_reported_and_a_retry_persists_it() throws {
+        let dir = tempDir()
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+            try? FileManager.default.removeItem(at: dir)
+        }
+        let store = makeStore(in: dir)
+        store.updateProfile(name: "Alice", embedding: [1, 0, 0], sampleCount: 1)
+        store.updateProfile(name: "Bob", embedding: [0, 0, 1], sampleCount: 1)
+        var seen: [SpeakerProfileStore.Deletion] = []
+        store.addDeletionObserver { seen.append($0) }
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deletedForThisSessionOnly)
+
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "alice"), .stored, "still on disk")
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deletedForThisSessionOnly, "still failing")
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .deleted, "the retry is the save")
+
+        XCTAssertEqual(store.storedVoice(forSpeakerNamed: "Alice"), .notStored)
+        XCTAssertEqual(store.forgetSpeaker(named: "Alice"), .nothingToDelete)
+        XCTAssertEqual(makeStore(in: dir).profiles.map(\.name), ["Bob"])
+        XCTAssertEqual(seen, [.named(["Alice"])], "observers are told once")
+    }
+
     func test_renameProfile() throws {
         let dir = tempDir()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

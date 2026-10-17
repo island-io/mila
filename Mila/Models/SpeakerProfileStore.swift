@@ -381,6 +381,7 @@ final class SpeakerProfileStore: ObservableObject {
                 self.profiles.removeAll()
                 // Whatever failed to save is gone from memory too.
                 self.hasUnsavedChanges = false
+                self.unsavedDeletions.removeAll()
             }
             // The main-window announcement follows the switch (#342).
             self.refreshDamagedProfilesNotice()
@@ -583,15 +584,25 @@ final class SpeakerProfileStore: ObservableObject {
     /// running session must stop matching the voice the user just deleted,
     /// and the deletion observers must still hear about it, or a recording
     /// in flight writes it back at stop. The outcome says the deletion did
-    /// not persist (`.deletedForThisSessionOnly`). A delete that matches
-    /// nothing writes nothing and notifies nobody, so a no-op does not
-    /// disturb an in-flight recording.
+    /// not persist (`.deletedForThisSessionOnly`), and `unsavedDeletions`
+    /// remembers it, so asking again retries the save. A delete that
+    /// matches nothing else writes nothing and notifies nobody, so a no-op
+    /// does not disturb an in-flight recording.
     @discardableResult
     private func deleteProfiles(where matches: (VoiceProfile) -> Bool) -> ProfileDeletionOutcome {
-        let removed = Set(profiles.filter(matches).map(\.name))
-        guard !removed.isEmpty else { return .nothingToDelete }
+        let gone = profiles.filter(matches)
+        guard !gone.isEmpty else {
+            // Already out of memory from an earlier delete whose save
+            // failed: the retry is the save itself. Observers were told the
+            // first time.
+            guard unsavedDeletions.contains(where: matches) else { return .nothingToDelete }
+            return save() ? .deleted : .deletedForThisSessionOnly
+        }
+        let removed = Set(gone.map(\.name))
         profiles.removeAll(where: matches)
         let saved = save()
+        // After the save: a successful one clears the list.
+        if !saved { unsavedDeletions.append(contentsOf: gone) }
         // Same reason as `deleteAllProfiles`: a live diarizer seeded with
         // this profile would otherwise keep matching it and write it back at
         // stop.
@@ -618,7 +629,8 @@ final class SpeakerProfileStore: ObservableObject {
     func storedVoice(forSpeakerNamed name: String) -> StoredVoice {
         let matches = Self.speakerNameMatcher(name)
         if settings.isEnabled {
-            if profiles.contains(where: { matches($0.name) }) { return .stored }
+            if profiles.contains(where: { matches($0.name) })
+                || unsavedDeletions.contains(where: { matches($0.name) }) { return .stored }
             return loadedFromDamagedFile ? .unknown : .notStored
         }
         if loadedFromDamagedFile { return .unknown }
@@ -750,6 +762,7 @@ final class SpeakerProfileStore: ObservableObject {
     func deleteAllProfiles() {
         profiles.removeAll()
         hasUnsavedChanges = false
+        unsavedDeletions.removeAll()
         do {
             if fileManager.fileExists(atPath: storeURL.path) {
                 try fileManager.removeItem(at: storeURL)
@@ -1055,6 +1068,7 @@ final class SpeakerProfileStore: ObservableObject {
             try data.write(to: storeURL, options: .atomic)
             lastSeenFileDate = currentFileDate()
             hasUnsavedChanges = false
+            unsavedDeletions.removeAll()
             hasStoredProfilesOnDisk = true
             return true
         } catch {
@@ -1138,6 +1152,15 @@ final class SpeakerProfileStore: ObservableObject {
     /// A change that `save()` could not write (the damaged file could not
     /// be moved aside, or the write failed). Blocks a recheck's re-read.
     private var hasUnsavedChanges = false
+
+    /// Profiles a single delete removed from memory whose save then failed
+    /// (`.deletedForThisSessionOnly`): still on disk, so they come back on
+    /// the next launch. Kept so `storedVoice` still reports them — or Known
+    /// speakers' ✕ would treat the name as plain and drop it in one click —
+    /// and so a retried delete re-attempts the save instead of finding
+    /// nothing in memory and writing nothing. Cleared by any successful
+    /// save (which persists the removal), a load, deleteAll and opt-out.
+    private var unsavedDeletions: [VoiceProfile] = []
 
     /// Modification date of the live file this store last read or wrote.
     private var lastSeenFileDate: Date?
@@ -1409,6 +1432,7 @@ final class SpeakerProfileStore: ObservableObject {
             }
             profiles = accepted
             hasUnsavedChanges = false
+            unsavedDeletions.removeAll()
             loadedFromDamagedFile = false
             profileLog.log("loaded \(accepted.count) of \(decoded.count) voice profiles")
         } catch {
