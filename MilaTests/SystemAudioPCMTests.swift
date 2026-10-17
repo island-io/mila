@@ -32,13 +32,68 @@ final class SystemAudioPCMTests: XCTestCase {
         let input = try makePCM(channels: 1, interleaved: false)
         let missing = try makeSample(input, attachData: false)
         XCTAssertNil(SystemAudioPCM.buffer(from: missing))
+        XCTAssertEqual(rejection(of: missing), .dataNotReady)
         XCTAssertEqual(CMSampleBufferSetDataReady(missing), noErr)
         XCTAssertNil(SystemAudioPCM.buffer(from: missing))
+        // Ready but with no data behind it: only the Core Media copy can tell.
+        guard case .some(.copyFailed) = rejection(of: missing) else {
+            return XCTFail("expected copyFailed, got \(String(describing: rejection(of: missing)))")
+        }
         let empty = try makeSample(input, attachData: false, frames: 0)
         XCTAssertEqual(CMSampleBufferSetDataReady(empty), noErr)
         XCTAssertNil(SystemAudioPCM.buffer(from: empty))
+        XCTAssertEqual(rejection(of: empty), .noFrames)
     }
 
+    /// The destination buffer is sized from the packet's own frame count, so
+    /// that count is capped (2 s at the packet's rate) BEFORE allocating —
+    /// not just at Int32.max, which would still let a corrupt header size a
+    /// multi-gigabyte allocation on the sample queue.
+    func test_oversized_packets_are_rejected_before_allocating() throws {
+        let input = try makePCM(channels: 1, interleaved: false)   // 16 kHz
+        let limit = try XCTUnwrap(SystemAudioPCM.maxFrames(sampleRate: 16_000))
+        XCTAssertEqual(limit, 32_000)
+        for frames in [limit + 1, 10_000_000] {
+            let sample = try makeSample(input, attachData: false, frames: frames)
+            XCTAssertEqual(CMSampleBufferSetDataReady(sample), noErr)
+            XCTAssertEqual(rejection(of: sample), .tooManyFrames(frames, limit: limit))
+        }
+        // A packet exactly at the cap gets past the size check (and then fails
+        // the copy only because this fixture has no data attached).
+        let atLimit = try makeSample(input, attachData: false, frames: limit)
+        XCTAssertEqual(CMSampleBufferSetDataReady(atLimit), noErr)
+        guard case .some(.copyFailed) = rejection(of: atLimit) else {
+            return XCTFail("a packet at the cap must not be refused as too large")
+        }
+    }
+
+    func test_frame_cap_refuses_rates_no_stream_has() {
+        XCTAssertEqual(SystemAudioPCM.maxFrames(sampleRate: 48_000), 96_000)
+        for rate in [0, -16_000, .nan, .infinity, 2_000_000] as [Double] {
+            XCTAssertNil(SystemAudioPCM.maxFrames(sampleRate: rate), "rate \(rate)")
+        }
+    }
+
+    /// A per-buffer hot path: every drop is counted, the first is logged with
+    /// its reason, and `stop()` reports and resets the tally for the next
+    /// session. Good packets don't count.
+    @MainActor
+    func test_rejected_packets_are_counted_per_session() async throws {
+        let recorder = SystemAudioRecorder()
+        let input = try makePCM(channels: 1, interleaved: false)
+        let bad = try makeSample(input, attachData: false)
+        let good = try makeSample(input)
+        for _ in 0..<3 { recorder.deliverSampleForTesting(bad) }
+        recorder.deliverSampleForTesting(good)
+        XCTAssertEqual(recorder.rejectedPacketCount, 3)
+        await recorder.stop()
+        XCTAssertEqual(recorder.rejectedPacketCount, 0)
+    }
+
+    /// The raw-AudioBuffer bound is a real check here, where the caller
+    /// supplies the AudioBuffer. Reached from an AVAudioPCMBuffer it cannot
+    /// fail (`mDataByteSize` there is derived from `frameLength`), which is
+    /// why it is exercised directly rather than through a PCM buffer.
     func test_invalid_float_storage_is_rejected_before_reading_samples() {
         var values = [Float](repeating: 0.25, count: 32)
         values.withUnsafeMutableBytes { bytes in
@@ -76,6 +131,41 @@ final class SystemAudioPCMTests: XCTestCase {
         empty.frameLength = 0
         XCTAssertTrue(AudioConvert.samples(from: empty).isEmpty)
         XCTAssertEqual(AudioMeter.level(from: empty), 0)
+    }
+
+    /// A constant fixture can't tell a strided copy from a wrong one; a ramp
+    /// on channel 0 (and a different value on channel 1) pins order and stride.
+    func test_interleaved_channel_zero_is_extracted_in_frame_order() throws {
+        for channels: AVAudioChannelCount in [2, 3] {
+            let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                                                     channels: channels, interleaved: true))
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 64))
+            buffer.frameLength = 50
+            let storage = try XCTUnwrap(buffer.audioBufferList.pointee.mBuffers.mData)
+                .assumingMemoryBound(to: Float.self)
+            for frame in 0..<50 {
+                for channel in 0..<Int(channels) {
+                    storage[frame * Int(channels) + channel] = channel == 0 ? Float(frame) : -1
+                }
+            }
+            XCTAssertEqual(AudioConvert.samples(from: buffer), (0..<50).map { Float($0) }, "\(channels) channels")
+        }
+    }
+
+    /// Only Float32 storage may be viewed as Float; anything else reads as
+    /// "no samples", never as reinterpreted bytes.
+    func test_non_float_buffers_read_as_empty() throws {
+        let format = try XCTUnwrap(AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16_000,
+                                                 channels: 1, interleaved: false))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 32))
+        buffer.frameLength = 32
+        XCTAssertTrue(AudioConvert.samples(from: buffer).isEmpty)
+        XCTAssertEqual(AudioMeter.level(from: buffer), 0)
+    }
+
+    private func rejection(of sample: CMSampleBuffer) -> SystemAudioPCM.Rejection? {
+        if case .failure(let rejection) = SystemAudioPCM.copy(from: sample) { return rejection }
+        return nil
     }
 
     private func makePCM(channels: AVAudioChannelCount, interleaved: Bool) throws -> AVAudioPCMBuffer {
