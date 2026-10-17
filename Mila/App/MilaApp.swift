@@ -426,17 +426,23 @@ struct MilaApp: App {
             UserDefaults.standard.set(false, forKey: "diarization.enabled")
             UserDefaults.standard.set(true, forKey: diarForceOffKey)
         }
-        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false)
+        // Settings an administrator locked via a configuration profile (MDM),
+        // read once here and handed to every settings object that carries a
+        // `.milaconfig` field. Precedence: managed > `.milaconfig` > the
+        // user's own choice. See `ManagedSettings` and docs/mdm.md (#360).
+        let managedSettings = ManagedSettings.loadFromSystem()
+        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false,
+                                               managed: managedSettings)
         // Remote transcription backend (opt-in, off by default). Constructed
         // here so the same instance backs both the Settings UI and the
         // transcription router.
-        let remoteSettings = RemoteTranscriptionSettings()
+        let remoteSettings = RemoteTranscriptionSettings(managed: managedSettings)
         let svc = TranscriptionService(store: store,
                                        modelManager: mgr,
                                        diarizationSettings: diarSettings,
                                        remoteSettings: remoteSettings)
         let session = RecordingSession()
-        let langSettings = RecordingLanguageSettings()
+        let langSettings = RecordingLanguageSettings(managed: managedSettings)
         let audioSettings = AudioInputSettings()
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
@@ -479,7 +485,7 @@ struct MilaApp: App {
                 performanceCoreCount: SystemCapabilities.live.performanceCoreCount
             )
             : .live
-        let liveAI = LiveAISettings(capabilities: liveAICapabilities)
+        let liveAI = LiveAISettings(capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
         // a dictation overlay while a meeting recording is in flight
@@ -623,6 +629,17 @@ struct MilaApp: App {
         // `store`; the `actions` wiring stays further down with the rest.
         let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
         sidecarWriter.cleanupAtLaunch()
+        // Lines the user cut from a saved transcript (#357) must not stay
+        // readable in the completed live snapshot mila-mcp serves; a no-op
+        // unless that snapshot is this recording's.
+        store.onTranscriptLinesRemoved = { [weak sidecarWriter] rec in
+            sidecarWriter?.dropRetainedLines(afterEditOf: rec.id)
+        }
+        // The post-stop speaker pass writes a stop-time copy of the segments
+        // back when it finishes, so a trim must wait for it (#357).
+        store.isTranscriptEditBlocked = { [weak svc] id in
+            svc?.isAwaitingSpeakerFinalization(id) ?? false
+        }
         svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
             // A recording whose live transcript wasn't final closed its live
             // sidecar WITHOUT a handoff id, because at Stop the batch worker
@@ -893,7 +910,7 @@ struct MilaApp: App {
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
-        let meetingSettings = MeetingDetectionSettings()
+        let meetingSettings = MeetingDetectionSettings(managed: managedSettings)
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
             detector: detector,
@@ -907,7 +924,8 @@ struct MilaApp: App {
             language: langSettings,
             liveAI: liveAI,
             diarization: diarSettings,
-            meetingDetection: meetingSettings
+            meetingDetection: meetingSettings,
+            managed: managedSettings
         )
         let speakerDirectory = SpeakerDirectory()
         // Imports `.milashare` bundles. Given the store it writes to, the
@@ -1864,7 +1882,7 @@ struct MilaApp: App {
             // anything. Mirror the feed-loop's gate here so an
             // immediate feed runs the moment the toggle flips.
             aiEnabledCancellable?.cancel()
-            aiEnabledCancellable = aiSettings.$enabled
+            aiEnabledCancellable = aiSettings.enabledPublisher
                 .dropFirst()
                 .filter { $0 }
                 .sink { [weak transcriber, weak aiSession] _ in

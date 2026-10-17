@@ -100,6 +100,18 @@ struct ContentView: View {
             actions: { Button("OK") { transcription.lastError = nil } },
             message: { Text(transcription.lastError ?? "") }
         )
+        // "End Conversation Here" trimmed the transcript but not the audio
+        // (#357). Shown here rather than in the detail view because the audio
+        // work can finish after the user has navigated elsewhere.
+        .alert(
+            "Transcript trim",
+            isPresented: Binding(
+                get: { store.trimNotice != nil },
+                set: { if !$0 { store.trimNotice = nil } }
+            ),
+            actions: { Button("OK") { store.trimNotice = nil } },
+            message: { Text(store.trimNotice ?? "") }
+        )
         .alert(
             "Recording stopped because your Mac slept",
             isPresented: Binding(
@@ -495,7 +507,16 @@ private struct LanguagePickerToolbarItem: View {
             .padding(.horizontal, 8)
         }
         .menuStyle(.borderlessButton)
-        .help("Language used for new voice memos and app-audio recordings")
+        // Locked by a configuration profile (issue #360): still shows the
+        // language, but can't be changed here.
+        .disabled(languageSettings.isManaged(.recordingLanguage))
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        languageSettings.isManaged(.recordingLanguage)
+            ? "Language used for new recordings — \(ManagedSettings.note.lowercased())"
+            : "Language used for new voice memos and app-audio recordings"
     }
 }
 

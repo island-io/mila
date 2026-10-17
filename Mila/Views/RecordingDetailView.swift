@@ -42,6 +42,12 @@ struct RecordingDetailView: View {
     /// Set when the user picks a merge target in the speaker popover; drives
     /// the confirmation alert, which is what actually performs the merge.
     @State private var pendingMerge: PendingSpeakerMerge?
+    /// Transcript lines picked with click / shift-click / command-click, the
+    /// targets of "Delete Segments" and ⌘⌫ (#357).
+    @State private var selection = TranscriptSelection()
+    /// A trim the user asked for and has not yet confirmed. Like a merge,
+    /// it is destructive and has no undo, so it is always confirmed.
+    @State private var pendingTrim: PendingTranscriptEdit?
 
     @FocusState private var titleFieldFocused: Bool
 
@@ -105,6 +111,19 @@ struct RecordingDetailView: View {
         // the old one. Re-point the player or it keeps playing a file that
         // is gone.
         .onChange(of: recording.audioFileName) { _, _ in configurePlayer() }
+        // "End Conversation Here" swaps in a shorter audio file under the SAME
+        // name, and the player still holds the old one open. The store bumps
+        // an explicit per-recording revision for exactly that swap — not
+        // `duration`, which a transcription pass also changes — so re-point
+        // the player at the trimmed file only then.
+        .onChange(of: store.audioRevisions[recording.id] ?? 0) { _, _ in
+            configurePlayer()
+            currentTime = 0
+        }
+        // Drop selected ids that no longer name a line: after a delete
+        // (count changes) or a re-transcription (new ids; status settles).
+        .onChange(of: recording.segments.count) { _, _ in pruneSelection() }
+        .onChange(of: recording.status) { _, _ in pruneSelection() }
         .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
         .onChange(of: playbackSpeed) { _, newValue in
             let rate = Float(PlaybackSpeed.nearest(to: newValue).rawValue)
@@ -331,6 +350,10 @@ struct RecordingDetailView: View {
     private var isTranscriptionBusy: Bool {
         transcription.activeRecordingID == recording.id
             || transcription.pendingIDs.contains(recording.id)
+            // An "End Conversation Here" audio cut is still running: a
+            // re-transcription now would read the full audio and write the
+            // removed lines back (#357). The store refuses it as well.
+            || store.audioTrimPendingIDs.contains(recording.id)
     }
 
     /// Human-readable name of the whisper model that will run for the
@@ -521,20 +544,24 @@ struct RecordingDetailView: View {
                             // One active id per render drives BOTH the highlight and
                             // the scroll target, so they can never disagree.
                             let activeID = activeSegmentID
+                            // Hoisted for the same reason: the row menus below
+                            // are built on every render (≈30 Hz during
+                            // playback), so each one may only do O(1) work.
+                            let rowMenu = RowMenuContext(
+                                canTrim: canEditTranscript,
+                                lastID: recording.segments.last?.id,
+                                lineCount: recording.segments.count,
+                                selectionCount: selection.ids.count)
                             ForEach(recording.segments) { seg in
                                 SegmentRow(segment: seg,
                                            isActive: seg.id == activeID,
+                                           isSelected: selection.contains(seg.id),
                                            showSpeaker: hasSpeakers,
                                            useSpeakerColor: hasMultipleSpeakers,
                                            language: recording.transcriptLanguage,
                                            speakerNames: recording.speakerNames,
                                            allSpeakers: distinctSpeakers,
-                                           onTap: {
-                                               // Tapping a line is an explicit "go
-                                               // here", so it re-engages following.
-                                               isFollowing = true
-                                               seek(to: seg.start)
-                                           },
+                                           onTap: { rowClicked(seg) },
                                            onAssignName: { raw, name in
                                                store.setSpeakerName(name, forSpeaker: raw,
                                                                     recordingID: recording.id)
@@ -578,6 +605,13 @@ struct RecordingDetailView: View {
                                         }
                                     }
                                 }
+                                // Per-line menu (#357). Takes over from the
+                                // transcript-wide menu below when the click
+                                // lands on a line, so it repeats that menu's
+                                // entries too.
+                                .contextMenu {
+                                    segmentContextMenu(for: seg.id, context: rowMenu)
+                                }
                             }
                         }
                         .padding()
@@ -604,14 +638,7 @@ struct RecordingDetailView: View {
                                      (recording.transcriptLanguage == "he" || recording.fullText.isPredominantlyHebrew)
                                      ? .rightToLeft : .leftToRight)
                     }
-                    .contextMenu {
-                        let other = RecordingLanguage.fromCode(recording.language).other
-                        Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
-                            retranscribe(in: other)
-                        }
-                        Button("Copy transcript") { copyTranscript() }
-                            .disabled(recording.fullText.isEmpty)
-                    }
+                    .contextMenu { transcriptMenuItems }
                     .coordinateSpace(name: Self.transcriptSpace)
                     .onPreferenceChange(ActiveRowFrameKey.self) { rect in
                         // Written to the coordinator, not @State: this fires on
@@ -628,6 +655,30 @@ struct RecordingDetailView: View {
                     }
                     .overlay(alignment: .bottom) { followPill(proxy) }
                     .animation(.easeOut(duration: 0.2), value: isFollowing)
+                    .background {
+                        // ⌘⌫ deletes the selected lines (after confirming).
+                        // Disabled unless there is a selection — and while the
+                        // title is being edited — so it never swallows ⌘⌫
+                        // ("delete to start of line") meant for a text field.
+                        Button("Delete Selected Lines") { requestDelete(selection.ids) }
+                            .keyboardShortcut(.delete, modifiers: .command)
+                            .disabled(selection.isEmpty || !canEditTranscript || isEditingTitle)
+                            .opacity(0)
+                            .frame(width: 0, height: 0)
+                            .accessibilityHidden(true)
+                    }
+                    .alert(pendingTrim?.title ?? "",
+                           isPresented: Binding(get: { pendingTrim != nil },
+                                                set: { if !$0 { pendingTrim = nil } }),
+                           presenting: pendingTrim) { edit in
+                        Button(edit.confirmLabel, role: .destructive) {
+                            pendingTrim = nil
+                            perform(edit)
+                        }
+                        Button("Cancel", role: .cancel) { pendingTrim = nil }
+                    } message: { edit in
+                        Text(trimConfirmationMessage(for: edit))
+                    }
                 }
             }
             // Presented HERE, not inside the speaker popover: the tap that
@@ -658,6 +709,202 @@ struct RecordingDetailView: View {
         let sourceName: String
         let targetName: String
         var id: String { "\(source)->\(target)" }
+    }
+
+    /// A transcript trim the user asked for and has not yet confirmed (#357).
+    struct PendingTranscriptEdit: Identifiable {
+        enum Kind {
+            /// Remove these lines; the audio is kept.
+            case delete(Set<TranscriptSegment.ID>)
+            /// Remove every line after this one and cut the audio at
+            /// `audioCut` (nil when this file's audio cannot be trimmed).
+            case endHere(TranscriptSegment.ID, audioCut: Double?)
+        }
+        let kind: Kind
+        /// How many lines the edit removes.
+        let lineCount: Int
+        let id = UUID()
+
+        var title: String {
+            switch kind {
+            case .delete:
+                return lineCount == 1 ? "Delete this line?" : "Delete \(lineCount) lines?"
+            case .endHere:
+                return "End the conversation here?"
+            }
+        }
+
+        var confirmLabel: String {
+            switch kind {
+            case .delete: return "Delete"
+            case .endHere: return "End Here"
+            }
+        }
+    }
+
+    // MARK: - Transcript selection and trimming (#357)
+
+    /// Whether the transcript can be trimmed right now: not while a
+    /// transcription pass is queued or running for it, nor while the
+    /// post-stop speaker pass is still to write its labels back — either
+    /// would put the deleted lines back — and only with lines to trim.
+    /// `isAwaitingSpeakerFinalization` is read here (not only through the
+    /// store's blocker) so the published marker re-renders the menus when
+    /// it clears.
+    private var canEditTranscript: Bool {
+        !isTranscriptionBusy
+            && !transcription.isAwaitingSpeakerFinalization(recording.id)
+            && store.canEditTranscriptNow(recording)
+    }
+
+    /// Everything a row's context menu needs that is the same for every row,
+    /// resolved once per render.
+    struct RowMenuContext {
+        let canTrim: Bool
+        let lastID: TranscriptSegment.ID?
+        let lineCount: Int
+        let selectionCount: Int
+    }
+
+    /// Click = select this line (and, as before, seek to it); shift-click =
+    /// extend from the anchor; command-click = toggle one line. Only the
+    /// plain click moves playback, so building a selection does not make
+    /// the audio jump around.
+    private func rowClicked(_ seg: TranscriptSegment) {
+        let flags = NSEvent.modifierFlags
+        let kind: TranscriptSelection.Click
+        if flags.contains(.shift) {
+            kind = .extend
+        } else if flags.contains(.command) {
+            kind = .toggle
+        } else {
+            kind = .plain
+        }
+        selection = selection.clicking(seg.id, kind: kind, order: recording.segments.map(\.id))
+        if kind == .plain {
+            // Tapping a line is an explicit "go here", so it re-engages
+            // following.
+            isFollowing = true
+            seek(to: seg.start)
+        }
+    }
+
+    private func pruneSelection() {
+        selection = selection.pruned(to: recording.segments.map(\.id))
+    }
+
+    /// A line's context menu. Built on every render for every loaded row, so
+    /// it does only O(1) work here: the deletion target (a set) is resolved
+    /// inside the action, when the item is actually picked.
+    @ViewBuilder
+    private func segmentContextMenu(for segmentID: TranscriptSegment.ID,
+                                    context: RowMenuContext) -> some View {
+        // Right-clicking a line inside the selection acts on the selection;
+        // any other line acts on itself (`deletionTarget`).
+        let count = selection.contains(segmentID) ? context.selectionCount : 1
+        let deleteLabel: String = count > 1 ? "Delete \(count) Segments" : "Delete Segment"
+        Button("End Conversation Here") { requestEndConversation(after: segmentID) }
+            .disabled(!context.canTrim || segmentID == context.lastID)
+        Button(deleteLabel) {
+            requestDelete(selection.deletionTarget(forContextClickOn: segmentID))
+        }
+        .disabled(!context.canTrim || count >= context.lineCount)
+        Divider()
+        transcriptMenuItems
+    }
+
+    /// The transcript-wide entries, shared by the menu on the transcript's
+    /// background and every line's menu (which replaces it under the
+    /// pointer). Re-transcribe is gated on a pass being queued or running,
+    /// as the header's Re-transcribe menu is.
+    @ViewBuilder
+    private var transcriptMenuItems: some View {
+        let other = RecordingLanguage.fromCode(recording.language).other
+        Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
+            retranscribe(in: other)
+        }
+        .disabled(isTranscriptionBusy)
+        Button("Copy transcript") { copyTranscript() }
+            .disabled(recording.fullText.isEmpty)
+    }
+
+    private func requestDelete(_ ids: Set<TranscriptSegment.ID>) {
+        let live = Set(recording.segments.map(\.id))
+        let target = ids.intersection(live)
+        // Nothing to delete, or everything: emptying the transcript is not a
+        // trim (delete the recording instead), and the store refuses it too.
+        guard canEditTranscript, !target.isEmpty, target.count < live.count else {
+            NSSound.beep()
+            return
+        }
+        pendingTrim = PendingTranscriptEdit(kind: .delete(target), lineCount: target.count)
+    }
+
+    private func requestEndConversation(after segmentID: TranscriptSegment.ID) {
+        let removed = TranscriptTrim.linesAfter(segmentID, in: recording.segments)
+        guard canEditTranscript, removed > 0 else { return }
+        let cut = store.canTrimAudio(for: recording)
+            ? TranscriptTrim.audioCutTime(endingAt: segmentID, in: recording.segments)
+            : nil
+        pendingTrim = PendingTranscriptEdit(kind: .endHere(segmentID, audioCut: cut),
+                                            lineCount: removed)
+    }
+
+    /// Whether a trim should regenerate the AI summary + action items: only
+    /// when there is one to replace and the user has summaries on. Otherwise
+    /// the confirmation says the summary is left as it is.
+    private var trimRegeneratesOverview: Bool {
+        hasOverviewToCopy && llmSettings.isConfigured && llmSettings.summaryEnabled
+    }
+
+    private func trimConfirmationMessage(for edit: PendingTranscriptEdit) -> String {
+        var parts: [String] = []
+        switch edit.kind {
+        case .delete:
+            parts.append(edit.lineCount == 1
+                ? "The line is removed from the transcript, its text and subtitle files, and what Mila serves to connected AI tools."
+                : "The lines are removed from the transcript, its text and subtitle files, and what Mila serves to connected AI tools.")
+            parts.append("The audio is kept, so re-transcribing this recording brings them back.")
+        case .endHere(_, let cut):
+            let lines = edit.lineCount == 1 ? "The line after this one is" : "All \(edit.lineCount) lines after this one are"
+            if let cut {
+                parts.append("\(lines) removed, and the audio is cut at \(formatDuration(cut)).")
+            } else {
+                parts.append("\(lines) removed. This recording's audio can't be trimmed, so it is kept in full.")
+            }
+        }
+        if hasOverviewToCopy {
+            parts.append(trimRegeneratesOverview
+                ? "The AI summary and action items will be regenerated from what remains."
+                : "The AI summary and action items are not updated and may still mention what was removed.")
+        }
+        parts.append("This can't be undone.")
+        return parts.joined(separator: " ")
+    }
+
+    private func perform(_ edit: PendingTranscriptEdit) {
+        let recordingID = recording.id
+        let regenerate = trimRegeneratesOverview
+        // Captured before any await: an environment object read from a task
+        // that outlives this view is not something to rely on.
+        let store = self.store
+        let summarizer = self.summarizer
+        switch edit.kind {
+        case .delete(let ids):
+            guard let updated = store.deleteSegments(ids, recordingID: recordingID) else { return }
+            selection = selection.pruned(to: updated.segments.map(\.id))
+            if regenerate { summarizer.regenerate(updated) }
+        case .endHere(let segmentID, _):
+            selection = TranscriptSelection()
+            // Touches no view state, so it is safe to outlive this view. An
+            // audio cut that did not happen is reported by the store itself
+            // (`trimNotice`, shown by ContentView), not from here.
+            Task { @MainActor in
+                guard let result = await store.endConversation(afterSegment: segmentID,
+                                                               recordingID: recordingID) else { return }
+                if regenerate { summarizer.regenerate(result.recording) }
+            }
+        }
     }
 
     @ViewBuilder
@@ -986,6 +1233,9 @@ private struct AIOverviewBanner: View {
 private struct SegmentRow: View {
     let segment: TranscriptSegment
     let isActive: Bool
+    /// Picked for "Delete Segments" / ⌘⌫. Drawn as an outline so it stays
+    /// distinguishable from — and combinable with — the playback highlight.
+    var isSelected: Bool = false
     let showSpeaker: Bool
     /// Whether to color the speaker label per-speaker rather than the
     /// default tint — set by the caller once it's seen more than one
@@ -1060,6 +1310,12 @@ private struct SegmentRow: View {
         .padding(8)
         .background(isActive ? Color.accentColor.opacity(0.18) : .clear,
                     in: RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            if isSelected {
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(Color.accentColor, lineWidth: 1.5)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { onTap() }
     }

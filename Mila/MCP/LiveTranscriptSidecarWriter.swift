@@ -208,6 +208,56 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
         }
     }
 
+    /// The user cut lines out of a saved recording's transcript
+    /// (island-io/mila#357). A finished session's snapshot keeps its live
+    /// lines on disk until the next recording overwrites it, although no
+    /// reader is served them any more — `get_live_transcript` answers a
+    /// `completed` or `interrupted` snapshot with status and handoff only.
+    /// So the lines are simply dropped, rather than kept in sync, and the
+    /// deleted text does not sit in `live/current.json`
+    /// (`bugbot-rules/deleted-data-stays-deleted.md`). Status, session and
+    /// handoff id are untouched; nothing a poller reads changes, so neither
+    /// does `revision`.
+    ///
+    /// Which snapshot qualifies:
+    ///   * `completed` — only when it provably belongs to `recordingID`
+    ///     (its published handoff id, or the handoff still awaited for that
+    ///     exact session), as in `attachHandoff`.
+    ///   * `interrupted` — always. A crashed session's audio comes back as a
+    ///     recovered recording with a NEW id, so it cannot be matched, and
+    ///     its lines are unreachable anyway.
+    ///   * `recording`, or any snapshot while this writer has a session
+    ///     open — never: that file belongs to a live meeting.
+    func dropRetainedLines(afterEditOf recordingID: UUID) {
+        guard snapshot == nil,
+              var onDisk = LiveTranscriptSnapshot.read(root: root),
+              !onDisk.segments.isEmpty || !onDisk.speakerNames.isEmpty else { return }
+        switch onDisk.state {
+        case .recording:
+            return
+        case .interrupted:
+            break
+        case .completed:
+            let isThisRecording: Bool
+            if let published = onDisk.finalRecordingID {
+                isThisRecording = published == recordingID
+            } else if let awaited = awaitingBatchHandoff {
+                isThisRecording = awaited.recordingID == recordingID && awaited.session == onDisk.sessionID
+            } else {
+                isThisRecording = false
+            }
+            guard isThisRecording else { return }
+        }
+        onDisk.segments = []
+        onDisk.speakerNames = [:]
+        do {
+            try onDisk.write(root: root)
+            sidecarLog.log("dropped retained live snapshot lines after a transcript edit of \(recordingID, privacy: .public)")
+        } catch {
+            sidecarLog.error("transcript-edit snapshot write failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
     // MARK: - Write scheduling
 
     private func scheduleWrite() {

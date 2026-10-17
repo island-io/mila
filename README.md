@@ -39,6 +39,12 @@ running through `whisper.cpp` (GPU via Metal).
 - **One-click team setup with `.milaconfig` files** — double-click a config file
   to apply the transcription server, model, language, and more in one step.
   Perfect for handing a team a ready-made configuration.
+- **Organization-wide settings via MDM** — the same settings a `.milaconfig`
+  carries can be pushed as a configuration profile (Jamf, Kandji, Intune, …)
+  and are then locked for every user ("Managed by your organization"), e.g. to
+  put a whole company on one transcription server. Managed settings win over a
+  `.milaconfig`, which wins over the user's own choice. See
+  [`docs/mdm.md`](docs/mdm.md).
 - **Share a recording with a colleague** — right-click → **Share Recording…**
   produces a single `.milashare` file (audio + transcript + speaker names +
   summary + action items, optionally the speakers' voice profiles). They
@@ -145,7 +151,9 @@ To deploy a **shared team server** on Kubernetes (one GPU, many users — Mila
 points at it via the Remote backend, audio stays on infrastructure you control),
 see **[docs/self-hosted-server/](docs/self-hosted-server/)**. That folder
 contains Kubernetes manifests and a step-by-step guide, plus an
-`example.milaconfig` you can hand to teammates for one-click setup.
+`example.milaconfig` you can hand to teammates for one-click setup. To lock
+every Mac in your organization to that server instead, push the same settings
+as a configuration profile — see **[docs/mdm.md](docs/mdm.md)**.
 
 ## Required permissions
 
@@ -197,6 +205,8 @@ Packages/
 └── WhisperBinary/                      # SPM wrapper for whisper.cpp xcframework
 docs/
 ├── REMOTE_TRANSCRIPTION_SERVER.md      # Single-host Docker quickstart
+├── mdm.md                              # Managing settings with MDM / configuration profiles
+├── example.mobileconfig                # Example profile for docs/mdm.md
 └── self-hosted-server/                 # Shared team server on Kubernetes (K8s manifests + guide)
 docker/speaches-hebrew/                 # Docker image with ivrit.ai Hebrew model pre-loaded
 scripts/make-dmg.sh                     # Builds a release DMG for distribution

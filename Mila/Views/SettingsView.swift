@@ -909,6 +909,10 @@ private struct ModelsSettingsTab: View {
                 // one control on this destination that is present whichever
                 // backend is selected.
                 .accessibilityIdentifier("models.backend.picker")
+                .disabled(remote.isManaged(.backend))
+                if remote.isManaged(.backend) {
+                    ManagedSettingNote(field: .backend)
+                }
 
                 switch remote.backend {
                 case .local:
@@ -1003,22 +1007,34 @@ private struct RemoteBackendSection: View {
                     TextField(RemoteTranscriptionSettings.defaultEndpoint, text: $remote.endpoint)
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
+                        .disabled(remote.isManaged(.endpoint))
                 }
-                Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Picking a model below fills this in; edit it to point at your own server.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if remote.isManaged(.endpoint) {
+                    ManagedSettingNote(field: .endpoint)
+                } else {
+                    Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Picking a model below fills this in; edit it to point at your own server.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 modelPickerRow
 
                 fieldRow(label: "API key") {
-                    SecureField("Stored in your Keychain", text: $remote.apiKey)
+                    SecureField(apiKeyPlaceholder, text: $remote.apiKey)
                         .textFieldStyle(.roundedBorder)
+                        .disabled(remote.isManaged(.apiKey))
                 }
-                Text("Sent as a Bearer token and stored encrypted in the macOS Keychain — never written to disk in plaintext. Leave blank for self-hosted servers that don't require auth.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if remote.isManaged(.apiKey) {
+                    // Not the Keychain sentence: a managed token comes from the
+                    // profile and is never written there.
+                    ManagedSettingNote(field: .apiKey)
+                } else {
+                    Text("Sent as a Bearer token and stored encrypted in the macOS Keychain — never written to disk in plaintext. Leave blank for self-hosted servers that don't require auth.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             advancedDisclosure
@@ -1061,6 +1077,9 @@ private struct RemoteBackendSection: View {
                     Section(group.displayName) {
                         ForEach(RemoteModelPreset.presets(in: group)) { preset in
                             Text(preset.displayName).tag(preset.id)
+                                // A preset on another server can't be taken
+                                // while the endpoint is managed (#360).
+                                .disabled(!remote.canApply(preset))
                         }
                     }
                 }
@@ -1068,8 +1087,12 @@ private struct RemoteBackendSection: View {
             }
             .labelsHidden()
             .accessibilityIdentifier("remote.model.picker")
+            .disabled(remote.isManaged(.model))
         }
 
+        if remote.isManaged(.model) {
+            ManagedSettingNote(field: .model)
+        }
         if let preset = remote.selectedPreset {
             Text(preset.detail)
                 .font(.caption)
@@ -1106,7 +1129,12 @@ private struct RemoteBackendSection: View {
                     showAdvanced = true
                     return
                 }
-                remote.apply(preset)
+                // A refused preset changes nothing, so nothing publishes and
+                // the menu would keep showing the rejected choice. Nudge a
+                // re-render so `get` puts the stored model back.
+                if !remote.apply(preset) {
+                    remote.objectWillChange.send()
+                }
             }
         )
     }
@@ -1142,6 +1170,7 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("remote.model.custom")
+                        .disabled(remote.isManaged(.model))
                 }
                 Text("Any model id your server accepts. Mila derives the response format from the id — `gpt-*` ids are sent without timestamps, anything else as a Whisper-style request (`verbose_json`).")
                     .font(.caption)
@@ -1153,6 +1182,10 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("remote.model.english")
+                        .disabled(remote.isManaged(.englishModel))
+                }
+                if remote.isManaged(.englishModel) {
+                    ManagedSettingNote(field: .englishModel)
                 }
                 Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
                     .font(.caption)
@@ -1171,6 +1204,10 @@ private struct RemoteBackendSection: View {
         .onChange(of: remote.model) { _, _ in
             if remote.selectedPreset == nil { showAdvanced = true }
         }
+    }
+
+    private var apiKeyPlaceholder: String {
+        remote.isManaged(.apiKey) ? "Set by your organization" : "Stored in your Keychain"
     }
 
     private var privacyWarning: some View {
@@ -1897,7 +1934,8 @@ private struct AIFeaturesSettingsTab: View {
                              // round-tripping either way.
                              toggleDisabled: !liveAI.isLiveAIAvailable
                                  || !liveAI.transcribeWhileRecording
-                                 || settings.liveAIDisabledByRemoteOpenAI,
+                                 || settings.liveAIDisabledByRemoteOpenAI
+                                 || liveAI.isManaged(.liveAIEnabled),
                              toggleIdentifier: "liveAI.enabled.toggle",
                              identifier: "ai.section.liveAI",
                              isExpanded: $showLiveAI) {
@@ -1971,6 +2009,11 @@ private struct AIFeaturesSettingsTab: View {
         }
         if settings.liveAIDisabledByRemoteOpenAI {
             return "Off while the provider is a remote endpoint."
+        }
+        // After the gates: a closed gate is the more useful thing to say, and
+        // it greys the switch out just the same.
+        if liveAI.isManaged(.liveAIEnabled) {
+            return "\(ManagedSettings.note)."
         }
         return "Show action items while the recording runs."
     }
@@ -2159,7 +2202,12 @@ private struct LiveAISection: View {
                     TextField(LiveAISettings.defaultModel, text: $settings.model)
                         .textFieldStyle(.roundedBorder)
                         .accessibilityIdentifier("liveAI.model")
-                    advancedCaption("Live loop only. Blank lets your CLI pick.")
+                        .disabled(settings.isManaged(.liveAIModel))
+                    if settings.isManaged(.liveAIModel) {
+                        ManagedSettingNote(field: .liveAIModel)
+                    } else {
+                        advancedCaption("Live loop only. Blank lets your CLI pick.")
+                    }
                 }
                 .help("Passed to the CLI as `--model` for the live loop only, so the cheap per-tick model doesn't have to be your default. Leave blank to let the CLI choose.")
 
@@ -2438,6 +2486,10 @@ private struct DiarizationSettingsTabContent: View {
 
             Toggle("Enable speaker diarization", isOn: $diarization.isEnabled)
                 .accessibilityIdentifier("speakers.enable.toggle")
+                .disabled(diarization.isManaged(.diarizationEnabled))
+            if diarization.isManaged(.diarizationEnabled) {
+                ManagedSettingNote(field: .diarizationEnabled)
+            }
 
             if showingBootstrapCard {
                 bootstrapCard
@@ -3059,6 +3111,10 @@ private struct MeetingsSettingsTab: View {
                 .controlSize(.regular)
                 // Meetings' per-section probe for `DetailLayoutUITests`.
                 .accessibilityIdentifier("meetings.enable.toggle")
+                .disabled(settings.isManaged(.meetingDetectionEnabled))
+                if settings.isManaged(.meetingDetectionEnabled) {
+                    ManagedSettingNote(field: .meetingDetectionEnabled)
+                }
 
                 Divider()
 
