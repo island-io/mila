@@ -132,6 +132,34 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         }
     }
 
+    /// Mirror of the app's `UntranscribedSpan`: seconds of the recording's
+    /// audio that are missing from its transcript because transcribing them
+    /// failed during the recording and again when it was finalized (the
+    /// remote server was unreachable). Mirrored because the app persists it —
+    /// it is what says a transcript is knowingly incomplete.
+    public struct UntranscribedSpan: Codable, Equatable, Sendable {
+        public var start: Double
+        public var end: Double
+        /// True when the app could not read this span's audio back from the
+        /// file, so no retry can recover it.
+        public var unreadable: Bool?
+
+        public init(start: Double, end: Double, unreadable: Bool? = nil) {
+            self.start = start
+            self.end = end
+            self.unreadable = unreadable
+        }
+
+        private enum CodingKeys: String, CodingKey { case start, end, unreadable }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            start = try c.decodeIfPresent(Double.self, forKey: .start) ?? 0
+            end = try c.decodeIfPresent(Double.self, forKey: .end) ?? 0
+            unreadable = try? c.decodeIfPresent(Bool.self, forKey: .unreadable)
+        }
+    }
+
     public var id: UUID
     public var title: String
     public var createdAt: Date
@@ -182,6 +210,9 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     /// See `RetranscriptionPriorState`. Nil unless a re-transcription of a
     /// row that already had a transcript is in flight.
     public var retranscriptionPriorState: RetranscriptionPriorState?
+    /// See `UntranscribedSpan`. Nil when the transcript covers the whole
+    /// recording (the app omits the key then).
+    public var untranscribedSpans: [UntranscribedSpan]?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
@@ -238,7 +269,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
              summary, actionItems, speakerNames, appBundleID, summaryLanguage,
-             sharedBy, sharedAt, transcriptionDeferredAt, retranscriptionPriorState
+             sharedBy, sharedAt, transcriptionDeferredAt, retranscriptionPriorState,
+             untranscribedSpans
         case legacyFullText = "fullText"
     }
 
@@ -269,6 +301,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         // whole store (the decode is all-or-nothing).
         retranscriptionPriorState = try? c.decodeIfPresent(RetranscriptionPriorState.self,
                                                            forKey: .retranscriptionPriorState)
+        untranscribedSpans = try? c.decodeIfPresent([UntranscribedSpan].self,
+                                                    forKey: .untranscribedSpans)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -282,6 +316,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 sharedBy: String? = nil, sharedAt: Date? = nil,
                 transcriptionDeferredAt: Date? = nil,
                 retranscriptionPriorState: RetranscriptionPriorState? = nil,
+                untranscribedSpans: [UntranscribedSpan]? = nil,
                 legacyFullText: String? = nil) {
         self.id = id
         self.title = title
@@ -305,6 +340,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.sharedAt = sharedAt
         self.transcriptionDeferredAt = transcriptionDeferredAt
         self.retranscriptionPriorState = retranscriptionPriorState
+        self.untranscribedSpans = untranscribedSpans
         self.legacyFullText = legacyFullText
     }
 }

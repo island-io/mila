@@ -1186,6 +1186,14 @@ final class QuickActionsController: ObservableObject {
         // recording's.
         if runsLivePipeline {
             await liveTranscriber?.transcribeNow()
+            // Utterances the live path gave up on (the remote server was
+            // unreachable through the drain, or refused them): transcribe just
+            // those spans of the WAV and slot the text in by time, BEFORE the
+            // diarizer labels are applied so the recovered lines get speakers
+            // too. Bounded: `transcribeSpans` stops at the first failure and
+            // uses the short live request timeout, and it is skipped outright
+            // when the drain has just found the server unreachable (#355).
+            await liveTranscriber?.recoverUntranscribedAudio(from: outputURL)
             await liveDiarizer?.awaitPending()
             if let diar = liveDiarizer {
                 liveTranscriber?.applySpeakerLabels(diar.intervals)
@@ -1213,6 +1221,9 @@ final class QuickActionsController: ObservableObject {
         // emptied live transcript apart from one that never existed. See
         // `liveTranscriptIsAuthoritative`.
         let userDeletedLiveLines = runsLivePipeline && (liveTranscriber?.hasUserDeletedSegments ?? false)
+        // Same snapshot rule: audio the live transcript is still missing after
+        // the span pass in the drain above (#355). Saved on the row below.
+        let untranscribedSpans = runsLivePipeline ? (liveTranscriber?.untranscribedSpans ?? []) : []
         let finalSummary = (runsLivePipeline ? (liveAISession?.summary ?? "") : "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalItems = runsLivePipeline ? (liveAISession?.actionItems ?? []) : []
@@ -1277,6 +1288,18 @@ final class QuickActionsController: ObservableObject {
         // empty. (Cursor Bugbot on #229.)
         let userEmptiedLiveTranscript = userDeletedLiveLines && !hasLiveSegments
         let liveTranscriptIsAuthoritative = (hasLiveSegments || userEmptiedLiveTranscript) && vadActive
+        // Spans the transcript is still missing are only worth recording on a
+        // final live transcript that has text: a non-authoritative row gets
+        // the full batch pass (which covers them), and a transcript the user
+        // deliberately emptied stays empty — offering to "retry" text into it
+        // would undo that.
+        let missingSpansToSave = (liveTranscriptIsAuthoritative && hasLiveSegments) ? untranscribedSpans : []
+        if !untranscribedSpans.isEmpty {
+            quickActionsLog.log("""
+                live transcript still missing \(untranscribedSpans.count, privacy: .public) spans after \
+                the span pass — saved on the row: \(missingSpansToSave.count, privacy: .public)
+                """)
+        }
         let finalFullText = finalTranscriptSegments.map(\.text).joined(separator: " ")
 
         guard var updated = store.recordings.first(where: { $0.id == recording.id }) else {
@@ -1304,6 +1327,9 @@ final class QuickActionsController: ObservableObject {
             return
         }
         updated.segments = finalTranscriptSegments
+        // Not silently complete: the detail view says how much is missing and
+        // offers "Retry missing parts" (#355).
+        updated.untranscribedSpans = missingSpansToSave.isEmpty ? nil : missingSpansToSave
         // Mid-recording speaker renames from the live pane are NOT copied
         // onto the row here — see the note at `store.add` above. They are
         // handed to `onRecordingFinalized` below (still before
