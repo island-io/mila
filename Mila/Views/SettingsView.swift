@@ -372,6 +372,7 @@ private struct LiveInputLevelMeter: View {
 
 private struct AudioSettingsTab: View {
     @EnvironmentObject private var settings: AudioInputSettings
+    @EnvironmentObject private var storage: RecordingStorageSettings
     @EnvironmentObject private var monitor: InputLevelMonitor
     @EnvironmentObject private var actions: QuickActionsController
     @EnvironmentObject private var liveAI: LiveAISettings
@@ -478,6 +479,28 @@ private struct AudioSettingsTab: View {
                     .disabled(!liveAI.isLiveAIAvailable)
                     .accessibilityIdentifier("liveAI.transcribeWhileRecording.toggle")
                 Text(transcribeWhileRecordingCaption)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider().padding(.vertical, 4)
+
+            // Auto-save. Independent of Live AI — it only decides what an
+            // ordinary Stop does: save and open the recording, or ask for a
+            // name first. Every source and every recording mode goes through
+            // the same Stop path, so one switch covers them all. The saved
+            // audio, transcript and transcription queue are identical either
+            // way.
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Save and open recordings automatically",
+                       isOn: $storage.autoSaveRecordings)
+                    .toggleStyle(.switch)
+                    .frame(minHeight: 44)
+                    .accessibilityIdentifier("recordings.autoSave.toggle")
+                    .help("Use the setting at Stop to open the saved recording without asking for a name.")
+                    .accessibilityHint("Applies at Stop in all recording modes. You can rename later.")
+                Text("When you stop, save and open the recording without asking for a name. Applies to all recording modes and uses this setting at Stop. Prepared titles are kept; AI title suggestions run in the background when configured in AI Features. You can rename later.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
