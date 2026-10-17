@@ -161,10 +161,6 @@ final class RemoteTranscriptionSettings: ObservableObject {
         set {
             guard !isManaged(.apiKey), newValue != storedAPIKey else { return }
             storedAPIKey = newValue
-            // Skip the write-back when we're just adopting the value we read
-            // from the Keychain — re-saving it would be a redundant write that
-            // could itself trigger a Keychain prompt.
-            guard !isAdoptingStoredAPIKey else { return }
             KeychainHelper.save(key: apiKeyKeychainKey, value: newValue)
             testStatus = .idle
         }
@@ -294,7 +290,11 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // A managed token replaces the Keychain entirely: adopt it and mark the
         // lazy load done, so the stored one is never read (and never prompts).
         self.storedAPIKey = managed.apiKey ?? ""
-        if managed.isManaged(.apiKey) { hasLoadedAPIKey = true }
+        // Only a managed token WITH a value replaces the Keychain. One the
+        // profile forces but Mila can't use (`lockedWithoutValue`) keeps the
+        // user's stored token, like every other locked-without-value field —
+        // it is still loaded below; only edits are refused.
+        if managed.apiKey != nil { hasLoadedAPIKey = true }
         if backend == .remote { loadAPIKeyIfNeeded() }
         // Upgrade path: everyone already pointed at an ivrit.ai endpoint before
         // per-language routing existed has a blank English model, and a blank
@@ -389,21 +389,14 @@ final class RemoteTranscriptionSettings: ObservableObject {
         // the in-memory field is still empty.
         guard apiKey.isEmpty else { return }
         guard let stored = KeychainHelper.load(key: apiKeyKeychainKey), !stored.isEmpty else { return }
-        // Assigning here triggers `apiKey`'s setter, but since `stored != ""` only
-        // when it differs from the current empty value, the write-through guard
-        // (`guard apiKey != oldValue`) lets it pass and re-saves the identical
-        // value. KeychainHelper.save is delete-then-add, so writing the same
-        // value back is harmless — but to avoid even that redundant Keychain
-        // write (which could itself prompt), suppress the write-through for this
-        // one assignment.
-        isAdoptingStoredAPIKey = true
-        apiKey = stored
-        isAdoptingStoredAPIKey = false
+        // Adopt it into storage directly, not through `apiKey`'s setter: the
+        // setter would write the value we just read straight back to the
+        // Keychain (a redundant write that could itself prompt), and it refuses
+        // every write while the key is managed — which must not stop Mila
+        // loading the user's own token when the profile locks the field
+        // without a usable value (`ManagedSettings.lockedWithoutValue`).
+        storedAPIKey = stored
     }
-
-    /// Set only while `loadAPIKeyIfNeeded` adopts the stored token, so the
-    /// `apiKey`'s setter write-through skips re-saving a value we just read.
-    private var isAdoptingStoredAPIKey = false
 
     /// True when the user has chosen the remote backend (regardless of whether
     /// it's fully configured). Drives routing in `TranscriptionService`.

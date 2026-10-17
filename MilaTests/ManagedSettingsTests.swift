@@ -454,6 +454,43 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
                        "A managed token is never written to the Keychain")
     }
 
+    /// Bugbot on #369: an API key forced with an unusable value must keep the
+    /// user's own token (loaded from the Keychain as usual) and only refuse
+    /// edits — not blank the token and leave remote auth empty.
+    func test_remote_apiKeyLockedWithoutValue_stillLoadsTheKeychainToken() {
+        let keychainKey = "ManagedSettingsTests.\(#function).apiKey"
+        KeychainHelper.save(key: keychainKey, value: "user-token")
+        defer { KeychainHelper.delete(key: keychainKey) }
+
+        var managed = ManagedSettings.empty
+        managed.backend = .remote
+        managed.lockedWithoutValue = [.apiKey]
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
+                                                 apiKeyKeychainKey: keychainKey,
+                                                 managed: managed)
+        XCTAssertTrue(remote.isManaged(.apiKey))
+        XCTAssertEqual(remote.apiKey, "user-token", "The user's stored token is kept")
+
+        remote.apiKey = "typed-over"
+        XCTAssertEqual(remote.apiKey, "user-token", "Edits are still refused")
+        XCTAssertEqual(KeychainHelper.load(key: keychainKey), "user-token")
+    }
+
+    func test_remote_apiKeyLockedWithoutValue_loadsLazilyOnSwitchToRemote() {
+        let keychainKey = "ManagedSettingsTests.\(#function).apiKey"
+        KeychainHelper.save(key: keychainKey, value: "user-token")
+        defer { KeychainHelper.delete(key: keychainKey) }
+
+        var managed = ManagedSettings.empty
+        managed.lockedWithoutValue = [.apiKey]
+        let remote = RemoteTranscriptionSettings(defaults: freshDefaults(#function),
+                                                 apiKeyKeychainKey: keychainKey,
+                                                 managed: managed)
+        XCTAssertEqual(remote.apiKey, "", "Still lazy: no Keychain read while local")
+        remote.backend = .remote
+        XCTAssertEqual(remote.apiKey, "user-token")
+    }
+
     func test_remote_managedEnglishModel_isNotReconciledAway() {
         var managed = ManagedSettings.empty
         managed.model = "ivrit-ai/whisper-large-v3-turbo-ct2"
