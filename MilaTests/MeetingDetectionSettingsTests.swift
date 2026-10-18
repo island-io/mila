@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import Mila
 
 @MainActor
@@ -9,6 +10,31 @@ final class MeetingDetectionSettingsTests: XCTestCase {
         let d = UserDefaults(suiteName: suite)!
         d.removePersistentDomain(forName: suite)
         return d
+    }
+
+    func test_enabled_changes_delivers_revocation_before_the_setter_returns() {
+        let settings = MeetingDetectionSettings(defaults: freshDefaults())
+        var values: [Bool] = []
+        let observation = settings.enabledChanges.sink { values.append($0) }
+        defer { observation.cancel() }
+        settings.enabled = false
+        XCTAssertEqual(values, [true, false])
+        XCTAssertFalse(settings.enabled)
+    }
+
+    func test_managed_detection_refuses_enable_without_publishing_or_persisting_it() {
+        let defaults = freshDefaults()
+        defaults.set(false, forKey: "meetingDetection.enabled")
+        var managed = ManagedSettings.empty
+        managed.meetingDetectionEnabled = false
+        let settings = MeetingDetectionSettings(defaults: defaults, managed: managed)
+        var values: [Bool] = []
+        let observation = settings.enabledChanges.sink { values.append($0) }
+        defer { observation.cancel() }
+        settings.enabled = true
+        XCTAssertEqual(values, [false])
+        XCTAssertFalse(settings.enabled)
+        XCTAssertFalse(defaults.bool(forKey: "meetingDetection.enabled"))
     }
 
     func test_enabled_defaults_on_for_first_launch() {

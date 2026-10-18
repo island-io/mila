@@ -200,21 +200,29 @@ struct VoiceProfile: Codable, Identifiable, Hashable {
 ///
 /// **Entirely gated on `VoiceRecognitionSettings.isConfigured`, which is
 /// off by default.** With the feature off this object is inert: the JSON
-/// file is never parsed, `profiles` stays empty, no embedding is written,
+/// file is never loaded, `profiles` stays empty, no embedding is written,
 /// and `seedEntries()` hands the diarizer nothing. A user who never opts in
 /// has no voice data stored — the guarantee is "never written", not
 /// "written and ignored".
 ///
-/// The one thing that still works while off is deletion
-/// (`deleteAllProfiles`), because off is precisely when somebody wants
-/// their voice data gone. Opting out is otherwise non-destructive: profiles
-/// stay on disk so re-enabling restores them, and Settings keeps an
-/// explicit delete button visible for as long as the file exists.
+/// The one thing that still works while off is deletion, because off is
+/// precisely when somebody wants their voice data gone: `deleteAllProfiles`
+/// removes the file outright, and `forgetSpeaker(named:)` (Settings → Known
+/// speakers' ✕) drops one voice from it. That second path, and
+/// `storedVoice(forSpeakerNamed:)` which Known speakers asks before it, are
+/// the only off-state reads of the file: decoded exactly as `load()` would,
+/// into a local that is gone when the call returns, never into `profiles`,
+/// and only on the user's own click. A file they cannot decode is left as
+/// it is. Opting out is otherwise non-destructive: profiles stay on disk so
+/// re-enabling restores them, and Settings keeps an explicit delete button
+/// visible for as long as the file exists.
 @MainActor
 final class SpeakerProfileStore: ObservableObject {
     /// Profiles held in memory. **Empty whenever the feature is off** — the
-    /// file is not even parsed until the user opts in, so an opted-out
-    /// process holds no voice data at all, not merely unused voice data.
+    /// file is not loaded until the user opts in, so an opted-out process
+    /// holds no voice data at all, not merely unused voice data. (The
+    /// off-state single-voice delete decodes the file transiently and keeps
+    /// nothing; see the type's doc.)
     @Published private(set) var profiles: [VoiceProfile] = []
 
     /// True when `speaker-profiles.json` exists on disk, whether or not it
@@ -306,10 +314,11 @@ final class SpeakerProfileStore: ObservableObject {
     enum Deletion: Equatable {
         /// Every profile — `deleteAllProfiles`. Carries no names on purpose:
         /// while the feature is off `profiles` is empty (the file is never
-        /// parsed), so the store genuinely does not know what it just
+        /// loaded), so the store genuinely does not know what it just
         /// deleted. "All" is the honest answer and the safe one.
         case all
-        /// One profile, by name.
+        /// Profiles by name — `deleteProfile`, `forgetSpeaker`, or a
+        /// recheck's re-read that no longer holds them.
         case named(Set<String>)
     }
 
@@ -372,6 +381,7 @@ final class SpeakerProfileStore: ObservableObject {
                 self.profiles.removeAll()
                 // Whatever failed to save is gone from memory too.
                 self.hasUnsavedChanges = false
+                self.unsavedDeletions.removeAll()
             }
             // The main-window announcement follows the switch (#342).
             self.refreshDamagedProfilesNotice()
@@ -533,22 +543,202 @@ final class SpeakerProfileStore: ObservableObject {
         save()
     }
 
-    func deleteProfile(id: UUID) {
-        let removed = Set(profiles.filter { $0.id == id }.map(\.name))
-        profiles.removeAll { $0.id == id }
-        save()
-        // Same reason as `deleteAllProfiles`: a live diarizer seeded with
-        // this profile would otherwise keep matching it and write it back at
-        // stop. Skipped when nothing matched the id, so a no-op delete does
-        // not disturb an in-flight recording.
-        if !removed.isEmpty { notifyDeleted(.named(removed)) }
+    /// What deleting one voice profile achieved. Returned rather than
+    /// assumed, so Settings never says a voice is gone when it is not.
+    enum ProfileDeletionOutcome: Equatable {
+        /// No stored voice profile matched; nothing changed.
+        case nothingToDelete
+        /// Gone from memory and from `speaker-profiles.json`.
+        case deleted
+        /// Gone from memory — recognition stops using it at once, and a
+        /// recording in flight has been told — but `speaker-profiles.json`
+        /// could not be written, so the voice comes back on the next launch
+        /// unless a later save succeeds first.
+        case deletedForThisSessionOnly
+        /// `speaker-profiles.json` could not be read or decoded — the file
+        /// `load()` calls damaged — so whether it holds this voice is
+        /// unknown and nothing was deleted from it. The file is left exactly
+        /// as it is: a damaged file is only ever moved aside, never written
+        /// over (#329). A matching profile still in memory was dropped from
+        /// there.
+        case profileFileUnreadable
+        /// Voice recognition is off and the file could not be rewritten;
+        /// nothing was deleted.
+        case notDeleted
     }
 
-    func deleteProfile(name: String) {
-        let removed = Set(profiles.filter { $0.name == name }.map(\.name))
-        profiles.removeAll { $0.name == name }
-        save()
-        if !removed.isEmpty { notifyDeleted(.named(removed)) }
+    @discardableResult
+    func deleteProfile(id: UUID) -> ProfileDeletionOutcome {
+        deleteProfiles { $0.id == id }
+    }
+
+    @discardableResult
+    func deleteProfile(name: String) -> ProfileDeletionOutcome {
+        deleteProfiles { $0.name == name }
+    }
+
+    /// The in-memory delete behind `deleteProfile(id:)`,
+    /// `deleteProfile(name:)` and, with recognition on, `forgetSpeaker`.
+    ///
+    /// The removal from `profiles` stands even when the save fails: the
+    /// running session must stop matching the voice the user just deleted,
+    /// and the deletion observers must still hear about it, or a recording
+    /// in flight writes it back at stop. The outcome says the deletion did
+    /// not persist (`.deletedForThisSessionOnly`), and `unsavedDeletions`
+    /// remembers it, so asking again retries the save. A delete that
+    /// matches nothing else writes nothing and notifies nobody, so a no-op
+    /// does not disturb an in-flight recording.
+    @discardableResult
+    private func deleteProfiles(where matches: (VoiceProfile) -> Bool) -> ProfileDeletionOutcome {
+        let gone = profiles.filter(matches)
+        guard !gone.isEmpty else {
+            // Already out of memory from an earlier delete whose save
+            // failed: the retry is the save itself. Observers were told the
+            // first time.
+            guard unsavedDeletions.contains(where: matches) else { return .nothingToDelete }
+            return save() ? .deleted : .deletedForThisSessionOnly
+        }
+        let removed = Set(gone.map(\.name))
+        profiles.removeAll(where: matches)
+        let saved = save()
+        // After the save: a successful one clears the list.
+        if !saved { unsavedDeletions.append(contentsOf: gone) }
+        // Same reason as `deleteAllProfiles`: a live diarizer seeded with
+        // this profile would otherwise keep matching it and write it back at
+        // stop.
+        notifyDeleted(.named(removed))
+        return saved ? .deleted : .deletedForThisSessionOnly
+    }
+
+    /// Whether a voice profile is stored under a speaker name, matched the
+    /// way `forgetSpeaker(named:)` matches. Known speakers asks before its
+    /// ✕ so that removing a plain name stays one click and only deleting a
+    /// trained voice asks for confirmation.
+    enum StoredVoice: Equatable {
+        case notStored
+        case stored
+        /// `speaker-profiles.json` could not be read or decoded, so there is
+        /// no telling — and `forgetSpeaker` could not delete it either.
+        case unknown
+    }
+
+    /// See `StoredVoice`. While recognition is off this reads the file the
+    /// same way the off-state `forgetSpeaker` does — into a local that is
+    /// dropped on return, never into `profiles` — and only when the user has
+    /// just asked to remove a name.
+    func storedVoice(forSpeakerNamed name: String) -> StoredVoice {
+        let matches = Self.speakerNameMatcher(name)
+        if settings.isEnabled {
+            if profiles.contains(where: { matches($0.name) })
+                || unsavedDeletions.contains(where: { matches($0.name) }) { return .stored }
+            return loadedFromDamagedFile ? .unknown : .notStored
+        }
+        if loadedFromDamagedFile { return .unknown }
+        do {
+            guard let stored = try readStoredFile() else { return .notStored }
+            return stored.contains(where: { matches($0.name) }) ? .stored : .notStored
+        } catch {
+            return .unknown
+        }
+    }
+
+    /// Delete the voice profile behind a name the user removed from Settings
+    /// → Known speakers, and say how far that got.
+    ///
+    /// **Removing the name alone is not enough.** The pick-list
+    /// (`SpeakerDirectory`) and the voice profiles are separate files, and
+    /// recognition reads only the profiles: a removed name whose profile
+    /// survived went on being seeded into every recording and labelling the
+    /// matched speaker with the name the user had just thrown away — an
+    /// imported "Daniel Solomon (from Daniel)" kept reappearing that way
+    /// (#358).
+    ///
+    /// Matches case-insensitively, the same way `SpeakerDirectory.remove`
+    /// does, so the entry and the profile go together even when their
+    /// spelling drifted in case.
+    ///
+    /// Not gated on the feature being on, like `deleteAllProfiles` and for
+    /// the same reason. While off the profiles are not in memory, so the
+    /// file is decoded exactly as `load()` decodes it, the matching rows are
+    /// dropped and the rest written back — or the file deleted, when nothing
+    /// is left — without anything reaching `profiles`. Otherwise switching
+    /// recognition back on would resurrect the voice.
+    ///
+    /// A file `load()` could not read is never rewritten here, in either
+    /// state: it may hold the user's only copy of every other voice, and a
+    /// damaged `speaker-profiles.json` is moved aside, never written over
+    /// (#329). The outcome is then `.profileFileUnreadable`, and Settings
+    /// says so rather than claiming the voice is gone.
+    @discardableResult
+    func forgetSpeaker(named name: String) -> ProfileDeletionOutcome {
+        let matches = Self.speakerNameMatcher(name)
+        guard settings.isEnabled else { return forgetOnDisk(where: matches) }
+        guard loadedFromDamagedFile else { return deleteProfiles { matches($0.name) } }
+        // A failed re-read leaves `profiles` as it was, so the voice may
+        // still be in memory and in use: drop it there and tell the
+        // observers. No `save()` — that would move the damaged file aside
+        // and leave this voice in the backup while reporting it deleted.
+        let removed = Set(profiles.map(\.name).filter(matches))
+        if !removed.isEmpty {
+            profiles.removeAll { matches($0.name) }
+            notifyDeleted(.named(removed))
+        }
+        profileLog.error("forgetSpeaker: speaker-profiles.json could not be read, so it was left as it is")
+        return .profileFileUnreadable
+    }
+
+    /// The off-state half of `forgetSpeaker`. Nothing decoded here outlives
+    /// the call.
+    private func forgetOnDisk(where matches: (String) -> Bool) -> ProfileDeletionOutcome {
+        guard !loadedFromDamagedFile else {
+            profileLog.error("forgetSpeaker: speaker-profiles.json could not be read, so it was left as it is")
+            return .profileFileUnreadable
+        }
+        let stored: [VoiceProfile]
+        do {
+            guard let decoded = try readStoredFile() else { return .nothingToDelete }
+            stored = decoded
+        } catch {
+            profileLog.error("forgetSpeaker: speaker-profiles.json could not be read, so it was left as it is: \(error.localizedDescription, privacy: .public)")
+            return .profileFileUnreadable
+        }
+        let removed = Set(stored.map(\.name).filter(matches))
+        guard !removed.isEmpty else { return .nothingToDelete }
+        let kept = stored.filter { !matches($0.name) }
+        do {
+            if kept.isEmpty {
+                // As `deleteAllProfiles` does: no voices left means no file,
+                // not an empty array — so Settings stops reporting stored
+                // voice data that is not there.
+                try fileManager.removeItem(at: storeURL)
+            } else {
+                try Self.encodeProfiles(kept).write(to: storeURL, options: .atomic)
+            }
+        } catch {
+            profileLog.error("forgetSpeaker error: \(error.localizedDescription, privacy: .public)")
+            return .notDeleted
+        }
+        lastSeenFileDate = currentFileDate()
+        let onDisk = storedFilesExist()
+        if onDisk != hasStoredProfilesOnDisk { hasStoredProfilesOnDisk = onDisk }
+        notifyDeleted(.named(removed))
+        return .deleted
+    }
+
+    /// How `forgetSpeaker` and `storedVoice` compare a speaker name with a
+    /// profile's: case-insensitively, like `SpeakerDirectory.remove`.
+    private static func speakerNameMatcher(_ name: String) -> (String) -> Bool {
+        return { $0.caseInsensitiveCompare(name) == .orderedSame }
+    }
+
+    /// `speaker-profiles.json` decoded exactly as `load()` decodes it, into a
+    /// value the caller drops when done — for the off-state paths, which
+    /// must leave nothing in `profiles`. nil when there is no file. Throws
+    /// for a file that cannot be read or decoded: one `load()` would call
+    /// damaged, which no caller may then rewrite.
+    private func readStoredFile() throws -> [VoiceProfile]? {
+        guard fileManager.fileExists(atPath: storeURL.path) else { return nil }
+        return try Self.decodeProfiles(from: Data(contentsOf: storeURL))
     }
 
     /// Remove every stored voice profile — the "Delete voice profiles"
@@ -572,6 +762,7 @@ final class SpeakerProfileStore: ObservableObject {
     func deleteAllProfiles() {
         profiles.removeAll()
         hasUnsavedChanges = false
+        unsavedDeletions.removeAll()
         do {
             if fileManager.fileExists(atPath: storeURL.path) {
                 try fileManager.removeItem(at: storeURL)
@@ -602,7 +793,7 @@ final class SpeakerProfileStore: ObservableObject {
         refreshDamagedProfilesNotice()
         // Unconditional, and after the file is gone: this must fire even
         // when `profiles` was already empty in memory (the feature is off,
-        // so the file was never parsed) — that is precisely the case where
+        // so the file was never loaded) — that is precisely the case where
         // the store cannot name what it deleted but a seeded pool may still
         // be holding it.
         notifyDeleted(.all)
@@ -624,7 +815,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// Gated on `isEnabled`, not `isConfigured`, deliberately: this is a
     /// READ of data the user already consented to store, and serialising
     /// floats into a file needs no diarization pipeline. (While off,
-    /// `profiles` is empty anyway — the file was never parsed.) Writes on
+    /// `profiles` is empty anyway — the file was never loaded.) Writes on
     /// the import side still go through `updateProfile` and its
     /// `isConfigured` gate; see `.claude/rules/feature-gates.md`.
     func profiles(named names: Set<String>) -> [VoiceProfile] {
@@ -819,7 +1010,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// Entries suitable for seeding the live diarizer pool.
     ///
     /// The seed gate. Returns nothing while the feature is off — and while
-    /// off `profiles` is empty anyway, since the file was never parsed.
+    /// off `profiles` is empty anyway, since the file was never loaded.
     func seedEntries() -> [(id: String, name: String, centroid: [Float], sampleCount: Int)] {
         guard settings.isConfigured else { return [] }
         return profiles.map { p in
@@ -867,19 +1058,17 @@ final class SpeakerProfileStore: ObservableObject {
             hasUnsavedChanges = true
             return false
         }
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         do {
             // Ensure the parent directory exists (first launch on a clean install).
             let dir = storeURL.deletingLastPathComponent()
             if !fileManager.fileExists(atPath: dir.path) {
                 try fileManager.createDirectory(at: dir, withIntermediateDirectories: true)
             }
-            let data = try encoder.encode(profiles)
+            let data = try Self.encodeProfiles(profiles)
             try data.write(to: storeURL, options: .atomic)
             lastSeenFileDate = currentFileDate()
             hasUnsavedChanges = false
+            unsavedDeletions.removeAll()
             hasStoredProfilesOnDisk = true
             return true
         } catch {
@@ -919,7 +1108,7 @@ final class SpeakerProfileStore: ObservableObject {
     /// reported to the deletion observers, exactly as a delete from
     /// Settings is, so a recording in flight does not write them back.
     ///
-    /// While the feature is off the file is never parsed, so a changed
+    /// While the feature is off the file is never loaded, so a changed
     /// file just clears the unreadable state; opting in re-detects it.
     func recheckDamagedProfiles() {
         let date = currentFileDate()
@@ -963,6 +1152,15 @@ final class SpeakerProfileStore: ObservableObject {
     /// A change that `save()` could not write (the damaged file could not
     /// be moved aside, or the write failed). Blocks a recheck's re-read.
     private var hasUnsavedChanges = false
+
+    /// Profiles a single delete removed from memory whose save then failed
+    /// (`.deletedForThisSessionOnly`): still on disk, so they come back on
+    /// the next launch. Kept so `storedVoice` still reports them — or Known
+    /// speakers' ✕ would treat the name as plain and drop it in one click —
+    /// and so a retried delete re-attempts the save instead of finding
+    /// nothing in memory and writing nothing. Cleared by any successful
+    /// save (which persists the removal), a load, deleteAll and opt-out.
+    private var unsavedDeletions: [VoiceProfile] = []
 
     /// Modification date of the live file this store last read or wrote.
     private var lastSeenFileDate: Date?
@@ -1170,6 +1368,27 @@ final class SpeakerProfileStore: ObservableObject {
         return true
     }
 
+    /// The one decoder for `speaker-profiles.json`. `load()` and the
+    /// off-state `forgetSpeaker` / `storedVoice` share it, so a file one of
+    /// them calls damaged the others do too. A more lenient reader (say,
+    /// `JSONSerialization`, which takes a row missing a field or a date in
+    /// the wrong format) would let a delete rewrite a file `load()` had left
+    /// alone for repair.
+    private static func decodeProfiles(from data: Data) throws -> [VoiceProfile] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try decoder.decode([VoiceProfile].self, from: data)
+    }
+
+    /// The one encoder for `speaker-profiles.json`, shared by `save()` and
+    /// the off-state `forgetSpeaker`.
+    private static func encodeProfiles(_ profiles: [VoiceProfile]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        return try encoder.encode(profiles)
+    }
+
     /// Parses `speaker-profiles.json` into memory. Called from `init` only
     /// when the user has already opted in, and from the opt-in transition —
     /// the guard is belt and braces so a future caller can't read voice data
@@ -1201,10 +1420,7 @@ final class SpeakerProfileStore: ObservableObject {
         }
         do {
             lastSeenFileDate = currentFileDate()
-            let data = try Data(contentsOf: storeURL)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let decoded = try decoder.decode([VoiceProfile].self, from: data)
+            let decoded = try Self.decodeProfiles(from: Data(contentsOf: storeURL))
             var accepted: [VoiceProfile] = []
             accepted.reserveCapacity(decoded.count)
             for profile in decoded {
@@ -1216,6 +1432,7 @@ final class SpeakerProfileStore: ObservableObject {
             }
             profiles = accepted
             hasUnsavedChanges = false
+            unsavedDeletions.removeAll()
             loadedFromDamagedFile = false
             profileLog.log("loaded \(accepted.count) of \(decoded.count) voice profiles")
         } catch {

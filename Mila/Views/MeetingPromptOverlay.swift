@@ -15,7 +15,7 @@ protocol MeetingRecordingActions: AnyObject {
 extension QuickActionsController: MeetingRecordingActions {
     var meetingRecordingURL: URL? { isRecording ? session.fileURL : nil }
     var canStartMeetingRecording: Bool {
-        activeJob == .none && !captureStartInFlight && !isFinalizingRecording
+        activeJob == .none && !captureStartInFlight && !isStoppingRecording
             && !transcription.isPreparingModel
     }
     var meetingRecordingChanges: AnyPublisher<Void, Never> {
@@ -134,7 +134,7 @@ final class MeetingPromptCoordinator: ObservableObject {
             .sink { [weak self] in self?.recordingChanged() }.store(in: &subscriptions)
         // Use the incoming @Published value synchronously for revocation;
         // reading the property here would still see its pre-willSet value.
-        settings.$enabled.sink { [weak self] enabled in
+        settings.enabledChanges.sink { [weak self] enabled in
             guard let self, !enabled else { return }
             self.invalidatePendingActions()
             self.owner = nil
@@ -420,6 +420,9 @@ final class MeetingPromptCoordinator: ObservableObject {
             announce("Recording has not started. Mila is busy; use Start transcribing when ready.")
         } else if prompt.automatic {
             announce("\(prompt.app.displayName): \(prompt.kind == .start ? "starting" : "stopping") recording in ten seconds. Focus the prompt to pause, or cancel.")
+        } else {
+            let question = prompt.kind == .start ? "Meeting detected. Start transcribing?" : "Meeting ended. Stop recording?"
+            announce("\(prompt.app.displayName): \(question) Focus the prompt to pause and respond.")
         }
     }
     private var panelSubscriptions: Set<AnyCancellable> = []

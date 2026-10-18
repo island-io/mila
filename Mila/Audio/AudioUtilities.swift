@@ -53,11 +53,68 @@ enum AudioConvert {
         return output
     }
 
-    /// Pull mono float samples out of a buffer (Whisper-shaped).
+    /// Hand `body` channel zero of a Float32 buffer as (pointer, frames, stride),
+    /// or return nil — never trap — when there is nothing safe to read: a
+    /// non-Float32 format, zero frames, or no storage behind the channel.
+    /// Interleaved buffers keep every channel in one AudioBuffer, so channel
+    /// zero is every `channelCount`-th sample (stride > 1).
+    ///
+    /// Reads go through the READ-ONLY `audioBufferList`. `mutableAudioBufferList`
+    /// is for callers that rewrite the list (Core Audio copies, converters);
+    /// fetching it on a read path turns every meter/sample read into a write
+    /// of the buffer's list metadata.
+    static func withFloatChannel<R>(from buffer: AVAudioPCMBuffer,
+                                    _ body: (UnsafePointer<Float>, Int, Int) -> R) -> R? {
+        let frames = Int(buffer.frameLength)
+        let channels = Int(buffer.format.channelCount)
+        guard buffer.format.commonFormat == .pcmFormatFloat32,
+              frames > 0, frames <= Int(buffer.frameCapacity), channels > 0 else { return nil }
+        let list = buffer.audioBufferList.pointee
+        let interleaved = buffer.format.isInterleaved
+        guard Int(list.mNumberBuffers) >= (interleaved ? 1 : channels) else { return nil }
+        // `mBuffers` is the list's first AudioBuffer — channel zero's storage
+        // in both layouts.
+        return withFloatChannel(from: list.mBuffers, frameCount: frames,
+                                stride: interleaved ? channels : 1, body)
+    }
+
+    /// Check a raw Float32 AudioBuffer against the extent the caller is about
+    /// to read — channel count matches the stride, storage is non-nil, and
+    /// `frameCount * stride` floats fit in `mDataByteSize` without overflow —
+    /// before building any typed view over it.
+    ///
+    /// What the byte check does and doesn't buy: for an arbitrary AudioBuffer
+    /// (the case the tests drive directly) it is a real bound. Reached from an
+    /// AVAudioPCMBuffer it cannot fail — `audioBufferList` reports
+    /// `mDataByteSize` derived from `frameLength`, and AVFAudio already
+    /// refuses a `frameLength` past `frameCapacity` — so on that path it is
+    /// consistency, not a check against the real allocation. The protection
+    /// against reading past an allocation is upstream, where a packet's
+    /// storage is COPIED into an AVAudioPCMBuffer sized from its own frame
+    /// count (`SystemAudioPCM`), never adopted with a foreign byte count.
+    static func withFloatChannel<R>(from storage: AudioBuffer, frameCount: Int, stride: Int,
+                                    _ body: (UnsafePointer<Float>, Int, Int) -> R) -> R? {
+        guard frameCount > 0, stride > 0, Int(storage.mNumberChannels) == stride,
+              let data = storage.mData else { return nil }
+        let (samples, sampleOverflow) = frameCount.multipliedReportingOverflow(by: stride)
+        let (bytes, byteOverflow) = samples.multipliedReportingOverflow(by: MemoryLayout<Float>.size)
+        guard !sampleOverflow, !byteOverflow, bytes <= Int(storage.mDataByteSize) else { return nil }
+        return body(UnsafePointer(data.assumingMemoryBound(to: Float.self)), frameCount, stride)
+    }
+
+    /// Pull channel-zero float samples (normally mono, Whisper-shaped).
     static func samples(from buffer: AVAudioPCMBuffer) -> [Float] {
-        guard let data = buffer.floatChannelData else { return [] }
-        let count = Int(buffer.frameLength)
-        return Array(UnsafeBufferPointer(start: data[0], count: count))
+        withFloatChannel(from: buffer) { data, count, stride in
+            if stride == 1 { return Array(UnsafeBufferPointer(start: data, count: count)) }
+            // Interleaved: a strided copy of column 0 — one `count`-row,
+            // 1-column submatrix of a `stride`-column matrix — with the same
+            // vDSP stride handling `AudioMeter` uses, not a per-sample map.
+            return [Float](unsafeUninitializedCapacity: count) { out, initialized in
+                vDSP_mmov(data, out.baseAddress!, 1, vDSP_Length(count),
+                          vDSP_Length(stride), 1)
+                initialized = count
+            }
+        } ?? []
     }
 
     /// Read a wav/aiff/m4a file and convert all of its samples to Whisper format.
@@ -70,6 +127,31 @@ enum AudioConvert {
             return []
         }
         try file.read(into: inputBuffer)
+        let converted = try toWhisperFormat(inputBuffer)
+        return samples(from: converted)
+    }
+
+    /// Read only `[start, end)` seconds of a wav/aiff/m4a file and convert
+    /// them to Whisper format, without decoding the rest of the recording.
+    /// Used to re-transcribe the spans the live path missed (#355). Clamped
+    /// to the file; an empty range returns `[]`.
+    static func loadAsWhisperSamples(url: URL, from start: TimeInterval, to end: TimeInterval) throws -> [Float] {
+        // A NaN or infinite bound would trap in the frame-count conversion.
+        guard start.isFinite, end.isFinite, end > start else { return [] }
+        let file = try AVAudioFile(forReading: url)
+        let rate = file.processingFormat.sampleRate
+        // Clamp in Double space BEFORE converting: a huge-but-finite bound
+        // (seconds × rate past Int64) would trap in the integer conversion.
+        let length = Double(file.length)
+        let startFrame = AVAudioFramePosition(min(length, max(0, start * rate).rounded(.down)))
+        let endFrame = AVAudioFramePosition(min(length, max(0, end * rate).rounded(.up)))
+        guard endFrame > startFrame,
+              let inputBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
+                                                 frameCapacity: AVAudioFrameCount(endFrame - startFrame)) else {
+            return []
+        }
+        file.framePosition = startFrame
+        try file.read(into: inputBuffer, frameCount: AVAudioFrameCount(endFrame - startFrame))
         let converted = try toWhisperFormat(inputBuffer)
         return samples(from: converted)
     }
@@ -195,12 +277,11 @@ enum AudioSignal {
 /// Computes a 0...1 RMS level from an audio buffer for VU meters.
 enum AudioMeter {
     static func level(from buffer: AVAudioPCMBuffer) -> Float {
-        guard let data = buffer.floatChannelData else { return 0 }
-        let count = vDSP_Length(buffer.frameLength)
-        var rms: Float = 0
-        vDSP_rmsqv(data[0], 1, &rms, count)
-        let avgPower = 20 * log10(max(rms, 0.000_001))
-        let normalized = max(0, (avgPower + 60) / 60)
-        return min(1, normalized)
+        AudioConvert.withFloatChannel(from: buffer) { data, count, stride in
+            var rms: Float = 0
+            vDSP_rmsqv(data, vDSP_Stride(stride), &rms, vDSP_Length(count))
+            let avgPower = 20 * log10(max(rms, 0.000_001))
+            return min(1, max(0, (avgPower + 60) / 60))
+        } ?? 0
     }
 }

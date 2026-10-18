@@ -100,6 +100,18 @@ struct ContentView: View {
             actions: { Button("OK") { transcription.lastError = nil } },
             message: { Text(transcription.lastError ?? "") }
         )
+        // "End Conversation Here" trimmed the transcript but not the audio
+        // (#357). Shown here rather than in the detail view because the audio
+        // work can finish after the user has navigated elsewhere.
+        .alert(
+            "Transcript trim",
+            isPresented: Binding(
+                get: { store.trimNotice != nil },
+                set: { if !$0 { store.trimNotice = nil } }
+            ),
+            actions: { Button("OK") { store.trimNotice = nil } },
+            message: { Text(store.trimNotice ?? "") }
+        )
         .alert(
             "Recording stopped because your Mac slept",
             isPresented: Binding(
@@ -495,7 +507,16 @@ private struct LanguagePickerToolbarItem: View {
             .padding(.horizontal, 8)
         }
         .menuStyle(.borderlessButton)
-        .help("Language used for new voice memos and app-audio recordings")
+        // Locked by a configuration profile (issue #360): still shows the
+        // language, but can't be changed here.
+        .disabled(languageSettings.isManaged(.recordingLanguage))
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        languageSettings.isManaged(.recordingLanguage)
+            ? "Language used for new recordings — \(ManagedSettings.note.lowercased())"
+            : "Language used for new voice memos and app-audio recordings"
     }
 }
 
@@ -519,6 +540,7 @@ private struct RecordingChip: View {
             Text(formatDuration(meters.elapsed))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(paused ? .orange : .primary)
+            ConnectionDropIndicator()
             // `RecordingPauseButton` applies its own `.buttonStyle(.plain)`
             // internally (closest-to-the-Button wins), so don't restate a
             // style here — it would read as doing something and do nothing.
@@ -539,6 +561,28 @@ private struct RecordingChip: View {
             Capsule().strokeBorder((paused ? Color.orange : Color.red).opacity(0.4), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+    }
+}
+
+/// The floating recording chip's half of the "can't reach the transcription
+/// server" warning (#355): the full banner lives in `LiveAIRecordingView`,
+/// which is only on screen on Home, and the chip is what shows everywhere
+/// else. Its own leaf so only this icon observes `LiveTranscriber`, not the
+/// chip or anything above it. Renders nothing while the server is reachable.
+private struct ConnectionDropIndicator: View {
+    @EnvironmentObject private var transcriber: LiveTranscriber
+    @EnvironmentObject private var actions: QuickActionsController
+
+    var body: some View {
+        // Until the previous recording's Stop hands over the live pipeline
+        // (#356), the transcriber's state is that meeting's, not this one's.
+        if transcriber.isConnectionInterrupted, !actions.isAwaitingLivePipeline {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+                .help("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
+                .accessibilityLabel("Can't reach the transcription server; recording continues")
+                .accessibilityIdentifier("recordingChip.connectionInterrupted")
+        }
     }
 }
 

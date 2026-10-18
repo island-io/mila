@@ -1,0 +1,165 @@
+<!doctype html>
+<!--
+  Source for site/app-screenshot.png: a recreation of Mila's main window
+  (sidebar + recording detail) with sample Hebrew/English data, laid out after
+  SidebarView, RecordingDetailView and AIOverviewSection. Render it with:
+
+    NODE_PATH=$(npm root -g) node design/website/render.mjs [fonts-dir]
+
+  Replace site/app-screenshot.png with a real capture of the app at any time;
+  the site only references the PNG.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  :root {
+    --win-bg: #ffffff;
+    --sidebar: #e9ecea;
+    --sep: #d6dad8;
+    --text: #1d1d1f;
+    --secondary: #6e6e73;
+    --accent: #157260;
+    --sel: rgba(21, 114, 96, 0.16);
+    --spk-a: #157260;
+    --spk-b: #b05a0a;
+    --spk-c: #5b3fa8;
+    --spk-d: #c0392b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: transparent; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Noto Sans Hebrew", "Noto Sans", Arial, sans-serif;
+    color: var(--text);
+    font-size: 13px;
+    padding: 28px;
+  }
+  .window {
+    width: 1224px; height: 744px;
+    background: var(--win-bg);
+    border-radius: 12px;
+    box-shadow: 0 0 0 0.5px rgba(0,0,0,.25), 0 22px 60px -12px rgba(0,0,0,.35);
+    overflow: hidden;
+    display: grid;
+    grid-template-columns: 232px 1fr;
+  }
+  /* Sidebar */
+  .sidebar { background: var(--sidebar); border-right: 1px solid var(--sep); padding: 12px 10px; }
+  .lights { display: flex; gap: 8px; padding: 2px 6px 18px; }
+  .lights span { width: 12px; height: 12px; border-radius: 50%; }
+  .lights span:nth-child(1) { background: #ff5f57; }
+  .lights span:nth-child(2) { background: #febc2e; }
+  .lights span:nth-child(3) { background: #28c840; }
+  .side-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; font-size: 13px; }
+  .side-item svg { width: 15px; height: 15px; color: var(--accent); flex: none; }
+  .side-head { font-size: 11px; font-weight: 600; color: var(--secondary); padding: 14px 8px 4px; }
+  .sub { padding: 4px 8px 4px 34px; border-radius: 6px; line-height: 1.25; }
+  .sub .t { display: block; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sub .d { display: block; font-size: 11px; color: var(--secondary); }
+  .sub.selected { background: var(--accent); color: #fff; }
+  .sub.selected .d { color: rgba(255,255,255,.8); }
+  .muted { color: var(--secondary); }
+  .rtl { direction: rtl; unicode-bidi: plaintext; }
+  /* Detail */
+  .detail { display: grid; grid-template-rows: auto auto auto minmax(0, 1fr) auto; min-width: 0; min-height: 0; }
+  .toolbar { height: 52px; border-bottom: 1px solid var(--sep); display: flex; align-items: center; justify-content: flex-end; gap: 14px; padding: 0 18px; color: var(--secondary); }
+  .pill { border: 1px solid var(--sep); border-radius: 7px; padding: 4px 10px; font-size: 12px; color: var(--text); background: #fafafa; }
+  .pill.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .header { padding: 16px 22px 10px; }
+  .title { font-size: 21px; font-weight: 650; margin: 0 0 5px; }
+  .meta { display: flex; align-items: center; gap: 8px; color: var(--secondary); font-size: 12.5px; }
+  .badge { width: 18px; height: 18px; border-radius: 5px; background: #2d8cff; display: grid; place-items: center; }
+  .badge svg { width: 12px; height: 12px; color: #fff; }
+  .transcript { overflow: hidden; padding: 6px 22px 0; }
+  .row { display: flex; align-items: baseline; gap: 8px; padding: 7px 8px; border-radius: 6px; }
+  .row.active { background: var(--sel); }
+  .row .text { flex: 1; font-size: 14px; line-height: 1.5; }
+  .row .spk { font-weight: 650; white-space: nowrap; font-size: 14px; }
+  .row .ts { font-size: 11px; color: var(--secondary); font-variant-numeric: tabular-nums; }
+  .a { color: var(--spk-a); } .b { color: var(--spk-b); } .c { color: var(--spk-c); } .dd { color: var(--spk-d); }
+  .ai { border-top: 1px solid var(--sep); border-bottom: 1px solid var(--sep); padding: 12px 22px 14px; display: grid; gap: 10px; }
+  .ai h4 { margin: 0 0 3px; font-size: 13px; font-weight: 600; display: flex; gap: 6px; align-items: center; }
+  .ai h4 svg { width: 14px; height: 14px; color: var(--accent); }
+  .ai p { margin: 0; font-size: 13px; line-height: 1.55; }
+  .player { border-top: 1px solid var(--sep); padding: 10px 22px; display: flex; align-items: center; gap: 14px; }
+  .play { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); display: grid; place-items: center; }
+  .play svg { width: 12px; height: 12px; color: #fff; }
+  .bar { flex: 1; height: 5px; border-radius: 3px; background: #dfe4e2; position: relative; }
+  .bar::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 31%; background: var(--accent); border-radius: 3px; }
+  .bar::after { content: ""; position: absolute; left: 31%; top: 50%; width: 13px; height: 13px; border-radius: 50%; background: #fff; box-shadow: 0 0 0 1px rgba(0,0,0,.2), 0 1px 3px rgba(0,0,0,.3); transform: translate(-50%, -50%); }
+  .time { font-size: 11.5px; color: var(--secondary); font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div class="window">
+  <aside class="sidebar">
+    <div class="lights"><span></span><span></span><span></span></div>
+    <div class="side-item"><svg viewBox="0 0 16 16"><path d="M2 7.5 8 2l6 5.5V14H10V9.5H6V14H2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>Home</div>
+    <div class="side-item"><svg viewBox="0 0 16 16"><rect x="2" y="3" width="12" height="10" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5 6.5h6M5 9.5h6" stroke="currentColor" stroke-width="1.4"/></svg>Queue</div>
+    <div class="side-item"><svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><circle cx="5.3" cy="8" r=".9" fill="currentColor"/><circle cx="8" cy="8" r=".9" fill="currentColor"/><circle cx="10.7" cy="8" r=".9" fill="currentColor"/></svg>More</div>
+    <div class="side-head">Folders</div>
+    <div class="side-item"><svg viewBox="0 0 16 16"><path d="M2 5h12v8H2zM2 5l2-2h8l2 2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>All Transcriptions</div>
+    <div class="sub selected"><span class="t rtl">סנכרון שבועי – צוות מוצר</span><span class="d">Today, 10:02</span></div>
+    <div class="sub"><span class="t">Customer call – Acme onboarding</span><span class="d">Today, 08:30</span></div>
+    <div class="sub"><span class="t rtl">ראיון מועמד – Backend</span><span class="d">Yesterday, 16:45</span></div>
+    <div class="sub"><span class="t">Design review: Settings</span><span class="d">Yesterday, 11:10</span></div>
+    <div class="sub"><span class="t rtl">פגישת תכנון רבעוני</span><span class="d">Oct 14, 14:00</span></div>
+    <div class="side-item"><svg viewBox="0 0 16 16"><path d="M2 5h12v8H2zM2 5l2-2h8l2 2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>Customers</div>
+    <div class="side-item"><svg viewBox="0 0 16 16"><path d="M2 5h12v8H2zM2 5l2-2h8l2 2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>Interviews</div>
+    <div class="side-item muted"><svg viewBox="0 0 16 16" style="color:var(--secondary)"><circle cx="8" cy="8" r="6" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 5v6M5 8h6" stroke="currentColor" stroke-width="1.4"/></svg>New Folder…</div>
+  </aside>
+
+  <section class="detail">
+    <div class="toolbar">
+      <span class="pill">🇮🇱 Hebrew</span>
+      <span class="pill">Share for Mila…</span>
+      <span class="pill primary">● Record</span>
+    </div>
+    <div class="header">
+      <h1 class="title rtl" style="text-align:left">סנכרון שבועי – צוות מוצר</h1>
+      <div class="meta">
+        <span class="badge"><svg viewBox="0 0 16 16"><rect x="1.5" y="4.5" width="9" height="7" rx="1.5" fill="currentColor"/><path d="m11 7 3.5-2v6L11 9z" fill="currentColor"/></svg></span>
+        Zoom <span>·</span> Oct 17, 2026, 10:02 <span>·</span> 42:18 <span>·</span> All Transcriptions
+      </div>
+    </div>
+
+    <div class="ai">
+      <div>
+        <h4><svg viewBox="0 0 16 16"><path d="M8 1.5 9.4 6.6 14.5 8 9.4 9.4 8 14.5 6.6 9.4 1.5 8 6.6 6.6z" fill="currentColor"/></svg>Summary</h4>
+        <p class="rtl">ההשקה מתוכננת ל-19 לחודש, עם החלטת go/no-go ביום שישי. באג הסנכרון ייסגר עד יום רביעי, והשיווק צריך שבועיים התראה לפני ההשקה.</p>
+        <p class="rtl">הלקוח Acme רוצה להריץ את המודל העברי על שרת משלו.</p>
+      </div>
+      <div>
+        <h4><svg viewBox="0 0 16 16"><path d="M3 4.5l1.3 1.3L6.8 3.3M3 10.5l1.3 1.3 2.5-2.5M9 5h5M9 11h5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></svg>Action items</h4>
+        <p dir="rtl">• יוסי: לסגור את באג הסנכרון עד יום רביעי</p>
+        <p dir="rtl">• מאיה: לעדכן את לוח הזמנים בשקופית</p>
+        <p dir="rtl">• Alex: לשלוח ל-Acme את קובץ ההגדרות</p>
+      </div>
+    </div>
+
+    <div class="transcript">
+      <div class="row"><span class="ts">00:04</span><span class="text rtl">בואו נתחיל מתאריך ההשקה. איפה עומד הפיתוח?</span><span class="spk a">:דנה</span></div>
+      <div class="row"><span class="ts">00:09</span><span class="text rtl">אנחנו בזמנים. הבאג בסנכרון ייסגר עד יום רביעי, נשאר רק לעבור על הבדיקות.</span><span class="spk b">:יוסי</span></div>
+      <div class="row active"><span class="ts">00:17</span><span class="text rtl">השיווק צריך שבועיים התראה אחרי זה, כדי להכין את הקמפיין והדף באתר.</span><span class="spk c">:מאיה</span></div>
+      <div class="row"><span class="ts">00:26</span><span class="text">Quick note from the US side – the Acme pilot wants the Hebrew model on their own server.</span><span class="spk dd">Alex:</span></div>
+      <div class="row"><span class="ts">00:34</span><span class="text rtl">מעולה, זה בדיוק המצב שבו השרת של החברה נכנס לתמונה. אני אשלח להם את הקונפיג.</span><span class="spk b">:יוסי</span></div>
+      <div class="row"><span class="ts">00:41</span><span class="text rtl">אז מכוונים ל-19 לחודש, עם החלטת go/no-go ביום שישי.</span><span class="spk a">:דנה</span></div>
+      <div class="row"><span class="ts">00:48</span><span class="text rtl">מסכימה. אני מעדכנת את לוח הזמנים בשקופית.</span><span class="spk c">:מאיה</span></div>
+      <div class="row"><span class="ts">00:53</span><span class="text">Sounds good. I'll loop in their IT team today.</span><span class="spk dd">Alex:</span></div>
+      <div class="row"><span class="ts">01:02</span><span class="text rtl">עוד דבר קטן: הלקוחות שואלים אם אפשר לתמלל בלי שהאודיו יוצא מהמחשב.</span><span class="spk c">:מאיה</span></div>
+      <div class="row"><span class="ts">01:09</span><span class="text rtl">כן, ברירת המחדל היא תמלול מקומי על המק. השרת הארגוני הוא רק אופציה.</span><span class="spk b">:יוסי</span></div>
+      <div class="row"><span class="ts">01:16</span><span class="text rtl">מצוין. אז נכניס את זה גם לדף ההשקה. תודה לכולם, נתראה בשישי.</span><span class="spk a">:דנה</span></div>
+      <div class="row"><span class="ts">01:21</span><span class="text">Thanks all, talk Friday.</span><span class="spk dd">Alex:</span></div>
+    </div>
+
+    <div class="player">
+      <span class="play"><svg viewBox="0 0 12 12"><path d="M3 1.5v9l7.5-4.5z" fill="currentColor"/></svg></span>
+      <span class="time">13:07</span>
+      <span class="bar"></span>
+      <span class="time">42:18</span>
+      <span class="time">1×</span>
+    </div>
+  </section>
+</div>
+</body>
+</html>

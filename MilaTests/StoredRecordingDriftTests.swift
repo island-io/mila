@@ -70,9 +70,41 @@ final class StoredRecordingDriftTests: XCTestCase {
             // prior state) — this fixture is about every key being present.
             retranscriptionPriorState: .init(status: .completed, language: "he",
                                              modelName: "Earlier model",
-                                             transcriptionDeferredAt: fixtureDeferred)
+                                             transcriptionDeferredAt: fixtureDeferred),
+            speakerNameSuggestions: [
+                SpeakerNameSuggestion(speaker: "SPEAKER_01", name: "John",
+                                      evidence: "hi there, John here", origin: .transcript),
+            ],
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5),
+                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)]
         )
     }
+
+    /// Top-level keys `Recording` persists that `StoredRecording` deliberately
+    /// does not mirror, with the reason. Adding to this list is a decision;
+    /// leaving a key out of it is a bug. Shared by the top-level check and
+    /// the nested one, which must not demand a mirrored element type for a
+    /// container that is not mirrored at all.
+    private static let intentionallyUnmirrored: Set<String> = [
+        // The sidecar .txt owns the transcript text; the mirror reads it
+        // from disk rather than from the store.
+        "fullText",
+        // Bookkeeping for the Voice Memos importer: they tie a recording
+        // back to the entry it was imported from, so re-import can skip
+        // it. Opaque identifiers with no meaning to an MCP client, which
+        // asks about content — not about import provenance. (Found by
+        // this test when it was first written: both were already absent
+        // from the mirror while the old round-trip assertions stayed
+        // green, which is the drift this test exists to catch.)
+        "voiceMemoUniqueID",
+        "voiceMemoFolderUUID",
+        // Unconfirmed speaker-name SUGGESTIONS (#348): a model's guess the
+        // user has not accepted. MCP exposes the names the user confirmed
+        // (`speakerNames`); surfacing a pending guess there would let a
+        // client present it as fact. Once accepted it IS a `speakerNames`
+        // entry, which is mirrored.
+        "speakerNameSuggestions",
+    ]
 
     func test_fully_populated_recording_round_trips_into_stored_recording() throws {
         let id = fixtureID
@@ -120,6 +152,12 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(prior.language, "he")
         XCTAssertEqual(prior.modelName, "Earlier model")
         XCTAssertEqual(prior.transcriptionDeferredAt, fixtureDeferred)
+        let span = try XCTUnwrap(s.untranscribedSpans?.first)
+        XCTAssertEqual(s.untranscribedSpans?.count, 2)
+        XCTAssertEqual(span.start, 12, accuracy: 0.001)
+        XCTAssertEqual(span.end, 15.5, accuracy: 0.001)
+        XCTAssertNil(span.unreadable)
+        XCTAssertEqual(s.untranscribedSpans?.last?.unreadable, true)
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
@@ -138,22 +176,8 @@ final class StoredRecordingDriftTests: XCTestCase {
     /// the mirror also round-trips, unless it's listed as a deliberate
     /// omission below.
     func test_every_persisted_key_is_mirrored() throws {
-        // Deliberately not mirrored, with the reason. Adding to this list is
-        // a decision; leaving a key out of it is a bug.
-        let intentionallyUnmirrored: Set<String> = [
-            // The sidecar .txt owns the transcript text; the mirror reads it
-            // from disk rather than from the store.
-            "fullText",
-            // Bookkeeping for the Voice Memos importer: they tie a recording
-            // back to the entry it was imported from, so re-import can skip
-            // it. Opaque identifiers with no meaning to an MCP client, which
-            // asks about content — not about import provenance. (Found by
-            // this test when it was first written: both were already absent
-            // from the mirror while the old round-trip assertions stayed
-            // green, which is the drift this test exists to catch.)
-            "voiceMemoUniqueID",
-            "voiceMemoFolderUUID",
-        ]
+        // Deliberately not mirrored — see `Self.intentionallyUnmirrored`.
+        let intentionallyUnmirrored = Self.intentionallyUnmirrored
 
         let recording = fullyPopulatedRecording()
         let appJSON = try JSONSerialization.jsonObject(
@@ -209,6 +233,8 @@ final class StoredRecordingDriftTests: XCTestCase {
             "actionItems": [],
             // Nothing. `RetranscriptionPriorState` is mirrored in full.
             "retranscriptionPriorState": [],
+            // Nothing. `UntranscribedSpan` is mirrored in full.
+            "untranscribedSpans": [],
         ]
         // Object-valued keys whose KEYS are data, not schema: the mirror
         // decodes them as a dictionary, so there is no element type to drift.
@@ -252,10 +278,14 @@ final class StoredRecordingDriftTests: XCTestCase {
         // checked.
         let containers = appJSON.compactMap { key, value -> String? in
             guard !dataKeyedMaps.contains(key),
+                  // Not mirrored at all (top-level allowlist), so there is
+                  // no mirrored element type to compare against.
+                  !StoredRecordingDriftTests.intentionallyUnmirrored.contains(key),
                   let elements = elements(of: value), !elements.isEmpty else { return nil }
             return key
         }.sorted()
-        XCTAssertEqual(containers, ["actionItems", "retranscriptionPriorState", "segments"],
+        XCTAssertEqual(containers, ["actionItems", "retranscriptionPriorState", "segments",
+                                    "untranscribedSpans"],
                        "Recording gained (or lost) a nested container. Populate it in "
                        + "fullyPopulatedRecording(), mirror its element type in "
                        + "StoredRecording, and pin its shape in "
@@ -315,6 +345,12 @@ final class StoredRecordingDriftTests: XCTestCase {
                        "RetranscriptionPriorState's persisted shape changed — update the fixture "
                        + "and decide whether the new key belongs in "
                        + "StoredRecording.RetranscriptionPriorState")
+
+        let spans = try XCTUnwrap(appJSON["untranscribedSpans"] as? [[String: Any]])
+        let spanKeys = spans.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
+        XCTAssertEqual(spanKeys, ["start", "end", "unreadable"],
+                       "UntranscribedSpan's persisted shape changed — update the fixture and "
+                       + "decide whether the new key belongs in StoredRecording.UntranscribedSpan")
     }
 
     /// The recovered fields must actually arrive, not merely have a key.
@@ -342,6 +378,7 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertNil(s.actionItems)
         XCTAssertNil(s.summaryLanguage)
         XCTAssertNil(s.retranscriptionPriorState, "omitted when nil, so a never re-transcribed row has no key")
+        XCTAssertNil(s.untranscribedSpans, "omitted when nil, so a complete transcript has no key")
     }
 
     func test_legacy_inline_fulltext_decodes() throws {

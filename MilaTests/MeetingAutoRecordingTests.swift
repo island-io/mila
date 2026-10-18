@@ -71,6 +71,22 @@ final class MeetingAutoRecordingTests: XCTestCase {
         return try XCTUnwrap(recorder.meetingRecordingURL)
     }
 
+    func test_managed_disabled_detection_cannot_be_enabled_by_auto_mode() {
+        coordinator.stop()
+        var managed = ManagedSettings.empty
+        managed.meetingDetectionEnabled = false
+        settings = MeetingDetectionSettings(defaults: defaults, managed: managed)
+        coordinator = MeetingPromptCoordinator(detector: detector, settings: settings,
+            actions: recorder, presentsPanels: false, pollsDetector: false)
+        coordinator.start()
+        settings.setMode(.auto, forBundleID: zoom.bundleID)
+        settings.enabled = true
+        detector.meetingStarted.send(zoom)
+        XCTAssertFalse(settings.enabled)
+        XCTAssertNil(coordinator.pending)
+        XCTAssertEqual(recorder.starts, 0)
+    }
+
     func test_enable_auto_requires_a_fresh_countdown_before_capture() throws {
         detector.meetingStarted.send(zoom)
         let ask = try XCTUnwrap(coordinator.pending)
