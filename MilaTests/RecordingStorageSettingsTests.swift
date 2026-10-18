@@ -25,6 +25,49 @@ final class RecordingStorageSettingsTests: XCTestCase {
 
     // MARK: - RecordingStorageSettings
 
+    func test_autoSave_defaults_off_without_writing_or_migrating() {
+        defaults.set(true, forKey: "liveAI.backgroundMode")
+        let settings = RecordingStorageSettings(defaults: defaults)
+        XCTAssertFalse(settings.autoSaveRecordings)
+        XCTAssertNil(defaults.object(forKey: "recordings.autoSave"))
+        XCTAssertTrue(defaults.bool(forKey: "liveAI.backgroundMode"))
+    }
+
+    func test_autoSave_uses_its_own_key_and_restores_both_values() {
+        XCTAssertEqual(RecordingStorageSettings.autoSaveKey, "recordings.autoSave")
+        let first = RecordingStorageSettings(defaults: defaults)
+        first.minDuration = 8
+        first.limitBytes = 123_456
+        first.autoSaveRecordings = true
+        XCTAssertEqual(defaults.object(forKey: "recordings.autoSave") as? Bool, true)
+
+        let restored = RecordingStorageSettings(defaults: defaults)
+        XCTAssertTrue(restored.autoSaveRecordings)
+        XCTAssertEqual(restored.minDuration, 8)
+        XCTAssertEqual(restored.limitBytes, 123_456)
+        restored.autoSaveRecordings = false
+        XCTAssertEqual(defaults.object(forKey: "recordings.autoSave") as? Bool, false)
+        XCTAssertFalse(RecordingStorageSettings(defaults: defaults).autoSaveRecordings)
+    }
+
+    func test_autoSave_UI_suite_requires_UUID_and_restores_only_test_suite() throws {
+        XCTAssertNil(MilaApp.autoSaveUITestDefaults(arguments: []))
+        for invalid in ["", "NSGlobalDomain", "io.island.whisper.IslandWhisper", "../personal"] {
+            XCTAssertNil(MilaApp.autoSaveUITestDefaults(arguments: ["--ui-test-auto-save-suite=\(invalid)"]))
+        }
+        let id = UUID()
+        let suiteName = "Mila.AutoSaveUITests.\(id.uuidString)"
+        defer { UserDefaults().removePersistentDomain(forName: suiteName) }
+        let isolated = try XCTUnwrap(MilaApp.autoSaveUITestDefaults(
+            arguments: ["--ui-test-auto-save-suite=\(id.uuidString.lowercased())"]))
+        let settings = RecordingStorageSettings(defaults: isolated)
+        settings.autoSaveRecordings = true
+        let relaunched = try XCTUnwrap(MilaApp.autoSaveUITestDefaults(
+            arguments: ["--ui-test-auto-save-suite=\(id.uuidString)"]))
+        XCTAssertTrue(RecordingStorageSettings(defaults: relaunched).autoSaveRecordings)
+        XCTAssertNil(defaults.object(forKey: "recordings.autoSave"), "Other suites stay independent")
+    }
+
     func test_settings_starts_with_no_custom_directory_by_default() {
         let settings = RecordingStorageSettings(defaults: defaults)
         XCTAssertNil(settings.customDirectory)
