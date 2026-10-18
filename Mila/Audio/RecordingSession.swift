@@ -130,13 +130,35 @@ final class RecordingSession: ObservableObject {
         system.selectedApp = app
     }
 
+    /// Thrown when `start`'s caller-supplied `isStillValid` predicate turns
+    /// false during the async bring-up (e.g. a per-app prompt was revoked or
+    /// superseded while the permission or engine handshake was in flight).
+    /// The partial session has already been torn down by the time this
+    /// reaches the caller, so it is not a user-visible failure.
+    struct StartCancelled: Error {}
+    private var startInFlight = false
+
+    /// Start capture. `isStillValid` is re-checked after every await that can
+    /// span a user decision (mic permission, mic engine start, system-audio
+    /// start) and immediately before `.recording` is published; when it
+    /// returns false the partial session is torn down through the existing
+    /// failure teardown and `StartCancelled` is thrown, so no recording is
+    /// published for a superseded prompt. Manual callers keep the default
+    /// always-true predicate and observe identical behavior.
+    ///
     /// `cancellation` is handed to each capture leg's bring-up, which throws
     /// `CaptureStartCancellation.Cancelled` rather than open capture once it
     /// is tripped; the partial-bring-up teardown below then runs as for any
-    /// other failure (#328).
+    /// other failure (#328). Both arguments are defaulted, so a manual start
+    /// that passes neither behaves exactly as it did before.
     func start(source: RecordingSource, outputURL: URL,
+               isStillValid: () -> Bool = { true },
                cancellation: CaptureStartCancellation? = nil) async throws {
         guard state == .idle else { return }
+        guard !startInFlight, isStillValid() else { throw StartCancelled() }
+        startInFlight = true
+        defer { startInFlight = false }
+        let fileAlreadyExisted = FileManager.default.fileExists(atPath: outputURL.path)
         self.source = source
         self.fileURL = outputURL
         self.writesSinceStart = 0
@@ -165,7 +187,13 @@ final class RecordingSession: ObservableObject {
 
             if source == .microphone || source == .meeting {
                 _ = await mic.requestAccess()
+                if !isStillValid() {
+                    throw StartCancelled()
+                }
                 try await mic.start(cancellation: cancellation)
+                if !isStillValid() {
+                    throw StartCancelled()
+                }
                 micTask = Task { [weak self] in
                     guard let self else { return }
                     for await buf in self.mic.audioStream {
@@ -176,6 +204,9 @@ final class RecordingSession: ObservableObject {
 
             if source == .systemAudio || source == .meeting {
                 try await system.start(cancellation: cancellation)
+                if !isStillValid() {
+                    throw StartCancelled()
+                }
                 systemTask = Task { [weak self] in
                     guard let self else { return }
                     for await buf in self.system.audioStream {
@@ -196,28 +227,39 @@ final class RecordingSession: ObservableObject {
             // quotes in `localizedDescription`. The far more common failure
             // here (Screen Recording permission denied) is fully described by
             // the source + domain + code, which stay public. (Issue #213.)
+            await teardownPartialStart()
+            if error is StartCancelled {
+                if !fileAlreadyExisted { try? FileManager.default.removeItem(at: outputURL) }
+                throw error
+            }
             let ns = error as NSError
             if error is CaptureStartCancellation.Cancelled {
                 // Deliberate (sleep / lock during Starting…, #328), not a
                 // bring-up failure — keep it out of the error-level lines a
-                // diagnostic report is triaged by.
+                // diagnostic report is triaged by. The WAV this attempt
+                // created is removed unless it pre-existed.
+                if !fileAlreadyExisted { try? FileManager.default.removeItem(at: outputURL) }
                 recLog.log("start(\(source.rawValue, privacy: .public)) cancelled before capture opened — tearing down partial session")
-            } else {
-                recLog.error("""
-                    start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
-                    — tearing down partial session \
-                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
-                    \(error.localizedDescription, privacy: .private)
-                    """)
+                throw error
             }
-            micTask?.cancel(); micTask = nil
-            systemTask?.cancel(); systemTask = nil
-            await mic.stop()
-            await system.stop()
-            audioFile = nil
-            fileURL = nil
-            pendingSystem.removeAll(keepingCapacity: false)
+            recLog.error("""
+                start(\(source.rawValue, privacy: .public)) failed mid-bring-up \
+                — tearing down partial session \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             throw error
+        }
+
+        // Final validity gate before this attempt publishes `.recording`. The
+        // per-leg checks above already cover the awaited bring-up; this closes
+        // the window between the last one and the state flip, so a consent
+        // revocation that landed after the final leg still tears the partial
+        // session down instead of being announced as a live recording.
+        if !isStillValid() {
+            await teardownPartialStart()
+            if !fileAlreadyExisted { try? FileManager.default.removeItem(at: outputURL) }
+            throw StartCancelled()
         }
 
         startTime = Date()
@@ -226,6 +268,21 @@ final class RecordingSession: ObservableObject {
         captureEpoch += 1
         state = .recording
         startElapsedTimer()
+    }
+
+    /// Tear down whatever a failed or cancelled `start` had already brought
+    /// up. Shared by the error path and the `isStillValid` cancellation path:
+    /// cancels the consumer tasks, stops both engines, and drops the
+    /// half-created WAV so `state` returns cleanly to `.idle`. Idempotent —
+    /// safe to call after only some of the legs started.
+    private func teardownPartialStart() async {
+        micTask?.cancel(); micTask = nil
+        systemTask?.cancel(); systemTask = nil
+        await mic.stop()
+        await system.stop()
+        audioFile = nil
+        fileURL = nil
+        pendingSystem.removeAll(keepingCapacity: false)
     }
 
     /// Drives the `elapsed` clock while a session is active. Kept running

@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import TranscriptionCore
 import MilaKit
 @testable import Mila
@@ -98,7 +99,7 @@ final class RecordWhileDrainingTests: XCTestCase {
         transcriber?.stop()
         if session?.state != .idle { _ = await session?.stop() }
         if let tempRoot { try? FileManager.default.removeItem(at: tempRoot) }
-        for suffix in ["diarization", "language", "llm"] {
+        for suffix in ["diarization", "language", "llm", "liveAI"] {
             UserDefaults().removePersistentDomain(forName: "\(suitePrefix).\(suffix)")
         }
         try await super.tearDown()
@@ -160,9 +161,13 @@ final class RecordWhileDrainingTests: XCTestCase {
                        "the WAV is closed and the row saved — nothing a new recording has to wait for")
 
         // Recording 2, started mid-drain.
-        let url2 = try freshWAV("StartedMidDrain")
-        await controller.startFakeRecordingForTesting(outputURL: url2)
-        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false),
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { }
+        session.system.bringUpOverride = { }
+        XCTAssertTrue(controller.canStartMeetingRecording)
+        let startedURL = await controller.startMeetingRecording(isStillValid: { true })
+        let url2 = try XCTUnwrap(startedURL)
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: true),
                        "a new recording must start while the previous one is still draining (#356)")
         XCTAssertEqual(session.state, .recording, "capture must be up immediately, not after the drain")
         XCTAssertTrue(controller.isFinalizingRecording,
@@ -259,6 +264,142 @@ final class RecordWhileDrainingTests: XCTestCase {
         await service.waitForIdle()
     }
 
+    /// Consent may be revoked immediately after capture publishes recording,
+    /// before claimLivePipeline runs. Releasing the previous drain during the
+    /// cancelled attempt's idle cleanup must not start its deferred AI session.
+    func test_cancelled_meeting_start_revokes_handover_before_idle_cleanup_yields() async throws {
+        simulatePreviousRecordingDraining()
+        let ai = LiveAISession(
+            llmSettings: LLMSettings(defaults: UserDefaults(suiteName: "\(suitePrefix).llm")!),
+            liveAISettings: LiveAISettings(defaults: UserDefaults(suiteName: "\(suitePrefix).liveAI")!))
+        controller.liveAISession = ai
+        ai.seedForTesting(summary: "previous meeting summary")
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { }
+        session.system.bringUpOverride = { }
+        let cleanupGate = HandoverStartGate()
+        var consent = true
+        var published = false
+        var cleanupStarted = false
+        var finished = false
+        var ownedURL: URL?
+        let observation = session.$state.sink { [self] state in
+            if state == .recording {
+                published = true
+                ownedURL = session.fileURL
+                session.onLiveSamples = { _ in }
+                consent = false
+            } else if state == .idle, published {
+                cleanupStarted = true
+                Task { @MainActor [self] in
+                    await cleanupGate.wait()
+                    session.onLiveSamples = nil
+                }
+            }
+        }
+        defer { observation.cancel() }
+        let start = Task { @MainActor [self] in
+            let result = await controller.startMeetingRecording(isStillValid: { consent })
+            finished = true
+            return result
+        }
+        let cleaning = await waitUntil { cleanupStarted }
+        XCTAssertTrue(cleaning)
+        XCTAssertFalse(finished)
+        XCTAssertTrue(controller.isStartingRecording)
+        XCTAssertTrue(controller.isFinalizingRecording)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"])
+        XCTAssertEqual(ai.summary, "previous meeting summary")
+        XCTAssertEqual(LiveTranscriptSnapshot.read(root: sidecarRoot)?.state, .recording)
+
+        // The cancelled attempt still holds the start reservation, but the
+        // previous recording is done reading. It owes no new AI session.
+        controller.isFinalizingRecording = false
+        XCTAssertEqual(ai.summary, "previous meeting summary",
+                       "release must not reset the old summary for a cancelled deferred start")
+        await cleanupGate.open()
+        let result = await start.value
+        XCTAssertNil(result)
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+        XCTAssertTrue(store.recordings.isEmpty)
+        let cancelledURL = try XCTUnwrap(ownedURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cancelledURL.path))
+
+        // No stale claim or cancellation token may affect the next attempt.
+        observation.cancel()
+        let replacement = await controller.startMeetingRecording(isStillValid: { true })
+        XCTAssertNotNil(replacement)
+        XCTAssertNotEqual(replacement, cancelledURL)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+        XCTAssertTrue(ai.summary.isEmpty)
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
+    func test_consent_revoked_during_bringup_preserves_the_previous_drain() async throws {
+        simulatePreviousRecordingDraining()
+        controller.microphonePermissionOverride = { true }
+        let gate = HandoverStartGate()
+        session.mic.bringUpOverride = { await gate.wait() }
+        session.system.bringUpOverride = { }
+        session.mic.bringUpTimeout = 30
+        var consent = true
+        let start = Task { @MainActor [self] in
+            await controller.startMeetingRecording(isStillValid: { consent })
+        }
+        let starting = await waitUntil { controller.isStartingRecording && session.fileURL != nil }
+        XCTAssertTrue(starting)
+        let cancelledURL = session.fileURL
+        consent = false
+        start.cancel()
+        await gate.open()
+        let result = await start.value
+        XCTAssertNil(result)
+        XCTAssertEqual(session.mic.captureStartCount, 0)
+        XCTAssertEqual(controller.activeJob, .none)
+        XCTAssertTrue(controller.isFinalizingRecording)
+        XCTAssertFalse(controller.isAwaitingLivePipeline)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"])
+        XCTAssertEqual(LiveTranscriptSnapshot.read(root: sidecarRoot)?.state, .recording)
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertNil(service.lastError)
+        if let cancelledURL { XCTAssertFalse(FileManager.default.fileExists(atPath: cancelledURL.path)) }
+        controller.isFinalizingRecording = false
+    }
+
+    func test_manual_microphone_start_is_not_blocked_by_the_previous_drain() async throws {
+        simulatePreviousRecordingDraining()
+        controller.microphonePermissionOverride = { true }
+        session.mic.bringUpOverride = { }
+        await controller.toggleVoiceMemo()
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false))
+        XCTAssertTrue(controller.isAwaitingLivePipeline)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"])
+        await controller.stopRecording()
+        XCTAssertTrue(controller.isFinalizingRecording)
+        controller.isFinalizingRecording = false
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
+    func test_app_audio_start_is_not_blocked_by_the_previous_drain() async throws {
+        simulatePreviousRecordingDraining()
+        session.system.bringUpOverride = { }
+        await controller.startAppRecording(app: nil, includeMic: false)
+        XCTAssertTrue(controller.isRecording)
+        XCTAssertEqual(session.source, .systemAudio)
+        XCTAssertTrue(controller.isAwaitingLivePipeline)
+        XCTAssertEqual(transcriber.segments.map(\.text), ["previous meeting"])
+        await controller.stopRecording()
+        XCTAssertTrue(controller.isFinalizingRecording)
+        controller.isFinalizingRecording = false
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+    }
+
     /// Pause used to be gated on `isFinalizingRecording`, which since #356
     /// can be the PREVIOUS recording's drain — so a recording started right
     /// after a Stop could not be paused until that drain finished. It is
@@ -326,5 +467,19 @@ final class RecordWhileDrainingTests: XCTestCase {
         XCTAssertTrue(transcriber.segments.isEmpty,
                       "with nothing draining, the previous recording's live state is cleared at record start as before")
 
+    }
+}
+
+private actor HandoverStartGate {
+    private var opened = false
+    private var waiter: CheckedContinuation<Void, Never>?
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiter = $0 }
+    }
+    func open() {
+        opened = true
+        waiter?.resume()
+        waiter = nil
     }
 }

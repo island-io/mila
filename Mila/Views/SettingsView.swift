@@ -3167,9 +3167,9 @@ private struct MeetingsSettingsTab: View {
                 header
                 Toggle(isOn: $settings.enabled) {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Prompt when a meeting starts or ends")
+                        Text("Detect meetings")
                             .font(.body)
-                        Text("Mila shows a small prompt in the top-right when it sees you join a meeting in a supported app — and, while it's recording, when that meeting ends, it offers to stop.")
+                        Text("Choose whether Mila asks before recording, records automatically, or ignores each app. Turning detection off cancels pending actions; an active recording continues.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -3200,7 +3200,7 @@ private struct MeetingsSettingsTab: View {
         VStack(alignment: .leading, spacing: 4) {
             Text("Meetings")
                 .font(.title3.weight(.semibold))
-            Text("Auto-prompt when Mila notices you're in a call so you don't have to remember to start recording.")
+            Text("Choose how Mila responds when a supported app starts or ends a call.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -3217,23 +3217,32 @@ private struct MeetingsSettingsTab: View {
                         .foregroundStyle(.tint)
                     Text(app.displayName)
                     Spacer()
-                    if settings.isDisabled(forBundleID: app.bundleID) {
-                        Text("Silenced")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else if !settings.enabled {
-                        Text("Off")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    } else {
-                        Text("On")
-                            .font(.caption)
-                            .foregroundStyle(.green)
+                    Picker("", selection: appModeBinding(for: app.bundleID)) {
+                        Text("Ask").tag(MeetingDetectionSettings.AppMode.ask)
+                        Text("Auto").tag(MeetingDetectionSettings.AppMode.auto)
+                        Text("Off").tag(MeetingDetectionSettings.AppMode.off)
                     }
+                    .pickerStyle(.segmented)
+                    .frame(width: 160)
+                    .disabled(!settings.enabled)
+                    .accessibilityIdentifier(
+                        "meetings.mode.\(app.bundleID)")
+                    .accessibilityLabel("\(app.displayName) recording mode")
                 }
                 .padding(.vertical, 4)
             }
+            Text("Ask: show start and stop prompts. Auto: start after a cancellable 10-second countdown, and offer the same countdown to stop a recording started by that meeting. Manual recordings always require confirmation to stop. Off: ignore this app.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private func appModeBinding(for bundleID: String) -> Binding<MeetingDetectionSettings.AppMode> {
+        Binding(
+            get: { settings.mode(forBundleID: bundleID) },
+            set: { settings.setMode($0, forBundleID: bundleID) }
+        )
     }
 
     @ViewBuilder
