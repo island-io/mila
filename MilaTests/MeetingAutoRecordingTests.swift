@@ -33,6 +33,8 @@ final class MeetingAutoRecordingTests: XCTestCase {
     private var suite: String!
     private var settings: MeetingDetectionSettings!
     private var detector: MeetingDetector!
+    private var screenLockNotifications: NotificationCenter!
+    private var screenLocked = false
     private var recorder: Recorder!
     private var coordinator: MeetingPromptCoordinator!
     private var zoom: MeetingDetector.App { MeetingDetector.supportedApps[0] }
@@ -43,9 +45,13 @@ final class MeetingAutoRecordingTests: XCTestCase {
         defaults = UserDefaults(suiteName: suite)!
         settings = MeetingDetectionSettings(defaults: defaults)
         detector = MeetingDetector(endConfirmationPolls: 1)
+        screenLockNotifications = NotificationCenter()
+        screenLocked = false
         recorder = Recorder()
         coordinator = MeetingPromptCoordinator(detector: detector, settings: settings,
-            actions: recorder, presentsPanels: false, pollsDetector: false)
+            actions: recorder, presentsPanels: false, pollsDetector: false,
+            screenLockNotifications: screenLockNotifications,
+            screenIsLocked: { [weak self] in self?.screenLocked ?? true })
         coordinator.start()
     }
     override func tearDown() async throws {
@@ -71,13 +77,77 @@ final class MeetingAutoRecordingTests: XCTestCase {
         return try XCTUnwrap(recorder.meetingRecordingURL)
     }
 
+    private func deliverScreenLock(_ locked: Bool) async {
+        screenLocked = locked
+        screenLockNotifications.post(name: Notification.Name(
+            locked ? "com.apple.screenIsLocked" : "com.apple.screenIsUnlocked"), object: nil)
+        // Drain the delivery hop without posting a real system lock event.
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    func test_screen_lock_cancels_auto_countdown_and_blocks_repeated_detection_until_unlock() async throws {
+        settings.setMode(.auto, forBundleID: zoom.bundleID)
+        detector.meetingStarted.send(zoom)
+        let stale = try XCTUnwrap(coordinator.pending)
+        await deliverScreenLock(true)
+        XCTAssertNil(coordinator.pending)
+        coordinator.performPrompt(id: stale.id)
+        detector.meetingStarted.send(zoom)
+        XCTAssertNil(coordinator.pending)
+        XCTAssertEqual(recorder.starts, 0)
+        await deliverScreenLock(false)
+        XCTAssertNil(coordinator.pending, "Unlock alone must not restart an old countdown")
+        detector.meetingStarted.send(zoom)
+        let fresh = try XCTUnwrap(coordinator.pending)
+        XCTAssertNotEqual(fresh.id, stale.id)
+        XCTAssertTrue(fresh.automatic)
+        XCTAssertEqual(recorder.starts, 0, "A fresh countdown must precede capture")
+    }
+
+    func test_lock_state_recheck_blocks_timer_before_notification_delivery() throws {
+        settings.setMode(.auto, forBundleID: zoom.bundleID)
+        detector.meetingStarted.send(zoom)
+        let stale = try XCTUnwrap(coordinator.pending)
+        screenLocked = true
+        // No event posted: validStart must query the current session state.
+        coordinator.performPrompt(id: stale.id)
+        XCTAssertNil(coordinator.pending)
+        XCTAssertEqual(recorder.starts, 0)
+    }
+
+    func test_starting_coordinator_while_locked_never_arms_an_auto_countdown() {
+        coordinator.stop()
+        screenLocked = true
+        coordinator.start()
+        settings.setMode(.auto, forBundleID: zoom.bundleID)
+        detector.meetingStarted.send(zoom)
+        XCTAssertNil(coordinator.pending)
+        XCTAssertEqual(recorder.starts, 0)
+    }
+
+    func test_screen_lock_revokes_pending_auto_stop_callback() async throws {
+        let owned = try await startAuto()
+        detector.meetingEnded.send(zoom)
+        let stop = try XCTUnwrap(coordinator.pending)
+        XCTAssertTrue(stop.automatic)
+        await deliverScreenLock(true)
+        XCTAssertNil(coordinator.pending)
+        coordinator.performPrompt(id: stop.id)
+        XCTAssertEqual(recorder.stops, 0, "The app delegate stops active capture separately")
+        XCTAssertEqual(recorder.meetingRecordingURL, owned)
+    }
+
     func test_managed_disabled_detection_cannot_be_enabled_by_auto_mode() {
         coordinator.stop()
         var managed = ManagedSettings.empty
         managed.meetingDetectionEnabled = false
         settings = MeetingDetectionSettings(defaults: defaults, managed: managed)
         coordinator = MeetingPromptCoordinator(detector: detector, settings: settings,
-            actions: recorder, presentsPanels: false, pollsDetector: false)
+            actions: recorder, presentsPanels: false, pollsDetector: false,
+            screenLockNotifications: screenLockNotifications,
+            screenIsLocked: { [weak self] in self?.screenLocked ?? true })
         coordinator.start()
         settings.setMode(.auto, forBundleID: zoom.bundleID)
         settings.enabled = true
@@ -504,6 +574,8 @@ final class MeetingAutoRecordingControllerTests: XCTestCase {
     private var session: RecordingSession!
     private var settings: MeetingDetectionSettings!
     private var detector: MeetingDetector!
+    private var screenLockNotifications: NotificationCenter!
+    private var screenLocked = false
     private var controller: QuickActionsController!
     private var coordinator: MeetingPromptCoordinator!
     private var defaults: UserDefaults!
@@ -515,6 +587,8 @@ final class MeetingAutoRecordingControllerTests: XCTestCase {
         defaults = UserDefaults(suiteName: suite)!
         settings = MeetingDetectionSettings(defaults: defaults)
         detector = MeetingDetector(endConfirmationPolls: 1)
+        screenLockNotifications = NotificationCenter()
+        screenLocked = false
 
         tempRoot = TestSupport.makeTempRoot(label: "MeetingAutoRecordingControllerTests")
         try FileManager.default.createDirectory(at: tempRoot, withIntermediateDirectories: true)
@@ -548,7 +622,9 @@ final class MeetingAutoRecordingControllerTests: XCTestCase {
         session.system.bringUpOverride = { }
 
         coordinator = MeetingPromptCoordinator(detector: detector, settings: settings,
-            actions: controller, presentsPanels: false, pollsDetector: false)
+            actions: controller, presentsPanels: false, pollsDetector: false,
+            screenLockNotifications: screenLockNotifications,
+            screenIsLocked: { [weak self] in self?.screenLocked ?? true })
         coordinator.start()
     }
 
@@ -601,6 +677,30 @@ final class MeetingAutoRecordingControllerTests: XCTestCase {
 
         await controller.awaitFinalizeTails()
         await service.waitForIdle()
+    }
+
+    func test_screen_lock_during_real_bringup_never_opens_the_microphone() async throws {
+        settings.setMode(.auto, forBundleID: zoom.bundleID)
+        let gate = MeetingStartGate()
+        session.mic.bringUpOverride = { await gate.wait() }
+        session.mic.bringUpTimeout = 30
+        detector.meetingStarted.send(zoom)
+        coordinator.performPrompt(id: try XCTUnwrap(coordinator.pending).id)
+        let entered = await waitForGateEntry(gate)
+        XCTAssertTrue(entered)
+        screenLocked = true
+        screenLockNotifications.post(name: Notification.Name("com.apple.screenIsLocked"), object: nil)
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+        await gate.open()
+        let finished = await waitUntil { !controller.isStartingRecording }
+        XCTAssertTrue(finished)
+        XCTAssertEqual(session.mic.captureStartCount, 0)
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertNil(session.fileURL)
+        XCTAssertTrue(store.recordings.isEmpty)
+        XCTAssertNil(service.lastError)
     }
 
     func test_meeting_end_during_a_real_startup_never_opens_the_microphone() async throws {

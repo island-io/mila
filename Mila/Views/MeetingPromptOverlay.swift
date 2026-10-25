@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Combine
+import CoreGraphics
 
 /// The production coordinator uses this same interface in deterministic tests.
 @MainActor
@@ -83,6 +84,9 @@ final class MeetingPromptCoordinator: ObservableObject {
     private let actions: any MeetingRecordingActions
     private let presentsPanels: Bool
     private let pollsDetector: Bool
+    private let screenLockNotifications: NotificationCenter
+    private let screenIsLocked: () -> Bool
+    private var screenLocked = false
     private var subscriptions: Set<AnyCancellable> = []
     private var running = false
     private var meetings: [String: UUID] = [:]
@@ -103,12 +107,19 @@ final class MeetingPromptCoordinator: ObservableObject {
 
     init(detector: MeetingDetector, settings: MeetingDetectionSettings,
          actions: any MeetingRecordingActions, presentsPanels: Bool = true,
-         pollsDetector: Bool = true) {
+         pollsDetector: Bool = true,
+         screenLockNotifications: NotificationCenter = DistributedNotificationCenter.default(),
+         screenIsLocked: @escaping () -> Bool = {
+             guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+             return session["CGSSessionScreenIsLocked"] as? Bool ?? false
+         }) {
         self.detector = detector
         self.settings = settings
         self.actions = actions
         self.presentsPanels = presentsPanels
         self.pollsDetector = pollsDetector
+        self.screenLockNotifications = screenLockNotifications
+        self.screenIsLocked = screenIsLocked
     }
 
     static func shouldShowStopPrompt(detectionEnabled: Bool, appSilenced: Bool,
@@ -122,6 +133,7 @@ final class MeetingPromptCoordinator: ObservableObject {
     func start() {
         guard !running else { return }
         running = true
+        screenLocked = screenIsLocked()
         // MeetingDetector and MeetingDetectionSettings are @MainActor;
         // their polling/mutation paths deliver these subjects on this actor.
         // Synchronous delivery prevents an ended/revoked request from firing
@@ -161,6 +173,17 @@ final class MeetingPromptCoordinator: ObservableObject {
         NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.invalidatePendingActions() }.store(in: &subscriptions)
+        screenLockNotifications.publisher(for: Notification.Name("com.apple.screenIsLocked"))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.screenLocked = true
+                self.invalidatePendingActions()
+                self.owner = nil
+            }.store(in: &subscriptions)
+        screenLockNotifications.publisher(for: Notification.Name("com.apple.screenIsUnlocked"))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.screenLocked = false }.store(in: &subscriptions)
         settingsChanged()
     }
 
@@ -179,7 +202,10 @@ final class MeetingPromptCoordinator: ObservableObject {
     }
 
     private func allowed(_ appID: String) -> Bool {
-        running && settings.enabled && settings.mode(forBundleID: appID) != .off
+        // Recheck at action/permission checkpoints: a timer must not win
+        // the delivery hop from the lock notification to the main queue.
+        running && !screenLocked && !screenIsLocked()
+            && settings.enabled && settings.mode(forBundleID: appID) != .off
     }
     private func validStart(_ prompt: Prompt) -> Bool {
         allowed(prompt.app.bundleID)

@@ -59,6 +59,11 @@ running through `whisper.cpp` (GPU via Metal).
   dropped automatically (threshold configurable in **Settings → Storage**).
 - **Opt into pre-release builds** via **Settings → General → Updates**.
 
+## Changelog
+
+- Automatic meeting recording cancels pending countdowns and startup when the
+  screen locks. Unlocking requires a fresh countdown before recording can start.
+
 ## System requirements
 
 To **run** Mila:
