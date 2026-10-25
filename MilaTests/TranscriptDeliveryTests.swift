@@ -133,6 +133,7 @@ final class TranscriptDeliveryTests: XCTestCase {
         XCTAssertTrue(LLMTool.claude.readsLocalFiles)
         XCTAssertTrue(LLMTool.cursor.readsLocalFiles)
         XCTAssertTrue(LLMTool.gemini.readsLocalFiles)
+        XCTAssertTrue(LLMTool.agy.readsLocalFiles)
         XCTAssertFalse(LLMTool.openaiCompatible.readsLocalFiles,
                        "a remote HTTP endpoint cannot open a path we name")
         XCTAssertFalse(LLMTool.none.readsLocalFiles)
@@ -144,7 +145,7 @@ final class TranscriptDeliveryTests: XCTestCase {
         let srt = try makeFile("a.srt")
         let requested = TranscriptDelivery.reference(TranscriptFiles(subtitles: srt))
 
-        for tool in [LLMTool.claude, .cursor, .gemini] {
+        for tool in [LLMTool.claude, .cursor, .gemini, .agy] {
             XCTAssertEqual(LLMRunner.effectiveDelivery(requested, tool: tool), requested,
                            "\(tool) can read files — the reference must survive")
         }
