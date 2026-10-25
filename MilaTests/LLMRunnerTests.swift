@@ -240,8 +240,8 @@ final class LLMRunnerTests: XCTestCase {
     ///     `test_timeout_returns_even_when_grandchild_holds_pipes_open` and
     ///     `test_diagnose_reports_timeout_without_throwing` — those exercise
     ///     the timeout path itself, so the bound IS the thing under test.
-    ///   * `timeout: 120` in the three real-CLI smoke tests
-    ///     (`test_claude_cli_…`, `test_cursor_cli_…`, `test_gemini_cli_…`),
+    ///   * `timeout: 120` in the four real-CLI smoke tests
+    ///     (`test_claude_cli_…`, `test_cursor_cli_…`, `test_gemini_cli_…`, `test_agy_cli_…`),
     ///     which wait on a live model round-trip rather than a script. They
     ///     auto-skip when the CLI isn't installed, so they don't run in CI at
     ///     all — but 120s would fit the allowance even if they did.
@@ -962,6 +962,39 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(args, ["-p", "Summarize", "--skip-trust"])
     }
 
+    // MARK: - Antigravity CLI (LLMTool.agy)
+
+    func test_agy_metadata_matches_cli() {
+        XCTAssertEqual(LLMTool.agy.executableName, "agy")
+        XCTAssertEqual(LLMTool.agy.displayName, "Antigravity (agy CLI)")
+        // Must be selectable in the Settings picker (ForEach over allCases).
+        XCTAssertTrue(LLMTool.allCases.contains(.agy))
+    }
+
+    func test_agy_arguments_are_prompt_by_default() {
+        XCTAssertEqual(LLMTool.agy.arguments(prompt: "Summarize"),
+                       ["-p", "Summarize"])
+    }
+
+    func test_agy_arguments_append_model_with_flag() {
+        XCTAssertEqual(
+            LLMTool.agy.arguments(prompt: "Summarize", model: "gemini-3.8-flash-high"),
+            ["-p", "Summarize", "--model", "gemini-3.8-flash-high"])
+    }
+
+    func test_agy_arguments_blank_model_is_omitted() {
+        XCTAssertEqual(LLMTool.agy.arguments(prompt: "Summarize", model: "   "),
+                       ["-p", "Summarize"])
+    }
+
+    func test_agy_arguments_ignore_session() {
+        // Antigravity's -p mode does not resume sessions; a session value
+        // must not leak flags into argv.
+        let args = LLMTool.agy.arguments(prompt: "Summarize",
+                                         session: .new(UUID()))
+        XCTAssertEqual(args, ["-p", "Summarize"])
+    }
+
     // MARK: - Executable lookup directories
 
     func test_searchDirectories_includes_version_manager_bins() {
@@ -1323,5 +1356,41 @@ final class LLMRunnerTests: XCTestCase {
             || s.contains("ineligibletiererror")
             || s.contains("please login")
             || s.contains("not authenticated")
+    }
+
+    func test_agy_cli_returns_a_title_for_a_sample_transcript() async throws {
+        guard let agyPath = resolve("agy") else {
+            throw XCTSkip("agy CLI not installed on this machine")
+        }
+        let transcript = "We agreed to migrate the staging ECR to the new account by Friday and Uri will open the PR."
+        let result: String
+        do {
+            result = try await LLMRunner.run(
+                tool: .agy,
+                prompt: LLMSettings.defaultNamePrompt,
+                transcript: transcript,
+                executablePathOverride: agyPath,
+                timeout: 120
+            )
+        } catch let error as LLMRunnerError {
+            // An installed-but-unusable CLI is an environment problem, not a
+            // regression in our argv/plumbing: skip rather than fail.
+            guard case .nonZeroExit(_, let stderr) = error,
+                  Self.looksLikeAgyAuthFailure(stderr) else { throw error }
+            throw XCTSkip("agy CLI is installed but not usable on this machine (auth): \(stderr.prefix(200))")
+        }
+        XCTAssertFalse(result.isEmpty, "agy returned empty output")
+        XCTAssertLessThan(result.count, 200,
+                          "agy reply looks like prose, not a title: \(result)")
+    }
+
+    /// Whether an `agy` non-zero exit is an auth problem (skip)
+    /// rather than a real failure of the invocation we're testing (fail).
+    private static func looksLikeAgyAuthFailure(_ stderr: String) -> Bool {
+        let s = stderr.lowercased()
+        return s.contains("error authenticating")
+            || s.contains("please login")
+            || s.contains("not authenticated")
+            || s.contains("unauthorized")
     }
 }
