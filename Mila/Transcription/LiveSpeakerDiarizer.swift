@@ -265,7 +265,7 @@ final class LiveSpeakerDiarizer: ObservableObject {
         diarLog.log("starting daemon python=\(pythonPath, privacy: .public)")
 
         let script = Self.daemonScript
-        let stdin = Pipe()
+        let stdin = Self.makeDaemonStdinPipe()
         let stdout = Pipe()
         let stderr = Pipe()
         let process = Process()
@@ -630,6 +630,34 @@ final class LiveSpeakerDiarizer: ObservableObject {
     }
 
     // MARK: - Daemon I/O
+
+    /// The daemon's stdin, with SIGPIPE turned off on our write end.
+    ///
+    /// The daemon can be gone when we write to it: it dies at startup when
+    /// the Python stack fails to import (1.9.7's bundle did, every launch), or
+    /// crashes mid-recording before its stdout EOF reaches the main actor.
+    /// `start()` keeps the pipe either way, and `stop()` writes `shutdown`
+    /// into it. Writing to a pipe with no reader raises SIGPIPE, whose default
+    /// action terminates Mila on the spot — no crash report, the window just
+    /// disappears as the user presses Stop. With `F_SETNOSIGPIPE` the write
+    /// fails with EPIPE instead, which `FileHandle.write(contentsOf:)` throws
+    /// and both `stop()` and `sendCommand` already handle.
+    ///
+    /// Per-descriptor rather than `signal(SIGPIPE, SIG_IGN)`: an ignored
+    /// signal is inherited across exec, and every child Mila spawns would get it.
+    static func makeDaemonStdinPipe() -> Pipe {
+        let pipe = Pipe()
+        _ = fcntl(pipe.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        return pipe
+    }
+
+    /// Test hook: adopt an already-launched process as the daemon, so a test
+    /// can drive `stop()` against a daemon that has already exited without
+    /// needing the bundled Python runtime `start()` requires.
+    func adoptDaemonForTesting(_ process: Process, stdin: Pipe) {
+        self.process = process
+        self.stdinPipe = stdin
+    }
 
     private func sendCommand(_ line: String) async -> EmbedResponse {
         guard let stdin = stdinPipe else {

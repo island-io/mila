@@ -213,6 +213,13 @@ huggingface_hub<1.0
 # pyannote.audio 3.3.2 requires torch>=2.0; we pin to match runtime download.
 torch==${TORCH_VERSION}
 torchaudio==${TORCHAUDIO_VERSION}
+# torch 2.2.x is built against the numpy 1.x C ABI, so the app installs
+# numpy<2 into the user dir at runtime (DiarizationBootstrap.extraInstallSpecs),
+# and that copy shadows the bundled one. torch's metadata does not say so, so
+# without this the resolver picks numpy 2.x and with it packages that refuse
+# numpy 1.x at import -- 1.9.7 shipped pandas 3.1.0, which raises ImportError
+# beside numpy 1.26 and took speaker detection down entirely.
+numpy<2
 EOF
 
 log "resolving deps for pyannote.audio==${PYANNOTE_VERSION} (this can take 3-6 min)..."
@@ -291,10 +298,11 @@ log "installing ${PYANNOTE_VERSION} stack into site-packages (this can take 3-6 
 # --only-binary=:all: bans compilation of C-extension sdists (we don't want
 # to ship .so files compiled against the build-host SDK).
 # --no-binary=<pkgs> overrides per-package to allow pure-Python sdists
-# (antlr4-python3-runtime, julius -- both ship sdist-only but are pure-py).
+# (antlr4-python3-runtime, julius, docopt -- all ship sdist-only but are pure-py;
+# docopt arrives with pyannote.metrics 3.x, which the numpy<2 constraint selects).
 # Multiple --platform tags because scipy has only macosx_12_0_arm64+ wheels.
 # No --abi flag: we want abi3 wheels (e.g. hf-xet ships cp37-abi3) to match.
-PURE_PY_SDIST_OVERRIDE="antlr4-python3-runtime,julius"
+PURE_PY_SDIST_OVERRIDE="antlr4-python3-runtime,julius,docopt"
 "$PY" -m pip install \
     --no-warn-script-location \
     --progress-bar off \
@@ -440,14 +448,20 @@ print('scipy version:', scipy.__version__)
 from importlib.metadata import version
 print('pyannote.audio version:', version('pyannote.audio'))
 print('huggingface_hub version:', version('huggingface_hub'))
-# Pure-python pyannote pieces:
+# The app runs torch 2.2.x, which needs numpy 1.x; see the constraints above.
+assert int(numpy.__version__.split('.')[0]) < 2, 'bundled numpy must be <2 for torch 2.2.x'
+# pandas checks the numpy version at import and refuses a mismatch.
+import pandas
+print('pandas version:', pandas.__version__)
+# Pure-python pyannote pieces (pyannote.database imports pandas):
 import pyannote.core
-print('pyannote.core OK')
+import pyannote.database
+print('pyannote.core + pyannote.database OK')
 " >&2
 SMOKE_RC=$?
 set -e
 if [[ "$SMOKE_RC" -ne 0 ]]; then
-    log "WARN: smoke test exited with $SMOKE_RC (continuing; investigate before shipping)"
+    die "smoke test exited with $SMOKE_RC -- this runtime cannot load pyannote's dependencies"
 fi
 
 # ---- Step 10: MANIFEST.txt -------------------------------------------------
