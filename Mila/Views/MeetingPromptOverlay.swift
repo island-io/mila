@@ -1,305 +1,506 @@
 import AppKit
 import SwiftUI
 import Combine
+import CoreGraphics
 
-/// Floating panel that asks "Want me to transcribe this meeting?" when a
-/// supported app (Zoom, …) appears to be in a call.
-///
-/// Lifecycle:
-///   * `MilaApp` constructs a single `MeetingPromptCoordinator`, hands
-///     it the detector and the action controller, and calls `start()`.
-///   * The coordinator subscribes to `MeetingDetector.meetingStarted`
-///     and renders the panel when an event fires (subject to the
-///     user's enabled / silenced settings).
-///   * The panel auto-dismisses after `autoDismissSeconds` unless the
-///     user is hovering it (a sleek progress bar at the bottom shows
-///     the countdown; hovering freezes the bar).
-///
-/// The panel is a borderless `NSPanel` floating at status-bar level,
-/// positioned top-right of the active screen.
+/// The production coordinator uses this same interface in deterministic tests.
+@MainActor
+protocol MeetingRecordingActions: AnyObject {
+    var meetingRecordingURL: URL? { get }
+    var canStartMeetingRecording: Bool { get }
+    var meetingRecordingChanges: AnyPublisher<Void, Never> { get }
+    func startMeetingRecording(isStillValid: @escaping () -> Bool) async -> URL?
+    func stopMeetingRecording(expectedURL: URL) async
+}
+
+extension QuickActionsController: MeetingRecordingActions {
+    var meetingRecordingURL: URL? { isRecording ? session.fileURL : nil }
+    var canStartMeetingRecording: Bool {
+        activeJob == .none && !captureStartInFlight && !isStoppingRecording
+            && !transcription.isPreparingModel
+    }
+    var meetingRecordingChanges: AnyPublisher<Void, Never> {
+        $activeJob.map { _ in () }.eraseToAnyPublisher()
+    }
+    func stopMeetingRecording(expectedURL: URL) async {
+        guard meetingRecordingURL == expectedURL else { return }
+        await stopRecording()
+    }
+}
+
+enum MeetingPromptKind: Equatable { case start, stop }
+
+/// A countdown belongs to one presented prompt. Large delivery gaps cancel an
+/// automatic action instead of spending the user's entire grace period asleep.
+struct MeetingPromptCountdown {
+    enum Outcome: Equatable { case waiting, primary, dismiss }
+    private(set) var elapsed: TimeInterval = 0
+    private(set) var finished = false
+    mutating func advance(by interval: TimeInterval, paused: Bool, automatic: Bool) -> Outcome {
+        guard !finished else { return .waiting }
+        guard interval.isFinite, interval >= 0 else { return .waiting }
+        if automatic && interval > 2 {
+            finished = true
+            return .dismiss
+        }
+        guard !paused else { return .waiting }
+        elapsed += interval
+        guard elapsed >= 10 else { return .waiting }
+        finished = true
+        return automatic ? .primary : .dismiss
+    }
+    mutating func cancel() { finished = true }
+}
+
+@MainActor
+final class MeetingPromptInteraction: ObservableObject {
+    @Published var keyboardActive = false
+}
+
+private final class MeetingPromptPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+}
+
+/// One prompt at a time. A callback must still own its generation before it can
+/// act; dismissing a panel revokes its callbacks even during the close animation.
 @MainActor
 final class MeetingPromptCoordinator: ObservableObject {
+    struct Prompt {
+        let id = UUID()
+        let app: MeetingDetector.App
+        let kind: MeetingPromptKind
+        let automatic: Bool
+        let meetingID: UUID?
+        let recordingURL: URL?
+        var startUnavailable = false
+    }
+    private struct Ownership {
+        let appID: String
+        let meetingID: UUID
+        let recordingURL: URL
+    }
     private let detector: MeetingDetector
     private let settings: MeetingDetectionSettings
-    private let actions: QuickActionsController
-    private var startCancellable: AnyCancellable?
-    private var endCancellable: AnyCancellable?
-    private var recordingStateCancellable: AnyCancellable?
-    private var window: NSPanel?
-    /// True only while the currently-presented panel is the *stop* prompt.
-    /// Used to auto-dismiss that prompt if recording ends through any other
-    /// path (Record button, hotkey, sleep) during its countdown — a dead
-    /// "Stop recording" button is worse than no prompt. The start prompt is
-    /// untouched by this.
-    private var stopPromptShowing = false
+    private let actions: any MeetingRecordingActions
+    private let presentsPanels: Bool
+    private let pollsDetector: Bool
+    private let screenLockNotifications: NotificationCenter
+    private let screenIsLocked: () -> Bool
+    private var screenLocked = false
+    private var subscriptions: Set<AnyCancellable> = []
+    private var running = false
+    private var meetings: [String: UUID] = [:]
 
-    init(detector: MeetingDetector,
-         settings: MeetingDetectionSettings,
-         actions: QuickActionsController) {
+    /// Declines survive detector blips for this app/meeting identity. A confirmed
+    /// end, lifecycle reset, or fresh opt-in retires them.
+    private struct DeclinedStart: Hashable {
+        let appID: String
+        let meetingID: UUID
+    }
+    private var declinedStarts: Set<DeclinedStart> = []
+
+    private var owner: Ownership?
+    private var starting: Prompt?
+    private var startTask: Task<Void, Never>?
+    private var window: NSPanel?
+    @Published private(set) var pending: Prompt?
+
+    init(detector: MeetingDetector, settings: MeetingDetectionSettings,
+         actions: any MeetingRecordingActions, presentsPanels: Bool = true,
+         pollsDetector: Bool = true,
+         screenLockNotifications: NotificationCenter = DistributedNotificationCenter.default(),
+         screenIsLocked: @escaping () -> Bool = {
+             guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return true }
+             return session["CGSSessionScreenIsLocked"] as? Bool ?? false
+         }) {
         self.detector = detector
         self.settings = settings
         self.actions = actions
+        self.presentsPanels = presentsPanels
+        self.pollsDetector = pollsDetector
+        self.screenLockNotifications = screenLockNotifications
+        self.screenIsLocked = screenIsLocked
     }
 
-    /// Pure decision for whether the *stop* prompt should appear when a
-    /// meeting goes inactive. Extracted so it's unit-testable without a
-    /// real Zoom: the inputs are exactly the three things that gate the
-    /// prompt. NOT gated on how the recording started — a manual record and
-    /// an auto-prompt record are treated identically.
-    ///
-    /// - Parameters:
-    ///   - detectionEnabled: the user's `MeetingDetectionSettings.enabled`
-    ///     toggle — the whole feature is off when this is false.
-    ///   - appSilenced: whether the user chose "don't show this for X" for
-    ///     the app whose meeting just ended.
-    ///   - isRecording: whether Mila is actively recording right now.
-    ///   - promptAlreadyShowing: whether a prompt panel is already up (we
-    ///     never stack a second one).
-    static func shouldShowStopPrompt(detectionEnabled: Bool,
-                                     appSilenced: Bool,
-                                     isRecording: Bool,
-                                     promptAlreadyShowing: Bool) -> Bool {
-        guard detectionEnabled else { return false }
-        guard !appSilenced else { return false }
-        guard isRecording else { return false }
-        guard !promptAlreadyShowing else { return false }
-        return true
+    static func shouldShowStopPrompt(detectionEnabled: Bool, appSilenced: Bool,
+                                    isRecording: Bool, promptAlreadyShowing: Bool) -> Bool {
+        detectionEnabled && !appSilenced && isRecording && !promptAlreadyShowing
     }
-
-    /// Pure decision for whether a *showing* stop prompt should now
-    /// auto-dismiss. The stop prompt only makes sense while a recording is
-    /// live — its sole action is "stop recording." If recording ends through
-    /// any other path during the prompt's countdown (Record button, hotkey,
-    /// system sleep, etc.), the button becomes a dead no-op, so we tear the
-    /// prompt down. Only applies to the stop prompt; the start prompt is left
-    /// alone. Extracted so it's unit-testable without a real Zoom / panel.
-    static func shouldDismissStopPrompt(stopPromptShowing: Bool,
-                                        isRecording: Bool) -> Bool {
+    static func shouldDismissStopPrompt(stopPromptShowing: Bool, isRecording: Bool) -> Bool {
         stopPromptShowing && !isRecording
     }
 
     func start() {
-        startCancellable = detector.meetingStarted
+        guard !running else { return }
+        running = true
+        screenLocked = screenIsLocked()
+        // MeetingDetector and MeetingDetectionSettings are @MainActor;
+        // their polling/mutation paths deliver these subjects on this actor.
+        // Synchronous delivery prevents an ended/revoked request from firing
+        // between the event and a later dispatch-queue hop.
+        detector.meetingStarted.sink { [weak self] in self?.meetingStarted($0) }
+            .store(in: &subscriptions)
+        detector.meetingEnded.sink { [weak self] in self?.meetingEnded($0) }
+            .store(in: &subscriptions)
+        actions.meetingRecordingChanges.receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.recordingChanged() }.store(in: &subscriptions)
+        // Use the incoming @Published value synchronously for revocation;
+        // reading the property here would still see its pre-willSet value.
+        settings.enabledChanges.sink { [weak self] enabled in
+            guard let self, !enabled else { return }
+            self.invalidatePendingActions()
+            self.owner = nil
+            self.meetings.removeAll()
+            self.declinedStarts.removeAll()
+        }.store(in: &subscriptions)
+        settings.$autoStartBundleIDs.sink { [weak self] ids in
+            guard let self else { return }
+            // @Published delivers before willSet, so the stored value is the
+            // previous set. Re-arm only the app newly opted in; republishing
+            // unchanged IDs or changing another app must preserve declines.
+            let newlyEnabledIDs = ids.subtracting(self.settings.autoStartBundleIDs)
+            self.declinedStarts = Set(self.declinedStarts.filter { !newlyEnabledIDs.contains($0.appID) })
+            self.revokeAutomation(except: ids)
+        }.store(in: &subscriptions)
+        settings.$disabledBundleIDs.sink { [weak self] ids in
+            guard let self else { return }
+            if let pending = self.pending, ids.contains(pending.app.bundleID) { self.dismissPrompt() }
+            if let starting = self.starting, ids.contains(starting.app.bundleID) { self.cancelStarting() }
+            if let owner = self.owner, ids.contains(owner.appID) { self.owner = nil }
+        }.store(in: &subscriptions)
+        settings.objectWillChange.receive(on: DispatchQueue.main)
+            .sink { [weak self] in self?.settingsChanged() }.store(in: &subscriptions)
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] app in
-                self?.handleMeetingStart(app: app)
-            }
-        endCancellable = detector.meetingEnded
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] app in
-                self?.handleMeetingEnd(app: app)
-            }
-        // Auto-dismiss a showing stop prompt the moment recording leaves the
-        // active state through any path — `activeJob` is what backs
-        // `isRecording`, so observing it covers the Record button, hotkeys,
-        // and system-sleep stops alike.
-        recordingStateCancellable = actions.$activeJob
+            .sink { [weak self] _ in self?.invalidatePendingActions() }.store(in: &subscriptions)
+        screenLockNotifications.publisher(for: Notification.Name("com.apple.screenIsLocked"))
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
-                self?.dismissStopPromptIfRecordingEnded()
-            }
-        if settings.enabled {
-            detector.start()
-        }
+                guard let self else { return }
+                self.screenLocked = true
+                self.invalidatePendingActions()
+                self.owner = nil
+            }.store(in: &subscriptions)
+        screenLockNotifications.publisher(for: Notification.Name("com.apple.screenIsUnlocked"))
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.screenLocked = false }.store(in: &subscriptions)
+        settingsChanged()
     }
+
+    // Kept for the existing App call site; start() installs one cancellable
+    // settings subscription, even if a SwiftUI scene mounts a second time.
+    func bindEnabledChanges() { if !running { start() } }
 
     func stop() {
-        startCancellable?.cancel()
-        startCancellable = nil
-        endCancellable?.cancel()
-        endCancellable = nil
-        recordingStateCancellable?.cancel()
-        recordingStateCancellable = nil
-        detector.stop()
-        hidePanel()
+        running = false
+        subscriptions.removeAll()
+        invalidatePendingActions()
+        meetings.removeAll()
+        declinedStarts.removeAll()
+        owner = nil
+        if pollsDetector { detector.stop() }
     }
 
-    /// Bind the detector's start/stop to the user's enabled toggle.
-    func bindEnabledChanges() {
-        // Re-observe whenever `enabled` flips: if the user disables
-        // detection, stop polling and dismiss any visible prompt;
-        // if they re-enable, restart polling.
-        NotificationCenter.default.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
+    private func allowed(_ appID: String) -> Bool {
+        // Recheck at action/permission checkpoints: a timer must not win
+        // the delivery hop from the lock notification to the main queue.
+        running && !screenLocked && !screenIsLocked()
+            && settings.enabled && settings.mode(forBundleID: appID) != .off
+    }
+    private func validStart(_ prompt: Prompt) -> Bool {
+        allowed(prompt.app.bundleID)
+            && meetings[prompt.app.bundleID] == prompt.meetingID
+            && prompt.meetingID != nil
+            && (!prompt.automatic || settings.mode(forBundleID: prompt.app.bundleID) == .auto)
+    }
+    private func validStop(_ prompt: Prompt) -> Bool {
+        guard allowed(prompt.app.bundleID), let url = prompt.recordingURL,
+              actions.meetingRecordingURL == url else { return false }
+        if !prompt.automatic { return true }
+        return settings.mode(forBundleID: prompt.app.bundleID) == .auto
+            && meetings.isEmpty && owner?.appID == prompt.app.bundleID
+            && owner?.recordingURL == url
+    }
+
+    private func meetingStarted(_ app: MeetingDetector.App) {
+        guard running else { return }
+        // A brief inactive poll can re-fire start before a confirmed end. Keep
+        // the identity until the detector confirms that this meeting ended.
+        if meetings[app.bundleID] == nil {
+            meetings[app.bundleID] = UUID()
+            // A rejoined call is a new meeting; the previous recording is
+            // now controlled explicitly, even when it still has the same URL.
+            if owner?.appID == app.bundleID { owner = nil }
+        }
+        if pending?.kind == .stop, pending?.automatic == true { dismissPrompt() }
+        guard pending == nil, starting == nil, actions.meetingRecordingURL == nil,
+              allowed(app.bundleID) else { return }
+        // The detector re-fires `meetingStarted` after any brief inactive poll,
+        // before it has confirmed an end, so the SAME `meetings` UUID can arrive
+        // again. A generation the user explicitly declined must not re-present a
+        // countdown (or, in Auto, capture) — only a confirmed end/rejoin may.
+        if let meetingID = meetings[app.bundleID],
+           declinedStarts.contains(DeclinedStart(appID: app.bundleID, meetingID: meetingID)) {
+            return
+        }
+        let wantsAuto = settings.mode(forBundleID: app.bundleID) == .auto
+        let automatic = wantsAuto && actions.canStartMeetingRecording
+        present(Prompt(app: app, kind: .start, automatic: automatic,
+                       meetingID: meetings[app.bundleID], recordingURL: nil,
+                       startUnavailable: wantsAuto && !automatic))
+    }
+
+    private func meetingEnded(_ app: MeetingDetector.App) {
+        let endedMeetingID = meetings.removeValue(forKey: app.bundleID)
+        // The generation is over: retire its decline so a genuine rejoin (which
+        // mints a fresh UUID anyway) and the bounded set both stay clean.
+        if let endedMeetingID {
+            declinedStarts.remove(DeclinedStart(appID: app.bundleID, meetingID: endedMeetingID))
+        }
+        if pending?.kind == .start, pending?.app.bundleID == app.bundleID { dismissPrompt() }
+        if starting?.app.bundleID == app.bundleID { cancelStarting() }
+        guard allowed(app.bundleID), pending == nil, let url = actions.meetingRecordingURL else { return }
+        let automatic = settings.mode(forBundleID: app.bundleID) == .auto
+            && owner?.appID == app.bundleID && owner?.meetingID == endedMeetingID
+            && owner?.recordingURL == url && meetings.isEmpty
+        present(Prompt(app: app, kind: .stop, automatic: automatic,
+                       meetingID: nil, recordingURL: url))
+    }
+
+    private func recordingChanged() {
+        let url = actions.meetingRecordingURL
+        if owner?.recordingURL != url { owner = nil }
+        guard let prompt = pending else { return }
+        if (prompt.kind == .start && url != nil)
+            || (prompt.kind == .stop && prompt.recordingURL != url) { dismissPrompt() }
+    }
+
+    private func revokeAutomation(except allowedIDs: Set<String>) {
+        if let pending, pending.automatic, !allowedIDs.contains(pending.app.bundleID) { dismissPrompt() }
+        if let starting, starting.automatic, !allowedIDs.contains(starting.app.bundleID) { cancelStarting() }
+        if let owner, !allowedIDs.contains(owner.appID) { self.owner = nil }
+    }
+
+    private func settingsChanged() {
+        if let owner, !allowed(owner.appID) || settings.mode(forBundleID: owner.appID) != .auto {
+            self.owner = nil // revocation does not stop an already-active recording
+        }
+        if let pending, !allowed(pending.app.bundleID)
+            || (pending.automatic && settings.mode(forBundleID: pending.app.bundleID) != .auto) {
+            dismissPrompt()
+        }
+        if let starting, !validStart(starting) { cancelStarting() }
+        if settings.enabled {
+            if pollsDetector { detector.start() }
+        } else {
+            meetings.removeAll()
+            declinedStarts.removeAll()
+            if pollsDetector { detector.stop() }
+        }
+    }
+
+    /// Explicit user cancellation of the current prompt ("Cancel start",
+    /// "Not now", Escape, or "Keep recording"). Cancelling a START is
+    /// remembered as a declined generation so a flickering detector cannot
+    /// re-present it; cancelling a STOP ("Keep recording") is not, and never
+    /// touches the active recording.
+    func cancelPrompt(id: UUID) { cancelPrompt(id: id, userInitiated: true) }
+
+    /// The countdown's own dismissal — an unattended timeout or a long
+    /// delivery gap. Identical to a cancel except that it is NOT a user
+    /// decline: the generation stays eligible if the detector re-fires it.
+    func expirePrompt(id: UUID) { cancelPrompt(id: id, userInitiated: false) }
+
+    private func cancelPrompt(id: UUID, userInitiated: Bool) {
+        guard let prompt = pending, prompt.id == id else { return }
+        if userInitiated, prompt.kind == .start, let meetingID = prompt.meetingID {
+            declinedStarts.insert(DeclinedStart(appID: prompt.app.bundleID, meetingID: meetingID))
+        }
+        if prompt.kind == .stop {
+            announce("Recording will continue.")
+        } else {
+            announce(prompt.automatic ? "Automatic recording cancelled." : "Recording has not started.")
+        }
+        dismissPrompt()
+    }
+
+    /// Both timer expiry and explicit button clicks go through the current
+    /// prompt, not captured booleans from when the window was created.
+    func performPrompt(id: UUID, enableAuto: Bool = false) {
+        guard var prompt = pending, prompt.id == id else { return }
+        guard allowed(prompt.app.bundleID) else { dismissPrompt(); return }
+        if enableAuto {
+            guard prompt.kind == .start, validStart(prompt), actions.meetingRecordingURL == nil else {
+                dismissPrompt(); return
+            }
+            settings.setMode(.auto, forBundleID: prompt.app.bundleID)
+            prompt = Prompt(app: prompt.app, kind: .start, automatic: true,
+                            meetingID: prompt.meetingID, recordingURL: nil)
+            // Enabling a preference is not consent to capture immediately.
+            // Give the newly enabled action its own cancellable grace period.
+            present(prompt)
+            return
+        }
+        switch prompt.kind {
+        case .start:
+            guard validStart(prompt), actions.meetingRecordingURL == nil else { dismissPrompt(); return }
+            guard actions.canStartMeetingRecording else {
+                // Keep an explicit action available after a busy/preparing
+                // interval; do not repeatedly retry capture in the background.
+                present(Prompt(app: prompt.app, kind: .start, automatic: false,
+                               meetingID: prompt.meetingID, recordingURL: nil, startUnavailable: true))
+                return
+            }
+            dismissPrompt()
+            starting = prompt
+            let prompt = prompt
+            startTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                if self.settings.enabled {
-                    self.detector.start()
-                } else {
-                    self.detector.stop()
-                    self.hidePanel()
+                let result = await self.actions.startMeetingRecording { [weak self] in
+                    guard let self else { return false }
+                    return self.starting?.id == prompt.id && self.validStart(prompt) && !Task.isCancelled
                 }
+                if self.starting?.id == prompt.id {
+                    if let result, self.validStart(prompt), self.actions.meetingRecordingURL == result {
+                        if prompt.automatic, let meetingID = prompt.meetingID {
+                            self.owner = Ownership(appID: prompt.app.bundleID, meetingID: meetingID, recordingURL: result)
+                        }
+                        self.announce("Recording started for \(prompt.app.displayName).")
+                    }
+                    self.starting = nil
+                    self.startTask = nil
+                }
+            }
+        case .stop:
+            guard validStop(prompt), let url = prompt.recordingURL else { dismissPrompt(); return }
+            dismissPrompt()
+            let prompt = prompt
+            Task { @MainActor [weak self] in
+                guard let self, self.validStop(prompt) else { return }
+                await self.actions.stopMeetingRecording(expectedURL: url)
+                self.owner = nil
+                self.announce("Recording stopped.")
             }
         }
     }
 
-    private func handleMeetingStart(app: MeetingDetector.App) {
-        // Already prompting (or recording, or a sheet is up) — don't
-        // pile a second floating panel on top.
-        guard window == nil else { return }
-        guard !actions.isRecording else { return }
-        // A Record click that is still bringing capture up counts as
-        // recording here: the user has already chosen, and the panel's own
-        // Record action (`toggleRecord(withSystemAudio: true)`) is dropped by
-        // the controller for the length of the bring-up — it would hide the
-        // panel and change nothing (#293).
-        guard !actions.isStartingRecording else { return }
-        guard settings.enabled else { return }
-        guard !settings.isDisabled(forBundleID: app.bundleID) else { return }
-
-        showStartPanel(for: app)
+    private func cancelStarting() {
+        // Cancelling the in-flight start task does two things: the controller
+        // bridges the Swift task cancellation to the attempt's
+        // `CaptureStartCancellation` synchronously (see `startRecording`), so a
+        // capture leg still suspended stops short of opening; and the
+        // controller's `isStillValid` predicate returns false at its next
+        // checkpoint, covering a bring-up that has already passed its last
+        // in-leg check.
+        starting = nil
+        startTask?.cancel()
+        startTask = nil
+    }
+    private func invalidatePendingActions() {
+        dismissPrompt()
+        cancelStarting()
     }
 
-    /// The inverse of `handleMeetingStart`: a meeting we were tracking went
-    /// inactive. If Mila is recording (regardless of how that recording was
-    /// started) and the feature is enabled, offer to stop.
-    private func handleMeetingEnd(app: MeetingDetector.App) {
-        guard Self.shouldShowStopPrompt(
-            detectionEnabled: settings.enabled,
-            appSilenced: settings.isDisabled(forBundleID: app.bundleID),
-            isRecording: actions.isRecording,
-            promptAlreadyShowing: window != nil
-        ) else { return }
-
-        showStopPanel(for: app)
-    }
-
-    /// Fires on every `actions.activeJob` change. If the stop prompt is up
-    /// and recording is no longer active, dismiss it — the "Stop recording"
-    /// button would otherwise be a dead no-op (recording already ended).
-    private func dismissStopPromptIfRecordingEnded() {
-        guard Self.shouldDismissStopPrompt(
-            stopPromptShowing: stopPromptShowing,
-            isRecording: actions.isRecording
-        ) else { return }
-        hidePanel()
-    }
-
-    private func showStartPanel(for app: MeetingDetector.App) {
-        let view = MeetingPromptView(
-            app: app,
-            kind: .start,
-            onPrimary: { [weak self] in
-                self?.hidePanel()
-                Task { @MainActor [weak self] in
-                    // Auto-prompt always captures system audio — the
-                    // whole point of detecting a meeting is to grab the
-                    // other participants' audio alongside the user's
-                    // mic. If the user only wanted mic, they can switch
-                    // sources from the recording chip after the fact.
-                    await self?.actions.toggleRecord(withSystemAudio: true)
-                }
-            },
-            onDismiss: { [weak self] in
-                // "Not now" or the auto-dismiss timeout — just hide. We no
-                // longer snooze: the detector re-arms when the meeting ends
-                // (mic capture stops), so the *next* meeting prompts again,
-                // while its `firedFor` prevents re-prompting within the
-                // current meeting. "Don't show for X" stops prompts entirely.
-                self?.hidePanel()
-            },
+    private func present(_ prompt: Prompt) {
+        dismissPrompt()
+        pending = prompt
+        guard presentsPanels else { return }
+        let interaction = MeetingPromptInteraction()
+        let view = MeetingPromptView(app: prompt.app, kind: prompt.kind,
+            autoAct: prompt.automatic, startUnavailable: prompt.startUnavailable, interaction: interaction,
+            onPrimary: { [weak self] in self?.performPrompt(id: prompt.id) },
+            onDismiss: { [weak self] in self?.cancelPrompt(id: prompt.id) },
+            onTimeout: { [weak self] in self?.expirePrompt(id: prompt.id) },
             onSilenceApp: { [weak self] in
-                self?.settings.disable(bundleID: app.bundleID)
-                self?.hidePanel()
-            }
-        )
-        presentPanel(hosting: view)
-    }
-
-    /// Mirror of `showStartPanel` for the end-of-meeting case. The primary
-    /// action stops the active recording; "Keep recording" just dismisses.
-    private func showStopPanel(for app: MeetingDetector.App) {
-        let view = MeetingPromptView(
-            app: app,
-            kind: .stop,
-            onPrimary: { [weak self] in
-                self?.hidePanel()
-                Task { @MainActor [weak self] in
-                    await self?.actions.stopRecording()
-                }
+                guard let self, self.pending?.id == prompt.id else { return }
+                self.settings.setMode(.off, forBundleID: prompt.app.bundleID)
+                self.announce("Meeting recording is off for \(prompt.app.displayName).")
+                self.dismissPrompt()
             },
-            onDismiss: { [weak self] in
-                // "Keep recording" or the auto-dismiss timeout — leave the
-                // recording running and just hide the panel.
-                self?.hidePanel()
-            },
-            onSilenceApp: { [weak self] in
-                self?.settings.disable(bundleID: app.bundleID)
-                self?.hidePanel()
-            }
-        )
-        stopPromptShowing = true
-        presentPanel(hosting: view)
-    }
-
-    private func presentPanel(hosting view: MeetingPromptView) {
-        let panel = NSPanel(
-            contentRect: NSRect(origin: .zero, size: NSSize(width: 360, height: 168)),
-            styleMask: [.borderless, .nonactivatingPanel],
-            backing: .buffered,
-            defer: false
-        )
+            onEnableAuto: prompt.kind == .start && !prompt.automatic ? { [weak self] in
+                self?.performPrompt(id: prompt.id, enableAuto: true)
+            } : nil,
+            onHeightChange: { [weak self] height in
+                guard let self, self.pending?.id == prompt.id, let panel = self.window else { return }
+                panel.setContentSize(NSSize(width: 360, height: height))
+                self.positionTopTrailing(panel)
+            })
+        let panel = MeetingPromptPanel(contentRect: NSRect(x: 0, y: 0, width: 360, height: 180),
+                                      styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.isFloatingPanel = true
         panel.level = .statusBar
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .participatesInCycle]
         panel.backgroundColor = .clear
         panel.isOpaque = false
         panel.hasShadow = true
-        panel.isMovable = false
         panel.contentView = NSHostingView(rootView: view)
-        positionTopTrailing(panel)
-
-        panel.alphaValue = 0
-        panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { ctx in
-            ctx.duration = 0.18
-            panel.animator().alphaValue = 1
+        window = panel
+        for notification in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification] {
+            NotificationCenter.default.publisher(for: notification, object: panel)
+                .sink { [weak panel, weak interaction] _ in interaction?.keyboardActive = panel?.isKeyWindow == true }
+                .store(in: &panelSubscriptions)
         }
-        self.window = panel
+        positionTopTrailing(panel)
+        panel.orderFrontRegardless()
+        if prompt.startUnavailable {
+            announce("Recording has not started. Mila is busy; use Start transcribing when ready.")
+        } else if prompt.automatic {
+            announce("\(prompt.app.displayName): \(prompt.kind == .start ? "starting" : "stopping") recording in ten seconds. Focus the prompt to pause, or cancel.")
+        } else {
+            let question = prompt.kind == .start ? "Meeting detected. Start transcribing?" : "Meeting ended. Stop recording?"
+            announce("\(prompt.app.displayName): \(question) Focus the prompt to pause and respond.")
+        }
     }
-
-    private func hidePanel() {
-        stopPromptShowing = false
+    private var panelSubscriptions: Set<AnyCancellable> = []
+    private func dismissPrompt() {
+        pending = nil
+        panelSubscriptions.removeAll()
         guard let panel = window else { return }
-        self.window = nil
-        NSAnimationContext.runAnimationGroup({ ctx in
-            ctx.duration = 0.14
-            panel.animator().alphaValue = 0
-        }, completionHandler: {
-            panel.orderOut(nil)
-        })
+        window = nil
+        panel.orderOut(nil)
+        panel.contentView = nil
     }
-
+    private func announce(_ text: String) {
+        guard presentsPanels else { return }
+        NSAccessibility.post(element: NSApplication.shared, notification: .announcementRequested,
+                             userInfo: [.announcement: text, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+    }
     private func positionTopTrailing(_ panel: NSPanel) {
         guard let screen = NSScreen.main else { return }
-        let visible = screen.visibleFrame
-        let size = panel.frame.size
-        let x = visible.maxX - size.width - 16
-        let y = visible.maxY - size.height - 16
-        panel.setFrameOrigin(NSPoint(x: x, y: y))
+        let frame = screen.visibleFrame
+        panel.setFrameTopLeftPoint(NSPoint(x: frame.maxX - panel.frame.width - 16, y: frame.maxY - 16))
     }
 }
 
-/// The sleek body of the prompt. Auto-dismisses after a short window,
-/// with the progress bar across the bottom acting as the countdown.
-/// Hovering pauses the bar (and freezes the auto-dismiss timer).
+private struct MeetingPromptHeight: PreferenceKey {
+    static var defaultValue: CGFloat = 180
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
 private struct MeetingPromptView: View {
     /// Which prompt this is — start a recording (meeting detected) or stop
     /// one (meeting ended). Drives all the copy, the primary button style,
     /// and the accessibility identifiers so a single view body serves both.
-    enum Kind {
-        case start
-        case stop
-    }
+    typealias Kind = MeetingPromptKind
 
     let app: MeetingDetector.App
     let kind: Kind
+    /// When true, the timer auto-triggers `onPrimary` instead of
+    /// `onDismiss` — used for per-app auto-start/stop.
+    let autoAct: Bool
+    let startUnavailable: Bool
+    @ObservedObject var interaction: MeetingPromptInteraction
     let onPrimary: () -> Void
     let onDismiss: () -> Void
+    /// Countdown expiry for an unattended prompt. Kept separate from
+    /// `onDismiss` so the coordinator can tell an explicit user cancellation
+    /// (which must suppress the rest of this meeting generation) from the
+    /// timer's own dismissal, which must not.
+    var onTimeout: (() -> Void)? = nil
     let onSilenceApp: () -> Void
+    /// Enable auto-start/stop and present a fresh cancellable countdown.
+    var onEnableAuto: (() -> Void)? = nil
+    var onHeightChange: (CGFloat) -> Void = { _ in }
 
     /// How long the prompt stays up if the user doesn't interact.
     private let autoDismissSeconds: Double = 10
@@ -307,13 +508,13 @@ private struct MeetingPromptView: View {
     /// being wasteful.
     private let tickInterval: Double = 1.0 / 30.0
 
-    @State private var elapsed: Double = 0
+    @State private var countdown = MeetingPromptCountdown()
     @State private var hovering = false
     @State private var expanded = false
     @State private var dismissed = false
-    /// Wall-clock anchor used to track elapsed time accurately even when
+    /// Monotonic anchor used to track elapsed time accurately even when
     /// the system briefly throttles SwiftUI's timer callbacks.
-    @State private var lastTick: Date = Date()
+    @State private var lastTick = ContinuousClock.now
 
     private let timer = Timer.publish(every: 1.0 / 30.0, on: .main, in: .common).autoconnect()
 
@@ -348,8 +549,15 @@ private struct MeetingPromptView: View {
         .frame(width: 360)
         .onHover { hovering = $0 }
         .onReceive(timer) { _ in tick() }
-        .onAppear { lastTick = Date() }
-        .accessibilityIdentifier("\(identifierPrefix).\(app.bundleID)")
+        .fixedSize(horizontal: false, vertical: true)
+        .background(GeometryReader { proxy in
+            Color.clear.preference(key: MeetingPromptHeight.self, value: proxy.size.height)
+        })
+        .onPreferenceChange(MeetingPromptHeight.self, perform: onHeightChange)
+        .onAppear { lastTick = .now }
+        .onDisappear { dismissed = true; countdown.cancel() }
+        // Keep identifiers on individual controls; a SwiftUI container
+        // identifier propagates to children and masks their identifiers.
     }
 
     /// Accessibility-identifier prefix, distinct per kind so UI tests can
@@ -369,6 +577,18 @@ private struct MeetingPromptView: View {
     }
 
     private var subtitleText: String {
+        if isPaused {
+            return autoAct ? "Countdown paused — leave the prompt to continue."
+                : "Prompt stays open while you interact."
+        }
+        if startUnavailable { return "Recording has not started. Mila is busy; try Start transcribing when ready." }
+        if autoAct {
+            let remaining = max(0, Int(ceil(autoDismissSeconds - countdown.elapsed)))
+            switch kind {
+            case .start: return "Starting recording in \(remaining)…"
+            case .stop:  return "Stopping recording in \(remaining)…"
+            }
+        }
         switch kind {
         case .start: return "Want Mila to transcribe this call?"
         case .stop:  return "Stop recording now?"
@@ -383,6 +603,7 @@ private struct MeetingPromptView: View {
     }
 
     private var dismissButtonText: String {
+        if autoAct { return kind == .start ? "Cancel start" : "Keep recording" }
         switch kind {
         case .start: return "Not now"
         case .stop:  return "Keep recording"
@@ -432,10 +653,12 @@ private struct MeetingPromptView: View {
                     }
                     .buttonStyle(.plain)
                     .help("More options")
+                    .accessibilityLabel("More meeting recording options")
                     .accessibilityIdentifier("\(identifierPrefix).chevron")
                 }
 
                 Text(subtitleText)
+                    .accessibilityIdentifier("\(identifierPrefix).countdown")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -456,6 +679,7 @@ private struct MeetingPromptView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .accessibilityIdentifier("\(identifierPrefix).dismiss")
+                    .keyboardShortcut(.cancelAction)
                 }
                 .padding(.top, 4)
             }
@@ -464,6 +688,23 @@ private struct MeetingPromptView: View {
 
     private var expandedActions: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if let onEnableAuto, kind == .start, !autoAct {
+                Button {
+                    guard !dismissed else { return }
+                    dismissed = true
+                    onEnableAuto()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "play.circle")
+                            .font(.caption)
+                        Text("Enable automatic start and stop for \(app.displayName)")
+                            .font(.callout)
+                    }
+                    .foregroundStyle(.primary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("\(identifierPrefix).enableAuto")
+            }
             Button(action: triggerSilence) {
                 HStack(spacing: 6) {
                     Image(systemName: "bell.slash")
@@ -488,7 +729,7 @@ private struct MeetingPromptView: View {
                 Rectangle()
                     .fill(Color.primary.opacity(0.08))
                 Rectangle()
-                    .fill(hovering ? Color.secondary : Color.accentColor)
+                    .fill(isPaused ? Color.secondary : Color.accentColor)
                     .frame(width: geo.size.width * CGFloat(progressFraction))
                     .animation(.linear(duration: tickInterval), value: progressFraction)
             }
@@ -500,19 +741,22 @@ private struct MeetingPromptView: View {
     }
 
     private var progressFraction: Double {
-        let remaining = max(0, autoDismissSeconds - elapsed)
+        let remaining = max(0, autoDismissSeconds - countdown.elapsed)
         return max(0, min(1, remaining / autoDismissSeconds))
     }
 
+    private var isPaused: Bool { hovering || expanded || interaction.keyboardActive }
+
     private func tick() {
         guard !dismissed else { return }
-        let now = Date()
-        let dt = now.timeIntervalSince(lastTick)
+        let now = ContinuousClock.now
+        let duration = lastTick.duration(to: now).components
         lastTick = now
-        if hovering { return }   // freeze the countdown while the cursor is over the card
-        elapsed += dt
-        if elapsed >= autoDismissSeconds {
-            triggerDismiss()
+        let dt = Double(duration.seconds) + Double(duration.attoseconds) / 1e18
+        switch countdown.advance(by: dt, paused: isPaused, automatic: autoAct) {
+        case .waiting: break
+        case .primary: triggerPrimary()
+        case .dismiss: triggerTimeout()
         }
     }
 
@@ -520,6 +764,15 @@ private struct MeetingPromptView: View {
         guard !dismissed else { return }
         dismissed = true
         onPrimary()
+    }
+
+    /// The timer's own dismissal — distinct from a user clicking the dismiss
+    /// button, so the coordinator does not record a declined generation for a
+    /// prompt the user never touched.
+    private func triggerTimeout() {
+        guard !dismissed else { return }
+        dismissed = true
+        (onTimeout ?? onDismiss)()
     }
 
     private func triggerDismiss() {

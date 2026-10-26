@@ -941,12 +941,38 @@ struct MilaApp: App {
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
-        let meetingSettings = MeetingDetectionSettings(managed: managedSettings)
+        var meetingDefaults = UserDefaults.standard
+        var meetingManagedSettings = managedSettings
+        #if DEBUG
+        if CommandLine.arguments.contains("--ui-test-meeting-auto"),
+           CommandLine.arguments.contains("--ui-test-clean-store") {
+            meetingManagedSettings = .empty
+            meetingDefaults = UserDefaults(suiteName: "Mila.MeetingAutoUITests")!
+            if CommandLine.arguments.contains("--ui-test-reset-meeting-auto") {
+                meetingDefaults.removePersistentDomain(forName: "Mila.MeetingAutoUITests")
+            }
+        }
+        #endif
+        let meetingSettings = MeetingDetectionSettings(defaults: meetingDefaults,
+                                                        managed: meetingManagedSettings)
         let detector = MeetingDetector()
+        var meetingActions: any MeetingRecordingActions = actions
+        var pollsMeetings = true
+        #if DEBUG
+        if CommandLine.arguments.contains("--ui-test-meeting-auto"),
+           CommandLine.arguments.contains("--ui-test-clean-store") {
+            let fixture = MeetingAutoRecordingTestHarness(detector: detector, settings: meetingSettings)
+            MeetingAutoRecordingTestHarness.retained = fixture
+            meetingSettings.enabled = true
+            meetingActions = fixture
+            pollsMeetings = false
+        }
+        #endif
         let promptCoordinator = MeetingPromptCoordinator(
             detector: detector,
             settings: meetingSettings,
-            actions: actions
+            actions: meetingActions,
+            pollsDetector: pollsMeetings
         )
         // Applies `.milaconfig` files. Given the settings objects it's allowed
         // to mutate; the open event is routed in from `MilaAppDelegate`.
@@ -1322,6 +1348,11 @@ struct MilaApp: App {
     private func startMeetingDetectionIfNeeded() {
         meetingPrompt.start()
         meetingPrompt.bindEnabledChanges()
+        #if DEBUG
+        if let fixture = MeetingAutoRecordingTestHarness.retained {
+            fixture.show()
+        }
+        #endif
     }
 
     /// CI/UI-test seam for the end-of-meeting STOP prompt. With
