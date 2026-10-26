@@ -43,6 +43,13 @@ struct ContentView: View {
                     // A leaf view, so `ContentView` itself does not observe
                     // the profile store (#342).
                     DamagedVoiceProfilesBanner()
+                    // Auto-save has no rename sheet to host the title
+                    // spinner, so it rides in this existing top overlay stack
+                    // — alongside the banners, never behind them over the
+                    // detail pane (issue #288).
+                    if isSelectedRecordingSuggestingTitle {
+                        SuggestingTitleBanner()
+                    }
                 }
                 .padding(.top, 8)
 
@@ -232,6 +239,20 @@ struct ContentView: View {
         .onChange(of: shareImporter.lastImport) { _, completion in
             if let completion { selection = .recording(completion.recordingID) }
         }
+        // Auto-save (#288): reveal the recording an ordinary Stop just saved
+        // instead of opening the rename sheet. Consumed on change and on
+        // appearance (the reveal can land before this view is mounted).
+        .onChange(of: actions.autoSaveRevealID) { _, _ in consumeAutoSaveReveal() }
+        .onAppear { consumeAutoSaveReveal() }
+        // If the revealed recording is permanently deleted (or auto-dropped
+        // as a short+empty misfire) while still selected, settle back to Home
+        // rather than showing a detail pane for a row that is gone. No data
+        // is restored — the delete stands.
+        .onReceive(store.permanentlyDeleted) { ids in
+            if let id = selectedRecordingID, ids.contains(id) {
+                selection = .home
+            }
+        }
         .onChange(of: columnVisibility) { _, _ in
             // Sidebar visibility changed — ping the AppDelegate so it
             // re-applies the withinWindow blending on the (possibly
@@ -250,6 +271,30 @@ struct ContentView: View {
     private var isViewingTrash: Bool {
         if case .category(.recentlyDeleted) = selection { return true }
         return false
+    }
+
+    /// The recording id the sidebar selection currently points at, if any.
+    private var selectedRecordingID: UUID? {
+        if case .recording(let id)? = selection { return id }
+        return nil
+    }
+
+    /// True while the currently-selected recording's background title
+    /// suggestion is in flight. The auto-save path has no rename sheet to
+    /// host the spinner, so the top overlay stack shows it instead.
+    private var isSelectedRecordingSuggestingTitle: Bool {
+        guard let id = selectedRecordingID,
+              store.recordings.contains(where: { $0.id == id && !$0.isTrashed }) else { return false }
+        return postRecording.autoSuggestingIDs.contains(id)
+    }
+
+    /// Consume the controller's one-shot auto-save reveal: select the saved
+    /// recording so the user sees it (and can rename it later) without the
+    /// rename sheet. Only an existing, untrashed row is revealed — a row that
+    /// was already auto-dropped (short + empty) is skipped.
+    private func consumeAutoSaveReveal() {
+        guard let id = actions.consumeAutoSaveReveal() else { return }
+        selection = .recording(id)
     }
 
     /// True iff the detail pane is currently rendering `LiveAIRecordingView`
@@ -399,6 +444,34 @@ private struct ModelDownloadBanner: View {
         .padding(.vertical, 10)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
         .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+    }
+}
+
+/// Non-modal "Suggesting title…" feedback for a recording auto-saved without
+/// a rename sheet (issue #288). Rendered in `ContentView`'s existing top
+/// overlay stack, so it sits alongside the download / damaged-profiles
+/// banners rather than behind them over the detail pane. It appears while the
+/// selected recording is in `PostRecordingCoordinator.autoSuggestingIDs` and
+/// disappears on completion, cancel, failure or deletion — the coordinator's
+/// existing job state owns the lifetime.
+private struct SuggestingTitleBanner: View {
+    var body: some View {
+        ProgressView("Suggesting title…")
+            .controlSize(.small)
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Suggesting title…")
+            .accessibilityIdentifier("main.autoSuggestingTitle")
+            .transition(.move(edge: .top).combined(with: .opacity))
     }
 }
 

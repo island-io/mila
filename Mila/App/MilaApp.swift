@@ -390,6 +390,24 @@ struct MilaApp: App {
     /// read, nothing written — until the setting above is turned on.
     @StateObject private var speakerProfileStore: SpeakerProfileStore
 
+    /// UI-test seam for the auto-save preference (issue #288). The end-to-end
+    /// check must persist the preference across a relaunch without touching
+    /// the user's real defaults, so `--ui-test-auto-save-suite=<UUID>` returns
+    /// a `UserDefaults` for a TEST-OWNED suite built from a fixed prefix plus
+    /// the validated UUID. The fixed prefix keeps the suite inside the test
+    /// namespace and the UUID validation stops an arbitrary string being used
+    /// as a suite name; the test process removes exactly this suite in
+    /// teardown. `nil` means normal production behaviour.
+    static func autoSaveUITestDefaults(arguments: [String] = CommandLine.arguments) -> UserDefaults? {
+        guard let arg = arguments.first(where: {
+            $0.hasPrefix("--ui-test-auto-save-suite=")
+        }) else { return nil }
+        let raw = String(arg.dropFirst("--ui-test-auto-save-suite=".count))
+        guard let id = UUID(uuidString: raw) else { return nil }
+        // A valid test flag must never fall back to personal defaults.
+        return UserDefaults(suiteName: "Mila.AutoSaveUITests.\(id.uuidString)")!
+    }
+
     init() {
         // RecordingStore's no-arg init handles the legacy migration and
         // opens at the default Application Support location. The
@@ -397,7 +415,12 @@ struct MilaApp: App {
         // resolution; we apply any user override by calling
         // `relocateRecordings(to:)` once both are constructed.
         let store = RecordingStore()
-        let storage = RecordingStorageSettings()
+        // The auto-save end-to-end check needs its preference to persist
+        // across a relaunch without ever touching the user's real defaults.
+        // `--ui-test-auto-save-suite=<UUID>` redirects just this object at a
+        // test-owned suite; anything malformed — or the flag absent — keeps
+        // normal production behaviour (`.standard`).
+        let storage = RecordingStorageSettings(defaults: Self.autoSaveUITestDefaults() ?? .standard)
         if let custom = storage.customDirectory {
             store.relocateRecordings(to: custom)
         }
@@ -1396,8 +1419,24 @@ struct MilaApp: App {
         // .recording before there's a listener to react.
         try? await Task.sleep(nanoseconds: 1_500_000_000)
         let sessionRef = session
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mila-fake-recording-\(UUID().uuidString).wav")
+        // Throughput fixtures only need a live stream. The isolated auto-save
+        // check also exercises Stop and reopening, so give that fake capture
+        // a real synthetic WAV inside its test-owned recordings directory.
+        let savesAutoSaveFixture = Self.autoSaveUITestDefaults() != nil
+            && CommandLine.arguments.contains("--ui-test-clean-store")
+        let outputURL = savesAutoSaveFixture
+            ? store.freshAudioURL(suggestedName: "Auto-save fixture")
+            : FileManager.default.temporaryDirectory
+                .appendingPathComponent("mila-fake-recording-\(UUID().uuidString).wav")
+        if savesAutoSaveFixture {
+            do {
+                try FileManager.default.copyItem(at: URL(fileURLWithPath: wavPath), to: outputURL)
+            } catch {
+                os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                    .error("auto-save fixture: could not prepare synthetic recording audio")
+                return
+            }
+        }
         // Start through QuickActionsController, NOT session directly. Routing
         // via `startFakeRecordingForTesting` sets `activeJob = .recording` so
         // `actions.isRecording` flips true — which is what
@@ -1641,14 +1680,14 @@ struct MilaApp: App {
         var dataLen = 0
         while idx + 8 <= data.count {
             let id = String(data: data[idx..<idx+4], encoding: .ascii) ?? ""
-            let size = Int(data[idx+4..<idx+8].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian })
+            let size = Int(data[idx+4..<idx+8].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian })
             let payloadStart = idx + 8
             switch id {
             case "fmt ":
-                fmtTag = data[payloadStart..<payloadStart+2].withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
-                channels = data[payloadStart+2..<payloadStart+4].withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
-                sampleRate = data[payloadStart+4..<payloadStart+8].withUnsafeBytes { $0.load(as: UInt32.self).littleEndian }
-                bitsPerSample = data[payloadStart+14..<payloadStart+16].withUnsafeBytes { $0.load(as: UInt16.self).littleEndian }
+                fmtTag = data[payloadStart..<payloadStart+2].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
+                channels = data[payloadStart+2..<payloadStart+4].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
+                sampleRate = data[payloadStart+4..<payloadStart+8].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self).littleEndian }
+                bitsPerSample = data[payloadStart+14..<payloadStart+16].withUnsafeBytes { $0.loadUnaligned(as: UInt16.self).littleEndian }
             case "data":
                 dataStart = payloadStart
                 dataLen = size
