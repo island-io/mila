@@ -11,6 +11,11 @@ enum MicrophoneError: Error, Equatable {
     /// `device` is the input the bring-up had chosen by then — nil when it
     /// stalled before choosing one — so the message can say which mic.
     case bringUpTimedOut(device: String?, timeout: TimeInterval)
+    /// `AVAudioEngine` refused the input tap, even after one retry at the
+    /// format the device reported afterwards. In practice: the device's
+    /// format changed mid-bring-up and had not settled (#385). `device` as
+    /// for `bringUpTimedOut`.
+    case tapInstallFailed(device: String?)
 }
 
 extension MicrophoneError: LocalizedError {
@@ -27,6 +32,9 @@ extension MicrophoneError: LocalizedError {
             let unit = seconds == "1" ? "second" : "seconds"
             let which = device.map { "The microphone “\($0)”" } ?? "The microphone"
             return "\(which) didn't start within \(seconds) \(unit). Try again, or choose a different input under Settings → Audio."
+        case .tapInstallFailed(let device):
+            let which = device.map { "The microphone “\($0)”" } ?? "The microphone"
+            return "\(which) couldn't be opened. This usually means its audio format changed as recording started — a call app switching Bluetooth headphones to call mode does this. Try again, or choose a different input under Settings → Audio."
         }
     }
 }
@@ -832,57 +840,80 @@ final class MicrophoneRecorder: ObservableObject {
             try cancellation?.throwIfCancelled()
             // One converter for the whole session: resampling is stateful,
             // and a fresh converter per tap buffer put a small discontinuity
-            // at every ~85ms boundary (see StreamingWhisperConverter). Tap
-            // callbacks for one engine are serial, so no locking needed.
-            // Fallback to the per-buffer path only if the converter can't
-            // be built for this format (effectively never).
-            let sessionConverter = StreamingWhisperConverter(inputFormat: nativeFormat)
-            input.installTap(onBus: 0,
-                             bufferSize: 4096,
-                             format: nativeFormat) { buffer, _ in
-                onLevel(AudioMeter.level(from: buffer))
-                do {
-                    let converted = try sessionConverter?.convert(buffer)
-                        ?? AudioConvert.toWhisperFormat(buffer)
-                    // Apply adaptive digital gain in-place on the whisper-
-                    // format buffer so the WAV writer AND the live VAD/
-                    // whisper feed both see the same boosted signal —
-                    // single source of truth. `toWhisperFormat` allocates
-                    // a fresh buffer in every real-mic path (mics never
-                    // come up at native 16kHz mono float), so writing into
-                    // it doesn't touch the engine-owned source buffer.
-                    // The defensive `aliasesInput` check covers the rare
-                    // exotic-device case where the formats happen to match.
-                    let toMutate: AVAudioPCMBuffer
-                    if converted === buffer {
-                        toMutate = Self.copyBuffer(buffer) ?? converted
-                    } else {
-                        toMutate = converted
-                    }
-                    if let channel = toMutate.floatChannelData?[0] {
-                        gain.process(channel, count: Int(toMutate.frameLength))
-                    }
-                    let yielded = Int(toMutate.frameLength)
-                    let isFirst = stats.withLock { s -> Bool in
-                        s.buffers += 1
-                        s.frames += yielded
-                        return s.buffers == 1
-                    }
-                    if isFirst {
-                        micLog.log("first mic buffer delivered (\(yielded, privacy: .public) frames) — capture is live")
-                    }
-                    continuation.yield(toMutate)
-                } catch {
-                    // Don't log every dropped buffer (could be thousands) —
-                    // log the first, and `stop()` reports the running total.
-                    let failures = stats.withLock { s -> Int in
-                        s.conversionFailures += 1
-                        return s.conversionFailures
-                    }
-                    if failures == 1 {
-                        micLog.error("mic buffer conversion failed (dropping frames): \(error.localizedDescription, privacy: .public)")
+            // at every ~85ms boundary (see StreamingWhisperConverter). It is
+            // built for the format the tap is actually installed with, which
+            // can differ from `nativeFormat` if the device re-negotiated in
+            // the meantime (#385, see `InputTap`). Tap callbacks for one
+            // engine are serial, so no locking needed. Fallback to the
+            // per-buffer path only if the converter can't be built for this
+            // format (effectively never).
+            let makeTapBlock = { (format: AVAudioFormat) -> AVAudioNodeTapBlock in
+                let sessionConverter = StreamingWhisperConverter(inputFormat: format)
+                return { buffer, _ in
+                    onLevel(AudioMeter.level(from: buffer))
+                    do {
+                        let converted = try sessionConverter?.convert(buffer)
+                            ?? AudioConvert.toWhisperFormat(buffer)
+                        // Apply adaptive digital gain in-place on the whisper-
+                        // format buffer so the WAV writer AND the live VAD/
+                        // whisper feed both see the same boosted signal —
+                        // single source of truth. `toWhisperFormat` allocates
+                        // a fresh buffer in every real-mic path (mics never
+                        // come up at native 16kHz mono float), so writing into
+                        // it doesn't touch the engine-owned source buffer.
+                        // The defensive `aliasesInput` check covers the rare
+                        // exotic-device case where the formats happen to match.
+                        let toMutate: AVAudioPCMBuffer
+                        if converted === buffer {
+                            toMutate = Self.copyBuffer(buffer) ?? converted
+                        } else {
+                            toMutate = converted
+                        }
+                        if let channel = toMutate.floatChannelData?[0] {
+                            gain.process(channel, count: Int(toMutate.frameLength))
+                        }
+                        let yielded = Int(toMutate.frameLength)
+                        let isFirst = stats.withLock { s -> Bool in
+                            s.buffers += 1
+                            s.frames += yielded
+                            return s.buffers == 1
+                        }
+                        if isFirst {
+                            micLog.log("first mic buffer delivered (\(yielded, privacy: .public) frames) — capture is live")
+                        }
+                        continuation.yield(toMutate)
+                    } catch {
+                        // Don't log every dropped buffer (could be thousands) —
+                        // log the first, and `stop()` reports the running total.
+                        let failures = stats.withLock { s -> Int in
+                            s.conversionFailures += 1
+                            return s.conversionFailures
+                        }
+                        if failures == 1 {
+                            micLog.error("mic buffer conversion failed (dropping frames): \(error.localizedDescription, privacy: .public)")
+                        }
                     }
                 }
+            }
+            let tapFormat: AVAudioFormat
+            do {
+                tapFormat = try InputTap.installFollowingFormatChange(
+                    initial: nativeFormat,
+                    currentFormat: { input.inputFormat(forBus: 0) },
+                    install: { format in
+                        try InputTap.install(on: input, bufferSize: 4096, format: format,
+                                             block: makeTapBlock(format))
+                    })
+            } catch {
+                // Without the catch this was an uncaught NSException and the
+                // whole app aborted (#385). Now it is an ordinary failed
+                // bring-up: `start()` surfaces it, a mid-session rebuild
+                // leaves it to the watchdog to retry.
+                micLog.error("input tap refused: \(error.localizedDescription, privacy: .public) — throwing tapInstallFailed")
+                throw MicrophoneError.tapInstallFailed(device: chosenDevice.withLock { $0 })
+            }
+            if tapFormat != nativeFormat {
+                micLog.log("input format changed during bring-up (\(nativeFormat.sampleRate, privacy: .public)Hz \(nativeFormat.channelCount, privacy: .public)ch → \(tapFormat.sampleRate, privacy: .public)Hz \(tapFormat.channelCount, privacy: .public)ch) — tap installed at the new format")
             }
             engine.prepare()
             // The last moment a cancelled start can be stopped without the
@@ -897,14 +928,14 @@ final class MicrophoneRecorder: ObservableObject {
             }
             try engine.start()
             micLog.log("AVAudioEngine started; tap installed, awaiting buffers")
-            return EngineBox(engine: engine, format: nativeFormat)
+            return EngineBox(engine: engine, format: tapFormat)
         }.value
     }
 
     /// Deep-copy a Float32 PCM buffer so we can apply in-place gain without
     /// mutating an engine-owned source buffer. Only used on the rare path
     /// where the input device already delivers whisper-format audio.
-    private static func copyBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
+    nonisolated private static func copyBuffer(_ source: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
         guard let copy = AVAudioPCMBuffer(pcmFormat: source.format,
                                           frameCapacity: source.frameCapacity) else {
             return nil
