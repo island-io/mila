@@ -1971,7 +1971,7 @@ enum LLMRunner {
 
     /// Walk the user's `$PATH` plus a few common shell-managed locations
     /// (`~/.local/bin`, `/opt/homebrew/bin`, …). GUI apps on macOS inherit
-    /// a stripped-down PATH from launchd, so claude/cursor/gemini installed by
+    /// a stripped-down PATH from launchd, so claude/cursor/gemini/agy installed by
     /// Homebrew or a node version manager are typically *not* on the
     /// inherited PATH — falling back to the well-known directories prevents
     /// the "works in Terminal, not in Mila" footgun.

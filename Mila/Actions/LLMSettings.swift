@@ -75,6 +75,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     case claude
     case cursor
     case gemini
+    case agy
     case openaiCompatible = "openai_compatible"
 
     var id: String { rawValue }
@@ -85,6 +86,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         case .claude:          return "Claude (claude CLI)"
         case .cursor:          return "Cursor (cursor-agent CLI)"
         case .gemini:          return "Gemini (gemini CLI)"
+        case .agy:             return "Antigravity (agy CLI)"
         case .openaiCompatible: return "OpenAI Compatible"
         }
     }
@@ -93,7 +95,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     /// file we name in the prompt. Gates `TranscriptDelivery.reference`
     /// (issue #179).
     ///
-    /// True for all three CLIs: each is an agentic coding tool whose whole
+    /// True for all four CLIs: each is an agentic coding tool whose whole
     /// premise is reading the local filesystem, and each is launched with
     /// workspace trust already granted (`cursor-agent -f`, `gemini
     /// --skip-trust`) so a read in the sandbox cwd's world doesn't stall on a
@@ -106,8 +108,8 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     /// apart on it.
     var readsLocalFiles: Bool {
         switch self {
-        case .claude, .cursor, .gemini: return true
-        case .none, .openaiCompatible:  return false
+        case .claude, .cursor, .gemini, .agy: return true
+        case .none, .openaiCompatible:        return false
         }
     }
 
@@ -120,6 +122,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         case .claude:          return "claude"
         case .cursor:          return "cursor-agent"
         case .gemini:          return "gemini"
+        case .agy:             return "agy"
         case .openaiCompatible: return ""
         }
     }
@@ -192,6 +195,17 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
                 args.append(contentsOf: ["-m", m])
             }
             // session intentionally ignored — gemini's -p mode has no
+            // documented conversation-resume flag.
+            return args
+        case .agy:
+            // `agy -p <prompt>` runs one-shot and prints the answer to
+            // stdout. `--model` pins a specific model (e.g. gemini-3.8-flash-high);
+            // the CLI's configured default is used when omitted.
+            var args: [String] = ["-p", prompt]
+            if hasModel, let m = trimmedModel {
+                args.append(contentsOf: ["--model", m])
+            }
+            // session intentionally ignored — agy's -p mode has no
             // documented conversation-resume flag.
             return args
         }
