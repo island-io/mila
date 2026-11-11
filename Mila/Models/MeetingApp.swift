@@ -10,6 +10,7 @@ enum MeetingApp: String, CaseIterable {
     case zoom
     case teams
     case googleMeet
+    case slack
 
     struct Info {
         let displayName: String
@@ -70,6 +71,16 @@ enum MeetingApp: String, CaseIterable {
                 // which persists no app identity at all.
                 bundleIDPrefixes: ["meet.google.com"],
                 matchSubstring: "meet.google.com"
+            )
+        case .slack:
+            return Info(
+                displayName: "Slack Huddle",
+                badgeColor: Color(red: 0.290, green: 0.082, blue: 0.294), // #4A154B
+                // The desktop app; its Electron helpers share the prefix.
+                bundleIDPrefixes: ["com.tinyspeck.slackmacgap"],
+                // Slack's app name is just "Slack"; the substring is the
+                // whole word, which no other supported app's name contains.
+                matchSubstring: "slack"
             )
         }
     }
