@@ -127,4 +127,20 @@ final class MeetingDetectorAppsTests: XCTestCase {
         XCTAssertTrue(teams.meetingTitleHints.isEmpty,
                       "No Teams window title distinguishes a call from the app being open")
     }
+
+    /// Slack huddles are a native-app entry (the desktop app, not a browser
+    /// tab) and, like Teams, mic-capture only. Appended after Zoom, which
+    /// several tests and the UI-test seam read as `supportedApps[0]`.
+    func test_slack_huddles_are_detected_from_the_desktop_app_by_mic_capture_only() throws {
+        let slack = try XCTUnwrap(
+            MeetingDetector.supportedApps.first { $0.bundleID == "com.tinyspeck.slackmacgap" },
+            "Slack (com.tinyspeck.slackmacgap) is not a supported app"
+        )
+        XCTAssertEqual(slack.captureBundlePrefixes, ["com.tinyspeck.slackmacgap"])
+        XCTAssertFalse(slack.isBrowserHosted)
+        XCTAssertTrue(slack.meetingTitleHints.isEmpty,
+                      "No Slack window title distinguishes a huddle from the app being open")
+        XCTAssertEqual(MeetingDetector.supportedApps.first?.bundleID, "us.zoom.xos",
+                       "Zoom must stay first — tests and the UI-test seam rely on it")
+    }
 }

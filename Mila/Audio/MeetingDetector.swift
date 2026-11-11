@@ -29,7 +29,8 @@ import OSLog
 /// signals in the same order, which has one consequence worth stating
 /// plainly: **mic capture proves a browser is in a live audio session, not
 /// that the session is Google Meet.** A Slack huddle or WhatsApp Web call
-/// in a supported browser reads as a Meet meeting on the primary path. That
+/// in a supported browser reads as a Meet meeting on the primary path
+/// (huddles in the Slack *desktop app* have their own entry). That
 /// is accepted deliberately — the prompt it produces is a 10-second
 /// auto-dismissing offer to transcribe a call the user really is in, and the
 /// alternative (title matching as the primary signal) trades it for a worse
@@ -184,6 +185,34 @@ final class MeetingDetector: ObservableObject {
             // no `google meet` hint — that is the *lobby* title, where the
             // user has not joined anything yet.
             meetingTitleHints: ["meet.google.com", "meet -"]
+        ),
+        // Slack huddles in the Slack desktop app. Slack is Electron, so the
+        // huddle's mic capture happens in a `.helper` subprocess
+        // (`com.tinyspeck.slackmacgap.helper`), which the app's own bundle ID
+        // already prefixes — one prefix covers both. Appended last on
+        // purpose: tests and the UI-test seam take `supportedApps[0]` as Zoom.
+        //
+        // Mic capture is the only Slack-specific signal there is, and it is
+        // not huddle-only: recording a voice or video clip in a message also
+        // captures the mic. That reads as a short "meeting", so the user may
+        // see the 10-second auto-dismissing prompt for a clip. Accepted for
+        // the same reason the Meet entry accepts its browser ambiguity — the
+        // user really is talking into Slack — and the prompt can be silenced
+        // per app.
+        //
+        // A huddle in Slack *in a browser* still reads as Google Meet (see
+        // the type doc); this entry only claims the desktop app.
+        App(
+            bundleID: "com.tinyspeck.slackmacgap",
+            displayName: "Slack Huddle",
+            appBundleIDs: ["com.tinyspeck.slackmacgap"],
+            captureBundlePrefixes: ["com.tinyspeck.slackmacgap"],
+            // Deliberately none, like Teams: every Slack window, huddle or
+            // not, is titled "… - Slack", so no hint can tell a huddle from
+            // Slack merely being open. Huddles are therefore detected on
+            // macOS 14.4+ (mic capture) only.
+            helperBundlePrefixes: [],
+            meetingTitleHints: []
         ),
     ]
 

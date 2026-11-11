@@ -25,6 +25,7 @@ final class MeetingDetectorBrowserDetectionTests: XCTestCase {
     private static let meetID = "meet.google.com"
     private static let zoomID = "us.zoom.xos"
     private static let teamsID = "com.microsoft.teams2"
+    private static let slackID = "com.tinyspeck.slackmacgap"
 
     /// Mila's own bundle ID (`project.yml`: `PRODUCT_BUNDLE_IDENTIFIER`).
     /// Hard-coded rather than read from `Bundle.main`, whose identifier under
@@ -167,13 +168,13 @@ final class MeetingDetectorBrowserDetectionTests: XCTestCase {
     /// whose IDs merely *resemble* a supported one. `net.us.zoom.fake` and
     /// `io.islandapp.Browser` are the prefix-anchoring cases: a `contains`
     /// match would let the first through, and an `io.island` prefix (the bug
-    /// pinned above) would let the second through. A Slack huddle is the
-    /// realistic non-Meet call — a live audio session that is emphatically
-    /// not Google Meet.
+    /// pinned above) would let the second through. `com.tinyspeck.slack…`
+    /// lookalikes are the same anchoring case for the Slack entry.
     func test_unrelated_mic_users_are_not_meetings() {
         let strangers: Set<String> = [
             "com.apple.Terminal",
-            "com.tinyspeck.slackmacgap",
+            "com.tinyspeck.slack",
+            "net.com.tinyspeck.slackmacgap",
             "net.us.zoom.fake",
             "com.google.GoogleDrive",
             "com.island.something.else",
@@ -217,6 +218,57 @@ final class MeetingDetectorBrowserDetectionTests: XCTestCase {
         XCTAssertTrue(
             MeetingDetector.micCaptureIndicatesMeeting(teams, capturing: ["com.microsoft.teams2"]),
             "Teams must still be detected by mic capture"
+        )
+    }
+
+    /// A Slack huddle in the desktop app is detected whether Core Audio
+    /// reports the capture under Slack's own ID or its Electron helper's —
+    /// and it is attributed to Slack alone, not to any other entry.
+    func test_slack_huddle_is_detected_by_the_desktop_apps_capture() throws {
+        let slack = try supportedApp(Self.slackID)
+        for capturingBundleID in ["com.tinyspeck.slackmacgap",
+                                  "com.tinyspeck.slackmacgap.helper",
+                                  "com.tinyspeck.slackmacgap.helper (Renderer)"] {
+            XCTAssertTrue(
+                MeetingDetector.micCaptureIndicatesMeeting(
+                    slack, capturing: [capturingBundleID]),
+                "\(capturingBundleID) should read as a Slack huddle"
+            )
+            for other in MeetingDetector.supportedApps where other.bundleID != Self.slackID {
+                XCTAssertFalse(
+                    MeetingDetector.micCaptureIndicatesMeeting(
+                        other, capturing: [capturingBundleID]),
+                    "\(capturingBundleID) was read as a \(other.displayName) meeting"
+                )
+            }
+        }
+        // And the reverse: other apps' capture is not a huddle.
+        for (browser, capturingBundleID) in browserCaptureIDs {
+            XCTAssertFalse(
+                MeetingDetector.micCaptureIndicatesMeeting(
+                    slack, capturing: [capturingBundleID]),
+                "\(browser) (\(capturingBundleID)) was read as a Slack huddle"
+            )
+        }
+        for nativeID in ["us.zoom.CptHost", "com.microsoft.teams2", Self.milaBundleID] {
+            XCTAssertFalse(
+                MeetingDetector.micCaptureIndicatesMeeting(slack, capturing: [nativeID]),
+                "\(nativeID) was read as a Slack huddle"
+            )
+        }
+    }
+
+    /// Every Slack window is titled "… - Slack", huddle or not, so Slack has
+    /// no title hint and the fallback must never claim a huddle from one.
+    func test_slack_opts_out_of_title_detection() throws {
+        let slack = try supportedApp(Self.slackID)
+        XCTAssertTrue(slack.meetingTitleHints.isEmpty,
+                      "Slack is deliberately title-hint-free")
+        XCTAssertFalse(
+            MeetingDetector.titleIndicatesMeeting(
+                slack,
+                titles: ["general (Channel) - Acme - Slack", "Huddle - Acme - Slack"]),
+            "Slack must not be detected from a window title"
         )
     }
 

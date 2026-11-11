@@ -68,6 +68,18 @@ final class MeetingAppTests: XCTestCase {
         XCTAssertEqual(MeetingApp.zoom.info.displayName, "Zoom")
         XCTAssertEqual(MeetingApp.teams.info.displayName, "Microsoft Teams")
         XCTAssertEqual(MeetingApp.googleMeet.info.displayName, "Google Meet")
+        XCTAssertEqual(MeetingApp.slack.info.displayName, "Slack Huddle")
+    }
+
+    /// A recording captured from the Slack desktop app (or one of its
+    /// Electron helpers) gets the Slack badge; lookalike IDs do not.
+    func test_matching_finds_slack_by_bundle_id_and_app_name() {
+        XCTAssertEqual(MeetingApp.matching(bundleID: "com.tinyspeck.slackmacgap"), .slack)
+        XCTAssertEqual(MeetingApp.matching(bundleID: "com.tinyspeck.slackmacgap.helper"), .slack)
+        XCTAssertEqual(MeetingApp.matching(bundleID: "COM.TINYSPECK.SLACKMACGAP"), .slack)
+        XCTAssertNil(MeetingApp.matching(bundleID: "com.tinyspeck.other"))
+        XCTAssertNil(MeetingApp.matching(bundleID: "net.com.tinyspeck.slackmacgap"))
+        XCTAssertEqual(MeetingApp.matching(text: "Slack"), .slack)
     }
 
     /// Google Meet's only bundle-ID prefix is the detector's synthetic
