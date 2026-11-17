@@ -130,7 +130,7 @@ private struct RecordingContextMenu: ViewModifier {
             }
             Divider()
             let currentLang = languageSettings.resolve(recording.language)
-            let otherLang = languageSettings.visible.first { $0.code != currentLang.code }
+            let targets = languageSettings.retranscribeTargets(for: recording.language)
             // Busy = this recording is already transcribing or queued. We gate
             // BEFORE mutating the store: `enqueue` drops active/queued ids, but
             // `prepareForRetranscription` persists `.pending`/language first, so
@@ -149,7 +149,7 @@ private struct RecordingContextMenu: ViewModifier {
                     transcription.deferTranscription(of: recording.id)
                 }
             }
-            Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
+            Button("Re-transcribe (\(currentLang.label))") {
                 // Route through the live-store chokepoint (same as the
                 // language-switch action) so we never enqueue a stale snapshot
                 // whose `.wav` a since-run compression already deleted.
@@ -159,9 +159,13 @@ private struct RecordingContextMenu: ViewModifier {
                 transcription.enqueue(prepared, isRetranscription: true)
             }
             .disabled(isBusy)
-            if let otherLang {
-                Button("Re-transcribe in \(otherLang.flagEmoji) \(otherLang.displayName)") {
-                    retranscribe(recording, in: otherLang)
+            if !targets.isEmpty {
+                Menu("Re-transcribe in") {
+                    ForEach(targets) { target in
+                        Button("\(target.label)") {
+                            retranscribe(recording, in: target)
+                        }
+                    }
                 }
                 .disabled(isBusy)
             }

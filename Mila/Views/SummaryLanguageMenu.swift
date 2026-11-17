@@ -40,7 +40,7 @@ struct SummaryLanguageMenu: View {
             .accessibilityIdentifier("summaryLanguage.default")
             Divider()
             ForEach(RecordingLanguage.summaryChoices) { lang in
-                Button(label("\(lang.flagEmoji) \(lang.displayName)", selected: current?.code == lang.code)) {
+                Button(label("\(lang.label)", selected: current?.code == lang.code)) {
                     onPick(lang)
                 }
                 .accessibilityIdentifier("summaryLanguage.\(lang.code)")

@@ -475,7 +475,9 @@ private struct HeroRecordButton: View {
         case (false, true):  sourceLabel = "App audio only"
         case (false, false): sourceLabel = "No source selected"
         }
-        return "\(languageFlag) \(languageName) · \(sourceLabel)"
+        return languageFlag.isEmpty
+            ? "\(languageName) · \(sourceLabel)"
+            : "\(languageFlag) \(languageName) · \(sourceLabel)"
     }
 
     private var backgroundColors: [Color] {

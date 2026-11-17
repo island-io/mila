@@ -178,7 +178,7 @@ struct LiveAIRecordingView: View {
             HStack(spacing: 6) {
                 Image(systemName: "globe")
                     .foregroundStyle(.secondary)
-                Text("\(languageSettings.current.flagEmoji) \(languageSettings.current.displayName)")
+                Text("\(languageSettings.current.label)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

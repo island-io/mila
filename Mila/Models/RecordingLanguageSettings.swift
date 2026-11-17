@@ -45,6 +45,12 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
         Locale(identifier: "en").localizedString(forLanguageCode: code) ?? code.uppercased()
     }
 
+    /// Flag and name for menus ("🇮🇱 Hebrew"), or just the name when the
+    /// entry has no flag — a user-added language starts without one.
+    var label: String {
+        flagEmoji.isEmpty ? displayName : "\(flagEmoji) \(displayName)"
+    }
+
     /// Script direction from CLDR, so Arabic, Farsi, Urdu and Yiddish lay out
     /// right-to-left without anyone having to know to tick a box.
     var isRTL: Bool {
@@ -210,6 +216,15 @@ final class RecordingLanguageSettings: ObservableObject {
     /// What a stored code means, hidden entries included. Never nil.
     func resolve(_ code: String) -> RecordingLanguage {
         RecordingLanguage.resolve(code, in: languages)
+    }
+
+    /// The languages a recording in `code` can be re-transcribed INTO: every
+    /// offered language except its own, in list order. Re-running in its own
+    /// language is a separate action that works even when that language is
+    /// no longer offered, so it isn't listed here.
+    func retranscribeTargets(for code: String) -> [RecordingLanguage] {
+        let own = resolve(code).code
+        return visible.filter { $0.code != own }
     }
 
     // MARK: - Editing

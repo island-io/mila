@@ -327,4 +327,45 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         XCTAssertEqual(ar.flagEmoji, "🇸🇦")
         XCTAssertEqual(ar.displayName, "Arabic")
     }
+
+    // MARK: - Re-transcribe targets
+
+    /// Every other offered language, in list order — not just the first one,
+    /// which left a third language unreachable from the menus.
+    func test_retranscribe_targets_are_the_visible_list_minus_the_recordings_own() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ru")
+        XCTAssertEqual(settings.retranscribeTargets(for: "he").map(\.code), ["en", "ru"])
+        XCTAssertEqual(settings.retranscribeTargets(for: "ru").map(\.code), ["he", "en"])
+    }
+
+    /// Aliases and regional variants count as the recording's own language.
+    func test_retranscribe_targets_treat_variants_and_legacy_codes_as_own() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(settings.retranscribeTargets(for: "en-US").map(\.code), ["he"])
+        XCTAssertEqual(settings.retranscribeTargets(for: "auto").map(\.code), ["en"])
+        XCTAssertEqual(settings.retranscribeTargets(for: "iw").map(\.code), ["en"])
+    }
+
+    /// A recording in a removed language: every offered language is a
+    /// target. (Re-running in its OWN language is the separate "current"
+    /// entry, which works whether or not the language is still offered.)
+    func test_a_recording_in_a_hidden_language_can_target_every_visible_one() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ru")
+        settings.remove(code: "ru")
+        XCTAssertEqual(settings.retranscribeTargets(for: "ru").map(\.code), ["he", "en"])
+    }
+
+    /// A shared recording's language may never have been in this user's
+    /// list at all.
+    func test_a_recording_in_an_unknown_language_can_target_every_visible_one() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(settings.retranscribeTargets(for: "fr").map(\.code), ["he", "en"])
+    }
+
+    func test_label_omits_the_flag_when_there_is_none() {
+        XCTAssertEqual(RecordingLanguage.hebrew.label, "🇮🇱 Hebrew")
+        XCTAssertEqual(RecordingLanguage(code: "ru").label, "Russian")
+    }
 }

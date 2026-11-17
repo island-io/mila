@@ -488,7 +488,7 @@ private struct LanguagePickerToolbarItem: View {
         Menu {
             Picker("Recording language", selection: $languageSettings.current) {
                 ForEach(languageSettings.visible) { lang in
-                    Text("\(lang.flagEmoji)  \(lang.displayName)")
+                    Text(lang.label)
                         .tag(lang)
                 }
             }
@@ -496,8 +496,10 @@ private struct LanguagePickerToolbarItem: View {
             .labelsHidden()
         } label: {
             HStack(spacing: 6) {
-                Text(languageSettings.current.flagEmoji)
-                    .font(.system(size: 16))
+                if !languageSettings.current.flagEmoji.isEmpty {
+                    Text(languageSettings.current.flagEmoji)
+                        .font(.system(size: 16))
+                }
                 Text(languageSettings.current.displayName)
                     .font(.callout.weight(.medium))
             }

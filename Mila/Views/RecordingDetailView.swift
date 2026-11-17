@@ -242,7 +242,7 @@ struct RecordingDetailView: View {
 
     private var actionButtons: some View {
         let currentLang = languageSettings.resolve(recording.language)
-        let otherLang = languageSettings.visible.first { $0.code != currentLang.code }
+        let targets = languageSettings.retranscribeTargets(for: recording.language)
         let busy = isTranscriptionBusy
         // Icon-only buttons with hover tooltips. Labeled buttons here
         // competed with the title for header width and truncated ("Copy
@@ -258,14 +258,15 @@ struct RecordingDetailView: View {
                     guard let prepared = store.prepareForRetranscription(id: recording.id) else { return }
                     transcription.enqueue(prepared, isRetranscription: true)
                 } label: {
-                    Label("\(currentLang.flagEmoji) \(currentLang.displayName) (current)",
+                    Label("\(currentLang.label) (current)",
                           systemImage: "arrow.clockwise")
                 }
-                if let otherLang {
+                if !targets.isEmpty { Divider() }
+                ForEach(targets) { target in
                     Button {
-                        retranscribe(in: otherLang)
+                        retranscribe(in: target)
                     } label: {
-                        Label("\(otherLang.flagEmoji) \(otherLang.displayName)",
+                        Label("\(target.label)",
                               systemImage: "arrow.triangle.2.circlepath")
                     }
                 }
@@ -888,10 +889,14 @@ struct RecordingDetailView: View {
     /// as the header's Re-transcribe menu is.
     @ViewBuilder
     private var transcriptMenuItems: some View {
-        let current = languageSettings.resolve(recording.language)
-        if let other = languageSettings.visible.first(where: { $0.code != current.code }) {
-            Button("Re-transcribe in \(other.flagEmoji) \(other.displayName)") {
-                retranscribe(in: other)
+        let targets = languageSettings.retranscribeTargets(for: recording.language)
+        if !targets.isEmpty {
+            Menu("Re-transcribe in") {
+                ForEach(targets) { target in
+                    Button("\(target.label)") {
+                        retranscribe(in: target)
+                    }
+                }
             }
             .disabled(isTranscriptionBusy)
         }
