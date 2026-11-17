@@ -196,6 +196,39 @@ final class TranscriptionService: ObservableObject {
     private var worker: Task<Void, Never>?
     private var shutdownTask: Task<Void, Never>?
     private var prewarmTasks: [UUID: Task<Void, Never>] = [:]
+
+    /// Whether the local whisper model should stay resident between uses.
+    ///
+    /// Live transcription needs it warm for the whole session, so
+    /// `MilaApp` seeds this from `LiveAISettings.runsLivePipeline` (and keeps
+    /// it true while a recording that snapshotted the live pipeline is still
+    /// capturing). In batch-only mode it is false: nothing loads at launch,
+    /// the first real transcription after Stop loads on demand, and the model
+    /// is released once the queue drains with no other local users left.
+    ///
+    /// Defaults to `true` to preserve the historical warm-model behaviour for
+    /// hosts and integration tests that never wire live settings. Production
+    /// always seeds it explicitly, so the default does not affect the app.
+    /// Set this directly at launch, before `prewarm` can run. Use
+    /// `updateLocalModelRetention(_:)` for later changes: turning retention
+    /// off has to release an already-warm model, which is `async`.
+    var retainsLocalModel = true
+
+    /// Local-engine users currently holding the model — the batch worker for a
+    /// whole recording, one live utterance, dictation, a span-recovery pass,
+    /// or a prewarm load. Incremented synchronously on the main actor BEFORE
+    /// the engine is touched, so an idle release can never observe zero users
+    /// in the gap between a load and the transcribe that needs it, and ending
+    /// one user cannot discard another.
+    private var localModelUsers = 0
+
+    /// True while this service is awaiting `engine.unload()`. `waitForIdle`
+    /// includes it so a caller that awaits the queue sees the release too.
+    private var isReleasingLocalModel = false
+    /// Callers that asked for an idle release while one was already running.
+    /// They are resumed when it finishes and then re-check, because a new
+    /// user may have loaded the model during the unload.
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
     /// The recording `process(_:)` is working on, from the moment the worker
     /// pops it until `process` returns. Wider than `activeRecordingID`, which
     /// is only published once the row has been flipped to `.running` — there
@@ -262,6 +295,91 @@ final class TranscriptionService: ObservableObject {
         }
     }
 
+    // MARK: - Local model lifetime
+
+    /// Apply the preference synchronously, so rapid UI changes cannot be
+    /// reordered by task scheduling. Cleanup re-checks the current preference;
+    /// a queued OFF cleanup cannot overwrite a later ON decision. Callers may
+    /// await the returned task when they need to observe cleanup finishing.
+    @discardableResult
+    func updateLocalModelRetention(_ retains: Bool) -> Task<Void, Never> {
+        retainsLocalModel = retains
+        return Task { [weak self] in
+            guard let self else { return }
+            await self.releaseLocalModelIfIdle()
+        }
+    }
+
+    /// Run `body` as one local-model user. The retain is taken before any
+    /// engine call, so a release triggered by some other user finishing can
+    /// never land between this body's `loadIfNeeded` and its `transcribe`.
+    private func withLocalModelUse<T>(_ body: () async throws -> T) async rethrows -> T {
+        localModelUsers += 1
+        // Admission waits for an in-flight release to FINISH, rather than
+        // assuming the engine executor processes independent calls FIFO.
+        // Counting this user first prevents another cleanup from overtaking it.
+        while isReleasingLocalModel {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+        }
+        do {
+            let value = try await body()
+            await endLocalModelUse()
+            return value
+        } catch {
+            await endLocalModelUse()
+            throw error
+        }
+    }
+
+    private func endLocalModelUse() async {
+        localModelUsers = max(0, localModelUsers - 1)
+        await releaseLocalModelIfIdle()
+    }
+
+    /// True when nothing is using, queueing or expecting the local model.
+    ///
+    /// `retainsLocalModel` keeps it warm for live transcription; selecting
+    /// the remote backend releases it regardless, because nothing local is
+    /// going to call the engine. `queue`/`processingID` are what stop an
+    /// unload BETWEEN two queued recordings (the next job must not pay a
+    /// reload), and `activeRecordingID` covers the moment a stopped worker's
+    /// UI slot is still being cleared.
+    private func canReleaseLocalModel() -> Bool {
+        if retainsLocalModel && !remoteSettings.isActive { return false }
+        return localModelUsers == 0
+            && !isReleasingLocalModel
+            && !cancellation.isStopped
+            && queue.isEmpty
+            && processingID == nil
+            && activeRecordingID == nil
+    }
+
+    /// Hand the model's memory back when it is genuinely idle. Safe to call
+    /// at any time; a no-op while any local user, queued job, live-retention
+    /// request or remote-backend switch still needs the engine.
+    ///
+    /// New users join the release barrier before touching the engine. Users
+    /// that already began are counted and keep this guard closed, so safety
+    /// does not depend on actor inbox ordering or a non-suspending unload.
+    private func releaseLocalModelIfIdle() async {
+        // Never enqueue a second unload that could straddle a fresh load.
+        // Wait for the running one, then re-evaluate: a new user may have
+        // loaded the model while it was in flight, in which case it must be
+        // released again once that user is done.
+        if isReleasingLocalModel {
+            await withCheckedContinuation { releaseWaiters.append($0) }
+            await releaseLocalModelIfIdle()
+            return
+        }
+        guard canReleaseLocalModel() else { return }
+        isReleasingLocalModel = true
+        await engine.unload()
+        isReleasingLocalModel = false
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
     // MARK: - Prewarm
 
     /// Pre-load the user's default model on the engine actor. Called
@@ -278,6 +396,13 @@ final class TranscriptionService: ObservableObject {
     /// pick the model the next recording is most likely to want.
     func prewarm(language: String) {
         guard !cancellation.isStopped else { return }
+        // Batch-only mode must not hold whisper's weights (or trigger the
+        // first CoreML compile) at launch. The first real transcription after
+        // Stop loads on demand instead.
+        guard retainsLocalModel, !remoteSettings.isActive else {
+            serviceLog.log("prewarm: skipping — local model retention is off for lang=\(language, privacy: .public)")
+            return
+        }
         guard let model = modelManager.model(for: language),
               modelManager.isInstalled(model) else {
             serviceLog.log("prewarm: skipping — no installed model for lang=\(language, privacy: .public)")
@@ -302,19 +427,24 @@ final class TranscriptionService: ObservableObject {
             // engine actor, but await ordering between two independent
             // Tasks is undefined, so we make it explicit here.
             await observerTask.value
-            guard !cancellation.isStopped, !Task.isCancelled else { return }
-            do {
-                try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
-                serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")
-            } catch {
-                // Silent — the real transcription call will retry and
-                // can surface any error through its own path.
-                // The model name and the whisper error are app/model state,
-                // not user content — no recording is involved in a prewarm.
-                serviceLog.error("""
-                    prewarm: failed for \(displayName, privacy: .public) \
-                    (will retry on first use): \(error.localizedDescription, privacy: .public)
-                    """)
+            guard let self, !cancellation.isStopped, !Task.isCancelled,
+                  self.retainsLocalModel, !self.remoteSettings.isActive else { return }
+            // Stay a counted local user for the load so a retention flip
+            // during the (possibly ~13s) CoreML compile cannot unload under it.
+            await self.withLocalModelUse {
+                do {
+                    try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
+                    serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")
+                } catch {
+                    // Silent — the real transcription call will retry and
+                    // can surface any error through its own path.
+                    // The model name and the whisper error are app/model state,
+                    // not user content — no recording is involved in a prewarm.
+                    serviceLog.error("""
+                        prewarm: failed for \(displayName, privacy: .public) \
+                        (will retry on first use): \(error.localizedDescription, privacy: .public)
+                        """)
+                }
             }
         }
     }
@@ -382,7 +512,14 @@ final class TranscriptionService: ObservableObject {
     /// per-test execution-time allowance.
     func waitForIdle(timeout: TimeInterval = 90) async {
         let deadline = Date().addingTimeInterval(timeout)
-        while (activeRecordingID != nil || !queue.isEmpty) && Date() < deadline {
+        // `worker`/`isReleasingLocalModel` carry the tail the queue state
+        // alone can't see: the worker has popped its last job but is still
+        // writing the result or handing the model back.
+        while Date() < deadline {
+            if worker == nil,
+               !isReleasingLocalModel,
+               activeRecordingID == nil,
+               queue.isEmpty { return }
             try? await Task.sleep(nanoseconds: 20_000_000)
         }
     }
@@ -657,26 +794,31 @@ final class TranscriptionService: ObservableObject {
         let modelURL = modelManager.url(for: model)
         let startedAt = Date()
         serviceLog.log("transcribeOnceSegments: loading model=\(model.name, privacy: .public) at \(modelURL.path, privacy: .public)")
-        // Bugbot #3: make sure the preparation observer is installed
-        // before `loadIfNeeded` — see `init` for the race.
-        await observerSetupTask.value
-        guard !cancellation.isStopped else { return .skipped }
-        do {
-            try await engine.loadIfNeeded(modelURL: modelURL,
-                                          displayName: model.displayName)
+        // One local user from the load through the transcribe. Without this
+        // retain, an idle release kicked off by another caller could free the
+        // context in the suspension between `loadIfNeeded` and `transcribe`.
+        return await withLocalModelUse {
+            // Bugbot #3: make sure the preparation observer is installed
+            // before `loadIfNeeded` — see `init` for the race.
+            await observerSetupTask.value
             guard !cancellation.isStopped else { return .skipped }
-            let segs = try await engine.transcribe(samples: samples,
-                                                   language: language,
-                                                   audioCtx: audioCtx,
-                                                   progress: nil,
-                                                   isCancelled: { [cancellation] in cancellation.isStopped })
-            guard !cancellation.isStopped else { return .skipped }
-            serviceLog.log("transcribeOnceSegments: model=\(model.name, privacy: .public) lang=\(language, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(Date().timeIntervalSince(startedAt), privacy: .public)s segs=\(segs.count, privacy: .public)")
-            return .transcribed(segs)
-        } catch {
-            if cancellation.isStopped || error is CancellationError { return .skipped }
-            serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            return .failed
+            do {
+                try await engine.loadIfNeeded(modelURL: modelURL,
+                                              displayName: model.displayName)
+                guard !cancellation.isStopped else { return .skipped }
+                let segs = try await engine.transcribe(samples: samples,
+                                                       language: language,
+                                                       audioCtx: audioCtx,
+                                                       progress: nil,
+                                                       isCancelled: { [cancellation] in cancellation.isStopped })
+                guard !cancellation.isStopped else { return .skipped }
+                serviceLog.log("transcribeOnceSegments: model=\(model.name, privacy: .public) lang=\(language, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(Date().timeIntervalSince(startedAt), privacy: .public)s segs=\(segs.count, privacy: .public)")
+                return .transcribed(segs)
+            } catch {
+                if cancellation.isStopped || error is CancellationError { return .skipped }
+                serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+                return .failed
+            }
         }
     }
 
@@ -717,6 +859,19 @@ final class TranscriptionService: ObservableObject {
     func transcribeSpans(_ spans: [UntranscribedSpan],
                          audioURL: URL,
                          language: String) async -> SpanTranscription {
+        // One model retain for the WHOLE span batch. Each span is its own
+        // local use (via `transcribeLiveSegments`), but without this outer
+        // user a release could unload between spans — a reload per utterance
+        // — and, worse, a gap where an idle release and the next span's load
+        // could interleave.
+        return await withLocalModelUse {
+            await transcribeSpansHoldingModel(spans, audioURL: audioURL, language: language)
+        }
+    }
+
+    private func transcribeSpansHoldingModel(_ spans: [UntranscribedSpan],
+                                             audioURL: URL,
+                                             language: String) async -> SpanTranscription {
         var recovered: [TranscriptSegment] = []
         var unresolved: [UntranscribedSpan] = []
         var gaveUp = false
@@ -1057,7 +1212,13 @@ final class TranscriptionService: ObservableObject {
     private func run() async {
         while !cancellation.isStopped, !Task.isCancelled, let next = popNext() {
             processingID = next.id
-            await process(next)
+            // Hold the local model for the whole job (load + transcribe +
+            // diarization). Ending it is what may release an idle model, and
+            // the queue check inside `canReleaseLocalModel` keeps a queued
+            // next job from paying a reload.
+            await withLocalModelUse {
+                await process(next)
+            }
             processingID = nil
             if stoppingRecordingID == next.id { stoppingRecordingID = nil }
             // A stop that landed during this run belongs to this run, and the
@@ -1066,7 +1227,12 @@ final class TranscriptionService: ObservableObject {
             // recording's next Transcribe.
             cancellation.remove(next.id)
         }
+        // The queue is drained and no job owns the engine. Hand a batch-only
+        // session's weights back now; with live retention on this is a no-op.
+        // `worker` clears first so an enqueue that lands during the unload
+        // starts a fresh worker, which joins the release barrier before loading.
         worker = nil
+        await releaseLocalModelIfIdle()
     }
 
     private func popNext() -> Recording? {

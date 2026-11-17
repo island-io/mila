@@ -35,6 +35,9 @@ final class TranscriptionServicePrewarmTests: XCTestCase {
             remoteSettings: TestSupport.isolatedRemoteSettings(label: "TranscriptionServicePrewarmTests"),
             engine: stub
         )
+        // These tests cover the live-transcription prewarm, which only runs
+        // while the local model is retained (batch-only mode never preloads).
+        service.retainsLocalModel = true
     }
 
     override func tearDown() async throws {
