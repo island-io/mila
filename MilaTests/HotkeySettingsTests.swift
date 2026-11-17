@@ -268,4 +268,22 @@ final class DictationHotkeyBinderTests: XCTestCase {
         XCTAssertEqual(wanted2[ru], combo)
         XCTAssertNil(wanted2[.dictateHebrew])
     }
+
+    /// A language locked by a configuration profile is offered even when
+    /// the user never added it — so its shortcut must register too.
+    func test_a_locked_language_outside_the_list_registers_its_shortcut() throws {
+        let registrar = FakeRegistrar()
+        let hotkeys = HotkeySettings(defaults: hotkeyDefaults)
+        let ru = HotkeyAction(languageCode: "ru")
+        let f6 = HotkeyBinding(keyCode: UInt32(kVK_F6), modifiers: UInt32(cmdKey))
+        hotkeys.setBinding(f6, for: ru)
+        var managed = ManagedSettings.empty
+        managed.recordingLanguage = try XCTUnwrap(ManagedSettings.strictLanguage("ru"))
+        let languages = RecordingLanguageSettings(defaults: languageDefaults, managed: managed)
+
+        let binder = DictationHotkeyBinder(hotkeys: hotkeys, languages: languages,
+                                           registrar: registrar) { _ in }
+        XCTAssertEqual(registrar.live[ru], f6)
+        _ = binder
+    }
 }

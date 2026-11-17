@@ -157,7 +157,9 @@ final class RecordingLanguageSettings: ObservableObject {
     /// toolbar picker is disabled then, so this only catches programmatic
     /// writes.
     var current: RecordingLanguage {
-        get { resolve(currentCode) }
+        // The offered entry when there is one: a locked language the user had
+        // hidden is offered un-hidden, and pickers compare whole entries.
+        get { configured(currentCode) ?? resolve(currentCode) }
         set {
             guard !isManaged(.recordingLanguage),
                   let entry = configured(newValue.code) else { return }
@@ -165,8 +167,26 @@ final class RecordingLanguageSettings: ObservableObject {
         }
     }
 
-    /// Entries the pickers offer, in list order.
-    var visible: [RecordingLanguage] { languages.filter { !$0.isHidden } }
+    /// Entries the pickers offer, in list order. A language locked by a
+    /// configuration profile is always among them — un-hidden if the user
+    /// removed it, appended if they never added it — so the active language
+    /// is one the pickers show. That happens here, in memory, and never in
+    /// the stored list: removing the profile leaves the list as it was.
+    var visible: [RecordingLanguage] { Self.offered(languages, locked: lockedCode) }
+
+    /// The code a configuration profile locks the language to, if any.
+    var lockedCode: String? { managed.recordingLanguage?.code }
+
+    /// `visible` for a given stored list — for a subscriber that receives
+    /// the list from `$languages` (whose emitted value is the NEW list,
+    /// while the property still holds the old one).
+    nonisolated static func offered(_ list: [RecordingLanguage], locked: String?) -> [RecordingLanguage] {
+        var out = list.filter { !$0.isHidden || $0.code == locked }
+        if let locked, !list.contains(where: { $0.code == locked }) {
+            out.append(RecordingLanguage.resolve(locked, in: list))
+        }
+        return out.map { var l = $0; l.isHidden = false; return l }
+    }
 
     /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`)
     /// unless `MilaApp` passes the system's managed preferences.
@@ -281,15 +301,21 @@ final class RecordingLanguageSettings: ObservableObject {
 
     /// Stop offering `code` for new recordings. The entry is hidden, never
     /// deleted, so recordings already in it keep their flag, direction and
-    /// model. Refused (false) for the last visible entry and for a code that
-    /// isn't visible. Removing the active language re-points it at the first
-    /// entry still visible.
+    /// model. Refused (false) for the last visible entry, for a code that
+    /// isn't visible, and for a language a configuration profile locks.
+    /// Removing the active language re-points it at the first entry still
+    /// visible.
     @discardableResult
     func remove(code: String) -> Bool {
         let code = code.lowercased()
+        let locked = lockedCode
         var list = languages
-        guard let i = list.firstIndex(where: { $0.code == code && !$0.isHidden }),
-              list.filter({ !$0.isHidden }).count > 1
+        // The locked language doesn't count toward "keep at least one": it
+        // goes away with the profile, and the user must still have one of
+        // their own then.
+        guard code != locked,
+              let i = list.firstIndex(where: { $0.code == code && !$0.isHidden }),
+              list.filter({ !$0.isHidden && $0.code != locked }).count > 1
         else { return false }
         list[i].isHidden = true
         commit(list)

@@ -1,5 +1,6 @@
 import Foundation
 import os
+import TranscriptionCore
 
 /// Where Mila reads administrator-**forced** preferences from.
 ///
@@ -350,19 +351,19 @@ extension ManagedSettings {
         return true
     }
 
-    /// A language code an administrator may lock: `he`/`iw`/`en` or a regional
-    /// form (`en-US`, `he_IL`). Stricter than `RecordingLanguage.fromCode`, which
-    /// reads anything unknown as Hebrew — right for legacy recordings, wrong for
-    /// a lock, where a typo would silently pin every user to Hebrew. Unknown
-    /// values are dropped (and logged) instead.
+    /// A language code an administrator may lock: any language whisper can
+    /// transcribe, or a regional form of one (`en-US`, `he_IL`, `pt-BR`), plus
+    /// the legacy `iw` for Hebrew. Stricter than `RecordingLanguage.resolve`,
+    /// which turns anything unknown into a synthesized entry — right for a
+    /// legacy recording, wrong for a lock, where a typo would pin every user to
+    /// a language whisper can't transcribe. Unknown values are dropped (and
+    /// logged) instead.
     static func strictLanguage(_ code: String) -> RecordingLanguage? {
         let normalized = code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let base = normalized.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map { String($0) } ?? ""
-        switch base {
-        case "he", "iw": return .hebrew
-        case "en": return .english
-        default: return nil
-        }
+        var base = normalized.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map { String($0) } ?? ""
+        if base == "iw" { base = "he" }
+        guard WhisperEngine.supportedLanguageCodes.contains(base) else { return nil }
+        return RecordingLanguage.resolve(base, in: RecordingLanguage.seeds)
     }
 
     /// Read the system's managed preferences once, at launch, and log which

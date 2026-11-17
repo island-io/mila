@@ -109,10 +109,12 @@ final class DictationHotkeyBinder {
          onPressed: @escaping (HotkeyAction) -> Void) {
         self.registrar = registrar
         self.onPressed = onPressed
+        let locked = languages.lockedCode
         observer = hotkeys.$bindings
             .combineLatest(languages.$languages)
             .sink { [weak self] bindings, list in
-                self?.apply(Self.wanted(bindings: bindings, languages: list))
+                let offered = RecordingLanguageSettings.offered(list, locked: locked)
+                self?.apply(Self.wanted(bindings: bindings, languages: offered))
             }
     }
 
