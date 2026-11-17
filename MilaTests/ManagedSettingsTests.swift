@@ -169,8 +169,9 @@ final class ManagedSettingsParsingTests: XCTestCase {
         XCTAssertEqual(managed.liveAIModel, "nested")
     }
 
-    /// `RecordingLanguage.fromCode` reads anything unknown as Hebrew — fine for
-    /// legacy recordings, wrong for a lock: a typo would pin everyone to Hebrew.
+    /// `RecordingLanguage.resolve` turns anything unknown into a synthesized
+    /// entry — fine for a legacy recording, wrong for a lock: a typo would pin
+    /// everyone to a language whisper can't transcribe.
     func test_recordingLanguage_isValidatedStrictly() {
         XCTAssertEqual(ManagedSettings.strictLanguage("en"), .english)
         XCTAssertEqual(ManagedSettings.strictLanguage("en-US"), .english)

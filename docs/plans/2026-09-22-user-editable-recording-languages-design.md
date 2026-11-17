@@ -1,6 +1,6 @@
 # User-Editable Recording Languages — Design
 
-**Status:** approved design (rev 2), not yet implemented
+**Status:** implemented on `feat/user-editable-languages` (2026-11-16); see "Implementation notes" in the plan for where it departs from this design
 **Date:** 2026-09-22
 
 **Goal:** Replace the hardcoded two-case `RecordingLanguage` enum with a

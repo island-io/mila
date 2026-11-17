@@ -1217,8 +1217,7 @@ final class RecordingSummarizerTests: XCTestCase {
     }
 
     /// recordings.json is user-editable on disk. A code the app does not know
-    /// must fall back to the global setting — NOT to Hebrew, which is what
-    /// `RecordingLanguage.fromCode` would have done
+    /// must fall back to the global setting, never to a guessed language
     /// (`bugbot-rules/untrusted-persisted-data.md`).
     func test_summarize_ignores_an_unknown_persisted_summary_language() async throws {
         llm.tool = .claude

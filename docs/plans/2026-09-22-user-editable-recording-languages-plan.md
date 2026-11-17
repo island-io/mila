@@ -365,3 +365,47 @@ Everything else is local. If Task 6 grows, it can ship as a follow-up PR,
 because after Task 2 the seeds keep ⌘2/⌘3 working, with `HotkeyAction` still
 mapping `dictateHebrew` to `he`. Every other task is small enough for one
 sitting.
+
+---
+
+## Implementation notes (2026-11-16)
+
+All tasks are implemented. The branch was merged with `main` at v1.9.8 first,
+which brought in three things this plan predates: MDM-managed settings (#360),
+`.milashare` sharing (#310) and the per-recording summary language (#308).
+Where the result differs from the tasks above:
+
+- **Re-transcribe (Task 7).** `retranscribeTargets(for:)` is the visible list
+  minus the recording's own language. Re-running in its OWN language stays the
+  separate "(current)" entry, which works even when that language is hidden,
+  so it isn't repeated in the submenu. The design's round-trip worry (remove
+  Hebrew, re-run a Hebrew recording in English by accident) is answered by
+  re-adding Hebrew, which restores it with its settings.
+- **Script direction (Task 8).** `RecordingLanguage.isRTL(code:)` needs no list:
+  direction comes from the code alone. The text heuristic became
+  `isPredominantlyRTL` / `hasDirectionalLetters` (every RTL script against every
+  other letter, not Hebrew against Latin), because a Russian summary of a
+  Hebrew recording has no Hebrew or Latin letters and fell back to RTL. The
+  detail view reads `transcriptLanguage` (#330), not `language`.
+- **Output language (Task 9).** `OutputLanguage` stayed a type: a struct over
+  `auto` or any whisper code, with `.auto/.english/.hebrew` constants, so call
+  sites and tests kept their shape. **Auto** asks for the recording's language
+  when the user added it (`ru` → Russian) but keeps reading the text for
+  Hebrew and English, the behaviour `main` pins (a Hebrew recording where
+  people spoke English gets English). `LiveAISession.start(languageCode:)`
+  carries the live recording's code. The per-recording summary language from
+  #308 accepts any whisper code, strictly (`RecordingLanguage.summaryLanguage(stored:)`),
+  and its menu offers the user's list plus a selection that is no longer
+  offered.
+- **MDM (new).** A lock may name any whisper code. The locked language is always
+  offered and can't be removed, but it is added to the OFFERED list in memory
+  only (`RecordingLanguageSettings.offered(_:locked:)`), never written into the
+  user's list, so removing the profile leaves the list as it was. It also
+  doesn't count toward "keep at least one".
+- **Languages tab (Task 10).** Add is a searchable list; picking a language adds
+  it and, if it has no flag yet, opens Edit. Edit holds flag and model; the
+  shortcut is captured in the row, as it was in General. The UI-test sections
+  list includes the tab; the manual pass is still to do.
+- **Not done here:** release notes (they belong to the release commit) and the
+  GitHub issue + PR, which wait until the manual pass is done.
+
