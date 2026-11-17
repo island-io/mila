@@ -22,8 +22,9 @@ final class ScriptDirectionTests: XCTestCase {
     func test_rtl_reads_aliases_and_regional_variants() {
         XCTAssertTrue(RecordingLanguage.isRTL(code: "iw"))
         XCTAssertTrue(RecordingLanguage.isRTL(code: "he-IL"))
-        XCTAssertTrue(RecordingLanguage.isRTL(code: "auto"), "legacy auto recordings were Hebrew")
-        XCTAssertTrue(RecordingLanguage.isRTL(code: ""), "pre-language recordings were Hebrew")
+        XCTAssertFalse(RecordingLanguage.isRTL(code: "auto"),
+                       "legacy auto says nothing about the script — the text decides")
+        XCTAssertFalse(RecordingLanguage.isRTL(code: ""), "same for a recording with no language")
         XCTAssertFalse(RecordingLanguage.isRTL(code: "en_GB"))
     }
 

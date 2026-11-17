@@ -71,12 +71,17 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
         return displayName.localizedCaseInsensitiveContains(q) || code.localizedCaseInsensitiveContains(q)
     }
 
-    /// Script direction for a STORED code — legacy aliases and regional
-    /// forms included (`iw`, `auto`, `he-IL`). Direction comes from the code
-    /// alone, so it needs no list: a recording in a removed or never-added
-    /// language still lays out correctly.
+    /// Script direction for a STORED code — `iw` and regional forms included
+    /// (`he-IL`). Direction comes from the code alone, so it needs no list: a
+    /// recording in a removed or never-added language still lays out
+    /// correctly. The legacy `auto` and `""` are NOT read as Hebrew here,
+    /// unlike `resolve`: they say nothing about what was spoken (model
+    /// routing sends `auto` to the multilingual model too), so callers let
+    /// the text decide, as they always have.
     nonisolated static func isRTL(code: String) -> Bool {
-        resolve(code, in: seeds).isRTL
+        let normalized = code.lowercased()
+        guard normalized != "auto", !normalized.isEmpty else { return false }
+        return resolve(normalized, in: seeds).isRTL
     }
 
     // Lenient decode: a list written by a newer build may lack or add fields,

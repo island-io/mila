@@ -789,7 +789,7 @@ private struct ModelsSettingsTab: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Whisper models")
                 .font(.headline)
-            Text("English dictation uses the OpenAI turbo model; Hebrew uses ivrit.ai. Both download automatically on first launch (~1.6 GB each). The optional ivrit.ai large model is higher accuracy but ~2× slower.")
+            Text("Hebrew uses ivrit.ai; English and every other language use the OpenAI turbo model (pick per language in Settings → Languages). Both download automatically on first launch (~1.6 GB each). The optional ivrit.ai large model is higher accuracy but ~2× slower.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

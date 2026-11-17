@@ -189,7 +189,8 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     /// Raw diarizer ID (`SPEAKER_00`) → user-assigned display name.
     public var speakerNames: [String: String]
     /// The app's per-recording override of the language its `summary` and
-    /// `actionItems` are written in (`"he"` / `"en"`), when the user set
+    /// `actionItems` are written in (a whisper language code: `"he"`, `"en"`,
+    /// `"ru"`, …), when the user set
     /// one; nil means the app's global output-language setting applied.
     /// Kept as a string so a language the app adds later doesn't fail the
     /// decode. Mirrored because the app persists it — not exposed by any
