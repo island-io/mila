@@ -302,6 +302,40 @@ final class ShareManifestTests: XCTestCase {
         XCTAssertNil(try m.validated().recording.summaryLanguage)
     }
 
+    /// A colleague's recording in a language the receiver never added (#310 ×
+    /// user-editable languages): it imports in that language, keeps its summary
+    /// language, displays and can be re-transcribed — and the receiver's own
+    /// list is left alone.
+    @MainActor
+    func test_a_recording_in_a_language_the_receiver_lacks_imports_and_resolves() throws {
+        var m = sampleManifest()
+        m.recording.language = "ru"
+        m.recording.summaryLanguage = "ru"
+        let validated = try m.validated()
+        XCTAssertEqual(validated.recording.summaryLanguage, "ru",
+                       "any language whisper knows is a valid summary language")
+
+        let made = validated.recording.makeRecording(audioFileName: "a.m4a", fullText: "Всем привет",
+                                                     sharedBy: "Ada", sharedAt: exported, folder: nil)
+        XCTAssertEqual(made.language, "ru")
+        XCTAssertEqual(made.summaryLanguageOverride?.code, "ru")
+
+        let suite = "ShareManifestTests.receiver"
+        UserDefaults().removePersistentDomain(forName: suite)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let receiver = RecordingLanguageSettings(defaults: defaults)
+
+        let shown = receiver.resolve(made.language)
+        XCTAssertEqual(shown.displayName, "Russian")
+        XCTAssertEqual(shown.label, "Russian", "no flag: the receiver never configured one")
+        XCTAssertFalse(RecordingLanguage.isRTL(code: made.language))
+        XCTAssertEqual(receiver.retranscribeTargets(for: made.language).map(\.code), ["he", "en"])
+        XCTAssertEqual(receiver.choices(including: made.summaryLanguage).map(\.code), ["he", "en", "ru"],
+                       "the summary-language menu still shows the ✓ on Russian")
+        XCTAssertEqual(receiver.visible.map(\.code), ["he", "en"], "the receiver's list is untouched")
+    }
+
     func test_unknown_source_and_action_source_fall_back_instead_of_failing() {
         var payload = ShareManifest.RecordingPayload(sharing: fullyPopulatedRecording())
         payload.source = "hologram"
