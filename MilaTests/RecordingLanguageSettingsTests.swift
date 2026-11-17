@@ -1,5 +1,6 @@
 import XCTest
 import Combine
+import TranscriptionCore
 @testable import Mila
 
 @MainActor
@@ -387,5 +388,56 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         XCTAssertEqual(settings.choices(including: "ru").map(\.code), ["he", "en", "ru"])
         XCTAssertEqual(settings.choices(including: "ru").last?.flagEmoji, "🇷🇺")
         XCTAssertEqual(settings.choices(including: "fr").map(\.code), ["he", "en", "fr"])
+    }
+
+    // MARK: - Settings → Languages
+
+    func test_can_remove_mirrors_remove() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertTrue(settings.canRemove(code: "he"))
+        settings.remove(code: "he")
+        XCTAssertFalse(settings.canRemove(code: "en"), "the last visible language stays")
+        XCTAssertFalse(settings.canRemove(code: "he"), "already hidden")
+        XCTAssertFalse(settings.canRemove(code: "ru"), "never added")
+    }
+
+    /// Everything whisper knows that isn't offered yet, by name, with
+    /// previously-removed entries still carrying their settings.
+    func test_addable_languages_are_whisper_minus_visible_sorted_by_name() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ru")
+        settings.update(RecordingLanguage(code: "ru", flagEmoji: "🇷🇺"))
+        settings.remove(code: "ru")
+
+        let addable = settings.addableLanguages()
+        let codes = addable.map(\.code)
+        XCTAssertFalse(codes.contains("he"))
+        XCTAssertFalse(codes.contains("en"))
+        XCTAssertTrue(codes.contains("fr"))
+        XCTAssertEqual(Set(codes), Set(WhisperEngine.supportedLanguageCodes).subtracting(["he", "en"]))
+        XCTAssertEqual(addable.map(\.displayName), addable.map(\.displayName).sorted {
+            $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
+        })
+
+        let ru = addable.first { $0.code == "ru" }
+        XCTAssertEqual(ru?.isHidden, true, "marked as previously added")
+        XCTAssertEqual(ru?.flagEmoji, "🇷🇺")
+    }
+
+    func test_addable_languages_match_a_search_by_name_or_code() {
+        let ru = RecordingLanguage(code: "ru")
+        XCTAssertTrue(ru.matches(search: ""))
+        XCTAssertTrue(ru.matches(search: "russ"))
+        XCTAssertTrue(ru.matches(search: "RU"))
+        XCTAssertFalse(ru.matches(search: "fren"))
+    }
+
+    /// The flag field takes whatever is typed or picked, trimmed and kept
+    /// short: one emoji is one Character, and a few letters ("UK") are fine.
+    func test_flag_input_is_trimmed_and_capped() {
+        XCTAssertEqual(RecordingLanguage.normalizedFlag("  🇷🇺 "), "🇷🇺")
+        XCTAssertEqual(RecordingLanguage.normalizedFlag("UK"), "UK")
+        XCTAssertEqual(RecordingLanguage.normalizedFlag("🇷🇺🇺🇦🇧🇾🇰🇿"), "🇷🇺🇺🇦🇧🇾")
+        XCTAssertEqual(RecordingLanguage.normalizedFlag("   "), "")
     }
 }

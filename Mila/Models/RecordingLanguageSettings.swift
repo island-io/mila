@@ -57,6 +57,20 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
         Locale.Language(identifier: code).characterDirection == .rightToLeft
     }
 
+    /// What the flag field stores: trimmed, at most three Characters (a flag
+    /// emoji is one; "UK" is two). Empty means no flag.
+    nonisolated static func normalizedFlag(_ input: String) -> String {
+        String(input.trimmingCharacters(in: .whitespacesAndNewlines).prefix(3))
+    }
+
+    /// Whether a search typed into the Add Language list matches this entry,
+    /// by English name or by code. An empty search matches everything.
+    func matches(search: String) -> Bool {
+        let q = search.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return true }
+        return displayName.localizedCaseInsensitiveContains(q) || code.localizedCaseInsensitiveContains(q)
+    }
+
     /// Script direction for a STORED code — legacy aliases and regional
     /// forms included (`iw`, `auto`, `he-IL`). Direction comes from the code
     /// alone, so it needs no list: a recording in a removed or never-added
@@ -271,6 +285,30 @@ final class RecordingLanguageSettings: ObservableObject {
         return visible.filter { $0.code != own }
     }
 
+    /// Whether `remove(code:)` would succeed — drives the Remove button.
+    /// The locked language doesn't count toward "keep at least one": it goes
+    /// away with the profile, and the user must still have one of their own
+    /// then.
+    func canRemove(code: String) -> Bool {
+        let code = code.lowercased()
+        let locked = lockedCode
+        return code != locked
+            && languages.contains { $0.code == code && !$0.isHidden }
+            && languages.filter({ !$0.isHidden && $0.code != locked }).count > 1
+    }
+
+    /// The Add Language list: every language whisper can transcribe that
+    /// isn't offered yet, sorted by English name. A previously removed
+    /// entry comes back as stored (`isHidden`, flag and model intact), so the
+    /// list can mark it and adding it restores its settings.
+    func addableLanguages() -> [RecordingLanguage] {
+        let offered = Set(visible.map(\.code))
+        return WhisperEngine.supportedLanguageCodes
+            .filter { !offered.contains($0) }
+            .map { code in languages.first { $0.code == code } ?? RecordingLanguage(code: code) }
+            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+    }
+
     // MARK: - Editing
     //
     // Each edit assigns `languages` once — one publish, one write.
@@ -308,15 +346,10 @@ final class RecordingLanguageSettings: ObservableObject {
     @discardableResult
     func remove(code: String) -> Bool {
         let code = code.lowercased()
-        let locked = lockedCode
-        var list = languages
-        // The locked language doesn't count toward "keep at least one": it
-        // goes away with the profile, and the user must still have one of
-        // their own then.
-        guard code != locked,
-              let i = list.firstIndex(where: { $0.code == code && !$0.isHidden }),
-              list.filter({ !$0.isHidden && $0.code != locked }).count > 1
+        guard canRemove(code: code),
+              let i = languages.firstIndex(where: { $0.code == code })
         else { return false }
+        var list = languages
         list[i].isHidden = true
         commit(list)
         if currentCode == code, !isManaged(.recordingLanguage), let first = visible.first {

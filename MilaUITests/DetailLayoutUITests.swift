@@ -155,6 +155,7 @@ final class DetailLayoutUITests: XCTestCase {
     /// the window's bounds, is what makes that failure loud.
     private static let settingsSections: [(row: String, title: String, probe: String)] = [
         ("settings.section.general",    "General",     "updates.autoCheck.toggle"),
+        ("settings.section.languages",  "Languages",   "languages.add.button"),
         ("settings.section.audio",      "Audio",       "audio.input.picker"),
         ("settings.section.models",     "Models",      "models.backend.picker"),
         ("settings.section.aiProvider", "AI Provider", "ai.provider.tool"),
