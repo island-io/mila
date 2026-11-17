@@ -23,6 +23,10 @@ import AppKit
 /// Hebrew recording is exactly what that override produces, and it must
 /// read left-to-right.
 struct AIOverviewSection: View {
+    /// Read HERE, in the ordinary view tree, and handed to
+    /// `SummaryLanguageMenu` as a plain list — context-menu content must not
+    /// depend on the environment reaching it.
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     let summary: String?
     let items: [ActionItem]
     let recordingLanguage: String
@@ -178,6 +182,7 @@ struct AIOverviewSection: View {
                         }
                         if let onSetSummaryLanguage {
                             SummaryLanguageMenu(
+                                choices: languageSettings.choices(including: summaryLanguage?.code),
                                 current: summaryLanguage,
                                 global: globalOutputLanguage,
                                 isDisabled: isSummarizing || isTranscribing,

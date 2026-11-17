@@ -18,8 +18,17 @@ import SwiftUI
 /// The ✓-prefixed `Button` convention mirrors the "Move to Folder" submenu in
 /// `RecordingContextMenu` rather than a `Picker`: the selection is OPTIONAL
 /// (nil = Default), which a `Picker` over a non-optional enum doesn't model.
+///
+/// The view reads NO environment object. Every host builds it inside
+/// `.contextMenu` content, which AppKit hosts as a separate menu; whether an
+/// `@EnvironmentObject` reaches a view in there is not something to depend
+/// on, and a miss is a crash on right-click. The host, which sits in the
+/// ordinary view tree, resolves the list and hands it in as `choices`.
 struct SummaryLanguageMenu: View {
-    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
+    /// The languages to offer: `RecordingLanguageSettings.choices(including:)`
+    /// for the current override, so a language chosen before it was removed
+    /// from the list still shows its ✓.
+    let choices: [RecordingLanguage]
     /// The recording's current override; nil = following the global setting.
     let current: RecordingLanguage?
     /// The global output language, shown in the Default entry's label so the
@@ -40,7 +49,7 @@ struct SummaryLanguageMenu: View {
             }
             .accessibilityIdentifier("summaryLanguage.default")
             Divider()
-            ForEach(languageSettings.choices(including: current?.code)) { lang in
+            ForEach(choices) { lang in
                 Button(label("\(lang.label)", selected: current?.code == lang.code)) {
                     onPick(lang)
                 }

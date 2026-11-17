@@ -181,6 +181,8 @@ private struct RecordingContextMenu: ViewModifier {
                 // instead of waiting for the next automatic pass. Re-picking
                 // the ✓'d entry is a no-op (`RecordingSummarizer.setSummaryLanguage`).
                 SummaryLanguageMenu(
+                    choices: languageSettings.choices(
+                        including: recording.summaryLanguageOverride?.code),
                     current: recording.summaryLanguageOverride,
                     global: liveAI.outputLanguage,
                     isDisabled: isBusy

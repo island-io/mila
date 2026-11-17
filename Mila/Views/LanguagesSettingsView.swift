@@ -20,6 +20,8 @@ struct LanguagesSettingsTab: View {
     @State private var lastError: String?
     @State private var showingAdd = false
     @State private var editing: RecordingLanguage?
+    /// A language just added, to open in Edit once the Add sheet has gone.
+    @State private var editAfterAdd: RecordingLanguage?
     /// The active language, waiting for the user to confirm its removal.
     @State private var pendingRemoval: RecordingLanguage?
 
@@ -55,12 +57,21 @@ struct LanguagesSettingsTab: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .sheet(isPresented: $showingAdd) {
+        .sheet(isPresented: $showingAdd, onDismiss: {
+            // Only now, with the Add sheet fully dismissed: asking for the
+            // Edit sheet in the same turn that closes this one is a second
+            // presentation on a view that is still presenting, which SwiftUI
+            // may simply drop.
+            if let next = editAfterAdd {
+                editAfterAdd = nil
+                editing = next
+            }
+        }) {
             AddLanguageSheet { added in
-                showingAdd = false
                 // Straight into Edit for a brand-new entry: it has no flag
                 // yet and the default model, which is worth a look.
-                if let added, added.flagEmoji.isEmpty { editing = added }
+                editAfterAdd = added.flatMap { $0.flagEmoji.isEmpty ? $0 : nil }
+                showingAdd = false
             }
         }
         .sheet(item: $editing) { language in
