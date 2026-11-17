@@ -705,7 +705,7 @@ struct RecordingDetailView: View {
                         // not `language`: while a re-run in the other language
                         // is in flight the text is still the earlier one (#330).
                         .environment(\.layoutDirection,
-                                     (recording.transcriptLanguage == "he" || recording.fullText.isPredominantlyHebrew)
+                                     (RecordingLanguage.isRTL(code: recording.transcriptLanguage) || recording.fullText.isPredominantlyRTL)
                                      ? .rightToLeft : .leftToRight)
                     }
                     .contextMenu { transcriptMenuItems }

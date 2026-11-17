@@ -57,6 +57,14 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
         Locale.Language(identifier: code).characterDirection == .rightToLeft
     }
 
+    /// Script direction for a STORED code — legacy aliases and regional
+    /// forms included (`iw`, `auto`, `he-IL`). Direction comes from the code
+    /// alone, so it needs no list: a recording in a removed or never-added
+    /// language still lays out correctly.
+    nonisolated static func isRTL(code: String) -> Bool {
+        resolve(code, in: seeds).isRTL
+    }
+
     // Lenient decode: a list written by a newer build may lack or add fields,
     // and a failed decode would throw away the user's whole list.
     private enum CodingKeys: String, CodingKey { case code, flagEmoji, modelName, isHidden }

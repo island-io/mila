@@ -56,7 +56,7 @@ final class DictationOverlayWindow {
     }
 
     /// Tell the overlay which language the user is dictating in so the
-    /// live text strip can flip to RTL alignment for Hebrew (truncation
+    /// live text strip can flip to RTL alignment for an RTL language (truncation
     /// dots land on the right edge, matching reading direction).
     func setLanguage(_ code: String) {
         viewModel.language = code
@@ -110,7 +110,7 @@ final class DictationOverlayModel: ObservableObject {
     /// so the pill stays compact at the start of a dictation.
     @Published var liveText: String = ""
     /// Language of the current dictation. Drives RTL handling for the
-    /// live-text strip (Hebrew dictation places truncation dots on the
+    /// live-text strip (RTL dictation places truncation dots on the
     /// right, matching reading direction).
     @Published var language: String = "en"
 }
@@ -119,7 +119,7 @@ private struct DictationOverlayContent: View {
     @ObservedObject var viewModel: DictationOverlayModel
 
     private let pillColor = Color(red: 0.20, green: 0.55, blue: 0.95)
-    private var isRTL: Bool { viewModel.language == "he" }
+    private var isRTL: Bool { RecordingLanguage.isRTL(code: viewModel.language) }
 
     var body: some View {
         VStack(spacing: 6) {

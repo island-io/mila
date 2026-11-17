@@ -14,11 +14,11 @@ import AppKit
 /// `.regularMaterial` card. Both use `AIOverviewSection` below for the
 /// inner content (Summary header + body, Action items header + list).
 ///
-/// RTL: decided from the actual text content (`isPredominantlyHebrew`
+/// RTL: decided from the actual text content (`isPredominantlyRTL`
 /// over the summary + items blob); `recordingLanguage` is only the
 /// fallback while there is no text yet — see `isRTL`. This no longer
 /// matches `LiveAIRecordingView.aiOutputIsRTL`, whose Auto branch checks
-/// `language == "he"` BEFORE looking at the text: the live view has no
+/// the recording's language BEFORE looking at the text: the live view has no
 /// per-recording summary language, while here an English summary on a
 /// Hebrew recording is exactly what that override produces, and it must
 /// read left-to-right.
@@ -85,10 +85,10 @@ struct AIOverviewSection: View {
     /// exists for. Static so the rule can be pinned without building the view.
     static func isRTL(summary: String?, items: [ActionItem], recordingLanguage: String) -> Bool {
         let blob = (summary ?? "") + " " + items.map(\.text).joined(separator: " ")
-        if blob.hasHebrewOrLatinLetters {
-            return blob.isPredominantlyHebrew
+        if blob.hasDirectionalLetters {
+            return blob.isPredominantlyRTL
         }
-        return recordingLanguage == "he"
+        return RecordingLanguage.isRTL(code: recordingLanguage)
     }
 
     var body: some View {

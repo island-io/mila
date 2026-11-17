@@ -26,6 +26,40 @@ extension String {
         return counts.hebrew > 0 || counts.latin > 0
     }
 
+    /// True when more of this string's letters belong to a right-to-left
+    /// script (Hebrew, Arabic, Syriac, Thaana, N'Ko, …) than to any other.
+    /// The script-agnostic form of `isPredominantlyHebrew`, for layout: a
+    /// recording can be in any language the user added, so an Arabic
+    /// transcript or a Russian summary needs a verdict of its own.
+    var isPredominantlyRTL: Bool {
+        let counts = directionalLetterCounts
+        return counts.rtl > counts.ltr
+    }
+
+    /// Whether `isPredominantlyRTL` has anything to go on: false for a
+    /// string with no letters at all (empty, digits, punctuation), so a
+    /// caller can fall back to the recording's language instead.
+    var hasDirectionalLetters: Bool {
+        let counts = directionalLetterCounts
+        return counts.rtl > 0 || counts.ltr > 0
+    }
+
+    private var directionalLetterCounts: (rtl: Int, ltr: Int) {
+        var rtl = 0
+        var ltr = 0
+        for scalar in unicodeScalars where scalar.properties.isAlphabetic {
+            if Self.isRTLScalar(scalar.value) { rtl += 1 } else { ltr += 1 }
+        }
+        return (rtl, ltr)
+    }
+
+    /// Hebrew through the Arabic Extended blocks (U+0590–U+08FF: Hebrew,
+    /// Arabic, Syriac, Thaana, N'Ko, Samaritan, Mandaic) plus the Hebrew and
+    /// Arabic presentation forms.
+    private static func isRTLScalar(_ v: UInt32) -> Bool {
+        (0x0590...0x08FF).contains(v) || (0xFB1D...0xFDFF).contains(v) || (0xFE70...0xFEFF).contains(v)
+    }
+
     private var hebrewAndLatinLetterCounts: (hebrew: Int, latin: Int) {
         var hebrew = 0
         var latin = 0

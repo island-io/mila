@@ -37,6 +37,17 @@ final class AIOverviewSummaryTests: XCTestCase {
         XCTAssertFalse(AIOverviewSection.isRTL(summary: "", items: [], recordingLanguage: "en"))
         XCTAssertTrue(AIOverviewSection.isRTL(summary: "12:30 — …", items: [], recordingLanguage: "he"),
                       "digits and punctuation alone are not a verdict either")
+        XCTAssertTrue(AIOverviewSection.isRTL(summary: nil, items: [], recordingLanguage: "ar"),
+                      "the fallback is the language's direction, not a Hebrew check")
+    }
+
+    /// Scripts beyond Hebrew and Latin: a Russian summary of a Hebrew
+    /// recording reads LTR, an Arabic one of an English recording RTL.
+    func test_direction_reads_scripts_other_than_hebrew_and_latin() {
+        XCTAssertFalse(AIOverviewSection.isRTL(summary: "Команда договорилась выпустить релиз.",
+                                               items: [], recordingLanguage: "he"))
+        XCTAssertTrue(AIOverviewSection.isRTL(summary: "اتفق الفريق على الإصدار الأسبوع المقبل.",
+                                              items: [], recordingLanguage: "en"))
     }
 
     func test_multiSentence_paragraph_splits_into_lines_without_bullets() {
