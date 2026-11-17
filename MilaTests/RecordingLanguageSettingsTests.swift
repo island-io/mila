@@ -135,6 +135,28 @@ final class RecordingLanguageSettingsTests: XCTestCase {
                        "a decode failure must not overwrite what the user had")
     }
 
+    /// The plist is user-editable and may come from another build: a row that
+    /// doesn't decode, a code whisper can't transcribe and a repeated code
+    /// are each dropped on their own, and the rest of the list survives.
+    func test_bad_entries_are_dropped_and_the_rest_of_the_list_survives() {
+        let json = Data(#"""
+        [{"code":"ru","flagEmoji":"🇷🇺"},
+         {"flagEmoji":"no code"},
+         {"code":"zz-not-whisper"},
+         {"code":"RU","flagEmoji":"dup"},
+         {"code":"he","isHidden":true},
+         "not an object"]
+        """#.utf8)
+        defaults.set(json, forKey: "recording.languages")
+
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(settings.languages.map(\.code), ["ru", "he"])
+        XCTAssertEqual(settings.languages.first?.flagEmoji, "🇷🇺", "the first of a repeated code wins")
+        XCTAssertEqual(settings.visible.map(\.code), ["ru"])
+        XCTAssertEqual(defaults.data(forKey: "recording.languages"), json,
+                       "loading alone must not rewrite the stored list")
+    }
+
     /// A stored active code that is no longer visible — say the list was edited
     /// by an older build — lands on the first visible entry and is rewritten.
     func test_stored_code_outside_the_list_falls_back_to_the_first_visible_entry() {

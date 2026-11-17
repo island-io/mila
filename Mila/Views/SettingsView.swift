@@ -560,20 +560,21 @@ private struct AudioSettingsTab: View {
     }
 }
 
-// MARK: - Hotkeys
+// MARK: - General
 
-/// Settings → General. Dictation hotkeys plus the small Updates group (auto
-/// update check + nested beta opt-in). The Updates group used to be its own
-/// tab; it was folded in here because a single toggle and a version string
-/// didn't justify a tenth tab — and the tab strip had already overflowed into
-/// AppKit's ">>" overflow chevron at that width, which is what made the
-/// Updates tab look "disabled" (see PR discussion).
+/// Settings → General: the small Updates group (auto update check + nested
+/// beta opt-in). The Updates group used to be its own tab; it was folded in
+/// here because a single toggle and a version string didn't justify a tenth
+/// tab — and the tab strip had already overflowed into AppKit's ">>" overflow
+/// chevron at that width, which is what made the Updates tab look "disabled"
+/// (see PR discussion).
 ///
 /// The strip is gone as of #177, so the width half of that argument no longer
 /// applies. The other half — a single toggle and a version string don't
 /// deserve their own destination — still does, which is why this stays folded
 /// in.
-/// Settings → General. The dictation shortcuts moved to Settings →
+///
+/// The dictation shortcuts that used to share this tab moved to Settings →
 /// Languages, next to the language each one dictates in.
 private struct GeneralSettingsTab: View {
     var body: some View {

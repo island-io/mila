@@ -287,9 +287,7 @@ final class LiveAISettings: ObservableObject {
         ///   was spoken, so they read the text too.
         static func promptName(output: OutputLanguage, recordingCode: String, text: String) -> String {
             if !output.isAuto { return output.displayName }
-            let base = recordingCode.lowercased()
-                .split(whereSeparator: { $0 == "-" || $0 == "_" })
-                .first.map(String.init) ?? ""
+            let base = RecordingLanguage.baseCode(of: recordingCode)
             if !["he", "iw", "en"].contains(base), WhisperEngine.supportedLanguageCodes.contains(base) {
                 return RecordingLanguage.resolve(base, in: RecordingLanguage.seeds).displayName
             }

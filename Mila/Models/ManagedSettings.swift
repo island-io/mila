@@ -359,8 +359,7 @@ extension ManagedSettings {
     /// a language whisper can't transcribe. Unknown values are dropped (and
     /// logged) instead.
     static func strictLanguage(_ code: String) -> RecordingLanguage? {
-        let normalized = code.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        var base = normalized.split(whereSeparator: { $0 == "-" || $0 == "_" }).first.map { String($0) } ?? ""
+        var base = RecordingLanguage.baseCode(of: code.trimmingCharacters(in: .whitespacesAndNewlines))
         if base == "iw" { base = "he" }
         guard WhisperEngine.supportedLanguageCodes.contains(base) else { return nil }
         return RecordingLanguage.resolve(base, in: RecordingLanguage.seeds)

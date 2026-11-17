@@ -168,9 +168,11 @@ final class ModelManager: NSObject, ObservableObject {
     /// displays as Hebrew, but only the multilingual model can serve a
     /// detect-the-language pass, and that is what it has always transcribed
     /// on. Only reachable by re-transcribing a recording made before
-    /// auto-detect was removed.
+    /// auto-detect was removed. A code-less `""` is the same pass —
+    /// `WhisperEngine.languageParams` hands whisper `"auto"` for it — so it
+    /// stays on the multilingual model too, as it always has.
     func bestModel(for languageCode: String) -> WhisperModel {
-        if languageCode.lowercased() == "auto" { return .openaiTurbo }
+        if languageCode.isEmpty || languageCode.lowercased() == "auto" { return .openaiTurbo }
         return languageModelResolver(languageCode).flatMap(WhisperModel.named) ?? .openaiTurbo
     }
 

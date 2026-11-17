@@ -162,6 +162,15 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertEqual(mgr.bestModel(for: "AUTO"), .openaiTurbo)
     }
 
+    /// A code-less recording also displays as Hebrew, but the engine turns
+    /// `""` into whisper's `auto` (`WhisperEngine.languageParams`) — the same
+    /// detect-the-language pass, so the same model it always ran on.
+    func test_empty_code_routes_to_turbo_like_auto() {
+        let mgr = makeManager()
+        XCTAssertEqual(RecordingLanguage.resolve("", in: RecordingLanguage.seeds).code, "he")
+        XCTAssertEqual(mgr.bestModel(for: ""), .openaiTurbo)
+    }
+
     func test_model_for_language_falls_back_to_selected_when_best_not_installed() throws {
         let mgr = makeManager()
         // Install only the OpenAI turbo, then ask for the Hebrew best model.

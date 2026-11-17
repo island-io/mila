@@ -188,6 +188,16 @@ final class HotkeyManager: HotkeyRegistering {
     func register(_ action: HotkeyAction,
                   binding: HotkeyBinding,
                   onPressed: @escaping () -> Void) -> Bool {
+        // Already live under this very combo: keep the Carbon registration
+        // and take the new handler. `DictationHotkeyBinder` re-applies every
+        // hotkey whenever the language list or any binding changes, and
+        // tearing each one down and re-registering it for an unrelated edit
+        // (a flag, another language's shortcut) would be pure churn.
+        if var existing = registrations[action], existing.binding == binding {
+            existing.handler = onPressed
+            registrations[action] = existing
+            return true
+        }
         unregister(action)
 
         let carbonID = nextCarbonID

@@ -29,7 +29,10 @@ struct LanguagesSettingsTab: View {
                 Text("Languages")
                     .font(.title3.weight(.semibold))
                 Spacer()
-                Button("Add Language…") { showingAdd = true }
+                Button("Add Language…") {
+                    endCapture()
+                    showingAdd = true
+                }
                     .accessibilityIdentifier("languages.add.button")
             }
             Text("The languages you record and dictate in. Each one has its own transcription model and can have a dictation shortcut: press it anywhere in macOS to start dictating, and again to stop and paste. Click a shortcut to record a new one; press Esc to cancel. Removing a language keeps every recording made in it, and adding it back restores its settings.")
@@ -80,11 +83,23 @@ struct LanguagesSettingsTab: View {
         .onDisappear {
             // Window closed mid-capture: don't leave the app's hotkeys
             // parked forever.
-            if recordingAction != nil {
-                recordingAction = nil
-                HotkeyManager.shared.resumeAll()
-            }
+            endCapture()
         }
+    }
+
+    /// Leave capture mode and put the parked hotkeys back.
+    ///
+    /// Everything that changes a binding or the list calls this FIRST. The
+    /// capture field doesn't give up on its own when the user clicks
+    /// elsewhere, and `DictationHotkeyBinder` re-registers on every such
+    /// change: mid-capture it would register live hotkeys next to the parked
+    /// set, and the later `resumeAll()` would then restore that stale set on
+    /// top — bringing back the combo of a shortcut just cleared, or of a
+    /// language just removed, until the next change or relaunch.
+    private func endCapture() {
+        guard recordingAction != nil else { return }
+        recordingAction = nil
+        HotkeyManager.shared.resumeAll()
     }
 
     private func row(for language: RecordingLanguage) -> some View {
@@ -140,15 +155,19 @@ struct LanguagesSettingsTab: View {
                                    HotkeyManager.shared.suspendAll()
                                },
                                onCaptured: { applyCapture($0, for: action) },
-                               onCancel: {
-                                   recordingAction = nil
-                                   HotkeyManager.shared.resumeAll()
-                               })
+                               onCancel: { endCapture() })
                 .frame(width: 140)
 
             Menu {
-                Button("Edit…") { editing = language }
+                Button("Edit…") {
+                    endCapture()
+                    editing = language
+                }
+                // A locked language the user never added is offered from
+                // memory only, so there is no stored entry for Edit to change.
+                .disabled(!languageSettings.languages.contains { $0.code == language.code })
                 Button(HotkeyAction.defaults[action] == nil ? "Clear Shortcut" : "Reset Shortcut") {
+                    endCapture()
                     hotkeys.resetToDefault(action)
                     lastError = nil
                 }
@@ -174,6 +193,7 @@ struct LanguagesSettingsTab: View {
     /// so that one asks first. Any other removal is undone by adding the
     /// language back.
     private func requestRemoval(of language: RecordingLanguage) {
+        endCapture()
         if languageSettings.current.code == language.code {
             pendingRemoval = language
         } else {
@@ -182,8 +202,10 @@ struct LanguagesSettingsTab: View {
     }
 
     private func applyCapture(_ binding: HotkeyBinding, for action: HotkeyAction) {
-        recordingAction = nil
-        HotkeyManager.shared.resumeAll()
+        // A key that lands after capture was ended some other way (a menu
+        // action, another row's field) is not a capture.
+        guard recordingAction == action else { return }
+        endCapture()
 
         // Reject empty / modifier-only combos: Carbon will accept them but
         // Apple shortcut conventions require at least one of ⌘ ⌃ ⌥.

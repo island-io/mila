@@ -1,6 +1,10 @@
 import Foundation
 import Combine
+import os
 import TranscriptionCore
+
+private let languageSettingsLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                         category: "RecordingLanguage")
 
 /// One language a recording can be transcribed in: an entry in the user's
 /// editable list (Settings → Languages), seeded with Hebrew and English.
@@ -42,8 +46,11 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
 
     /// English name from CLDR, matching Mila's English-only chrome.
     var displayName: String {
-        Locale(identifier: "en").localizedString(forLanguageCode: code) ?? code.uppercased()
+        Self.nameLocale.localizedString(forLanguageCode: code) ?? code.uppercased()
     }
+
+    /// Built once — `displayName` is read for every row of every picker.
+    private static let nameLocale = Locale(identifier: "en")
 
     /// Flag and name for menus ("🇮🇱 Hebrew"), or just the name when the
     /// entry has no flag — a user-added language starts without one.
@@ -98,11 +105,14 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
 
     // MARK: - Seeds
 
+    // Model names come from the catalog, so a renamed entry can't leave a
+    // seed pointing at nothing (which would quietly route Hebrew to the
+    // multilingual default).
     static let hebrew = RecordingLanguage(code: "he", flagEmoji: "🇮🇱",
-                                          modelName: "ivrit-ai-whisper-large-v3")
+                                          modelName: WhisperModel.ivritLarge.name)
     /// British flag matches the user's "Israel and UK" mental model.
     static let english = RecordingLanguage(code: "en", flagEmoji: "🇬🇧",
-                                           modelName: "openai-whisper-large-v3-turbo")
+                                           modelName: WhisperModel.openaiTurbo.name)
 
     /// The list a fresh install starts with, in picker order.
     static let seeds: [RecordingLanguage] = [.hebrew, .english]
@@ -141,6 +151,14 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
         if let variant = list.first(where: { isVariant(normalized, of: $0.code) }) { return variant }
         if let seed = seeds.first(where: { isVariant(normalized, of: $0.code) }) { return seed }
         return RecordingLanguage(code: normalized)
+    }
+
+    /// The language part of a code, lowercased, with any region dropped:
+    /// `en-US` and `en_GB` → `en`. Empty for an empty code.
+    nonisolated static func baseCode(of code: String) -> String {
+        code.lowercased()
+            .split(whereSeparator: { $0 == "-" || $0 == "_" })
+            .first.map(String.init) ?? ""
     }
 
     /// Whether `code` is `base` or a regional form of it (`en-US`, `en_GB`).
@@ -227,7 +245,7 @@ final class RecordingLanguageSettings: ObservableObject {
         // disk untouched, so a decode bug never overwrites the user's list.
         let loaded: [RecordingLanguage]
         if let data = defaults.data(forKey: Self.listKey) {
-            let decoded = try? JSONDecoder().decode([RecordingLanguage].self, from: data)
+            let decoded = Self.decodeList(data)
             loaded = (decoded?.contains { !$0.isHidden } == true) ? decoded! : RecordingLanguage.seeds
         } else {
             loaded = RecordingLanguage.seeds
@@ -258,6 +276,33 @@ final class RecordingLanguageSettings: ObservableObject {
                 defaults.set(active, forKey: Self.key)
             }
         }
+    }
+
+    /// The stored list, entry by entry, or nil when the bytes aren't a JSON
+    /// array at all. The defaults plist is user-editable and may come from
+    /// another build, so each row is checked on its own and a bad one is
+    /// dropped rather than costing the user the whole list
+    /// (`bugbot-rules/untrusted-persisted-data.md`):
+    ///
+    /// - a row that doesn't decode (no `code`, wrong type);
+    /// - a code whisper can't transcribe — `add` refuses those, and offering
+    ///   one would only fail at transcription time;
+    /// - a repeated code — every lookup is by code and the pickers use it as
+    ///   the row id, so the first one wins.
+    private nonisolated static func decodeList(_ data: Data) -> [RecordingLanguage]? {
+        struct Row: Decodable {
+            let entry: RecordingLanguage?
+            init(from decoder: Decoder) throws { entry = try? RecordingLanguage(from: decoder) }
+        }
+        guard let rows = try? JSONDecoder().decode([Row].self, from: data) else { return nil }
+        var seen: Set<String> = []
+        let kept = rows.compactMap(\.entry).filter {
+            WhisperEngine.supportedLanguageCodes.contains($0.code) && seen.insert($0.code).inserted
+        }
+        if kept.count != rows.count {
+            languageSettingsLog.error("language list: dropped \(rows.count - kept.count, privacy: .public) of \(rows.count, privacy: .public) stored entries (undecodable, unknown to whisper, or duplicate)")
+        }
+        return kept
     }
 
     /// The visible entry for `code` (exact or regional variant), or nil.
@@ -308,10 +353,14 @@ final class RecordingLanguageSettings: ObservableObject {
     /// list can mark it and adding it restores its settings.
     func addableLanguages() -> [RecordingLanguage] {
         let offered = Set(visible.map(\.code))
+        // Names are looked up once per entry, not once per comparison: the
+        // Add sheet calls this on every keystroke of its search field.
         return WhisperEngine.supportedLanguageCodes
             .filter { !offered.contains($0) }
             .map { code in languages.first { $0.code == code } ?? RecordingLanguage(code: code) }
-            .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            .map { (name: $0.displayName, entry: $0) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            .map { $0.entry }
     }
 
     // MARK: - Editing
