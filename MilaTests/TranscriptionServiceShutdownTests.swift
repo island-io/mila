@@ -189,6 +189,7 @@ extension TranscriptionServiceShutdownTests {
     func test_shutdown_waits_for_prewarm_before_local_teardown_and_is_idempotent() async throws {
         let fixture = try ServiceShutdownFixture(stage: .load, local: true)
         defer { fixture.cleanUp() }
+        fixture.service.retainsLocalModel = true
         fixture.service.prewarm(language: "en")
         await fulfillment(of: [fixture.local.gate.entered], timeout: 10)
         let finished = expectation(description: "both shutdown callers returned")
