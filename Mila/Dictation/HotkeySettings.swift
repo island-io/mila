@@ -117,12 +117,23 @@ final class DictationHotkeyBinder {
     }
 
     /// Which action should be live under which combo.
+    ///
+    /// A combo goes to the FIRST visible language in list order that has it.
+    /// Duplicates are possible: Settings only checks collisions among visible
+    /// languages, and a hidden language keeps its binding (or its seed
+    /// default), so re-adding it can bring back a combo another language took
+    /// meanwhile. Without this, which one Carbon kept would depend on
+    /// dictionary order; now the loser is deterministic and shows Settings'
+    /// "couldn't be registered" warning.
     static func wanted(bindings: [HotkeyAction: HotkeyBinding],
                        languages: [RecordingLanguage]) -> [HotkeyAction: HotkeyBinding] {
         var out: [HotkeyAction: HotkeyBinding] = [:]
+        var taken: Set<HotkeyBinding> = []
         for language in languages where !language.isHidden {
             let action = HotkeyAction(languageCode: language.code)
-            if let binding = bindings[action] { out[action] = binding }
+            if let binding = bindings[action], taken.insert(binding).inserted {
+                out[action] = binding
+            }
         }
         return out
     }

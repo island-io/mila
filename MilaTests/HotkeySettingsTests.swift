@@ -249,4 +249,23 @@ final class DictationHotkeyBinderTests: XCTestCase {
         XCTAssertEqual(pressed, [.dictateHebrew])
         _ = binder
     }
+
+    /// Two visible languages can end up with the same combo (a hidden one
+    /// keeps its binding and is re-added later). The first in list order
+    /// keeps it, whatever the dictionary order of `bindings`.
+    func test_a_shared_combo_goes_to_the_first_language_in_list_order() {
+        let combo = HotkeyAction.defaults[.dictateHebrew]!
+        let ru = HotkeyAction(languageCode: "ru")
+        let list = RecordingLanguage.seeds + [RecordingLanguage(code: "ru")]
+        let bindings: [HotkeyAction: HotkeyBinding] = [ru: combo, .dictateHebrew: combo]
+
+        let wanted = DictationHotkeyBinder.wanted(bindings: bindings, languages: list)
+        XCTAssertEqual(wanted[.dictateHebrew], combo)
+        XCTAssertNil(wanted[ru])
+
+        let reordered = [RecordingLanguage(code: "ru")] + RecordingLanguage.seeds
+        let wanted2 = DictationHotkeyBinder.wanted(bindings: bindings, languages: reordered)
+        XCTAssertEqual(wanted2[ru], combo)
+        XCTAssertNil(wanted2[.dictateHebrew])
+    }
 }
