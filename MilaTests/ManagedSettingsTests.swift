@@ -315,8 +315,8 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
                          write: { o.apiKey += "-changed" })
         case .recordingLanguage:
             let o = RecordingLanguageSettings(defaults: defaults, managed: managed)
-            return Probe(object: o, objectWillChange: publisher(o), read: { o.current.rawValue },
-                         write: { o.current = o.current.other })
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.current.code },
+                         write: { o.current = o.visible.first { $0.code != o.current.code }! })
         case .liveAIEnabled:
             let o = LiveAISettings(defaults: defaults, managed: managed)
             return Probe(object: o, objectWillChange: publisher(o), read: { "\(o.enabled)" },

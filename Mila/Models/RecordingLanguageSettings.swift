@@ -74,6 +74,11 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
     /// The list a fresh install starts with, in picker order.
     static let seeds: [RecordingLanguage] = [.hebrew, .english]
 
+    /// The languages a summary can be written in (per-recording override and
+    /// `LiveAISettings.OutputLanguage`). Fixed to the seeds on purpose: it is
+    /// independent of the user's editable transcription list.
+    static let summaryChoices: [RecordingLanguage] = seeds
+
     // MARK: - Resolution
 
     /// The entry a stored code means — for displaying and re-transcribing a

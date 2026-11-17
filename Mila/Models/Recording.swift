@@ -163,13 +163,13 @@ struct Recording: Identifiable, Codable, Hashable {
     var summaryLanguage: String?
 
     /// `summaryLanguage` as a `RecordingLanguage`, or nil when unset OR
-    /// unrecognised. Deliberately `init(rawValue:)` rather than
+    /// unrecognised. Deliberately an exact match against `summaryChoices` rather than
     /// `RecordingLanguage.fromCode`: `fromCode` falls back to Hebrew for any
     /// unknown string, which would turn a hand-edited `"fr"` in
     /// recordings.json into a silent Hebrew override. Unknown → nil → the
     /// global setting applies (`bugbot-rules/untrusted-persisted-data.md`).
     var summaryLanguageOverride: RecordingLanguage? {
-        summaryLanguage.flatMap(RecordingLanguage.init(rawValue:))
+        summaryLanguage.flatMap { code in RecordingLanguage.summaryChoices.first { $0.code == code } }
     }
 
     /// Display name of the person who shared this recording, when it arrived

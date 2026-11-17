@@ -394,7 +394,7 @@ struct ShareManifest: Codable, Equatable {
         // Only a language this build can summarise in is kept.
         // `Recording.summaryLanguageOverride` would read anything else as
         // unset anyway; dropping it here keeps it out of recordings.json.
-        if let lang = recording.summaryLanguage, RecordingLanguage(rawValue: lang) == nil {
+        if let lang = recording.summaryLanguage, !RecordingLanguage.summaryChoices.contains { $0.code == lang } {
             copy.recording.summaryLanguage = nil
         }
         return copy

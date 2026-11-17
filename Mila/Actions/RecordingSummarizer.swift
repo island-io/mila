@@ -406,13 +406,13 @@ final class RecordingSummarizer: ObservableObject {
     /// back in the same language.
     func setSummaryLanguage(_ language: RecordingLanguage?, for recordingID: UUID) {
         guard let live = liveRecording(recordingID) else { return }
-        let code = language?.rawValue
+        let code = language?.code
         guard live.summaryLanguage != code else {
             summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): unchanged — nothing to do")
             return
         }
         guard let updated = store.setSummaryLanguage(code, recordingID: recordingID) else { return }
-        guard live.summaryLanguageOverride != language else {
+        guard live.summaryLanguageOverride?.code != language?.code else {
             summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): normalised an unrecognised code — language in force unchanged, not regenerating")
             return
         }

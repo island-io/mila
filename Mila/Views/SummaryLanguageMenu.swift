@@ -39,11 +39,11 @@ struct SummaryLanguageMenu: View {
             }
             .accessibilityIdentifier("summaryLanguage.default")
             Divider()
-            ForEach(RecordingLanguage.allCases) { lang in
-                Button(label("\(lang.flagEmoji) \(lang.displayName)", selected: current == lang)) {
+            ForEach(RecordingLanguage.summaryChoices) { lang in
+                Button(label("\(lang.flagEmoji) \(lang.displayName)", selected: current?.code == lang.code)) {
                     onPick(lang)
                 }
-                .accessibilityIdentifier("summaryLanguage.\(lang.rawValue)")
+                .accessibilityIdentifier("summaryLanguage.\(lang.code)")
             }
         }
         .disabled(isDisabled)
