@@ -228,34 +228,34 @@ struct HomeView: View {
         .controlSize(.small)
     }
 
-    /// Discrete reminder of the two global dictation hotkeys. Reads live
-    /// from HotkeySettings so a rebind in Settings is reflected here
-    /// without a restart. Visually low-key — secondary color, small
-    /// caption font, no background pill / button affordance — because
-    /// this is a hint about something the user does OUTSIDE the app via
-    /// the system-wide hotkey, not a button to click.
+    /// Discrete reminder of the global dictation hotkeys — one per offered
+    /// language that has a binding. Reads live from HotkeySettings so a
+    /// rebind in Settings is reflected here without a restart. Visually
+    /// low-key — secondary color, small caption font, no background pill /
+    /// button affordance — because this is a hint about something the user
+    /// does OUTSIDE the app via the system-wide hotkey, not a button to click.
     private var dictationHint: some View {
-        HStack(spacing: 14) {
-            HStack(spacing: 4) {
-                Text("🇬🇧")
-                Text("dictate")
-                Text(hotkeys.binding(for: .dictateEnglish).displayName)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.primary.opacity(0.7))
-            }
-            Text("·")
-                .foregroundStyle(.tertiary)
-            HStack(spacing: 4) {
-                Text("🇮🇱")
-                Text("dictate")
-                Text(hotkeys.binding(for: .dictateHebrew).displayName)
-                    .font(.system(.caption, design: .monospaced))
-                    .foregroundStyle(.primary.opacity(0.7))
+        let bound = languageSettings.visible.compactMap { language in
+            hotkeys.binding(for: HotkeyAction(languageCode: language.code)).map { (language, $0) }
+        }
+        return HStack(spacing: 14) {
+            ForEach(Array(bound.enumerated()), id: \.element.0.id) { index, pair in
+                if index > 0 {
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                }
+                HStack(spacing: 4) {
+                    Text(pair.0.flagEmoji.isEmpty ? pair.0.code.uppercased() : pair.0.flagEmoji)
+                    Text("dictate")
+                    Text(pair.1.displayName)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.primary.opacity(0.7))
+                }
             }
         }
         .font(.caption)
         .foregroundStyle(.secondary)
-        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → General.")
+        .help("Press these shortcuts anywhere in macOS to dictate. Configure in Settings → Languages.")
         .accessibilityIdentifier("home.dictation.hint")
     }
 
@@ -475,7 +475,9 @@ private struct HeroRecordButton: View {
         case (false, true):  sourceLabel = "App audio only"
         case (false, false): sourceLabel = "No source selected"
         }
-        return "\(languageFlag) \(languageName) · \(sourceLabel)"
+        return languageFlag.isEmpty
+            ? "\(languageName) · \(sourceLabel)"
+            : "\(languageFlag) \(languageName) · \(sourceLabel)"
     }
 
     private var backgroundColors: [Color] {

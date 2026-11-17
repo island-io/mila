@@ -15,10 +15,12 @@ running through `whisper.cpp` (GPU via Metal).
 - **Record system audio** from a single app (Zoom, Google Meet in Chrome,
   Slack, etc.) via `ScreenCaptureKit` — no virtual audio device required.
 - **Record meetings** = mic + system audio mixed into one mono 16 kHz WAV file.
-- **Dictate in two languages** with separate global hotkeys:
+- **Record and dictate in any language whisper supports.** Hebrew and English
+  come preset; add Russian, Arabic, French and the rest in
+  **Settings → Languages**, each with its own model and optional global
+  dictation hotkey:
     - `⌘2` — English dictation (OpenAI `large-v3-turbo`)
     - `⌘3` — Hebrew dictation (ivrit.ai `large-v3`)
-  Both hotkeys are user-configurable in **Settings → General**.
 - **Transcribe on-device** with ivrit.ai `large-v3` (Hebrew) or OpenAI
   `large-v3-turbo` (English / multilingual). Audio never leaves your Mac.
 - **Transcribe on a remote server** — point Mila at any OpenAI-compatible

@@ -446,6 +446,9 @@ struct MilaApp: App {
                                        remoteSettings: remoteSettings)
         let session = RecordingSession()
         let langSettings = RecordingLanguageSettings(managed: managedSettings)
+        // Local model routing follows the user's language list (he → ivrit.ai
+        // by seed, a new language → whatever its entry names).
+        mgr.languageModelResolver = { [langSettings] in langSettings.resolve($0).modelName }
         let audioSettings = AudioInputSettings()
         let inputMonitor = InputLevelMonitor()
         inputMonitor.preferredUID = audioSettings.preferredUID
@@ -1020,6 +1023,7 @@ struct MilaApp: App {
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
                                                       hotkeySettings: hotkeys,
+                                                      languageSettings: langSettings,
                                                       liveTranscriber: dictationTrans)
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
@@ -1211,11 +1215,14 @@ struct MilaApp: App {
                 }
             }
             CommandMenu("Dictation") {
-                Button("English Dictation (\(hotkeySettings.binding(for: .dictateEnglish).displayName))") {
-                    Task { await dictation.toggle(action: .dictateEnglish) }
-                }
-                Button("Hebrew Dictation (\(hotkeySettings.binding(for: .dictateHebrew).displayName))") {
-                    Task { await dictation.toggle(action: .dictateHebrew) }
+                // One item per offered language. Works without a hotkey too —
+                // the combo in the title is only a reminder.
+                ForEach(languageSettings.visible) { language in
+                    let action = HotkeyAction(languageCode: language.code)
+                    let combo = hotkeySettings.binding(for: action).map { " (\($0.displayName))" } ?? ""
+                    Button("\(language.displayName) Dictation\(combo)") {
+                        Task { await dictation.toggle(action: action) }
+                    }
                 }
             }
             // Surface the diagnostic-report action under Help so a user
@@ -1234,6 +1241,7 @@ struct MilaApp: App {
                 .environmentObject(storageSettings)
                 .environmentObject(modelManager)
                 .environmentObject(hotkeySettings)
+                .environmentObject(languageSettings)
                 .environmentObject(transcription)
                 .environmentObject(audioInputSettings)
                 .environmentObject(inputLevelMonitor)
@@ -1871,7 +1879,7 @@ struct MilaApp: App {
                 // is saved.
                 diarizer?.submit(samples: samples, startSeconds: start, endSeconds: end)
             }
-            transcriber.start(language: langSettings.current.rawValue)
+            transcriber.start(language: langSettings.current.code)
             print("wireLiveAIPipeline: .recording — installing onLiveSamples → liveTranscriber.ingest")
             sessionRef.onLiveSamples = { [weak transcriber] samples in
                 // The callback is invoked synchronously from
@@ -2371,7 +2379,7 @@ struct MilaApp: App {
         guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
-        transcription.prewarm(language: languageSettings.current.rawValue)
+        transcription.prewarm(language: languageSettings.current.code)
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest

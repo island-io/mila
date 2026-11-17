@@ -47,7 +47,7 @@ remoteTranscription        dictionary   the remote (OpenAI-compatible) transcrip
 ├─ model                   string       model id the server expects
 ├─ englishModel            string       model id for English recordings ("" = use model for all)
 └─ apiKey                  string       bearer token — read "Secrets" below first
-recordingLanguage          string       he or en (regional forms like en-US accepted)
+recordingLanguage          string       a whisper language code: he, en, ru, … (regional forms like en-US accepted)
 liveAI                     dictionary
 ├─ enabled                 boolean      Live AI mode on/off
 └─ model                   string       model passed to the AI CLI for the live loop
@@ -60,7 +60,7 @@ meetingDetection           dictionary
 | Top-level key | Type | Keys inside it |
 |---|---|---|
 | `remoteTranscription` | dictionary | `enabled` (boolean), `endpoint` (string), `model` (string), `englishModel` (string), `apiKey` (string) |
-| `recordingLanguage` | string | — (`he` or `en`) |
+| `recordingLanguage` | string | — (a language code: `he`, `en`, `ru`, …) |
 | `liveAI` | dictionary | `enabled` (boolean), `model` (string) |
 | `diarization` | dictionary | `enabled` (boolean) |
 | `meetingDetection` | dictionary | `enabled` (boolean) |
@@ -68,12 +68,17 @@ meetingDetection           dictionary
 Notes on individual keys:
 
 - `endpoint`: Mila appends `audio/transcriptions` to it.
-- `englishModel`: for servers whose main model is Hebrew-only (an ivrit.ai
-  finetune, for example). An empty string means `model` handles every language.
-- `recordingLanguage`: must be `he`, `iw` or `en`, or a regional form of one
-  (`en-US`, `he_IL`). **Any other value is not applied** (and is logged):
-  rather than guessing a language, the setting stays locked at whatever each
-  user already had. **Locking it disables the language
+- `englishModel`: the model for every language except Hebrew, for servers whose
+  main model is Hebrew-only (an ivrit.ai finetune, for example). An empty string
+  means `model` handles every language.
+- `recordingLanguage`: any language code whisper can transcribe (`he`, `en`,
+  `ru`, `ar`, …), the legacy `iw` for Hebrew, or a regional form of one
+  (`en-US`, `he_IL`, `pt-BR`). **Any other value is not applied** (and is
+  logged): rather than guessing a language, the setting stays locked at
+  whatever each user already had. The locked language is offered even if a user
+  removed it from (or never added it to) Settings → Languages, and it can't be
+  removed while the profile is installed; each user's own list is left as it
+  was, so removing the profile restores it. **Locking it disables the language
   picker in the toolbar**, so users can no longer switch language per recording
   — leave it out unless that is what you want.
 

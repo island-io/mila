@@ -435,8 +435,11 @@ final class RemoteTranscriptionSettings: ObservableObject {
     /// mirror of `ModelManager.model(for:)`, which does the same routing for the
     /// on-device backend.
     ///
-    /// * `he` (and legacy `iw`/unrecognised codes) → `model`, the primary.
-    /// * `en` → `englishModel`.
+    /// * `he` (and legacy `iw`/`""`, and regional variants) → `model`, the
+    ///   primary — the Hebrew specialist in the two-model setup.
+    /// * every other language → `englishModel`, the multilingual slot (the
+    ///   storage key keeps its historical name). A user-added language must
+    ///   not land on a Hebrew-only finetune.
     /// * legacy `auto` → `englishModel`, the only one that can serve a
     ///   detect-the-language request. Auto-detect was retired as a user
     ///   choice (see `RecordingLanguage`), but recordings made under it keep
@@ -449,10 +452,10 @@ final class RemoteTranscriptionSettings: ObservableObject {
         let english = englishModel.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !english.isEmpty else { return primary }
         if languageCode.lowercased() == "auto" { return english }
-        switch RecordingLanguage.fromCode(languageCode) {
-        case .hebrew:   return primary
-        case .english:  return english
-        }
+        // Seeds are enough here: only the Hebrew aliases and variants matter,
+        // and a hidden Hebrew entry still has code "he".
+        let resolved = RecordingLanguage.resolve(languageCode, in: RecordingLanguage.seeds)
+        return resolved.code == "he" ? primary : english
     }
 
     /// Trim a user-entered model id, falling back to the default when blank.

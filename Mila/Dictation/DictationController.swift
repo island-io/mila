@@ -55,8 +55,7 @@ final class DictationController: ObservableObject {
 
     private let store: RecordingStore
     private let transcription: TranscriptionService
-    private let hotkeySettings: HotkeySettings
-    private var bindingsObserver: AnyCancellable?
+    private var hotkeyBinder: DictationHotkeyBinder?
     /// Late-bound by MilaApp. Enforces the storage cap for dictation too,
     /// so a full library blocks new clips consistently with Settings copy.
     var storageSettings: RecordingStorageSettings?
@@ -64,25 +63,17 @@ final class DictationController: ObservableObject {
     init(store: RecordingStore,
          transcription: TranscriptionService,
          hotkeySettings: HotkeySettings,
+         languageSettings: RecordingLanguageSettings,
          liveTranscriber: LiveTranscriber) {
         self.store = store
         self.transcription = transcription
-        self.hotkeySettings = hotkeySettings
         self.liveTranscriber = liveTranscriber
-        registerHotkeys()
-        bindingsObserver = hotkeySettings.$bindings
-            .dropFirst()
-            .sink { [weak self] _ in self?.registerHotkeys() }
-    }
-
-    // MARK: - Hotkey wiring
-
-    private func registerHotkeys() {
-        for action in HotkeyAction.allCases {
-            let binding = hotkeySettings.binding(for: action)
-            HotkeyManager.shared.register(action, binding: binding) { [weak self] in
-                Task { await self?.toggle(action: action) }
-            }
+        // One global hotkey per visible language with a binding; the binder
+        // re-registers whenever either the list or a binding changes.
+        hotkeyBinder = DictationHotkeyBinder(hotkeys: hotkeySettings,
+                                             languages: languageSettings,
+                                             registrar: HotkeyManager.shared) { [weak self] action in
+            Task { await self?.toggle(action: action) }
         }
     }
 

@@ -162,9 +162,17 @@ final class MilaConfigImporter: ObservableObject {
             }
         }
         if let langCode = config.recordingLanguage {
-            let target = RecordingLanguage.fromCode(langCode)
-            if target != language.current {
-                out.append(.init(label: ManagedField.recordingLanguage.label, value: target.displayName))
+            // Only a language the user's list offers can become active —
+            // `current`'s setter ignores anything else — so say it's skipped
+            // rather than preview a change that won't happen.
+            if let target = language.configured(langCode) {
+                if target.code != language.current.code {
+                    out.append(.init(label: ManagedField.recordingLanguage.label, value: target.displayName))
+                }
+            } else {
+                let name = language.resolve(langCode).displayName
+                out.append(.init(label: ManagedField.recordingLanguage.label,
+                                 value: "\(name) (not in your languages — skipped)"))
             }
         }
         if let live = config.liveAI {
@@ -231,7 +239,7 @@ final class MilaConfigImporter: ObservableObject {
             if let enabled = r.enabled { remote.backend = enabled ? .remote : .local }
         }
         if let langCode = config.recordingLanguage {
-            language.current = RecordingLanguage.fromCode(langCode)
+            if let target = language.configured(langCode) { language.current = target }
         }
         if let live = config.liveAI {
             if let enabled = live.enabled { liveAI.enabled = enabled }

@@ -406,13 +406,13 @@ final class RecordingSummarizer: ObservableObject {
     /// back in the same language.
     func setSummaryLanguage(_ language: RecordingLanguage?, for recordingID: UUID) {
         guard let live = liveRecording(recordingID) else { return }
-        let code = language?.rawValue
+        let code = language?.code
         guard live.summaryLanguage != code else {
             summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): unchanged — nothing to do")
             return
         }
         guard let updated = store.setSummaryLanguage(code, recordingID: recordingID) else { return }
-        guard live.summaryLanguageOverride != language else {
+        guard live.summaryLanguageOverride?.code != language?.code else {
             summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): normalised an unrecognised code — language in force unchanged, not regenerating")
             return
         }
@@ -881,11 +881,9 @@ final class RecordingSummarizer: ObservableObject {
 
     /// The language name the one-shot prompt is written for: the recording's
     /// own `summaryLanguageOverride` when the user set one, otherwise the
-    /// global `LiveAISettings.outputLanguage` — with `.auto` resolved against
-    /// the transcript text here rather than passed to the model as "match the
-    /// transcript", because Claude / cursor-agent obey a concrete "Output in
-    /// Hebrew" far more reliably than an introspective instruction (same
-    /// reasoning as `LiveAISession.kick`).
+    /// global `LiveAISettings.outputLanguage` — with `.auto` resolved to a
+    /// concrete language by `OutputLanguage.promptName` (the language the
+    /// transcript is in, not the one a re-run in flight will produce).
     ///
     /// Pure and static so a test can pin the resolution order without a
     /// store or a runner. Returns the exact token substituted for
@@ -895,14 +893,9 @@ final class RecordingSummarizer: ObservableObject {
         if let override = recording.summaryLanguageOverride {
             return override.displayName
         }
-        switch global {
-        case .auto:
-            return recording.fullText.isPredominantlyHebrew ? "Hebrew" : "English"
-        case .english:
-            return "English"
-        case .hebrew:
-            return "Hebrew"
-        }
+        return LiveAISettings.OutputLanguage.promptName(output: global,
+                                                        recordingCode: recording.transcriptLanguage,
+                                                        text: recording.fullText)
     }
 
     /// The one line that always carries the output language to the model.

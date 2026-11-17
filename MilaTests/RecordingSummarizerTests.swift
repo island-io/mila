@@ -1217,8 +1217,7 @@ final class RecordingSummarizerTests: XCTestCase {
     }
 
     /// recordings.json is user-editable on disk. A code the app does not know
-    /// must fall back to the global setting — NOT to Hebrew, which is what
-    /// `RecordingLanguage.fromCode` would have done
+    /// must fall back to the global setting, never to a guessed language
     /// (`bugbot-rules/untrusted-persisted-data.md`).
     func test_summarize_ignores_an_unknown_persisted_summary_language() async throws {
         llm.tool = .claude
@@ -1230,7 +1229,7 @@ final class RecordingSummarizerTests: XCTestCase {
         }
 
         var rec = try addRecording(named: "Unknown", text: "we discussed the roadmap")
-        rec.summaryLanguage = "fr"
+        rec.summaryLanguage = "klingon"
         store.update(rec)
         XCTAssertNil(rec.summaryLanguageOverride, "an unknown code is not an override")
 
@@ -1725,7 +1724,7 @@ final class RecordingSummarizerTests: XCTestCase {
         }
 
         let rec = try addRecording(named: "Junk", text: "a transcript")
-        _ = store.setSummaryLanguage("fr", recordingID: rec.id)
+        _ = store.setSummaryLanguage("klingon", recordingID: rec.id)
         summarizer.summarizeIfNeeded(try XCTUnwrap(store.recordings.first { $0.id == rec.id }))
         summarizer.setSummaryLanguage(nil, for: rec.id)
         XCTAssertNil(store.recordings.first { $0.id == rec.id }?.summaryLanguage)
@@ -2072,7 +2071,7 @@ final class RecordingSummarizerTests: XCTestCase {
         // so picking Default cleans the stored value WITHOUT an LLM call —
         // the language in force did not change — while a concrete language
         // is a real change.
-        store.setSummaryLanguage("fr", recordingID: rec.id)
+        store.setSummaryLanguage("klingon", recordingID: rec.id)
         summarizer.setSummaryLanguage(nil, for: rec.id)
         XCTAssertFalse(summarizer.isSummarizing(rec.id))
         XCTAssertEqual(callCount, 2, "Default on an unknown code is still the ✓'d entry")

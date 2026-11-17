@@ -80,8 +80,8 @@ struct LiveAIRecordingView: View {
 
     /// Recording's current language. Drives RTL handling for the
     /// transcript pane + friendly speaker labels.
-    private var language: String { languageSettings.current.rawValue }
-    private var isRTL: Bool { language == "he" }
+    private var language: String { languageSettings.current.code }
+    private var isRTL: Bool { RecordingLanguage.isRTL(code: language) }
     private var aiActive: Bool {
         liveAISettings.enabled && llmSettings.isConfigured
             && !llmSettings.liveAIDisabledByRemoteOpenAI
@@ -118,15 +118,12 @@ struct LiveAIRecordingView: View {
     /// transcript pane: flipping layoutDirection mis-measured inside the
     /// split view / open sidebar and shoved Hebrew to the left.
     private var aiOutputIsRTL: Bool {
-        switch liveAISettings.outputLanguage {
-        case .hebrew: return true
-        case .english: return false
-        case .auto:
-            if language == "he" { return true }
-            let combined = aiSession.summary + " "
-                + aiSession.actionItems.map(\.text).joined(separator: " ")
-            return combined.isPredominantlyHebrew
-        }
+        let output = liveAISettings.outputLanguage
+        if !output.isAuto { return RecordingLanguage.isRTL(code: output.rawValue) }
+        if RecordingLanguage.isRTL(code: language) { return true }
+        let combined = aiSession.summary + " "
+            + aiSession.actionItems.map(\.text).joined(separator: " ")
+        return combined.isPredominantlyRTL
     }
 
     // MARK: - Header
@@ -178,7 +175,7 @@ struct LiveAIRecordingView: View {
             HStack(spacing: 6) {
                 Image(systemName: "globe")
                     .foregroundStyle(.secondary)
-                Text("\(languageSettings.current.flagEmoji) \(languageSettings.current.displayName)")
+                Text("\(languageSettings.current.label)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -460,8 +457,8 @@ struct LiveAIRecordingView: View {
         // more reliable than the language dropdown, which the user
         // may not have flipped before pressing Record.
         let paneIsRTL = transcriber.fullText.isEmpty
-            ? (language == "he")
-            : transcriber.fullText.isPredominantlyHebrew
+            ? RecordingLanguage.isRTL(code: language)
+            : transcriber.fullText.isPredominantlyRTL
         // For Hebrew we use explicit `.trailing` frame alignment +
         // `.trailing` text alignment instead of flipping
         // `\.layoutDirection`. Setting layoutDirection here
@@ -927,7 +924,7 @@ private struct TranscriptLineView: View {
         // when the line's text is the opposite of the pane (mixed-language
         // calls — a single English aside inside a Hebrew conversation
         // should still display LTR within its own line).
-        let lineRTL = segment.text.isPredominantlyHebrew || language == "he"
+        let lineRTL = segment.text.isPredominantlyRTL || RecordingLanguage.isRTL(code: language)
         // Outer HStack stays LTR so the trash control is always the
         // physical trailing child. Inner stack owns lineRTL for speaker
         // + text; putting the button inside that stack would mirror it

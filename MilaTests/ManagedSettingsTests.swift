@@ -169,15 +169,20 @@ final class ManagedSettingsParsingTests: XCTestCase {
         XCTAssertEqual(managed.liveAIModel, "nested")
     }
 
-    /// `RecordingLanguage.fromCode` reads anything unknown as Hebrew — fine for
-    /// legacy recordings, wrong for a lock: a typo would pin everyone to Hebrew.
+    /// `RecordingLanguage.resolve` turns anything unknown into a synthesized
+    /// entry — fine for a legacy recording, wrong for a lock: a typo would pin
+    /// everyone to a language whisper can't transcribe.
     func test_recordingLanguage_isValidatedStrictly() {
         XCTAssertEqual(ManagedSettings.strictLanguage("en"), .english)
         XCTAssertEqual(ManagedSettings.strictLanguage("en-US"), .english)
         XCTAssertEqual(ManagedSettings.strictLanguage(" EN "), .english)
         XCTAssertEqual(ManagedSettings.strictLanguage("he_IL"), .hebrew)
         XCTAssertEqual(ManagedSettings.strictLanguage("iw"), .hebrew)
+        XCTAssertEqual(ManagedSettings.strictLanguage("ru")?.code, "ru",
+                       "any language whisper knows can be locked, not just the seeds")
+        XCTAssertEqual(ManagedSettings.strictLanguage("pt-BR")?.code, "pt")
         XCTAssertNil(ManagedSettings.strictLanguage("auto"))
+        XCTAssertNil(ManagedSettings.strictLanguage("klingon"))
         XCTAssertNil(ManagedSettings.strictLanguage("enochian"))
         XCTAssertNil(ManagedSettings.strictLanguage("eng"))
         XCTAssertNil(ManagedSettings.strictLanguage(""))
@@ -315,8 +320,8 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
                          write: { o.apiKey += "-changed" })
         case .recordingLanguage:
             let o = RecordingLanguageSettings(defaults: defaults, managed: managed)
-            return Probe(object: o, objectWillChange: publisher(o), read: { o.current.rawValue },
-                         write: { o.current = o.current.other })
+            return Probe(object: o, objectWillChange: publisher(o), read: { o.current.code },
+                         write: { o.current = o.visible.first { $0.code != o.current.code }! })
         case .liveAIEnabled:
             let o = LiveAISettings(defaults: defaults, managed: managed)
             return Probe(object: o, objectWillChange: publisher(o), read: { "\(o.enabled)" },
@@ -607,6 +612,54 @@ final class ManagedSettingsEnforcementTests: XCTestCase {
         XCTAssertEqual(defaults.string(forKey: "recording.language"), "he")
         XCTAssertEqual(RecordingLanguageSettings(defaults: defaults).current, .hebrew,
                        "Without the profile the user's own choice comes back")
+    }
+
+    /// A lock on a language the user never added: it is offered and active,
+    /// but the user's stored list is left exactly as it was.
+    func test_language_forced_outsideTheList_isOfferedWithoutTouchingTheList() throws {
+        let defaults = freshDefaults(#function)
+        var managed = ManagedSettings.empty
+        managed.recordingLanguage = try XCTUnwrap(ManagedSettings.strictLanguage("ru"))
+        let storedBefore = RecordingLanguageSettings(defaults: defaults).languages
+
+        let language = RecordingLanguageSettings(defaults: defaults, managed: managed)
+        XCTAssertEqual(language.current.code, "ru")
+        XCTAssertEqual(language.visible.map(\.code), ["he", "en", "ru"])
+        XCTAssertNotNil(language.configured("ru"), "pickers and menus must show the active language")
+        XCTAssertFalse(language.remove(code: "ru"), "the locked language can't be removed")
+
+        XCTAssertEqual(RecordingLanguageSettings(defaults: defaults).languages, storedBefore,
+                       "the lock is not written into the user's list")
+    }
+
+    /// A lock on a language the user removed: offered again while locked,
+    /// keeping its flag and model; still hidden once the profile goes away.
+    func test_language_forced_onAHiddenLanguage_isOfferedWhileLocked() {
+        let defaults = freshDefaults(#function)
+        RecordingLanguageSettings(defaults: defaults).remove(code: "he")
+        var managed = ManagedSettings.empty
+        managed.recordingLanguage = .hebrew
+
+        let language = RecordingLanguageSettings(defaults: defaults, managed: managed)
+        XCTAssertEqual(language.current.code, "he")
+        XCTAssertEqual(language.visible.map(\.code), ["he", "en"])
+        XCTAssertEqual(language.configured("he")?.modelName, RecordingLanguage.hebrew.modelName)
+        XCTAssertFalse(language.remove(code: "he"))
+
+        let unlocked = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertNil(unlocked.configured("he"), "without the profile it is hidden again")
+    }
+
+    /// The locked language doesn't count toward "keep at least one": the user
+    /// can't end up with only the admin's language and none of their own.
+    func test_language_forced_theUsersLastLanguageCannotBeRemoved() throws {
+        let defaults = freshDefaults(#function)
+        RecordingLanguageSettings(defaults: defaults).remove(code: "he")
+        var managed = ManagedSettings.empty
+        managed.recordingLanguage = try XCTUnwrap(ManagedSettings.strictLanguage("ru"))
+
+        let language = RecordingLanguageSettings(defaults: defaults, managed: managed)
+        XCTAssertFalse(language.remove(code: "en"))
     }
 }
 

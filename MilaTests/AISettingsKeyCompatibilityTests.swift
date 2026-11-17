@@ -192,14 +192,15 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         // tenth costs scrollable vertical space rather than a re-measured tab
         // strip. Adding one here plus a case is the whole job.
         XCTAssertEqual(SettingsTab.general.rawValue, 0)
-        XCTAssertEqual(SettingsTab.audio.rawValue, 1)
-        XCTAssertEqual(SettingsTab.models.rawValue, 2)
-        XCTAssertEqual(SettingsTab.aiProvider.rawValue, 3)
-        XCTAssertEqual(SettingsTab.aiFeatures.rawValue, 4)
-        XCTAssertEqual(SettingsTab.speakers.rawValue, 5)
-        XCTAssertEqual(SettingsTab.meetings.rawValue, 6)
-        XCTAssertEqual(SettingsTab.voiceMemos.rawValue, 7)
-        XCTAssertEqual(SettingsTab.storage.rawValue, 8)
+        XCTAssertEqual(SettingsTab.languages.rawValue, 1)
+        XCTAssertEqual(SettingsTab.audio.rawValue, 2)
+        XCTAssertEqual(SettingsTab.models.rawValue, 3)
+        XCTAssertEqual(SettingsTab.aiProvider.rawValue, 4)
+        XCTAssertEqual(SettingsTab.aiFeatures.rawValue, 5)
+        XCTAssertEqual(SettingsTab.speakers.rawValue, 6)
+        XCTAssertEqual(SettingsTab.meetings.rawValue, 7)
+        XCTAssertEqual(SettingsTab.voiceMemos.rawValue, 8)
+        XCTAssertEqual(SettingsTab.storage.rawValue, 9)
     }
 
     // MARK: - Sidebar destination inventory (#177)
@@ -212,7 +213,7 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         // blank title is an unclickable-looking empty row, and a duplicate
         // title or identifier makes deep links and GUI tests ambiguous.
         let all = SettingsTab.allCases
-        XCTAssertEqual(all.count, 9, "Destination count changed — intended?")
+        XCTAssertEqual(all.count, 10, "Destination count changed — intended?")
 
         for tab in all {
             XCTAssertFalse(tab.title.isEmpty, "\(tab) has no sidebar title")
@@ -241,6 +242,7 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
     /// `settings.section.speakers` by name.
     func test_destination_identifiers_match_the_strings_the_gui_tests_use() {
         XCTAssertEqual(SettingsTab.general.accessibilityID, "settings.section.general")
+        XCTAssertEqual(SettingsTab.languages.accessibilityID, "settings.section.languages")
         XCTAssertEqual(SettingsTab.audio.accessibilityID, "settings.section.audio")
         XCTAssertEqual(SettingsTab.models.accessibilityID, "settings.section.models")
         XCTAssertEqual(SettingsTab.aiProvider.accessibilityID, "settings.section.aiProvider")

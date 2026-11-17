@@ -639,7 +639,7 @@ final class QuickActionsController: ObservableObject {
             liveAISessionStartedByRelease = false
             return
         }
-        if startingLiveAISession { liveAISession?.start() }
+        if startingLiveAISession { liveAISession?.start(languageCode: languageSettings.current.code) }
     }
 
     /// Runs when a drain lets go of the live singletons (the
@@ -665,7 +665,7 @@ final class QuickActionsController: ObservableObject {
         // fresh — `claimLivePipeline` then knows not to start it twice.
         if liveAISessionStartDeferred {
             liveAISessionStartDeferred = false
-            liveAISession?.start()
+            liveAISession?.start(languageCode: languageSettings.current.code)
             liveAISessionStartedByRelease = !isAwaitingLivePipeline
         }
         isAwaitingLivePipeline = false
@@ -1316,7 +1316,7 @@ final class QuickActionsController: ObservableObject {
             source: source,
             audioFileName: outputURL.lastPathComponent,
             status: initialStatus,
-            language: languageSettings.current.rawValue,
+            language: languageSettings.current.code,
             segments: initialTranscriptSegments,
             fullText: initialTranscriptSegments.map(\.text).joined(separator: " "),
             folder: chosenFolder,

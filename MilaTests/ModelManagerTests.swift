@@ -119,11 +119,56 @@ final class ModelManagerTests: XCTestCase {
         XCTAssertEqual(reloaded.selectedModelName, WhisperModel.openaiTurbo.name)
     }
 
-    func test_best_model_for_language_routes_hebrew_to_ivrit() {
-        XCTAssertEqual(WhisperModel.bestModel(for: "he"), .ivritLarge)
-        XCTAssertEqual(WhisperModel.bestModel(for: "iw"), .ivritLarge)
-        XCTAssertEqual(WhisperModel.bestModel(for: "en"), .openaiTurbo)
-        XCTAssertEqual(WhisperModel.bestModel(for: "auto"), .openaiTurbo)
+    /// Unwired (no language settings injected), routing falls back to the
+    /// seeds — the same join the app shipped with before the list existed.
+    func test_best_model_defaults_to_the_seeded_languages() {
+        let mgr = makeManager()
+        XCTAssertEqual(mgr.bestModel(for: "he"), .ivritLarge)
+        XCTAssertEqual(mgr.bestModel(for: "iw"), .ivritLarge)
+        XCTAssertEqual(mgr.bestModel(for: "he-IL"), .ivritLarge)
+        XCTAssertEqual(mgr.bestModel(for: "en"), .openaiTurbo)
+        XCTAssertEqual(mgr.bestModel(for: "ru"), .openaiTurbo,
+                       "a language with no model of its own gets the multilingual default")
+    }
+
+    /// The model is whatever the language's entry names, not a hardcoded
+    /// switch — the user can put Hebrew on the turbo, or any language on ivrit.
+    func test_best_model_comes_from_the_injected_resolver() {
+        let mgr = makeManager()
+        mgr.languageModelResolver = { code in
+            ["he": WhisperModel.openaiTurbo.name, "ru": WhisperModel.ivritLarge.name][code]
+        }
+        XCTAssertEqual(mgr.bestModel(for: "he"), .openaiTurbo)
+        XCTAssertEqual(mgr.bestModel(for: "ru"), .ivritLarge)
+        XCTAssertEqual(mgr.bestModel(for: "fr"), .openaiTurbo, "nil → multilingual default")
+    }
+
+    /// A name no longer in the catalog (a list written by a build with more
+    /// models) must not strand the language — it gets the multilingual default.
+    func test_best_model_for_an_unknown_model_name_is_the_multilingual_default() {
+        let mgr = makeManager()
+        mgr.languageModelResolver = { _ in "some-future-model" }
+        XCTAssertEqual(mgr.bestModel(for: "he"), .openaiTurbo)
+    }
+
+    /// Legacy `auto` DISPLAYS as Hebrew (RecordingLanguage.resolve) but has
+    /// always transcribed on the multilingual model — only it can serve a
+    /// detect-the-language pass. Routing it through the language entry would
+    /// silently move old recordings onto the Hebrew-only finetune.
+    func test_auto_routes_to_turbo_even_though_it_resolves_to_hebrew() {
+        let mgr = makeManager()
+        XCTAssertEqual(RecordingLanguage.resolve("auto", in: RecordingLanguage.seeds).code, "he")
+        XCTAssertEqual(mgr.bestModel(for: "auto"), .openaiTurbo)
+        XCTAssertEqual(mgr.bestModel(for: "AUTO"), .openaiTurbo)
+    }
+
+    /// A code-less recording also displays as Hebrew, but the engine turns
+    /// `""` into whisper's `auto` (`WhisperEngine.languageParams`) — the same
+    /// detect-the-language pass, so the same model it always ran on.
+    func test_empty_code_routes_to_turbo_like_auto() {
+        let mgr = makeManager()
+        XCTAssertEqual(RecordingLanguage.resolve("", in: RecordingLanguage.seeds).code, "he")
+        XCTAssertEqual(mgr.bestModel(for: ""), .openaiTurbo)
     }
 
     func test_model_for_language_falls_back_to_selected_when_best_not_installed() throws {

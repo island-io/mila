@@ -191,6 +191,35 @@ final class MilaConfigImporterTests: XCTestCase {
         XCTAssertFalse(h.meetingDetection.enabled)
     }
 
+    /// A config can only pick a language the user's list offers: `current`
+    /// must always be a visible entry. The preview says so instead of
+    /// promising a change that won't happen.
+    func test_language_outside_the_list_is_skipped_and_the_preview_says_so() {
+        let h = makeHarness()
+        defer { KeychainHelper.delete(key: h.keychainKey) }
+        let config = MilaConfig(version: 1, recordingLanguage: "ru")
+
+        let row = h.importer.plannedChanges(for: config).first { $0.label == "Recording language" }
+        XCTAssertEqual(row?.value, "Russian (not in your languages — skipped)")
+
+        h.importer.apply(config)
+        XCTAssertEqual(h.language.current.code, "he")
+        XCTAssertFalse(h.language.languages.contains { $0.code == "ru" },
+                       "Importing must not add a language to the list")
+    }
+
+    func test_language_in_the_list_is_applied() {
+        let h = makeHarness()
+        defer { KeychainHelper.delete(key: h.keychainKey) }
+        h.language.add(code: "ru")
+        let config = MilaConfig(version: 1, recordingLanguage: "ru")
+
+        let row = h.importer.plannedChanges(for: config).first { $0.label == "Recording language" }
+        XCTAssertEqual(row?.value, "Russian")
+        h.importer.apply(config)
+        XCTAssertEqual(h.language.current.code, "ru")
+    }
+
     func test_plannedChanges_listsOnlyDiffs_andMasksKey() {
         let h = makeHarness()
         defer { KeychainHelper.delete(key: h.keychainKey) }

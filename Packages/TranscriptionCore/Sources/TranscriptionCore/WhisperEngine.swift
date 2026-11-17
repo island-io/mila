@@ -464,6 +464,19 @@ public actor WhisperEngine {
         (language: language.isEmpty ? "auto" : language, detectLanguage: false)
     }
 
+    /// Every language code whisper.cpp can transcribe, in whisper's own id
+    /// order (`"en"`, `"zh"`, `"de"`, …). Read from the library's static
+    /// language table, so no model needs to be loaded.
+    ///
+    /// The app offers exactly this list when the user adds a recording
+    /// language: the stored code is later handed to `whisper_lang_id`
+    /// verbatim (`languageParams` rewrites only `""`), so a free-typed
+    /// `"ru-RU"` or `"rus"` would not resolve.
+    public static let supportedLanguageCodes: [String] =
+        (0...whisper_lang_max_id()).compactMap { id in
+            whisper_lang_str(id).map { String(cString: $0) }
+        }
+
     /// Classify whisper.cpp's init-time log lines into a `CoreMLStatus`.
     ///
     /// whisper.cpp's published log strings during CoreML init are:

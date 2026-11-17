@@ -20,7 +20,7 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
     /// is technical and set once (often via a `.milaconfig` import), while the
     /// feature switches are what people come back for. Keeping them on one
     /// screen forced every feature below the fold behind a disclosure arrow.
-    case general, audio, models, aiProvider, aiFeatures, speakers, meetings, voiceMemos, storage
+    case general, languages, audio, models, aiProvider, aiFeatures, speakers, meetings, voiceMemos, storage
 
     var id: Int { rawValue }
 
@@ -28,6 +28,7 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
     var title: String {
         switch self {
         case .general: return "General"
+        case .languages: return "Languages"
         case .audio: return "Audio"
         case .models: return "Models"
         case .aiProvider: return "AI Provider"
@@ -42,6 +43,7 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
     var systemImage: String {
         switch self {
         case .general: return "gearshape"
+        case .languages: return "globe"
         case .audio: return "mic"
         case .models: return "cube.box"
         case .aiProvider: return "sparkles"
@@ -61,6 +63,7 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
     var accessibilityID: String {
         switch self {
         case .general: return "settings.section.general"
+        case .languages: return "settings.section.languages"
         case .audio: return "settings.section.audio"
         case .models: return "settings.section.models"
         case .aiProvider: return "settings.section.aiProvider"
@@ -86,7 +89,7 @@ enum SettingsTab: Int, Hashable, CaseIterable, Identifiable {
         switch self {
         case .models, .aiProvider, .aiFeatures, .meetings, .storage:
             return true
-        case .general, .audio, .speakers, .voiceMemos:
+        case .general, .languages, .audio, .speakers, .voiceMemos:
             return false
         }
     }
@@ -317,6 +320,7 @@ struct SettingsView: View {
     private var destination: some View {
         switch selectedTab {
         case .general: GeneralSettingsTab()
+        case .languages: LanguagesSettingsTab()
         case .audio: AudioSettingsTab()
         case .models: ModelsSettingsTab()
         case .aiProvider: AIProviderSettingsTab()
@@ -556,134 +560,29 @@ private struct AudioSettingsTab: View {
     }
 }
 
-// MARK: - Hotkeys
+// MARK: - General
 
-/// Settings → General. Dictation hotkeys plus the small Updates group (auto
-/// update check + nested beta opt-in). The Updates group used to be its own
-/// tab; it was folded in here because a single toggle and a version string
-/// didn't justify a tenth tab — and the tab strip had already overflowed into
-/// AppKit's ">>" overflow chevron at that width, which is what made the
-/// Updates tab look "disabled" (see PR discussion).
+/// Settings → General: the small Updates group (auto update check + nested
+/// beta opt-in). The Updates group used to be its own tab; it was folded in
+/// here because a single toggle and a version string didn't justify a tenth
+/// tab — and the tab strip had already overflowed into AppKit's ">>" overflow
+/// chevron at that width, which is what made the Updates tab look "disabled"
+/// (see PR discussion).
 ///
 /// The strip is gone as of #177, so the width half of that argument no longer
 /// applies. The other half — a single toggle and a version string don't
 /// deserve their own destination — still does, which is why this stays folded
 /// in.
+///
+/// The dictation shortcuts that used to share this tab moved to Settings →
+/// Languages, next to the language each one dictates in.
 private struct GeneralSettingsTab: View {
-    @EnvironmentObject private var hotkeys: HotkeySettings
-
-    /// The action whose hotkey the user is currently re-recording. Nil when
-    /// no row is in capture mode.
-    @State private var recordingAction: HotkeyAction?
-    @State private var lastError: String?
-
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Dictation hotkeys")
-                .font(.title3.weight(.semibold))
-            Text("Press the hotkey anywhere in macOS to start dictating. Press it again to stop, transcribe, and paste at the cursor. Click a binding to record a new one; press Esc to cancel.")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            VStack(spacing: 8) {
-                ForEach(HotkeyAction.allCases) { action in
-                    HotkeyRow(action: action,
-                              isRecording: recordingAction == action,
-                              // Live-registration warning: register() can fail
-                              // (another app owns the combo globally) and the
-                              // binding then LOOKS active while doing nothing.
-                              // Suppressed mid-capture — suspendAll() has
-                              // deliberately parked everything then.
-                              showsInactiveWarning: recordingAction == nil
-                                  && !HotkeyManager.shared.isRegistered(action),
-                              onStartRecording: {
-                                  recordingAction = action
-                                  // Park our own registrations so the pressed
-                                  // combo reaches the capture field's keyDown —
-                                  // Carbon otherwise consumes a currently-bound
-                                  // combo and STARTS DICTATION mid-capture.
-                                  HotkeyManager.shared.suspendAll()
-                              },
-                              onCaptured: { applyCapture($0, for: action) },
-                              onCancel: {
-                                  recordingAction = nil
-                                  HotkeyManager.shared.resumeAll()
-                              },
-                              onReset: { resetToDefault(action) })
-                }
-            }
-
-            if let lastError {
-                Text(lastError)
-                    .font(.callout)
-                    .foregroundStyle(.red)
-            }
-
-            Divider().padding(.vertical, 4)
-
             UpdatesSettingsSection()
-
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onDisappear {
-            // Window closed mid-capture: don't leave the app's hotkeys
-            // parked forever.
-            if recordingAction != nil {
-                recordingAction = nil
-                HotkeyManager.shared.resumeAll()
-            }
-        }
-    }
-
-    private func applyCapture(_ binding: HotkeyBinding, for action: HotkeyAction) {
-        recordingAction = nil
-        HotkeyManager.shared.resumeAll()
-
-        // Reject empty / modifier-only combos: Carbon will accept them but
-        // Apple shortcut conventions require at least one of ⌘ ⌃ ⌥.
-        let needsModifier = UInt32(cmdKey | controlKey | optionKey)
-        guard binding.modifiers & needsModifier != 0 else {
-            lastError = "Please include at least one modifier (⌘, ⌃, or ⌥)."
-            return
-        }
-
-        // Reject collisions with the *other* action so the user doesn't
-        // shoot themselves in the foot.
-        for other in HotkeyAction.allCases where other != action {
-            let existing = hotkeys.binding(for: other)
-            if existing == binding {
-                lastError = "\(binding.displayName) is already used for \(other.displayLabel)."
-                return
-            }
-        }
-
-        // Re-capturing the combo the action already has: nothing to do
-        // (and the registrability probe below would false-positive against
-        // our own live registration).
-        guard binding != hotkeys.binding(for: action) else {
-            lastError = nil
-            return
-        }
-
-        // Validate registrability BEFORE persisting. The old flow persisted
-        // first and dropped the registration failure on the floor: Settings
-        // showed the new combo as active while no hotkey was registered at
-        // all (the previous combo had already been unregistered) — dictation
-        // went silently dead until a reset.
-        guard HotkeyManager.shared.canRegister(binding) else {
-            lastError = "\(binding.displayName) is already taken by another app or macOS — choose a different combo."
-            return
-        }
-
-        lastError = nil
-        hotkeys.setBinding(binding, for: action)
-    }
-
-    private func resetToDefault(_ action: HotkeyAction) {
-        hotkeys.resetToDefault(action)
-        lastError = nil
     }
 }
 
@@ -745,52 +644,11 @@ private struct UpdatesSettingsSection: View {
     }
 }
 
-private struct HotkeyRow: View {
-    @EnvironmentObject private var hotkeys: HotkeySettings
-
-    let action: HotkeyAction
-    let isRecording: Bool
-    let showsInactiveWarning: Bool
-    let onStartRecording: () -> Void
-    let onCaptured: (HotkeyBinding) -> Void
-    let onCancel: () -> Void
-    let onReset: () -> Void
-
-    var body: some View {
-        HStack {
-            Text(action.displayLabel)
-                .font(.body)
-                .frame(width: 160, alignment: .leading)
-
-            if showsInactiveWarning {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
-                    .help("This combo couldn't be registered — another app or macOS owns it globally. Pick a different one or hit Reset.")
-                    .accessibilityIdentifier("hotkeys.\(action.rawValue).inactive")
-            }
-
-            Spacer()
-
-            HotkeyCaptureField(currentDisplay: hotkeys.binding(for: action).displayName,
-                               isRecording: isRecording,
-                               onStartRecording: onStartRecording,
-                               onCaptured: onCaptured,
-                               onCancel: onCancel)
-                .frame(width: 160)
-
-            Button("Reset") { onReset() }
-                .buttonStyle(.borderless)
-        }
-        .padding(8)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
-    }
-}
-
 /// A click-to-record hotkey field. When activated it becomes first responder
 /// and captures the next non-modifier keyDown event into a `HotkeyBinding`.
 /// Hosted via `NSViewRepresentable` because SwiftUI's focus / key event APIs
 /// don't expose the raw virtual key code we need to register through Carbon.
-private struct HotkeyCaptureField: NSViewRepresentable {
+struct HotkeyCaptureField: NSViewRepresentable {
     let currentDisplay: String
     let isRecording: Bool
     let onStartRecording: () -> Void
@@ -932,7 +790,7 @@ private struct ModelsSettingsTab: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Whisper models")
                 .font(.headline)
-            Text("English dictation uses the OpenAI turbo model; Hebrew uses ivrit.ai. Both download automatically on first launch (~1.6 GB each). The optional ivrit.ai large model is higher accuracy but ~2× slower.")
+            Text("Hebrew uses ivrit.ai; English and every other language use the OpenAI turbo model (pick per language in Settings → Languages). Both download automatically on first launch (~1.6 GB each). The optional ivrit.ai large model is higher accuracy but ~2× slower.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1177,7 +1035,7 @@ private struct RemoteBackendSection: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                fieldRow(label: "English model") {
+                fieldRow(label: "Multilingual") {
                     TextField("Same as above", text: $remote.englishModel)
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
@@ -1187,7 +1045,7 @@ private struct RemoteBackendSection: View {
                 if remote.isManaged(.englishModel) {
                     ManagedSettingNote(field: .englishModel)
                 }
-                Text("Optional. Set this when the model above only handles one language — an ivrit.ai server, for example, returns Hebrew words for English speech. English recordings then use this model instead. Leave blank for multilingual endpoints like OpenAI.")
+                Text("Optional. Set this when the model above only handles Hebrew — an ivrit.ai server, for example, returns Hebrew words for English speech. Every language except Hebrew then uses this model instead. Leave blank for multilingual endpoints like OpenAI.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1845,6 +1703,7 @@ private struct AIProviderSettingsTab: View {
 private struct AIFeaturesSettingsTab: View {
     @EnvironmentObject private var settings: LLMSettings
     @EnvironmentObject private var liveAI: LiveAISettings
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     // Nothing starts expanded: the point of this screen is that you can read
     // and flip every feature without expanding a thing.
@@ -2079,14 +1938,20 @@ private struct AIFeaturesSettingsTab: View {
             HStack(spacing: aiLabelGap) {
                 Text("Output language")
                     .frame(width: labelWidth, alignment: .leading)
+                // A menu, not segments: the list is the user's and can be
+                // long. A choice whose language was removed stays listed
+                // (and selected) until the user picks another.
                 Picker("Output language", selection: $liveAI.outputLanguage) {
-                    ForEach(LiveAISettings.OutputLanguage.allCases) { lang in
-                        Text(lang.displayName).tag(lang)
+                    Text(LiveAISettings.OutputLanguage.auto.displayName).tag(LiveAISettings.OutputLanguage.auto)
+                    Divider()
+                    let selected = liveAI.outputLanguage.isAuto ? nil : liveAI.outputLanguage.rawValue
+                    ForEach(languageSettings.choices(including: selected)) { lang in
+                        Text(lang.label).tag(LiveAISettings.OutputLanguage(lang))
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .labelsHidden()
-                .frame(maxWidth: 220)
+                .fixedSize()
                 .accessibilityIdentifier("ai.features.outputLanguage")
                 Spacer(minLength: 0)
             }

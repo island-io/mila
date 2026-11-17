@@ -30,6 +30,7 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var store: RecordingStore
     @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var llm: LLMSettings
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     @EnvironmentObject private var summarizer: RecordingSummarizer
     @EnvironmentObject private var liveAI: LiveAISettings
     @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
@@ -128,7 +129,8 @@ private struct RecordingContextMenu: ViewModifier {
                 }
             }
             Divider()
-            let currentLang = RecordingLanguage.fromCode(recording.language)
+            let currentLang = languageSettings.resolve(recording.language)
+            let targets = languageSettings.retranscribeTargets(for: recording.language)
             // Busy = this recording is already transcribing or queued. We gate
             // BEFORE mutating the store: `enqueue` drops active/queued ids, but
             // `prepareForRetranscription` persists `.pending`/language first, so
@@ -147,7 +149,7 @@ private struct RecordingContextMenu: ViewModifier {
                     transcription.deferTranscription(of: recording.id)
                 }
             }
-            Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
+            Button("Re-transcribe (\(currentLang.label))") {
                 // Route through the live-store chokepoint (same as the
                 // language-switch action) so we never enqueue a stale snapshot
                 // whose `.wav` a since-run compression already deleted.
@@ -157,10 +159,16 @@ private struct RecordingContextMenu: ViewModifier {
                 transcription.enqueue(prepared, isRetranscription: true)
             }
             .disabled(isBusy)
-            Button("Re-transcribe in \(currentLang.other.flagEmoji) \(currentLang.other.displayName)") {
-                retranscribe(recording, in: currentLang.other)
+            if !targets.isEmpty {
+                Menu("Re-transcribe in") {
+                    ForEach(targets) { target in
+                        Button("\(target.label)") {
+                            retranscribe(recording, in: target)
+                        }
+                    }
+                }
+                .disabled(isBusy)
             }
-            .disabled(isBusy)
             if llm.isConfigured {
                 Divider()
                 Button("Send to \(llm.tool.displayName)…") {
@@ -173,6 +181,8 @@ private struct RecordingContextMenu: ViewModifier {
                 // instead of waiting for the next automatic pass. Re-picking
                 // the ✓'d entry is a no-op (`RecordingSummarizer.setSummaryLanguage`).
                 SummaryLanguageMenu(
+                    choices: languageSettings.choices(
+                        including: recording.summaryLanguageOverride?.code),
                     current: recording.summaryLanguageOverride,
                     global: liveAI.outputLanguage,
                     isDisabled: isBusy
@@ -218,7 +228,7 @@ private struct RecordingContextMenu: ViewModifier {
         // Mutate only language+status on the LIVE record so we don't clobber a
         // since-compressed `.m4a` audioFileName back to a deleted `.wav`.
         guard let prepared = store.prepareForRetranscription(id: recording.id,
-                                                             language: language.rawValue)
+                                                             language: language.code)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
     }

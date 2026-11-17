@@ -57,6 +57,10 @@ final class LiveAISession: ObservableObject {
     /// late chunks are never dropped.
     private var coalesced: Bool = false
     private var latestTranscript: String = ""
+    /// The recording's language, set by `start(languageCode:)`. Auto output
+    /// follows it for a language the user added (Russian meeting → Russian
+    /// action items); `"auto"` leaves the decision to the transcript text.
+    private(set) var languageCode: String = "auto"
 
     // MARK: - Min-interval throttle
 
@@ -219,8 +223,9 @@ final class LiveAISession: ObservableObject {
     /// session id when the user's LLM tool supports session continuity
     /// (Claude does; Cursor doesn't), so each recording gets its own
     /// isolated conversation history with the model.
-    func start() {
+    func start(languageCode: String = "auto") {
         cancel()
+        self.languageCode = languageCode
         actionItems = []
         summary = ""
         lastError = nil
@@ -456,21 +461,13 @@ final class LiveAISession: ObservableObject {
         let snapshot = latestTranscript
         let tool = llmSettings.tool
         let exe = llmSettings.executablePath.isEmpty ? nil : llmSettings.executablePath
-        // When the user picks `.auto`, detect Hebrew vs English from the
-        // transcript itself rather than passing the abstract phrase
-        // "match the transcript language" through to the LLM — Claude
-        // / cursor-agent obey concrete instructions ("Output in Hebrew")
-        // far more consistently than they obey introspective ones.
-        let promptLanguageName: String = {
-            switch liveAISettings.outputLanguage {
-            case .auto:
-                return snapshot.isPredominantlyHebrew ? "Hebrew" : "English"
-            case .english:
-                return "English"
-            case .hebrew:
-                return "Hebrew"
-            }
-        }()
+        // Always a concrete language name, never "match the transcript" —
+        // Claude / cursor-agent obey "Output in Hebrew" far more
+        // consistently than introspective instructions. See `promptName`.
+        let promptLanguageName = LiveAISettings.OutputLanguage.promptName(
+            output: liveAISettings.outputLanguage,
+            recordingCode: languageCode,
+            text: snapshot)
         // Read the per-meeting notes at TICK time, not at `start()` — a
         // meeting-detector auto-start beats the user to the pane, so the
         // agenda usually gets pasted a minute into the recording.
