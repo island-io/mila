@@ -14,6 +14,29 @@ private let remoteLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 /// the live transcript). `RemoteWhisperEngine` is the only production conformer.
 protocol RemoteTranscribing: TranscribingEngine {
     func configure(_ config: RemoteTranscriptionConfig) async
+
+    /// One short clip (a live utterance, a dictation, a missing span) with
+    /// an explicit per-request idle timeout. The plain `transcribe` keeps the
+    /// 1-hour timeout a whole-recording upload needs; a live clip must fail
+    /// in seconds instead, or a connection that silently stops answering
+    /// holds the live queue — and Stop's drain — for an hour (#355).
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment]
+}
+
+extension RemoteTranscribing {
+    /// Test doubles have no network, so the timeout means nothing to them.
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await transcribe(samples: samples, language: language, audioCtx: audioCtx,
+                             progress: nil, isCancelled: isCancelled)
+    }
 }
 
 /// A `TranscribingEngine` that offloads transcription to an OpenAI-compatible
@@ -196,15 +219,21 @@ actor RemoteWhisperEngine: RemoteTranscribing {
 
     private var config: RemoteTranscriptionConfig?
     private let session: URLSession
+    private let encodeAudio: @Sendable ([Float]) async throws -> Data
+    private var isShutDown = false
 
-    init() {
+    init(session: URLSession? = nil,
+         encodeAudio: @escaping @Sendable ([Float]) async throws -> Data = {
+             try await RemoteWhisperEngine.encodeM4A(samples: $0)
+         }) {
         let configuration = URLSessionConfiguration.default
         // A long meeting can take a while to transcribe server-side; the
         // resource timeout has to clear the whole round trip, not just the
         // upload.
         configuration.timeoutIntervalForRequest = 120
         configuration.timeoutIntervalForResource = 60 * 60
-        self.session = URLSession(configuration: configuration)
+        self.session = session ?? URLSession(configuration: configuration)
+        self.encodeAudio = encodeAudio
     }
 
     func configure(_ config: RemoteTranscriptionConfig) {
@@ -217,10 +246,13 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     /// `RemoteTranscriptionSettings.testConnection()`; here we just confirm
     /// the engine was configured.
     func loadIfNeeded(modelURL: URL, displayName: String) async throws {
+        try checkCancellation(nil)
         guard config != nil else { throw RemoteError.notConfigured }
     }
 
     func shutdown() async {
+        guard !isShutDown else { return }
+        isShutDown = true
         session.invalidateAndCancel()
     }
 
@@ -229,8 +261,29 @@ actor RemoteWhisperEngine: RemoteTranscribing {
                     audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await upload(samples: samples, language: language, progress: progress,
+                         isCancelled: isCancelled, requestTimeout: Self.wholeRecordingTimeout)
+    }
+
+    func transcribe(samples: [Float],
+                    language: String,
+                    audioCtx: Int32?,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await upload(samples: samples, language: language, progress: nil,
+                         isCancelled: isCancelled, requestTimeout: requestTimeout)
+    }
+
+    /// See the per-request override in `upload`.
+    static let wholeRecordingTimeout: TimeInterval = 60 * 60
+
+    private func upload(samples: [Float],
+                        language: String,
+                        progress: (@Sendable (Float) -> Void)?,
+                        isCancelled: (@Sendable () -> Bool)?,
+                        requestTimeout: TimeInterval) async throws -> [TranscriptSegment] {
+        try checkCancellation(isCancelled)
         guard let config else { throw RemoteError.notConfigured }
-        if isCancelled?() == true { throw CancellationError() }
 
         // Never POST audio with nothing in it. A capture session that
         // delivered zero frames encodes to a header-only file, and the server
@@ -244,7 +297,8 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         }
 
         progress?(0.05)
-        let audioData = try await Self.encodeM4A(samples: samples)
+        let audioData = try await encodeAudio(samples)
+        try checkCancellation(isCancelled)
         progress?(0.2)
 
         let boundary = "MilaBoundary-\(UUID().uuidString)"
@@ -256,8 +310,10 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         // well past 120s of server-side processing, which failed the whole
         // transcription with "The request timed out". Override per-request so
         // only the 1-hour resource timeout bounds the wait; the short idle
-        // timeout still applies to everything else on this session.
-        request.timeoutInterval = 60 * 60
+        // timeout still applies to everything else on this session. Short
+        // clips (`transcribe(…requestTimeout:)`) pass their own, much shorter
+        // bound: a live utterance is answered in seconds or not at all.
+        request.timeoutInterval = requestTimeout
         request.setValue("multipart/form-data; boundary=\(boundary)",
                          forHTTPHeaderField: "Content-Type")
         if !config.apiKey.isEmpty {
@@ -272,26 +328,46 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         // hostnames or credentials/query tokens we must not leak to the log.
         remoteLog.log("transcribe: POST \(request.url?.absoluteString ?? "?", privacy: .private) model=\(config.model, privacy: .public) format=\(Self.ResponseFormat.forModel(config.model).rawValue, privacy: .public) lang=\(language, privacy: .public) bytes=\(body.count, privacy: .public)")
 
-        // The protocol's `isCancelled` is a polled flag (the batch Cancel
-        // button), not Swift task cancellation. Bridge it: run the upload in a
-        // child task and a watchdog that cancels it the moment the flag flips.
-        let netTask = Task { try await session.upload(for: request, from: body) }
+        // Task creation and session invalidation must share this actor turn.
+        // A check before Task { session.upload(...) } still lets shutdown
+        // invalidate the session before that task creates its upload (#301).
+        let (responses, continuation) = AsyncThrowingStream<(Data, URLResponse), Error>.makeStream()
+        let upload = session.uploadTask(with: request, from: body) { data, response, error in
+            if let error {
+                continuation.finish(throwing: error)
+            } else if let data, let response {
+                continuation.yield((data, response))
+                continuation.finish()
+            } else {
+                continuation.finish(throwing: RemoteError.badResponse)
+            }
+        }
+        upload.resume()
+
+        // Preserve the batch Cancel button's polled flag, as well as Swift
+        // cancellation. The handler also covers cancellation before registration.
         let watchdog = Task {
             while !Task.isCancelled {
-                if isCancelled?() == true { netTask.cancel(); return }
+                if isCancelled?() == true { upload.cancel(); return }
                 try? await Task.sleep(nanoseconds: 200_000_000)
             }
         }
         defer { watchdog.cancel() }
-
         let data: Data
         let response: URLResponse
         do {
-            (data, response) = try await netTask.value
-        } catch is CancellationError {
-            throw CancellationError()
+            (data, response) = try await withTaskCancellationHandler {
+                var iterator = responses.makeAsyncIterator()
+                guard let result = try await iterator.next() else { throw CancellationError() }
+                return result
+            } onCancel: {
+                upload.cancel()
+            }
+            try checkCancellation(isCancelled)
         } catch {
-            if isCancelled?() == true { throw CancellationError() }
+            // Foundation reports URLError.cancelled for invalidated uploads;
+            // normalize shutdown and ignore a completion that raced it.
+            try checkCancellation(isCancelled)
             throw error
         }
 
@@ -306,6 +382,12 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         progress?(1.0)
         remoteLog.log("transcribe: ok segs=\(segments.count, privacy: .public)")
         return segments
+    }
+
+    private func checkCancellation(_ isCancelled: (@Sendable () -> Bool)?) throws {
+        if isShutDown || Task.isCancelled || isCancelled?() == true {
+            throw CancellationError()
+        }
     }
 
     // MARK: - Encoding

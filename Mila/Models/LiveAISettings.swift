@@ -16,9 +16,33 @@ import Combine
 /// per N seconds.
 @MainActor
 final class LiveAISettings: ObservableObject {
-    @Published var enabled: Bool {
-        didSet { defaults.set(enabled, forKey: Keys.enabled) }
+    // `enabled` and `model` are manageable by a configuration profile
+    // (`ManagedSettings`): computed over private `@Published` storage so a
+    // locked write is refused before anything is stored, published or
+    // persisted.
+    @Published private var storedEnabled: Bool
+    @Published private var storedModel: String
+
+    var enabled: Bool {
+        get { storedEnabled }
+        set {
+            guard !isManaged(.liveAIEnabled) else { return }
+            storedEnabled = newValue
+            defaults.set(newValue, forKey: Keys.enabled)
+        }
     }
+
+    /// `enabled`'s change publisher (fires on willSet, like `$enabled` did).
+    var enabledPublisher: Published<Bool>.Publisher { $storedEnabled }
+
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`)
+    /// unless `MilaApp` passes the system's managed preferences. Only
+    /// `enabled` and `model` are manageable — the same two a `.milaconfig`
+    /// carries.
+    private let managed: ManagedSettings
+
+    /// Whether a configuration profile locks `field` (see `ManagedSettings`).
+    func isManaged(_ field: ManagedField) -> Bool { managed.isManaged(field) }
 
     /// Snapshot of the host Mac's hardware identity. Injected in tests
     /// (so `isLiveAIAvailable` can be exercised without a real
@@ -30,8 +54,13 @@ final class LiveAISettings: ObservableObject {
     /// Model name passed to the CLI as `--model <value>`. Empty string ==
     /// "let the CLI pick" — typically the CLI's last-configured model. The
     /// UI nudges the user toward a cheap model via the placeholder.
-    @Published var model: String {
-        didSet { defaults.set(model, forKey: Keys.model) }
+    var model: String {
+        get { storedModel }
+        set {
+            guard !isManaged(.liveAIModel) else { return }
+            storedModel = newValue
+            defaults.set(newValue, forKey: Keys.model)
+        }
     }
 
     /// Tick frequency in seconds. The Live transcriber + LLM run on this
@@ -85,6 +114,20 @@ final class LiveAISettings: ObservableObject {
     /// continuous rendering competes with whisper for CPU.
     @Published var backgroundMode: Bool {
         didSet { defaults.set(backgroundMode, forKey: Keys.backgroundMode) }
+    }
+
+    /// Whether recordings are transcribed live, while they run. Default ON.
+    /// OFF is the low-CPU mode: a recording only captures audio — no live
+    /// whisper, no live speaker-diarization daemon (~1 GB of pyannote/torch),
+    /// no Live AI loop — and is transcribed by the ordinary batch pass after
+    /// Stop. Unlike `backgroundMode`, which only hides the live pane, this
+    /// actually takes the work off the CPU during the call.
+    ///
+    /// Read once per recording, at record start (see
+    /// `QuickActionsController.recordingRunsLivePipeline`); flipping it
+    /// mid-recording applies to the next one.
+    @Published var transcribeWhileRecording: Bool {
+        didSet { defaults.set(transcribeWhileRecording, forKey: Keys.transcribeWhileRecording) }
     }
 
     /// Override that lets a user opt into Live AI on hardware the
@@ -165,6 +208,15 @@ final class LiveAISettings: ObservableObject {
         capabilities.isLiveAIRecommended || forceLiveAIOnLowEndHardware
     }
 
+    /// Whether the next recording runs the live pipeline: the hardware allows
+    /// it AND the user hasn't turned live transcription off. Kept separate
+    /// from `isLiveAIAvailable` on purpose — that one is purely "can this Mac
+    /// do it" and drives the "gated off on Air-class chips" notice, which a
+    /// user who simply switched live transcription off must not see.
+    var runsLivePipeline: Bool {
+        isLiveAIAvailable && transcribeWhileRecording
+    }
+
     /// Whether Live AI is currently ready to actually run — i.e. the
     /// hardware supports it AND the user has an LLM CLI configured.
     /// The user's `enabled` toggle is intentionally NOT part of this
@@ -220,15 +272,17 @@ final class LiveAISettings: ObservableObject {
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard,
-         capabilities: SystemCapabilities = .live) {
+         capabilities: SystemCapabilities = .live,
+         managed: ManagedSettings = .empty) {
         self.defaults = defaults
         self.capabilities = capabilities
+        self.managed = managed
         // Default ON: users who never touched the toggle should get
         // the LLM summary/action-items pane. If their LLM CLI isn't
         // configured, `isLiveAIReady` still gates everything down to
-        // a no-op, so this is safe.
-        self.enabled = defaults.object(forKey: Keys.enabled) as? Bool ?? true
-        self.model = defaults.string(forKey: Keys.model) ?? Self.defaultModel
+        // a no-op, so this is safe. A managed value wins over both.
+        self.storedEnabled = managed.liveAIEnabled ?? (defaults.object(forKey: Keys.enabled) as? Bool) ?? true
+        self.storedModel = managed.liveAIModel ?? defaults.string(forKey: Keys.model) ?? Self.defaultModel
         // Migrate pre-1.6.1 persisted values (default was 5s, range 3-20s).
         // 5s windows cut words mid-utterance and made the trailing-window
         // merge stitch together inconsistent segments. Only values below
@@ -251,6 +305,8 @@ final class LiveAISettings: ObservableObject {
         // is preserved for users who turned it off.
         self.useNeuralVAD = defaults.object(forKey: Keys.useNeuralVAD) as? Bool ?? true
         self.backgroundMode = defaults.bool(forKey: Keys.backgroundMode)
+        // Default ON — today's behaviour. Explicit false is preserved.
+        self.transcribeWhileRecording = defaults.object(forKey: Keys.transcribeWhileRecording) as? Bool ?? true
         self.forceLiveAIOnLowEndHardware = defaults.bool(forKey: Keys.forceLowEnd)
         let sim = defaults.double(forKey: Keys.simThreshold)
         if defaults.bool(forKey: Keys.simThresholdMigrated) {
@@ -392,6 +448,7 @@ the content.
         static let useVAD = "liveAI.useVAD"
         static let useNeuralVAD = "liveAI.useNeuralVAD"
         static let backgroundMode = "liveAI.backgroundMode"
+        static let transcribeWhileRecording = "liveAI.transcribeWhileRecording"
         static let forceLowEnd = "liveAI.forceOnLowEndHardware"
         static let simThreshold = "liveAI.speakerSimilarityThreshold"
         static let simThresholdMigrated = "liveAI.speakerSimilarityThreshold.migrated"

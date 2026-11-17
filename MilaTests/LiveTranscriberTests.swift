@@ -282,6 +282,96 @@ final class LiveTranscriberTests: XCTestCase {
         _ = transcriber.stop()
     }
 
+    /// Deletions are per-recording state, and `stop()` — the teardown every
+    /// path runs, including dictation and a failed stop, not only the
+    /// record-start `reset()` — drops them. Otherwise one recording's emptied
+    /// transcript makes the next one's empty transcript look deliberate
+    /// (authoritative), and its batch pass is never run. (Cursor Bugbot on #229.)
+    func test_stop_forgets_this_recordings_deletions() async throws {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "only line")])
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        await transcriber.transcribeNow()
+        let line = try XCTUnwrap(transcriber.segments.first)
+        transcriber.removeSegment(id: line.id)
+        XCTAssertTrue(transcriber.hasUserDeletedSegments, "precondition")
+
+        _ = transcriber.stop()
+
+        XCTAssertFalse(transcriber.hasUserDeletedSegments)
+    }
+
+    /// A fixed-window tick that is already inside whisper when the pipeline
+    /// is torn down returns AFTER the teardown — the engine does not observe
+    /// the Task cancellation in `stop()`. Its result belongs to the recording
+    /// that just ended and must be dropped, not merged into `segments`.
+    /// (Ported from #289 by @noamleibovitch.)
+    func test_fixed_window_tick_in_flight_at_stop_is_dropped() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "tail of the meeting")])
+        await stub.setDefaultDelay(0.4)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        // `transcribeNow()` runs the tick directly rather than through the
+        // `inFlight` task `stop()` cancels, so it stands in for a tick the
+        // engine keeps running regardless.
+        let t: LiveTranscriber = transcriber
+        let tick = Task { await t.transcribeNow() }
+        await waitUntilWhisperEntered()
+
+        _ = transcriber.stop()
+        await tick.value
+
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "a tick in flight at stop() merged its result after the teardown")
+        XCTAssertEqual(transcriber.fullText, "")
+    }
+
+    /// The same tick across the next recording's `reset()` — the realistic
+    /// sequence: meeting N's last tick is in flight, N ends, meeting N+1
+    /// begins with `reset()` (and, with live transcription off, nothing else
+    /// ever clears the transcriber), then the tick returns. Before the guard
+    /// N's tail became N+1's live transcript, and `stopRecording` saved it as
+    /// such.
+    func test_fixed_window_tick_in_flight_across_reset_never_reaches_the_next_recording() async {
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "previous meeting")])
+        await stub.setDefaultDelay(0.4)
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        let t: LiveTranscriber = transcriber
+        let lateTick = Task { await t.transcribeNow() }
+        await waitUntilWhisperEntered()
+
+        _ = transcriber.stop()
+        transcriber.reset()
+        await lateTick.value
+
+        XCTAssertTrue(transcriber.segments.isEmpty,
+                      "the previous meeting's tail reached the next recording")
+        XCTAssertEqual(transcriber.fullText, "")
+
+        // The guard is per run, not a latch: the next recording's own ticks
+        // still arrive.
+        await stub.setDefaultDelay(0)
+        await stub.setDefaultCanned([TranscriptSegment(start: 0, end: 1, text: "this meeting")])
+        transcriber.start(language: "en")
+        transcriber.ingest(ArraySlice(Array(repeating: Float(0.3), count: 32_000)))
+        await transcriber.transcribeNow()
+        XCTAssertEqual(transcriber.segments.map(\.text), ["this meeting"])
+        _ = transcriber.stop()
+    }
+
+    /// Poll until the stub has been entered, so a `stop()`/`reset()` arrives
+    /// while whisper is still running rather than before the tick started.
+    private func waitUntilWhisperEntered(file: StaticString = #filePath, line: UInt = #line) async {
+        let deadline = Date().addingTimeInterval(5)
+        var count = await stub.transcribeCalls.count
+        while count < 1 && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+            count = await stub.transcribeCalls.count
+        }
+        XCTAssertEqual(count, 1, "precondition: whisper was entered", file: file, line: line)
+    }
+
     /// A deleted line must not reappear when the fixed-window path
     /// re-transcribes its rolling buffer on the next tick — the deleted
     /// time range is suppressed.

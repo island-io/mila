@@ -69,7 +69,77 @@ final class RecordingSummarizer: ObservableObject {
     /// spinner on the summary section while a call is in flight (used by
     /// the "Regenerate summary" affordance + backfill).
     @Published private(set) var inFlightIDs: Set<UUID> = []
-    private var inFlight: [UUID: Task<Void, Never>] = [:]
+    private var inFlight: [UUID: InFlightRun] = [:]
+
+    /// One in-flight summary call, with the snapshot it was built from.
+    ///
+    /// The snapshot is how a completion tells whether its output is still a
+    /// summary of the recording (#318). A re-transcription persisting a new
+    /// transcript, a summary-language pick, a `.milashare` re-import — any of
+    /// them can change the row while the call is out, and requests that
+    /// arrive meanwhile hit the dedup guard. So the completion compares the
+    /// LIVE row's `fullText` and summary-language override against the
+    /// snapshot (`completion(of:token:produced:)`): if either moved, the
+    /// output is discarded and one follow-up runs from the live row. That
+    /// replaces #313's language-only `replayIfSummaryLanguageChanged` rather
+    /// than adding a second mechanism next to it.
+    private struct InFlightRun {
+        /// Identifies THIS run, so a completion only acts on its own state:
+        /// after `cancel(recordingID:)` a newer run for the same id can start
+        /// while the cancelled task is still unwinding.
+        let token: UUID
+        let task: Task<Void, Never>
+        let inputs: SummaryInputs
+        /// The global output language the run resolved against. The
+        /// completion re-resolves the LIVE row's prompt language against
+        /// this same global value: what matters is the language the prompt
+        /// asks for, not the stored override — so picking English when Auto
+        /// already resolved to English, or normalising an unrecognised stored
+        /// code to Default, costs no call. A GLOBAL flip mid-flight with no
+        /// request keeps the result, as it always has.
+        let globalLanguage: LiveAISettings.OutputLanguage
+        /// Starts as the run's own `force`; any `regenerate` that hits the
+        /// dedup guard sets it, so the output is stored with force semantics
+        /// (overwriting a summary another path stored meanwhile) and a
+        /// follow-up goes through `regenerate` too.
+        var force: Bool
+        /// A `regenerate` arrived with exactly this run's inputs. It is
+        /// served by this run rather than by a second identical call — unless
+        /// the run produces no summary, in which case the request still gets
+        /// its own attempt.
+        var regenerateFolded = false
+        /// A `regenerate` arrived whose inputs differ from this run's in a
+        /// way the row snapshot does not see (the summary prompt, global
+        /// output language, tool or model changed in Settings). Its output is
+        /// discarded for a follow-up built from the current settings.
+        var regenerateWithNewInputs = false
+    }
+
+    /// Everything a summary call is built from that could change between
+    /// two requests. The API key is left out: it changes whether a call
+    /// works, not what it produces.
+    private struct SummaryInputs: Equatable {
+        let tool: LLMTool
+        let executableOverride: String?
+        let model: String
+        let extraArgs: [String]
+        let promptLanguageName: String
+        let prompt: String
+        let transcript: String
+        let openAIBaseURL: String
+    }
+
+    /// How a completed call is handled — see `completion(of:token:produced:)`.
+    private enum Completion {
+        /// This run no longer owns the id (cancelled): store nothing, signal
+        /// nothing.
+        case abandoned
+        /// Discard the output; the task's `defer` starts one follow-up from
+        /// the live row, whose own completion signals.
+        case rerun
+        /// Carry on as normal with this run's state.
+        case proceed(InFlightRun)
+    }
 
     /// Fired once per summarize attempt, after the recording's summary state
     /// is final — i.e. after a summary was generated, or synchronously when
@@ -80,14 +150,19 @@ final class RecordingSummarizer: ObservableObject {
     /// action items are ready, falling back to the transcript when no summary
     /// was produced. It is NOT fired for the dedup early-return (a duplicate
     /// call while one is already in flight — the in-flight task fires instead)
-    /// or when the recording has been deleted mid-flight (nothing to export;
+    /// or when the recording is no longer in the store (whether it was
+    /// deleted mid-flight or before a skipped request arrived), or was moved
+    /// to Recently Deleted while a stale run was out (nothing to export;
     /// this covers the failure and empty-output paths too, not just success —
-    /// `cancel(recordingID:)` is what a permanent delete calls, and that
-    /// surfaces here as a thrown `CancellationError`).
+    /// a permanent delete calls `cancel(recordingID:)` through
+    /// `RecordingStore.permanentlyDeleted`, and the cancelled call surfaces
+    /// here as a thrown `LLMRunnerError.cancelled` / `CancellationError`).
     ///
-    /// Exactly one of the branches below fires it per attempt, and each one
-    /// returns immediately afterwards, so a single `runSummary` can never fire
-    /// twice. Anything the observer does is its own problem: this is a plain
+    /// Exactly one of the branches below fires it per attempt — or hands the
+    /// attempt off to a re-run (`Completion.rerun`), whose own
+    /// completion fires instead — and each one returns immediately
+    /// afterwards, so a single `runSummary` can never fire twice. Anything
+    /// the observer does is its own problem: this is a plain
     /// synchronous call on the main actor, so an observer that throws is a
     /// programmer error, but an observer that *fails internally* (e.g. a file
     /// write that can't complete) cannot stall or corrupt summarisation —
@@ -99,6 +174,15 @@ final class RecordingSummarizer: ObservableObject {
     /// across the whole batch instead of letting all candidates spawn at
     /// once.
     private var backfillQueue: [UUID] = []
+
+    /// Runs `cancel(recordingID:)` has removed from `inFlight` whose tasks
+    /// have not unwound yet, keyed by run token. Their child is still being
+    /// killed (SIGTERM, grace, SIGKILL, bounded reap), so `pumpBackfill`
+    /// counts them against `maxConcurrent`: otherwise another run's
+    /// completion could start new CLIs while the cancelled one is still
+    /// alive. Inserted by `cancel`, removed by token in the cancelled task's
+    /// own `defer`. Also what `awaitInFlight` waits on for a cancelled id.
+    private var cancelledRuns: [UUID: (recordingID: UUID, task: Task<Void, Never>)] = [:]
 
     /// Max concurrent in-flight CLI invocations the summarizer will
     /// schedule from backfill / regeneration. Starts at 2 — high enough
@@ -176,6 +260,19 @@ final class RecordingSummarizer: ObservableObject {
                 self.backfillIfNeeded()
             }
             .store(in: &cancellables)
+
+        // Permanent delete (single row, or emptying Recently Deleted) cancels
+        // that row's summary call. Wired here rather than at each delete call
+        // site so no path can forget it: every permanent removal goes through
+        // `RecordingStore.permanentlyDelete` / `emptyTrash`, and both emit.
+        // Synchronous on the main actor, like the store mutation itself, so
+        // the cancel happens in the same turn as the delete.
+        store.permanentlyDeleted
+            .sink { [weak self] ids in
+                guard let self else { return }
+                for id in ids { self.cancel(recordingID: id) }
+            }
+            .store(in: &cancellables)
     }
 
     // MARK: - Predicates
@@ -211,10 +308,24 @@ final class RecordingSummarizer: ObservableObject {
     /// subprocess spawn + pipe drain can slip past a fixed window); awaiting
     /// the task itself is deterministic. The task clears its own `inFlight`
     /// entry in a `defer`, so by the time this returns the store write (if any)
-    /// has already happened.
+    /// has already happened — including a follow-up's: a stale run starts its
+    /// follow-up from that same `defer`, so this keeps awaiting until no run
+    /// is left for the id.
+    ///
+    /// A run `cancel(recordingID:)` took out of `inFlight` is awaited too,
+    /// until its task has unwound — otherwise a permanent delete would make
+    /// this return before the cancelled call had even started, and a test
+    /// asserting "nothing was stored / exported" would pass vacuously.
     func awaitInFlight(_ recordingID: UUID) async {
-        guard let task = inFlight[recordingID] else { return }
-        await task.value
+        while true {
+            if let run = inFlight[recordingID] {
+                await run.task.value
+            } else if let cancelled = cancelledRuns.values.first(where: { $0.recordingID == recordingID }) {
+                await cancelled.task.value
+            } else {
+                return
+            }
+        }
     }
 
     // MARK: - Public API
@@ -222,13 +333,18 @@ final class RecordingSummarizer: ObservableObject {
     /// Kick off a background summary for `recording` if the gate above
     /// allows. Returns immediately — the caller doesn't await the LLM.
     /// Idempotent: a second call while one is in flight is a no-op so a
-    /// re-enqueue from the transcription path can't double-bill.
+    /// re-enqueue from the transcription path can't double-bill. If the
+    /// transcript changed meanwhile, the in-flight run's completion notices
+    /// and re-runs (`InFlightRun`).
     func summarizeIfNeeded(_ recording: Recording) {
+        // Gate on the same live row `runSummary` builds from, not on
+        // whatever copy the caller holds.
+        let recording = latestRecording(recording.id, fallback: recording)
         guard shouldSummarize(recording) else {
             logSkip(recording, force: false)
             // No summary will be generated — signal completion now so a
             // pending Obsidian export falls back to the transcript.
-            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
+            signalSkipped(recording.id)
             return
         }
         runSummary(for: recording, force: false)
@@ -242,21 +358,65 @@ final class RecordingSummarizer: ObservableObject {
     ///   * The "Regenerate summary" context-menu action.
     ///
     /// Still respects the two hard requirements: LLM must be configured,
-    /// transcript must be non-empty. Returns immediately.
+    /// transcript must be non-empty. Returns immediately. A call while this
+    /// recording's run is in flight is not dropped: that run's output is
+    /// stored with force semantics, and if the transcript or language moved
+    /// meanwhile it is discarded for a follow-up regenerate from the live row
+    /// (`InFlightRun`).
     func regenerate(_ recording: Recording) {
+        // Gate on the same live row `runSummary` builds from, not on
+        // whatever copy the caller holds.
+        let recording = latestRecording(recording.id, fallback: recording)
         guard llmSettings.isConfigured else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — LLM not configured")
-            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
+            signalSkipped(recording.id)
             return
         }
         let transcript = recording.fullText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !transcript.isEmpty else {
             summarizerLog.log("regenerate \(self.shortID(recording.id), privacy: .public): skipped — transcript empty")
-            onSummaryFinished?(latestRecording(recording.id, fallback: recording))
+            signalSkipped(recording.id)
             return
         }
         runSummary(for: recording, force: true)
+    }
+
+    /// The "Summary language" menu's one entry point (`SummaryLanguageMenu`,
+    /// via every host's `onPick`): persist `language` as the per-recording
+    /// override on the LIVE row and regenerate from that row — never from
+    /// the `Recording` the menu captured, which can be a stale snapshot (see
+    /// `RecordingStore.setSummaryLanguage`).
+    ///
+    /// A pick that matches what is already in force is a no-op: nothing is
+    /// written and no LLM call starts. The menu shows a ✓ on that entry, so
+    /// re-picking it reads as "leave it", and the explicit re-run is
+    /// "Regenerate summary", one entry up. Before this lived here each of
+    /// the three hosts had its own copy of the glue, and every copy
+    /// regenerated unconditionally (review of #308).
+    ///
+    /// Two comparisons, because the stored string and the language in force
+    /// can disagree: an unrecognised persisted code (`"fr"`, hand-edited or
+    /// from a newer app) resolves to Default through
+    /// `summaryLanguageOverride`, which is what the ✓ reflects. The RAW
+    /// value decides whether to write — so picking Default on such a row
+    /// cleans the junk out of recordings.json instead of leaving it there
+    /// forever — and the TYPED override decides whether to regenerate, so
+    /// that clean-up does not cost an LLM call for a summary that would come
+    /// back in the same language.
+    func setSummaryLanguage(_ language: RecordingLanguage?, for recordingID: UUID) {
+        guard let live = liveRecording(recordingID) else { return }
+        let code = language?.rawValue
+        guard live.summaryLanguage != code else {
+            summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): unchanged — nothing to do")
+            return
+        }
+        guard let updated = store.setSummaryLanguage(code, recordingID: recordingID) else { return }
+        guard live.summaryLanguageOverride != language else {
+            summarizerLog.log("summary language \(self.shortID(recordingID), privacy: .public): normalised an unrecognised code — language in force unchanged, not regenerating")
+            return
+        }
+        regenerate(updated)
     }
 
     /// Scan the store for completed recordings missing a summary, then
@@ -307,14 +467,34 @@ final class RecordingSummarizer: ObservableObject {
         pumpBackfill()
     }
 
-    /// Cancel any in-flight summary work for `recordingID`. Used when a
-    /// recording is being permanently deleted so we don't spend a CLI
-    /// call on output that has nowhere to land.
+    /// Cancel any summary work for `recordingID`: drop it from the backfill
+    /// queue and cancel its in-flight call. Called for every permanent
+    /// delete via `RecordingStore.permanentlyDeleted` (see `init`), so a
+    /// deleted recording does not spend a CLI call on output that has
+    /// nowhere to go.
+    ///
+    /// Cancelling the task is what stops the child: `LLMRunner.run` bridges
+    /// task cancellation to SIGTERM, escalating to SIGKILL after a short
+    /// grace, with every wait bounded. The slot is handed on once that child
+    /// is gone, not before: the cancelled task's `defer` runs
+    /// `pumpBackfill()` when the call unwinds, so the next queued recording
+    /// starts then, and `maxConcurrent` keeps counting processes that are
+    /// really running rather than ones still being killed.
+    ///
+    /// NOT called when a recording is moved to Recently Deleted. That is
+    /// reversible, and nothing re-queues a restored recording's summary
+    /// until the next launch's backfill, so cancelling (or dropping it from
+    /// the queue) would leave a restored row without one; letting the call
+    /// happen costs only the call the recording was already owed. Emptying
+    /// the bin cancels whatever is still running or queued.
     func cancel(recordingID: UUID) {
         backfillQueue.removeAll { $0 == recordingID }
-        if let task = inFlight.removeValue(forKey: recordingID) {
-            task.cancel()
+        if let run = inFlight.removeValue(forKey: recordingID) {
+            run.task.cancel()
             inFlightIDs.remove(recordingID)
+            // Still holds its slot until its task unwinds (see
+            // `cancelledRuns`); the task's `defer` gives it back.
+            cancelledRuns[run.token] = (recordingID, run.task)
         }
     }
 
@@ -324,7 +504,7 @@ final class RecordingSummarizer: ObservableObject {
     /// each task's `defer` so as soon as one finishes the next one can
     /// start.
     private func pumpBackfill() {
-        while inFlight.count < maxConcurrent, !backfillQueue.isEmpty {
+        while inFlight.count + cancelledRuns.count < maxConcurrent, !backfillQueue.isEmpty {
             let id = backfillQueue.removeFirst()
             guard let rec = store.recordings.first(where: { $0.id == id }) else {
                 continue
@@ -341,54 +521,53 @@ final class RecordingSummarizer: ObservableObject {
     /// `force` controls whether an already-present summary is overwritten
     /// when the CLI returns.
     private func runSummary(for recording: Recording, force: Bool) {
-        let id = recording.id
-        // Dedup: a re-enqueue from the transcription path or a second
-        // "Regenerate" tap while the first is in flight is a no-op so a
-        // re-enqueue from the transcription path can't double-bill.
-        guard inFlight[id] == nil else {
-            summarizerLog.log("\(self.shortID(id), privacy: .public): skipped — already in flight")
+        // Built from the LIVE row when there is one: callers hand over
+        // whatever copy they hold, and the completion compares against the
+        // live row, so a copy that differs from the store would make every
+        // run look stale from the start.
+        //
+        // A row that is no longer in the store gets no call at all. A
+        // request can arrive after a permanent delete with the caller's
+        // stale copy (a post-recording step still finishing after a
+        // discard, a regenerate racing the delete), and the delete's
+        // `permanentlyDeleted` cancel has already fired, so nothing would
+        // ever cancel a call started now: it would hold a slot for the
+        // whole `cliTimeout` for output with nowhere to go (#334). No
+        // signal either, as for any deleted row.
+        guard let recording = liveRecording(recording.id) else {
+            summarizerLog.log("skipped \(self.shortID(recording.id), privacy: .public): recording is gone")
             return
         }
-        let tool = llmSettings.tool
-        let executableOverride = llmSettings.executablePath.isEmpty
-            ? nil
-            : llmSettings.executablePath
-        // OpenAI-compatible runs use the endpoint's model name from
-        // `llmSettings.openAIModelName`; CLI runs use Live AI's model
-        // override. Mirrors `LiveAISession.kick`'s tool-conditional selection
-        // (issue celarent7/mila#4 — previously this always sent
-        // `liveAISettings.model`, e.g. "claude-sonnet-4-6", to the OpenAI
-        // endpoint, which 404'd on model-not-found).
-        let model = (tool == .openaiCompatible)
-            ? llmSettings.openAIModelName
-            : liveAISettings.model
-        let extraArgs = llmSettings.extraArgsTokens
-        let promptLanguageName: String = {
-            switch liveAISettings.outputLanguage {
-            case .auto:
-                return recording.fullText.isPredominantlyHebrew ? "Hebrew" : "English"
-            case .english:
-                return "English"
-            case .hebrew:
-                return "Hebrew"
+        let id = recording.id
+        // Dedup: a second request while one is in flight never starts a
+        // second overlapping call, so a re-enqueue can't double-bill. It is
+        // not lost either: the completion re-runs if the row's transcript or
+        // language moved meanwhile, and a `regenerate` is either served by
+        // the running call (same inputs) or gets a follow-up (new inputs).
+        if var run = inFlight[id] {
+            if force {
+                if run.inputs == summaryInputs(for: recording) {
+                    run.regenerateFolded = true
+                    summarizerLog.log("\(self.shortID(id), privacy: .public): already in flight — regenerate folded into it")
+                } else {
+                    run.regenerateWithNewInputs = true
+                    summarizerLog.log("\(self.shortID(id), privacy: .public): already in flight — regenerate with new inputs, re-running after it")
+                }
+                run.force = true
+                inFlight[id] = run
+            } else {
+                summarizerLog.log("\(self.shortID(id), privacy: .public): skipped — already in flight")
             }
-        }()
-        let basePrompt = liveAISettings.summaryPrompt
-            .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
-        // Wrap the user's plain-text summary prompt so the one-shot call
-        // also returns action items. Restores the summary + action-items
-        // pair the pre-#87 inline final Live-AI tick used to produce. See
-        // `promptWithActionItems`: the summary stays PLAIN TEXT and only a
-        // compact item array is JSON, so a long multi-line Hebrew summary
-        // full of quotes can't corrupt the parse.
-        let prompt = Self.promptWithActionItems(base: basePrompt)
-        let transcript = recording.fullText
+            return
+        }
+        let globalLanguage = liveAISettings.outputLanguage
+        let inputs = summaryInputs(for: recording)
+        let hasLanguageOverride = recording.summaryLanguage != nil
         let timeout = timeoutSeconds
         // OpenAI-compatible config captured up front so the detached call
         // doesn't depend on `self` (mirrors tool/prompt/etc. above). Summary
         // is free-text, so `jsonMode` is false; `transport` stays nil so the
         // production `URLSession` default applies.
-        let openAIBaseURL = llmSettings.openAIBaseURL
         let openAIAPIKey = llmSettings.openAIAPIKey
         let startedAt = Date()
         // Captured strongly: the runner closure holds no reference to
@@ -398,9 +577,16 @@ final class RecordingSummarizer: ObservableObject {
         let runLLM = self.runLLM
 
         inFlightIDs.insert(id)
-        summarizerLog.log("started \(self.shortID(id), privacy: .public) transcript=\(transcript.count, privacy: .public)c force=\(force, privacy: .public)")
+        let token = UUID()
+        // `language` is the resolved keyword ("Hebrew"/"English"), never user
+        // text, so it is safe as a `.public` field — and it is what makes a
+        // "why is this summary in the wrong language" report diagnosable.
+        summarizerLog.log("started \(self.shortID(id), privacy: .public) transcript=\(inputs.transcript.count, privacy: .public)c force=\(force, privacy: .public) language=\(inputs.promptLanguageName, privacy: .public) override=\(hasLanguageOverride, privacy: .public)")
 
         let task = Task { @MainActor [weak self] in
+            // Set by whichever outcome below got `.rerun`; acted on in the
+            // `defer`.
+            var followUp = false
             defer {
                 // `return` cannot transfer control out of a defer body in
                 // Swift, so an `if let self` block is what we want here
@@ -408,8 +594,36 @@ final class RecordingSummarizer: ObservableObject {
                 // has already deinit'd, there's nothing to clean up —
                 // the dictionary and the publisher set went with it.
                 if let self {
-                    self.inFlight[id] = nil
-                    self.inFlightIDs.remove(id)
+                    // Only this run's own state: after `cancel` a newer run
+                    // may own the id.
+                    if let run = self.inFlight[id], run.token == token {
+                        self.inFlight[id] = nil
+                        self.inFlightIDs.remove(id)
+                        // Started HERE, synchronously, once `inFlight` is
+                        // clear and BEFORE the backfill pump: the follow-up
+                        // takes the slot this run just freed instead of
+                        // starting on top of a backfill candidate that took
+                        // it, so `maxConcurrent` holds. Re-read now, so it
+                        // summarizes the row as of completion. Non-force
+                        // follow-ups go back through the normal gate
+                        // (auto-summary may have been switched off). A row
+                        // that is gone, or in Recently Deleted, gets no LLM
+                        // call and no signal — the same as a row trashed
+                        // mid-pass gets no completion work from
+                        // `TranscriptionService` (no export of a recording
+                        // the user threw away).
+                        if followUp, let live = self.liveRecording(id), !live.isTrashed {
+                            if run.force {
+                                self.regenerate(live)
+                            } else {
+                                self.summarizeIfNeeded(live)
+                            }
+                        }
+                    }
+                    // Cancelled: this run's slot was held for it in
+                    // `cancelledRuns` until now. (A no-op for a run that
+                    // was never cancelled.)
+                    self.cancelledRuns[token] = nil
                     // After each completion, try to pull the next
                     // queued backfill candidate in.
                     self.pumpBackfill()
@@ -420,14 +634,14 @@ final class RecordingSummarizer: ObservableObject {
                 // `LLMRunner.run`) so tests can return canned output without
                 // spawning a real CLI subprocess.
                 let raw = try await runLLM(
-                    tool,
-                    prompt,
-                    transcript,
-                    executableOverride,
-                    model.isEmpty ? nil : model,
-                    extraArgs,
+                    inputs.tool,
+                    inputs.prompt,
+                    inputs.transcript,
+                    inputs.executableOverride,
+                    inputs.model.isEmpty ? nil : inputs.model,
+                    inputs.extraArgs,
                     timeout,
-                    openAIBaseURL,
+                    inputs.openAIBaseURL,
                     openAIAPIKey,
                     false,
                     nil
@@ -449,10 +663,16 @@ final class RecordingSummarizer: ObservableObject {
                     // transcript and is user content, so it must not reach a
                     // `.public` log field (`bugbot-rules/no-user-content-in-logs.md`).
                     summarizerLog.log("skipped \(self?.shortID(id) ?? "?", privacy: .public): no summary parsed origin=\(origin.rawValue, privacy: .public) output=\(raw.count, privacy: .public)c")
-                    // No summary landed — let a pending export fall back to
+                    guard let self else { return }
+                    switch self.completion(of: id, token: token, produced: false) {
+                    case .abandoned: return
+                    case .rerun: followUp = true; return
+                    case .proceed: break
+                    }
+                    // No summary came back — let a pending export fall back to
                     // the transcript rather than waiting forever. Skip the
                     // signal entirely if the recording went away mid-flight.
-                    if let self, let current = self.liveRecording(id) {
+                    if let current = self.liveRecording(id) {
                         self.onSummaryFinished?(current)
                     }
                     return
@@ -466,9 +686,20 @@ final class RecordingSummarizer: ObservableObject {
                     // Deleted mid-flight — nothing to export, so no signal.
                     return
                 }
+                // Checked before the "a summary is already there" skip below,
+                // and before storing: output built from a snapshot that is no
+                // longer the row's transcript or language must not be shown
+                // as current even briefly, nor survive a failed follow-up.
+                let run: InFlightRun
+                switch self.completion(of: id, token: token, produced: true) {
+                case .abandoned: return
+                case .rerun: followUp = true; return
+                case .proceed(let owned): run = owned
+                }
                 let existing = (current.summary ?? "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !force, !existing.isEmpty {
+                // `run.force` includes a `regenerate` folded into this run.
+                if !run.force, !existing.isEmpty {
                     summarizerLog.log("skipped \(self.shortID(id), privacy: .public): a summary landed mid-flight")
                     // A summary is present (just from another path) — the
                     // recording is ready to export.
@@ -503,16 +734,110 @@ final class RecordingSummarizer: ObservableObject {
                     failed \(self?.shortID(id) ?? "?", privacy: .public): \
                     \(LLMRunnerError.logMessage(for: error), privacy: .public)
                     """)
+                guard let self else { return }
+                // A row that changed while this call was out gets its re-run
+                // whatever became of the call — a timeout at the wrong moment
+                // must not leave a new transcript or a persisted language
+                // override never honoured. A `cancel` (permanent delete)
+                // arrives here as a CancellationError and is `.abandoned`.
+                switch self.completion(of: id, token: token, produced: false) {
+                case .abandoned: return
+                case .rerun: followUp = true; return
+                case .proceed: break
+                }
                 // Failed generation — signal so a pending export can still
-                // write the transcript fallback. A permanent delete cancels
-                // the task, which lands here as a CancellationError, so the
-                // store lookup is what stops a deleted recording being filed.
-                if let self, let current = self.liveRecording(id) {
+                // write the transcript fallback. The store lookup is what
+                // stops a deleted recording being filed.
+                if let current = self.liveRecording(id) {
                     self.onSummaryFinished?(current)
                 }
             }
         }
-        inFlight[id] = task
+        inFlight[id] = InFlightRun(token: token,
+                                   task: task,
+                                   inputs: inputs,
+                                   globalLanguage: globalLanguage,
+                                   force: force)
+    }
+
+    /// Everything `runSummary` builds a call from, resolved now. Also used
+    /// to decide whether a `regenerate` hitting the dedup guard asks for the
+    /// same call as the one in flight.
+    private func summaryInputs(for recording: Recording) -> SummaryInputs {
+        let tool = llmSettings.tool
+        let executableOverride = llmSettings.executablePath.isEmpty
+            ? nil
+            : llmSettings.executablePath
+        // OpenAI-compatible runs use the endpoint's model name from
+        // `llmSettings.openAIModelName`; CLI runs use Live AI's model
+        // override. Mirrors `LiveAISession.kick`'s tool-conditional selection
+        // (issue celarent7/mila#4 — previously this always sent
+        // `liveAISettings.model`, e.g. "claude-sonnet-4-6", to the OpenAI
+        // endpoint, which 404'd on model-not-found).
+        let model = LLMSettings.backgroundModelName(tool: tool,
+                                                    openAIModelName: llmSettings.openAIModelName,
+                                                    liveAIModel: liveAISettings.model)
+        // Per-recording override first, then the global setting (with Auto
+        // resolved against the transcript text). Resolved ONCE per run; a
+        // pick while the call is out is caught by the completion.
+        let promptLanguageName = Self.promptLanguageName(for: recording,
+                                                         global: liveAISettings.outputLanguage)
+        let basePrompt = liveAISettings.summaryPrompt
+            .replacingOccurrences(of: "{{LANGUAGE}}", with: promptLanguageName)
+        // Wrap the user's plain-text summary prompt so the one-shot call
+        // also returns action items. Restores the summary + action-items
+        // pair the pre-#87 inline final Live-AI tick used to produce. See
+        // `promptWithActionItems`: the summary stays PLAIN TEXT and only a
+        // compact item array is JSON, so a long multi-line Hebrew summary
+        // full of quotes can't corrupt the parse.
+        let prompt = Self.promptWithActionItems(base: basePrompt, language: promptLanguageName)
+        return SummaryInputs(tool: tool,
+                             executableOverride: executableOverride,
+                             model: model,
+                             extraArgs: llmSettings.extraArgsTokens,
+                             promptLanguageName: promptLanguageName,
+                             prompt: prompt,
+                             transcript: recording.fullText,
+                             openAIBaseURL: llmSettings.openAIBaseURL)
+    }
+
+    /// Decide what a completed call (`token`) does with its output. Called
+    /// from every completion outcome, not just success — a re-transcription,
+    /// a language pick or an explicit regenerate gets its re-run regardless
+    /// of what became of the call it interrupted.
+    ///
+    /// `.rerun` when the row moved on (its transcript, or the language its
+    /// prompt resolves to, differs from the run's snapshot), when a `regenerate` asked
+    /// for different inputs, or when a folded-in `regenerate` would
+    /// otherwise end with nothing (`produced == false`). A STALE run on a
+    /// row in Recently Deleted still discards, so a stale summary cannot
+    /// come back on restore, but gets no follow-up and no signal. (A run
+    /// that is not stale treats a trashed row as it always has.) A row that
+    /// is gone proceeds, and the callers' own lookups keep it unsignalled.
+    ///
+    /// Several requests during one run therefore cost one follow-up, built
+    /// from the row as of completion; it can only chain if something changes
+    /// again while IT is out. A GLOBAL setting flip mid-flight with no
+    /// request keeps the result, as it always has.
+    private func completion(of id: UUID, token: UUID, produced: Bool) -> Completion {
+        guard let run = inFlight[id], run.token == token else {
+            summarizerLog.log("discarded \(self.shortID(id), privacy: .public): run was cancelled")
+            return .abandoned
+        }
+        guard let live = liveRecording(id) else { return .proceed(run) }
+        let reason: String
+        let liveLanguage = Self.promptLanguageName(for: live, global: run.globalLanguage)
+        if live.fullText != run.inputs.transcript || liveLanguage != run.inputs.promptLanguageName {
+            reason = "transcript or summary language changed mid-flight"
+        } else if run.regenerateWithNewInputs {
+            reason = "regenerate with new inputs requested mid-flight"
+        } else if run.regenerateFolded, !produced {
+            reason = "folded-in regenerate produced no summary"
+        } else {
+            return .proceed(run)
+        }
+        summarizerLog.log("discarded \(self.shortID(id), privacy: .public): \(reason, privacy: .public) — re-running from the live row")
+        return .rerun
     }
 
     /// Log why a `summarizeIfNeeded` call was rejected. Split out so the
@@ -554,15 +879,52 @@ final class RecordingSummarizer: ObservableObject {
     /// less prone to stray quotes — needs to be valid JSON.
     static let actionItemsSentinel = "###ACTION_ITEMS###"
 
+    /// The language name the one-shot prompt is written for: the recording's
+    /// own `summaryLanguageOverride` when the user set one, otherwise the
+    /// global `LiveAISettings.outputLanguage` — with `.auto` resolved against
+    /// the transcript text here rather than passed to the model as "match the
+    /// transcript", because Claude / cursor-agent obey a concrete "Output in
+    /// Hebrew" far more reliably than an introspective instruction (same
+    /// reasoning as `LiveAISession.kick`).
+    ///
+    /// Pure and static so a test can pin the resolution order without a
+    /// store or a runner. Returns the exact token substituted for
+    /// `{{LANGUAGE}}` and appended by `promptWithActionItems`.
+    static func promptLanguageName(for recording: Recording,
+                                   global: LiveAISettings.OutputLanguage) -> String {
+        if let override = recording.summaryLanguageOverride {
+            return override.displayName
+        }
+        switch global {
+        case .auto:
+            return recording.fullText.isPredominantlyHebrew ? "Hebrew" : "English"
+        case .english:
+            return "English"
+        case .hebrew:
+            return "Hebrew"
+        }
+    }
+
+    /// The one line that always carries the output language to the model.
+    /// `summaryPrompt`'s `{{LANGUAGE}}` slot is the user's to edit — and a
+    /// user who edited it out used to get a silent no-op from the Output
+    /// language setting (and would from the per-recording override too). So
+    /// the language is stated here as well, in the part of the request Mila
+    /// owns, and it names the action items explicitly because the base prompt
+    /// never mentions them.
+    static func languageDirective(_ language: String) -> String {
+        "Write the summary and every action item in \(language)."
+    }
+
     /// Wrap the user's plain-text summary prompt so the one-shot call also
     /// returns action items, WITHOUT embedding the summary in JSON. The
     /// user's `summaryPrompt` still drives the summary's content and style
     /// (including its `{{LANGUAGE}}` directive); this only appends the
-    /// output-format + action-item contract. Building the request here rather
-    /// than baking it into the persisted `summaryPrompt` means a user's
-    /// customised prompt keeps working and no persisted-default migration is
-    /// needed.
-    static func promptWithActionItems(base: String) -> String {
+    /// output-format + action-item contract and the language directive.
+    /// Building the request here rather than baking it into the persisted
+    /// `summaryPrompt` means a user's customised prompt keeps working and no
+    /// persisted-default migration is needed.
+    static func promptWithActionItems(base: String, language: String) -> String {
         """
         \(base)
 
@@ -580,6 +942,8 @@ final class RecordingSummarizer: ObservableObject {
         task someone committed to do (with or without a deadline) or an \
         explicit follow-up or request. If there are none, output an empty \
         array: []
+
+        \(languageDirective(language))
         """
     }
 
@@ -880,11 +1244,27 @@ final class RecordingSummarizer: ObservableObject {
     }
 
     /// The freshest copy of a recording from the store, or `fallback` when
-    /// it's no longer there. Used by the SYNCHRONOUS skip paths, where the
-    /// caller handed us the recording a moment ago and the fallback is the
-    /// same object it already holds.
+    /// it's no longer there. Used to GATE a request on the live row; never
+    /// to signal with, since the fallback can describe a row that has been
+    /// deleted (see `signalSkipped`).
     private func latestRecording(_ id: UUID, fallback: Recording) -> Recording {
         store.recordings.first(where: { $0.id == id }) ?? fallback
+    }
+
+    /// Signal `onSummaryFinished` for a request that was skipped without a
+    /// call, with the LIVE row, and not at all when the row is gone. The
+    /// skip paths used to fall back to the caller's copy, so a request
+    /// arriving after a permanent delete (a post-recording step finishing
+    /// after a discard) signalled a recording that no longer exists, and
+    /// only the Obsidian exporter's discard tombstone kept that from filing
+    /// a note for it. The asynchronous completion paths already refused a
+    /// row that is gone; this is the same rule for the synchronous ones.
+    private func signalSkipped(_ id: UUID) {
+        guard let live = liveRecording(id) else {
+            summarizerLog.log("skipped \(self.shortID(id), privacy: .public): recording is gone — not signalled")
+            return
+        }
+        onSummaryFinished?(live)
     }
 
     /// The recording as the store currently holds it, or nil when it's gone.

@@ -20,6 +20,18 @@
 				<string>io.island.mila.config</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Mila Shared Recording</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>io.island.mila.share</string>
+			</array>
+		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
@@ -89,6 +101,27 @@
 				<key>public.filename-extension</key>
 				<array>
 					<string>milaconfig</string>
+				</array>
+			</dict>
+		</dict>
+		<dict>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>public.zip-archive</string>
+			</array>
+			<key>UTTypeDescription</key>
+			<string>Mila Shared Recording</string>
+			<key>UTTypeIdentifier</key>
+			<string>io.island.mila.share</string>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>milashare</string>
+				</array>
+				<key>public.mime-type</key>
+				<array>
+					<string>application/vnd.mila.share+zip</string>
 				</array>
 			</dict>
 		</dict>

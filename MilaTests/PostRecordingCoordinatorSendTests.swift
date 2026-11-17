@@ -761,6 +761,102 @@ final class PostRecordingCoordinatorSendTests: XCTestCase {
                        "discarding the recording must take its note out of the vault")
     }
 
+    // MARK: - Permanent delete cancels post-recording LLM work (#340)
+
+    /// A runner stub that parks every call until it is cancelled, counting
+    /// the calls that started and the ones that ended in a cancel.
+    private final class ParkedCalls {
+        var started = 0
+        var cancelled = 0
+    }
+
+    private func parkingCoordinator(label: String,
+                                    calls: ParkedCalls,
+                                    nameGeneration: Bool = false) -> PostRecordingCoordinator {
+        let suiteName = "PostRecordingCoordinatorSendTests.\(label)"
+        UserDefaults().removePersistentDomain(forName: suiteName)
+        let llm = LLMSettings(defaults: UserDefaults(suiteName: suiteName)!,
+                              apiKeyKeychainKey: suiteName)
+        llm.tool = .claude
+        llm.nameGenerationEnabled = nameGeneration
+        let made = PostRecordingCoordinator(
+            store: store, transcription: service, llm: llm,
+            runLLM: { _, _, _, _, _, _, _, _, _, _, _, _, _, _ in
+                calls.started += 1
+                do {
+                    try await Task.sleep(nanoseconds: 120 * 1_000_000_000)
+                } catch {
+                    calls.cancelled += 1
+                    throw error
+                }
+                return "LATE"
+            })
+        made.transcriptWaitTimeout = Self.testTranscriptWait
+        return made
+    }
+
+    /// Deleting a recording from the list (not through the rename sheet's
+    /// Discard) cancels its in-flight Send. Only Discard used to, so the CLI
+    /// ran to completion for a recording that no longer existed and posted
+    /// its answer in the banner.
+    func test_permanent_delete_cancels_an_in_flight_send() async throws {
+        let calls = ParkedCalls()
+        let coordinator = parkingCoordinator(label: #function, calls: calls)
+        let rec = addCompletedRecording(text: "the transcript")
+
+        coordinator.sendToLLM(recordingID: rec.id, tool: .claude, prompt: "p",
+                              transcript: "the transcript", summary: "",
+                              executableOverride: nil,
+                              cliTimeout: Self.testCLITimeout)
+        try await waitFor(calls.started == 1)
+        XCTAssertTrue(coordinator.isSending(rec.id))
+
+        store.permanentlyDelete(rec)
+        XCTAssertFalse(coordinator.isSending(rec.id),
+                       "a permanent delete must cancel the recording's Send")
+        try await waitFor(calls.cancelled == 1)
+        XCTAssertNotEqual(coordinator.activityStatus, "Claude: LATE")
+    }
+
+    /// Emptying Recently Deleted cancels the background auto-title job of a
+    /// recording in the bin, and moving it to the bin on its own does not
+    /// (that is reversible).
+    func test_emptying_the_trash_cancels_an_in_flight_auto_title() async throws {
+        let calls = ParkedCalls()
+        let coordinator = parkingCoordinator(label: #function, calls: calls, nameGeneration: true)
+        let rec = addCompletedRecording(text: "the transcript")
+
+        coordinator.present(rec)
+        try await waitFor(calls.started == 1)
+        XCTAssertTrue(coordinator.autoSuggestingIDs.contains(rec.id))
+
+        store.softDelete(rec)
+        XCTAssertTrue(coordinator.autoSuggestingIDs.contains(rec.id),
+                      "moving to Recently Deleted must not cancel the title job")
+
+        XCTAssertEqual(store.emptyTrash(), 1)
+        XCTAssertFalse(coordinator.autoSuggestingIDs.contains(rec.id),
+                       "emptying the bin must cancel the title job")
+        try await waitFor(calls.cancelled == 1)
+    }
+
+    /// A permanent delete also closes a rename sheet still showing that
+    /// recording: its Suggest / Send would otherwise start calls for a
+    /// deleted row after the delete hook had fired. Another row's sheet is
+    /// left alone.
+    func test_permanent_delete_closes_the_rename_sheet_for_that_recording() {
+        let shown = addCompletedRecording(text: "shown")
+        let other = addCompletedRecording(text: "other")
+        coordinator.present(shown)
+        XCTAssertEqual(coordinator.pending?.id, shown.id)
+
+        store.permanentlyDelete(other)
+        XCTAssertEqual(coordinator.pending?.id, shown.id, "deleting another row must not close the sheet")
+
+        store.permanentlyDelete(shown)
+        XCTAssertNil(coordinator.pending, "the sheet must not stay up on a deleted recording")
+    }
+
     // MARK: - Helpers
 
     /// Wait up to `timeoutSeconds` (default 5) for `condition` to hold, polling

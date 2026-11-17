@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import ScreenCaptureKit
 
 struct ContentView: View {
@@ -13,6 +14,7 @@ struct ContentView: View {
     @EnvironmentObject private var llmSettings: LLMSettings
     @EnvironmentObject private var liveAISettings: LiveAISettings
     @EnvironmentObject private var updater: UpdaterViewModel
+    @EnvironmentObject private var shareImporter: RecordingShareImporter
 
     @State private var selection: SidebarSelection? = .home
     @State private var search: String = ""
@@ -33,11 +35,16 @@ struct ContentView: View {
                 detailContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                if let progress = activeDownloadProgress() {
-                    ModelDownloadBanner(progress: progress)
-                        .padding(.top, 8)
-                        .transition(.move(edge: .top).combined(with: .opacity))
+                VStack(spacing: 8) {
+                    if let progress = activeDownloadProgress() {
+                        ModelDownloadBanner(progress: progress)
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                    // A leaf view, so `ContentView` itself does not observe
+                    // the profile store (#342).
+                    DamagedVoiceProfilesBanner()
                 }
+                .padding(.top, 8)
 
                 // The floating RecordingChip used to be the only "you
                 // are recording" indicator. With the new always-on live
@@ -92,6 +99,18 @@ struct ContentView: View {
             ),
             actions: { Button("OK") { transcription.lastError = nil } },
             message: { Text(transcription.lastError ?? "") }
+        )
+        // "End Conversation Here" trimmed the transcript but not the audio
+        // (#357). Shown here rather than in the detail view because the audio
+        // work can finish after the user has navigated elsewhere.
+        .alert(
+            "Transcript trim",
+            isPresented: Binding(
+                get: { store.trimNotice != nil },
+                set: { if !$0 { store.trimNotice = nil } }
+            ),
+            actions: { Button("OK") { store.trimNotice = nil } },
+            message: { Text(store.trimNotice ?? "") }
         )
         .alert(
             "Recording stopped because your Mac slept",
@@ -207,6 +226,12 @@ struct ContentView: View {
             }
         }
         .animation(.easeOut(duration: 0.2), value: postRecording.activityStatus)
+        // A just-imported `.milashare` opens itself, the way a just-finished
+        // recording does — the user double-clicked a file and expects to
+        // see it, not to hunt for it in a list sorted by the SENDER's date.
+        .onChange(of: shareImporter.lastImport) { _, completion in
+            if let completion { selection = .recording(completion.recordingID) }
+        }
         .onChange(of: columnVisibility) { _, _ in
             // Sidebar visibility changed — ping the AppDelegate so it
             // re-applies the withinWindow blending on the (possibly
@@ -235,14 +260,18 @@ struct ContentView: View {
             && actions.isRecording
             && liveAISettings.enabled
             && llmSettings.isConfigured
-            && liveAISettings.isLiveAIAvailable
+            && actions.recordingRunsLivePipeline
     }
 
     /// Whether the home pane should swap to `LiveAIRecordingView`.
-    /// The UI-test bypass for the hardware gate lives centrally in
-    /// `MilaApp.init()` (it injects a non-Air `SystemCapabilities`
-    /// into `LiveAISettings`), so checking `isLiveAIAvailable` here
-    /// works in both production and UI-test launches. The
+    /// Keyed on the controller's per-recording decision
+    /// (`recordingRunsLivePipeline`: hardware gate AND "Transcribe while
+    /// recording"), not on the settings, so a toggle flipped mid-call
+    /// neither strands the user in an empty live pane nor yanks away a
+    /// running one. The UI-test bypass for the hardware gate lives
+    /// centrally in `MilaApp.init()` (it injects a non-Air
+    /// `SystemCapabilities` into `LiveAISettings`), so this works in both
+    /// production and UI-test launches. The
     /// `--ui-test-rtl-live-hebrew` route additionally forces the
     /// view even when no recording is in progress so the layout
     /// regression test can assert without driving real audio.
@@ -258,7 +287,7 @@ struct ContentView: View {
         // whisper for CPU, this trades off live visibility for
         // throughput.
         if liveAISettings.backgroundMode { return false }
-        return actions.isRecording && liveAISettings.isLiveAIAvailable
+        return actions.isRecording && actions.recordingRunsLivePipeline
     }
 
     /// Compose the wake-up alert body. Always shows the captured length so
@@ -478,7 +507,16 @@ private struct LanguagePickerToolbarItem: View {
             .padding(.horizontal, 8)
         }
         .menuStyle(.borderlessButton)
-        .help("Language used for new voice memos and app-audio recordings")
+        // Locked by a configuration profile (issue #360): still shows the
+        // language, but can't be changed here.
+        .disabled(languageSettings.isManaged(.recordingLanguage))
+        .help(helpText)
+    }
+
+    private var helpText: String {
+        languageSettings.isManaged(.recordingLanguage)
+            ? "Language used for new recordings — \(ManagedSettings.note.lowercased())"
+            : "Language used for new voice memos and app-audio recordings"
     }
 }
 
@@ -502,6 +540,7 @@ private struct RecordingChip: View {
             Text(formatDuration(meters.elapsed))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(paused ? .orange : .primary)
+            ConnectionDropIndicator()
             // `RecordingPauseButton` applies its own `.buttonStyle(.plain)`
             // internally (closest-to-the-Button wins), so don't restate a
             // style here — it would read as doing something and do nothing.
@@ -522,6 +561,28 @@ private struct RecordingChip: View {
             Capsule().strokeBorder((paused ? Color.orange : Color.red).opacity(0.4), lineWidth: 1)
         )
         .shadow(color: .black.opacity(0.1), radius: 6, y: 2)
+    }
+}
+
+/// The floating recording chip's half of the "can't reach the transcription
+/// server" warning (#355): the full banner lives in `LiveAIRecordingView`,
+/// which is only on screen on Home, and the chip is what shows everywhere
+/// else. Its own leaf so only this icon observes `LiveTranscriber`, not the
+/// chip or anything above it. Renders nothing while the server is reachable.
+private struct ConnectionDropIndicator: View {
+    @EnvironmentObject private var transcriber: LiveTranscriber
+    @EnvironmentObject private var actions: QuickActionsController
+
+    var body: some View {
+        // Until the previous recording's Stop hands over the live pipeline
+        // (#356), the transcriber's state is that meeting's, not this one's.
+        if transcriber.isConnectionInterrupted, !actions.isAwaitingLivePipeline {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+                .help("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
+                .accessibilityLabel("Can't reach the transcription server; recording continues")
+                .accessibilityIdentifier("recordingChip.connectionInterrupted")
+        }
     }
 }
 
@@ -652,9 +713,22 @@ private struct QueueRow: View {
                 }
             }
 
-            // Stop (cancel + move to Recently Deleted) + Remove (cancel +
-            // permanently delete). Both trip the engine abort flag first so a
-            // `.running` item stops burning CPU immediately.
+            // Transcribe later (stop, keep the recording in the library),
+            // Stop (cancel + move to Recently Deleted) and Remove (cancel +
+            // permanently delete). All three take a `.running` item off the
+            // CPU immediately. "Later" is shown only while there is a run to
+            // stop: a row still being finalized after Stop isn't queued yet.
+            if transcription.isQueuedOrActive(recording.id) {
+                Button {
+                    transcription.deferTranscription(of: recording.id)
+                } label: {
+                    Image(systemName: "pause.circle")
+                }
+                .buttonStyle(.borderless)
+                .help("Stop transcribing for now and keep the recording — transcribe it later from its page")
+                .accessibilityIdentifier("queue.row.later.\(recording.id)")
+            }
+
             Button {
                 cancel()
             } label: {
@@ -771,6 +845,111 @@ private struct AppPickerSheet: View {
         }
         .padding(20)
         .frame(width: 460)
+    }
+}
+
+/// Tells the user, once, that their saved voice profiles could not be read
+/// (#342). Settings → Speakers has said so since #336, but someone who
+/// never opens it would only notice speakers silently going unrecognised.
+/// Non-modal: it sits over the detail pane until closed, and
+/// `SpeakerProfileStore.damagedProfilesAnnouncement` decides when it shows
+/// (once per incident, never for a backup dismissed in Settings, not while
+/// voice recognition is off).
+private struct DamagedVoiceProfilesBanner: View {
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
+    @Environment(\.openSettings) private var openSettings
+    /// `.key` only while this window is the one in front of the user — built
+    /// into the view tree (minimised, behind Settings, Mila in the
+    /// background) is not the same as seen.
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    var body: some View {
+        Group {
+            if let notice = profileStore.damagedProfilesAnnouncement {
+                banner(notice)
+                    // In front of the user: this incident is now announced
+                    // (#342).
+                    .onChange(of: notice, initial: true) { _, _ in noteIfVisible() }
+                    .onChange(of: controlActiveState) { _, _ in noteIfVisible() }
+            }
+        }
+        // "Show in Finder" invites the user to fix things by hand; look
+        // again when they come back, as Settings does, so the banner does
+        // not keep describing a file that is gone or repaired. Only while
+        // it is up, so an ordinary activation does no file work.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if profileStore.damagedProfilesAnnouncement != nil {
+                profileStore.recheckDamagedProfiles()
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: profileStore.damagedProfilesAnnouncement)
+    }
+
+    private func noteIfVisible() {
+        guard controlActiveState == .key else { return }
+        profileStore.noteDamagedProfilesAnnouncementShown()
+    }
+
+    private func banner(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Saved voices are not being recognised")
+                    .font(.callout.weight(.semibold))
+                Text(message(notice))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Open Settings") {
+                        SettingsNavigation.shared.pendingTab = .speakers
+                        SettingsNavigation.shared.pendingAnchor = .voiceRecognition
+                        openSettings()
+                        profileStore.acknowledgeDamagedProfilesAnnouncement()
+                    }
+                    .accessibilityIdentifier("main.damagedVoiceProfiles.openSettings")
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
+                    }
+                    .accessibilityIdentifier("main.damagedVoiceProfiles.showInFinder")
+                }
+                .controlSize(.small)
+            }
+            Button {
+                profileStore.acknowledgeDamagedProfilesAnnouncement()
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 10, weight: .semibold))
+            }
+            .buttonStyle(.borderless)
+            .help("Close")
+            .accessibilityLabel("Close")
+            .accessibilityIdentifier("main.damagedVoiceProfiles.close")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: 480, alignment: .leading)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.orange.opacity(0.35), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+        .padding(.horizontal, 16)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("main.damagedVoiceProfiles")
+        .transition(.move(edge: .top).combined(with: .opacity))
+    }
+
+    private func message(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {
+        switch notice {
+        case .unreadable(let file):
+            return "\(file.lastPathComponent) can't be read, so nobody saved in it will be recognised in new recordings. The file is left untouched. Settings → Speakers → Voice recognition has the details."
+        case .setAside(let backup):
+            return "Your earlier voice profiles couldn't be read, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
+        }
     }
 }
 

@@ -38,12 +38,15 @@ final class DiarizationBootstrap: ObservableObject {
     /// after the wheels download. These don't have a fixed wheel URL we
     /// pin; pip resolves them at install time.
     ///
-    /// `numpy<2`: torch 2.2.x was compiled against the numpy 1.x C ABI.
-    /// The bundled site-packages ships numpy 2.4 because that's what
-    /// pyannote's transitive deps resolve to today, but torch can't
-    /// consume it at runtime — first call raises
+    /// `numpy<2`: torch 2.2.x was compiled against the numpy 1.x C ABI,
+    /// and a numpy 2.x makes its first call raise
     /// `RuntimeError: Numpy is not available`. Installing numpy 1.26.x
-    /// into the user dir works because PYTHONPATH puts user FIRST.
+    /// into the user dir works because PYTHONPATH puts user FIRST — so
+    /// this copy shadows the bundled numpy, and every bundled package
+    /// has to import against it. `build-diarization-bundle.sh` therefore
+    /// resolves the bundle under the same `numpy<2` constraint; 1.9.7's
+    /// bundle was resolved without it, shipped pandas 3.1.0, and pandas
+    /// refused numpy 1.26 at import, failing the whole pyannote stack.
     ///
     /// `matplotlib` + chain: pyannote's audiomentations + pyannote-metrics
     /// lazily import matplotlib deep inside `Pipeline.from_pretrained`. If

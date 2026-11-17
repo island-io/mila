@@ -27,6 +27,7 @@ final class StoredRecordingDriftTests: XCTestCase {
     private let fixtureID = UUID()
     private let fixtureCreated = Date(timeIntervalSince1970: 1_700_000_000)
     private let fixtureDeleted = Date(timeIntervalSince1970: 1_700_000_500)
+    private let fixtureDeferred = Date(timeIntervalSince1970: 1_700_000_250)
 
     /// One `Recording` with **every** persisted field set. Shared by the
     /// field-by-field test and the key-set test so a newly added field only
@@ -60,9 +61,50 @@ final class StoredRecordingDriftTests: XCTestCase {
                                      addedAt: created)],
             voiceMemoUniqueID: "VM-1",
             voiceMemoFolderUUID: "VMF-1",
-            speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"]
+            speakerNames: ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"],
+            summaryLanguage: "en",
+            sharedBy: "Ada Lovelace",
+            sharedAt: created,
+            transcriptionDeferredAt: fixtureDeferred,
+            // Not a state a real row is ever in (a `.completed` row carries no
+            // prior state) — this fixture is about every key being present.
+            retranscriptionPriorState: .init(status: .completed, language: "he",
+                                             modelName: "Earlier model",
+                                             transcriptionDeferredAt: fixtureDeferred),
+            speakerNameSuggestions: [
+                SpeakerNameSuggestion(speaker: "SPEAKER_01", name: "John",
+                                      evidence: "hi there, John here", origin: .transcript),
+            ],
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5),
+                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)]
         )
     }
+
+    /// Top-level keys `Recording` persists that `StoredRecording` deliberately
+    /// does not mirror, with the reason. Adding to this list is a decision;
+    /// leaving a key out of it is a bug. Shared by the top-level check and
+    /// the nested one, which must not demand a mirrored element type for a
+    /// container that is not mirrored at all.
+    private static let intentionallyUnmirrored: Set<String> = [
+        // The sidecar .txt owns the transcript text; the mirror reads it
+        // from disk rather than from the store.
+        "fullText",
+        // Bookkeeping for the Voice Memos importer: they tie a recording
+        // back to the entry it was imported from, so re-import can skip
+        // it. Opaque identifiers with no meaning to an MCP client, which
+        // asks about content — not about import provenance. (Found by
+        // this test when it was first written: both were already absent
+        // from the mirror while the old round-trip assertions stayed
+        // green, which is the drift this test exists to catch.)
+        "voiceMemoUniqueID",
+        "voiceMemoFolderUUID",
+        // Unconfirmed speaker-name SUGGESTIONS (#348): a model's guess the
+        // user has not accepted. MCP exposes the names the user confirmed
+        // (`speakerNames`); surfacing a pending guess there would let a
+        // client present it as fact. Once accepted it IS a `speakerNames`
+        // entry, which is mirrored.
+        "speakerNameSuggestions",
+    ]
 
     func test_fully_populated_recording_round_trips_into_stored_recording() throws {
         let id = fixtureID
@@ -100,6 +142,22 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertEqual(s.actionItems?.first?.speaker, "SPEAKER_00")
         XCTAssertEqual(s.actionItems?.first?.timestampSeconds, 3)
         XCTAssertEqual(s.speakerNames, ["SPEAKER_00": "Daniel", "SPEAKER_01": "John Doe"])
+        XCTAssertEqual(s.summaryLanguage, "en")
+        XCTAssertEqual(s.sharedBy, "Ada Lovelace")
+        XCTAssertEqual(s.sharedAt, created)
+        XCTAssertEqual(s.transcriptionDeferredAt, fixtureDeferred)
+        XCTAssertTrue(s.isTranscriptionDeferred)
+        let prior = try XCTUnwrap(s.retranscriptionPriorState)
+        XCTAssertEqual(prior.status, TranscriptionStatus.completed.rawValue)
+        XCTAssertEqual(prior.language, "he")
+        XCTAssertEqual(prior.modelName, "Earlier model")
+        XCTAssertEqual(prior.transcriptionDeferredAt, fixtureDeferred)
+        let span = try XCTUnwrap(s.untranscribedSpans?.first)
+        XCTAssertEqual(s.untranscribedSpans?.count, 2)
+        XCTAssertEqual(span.start, 12, accuracy: 0.001)
+        XCTAssertEqual(span.end, 15.5, accuracy: 0.001)
+        XCTAssertNil(span.unreadable)
+        XCTAssertEqual(s.untranscribedSpans?.last?.unreadable, true)
         // fullText is deliberately NOT encoded by the app (sidecar .txt owns it).
         XCTAssertNil(s.legacyFullText)
         XCTAssertEqual(s.transcriptFileName, "Weekly sync.txt")
@@ -118,22 +176,8 @@ final class StoredRecordingDriftTests: XCTestCase {
     /// the mirror also round-trips, unless it's listed as a deliberate
     /// omission below.
     func test_every_persisted_key_is_mirrored() throws {
-        // Deliberately not mirrored, with the reason. Adding to this list is
-        // a decision; leaving a key out of it is a bug.
-        let intentionallyUnmirrored: Set<String> = [
-            // The sidecar .txt owns the transcript text; the mirror reads it
-            // from disk rather than from the store.
-            "fullText",
-            // Bookkeeping for the Voice Memos importer: they tie a recording
-            // back to the entry it was imported from, so re-import can skip
-            // it. Opaque identifiers with no meaning to an MCP client, which
-            // asks about content — not about import provenance. (Found by
-            // this test when it was first written: both were already absent
-            // from the mirror while the old round-trip assertions stayed
-            // green, which is the drift this test exists to catch.)
-            "voiceMemoUniqueID",
-            "voiceMemoFolderUUID",
-        ]
+        // Deliberately not mirrored — see `Self.intentionallyUnmirrored`.
+        let intentionallyUnmirrored = Self.intentionallyUnmirrored
 
         let recording = fullyPopulatedRecording()
         let appJSON = try JSONSerialization.jsonObject(
@@ -187,6 +231,19 @@ final class StoredRecordingDriftTests: XCTestCase {
             // Nothing. `ActionItem` is mirrored in full — see the note above
             // for what the gap here used to cost.
             "actionItems": [],
+            // Nothing. `RetranscriptionPriorState` is mirrored in full.
+            "retranscriptionPriorState": [],
+            // Nothing. `UntranscribedSpan` is mirrored in full.
+            "untranscribedSpans": [],
+        ]
+        // Object-valued keys whose KEYS are data, not schema: the mirror
+        // decodes them as a dictionary, so there is no element type to drift.
+        // Declared rather than detected, so that a new map still has to be
+        // classified here by someone — the pin below fails until it is.
+        let dataKeyedMaps: Set<String> = [
+            // Raw diarizer ID → display name. The round-trip test checks the
+            // values; the keys are whatever the diarizer minted.
+            "speakerNames",
         ]
 
         let recording = fullyPopulatedRecording()
@@ -203,32 +260,50 @@ final class StoredRecordingDriftTests: XCTestCase {
         func keyUnion(_ elements: [[String: Any]]) -> Set<String> {
             elements.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
         }
+        // A container is either an array of objects or one object; both are
+        // compared as a list of elements. nil for anything else.
+        func elements(of value: Any?) -> [[String: Any]]? {
+            if let array = value as? [[String: Any]] { return array }
+            if let object = value as? [String: Any] { return [object] }
+            return nil
+        }
 
         // Derive the containers from what the app actually encoded — every
-        // top-level key whose value is a non-empty array of objects. Driving
-        // the loop off `intentionallyUnmirrored` instead would leave this
-        // test with the same hole it exists to close: a NEW nested container
-        // nobody listed would simply not be checked.
+        // top-level key whose value is a non-empty array of objects, or a
+        // single object (a nested struct such as `retranscriptionPriorState`,
+        // which an arrays-only rule used to skip, leaving its keys free to
+        // drift unseen). Driving the loop off `intentionallyUnmirrored`
+        // instead would leave this test with the same hole it exists to
+        // close: a NEW nested container nobody listed would simply not be
+        // checked.
         let containers = appJSON.compactMap { key, value -> String? in
-            guard let elements = value as? [[String: Any]], !elements.isEmpty else { return nil }
+            guard !dataKeyedMaps.contains(key),
+                  // Not mirrored at all (top-level allowlist), so there is
+                  // no mirrored element type to compare against.
+                  !StoredRecordingDriftTests.intentionallyUnmirrored.contains(key),
+                  let elements = elements(of: value), !elements.isEmpty else { return nil }
             return key
         }.sorted()
-        XCTAssertEqual(containers, ["actionItems", "segments"],
+        XCTAssertEqual(containers, ["actionItems", "retranscriptionPriorState", "segments",
+                                    "untranscribedSpans"],
                        "Recording gained (or lost) a nested container. Populate it in "
                        + "fullyPopulatedRecording(), mirror its element type in "
                        + "StoredRecording, and pin its shape in "
-                       + "test_nested_fixtures_populate_every_persisted_element_key.")
+                       + "test_nested_fixtures_populate_every_persisted_element_key — or, "
+                       + "if its keys are data rather than schema, list it in dataKeyedMaps.")
         XCTAssertTrue(Set(intentionallyUnmirrored.keys).subtracting(containers).isEmpty,
                       "stale entries in the nested allowlist: "
                       + "\(Set(intentionallyUnmirrored.keys).subtracting(containers).sorted())")
+        let staleMaps = dataKeyedMaps.filter { !(appJSON[$0] is [String: Any]) }
+        XCTAssertTrue(staleMaps.isEmpty, "stale entries in dataKeyedMaps: \(staleMaps.sorted())")
 
         for container in containers {
             let allowlist = intentionallyUnmirrored[container] ?? []
-            let appElements = try XCTUnwrap(appJSON[container] as? [[String: Any]])
-            let mirrorElements = try XCTUnwrap(mirrorJSON[container] as? [[String: Any]],
-                                               "\(container) is missing (or not an array of "
-                                               + "objects) in the mirror's JSON — the whole "
-                                               + "container is unmirrored")
+            let appElements = try XCTUnwrap(elements(of: appJSON[container]))
+            let mirrorElements = try XCTUnwrap(elements(of: mirrorJSON[container]),
+                                               "\(container) is missing (or neither an object nor "
+                                               + "an array of objects) in the mirror's JSON — the "
+                                               + "whole container is unmirrored")
             XCTAssertFalse(mirrorElements.isEmpty,
                            "\(container) round-tripped as an EMPTY array — the mirror "
                            + "dropped every element")
@@ -264,6 +339,18 @@ final class StoredRecordingDriftTests: XCTestCase {
                        ["id", "text", "speaker", "timestampSeconds", "source", "addedAt"],
                        "ActionItem's persisted shape changed — update the fixture and decide "
                        + "whether the new key belongs in StoredRecording.ActionItem")
+
+        let prior = try XCTUnwrap(appJSON["retranscriptionPriorState"] as? [String: Any])
+        XCTAssertEqual(Set(prior.keys), ["status", "language", "modelName", "transcriptionDeferredAt"],
+                       "RetranscriptionPriorState's persisted shape changed — update the fixture "
+                       + "and decide whether the new key belongs in "
+                       + "StoredRecording.RetranscriptionPriorState")
+
+        let spans = try XCTUnwrap(appJSON["untranscribedSpans"] as? [[String: Any]])
+        let spanKeys = spans.reduce(into: Set<String>()) { $0.formUnion($1.keys) }
+        XCTAssertEqual(spanKeys, ["start", "end", "unreadable"],
+                       "UntranscribedSpan's persisted shape changed — update the fixture and "
+                       + "decide whether the new key belongs in StoredRecording.UntranscribedSpan")
     }
 
     /// The recovered fields must actually arrive, not merely have a key.
@@ -289,6 +376,9 @@ final class StoredRecordingDriftTests: XCTestCase {
         XCTAssertFalse(s.isTrashed)
         XCTAssertEqual(s.segments.count, 0)
         XCTAssertNil(s.actionItems)
+        XCTAssertNil(s.summaryLanguage)
+        XCTAssertNil(s.retranscriptionPriorState, "omitted when nil, so a never re-transcribed row has no key")
+        XCTAssertNil(s.untranscribedSpans, "omitted when nil, so a complete transcript has no key")
     }
 
     func test_legacy_inline_fulltext_decodes() throws {

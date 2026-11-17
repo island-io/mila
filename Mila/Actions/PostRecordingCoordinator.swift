@@ -87,6 +87,9 @@ final class PostRecordingCoordinator: ObservableObject {
     /// cancels + replaces the prior one.
     private var sendTasks: [UUID: Task<Void, Never>] = [:]
 
+    /// The `RecordingStore.permanentlyDeleted` subscription (see `init`).
+    private var cancellables: Set<AnyCancellable> = []
+
     /// How long the background send will wait for an as-yet-unfinished
     /// transcript before giving up. "Send to Claude" can now be pressed
     /// before transcription finishes (fire and walk away), so when the
@@ -130,6 +133,39 @@ final class PostRecordingCoordinator: ObservableObject {
         self.transcription = transcription
         self.llm = llm
         self.runLLM = runLLM
+
+        // Every permanent delete (context menu, Queue "Remove", Empty
+        // Recently Deleted, the sheet's own Discard) cancels that row's
+        // title and Send calls, the same hook `RecordingSummarizer` uses.
+        // Only Discard used to, so deleting a recording any other way left
+        // its CLI running to completion for a row that no longer exists.
+        // Synchronous on the main actor, in the same turn as the delete.
+        store.permanentlyDeleted
+            .sink { [weak self] ids in
+                guard let self else { return }
+                for id in ids { self.cancelLLMWork(for: id) }
+                // And close a rename sheet still showing a deleted row (the
+                // short-empty auto-drop, or Empty Recently Deleted from the
+                // menu): its Suggest / Send would otherwise start new calls
+                // for it after this hook has already fired, which nothing
+                // would cancel.
+                if let shown = self.pending, ids.contains(shown.id) {
+                    self.pending = nil
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Cancel the auto-title / Suggest task and the background Send for
+    /// `recordingID`. Cancelling the task is what stops the CLI:
+    /// `LLMRunner.run` turns it into SIGTERM, then SIGKILL, for the CLI's
+    /// whole process group. Removing the handles first is what the tasks'
+    /// own `defer`s expect of a cancel: they leave the slot alone when
+    /// cancelled, so nothing else would clear it.
+    func cancelLLMWork(for recordingID: UUID) {
+        autoSuggestingIDs.remove(recordingID)
+        llmTasks.removeValue(forKey: recordingID)?.cancel()
+        sendTasks.removeValue(forKey: recordingID)?.cancel()
     }
 
     /// Open the rename sheet for a freshly-added recording. Called by
@@ -652,13 +688,10 @@ final class PostRecordingCoordinator: ObservableObject {
     ///  5. dismiss the sheet
     func cancelAndDiscard() {
         guard let recording = pending else { pending = nil; return }
-        autoSuggestingIDs.remove(recording.id)
-        if let task = llmTasks.removeValue(forKey: recording.id) {
-            task.cancel()
-        }
-        if let task = sendTasks.removeValue(forKey: recording.id) {
-            task.cancel()
-        }
+        // The `permanentlyDeleted` hook installed in `init` does this too,
+        // but only when the row is still in the store to delete; a pending
+        // recording can be gone already and still have work in flight.
+        cancelLLMWork(for: recording.id)
         transcription.cancel(recordingID: recording.id)
         let stored = store.recordings.first(where: { $0.id == recording.id })
         if let stored {

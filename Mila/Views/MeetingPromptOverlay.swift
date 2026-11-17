@@ -141,6 +141,12 @@ final class MeetingPromptCoordinator: ObservableObject {
         // pile a second floating panel on top.
         guard window == nil else { return }
         guard !actions.isRecording else { return }
+        // A Record click that is still bringing capture up counts as
+        // recording here: the user has already chosen, and the panel's own
+        // Record action (`toggleRecord(withSystemAudio: true)`) is dropped by
+        // the controller for the length of the bring-up — it would hide the
+        // panel and change nothing (#293).
+        guard !actions.isStartingRecording else { return }
         guard settings.enabled else { return }
         guard !settings.isDisabled(forBundleID: app.bundleID) else { return }
 

@@ -7,6 +7,8 @@ of Whisper, English by
 [OpenAI's `large-v3-turbo`](https://huggingface.co/ggerganov/whisper.cpp), both
 running through `whisper.cpp` (GPU via Metal).
 
+**Download:** [island-io.github.io/mila](https://island-io.github.io/mila/)
+
 ## Features
 
 - **Record from the microphone** at any time.
@@ -37,6 +39,18 @@ running through `whisper.cpp` (GPU via Metal).
 - **One-click team setup with `.milaconfig` files** — double-click a config file
   to apply the transcription server, model, language, and more in one step.
   Perfect for handing a team a ready-made configuration.
+- **Organization-wide settings via MDM** — the same settings a `.milaconfig`
+  carries can be pushed as a configuration profile (Jamf, Kandji, Intune, …)
+  and are then locked for every user ("Managed by your organization"), e.g. to
+  put a whole company on one transcription server. Managed settings win over a
+  `.milaconfig`, which wins over the user's own choice. See
+  [`docs/mdm.md`](docs/mdm.md).
+- **Share a recording with a colleague** — right-click → **Share Recording…**
+  produces a single `.milashare` file (audio + transcript + speaker names +
+  summary + action items, optionally the speakers' voice profiles). They
+  double-click it and it arrives in their library tagged "Shared by …";
+  re-sharing an updated transcript updates their copy instead of duplicating
+  it. See [`docs/sharing.md`](docs/sharing.md).
 - **Transcription queue** — view queued, in-progress, and recently-deleted jobs;
   stop or remove any item from the queue at any time.
 - **SRT export** (including mid-recording), per-segment timestamps, click to seek,
@@ -137,7 +151,9 @@ To deploy a **shared team server** on Kubernetes (one GPU, many users — Mila
 points at it via the Remote backend, audio stays on infrastructure you control),
 see **[docs/self-hosted-server/](docs/self-hosted-server/)**. That folder
 contains Kubernetes manifests and a step-by-step guide, plus an
-`example.milaconfig` you can hand to teammates for one-click setup.
+`example.milaconfig` you can hand to teammates for one-click setup. To lock
+every Mac in your organization to that server instead, push the same settings
+as a configuration profile — see **[docs/mdm.md](docs/mdm.md)**.
 
 ## Required permissions
 
@@ -189,6 +205,8 @@ Packages/
 └── WhisperBinary/                      # SPM wrapper for whisper.cpp xcframework
 docs/
 ├── REMOTE_TRANSCRIPTION_SERVER.md      # Single-host Docker quickstart
+├── mdm.md                              # Managing settings with MDM / configuration profiles
+├── example.mobileconfig                # Example profile for docs/mdm.md
 └── self-hosted-server/                 # Shared team server on Kubernetes (K8s manifests + guide)
 docker/speaches-hebrew/                 # Docker image with ivrit.ai Hebrew model pre-loaded
 scripts/make-dmg.sh                     # Builds a release DMG for distribution
@@ -217,49 +235,6 @@ distribution via the App Store you'd:
 - Add the appropriate entitlements (`com.apple.security.device.screen-recording`,
   `com.apple.security.network.client`, etc.)
 - Provide your team ID in `DEVELOPMENT_TEAM`.
-
-## Changelog
-
-Newest first. Dates are release dates.
-
-- **1.9.0** (2026-07-22) — Remote transcription server support (OpenAI-compatible API), one-click `.milaconfig` setup files, iPhone Voice Memos sync, named speaker labels, opt-in beta updates, hallucination reduction via neural VAD, adaptive gain for quiet mics, auto-discard of empty clips, stop/remove queue items, no more stuck "Queued" items after relaunch, color-coded speakers, mid-recording SRT export, automatic summaries toggle with configurable timeout, record button no longer waits on the previous summary, collapsible "All Transcriptions" sidebar section, CodeQL security scanning added to CI, and a large sweep of reliability fixes across audio capture, diarization, and UI.
-- **1.8.5** (2026-06-09) — Independent mic / app-audio capture toggles, AAC (`.m4a`) recordings, and a configurable recording-storage cap.
-- **1.8.4** (2026-06-09) — Fixed speaker diarization silently breaking in notarized builds (the bundled Python couldn't load torch's dylibs).
-- **1.8.3** (2026-06-08) — Mic-capture diagnostics, automatic language detection, and a post-recording sheet fix.
-- **1.8.2** (2026-06-04) — Live transcription of app audio, screen-lock guard, recording-screen CPU fix, diarization improvements.
-- **1.8.1** (2026-06-03) — Reverted automatic silence-dropping for app recordings.
-- **1.8.0** (2026-06-01) — Five post-1.7 fixes: AGC-aware VAD, instant stop dialog, background recording mode, audio-context tuning.
-- **1.7.0** (2026-05-28) — Automatic gain control, summary backfill, post-recording popup, and more.
-- **1.6.5** (2026-05-28) — Removed a hardcoded email address from the default action prompt.
-- **1.6.4** (2026-05-27) — Live speaker labels and instant save.
-- **1.6.3** (2026-05-27) — Voice-activity-detection tuning for real conversations.
-- **1.6.2** (2026-05-27) — VAD-driven live transcription, Claude Sonnet 4.6, rename sheet always shown.
-- **1.6.1** (2026-05-27) — Live AI chunk size 5s → 30s to stop word-cutting.
-- **1.6.0** (2026-05-26) — Live AI mode plus LLM/UI end-to-end test infrastructure.
-- **1.5.0** (2026-05-25) — Speaker diarization on by default; added license and attributions.
-- **1.4.3** (2026-05-23) — Build/CI maintenance (macOS 26 "Tahoe" runners).
-- **1.4.2** (2026-05-23) — Restored the floating sidebar card and froze its material.
-- **1.4.1** (2026-05-23) — In-place-update bundle relocator and UI polish.
-- **1.4.0** (2026-05-23) — Stabilized the app bundle identifier.
-- **1.3.11** (2026-05-20) — Speaker labels included in copied transcripts and LLM prompts.
-- **1.3.10** (2026-05-19) — Diarization availability re-checked at launch to match what's on disk.
-- **1.3.9** (2026-05-18) — Diarization self-heal: nuclear-repair fallback and matplotlib pre-install.
-- **1.3.8** (2026-05-18) — Diarization self-heal: recover from missing Python modules; install numpy<2.
-- **1.3.7** (2026-05-17) — Bundle torch dependencies; self-heal missing transitive deps.
-- **1.3.6** (2026-05-17) — Release-packaging fix.
-- **1.3.5** (2026-05-17) — Bundled diarization runtime (Python 3.11 + pyannote.audio) inside the app; manual rename and flat folders for organizing transcriptions.
-- **1.3.1** (2026-05-13) — Maintenance release (version bump for auto-update).
-- **1.3.0** (2026-05-13) — Initial speaker diarization and transcript (SRT) export.
-- **1.2.8** (2026-05-13) — Security: pin and verify the SHA-256 of Whisper models downloaded from Hugging Face.
-- **1.2.7** (2026-05-12) — Pick a specific input device; shell out to a local Claude/Cursor CLI to auto-name recordings.
-- **1.2.6** (2026-05-11) — Fixed a Sparkle auto-update loop.
-- **1.2.4 / 1.2.5** (2026-05-11) — Internal auto-update pipeline verification (no user-facing changes).
-- **1.2.3** (2026-05-11) — Hardened the release DMG mount-path parsing.
-- **1.2.2** (2026-05-10) — Stable code signing so in-place updates keep macOS permission grants.
-- **1.2.1** (2026-05-10) — Fixed dictation pasting into the wrong window and a main-thread freeze with wireless mics.
-- **1.2.0** (2026-05-09) — Switched the Hebrew default to the ivrit.ai large-v3 model (~3 GB).
-- **1.1.0** (2026-05-09) — New app icon, per-language voice memos, hotkeys card, hide-recents toggle.
-- **1.0.0** (2026-05-09) — Initial release.
 
 ## License
 

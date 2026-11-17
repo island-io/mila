@@ -292,6 +292,7 @@ final class LLMRunnerObservabilityTests: XCTestCase {
         XCTAssertEqual(LLMFeature.name.rawValue, "name")
         XCTAssertEqual(LLMFeature.summary.rawValue, "summary")
         XCTAssertEqual(LLMFeature.action.rawValue, "action")
+        XCTAssertEqual(LLMFeature.speakerNames.rawValue, "speaker-names")
         XCTAssertEqual(LLMFeature.liveAI.rawValue, "live-ai")
         XCTAssertEqual(LLMFeature.settingsTest.rawValue, "settings-test")
         XCTAssertEqual(LLMFeature.unspecified.rawValue, "unspecified")
@@ -300,7 +301,7 @@ final class LLMRunnerObservabilityTests: XCTestCase {
     /// Tokens must be single words: a space would split a `key=value` pair in
     /// the log line and break naive parsing of it.
     func test_feature_log_tokens_have_no_whitespace() {
-        for feature in [LLMFeature.name, .summary, .action, .liveAI,
+        for feature in [LLMFeature.name, .summary, .action, .speakerNames, .liveAI,
                         .settingsTest, .unspecified] {
             XCTAssertFalse(feature.rawValue.contains(where: { $0.isWhitespace }),
                            "\(feature) has whitespace in its log token")

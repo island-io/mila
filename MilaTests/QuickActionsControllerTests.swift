@@ -94,18 +94,18 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertTrue(session.state == .idle)
     }
 
-    /// Pause is refused while the previous recording is finalizing. The
-    /// finalize window tears the live pipeline down; letting a Pause land in
-    /// it would move the session out from under `stopRecording`.
-    func test_pause_is_refused_while_finalizing() async {
-        let url = store.freshAudioURL(suggestedName: "PauseFinalizing")
+    /// Pause is refused while THIS recording is being stopped
+    /// (`isStoppingRecording`): letting a Pause land in it would move the
+    /// session out from under `stopRecording`.
+    func test_pause_is_refused_while_stopping() async {
+        let url = store.freshAudioURL(suggestedName: "PauseStopping")
         await controller.startFakeRecordingForTesting(outputURL: url)
-        controller.isFinalizingRecording = true
+        controller.isStoppingRecording = true
         await controller.pauseRecording()
         XCTAssertFalse(controller.isPaused,
-                       "pause must not fire while stopRecording owns the lifecycle")
+                       "pause must not fire while stopRecording owns the session")
         XCTAssertTrue(session.state == .recording)
-        controller.isFinalizingRecording = false
+        controller.isStoppingRecording = false
         _ = await session.stop()
     }
 
@@ -458,6 +458,42 @@ final class QuickActionsControllerTests: XCTestCase {
         XCTAssertEqual(maxConcurrent, 1)
     }
 
+    /// ⌘O is legitimately concurrent with a recording, and `activeJob` is what
+    /// backs `isRecording`. `transcribeFile` used to claim it unconditionally
+    /// and release it to `.none` afterwards, so importing a file mid-meeting
+    /// made the app forget the mic was hot: the live view swapped back to
+    /// Home, the chip vanished, the sleep / lock guards stopped stopping the
+    /// recording, and Stop later titled it from the `default:` branch.
+    /// (Surfaced by Cursor Bugbot on #294, where the new `.starting` state
+    /// opened a second window for the same clobber — that one is pinned in
+    /// `RecordStartingStateTests`.)
+    func test_file_import_during_a_recording_does_not_end_it() async throws {
+        try FileManager.default.createDirectory(at: store.recordingsDirectory,
+                                                withIntermediateDirectories: true)
+        let url = store.freshAudioURL(suggestedName: "ImportWhileRecording")
+        try TestSupport.writeStereo48kSineWav(at: url, durationSeconds: 0.4)
+        await controller.startFakeRecordingForTesting(outputURL: url)
+        XCTAssertTrue(controller.isRecording)
+
+        let imported = tempRoot.appendingPathComponent("import-while-recording.wav")
+        try TestSupport.writeStereo48kSineWav(at: imported, durationSeconds: 0.4)
+        await controller.transcribeFile(imported)
+
+        XCTAssertEqual(controller.activeJob, .recording(withSystemAudio: false),
+                       "an import must not take activeJob away from a live recording")
+        XCTAssertTrue(controller.isRecording, "the mic is still hot; the app must still say so")
+        XCTAssertNotNil(store.recordings.first { $0.title == "import-while-recording" },
+                        "the import itself still goes through")
+
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+        let stored = try XCTUnwrap(savedRecording(for: url))
+        XCTAssertEqual(stored.source, .microphone,
+                       "Stop must still see the recording's own job, not the import's leftovers")
+        XCTAssertEqual(controller.activeJob, .none)
+    }
+
     // MARK: - State machine
 
     func test_active_job_is_none_initially() {
@@ -555,37 +591,54 @@ final class QuickActionsControllerTests: XCTestCase {
         func tick() -> Int { value += 1; return value }
     }
 
-    /// REGRESSION (PR #32 follow-up — Bugbot Finding #1, "inline drain
-    /// still races a new recording"):
+    /// `toggleRecord` is a no-op while a Stop is closing the previous
+    /// recording's WAV (`isStoppingRecording`): a tap there would either stop
+    /// the same capture twice or start on a session that is still stopping.
     ///
-    /// `stopRecording`'s inline drain holds `isFinalizingRecording = true`
-    /// across multiple `await`s. Without a re-entry guard, a Record-button
-    /// tap landing on @MainActor between those awaits would call
-    /// `startRecording` → wipe the live segments and apply an empty
-    /// snapshot to the OLD recording's id. The guard makes `toggleRecord`
-    /// a no-op while finalize is in flight; this test pins that behavior
-    /// by setting the flag manually and asserting nothing observable
-    /// happens.
-    func test_toggleRecord_no_op_while_finalizing() async {
+    /// This used to key on `isFinalizingRecording` — the whole live-pipeline
+    /// drain — which is what held the Record button on "Finalizing…" for the
+    /// drain's length (issue #356). The drain no longer blocks a start; see
+    /// `RecordWhileDrainingTests` for what keeps that safe.
+    func test_toggleRecord_no_op_while_stopping() async {
         XCTAssertEqual(controller.activeJob, .none)
-        controller.isFinalizingRecording = true
+        controller.isStoppingRecording = true
         await controller.toggleRecord(withSystemAudio: false)
         XCTAssertEqual(controller.activeJob, .none,
-                       "toggleRecord must not start a recording while finalize is in flight")
+                       "toggleRecord must not start a recording while a stop is closing the WAV")
         XCTAssertFalse(controller.isRecording)
-        controller.isFinalizingRecording = false
+        controller.isStoppingRecording = false
     }
 
     /// Same guard, exercised via the back-compat `toggleVoiceMemo` shim
     /// the menu command + UI tests use. Both entry points must honor
-    /// the finalize gate.
-    func test_toggleVoiceMemo_no_op_while_finalizing() async {
+    /// the stop gate.
+    func test_toggleVoiceMemo_no_op_while_stopping() async {
         XCTAssertEqual(controller.activeJob, .none)
-        controller.isFinalizingRecording = true
+        controller.isStoppingRecording = true
         await controller.toggleVoiceMemo()
         XCTAssertEqual(controller.activeJob, .none)
         XCTAssertFalse(controller.isRecording)
-        controller.isFinalizingRecording = false
+        controller.isStoppingRecording = false
+    }
+
+    /// The app picker's "Start recording" calls `startAppRecording` directly,
+    /// and the picker is not disabled during a stop the way the Home button
+    /// is, so this path needs the same stop gate as `toggleRecord`.
+    /// The permission-alert and error assertions are what make the test
+    /// non-vacuous: without the gate the path publishes `.starting` and runs
+    /// a real system-audio bring-up, which on a grant-less CI host comes back
+    /// to `.none` through one of those two.
+    func test_startAppRecording_no_op_while_stopping() async {
+        XCTAssertEqual(controller.activeJob, .none)
+        controller.isStoppingRecording = true
+        await controller.startAppRecording(app: nil, includeMic: false)
+        XCTAssertEqual(controller.activeJob, .none,
+                       "startAppRecording must not start a recording while a stop is closing the WAV")
+        XCTAssertFalse(controller.isRecording)
+        XCTAssertEqual(session.state, .idle)
+        XCTAssertFalse(controller.screenRecordingPermissionMissing)
+        XCTAssertNil(service.lastError)
+        controller.isStoppingRecording = false
     }
 
     /// REGRESSION (user report: "couldn't start a new recording until the

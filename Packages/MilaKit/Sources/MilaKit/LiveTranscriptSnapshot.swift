@@ -33,7 +33,8 @@ public struct LiveTranscriptSnapshot: Codable, Sendable {
     public var version: Int
     public var sessionID: UUID
     public var state: State
-    /// False when the recording runs on hardware below the live-AI bar:
+    /// False when the recording runs without live transcription — the user
+    /// turned it off in Settings, or the hardware is below the live-AI bar:
     /// the meeting is being captured, but no live transcript will appear
     /// until it completes.
     public var liveTranscriptAvailable: Bool

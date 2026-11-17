@@ -31,8 +31,15 @@ private struct RecordingContextMenu: ViewModifier {
     @EnvironmentObject private var transcription: TranscriptionService
     @EnvironmentObject private var llm: LLMSettings
     @EnvironmentObject private var languageSettings: RecordingLanguageSettings
+    @EnvironmentObject private var summarizer: RecordingSummarizer
+    @EnvironmentObject private var liveAI: LiveAISettings
+    @EnvironmentObject private var speakerProfileStore: SpeakerProfileStore
+    @EnvironmentObject private var voiceRecognition: VoiceRecognitionSettings
 
     @State private var renameRequest: String?
+    /// Non-nil while the `.milashare` export sheet (voice-profile opt-in) is
+    /// up; nil goes straight to the save panel.
+    @State private var shareSelection: SharedSpeakersExportSelection?
     @State private var promptForNewFolder = false
     @State private var newFolderDraft = ""
     @State private var showingSendSheet = false
@@ -75,6 +82,7 @@ private struct RecordingContextMenu: ViewModifier {
             .sheet(isPresented: $showingSendSheet) {
                 SendToLLMSheet(recording: recording)
             }
+            .recordingShareSheet(selection: $shareSelection, recording: recording, store: store)
             .confirmationDialog("Delete “\(recording.title)” permanently?",
                                 isPresented: $confirmingPermanentDelete,
                                 titleVisibility: .visible) {
@@ -130,6 +138,17 @@ private struct RecordingContextMenu: ViewModifier {
             // status even though the enqueue itself no-ops.
             let isBusy = transcription.activeRecordingID == recording.id
                 || transcription.pendingIDs.contains(recording.id)
+                // An "End Conversation Here" audio cut is still running; a
+                // re-run now would read the full audio and bring the removed
+                // lines back (#357). `prepareForRetranscription` refuses too.
+                || store.audioTrimPendingIDs.contains(recording.id)
+            if transcription.isQueuedOrActive(recording.id) {
+                // Take the run off the CPU now and keep the recording; the
+                // Re-transcribe items below start it again later.
+                Button("Stop Transcribing") {
+                    transcription.deferTranscription(of: recording.id)
+                }
+            }
             Button("Re-transcribe (\(currentLang.flagEmoji) \(currentLang.displayName))") {
                 // Route through the live-store chokepoint (same as the
                 // language-switch action) so we never enqueue a stale snapshot
@@ -152,8 +171,26 @@ private struct RecordingContextMenu: ViewModifier {
                     showingSendSheet = true
                 }
                 .disabled(recording.fullText.isEmpty && recording.segments.isEmpty)
+                // Per-recording summary language. Picking one persists it on
+                // the live row and regenerates right away, so the user sees
+                // the summary + action items come back in that language
+                // instead of waiting for the next automatic pass. Re-picking
+                // the ✓'d entry is a no-op (`RecordingSummarizer.setSummaryLanguage`).
+                SummaryLanguageMenu(
+                    current: recording.summaryLanguageOverride,
+                    global: liveAI.outputLanguage,
+                    isDisabled: isBusy
+                        || summarizer.isSummarizing(recording.id)
+                        || recording.fullText
+                            .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                    onPick: { summarizer.setSummaryLanguage($0, for: recording.id) }
+                )
             }
             Divider()
+            Button("Share Recording…") {
+                shareRecording()
+            }
+            .disabled(!RecordingShareExporter.canExport(recording))
             Button("Export Subtitles (.srt)…") {
                 exportSRT()
             }
@@ -188,6 +225,21 @@ private struct RecordingContextMenu: ViewModifier {
                                                              language: language.code)
         else { return }
         transcription.enqueue(prepared, isRetranscription: true)
+    }
+
+    /// Produce a `.milashare` for a colleague. When the recording's named
+    /// speakers have voice profiles, an opt-in sheet comes first; otherwise
+    /// the save panel opens directly.
+    private func shareRecording() {
+        if let selection = RecordingShareExporter.exportSelection(
+            for: recording, profiles: speakerProfileStore, voiceRecognition: voiceRecognition) {
+            shareSelection = selection
+        } else {
+            let recording = recording
+            Task { @MainActor in
+                await RecordingShareExporter.saveInteractively(recording, store: store, profiles: [])
+            }
+        }
     }
 
     /// Save the recording's SRT to a user-chosen location. NSSavePanel lets

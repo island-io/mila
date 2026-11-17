@@ -51,9 +51,27 @@ struct MilaConfigConfirmationView: View {
                 Text("Settings not listed in the file are left unchanged.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            } else {
+            } else if pending.managedSkipped.isEmpty {
                 Text("This configuration matches your current settings — nothing will change.")
                     .foregroundStyle(.secondary)
+            } else {
+                Text("Nothing will change.")
+                    .foregroundStyle(.secondary)
+            }
+
+            // Settings a configuration profile locks outrank a `.milaconfig`;
+            // say which of the file's values won't be applied rather than
+            // letting them vanish silently (issue #360).
+            if !pending.managedSkipped.isEmpty {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "building.2")
+                        .foregroundStyle(.secondary)
+                    Text("Not changed — managed by your organization: \(pending.managedSkipped.joined(separator: ", ")).")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .accessibilityIdentifier("milaconfig.managedSkipped")
             }
 
             HStack {

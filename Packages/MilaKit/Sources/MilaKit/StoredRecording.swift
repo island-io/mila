@@ -20,7 +20,7 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     /// accepts a segment id. Mirroring it would advertise an addressability
     /// the app does not offer. Recorded in `StoredRecordingDriftTests`'
     /// nested allowlist so the tripwire stays armed for every OTHER field.
-    public struct Segment: Codable, Equatable, Sendable, SpeakerTextSegment {
+    public struct Segment: Codable, Equatable, Sendable, TimedSpeakerTextSegment {
         public var start: Double
         public var end: Double
         public var text: String
@@ -96,6 +96,70 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         }
     }
 
+    /// Mirror of the app's `Recording.RetranscriptionPriorState`: what a
+    /// recording that already had a transcript looked like before the user
+    /// started a re-transcription of it, kept on the row so a Stop after a
+    /// relaunch can still put the transcript's own language and model back.
+    /// Present only while the re-run is `pending`/`running`. Mirrored because
+    /// the app persists it — no tool exposes it today, though it is the
+    /// honest answer to "what language is this text in?" while a re-run in
+    /// the other language is in flight.
+    public struct RetranscriptionPriorState: Codable, Equatable, Sendable {
+        /// Raw value of the app's `TranscriptionStatus` the row will go back to.
+        public var status: String
+        public var language: String
+        public var modelName: String?
+        public var transcriptionDeferredAt: Date?
+
+        public init(status: String = "", language: String = "", modelName: String? = nil,
+                    transcriptionDeferredAt: Date? = nil) {
+            self.status = status
+            self.language = language
+            self.modelName = modelName
+            self.transcriptionDeferredAt = transcriptionDeferredAt
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case status, language, modelName, transcriptionDeferredAt
+        }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            status = try c.decodeIfPresent(String.self, forKey: .status) ?? ""
+            language = try c.decodeIfPresent(String.self, forKey: .language) ?? ""
+            modelName = try c.decodeIfPresent(String.self, forKey: .modelName)
+            transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
+        }
+    }
+
+    /// Mirror of the app's `UntranscribedSpan`: seconds of the recording's
+    /// audio that are missing from its transcript because transcribing them
+    /// failed during the recording and again when it was finalized (the
+    /// remote server was unreachable). Mirrored because the app persists it —
+    /// it is what says a transcript is knowingly incomplete.
+    public struct UntranscribedSpan: Codable, Equatable, Sendable {
+        public var start: Double
+        public var end: Double
+        /// True when the app could not read this span's audio back from the
+        /// file, so no retry can recover it.
+        public var unreadable: Bool?
+
+        public init(start: Double, end: Double, unreadable: Bool? = nil) {
+            self.start = start
+            self.end = end
+            self.unreadable = unreadable
+        }
+
+        private enum CodingKeys: String, CodingKey { case start, end, unreadable }
+
+        public init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            start = try c.decodeIfPresent(Double.self, forKey: .start) ?? 0
+            end = try c.decodeIfPresent(Double.self, forKey: .end) ?? 0
+            unreadable = try? c.decodeIfPresent(Bool.self, forKey: .unreadable)
+        }
+    }
+
     public var id: UUID
     public var title: String
     public var createdAt: Date
@@ -124,11 +188,60 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     public var actionItems: [ActionItem]?
     /// Raw diarizer ID (`SPEAKER_00`) → user-assigned display name.
     public var speakerNames: [String: String]
+    /// The app's per-recording override of the language its `summary` and
+    /// `actionItems` are written in (`"he"` / `"en"`), when the user set
+    /// one; nil means the app's global output-language setting applied.
+    /// Kept as a string so a language the app adds later doesn't fail the
+    /// decode. Mirrored because the app persists it — not exposed by any
+    /// tool today (the summary text speaks for itself).
+    public var summaryLanguage: String?
+    /// Display name of the Mila user who shared this recording as a
+    /// `.milashare` bundle; nil for recordings this Mac captured itself.
+    /// Attribution, not provenance of the audio — `source` still says how
+    /// the recording was captured.
+    public var sharedBy: String?
+    /// When that bundle was exported (the sender's clock). Set with `sharedBy`.
+    public var sharedAt: Date?
+    /// When the user stopped this recording's transcription to run it later.
+    /// Non-nil only on a `failed` row that hasn't been through a full pass —
+    /// no transcript, or only a live draft — and it is what tells "the user
+    /// chose not to transcribe this yet" apart from a genuine failure.
+    public var transcriptionDeferredAt: Date?
+    /// See `RetranscriptionPriorState`. Nil unless a re-transcription of a
+    /// row that already had a transcript is in flight.
+    public var retranscriptionPriorState: RetranscriptionPriorState?
+    /// See `UntranscribedSpan`. Nil when the transcript covers the whole
+    /// recording (the app omits the key then).
+    public var untranscribedSpans: [UntranscribedSpan]?
     /// Inline transcript on legacy records only; current records keep the
     /// text in the `.txt` sidecar and omit this key.
     public var legacyFullText: String?
 
     public var isTrashed: Bool { deletedAt != nil }
+    public var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
+
+    /// Whether a re-transcription of a row that already had a transcript is
+    /// in flight — the transcript on disk is still the EARLIER one. Same
+    /// definition as the app's `Recording.isRetranscriptionInFlight`: the row
+    /// is pending/running and the prior status is a settled one (all the
+    /// app ever captures).
+    public var isRetranscriptionInFlight: Bool {
+        guard let before = retranscriptionPriorState else { return false }
+        return (status == "pending" || status == "running")
+            && (before.status == "completed" || before.status == "failed")
+    }
+
+    /// The language of the transcript this row currently holds. Normally
+    /// `language`; while a re-run is in flight it is the prior state's,
+    /// because the app switches `language` to the re-run's the moment the
+    /// re-run is queued, long before any new text exists (island-io/mila#330).
+    public var transcriptLanguage: String {
+        if isRetranscriptionInFlight, let before = retranscriptionPriorState,
+           !before.language.isEmpty {
+            return before.language
+        }
+        return language
+    }
 
     /// Sidecar names, derived from `audioFileName` the same way the app does.
     public var transcriptFileName: String {
@@ -155,7 +268,9 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, title, createdAt, duration, source, audioFileName,
              status, language, modelName, segments, deletedAt, folder, appName,
-             summary, actionItems, speakerNames, appBundleID
+             summary, actionItems, speakerNames, appBundleID, summaryLanguage,
+             sharedBy, sharedAt, transcriptionDeferredAt, retranscriptionPriorState,
+             untranscribedSpans
         case legacyFullText = "fullText"
     }
 
@@ -178,6 +293,16 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         summary = try c.decodeIfPresent(String.self, forKey: .summary)
         actionItems = try c.decodeIfPresent([ActionItem].self, forKey: .actionItems)
         speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
+        sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
+        sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
+        transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
+        // `try?`: bookkeeping no tool reads must never cost the helper the
+        // whole store (the decode is all-or-nothing).
+        retranscriptionPriorState = try? c.decodeIfPresent(RetranscriptionPriorState.self,
+                                                           forKey: .retranscriptionPriorState)
+        untranscribedSpans = try? c.decodeIfPresent([UntranscribedSpan].self,
+                                                    forKey: .untranscribedSpans)
         legacyFullText = try c.decodeIfPresent(String.self, forKey: .legacyFullText)
     }
 
@@ -187,7 +312,12 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
                 deletedAt: Date? = nil, folder: String? = nil, appName: String? = nil,
                 appBundleID: String? = nil,
                 summary: String? = nil, actionItems: [ActionItem]? = nil,
-                speakerNames: [String: String] = [:], legacyFullText: String? = nil) {
+                speakerNames: [String: String] = [:], summaryLanguage: String? = nil,
+                sharedBy: String? = nil, sharedAt: Date? = nil,
+                transcriptionDeferredAt: Date? = nil,
+                retranscriptionPriorState: RetranscriptionPriorState? = nil,
+                untranscribedSpans: [UntranscribedSpan]? = nil,
+                legacyFullText: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -205,6 +335,12 @@ public struct StoredRecording: Codable, Identifiable, Sendable {
         self.summary = summary
         self.actionItems = actionItems
         self.speakerNames = speakerNames
+        self.summaryLanguage = summaryLanguage
+        self.sharedBy = sharedBy
+        self.sharedAt = sharedAt
+        self.transcriptionDeferredAt = transcriptionDeferredAt
+        self.retranscriptionPriorState = retranscriptionPriorState
+        self.untranscribedSpans = untranscribedSpans
         self.legacyFullText = legacyFullText
     }
 }

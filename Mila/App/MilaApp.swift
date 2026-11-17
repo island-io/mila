@@ -370,8 +370,15 @@ struct MilaApp: App {
     /// Persistent, app-wide list of speaker names — the pick-list behind
     /// the transcript's speaker rename popover.
     @StateObject private var speakerDirectory: SpeakerDirectory
+    /// Settings → Speakers → "Your name" (issue #348). Read by the speaker
+    /// name suggester; one publish per edit, never per audio buffer.
+    @StateObject private var speakerIdentitySettings: SpeakerIdentitySettings
     /// Applies double-clicked `.milaconfig` files (with a confirmation sheet).
     @StateObject private var configImporter: MilaConfigImporter
+    /// Imports double-clicked `.milashare` bundles — a recording another Mila
+    /// user shared — with a confirmation sheet. Publishes only on user
+    /// actions (open / confirm / cancel), never at audio or timer cadence.
+    @StateObject private var shareImporter: RecordingShareImporter
     /// Mirrors the live transcript to `live/current.json` for external
     /// tools (mila-mcp). Not observed by any view; held as a StateObject
     /// purely so it survives SwiftUI re-inits like the other singletons.
@@ -422,17 +429,23 @@ struct MilaApp: App {
             UserDefaults.standard.set(false, forKey: "diarization.enabled")
             UserDefaults.standard.set(true, forKey: diarForceOffKey)
         }
-        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false)
+        // Settings an administrator locked via a configuration profile (MDM),
+        // read once here and handed to every settings object that carries a
+        // `.milaconfig` field. Precedence: managed > `.milaconfig` > the
+        // user's own choice. See `ManagedSettings` and docs/mdm.md (#360).
+        let managedSettings = ManagedSettings.loadFromSystem()
+        let diarSettings = DiarizationSettings(defaultEnabledIfUnset: false,
+                                               managed: managedSettings)
         // Remote transcription backend (opt-in, off by default). Constructed
         // here so the same instance backs both the Settings UI and the
         // transcription router.
-        let remoteSettings = RemoteTranscriptionSettings()
+        let remoteSettings = RemoteTranscriptionSettings(managed: managedSettings)
         let svc = TranscriptionService(store: store,
                                        modelManager: mgr,
                                        diarizationSettings: diarSettings,
                                        remoteSettings: remoteSettings)
         let session = RecordingSession()
-        let langSettings = RecordingLanguageSettings()
+        let langSettings = RecordingLanguageSettings(managed: managedSettings)
         // Local model routing follows the user's language list (he → ivrit.ai
         // by seed, a new language → whatever its entry names).
         mgr.languageModelResolver = { [langSettings] in langSettings.resolve($0).modelName }
@@ -478,7 +491,7 @@ struct MilaApp: App {
                 performanceCoreCount: SystemCapabilities.live.performanceCoreCount
             )
             : .live
-        let liveAI = LiveAISettings(capabilities: liveAICapabilities)
+        let liveAI = LiveAISettings(capabilities: liveAICapabilities, managed: managedSettings)
         let liveTrans = LiveTranscriber(transcription: svc)
         // Dictation gets its OWN LiveTranscriber instance so triggering
         // a dictation overlay while a meeting recording is in flight
@@ -556,6 +569,18 @@ struct MilaApp: App {
         let summarizer = RecordingSummarizer(store: store,
                                              llmSettings: llm,
                                              liveAISettings: liveAI)
+        // Speaker-name SUGGESTIONS (issue #348): "Your name" for the one voice
+        // on a mic-only recording, and names the transcript states, offered
+        // for one-click accept. Runs once per fresh completion, after that
+        // recording's summary attempt settles (`markPending` below and in
+        // `finalizeTail`, `suggestIfPending` in `onSummaryFinished`). Owned
+        // by `actions` (strong, like its other late-bound collaborators);
+        // every closure here holds it weakly.
+        let speakerIdentity = SpeakerIdentitySettings()
+        let nameSuggester = SpeakerNameSuggester(store: store,
+                                                 llmSettings: llm,
+                                                 liveAISettings: liveAI,
+                                                 identity: speakerIdentity)
         // Obsidian vault destination. When enabled, a completed recording is
         // written into the vault as a Markdown note (summary + action items,
         // transcript fallback) once its summary is ready, then optionally
@@ -598,7 +623,10 @@ struct MilaApp: App {
         let obsidian = ObsidianExporter(settings: obsidianSettings)
         // Write the note once the summary state is final. Gated on `pending`
         // so a launch-time backfill sweep never re-files the back-catalogue.
-        summarizer.onSummaryFinished = { [weak obsidian] rec in
+        summarizer.onSummaryFinished = { [weak obsidian, weak nameSuggester] rec in
+            // First, and independent of Obsidian: a no-op unless a fresh
+            // completion marked this recording (never for backfill).
+            nameSuggester?.suggestIfPending(rec)
             guard let obsidian, obsidian.isPending(rec.id) else { return }
             obsidian.export(rec)
             obsidian.clearPending(rec.id)
@@ -622,7 +650,27 @@ struct MilaApp: App {
         // `store`; the `actions` wiring stays further down with the rest.
         let sidecarWriter = LiveTranscriptSidecarWriter(root: store.originalRootDirectory)
         sidecarWriter.cleanupAtLaunch()
-        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter] rec, wasRetranscription in
+        // Lines the user cut from a saved transcript (#357) must not stay
+        // readable in the completed live snapshot mila-mcp serves; a no-op
+        // unless that snapshot is this recording's.
+        store.onTranscriptLinesRemoved = { [weak sidecarWriter] rec in
+            sidecarWriter?.dropRetainedLines(afterEditOf: rec.id)
+        }
+        // The post-stop speaker pass writes a stop-time copy of the segments
+        // back when it finishes, so a trim must wait for it (#357).
+        store.isTranscriptEditBlocked = { [weak svc] id in
+            svc?.isAwaitingSpeakerFinalization(id) ?? false
+        }
+        svc.onTranscriptionCompleted = { [weak summarizer, weak llm, weak obsidianSettings, weak obsidian, weak sidecarWriter, weak nameSuggester] rec, wasRetranscription in
+            // Speaker-name suggestions for this pass's (re-keyed) speakers,
+            // once the summary attempt below settles. With no summarizer
+            // there is no settle signal to wait for, so run them now rather
+            // than leave a mark nothing will consume.
+            if summarizer != nil {
+                nameSuggester?.markPending(rec.id)
+            } else {
+                nameSuggester?.suggest(recordingID: rec.id)
+            }
             // A recording whose live transcript wasn't final closed its live
             // sidecar WITHOUT a handoff id, because at Stop the batch worker
             // hadn't produced the transcript yet. It just did — so publish the
@@ -644,6 +692,9 @@ struct MilaApp: App {
                     // No summary will be regenerated — export immediately with
                     // the transcript fallback (no summarizer hook to wait for).
                     if obsidianOn { obsidian?.export(rec) }
+                    // No summarizer hook here either, so settle the pending
+                    // speaker-name suggestions now.
+                    nameSuggester?.suggestIfPending(rec)
                     return
                 }
                 if obsidianOn { obsidian?.markPending(rec.id) }
@@ -888,11 +939,12 @@ struct MilaApp: App {
         actions.storageSettings = storage
         actions.obsidianSettings = obsidianSettings
         actions.obsidianExporter = obsidian
+        actions.speakerNameSuggester = nameSuggester
         // Discard un-exports: the note can already be in the vault by the time
         // the user throws the recording away.
         coordinator.obsidianExporter = obsidian
         actions.liveSidecarWriter = sidecarWriter
-        let meetingSettings = MeetingDetectionSettings()
+        let meetingSettings = MeetingDetectionSettings(managed: managedSettings)
         let detector = MeetingDetector()
         let promptCoordinator = MeetingPromptCoordinator(
             detector: detector,
@@ -906,7 +958,25 @@ struct MilaApp: App {
             language: langSettings,
             liveAI: liveAI,
             diarization: diarSettings,
-            meetingDetection: meetingSettings
+            meetingDetection: meetingSettings,
+            managed: managedSettings
+        )
+        let speakerDirectory = SpeakerDirectory()
+        // Imports `.milashare` bundles. Given the store it writes to, the
+        // storage cap, and the voice-profile objects the import sheet's
+        // per-speaker merge needs; `isRecordingBusy` keeps it from replacing
+        // a recording that is mid-transcription.
+        let shareImporter = RecordingShareImporter(
+            store: store,
+            storageSettings: storage,
+            profileStore: profileStoreRef,
+            voiceRecognition: voiceSettings,
+            similarityThreshold: { [weak liveAI] in liveAI?.speakerSimilarityThreshold ?? 0.55 },
+            speakerDirectory: speakerDirectory,
+            isRecordingBusy: { [weak svc] id in
+                guard let svc else { return false }
+                return svc.activeRecordingID == id || svc.pendingIDs.contains(id)
+            }
         )
         _store = StateObject(wrappedValue: store)
         _storageSettings = StateObject(wrappedValue: storage)
@@ -945,8 +1015,10 @@ struct MilaApp: App {
                                             languageSettings: langSettings)
         _voiceMemosSettings = StateObject(wrappedValue: vmSettings)
         _voiceMemosImporter = StateObject(wrappedValue: vmImporter)
-        _speakerDirectory = StateObject(wrappedValue: SpeakerDirectory())
+        _speakerDirectory = StateObject(wrappedValue: speakerDirectory)
+        _speakerIdentitySettings = StateObject(wrappedValue: speakerIdentity)
         _configImporter = StateObject(wrappedValue: configImporter)
+        _shareImporter = StateObject(wrappedValue: shareImporter)
         _liveSidecarWriter = StateObject(wrappedValue: sidecarWriter)
         let dictationController = DictationController(store: store,
                                                       transcription: svc,
@@ -996,7 +1068,9 @@ struct MilaApp: App {
                 .of("obsidianExporter", obsidian),
                 .of("voiceMemosSettings", vmSettings),
                 .of("voiceMemosImporter", vmImporter),
+                .of("speakerIdentitySettings", speakerIdentity),
                 .of("configImporter", configImporter),
+                .of("shareImporter", shareImporter),
                 .of("liveSidecarWriter", sidecarWriter),
                 .of("dictation", dictationController)
             ])
@@ -1056,6 +1130,7 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(speakerIdentitySettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
@@ -1080,6 +1155,29 @@ struct MilaApp: App {
                 } message: {
                     Text(configImporter.errorMessage ?? "")
                 }
+                .environmentObject(shareImporter)
+                .sheet(item: Binding(
+                    get: { shareImporter.pending },
+                    set: { if $0 == nil { shareImporter.cancel() } }
+                )) { pending in
+                    RecordingShareConfirmationView(
+                        importer: shareImporter,
+                        pending: pending,
+                        onImport: { Task { await shareImporter.confirm() } },
+                        onCancel: { shareImporter.cancel() }
+                    )
+                }
+                .alert(
+                    "Couldn't import shared recording",
+                    isPresented: Binding(
+                        get: { shareImporter.errorMessage != nil },
+                        set: { if !$0 { shareImporter.errorMessage = nil } }
+                    )
+                ) {
+                    Button("OK", role: .cancel) { }
+                } message: {
+                    Text(shareImporter.errorMessage ?? "")
+                }
                 .environmentObject(obsidianVaultSettings)
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
@@ -1093,14 +1191,28 @@ struct MilaApp: App {
                 .disabled(!updater.canCheckForUpdates)
             }
             CommandGroup(replacing: .newItem) {
-                Button("New Voice Memo") {
+                // While the previous ⌘N (or Record click) is still bringing
+                // capture up, say so and refuse a second press: the
+                // controller drops it anyway, but a greyed "Starting…" item
+                // is the only feedback a keyboard user gets that the first
+                // press registered (#293). `actions` is a `@StateObject` on
+                // this App, so its one-shot `.starting` publish re-evaluates
+                // this menu like any other job transition already does.
+                Button(actions.isStartingRecording ? "Starting Recording…" : "New Voice Memo") {
                     Task { await actions.toggleVoiceMemo() }
                 }
                 .keyboardShortcut("n", modifiers: .command)
+                .disabled(actions.isStartingRecording)
                 Button("Open Audio File…") {
                     Task { await actions.openFiles() }
                 }
                 .keyboardShortcut("o", modifiers: .command)
+                // Separate from "Open Audio File…" on purpose: that path
+                // re-transcribes whatever it is given, this one imports a
+                // colleague's transcript as-is.
+                Button("Import Shared Recording…") {
+                    shareImporter.openInteractively()
+                }
             }
             CommandMenu("Dictation") {
                 // One item per offered language. Works without a hotkey too —
@@ -1143,9 +1255,11 @@ struct MilaApp: App {
                 .environmentObject(voiceMemosSettings)
                 .environmentObject(voiceMemosImporter)
                 .environmentObject(speakerDirectory)
+                .environmentObject(speakerIdentitySettings)
                 .environmentObject(voiceRecognitionSettings)
                 .environmentObject(speakerProfileStore)
                 .environmentObject(configImporter)
+                .environmentObject(shareImporter)
                 // Settings ▸ General shows the Sparkle-backed
                 // "Automatically check for updates" toggle, so the Settings
                 // scene needs the same single updater instance the main window
@@ -1200,10 +1314,12 @@ struct MilaApp: App {
         appDelegate.dictation = dictation
         appDelegate.modelManager = modelManager
         appDelegate.actions = actions
-        // Route `.milaconfig` opens through the importer, and drain any that
-        // arrived during a cold launch (before this wiring ran).
+        // Route `.milaconfig` / `.milashare` opens through their importers,
+        // and drain any that arrived during a cold launch (before this
+        // wiring ran).
         appDelegate.configImporter = configImporter
-        appDelegate.flushBufferedConfigOpens()
+        appDelegate.shareImporter = shareImporter
+        appDelegate.flushBufferedOpens()
         appDelegate.startScreenLockObserversIfNeeded()
     }
 
@@ -1644,12 +1760,308 @@ struct MilaApp: App {
         // never starts the session observer").
         //
         // The state observer below runs forever now; the `.recording`
-        // branch is where we gate on `aiSettings.isLiveAIAvailable`.
+        // branch is where we gate — on the per-recording decision
+        // `QuickActionsController.recordingRunsLivePipeline`, which folds in
+        // both this hardware gate and the user's "Transcribe while
+        // recording" setting.
 
-        // Epoch of the capture this observer has already wired. `nil` until
-        // the first recording.
+        // Epoch of the capture this observer has already seen a `.recording`
+        // for. `nil` until the first recording.
         var wiredCaptureEpoch: Int?
-        for await state in sessionRef.$state.values {
+        // Epoch of the capture whose live pipeline was actually WIRED (the
+        // `wireCapture` body ran for it). What the `.idle` teardown keys on:
+        // a capture that never got the live pipeline — it started during the
+        // previous recording's drain and ended before the hand-over — owns
+        // none of the singletons, so tearing them down would cut into the
+        // drain that does.
+        var liveWiredEpoch: Int?
+        // A capture that started during the previous recording's drain
+        // (issue #356): its epoch, and the live audio held for it until the
+        // drain releases the live pipeline.
+        var deferredWireEpoch: Int?
+        var deferredHold: LiveSampleHold?
+
+        /// Wire the live pipeline to the capture now in progress, then replay
+        /// any audio held for it while the previous recording's drain owned
+        /// the pipeline. Synchronous — no suspension point anywhere in it —
+        /// so the held audio reaches the transcriber before any newly
+        /// captured sample can, in order, and the VAD's sample clock (which
+        /// dates every utterance) starts at the recording's true zero.
+        func wireCapture(replaying held: LiveSampleHold?) {
+            liveWiredEpoch = sessionRef.captureEpoch
+            // Decided once, at record start, by the controller (see
+            // `recordingRunsLivePipeline`) — re-reading the settings here
+            // could disagree with the recording view, which keys on the
+            // same decision. The fallback only covers a host with no
+            // controller.
+            let runsLive = actionsRef?.recordingRunsLivePipeline ?? aiSettings.runsLivePipeline
+            guard runsLive else {
+                // No live pipeline for this recording: the hardware is
+                // below the Live AI bar with no override, or the user
+                // switched off "Transcribe while recording" to keep the
+                // CPU free during the call. Recording still runs via
+                // RecordingSession; QuickActionsController enqueues a
+                // post-record transcribe on stop. We just skip the live
+                // pipeline setup.
+                //
+                // BUT: clear the transcriber's `segments` and the
+                // diarizer's pool first. Without this, a stale live
+                // transcript from a previous recording would still be
+                // sitting in memory; `stopRecording` would snapshot it
+                // onto the new recording and could mark it `.completed`
+                // without ever running batch transcription. Cursor
+                // flagged on 62e1c3b. (`stop()` alone does NOT clear
+                // `segments` — that is `reset()`. The controller already
+                // did this at record start; repeating it is harmless.)
+                transcriber.reset()
+                // `stop()` too: a drain that handed over to this recording
+                // may have kept the diarizer daemon warm for it
+                // (`retireLiveDiarizerAfterDrain`), and a recording with
+                // no live pipeline must not leave ~1 GB of pyannote idling.
+                diarizer.stop()
+                diarizer.reset()
+                sessionRef.onLiveSamples = nil
+                // Also clear LiveAISession so its rolling `summary`
+                // and `actionItems` from a previous override-enabled
+                // recording don't leak onto this gated capture.
+                // `stopRecording` reads aiSession.summary /
+                // actionItems unconditionally; without this reset,
+                // a previous Live AI session's output would attach
+                // to a recording that never ran the LLM loop.
+                // Cursor flagged on c95d2bb.
+                aiSession.cancel()
+                // Still surface the recording to external pollers
+                // (mila-mcp): they get an honest "recording, but no
+                // live text" status instead of silence.
+                sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
+                os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                    .log("wireLiveAIPipeline: .recording skipped — live pipeline off for this recording (hardwareAllows=\(aiSettings.isLiveAIAvailable, privacy: .public) transcribeWhileRecording=\(aiSettings.transcribeWhileRecording, privacy: .public) model=\(aiSettings.capabilities.marketingName, privacy: .public))")
+                return
+            }
+            // Open the live-transcript sidecar for this recording so
+            // external tools (mila-mcp) can follow the meeting; the
+            // feed loop below streams content into it.
+            sidecarWriter.begin(title: nil, source: nil, liveAvailable: true)
+            // Live transcription runs on every recording — it's how
+            // the recording UI shows the live transcript pane even
+            // when AI mode is off. Apply the user's tick-interval
+            // setting before start() so the running loop picks it
+            // up (default 5s, settable in Settings → AI Features).
+            transcriber.chunkSeconds = aiSettings.chunkSeconds
+            transcriber.useVAD = aiSettings.useVAD
+            // Attach the neural-VAD speech gate (drops noise-only
+            // utterances before whisper). Only meaningful on the VAD
+            // path; the fixed-timer path has no per-utterance gate.
+            if aiSettings.useNeuralVAD && aiSettings.useVAD {
+                if !sileroVADLoadAttempted {
+                    sileroVADLoadAttempted = true
+                    if let vadPath = Bundle.main.path(forResource: "ggml-silero-v5.1.2", ofType: "bin") {
+                        sileroVAD = try? SileroVAD(modelPath: vadPath)
+                    }
+                    if sileroVAD == nil {
+                        os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                            .error("Neural VAD enabled but Silero model failed to load — running without the gate")
+                    }
+                }
+                transcriber.speechGate = sileroVAD
+            } else {
+                transcriber.speechGate = nil
+            }
+            // Wire each VAD-bounded utterance into the speaker
+            // diarizer. Without this, diarizer.process is never
+            // called, intervals stays empty, and segments never
+            // get a speaker label.
+            transcriber.onUtteranceCaptured = { [weak diarizer] samples, start, end in
+                // Use `submit` (chained, trackable) rather than a
+                // detached task — at end-of-recording we need to
+                // `awaitPending()` so the final utterance's
+                // speaker label is attached before the transcript
+                // is saved.
+                diarizer?.submit(samples: samples, startSeconds: start, endSeconds: end)
+            }
+            transcriber.start(language: langSettings.current.code)
+            print("wireLiveAIPipeline: .recording — installing onLiveSamples → liveTranscriber.ingest")
+            sessionRef.onLiveSamples = { [weak transcriber] samples in
+                // The callback is invoked synchronously from
+                // RecordingSession.write (already @MainActor), so we
+                // can ingest directly without spawning a Task —
+                // hopping through a detached Task here was dropping
+                // the ArraySlice on some Swift-concurrency edge.
+                transcriber?.ingest(samples)
+            }
+            // NOTE: the Live AI session is reset deterministically at
+            // record-start in QuickActionsController (`liveAISession?.start()`),
+            // NOT here. Driving the reset off this async `.recording`
+            // observer risked the transition being coalesced under load,
+            // leaving the previous recording's session live so its first
+            // tick `--resume`d the prior meeting → cross-recording bleed.
+            // By the time this runs, the session has already been freshly
+            // started for this recording.
+            diarizer.reset()
+            // Seed the embedding pool with known voices only when the
+            // user opted in. `seedEntries()` refuses on its own too, and
+            // while off it has nothing to hand over regardless (the
+            // profiles file is never loaded) — three independent reasons
+            // an opted-out recording starts from a blank pool.
+            if voiceRecognitionSettings.isConfigured {
+                diarizer.seedPool(with: speakerProfileStore.seedEntries())
+            }
+            diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
+            // Detach the diarizer start so a quick stop-after-start
+            // doesn't block the state observer on pyannote cold-init.
+            // The session token (claimed synchronously HERE) lets a
+            // stop() that lands before/while the detached body runs
+            // supersede it — otherwise a fast start→stop recording
+            // booted the ~1 GB daemon after the recording ended and
+            // left it idling.
+            let diarSession = diarizer.beginSession()
+            Task.detached(priority: .userInitiated) { [diarizer, diarSettings] in
+                await diarizer.start(diarization: diarSettings, session: diarSession)
+            }
+            // Watch for off→on transitions on the Live AI toggle.
+            // The feed loop only kicks when new segments land, so
+            // a user who toggles Live AI on mid-recording would
+            // otherwise wait up to one chunk before the LLM sees
+            // anything. Mirror the feed-loop's gate here so an
+            // immediate feed runs the moment the toggle flips.
+            aiEnabledCancellable?.cancel()
+            aiEnabledCancellable = aiSettings.enabledPublisher
+                .dropFirst()
+                .filter { $0 }
+                .sink { [weak transcriber, weak aiSession] _ in
+                    guard llmSettingsRef.isConfigured else { return }
+                    if let text = transcriber?.formattedTranscript, !text.isEmpty {
+                        // User just flipped Live AI on — bypass the
+                        // min-interval floor for instant feedback.
+                        aiSession?.feed(transcript: text, immediate: true)
+                    }
+                }
+
+            feedTask?.cancel()
+            feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
+                var lastFed = ""
+                // Mirrors `LiveTranscriber.deletionCount`, which resets to
+                // 0 in `start()` — and this task is rebuilt per recording,
+                // so both sides start from 0 together.
+                var lastDeletionCount = 0
+                guard let transcriber else { return }
+                for await _ in transcriber.$segments.values {
+                    if Task.isCancelled { break }
+                    // Recompute each tick — Live AI is whatever
+                    // the toggle currently says. Recording started
+                    // with it off + flipped on → ticks fire from
+                    // now on. Recording started with it on +
+                    // flipped off → ticks stop; the LLM session
+                    // preserves whatever it has produced so far.
+                    let aiActive = aiSettings.enabled && llmSettingsRef.isConfigured
+                        && !llmSettingsRef.liveAIDisabledByRemoteOpenAI
+                    // Speaker labels are a transcription feature,
+                    // not an LLM feature — apply them whenever the
+                    // diarizer has produced intervals, regardless
+                    // of whether the user has the LLM CLI
+                    // configured.
+                    if let diarizer {
+                        transcriber.applySpeakerLabels(diarizer.intervals)
+                    }
+                    // Mirror the tick to the on-disk live sidecar
+                    // (throttled + deduped inside the writer).
+                    let liveSegments = transcriber.segments.map {
+                        TranscriptSegment(start: $0.startSeconds, end: $0.endSeconds,
+                                          text: $0.text, speaker: $0.speaker)
+                    }
+                    sidecarWriter?.update(segments: liveSegments,
+                                          speakerNames: transcriber.speakerNames)
+                    // A per-line delete removes text the LLM session may
+                    // already have been sent, and every tick after the
+                    // first is `claude --resume`, which carries the whole
+                    // earlier conversation — so the session has to be
+                    // ABANDONED, not merely re-prompted (issue #239).
+                    //
+                    // Checked outside the `aiActive` gate on purpose: a
+                    // deletion made while Live AI is toggled off must still
+                    // invalidate the session that produced the summary the
+                    // user is looking at, because toggling back on resumes
+                    // that same conversation.
+                    let deletions = transcriber.deletionCount
+                    if deletions != lastDeletionCount {
+                        lastDeletionCount = deletions
+                        aiSession?.noteTranscriptEdited()
+                    }
+                    if aiActive {
+                        let text = transcriber.formattedTranscript
+                        // Deliberately no `!text.isEmpty` guard. `lastFed`
+                        // starts empty too, so the only way to reach
+                        // `feed("")` is a transition from non-empty to
+                        // empty — the user deleting the last remaining
+                        // line. That has to land, or `latestTranscript`
+                        // keeps the pre-deletion text and the stop-time
+                        // final tick summarises what was just removed.
+                        // Past that point it costs nothing: `scheduleKick`
+                        // returns early on an empty transcript.
+                        if text != lastFed {
+                            lastFed = text
+                            aiSession?.feed(transcript: text)
+                        }
+                    }
+                }
+            }
+            if let held {
+                os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                    .log("wireLiveAIPipeline: replaying \(held.sampleCount, privacy: .public) live samples held during the previous recording's drain")
+                held.replay(into: transcriber)
+            }
+        }
+
+        // State changes and the end of a drain, as ONE ordered, buffered
+        // stream. Two reasons it is not `sessionRef.$state.values`:
+        //  * that drops values published while this loop is busy, and a
+        //    dropped state is a capture left unwired or a teardown missed;
+        //  * a capture that starts during the previous recording's drain is
+        //    wired when that drain ends (`isFinalizingRecording` clearing),
+        //    which is not a session state at all. Waiting for it INSIDE the
+        //    loop would stop the loop observing the session meanwhile — so
+        //    it arrives here as an event instead, in order with the rest.
+        // `@Published` emits on willSet, so a `.drainReleased` event is
+        // processed only after the flag's `didSet` (`releaseLivePipeline()`:
+        // singletons cleared, Live AI session started) has run.
+        enum PipelineEvent {
+            case state(RecordingSession.State)
+            case drainReleased
+        }
+        let (events, eventSink) = AsyncStream.makeStream(of: PipelineEvent.self)
+        let stateSubscription = sessionRef.$state.sink { eventSink.yield(.state($0)) }
+        let drainSubscription = actionsRef?.$isFinalizingRecording
+            .dropFirst()
+            .filter { !$0 }
+            .sink { _ in eventSink.yield(.drainReleased) }
+
+        for await event in events {
+            let state: RecordingSession.State
+            switch event {
+            case .drainReleased:
+                guard let epoch = deferredWireEpoch else { continue }
+                // Another drain already holds the pipeline again; its own
+                // release will bring us back here.
+                if actionsRef?.isFinalizingRecording == true { continue }
+                let held = deferredHold
+                deferredWireEpoch = nil
+                deferredHold = nil
+                // Wire only the capture the audio was held for, and only if
+                // it is still running. One that ended first was stopped
+                // without the live pipeline (`stopRecording` saw
+                // `isAwaitingLivePipeline`) and is batch-transcribed.
+                let capturing = sessionRef.state == .recording || sessionRef.state == .paused
+                guard capturing, epoch == sessionRef.captureEpoch else {
+                    if sessionRef.state == .idle { sessionRef.onLiveSamples = nil }
+                    os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
+                        .log("wireLiveAIPipeline: held capture ended before the live pipeline was released — not wiring it")
+                    continue
+                }
+                wireCapture(replaying: held)
+                continue
+            case .state(let newState):
+                state = newState
+            }
             switch state {
             case .recording:
                 // `.recording` is published twice per recording that gets
@@ -1657,226 +2069,46 @@ struct MilaApp: App {
                 // new recording — re-running the setup below on a resume
                 // would call `transcriber.start()`, which resets `segments` /
                 // `fullText` and wipes the entire transcript the user has
-                // been reading.
-                //
-                // Keyed on the session's capture epoch rather than on the
-                // previously-observed state, because the `.paused` in between
-                // is not guaranteed to be delivered: `@Published` drops values
-                // published while its `.values` consumer has no outstanding
-                // demand, so a fast pause→resume can arrive here as a bare
-                // second `.recording`. The epoch only moves on a real
-                // `start()`, so it cannot be fooled that way.
+                // been reading. Keyed on the session's capture epoch, which
+                // only moves on a real `start()`.
                 if wiredCaptureEpoch == sessionRef.captureEpoch { break }
+                // Events are buffered, so this one can be processed after the
+                // capture it announced has already stopped (a very fast
+                // start → stop). Wiring then would begin a sidecar and boot a
+                // diarizer daemon for a recording that is over.
+                guard sessionRef.state == .recording || sessionRef.state == .paused else { break }
                 wiredCaptureEpoch = sessionRef.captureEpoch
-                guard aiSettings.isLiveAIAvailable else {
-                    // Hardware below the Live AI bar AND no override
-                    // flipped. Recording still runs via RecordingSession;
-                    // QuickActionsController enqueues a post-record
-                    // transcribe on stop. We just skip the live
-                    // pipeline setup.
-                    //
-                    // BUT: clear the transcriber's `segments` /
-                    // `useVAD` first. Without this, a stale live
-                    // transcript from a previous recording (when the
-                    // user had the override toggle on) would still be
-                    // sitting in memory; `stopRecording` would
-                    // snapshot it onto the new recording and could
-                    // mark it `.completed` without ever running batch
-                    // transcription. Cursor flagged on 62e1c3b.
-                    _ = transcriber.stop()
-                    sessionRef.onLiveSamples = nil
-                    // Also clear LiveAISession so its rolling `summary`
-                    // and `actionItems` from a previous override-enabled
-                    // recording don't leak onto this gated capture.
-                    // `stopRecording` reads aiSession.summary /
-                    // actionItems unconditionally; without this reset,
-                    // a previous Live AI session's output would attach
-                    // to a recording that never ran the LLM loop.
-                    // Cursor flagged on c95d2bb.
-                    aiSession.cancel()
-                    // Still surface the recording to external pollers
-                    // (mila-mcp): they get an honest "recording, but no
-                    // live text on this hardware" status instead of
-                    // silence.
-                    sidecarWriter.begin(title: nil, source: nil, liveAvailable: false)
+                // Recording started while the PREVIOUS recording's Stop is
+                // still draining the live pipeline (issue #356 — a new
+                // recording no longer waits for that drain). The transcriber,
+                // diarizer, Live AI session and sidecar all still belong to
+                // the drain, which is reading them to save the last meeting:
+                // wiring them now would reset that meeting's transcript under
+                // it. Hold this recording's live audio instead; the
+                // `.drainReleased` event wires it and replays the hold.
+                // Capture itself is not waiting — the WAV gets every sample.
+                if actionsRef?.isFinalizingRecording == true {
+                    let hold = LiveSampleHold()
+                    sessionRef.onLiveSamples = { samples in hold.append(samples) }
+                    deferredHold = hold
+                    deferredWireEpoch = sessionRef.captureEpoch
                     os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                        .log("wireLiveAIPipeline: .recording skipped — hardware below Live AI bar (model=\(aiSettings.capabilities.marketingName, privacy: .public))")
-                    continue
+                        .log("wireLiveAIPipeline: .recording — previous recording still draining; holding live audio until it releases the live pipeline")
+                    break
                 }
-                // Open the live-transcript sidecar for this recording so
-                // external tools (mila-mcp) can follow the meeting; the
-                // feed loop below streams content into it.
-                sidecarWriter.begin(title: nil, source: nil, liveAvailable: true)
-                // Live transcription runs on every recording — it's how
-                // the recording UI shows the live transcript pane even
-                // when AI mode is off. Apply the user's tick-interval
-                // setting before start() so the running loop picks it
-                // up (default 5s, settable in Settings → AI Features).
-                transcriber.chunkSeconds = aiSettings.chunkSeconds
-                transcriber.useVAD = aiSettings.useVAD
-                // Attach the neural-VAD speech gate (drops noise-only
-                // utterances before whisper). Only meaningful on the VAD
-                // path; the fixed-timer path has no per-utterance gate.
-                if aiSettings.useNeuralVAD && aiSettings.useVAD {
-                    if !sileroVADLoadAttempted {
-                        sileroVADLoadAttempted = true
-                        if let vadPath = Bundle.main.path(forResource: "ggml-silero-v5.1.2", ofType: "bin") {
-                            sileroVAD = try? SileroVAD(modelPath: vadPath)
-                        }
-                        if sileroVAD == nil {
-                            os.Logger(subsystem: "io.island.whisper.IslandWhisper", category: "MilaApp")
-                                .error("Neural VAD enabled but Silero model failed to load — running without the gate")
-                        }
-                    }
-                    transcriber.speechGate = sileroVAD
-                } else {
-                    transcriber.speechGate = nil
-                }
-                // Wire each VAD-bounded utterance into the speaker
-                // diarizer. Without this, diarizer.process is never
-                // called, intervals stays empty, and segments never
-                // get a speaker label.
-                transcriber.onUtteranceCaptured = { [weak diarizer] samples, start, end in
-                    // Use `submit` (chained, trackable) rather than a
-                    // detached task — at end-of-recording we need to
-                    // `awaitPending()` so the final utterance's
-                    // speaker label is attached before the transcript
-                    // is saved.
-                    diarizer?.submit(samples: samples, startSeconds: start, endSeconds: end)
-                }
-                transcriber.start(language: langSettings.current.code)
-                print("wireLiveAIPipeline: .recording — installing onLiveSamples → liveTranscriber.ingest")
-                sessionRef.onLiveSamples = { [weak transcriber] samples in
-                    // The callback is invoked synchronously from
-                    // RecordingSession.write (already @MainActor), so we
-                    // can ingest directly without spawning a Task —
-                    // hopping through a detached Task here was dropping
-                    // the ArraySlice on some Swift-concurrency edge.
-                    transcriber?.ingest(samples)
-                }
-                // NOTE: the Live AI session is reset deterministically at
-                // record-start in QuickActionsController (`liveAISession?.start()`),
-                // NOT here. Driving the reset off this async `.recording`
-                // observer risked the transition being coalesced under load,
-                // leaving the previous recording's session live so its first
-                // tick `--resume`d the prior meeting → cross-recording bleed.
-                // By the time this runs, the session has already been freshly
-                // started for this recording.
-                diarizer.reset()
-                // Seed the embedding pool with known voices only when the
-                // user opted in. `seedEntries()` refuses on its own too, and
-                // while off it has nothing to hand over regardless (the
-                // profiles file is never parsed) — three independent reasons
-                // an opted-out recording starts from a blank pool.
-                if voiceRecognitionSettings.isConfigured {
-                    diarizer.seedPool(with: speakerProfileStore.seedEntries())
-                }
-                diarizer.similarityThreshold = aiSettings.speakerSimilarityThreshold
-                // Detach the diarizer start so a quick stop-after-start
-                // doesn't block the state observer on pyannote cold-init.
-                // The session token (claimed synchronously HERE) lets a
-                // stop() that lands before/while the detached body runs
-                // supersede it — otherwise a fast start→stop recording
-                // booted the ~1 GB daemon after the recording ended and
-                // left it idling.
-                let diarSession = diarizer.beginSession()
-                Task.detached(priority: .userInitiated) { [diarizer, diarSettings] in
-                    await diarizer.start(diarization: diarSettings, session: diarSession)
-                }
-                // Watch for off→on transitions on the Live AI toggle.
-                // The feed loop only kicks when new segments land, so
-                // a user who toggles Live AI on mid-recording would
-                // otherwise wait up to one chunk before the LLM sees
-                // anything. Mirror the feed-loop's gate here so an
-                // immediate feed runs the moment the toggle flips.
-                aiEnabledCancellable?.cancel()
-                aiEnabledCancellable = aiSettings.$enabled
-                    .dropFirst()
-                    .filter { $0 }
-                    .sink { [weak transcriber, weak aiSession] _ in
-                        guard llmSettingsRef.isConfigured else { return }
-                        if let text = transcriber?.formattedTranscript, !text.isEmpty {
-                            // User just flipped Live AI on — bypass the
-                            // min-interval floor for instant feedback.
-                            aiSession?.feed(transcript: text, immediate: true)
-                        }
-                    }
-
-                feedTask?.cancel()
-                feedTask = Task { @MainActor [weak transcriber, weak diarizer, weak aiSession, weak sidecarWriter, aiSettings, llmSettingsRef] in
-                    var lastFed = ""
-                    // Mirrors `LiveTranscriber.deletionCount`, which resets to
-                    // 0 in `start()` — and this task is rebuilt per recording,
-                    // so both sides start from 0 together.
-                    var lastDeletionCount = 0
-                    guard let transcriber else { return }
-                    for await _ in transcriber.$segments.values {
-                        if Task.isCancelled { break }
-                        // Recompute each tick — Live AI is whatever
-                        // the toggle currently says. Recording started
-                        // with it off + flipped on → ticks fire from
-                        // now on. Recording started with it on +
-                        // flipped off → ticks stop; the LLM session
-                        // preserves whatever it has produced so far.
-                        let aiActive = aiSettings.enabled && llmSettingsRef.isConfigured
-                            && !llmSettingsRef.liveAIDisabledByRemoteOpenAI
-                        // Speaker labels are a transcription feature,
-                        // not an LLM feature — apply them whenever the
-                        // diarizer has produced intervals, regardless
-                        // of whether the user has the LLM CLI
-                        // configured.
-                        if let diarizer {
-                            transcriber.applySpeakerLabels(diarizer.intervals)
-                        }
-                        // Mirror the tick to the on-disk live sidecar
-                        // (throttled + deduped inside the writer).
-                        let liveSegments = transcriber.segments.map {
-                            TranscriptSegment(start: $0.startSeconds, end: $0.endSeconds,
-                                              text: $0.text, speaker: $0.speaker)
-                        }
-                        sidecarWriter?.update(segments: liveSegments,
-                                              speakerNames: transcriber.speakerNames)
-                        // A per-line delete removes text the LLM session may
-                        // already have been sent, and every tick after the
-                        // first is `claude --resume`, which carries the whole
-                        // earlier conversation — so the session has to be
-                        // ABANDONED, not merely re-prompted (issue #239).
-                        //
-                        // Checked outside the `aiActive` gate on purpose: a
-                        // deletion made while Live AI is toggled off must still
-                        // invalidate the session that produced the summary the
-                        // user is looking at, because toggling back on resumes
-                        // that same conversation.
-                        let deletions = transcriber.deletionCount
-                        if deletions != lastDeletionCount {
-                            lastDeletionCount = deletions
-                            aiSession?.noteTranscriptEdited()
-                        }
-                        if aiActive {
-                            let text = transcriber.formattedTranscript
-                            // Deliberately no `!text.isEmpty` guard. `lastFed`
-                            // starts empty too, so the only way to reach
-                            // `feed("")` is a transition from non-empty to
-                            // empty — the user deleting the last remaining
-                            // line. That has to land, or `latestTranscript`
-                            // keeps the pre-deletion text and the stop-time
-                            // final tick summarises what was just removed.
-                            // Past that point it costs nothing: `scheduleKick`
-                            // returns early on an empty transcript.
-                            if text != lastFed {
-                                lastFed = text
-                                aiSession?.feed(transcript: text)
-                            }
-                        }
-                    }
-                }
+                wireCapture(replaying: nil)
             case .paused:
                 // A pause suspends capture but keeps the whole live
                 // pipeline intact — RecordingSession simply drops incoming
                 // audio while paused, so the transcriber / diarizer / feed
                 // loop just see a gap and pick back up on resume. No
                 // teardown (that only happens on `.idle`).
-                break
+                //
+                // A capture still waiting for the hand-over has no
+                // transcriber to mark the pause in (`pauseRecording` skips
+                // `pauseBoundary()` for it), so the hold records it and the
+                // replay closes the utterance there instead.
+                deferredHold?.markPause()
             case .stopping:
                 // Don't tear down yet — RecordingSession.stop() still
                 // flushes the buffered system-audio tail during
@@ -1887,6 +2119,11 @@ struct MilaApp: App {
                 // happens when state lands at `.idle`.
                 break
             case .idle:
+                // A capture that ended while still waiting for the hand-over
+                // (`.drainReleased` handles the case where the release comes
+                // first): drop its hold, nothing to wire any more.
+                deferredWireEpoch = nil
+                deferredHold = nil
                 feedTask?.cancel()
                 feedTask = nil
                 aiEnabledCancellable?.cancel()
@@ -1909,8 +2146,15 @@ struct MilaApp: App {
                 // trigger — sleep / lock-screen / app-quit /
                 // cancelAll — we run the full drain here so the
                 // tail doesn't get lost.
+                //
+                // And only for a capture this observer actually wired: one
+                // that never got the live pipeline (it started during the
+                // previous recording's drain) owns none of the singletons,
+                // and that drain may still be reading them.
                 let stopRecordingOwnsFinalize = actionsRef?.isFinalizingRecording == true
-                if !stopRecordingOwnsFinalize {
+                let endedCaptureWasWired = liveWiredEpoch == sessionRef.captureEpoch
+                liveWiredEpoch = nil
+                if endedCaptureWasWired && !stopRecordingOwnsFinalize {
                     // Force one last whisper pass on whatever's in
                     // the buffer so the tail of the meeting (up to
                     // ~chunkSeconds since the previous tick) makes
@@ -1941,12 +2185,17 @@ struct MilaApp: App {
                     // deferred by the min-interval floor can still wake and
                     // spawn a `claude` child while the app is tearing down
                     // AVAudioEngine (CodeRabbit on #113). Safe to clear
-                    // `summary` / `actionItems` here — the only path that
-                    // reaches this branch today is `cancelAll()` at app
+                    // `summary` / `actionItems` here — the paths that
+                    // reach this branch are `cancelAll()` at app
                     // termination, which by design does NOT flush a WAV or
                     // assemble a Recording (the orphan WAV is recovered on
-                    // next launch instead), so there is no snapshot to
-                    // protect. Sleep and screen-lock both route through
+                    // next launch instead), and a start abandoned by sleep /
+                    // lock while it was still `.starting` (#321), which
+                    // discards its WAV — so there is no snapshot to protect.
+                    // The abandoned start keeps `activeJob` at `.starting`
+                    // until this drain has cleared `onLiveSamples`, so it
+                    // cannot overlap the next recording's start. Sleep and
+                    // screen-lock of an ACTIVE recording both route through
                     // `stopRecording`, which owns finalize and cancels the
                     // session itself once its snapshot is stored.
                     aiSession.cancel()
@@ -1967,6 +2216,7 @@ struct MilaApp: App {
                 sessionRef.onLiveSamples = nil
             }
         }
+        withExtendedLifetime((stateSubscription, drainSubscription)) {}
     }
 
     /// Recovery decision for one recording left over from a previous
@@ -2063,12 +2313,17 @@ struct MilaApp: App {
                     """)
                 toEnqueue.append(fixed)
             case .markFailed:
-                fixed.status = .failed
+                // A re-run that can't run keeps the earlier transcript, so
+                // the row goes back to describing it; anything else becomes
+                // `.failed`. Consumes `retranscriptionPriorState` either way
+                // (`Recording.settleFailedPass`).
+                fixed.settleFailedPass()
                 statusChanged.append(fixed)
                 appLog.log("""
                     reset stale \(recording.status.rawValue, privacy: .public) \
                     recording \(recording.id, privacy: .public) \
-                    (\(recording.audioFileName, privacy: .private)) to .failed (WAV missing)
+                    (\(recording.audioFileName, privacy: .private)) to \
+                    .\(fixed.status.rawValue, privacy: .public) (WAV missing)
                     """)
             case .leaveAlone:
                 break  // unreachable given the `where` filter above
@@ -2209,39 +2464,66 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     weak var modelManager: ModelManager?
     weak var actions: QuickActionsController?
     weak var configImporter: MilaConfigImporter?
+    weak var shareImporter: RecordingShareImporter?
 
     private var didShutDown = false
     private var screenLockObserversInstalled = false
-    /// `.milaconfig` URLs delivered by a cold launch (double-click while Mila
-    /// was not running) before `wireDelegate()` connected the importer. Drained
-    /// by `flushBufferedConfigOpens()`.
-    private var bufferedConfigURLs: [URL] = []
+    /// `.milaconfig` / `.milashare` URLs delivered by a cold launch
+    /// (double-click while Mila was not running) before `wireDelegate()`
+    /// connected the importers. Drained by `flushBufferedOpens()`.
+    private var bufferedOpenURLs: [URL] = []
+
+    /// Split a batch of opened URLs by the document type Mila claims for
+    /// them. Anything else is dropped — Mila declares exactly these two in
+    /// `CFBundleDocumentTypes`. Pure, so it is unit-testable without AppKit.
+    nonisolated static func partition(_ urls: [URL]) -> (config: [URL], share: [URL]) {
+        var config: [URL] = []
+        var share: [URL] = []
+        for url in urls {
+            switch url.pathExtension.lowercased() {
+            case MilaConfig.fileExtension: config.append(url)
+            case ShareManifest.fileExtension: share.append(url)
+            default: continue
+            }
+        }
+        return (config, share)
+    }
 
     /// macOS calls this when the user double-clicks / drops a file the app
-    /// declares it opens (`CFBundleDocumentTypes` in Info.plist). We only claim
-    /// `.milaconfig`; anything else is ignored.
+    /// declares it opens (`CFBundleDocumentTypes` in Info.plist).
     func application(_ application: NSApplication, open urls: [URL]) {
-        let configURLs = urls.filter {
-            $0.pathExtension.lowercased() == MilaConfig.fileExtension
-        }
-        guard !configURLs.isEmpty else { return }
+        let (configURLs, shareURLs) = Self.partition(urls)
+        guard !configURLs.isEmpty || !shareURLs.isEmpty else { return }
         Task { @MainActor in
-            if let importer = self.configImporter {
-                configURLs.forEach { importer.handleOpen($0) }
-            } else {
-                // Cold launch: hold until the importer is wired in.
-                self.bufferedConfigURLs.append(contentsOf: configURLs)
-            }
+            self.route(configURLs: configURLs, shareURLs: shareURLs)
         }
     }
 
-    /// Deliver any config opens that arrived before the importer was wired.
+    /// Hand each URL to its importer, or buffer it until that importer is
+    /// wired (cold launch). Buffered URLs re-enter through `partition`, so
+    /// the two paths cannot disagree about who handles what.
     @MainActor
-    func flushBufferedConfigOpens() {
-        guard let importer = configImporter, !bufferedConfigURLs.isEmpty else { return }
-        let urls = bufferedConfigURLs
-        bufferedConfigURLs.removeAll()
-        urls.forEach { importer.handleOpen($0) }
+    private func route(configURLs: [URL], shareURLs: [URL]) {
+        if let importer = configImporter {
+            configURLs.forEach { importer.handleOpen($0) }
+        } else {
+            bufferedOpenURLs.append(contentsOf: configURLs)
+        }
+        if let importer = shareImporter {
+            shareURLs.forEach { importer.handleOpen($0) }
+        } else {
+            bufferedOpenURLs.append(contentsOf: shareURLs)
+        }
+    }
+
+    /// Deliver any opens that arrived before the importers were wired.
+    @MainActor
+    func flushBufferedOpens() {
+        guard !bufferedOpenURLs.isEmpty else { return }
+        let urls = bufferedOpenURLs
+        bufferedOpenURLs.removeAll()
+        let (configURLs, shareURLs) = Self.partition(urls)
+        route(configURLs: configURLs, shareURLs: shareURLs)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -2483,12 +2765,22 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// menu). We race the system sleep timer to flush the WAV — the
     /// `stopBecauseOfSleep` path stashes the metadata so the wake-up
     /// alert can show duration + "stopped by sleep".
+    ///
+    /// A recording that is still being STARTED is not `isRecording` (there
+    /// is no session to stop yet), so it has its own branch: the start is
+    /// abandoned and never becomes a recording, instead of coming up after
+    /// the wake and running unattended (#321). Nothing to flush, so no await.
     @objc private func handleWillSleep(_ notification: Notification) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            if let actions = self.actions, actions.isRecording {
-                print("Sleep guard: stopping recording before system sleeps")
-                await actions.stopBecauseOfSleep()
+            if let actions = self.actions {
+                if actions.isStartingRecording {
+                    print("Sleep guard: abandoning the recording that is still starting")
+                    actions.abandonStartingRecording(reason: .systemSleep)
+                } else if actions.isRecording {
+                    print("Sleep guard: stopping recording before system sleeps")
+                    await actions.stopBecauseOfSleep()
+                }
             }
             if let dictation = self.dictation, case .recording = dictation.state {
                 print("Sleep guard: cancelling dictation before system sleeps")
@@ -2519,9 +2811,15 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     /// This only runs for *deliberate* locks: while recording, `SleepGuard`
     /// holds a display-sleep assertion that prevents the idle auto-lock from
     /// firing, so reaching here means the user explicitly locked the screen.
+    ///
+    /// A recording still being started is abandoned rather than stopped —
+    /// same reasoning as in `handleWillSleep` (#321).
     private func pauseForScreenLock(reason: String) async {
         guard let actions else { return }
-        if actions.isRecording {
+        if actions.isStartingRecording {
+            print("Screen-lock guard: abandoning the recording that is still starting (\(reason))")
+            actions.abandonStartingRecording(reason: .screenLock)
+        } else if actions.isRecording {
             print("Screen-lock guard: stopping active recording (\(reason))")
             await actions.stopRecording()
         }
@@ -2551,5 +2849,52 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // breathing room. Cost: quit takes ~half a second longer.
         try? await Task.sleep(nanoseconds: 500_000_000)
         HotkeyManager.shared.shutdown()
+    }
+}
+
+/// The live audio of a recording that started while the PREVIOUS recording's
+/// Stop was still draining the live pipeline (issue #356). `wireLiveAIPipeline`
+/// points `RecordingSession.onLiveSamples` here until the drain releases the
+/// live singletons, then replays it into the freshly started transcriber.
+///
+/// Kept as runs split at pauses: the session drops audio while paused, so
+/// without the split the replay would glue the two sides of a pause into one
+/// utterance — `pauseBoundary()` between runs is what `pauseRecording` does
+/// for a wired recording.
+///
+/// Unbounded on purpose: it holds 16 kHz mono floats (~3.8 MB a minute) for
+/// the length of a drain, which is seconds; capping it would mean dropping
+/// audio from the middle of the recording's live clock, and every later
+/// utterance's timestamp is counted from that clock.
+///
+/// Fixed-window (non-VAD) mode transcribes only the trailing window on each
+/// tick, so a hold longer than that window shows only its tail in the live
+/// pane. That mode is never authoritative — `stopRecording` sends it to the
+/// batch pass, which transcribes the whole WAV — so only the preview of a
+/// pathologically long drain (> 30 s) is affected.
+@MainActor
+private final class LiveSampleHold {
+    private var runs: [[Float]] = [[]]
+
+    var sampleCount: Int { runs.reduce(0) { $0 + $1.count } }
+
+    func append(_ chunk: ArraySlice<Float>) {
+        runs[runs.count - 1].append(contentsOf: chunk)
+    }
+
+    /// The capture was paused: what arrives next is after a gap.
+    func markPause() {
+        if !(runs.last?.isEmpty ?? true) { runs.append([]) }
+    }
+
+    func replay(into transcriber: LiveTranscriber) {
+        // `markPause` only opens a new run after a non-empty one, so every
+        // non-empty run but the last is followed by a pause — including a
+        // pause the capture is still in when it is wired.
+        for (index, run) in runs.enumerated() where !run.isEmpty {
+            transcriber.ingest(run[...])
+            if index < runs.count - 1 { transcriber.pauseBoundary() }
+        }
+        runs = [[]]
     }
 }

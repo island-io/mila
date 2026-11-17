@@ -91,11 +91,15 @@ final class AppSceneChurnTests: XCTestCase {
             try await Task.sleep(nanoseconds: 50_000_000)
         }
         // A skip, not a failure: `wireLiveAIPipeline` gates on
-        // `isLiveAIAvailable`, which `MilaApp.init` forces true under XCTest
-        // hosting — if that override ever regresses, the CI step that checks
-        // this test PASSED (not skipped) is what goes red, with this reason.
+        // `LiveAISettings.runsLivePipeline` — `isLiveAIAvailable`, which
+        // `MilaApp.init` forces true under XCTest hosting, AND the user's
+        // "Transcribe while recording" setting (default on; a developer who
+        // switched it off in their own Mila shares these defaults). If either
+        // regresses on CI, the step that checks this test PASSED (not skipped)
+        // is what goes red, with this reason.
         try XCTSkipUnless(wired, "the live pipeline never wired up to the fake recording "
-                          + "(isLiveAIAvailable false in the test host?) — nothing to budget")
+                          + "(isLiveAIAvailable false in the test host, or \"Transcribe while "
+                          + "recording\" switched off?) — nothing to budget")
         // Let the start-up publishes (state, activeJob, transcriber start)
         // drain before counting: the budget is for the steady state.
         try await Task.sleep(nanoseconds: 500_000_000)

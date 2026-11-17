@@ -48,6 +48,15 @@ final class TranscriptionService: ObservableObject {
     @Published private(set) var activeRecordingID: UUID?
     @Published private(set) var pendingIDs: [UUID] = []
 
+    /// The in-flight run the user has asked to stop ("Stop Transcribing")
+    /// but that hasn't unwound yet. Usually a fraction of a second, but a
+    /// stop that lands in a step nothing can interrupt — the model load (a
+    /// first CoreML compile is ~13 s) — waits for it to finish. Until
+    /// `activeRecordingID` clears, the UI shows "Stopping…" instead of a
+    /// progress bar and a Stop button that would do nothing a second time.
+    /// Cleared by `run()` once `process` has returned.
+    @Published private(set) var stoppingRecordingID: UUID?
+
     /// Set to a recording's id while the OFFLINE speaker re-diarize pass is
     /// running for it (`rediarizeSegments`). This is NOT transcription —
     /// the transcript text is already final by this point; the pyannote
@@ -185,6 +194,14 @@ final class TranscriptionService: ObservableObject {
 
     private var queue: [Recording] = []
     private var worker: Task<Void, Never>?
+    private var shutdownTask: Task<Void, Never>?
+    private var prewarmTasks: [UUID: Task<Void, Never>] = [:]
+    /// The recording `process(_:)` is working on, from the moment the worker
+    /// pops it until `process` returns. Wider than `activeRecordingID`, which
+    /// is only published once the row has been flipped to `.running` — there
+    /// is a suspension (`remoteEngine.configure`) before that, and a stop that
+    /// lands in it must still find the run. See `deferTranscription(of:)`.
+    private var processingID: UUID?
 
     /// Recordings the user asked to abandon mid-run. Held in a thread-safe
     /// box because whisper.cpp's `abort_callback` polls this from a
@@ -237,7 +254,7 @@ final class TranscriptionService: ObservableObject {
         self.observerSetupTask = Task { [engine] in
             await engine.setPreparationObserver { [weak serviceRef] preparing, status in
                 Task { @MainActor in
-                    guard let serviceRef else { return }
+                    guard let serviceRef, !serviceRef.cancellation.isStopped else { return }
                     serviceRef.isPreparingModel = preparing
                     serviceRef.preparationStatus = preparing ? status : nil
                 }
@@ -247,7 +264,7 @@ final class TranscriptionService: ObservableObject {
 
     // MARK: - Prewarm
 
-    /// Pre-load the user's default model in a detached task. Called
+    /// Pre-load the user's default model on the engine actor. Called
     /// once at app launch so the first-ever CoreML compile (~13s on
     /// M-series) happens BEFORE the user taps Record. Without this,
     /// pressing Record during the compile window produces a recording
@@ -260,6 +277,7 @@ final class TranscriptionService: ObservableObject {
     /// callers pass in their `RecordingLanguageSettings.current` so we
     /// pick the model the next recording is most likely to want.
     func prewarm(language: String) {
+        guard !cancellation.isStopped else { return }
         guard let model = modelManager.model(for: language),
               modelManager.isInstalled(model) else {
             serviceLog.log("prewarm: skipping — no installed model for lang=\(language, privacy: .public)")
@@ -272,7 +290,9 @@ final class TranscriptionService: ObservableObject {
         // re-promote it to Optional inside the closure.
         let observerTask: Task<Void, Never> = observerSetupTask
         serviceLog.log("prewarm: kicking off load for \(displayName, privacy: .public)")
-        Task.detached(priority: .userInitiated) { [engine] in
+        let warmID = UUID()
+        prewarmTasks[warmID] = Task { [weak self, engine, cancellation] in
+            defer { self?.prewarmTasks[warmID] = nil }
             // Bugbot #3: ensure the preparation observer is registered
             // BEFORE the first CoreML compile starts — otherwise the
             // engine fires the "preparing" callback into a nil
@@ -282,6 +302,7 @@ final class TranscriptionService: ObservableObject {
             // engine actor, but await ordering between two independent
             // Tasks is undefined, so we make it explicit here.
             await observerTask.value
+            guard !cancellation.isStopped, !Task.isCancelled else { return }
             do {
                 try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
                 serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")
@@ -313,7 +334,27 @@ final class TranscriptionService: ObservableObject {
     /// `isRetranscription` marks a deliberate re-run of an existing recording so
     /// the auto-drop gate never discards it (see `retranscriptionIDs`).
     func enqueue(_ recording: Recording, isRetranscription: Bool = false) {
-        if activeRecordingID == recording.id { return }
+        guard !cancellation.isStopped else {
+            // Leave a trace: the row stays pending for the next launch's
+            // recovery sweep, and without this line a "not transcribed until
+            // I relaunched" report has nothing in the log to correlate.
+            serviceLog.log("""
+                queue: refused \(recording.id.uuidString.prefix(8), privacy: .public) \
+                (\(recording.title, privacy: .private)) — service is shutting down
+                """)
+            return
+        }
+        // `processingID` covers the moment between the worker popping the job
+        // and publishing `activeRecordingID`, which would otherwise let the
+        // same recording be queued behind its own in-flight run. A run the
+        // user is STOPPING is the one exception: it is unwinding, not
+        // running, and a Transcribe click in that "Stopping…" window means
+        // "run it again once it has". So it IS queued behind the in-flight
+        // run — the worker pops it after `run()` has cleared that run's stop
+        // flag. Refusing it silently, as this used to, left the row
+        // `.pending` and unqueued until a second click.
+        let inFlight = activeRecordingID == recording.id || processingID == recording.id
+        if inFlight, stoppingRecordingID != recording.id { return }
         if queue.contains(where: { $0.id == recording.id }) { return }
         if isRetranscription { retranscriptionIDs.insert(recording.id) }
         queue.append(recording)
@@ -400,7 +441,7 @@ final class TranscriptionService: ObservableObject {
     /// audio is saved regardless — this only gets the user a fast, actionable
     /// error rather than a mystery blank pane.
     func probeRemoteBackendIfActive() async {
-        guard remoteSettings.isActive else { return }
+        guard !cancellation.isStopped, remoteSettings.isActive else { return }
         guard remoteSettings.isConfigured else {
             lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
             return
@@ -410,13 +451,127 @@ final class TranscriptionService: ObservableObject {
         // the recording stops or a newer recording starts, so a late, out-of-
         // order failure can't overwrite UI state for a recording the user has
         // already moved past.
-        if Task.isCancelled { return }
+        if cancellation.isStopped || Task.isCancelled { return }
         if case .failed(let message) = remoteSettings.testStatus {
             lastError = "Remote transcription server check failed: \(message) Your audio is still being recorded — fix the endpoint or API key in Settings → Models, then re-transcribe."
         }
     }
 
     func transcribeOnceSegments(samples: [Float], language: String, audioCtx: Int32?) async -> [TranscriptSegment] {
+        switch await transcribeLiveSegments(samples: samples, language: language, audioCtx: audioCtx) {
+        case .transcribed(let segments):
+            return segments
+        case .skipped, .failed:
+            return []
+        case .connectionUnavailable(let message):
+            // A one-shot caller (dictation) has nothing to retry with — the
+            // audio it handed over is gone once this returns — so a lost
+            // connection is still a failure the user has to hear about here.
+            // Only `LiveTranscriber`, which keeps the audio and retries, goes
+            // through `transcribeLiveSegments` directly and skips the alert.
+            if lastError == nil {
+                lastError = "Live transcription failed: \(message)"
+            }
+            return []
+        }
+    }
+
+    /// What one live-path transcription attempt came to. See
+    /// `transcribeLiveSegments`.
+    enum LiveTranscriptionOutcome {
+        /// The backend answered. Empty when it heard no speech. For the
+        /// remote backend this is also proof that the server is reachable.
+        case transcribed([TranscriptSegment])
+        /// There was nothing to transcribe, or nobody wants the result: the
+        /// service is shutting down, the call was cancelled, or the capture
+        /// was silent. Not a gap in the transcript.
+        case skipped
+        /// Transcription SHOULD have happened and did not, and sending the
+        /// same audio straight back would not help: the server refused the
+        /// request (bad key, bad model, a non-retryable HTTP error), the
+        /// backend is not configured, or the local model is missing / threw.
+        /// Remote refusals are reported through `lastError`. The live
+        /// transcriber records the audio as a gap so it can be retried at
+        /// finalize (#355).
+        case failed
+        /// The remote server could not be REACHED, or said it is temporarily
+        /// unavailable (`isTransientRemoteFailure`). Nothing is wrong with the
+        /// audio or the configuration, and the same request should succeed
+        /// once the server is back. NOT reported through `lastError`: a short
+        /// Wi-Fi drop mid-meeting used to pop a blocking "Transcription error"
+        /// alert while the recording carried on fine underneath it (#355).
+        /// The associated value is the error's user-facing text.
+        case connectionUnavailable(String)
+    }
+
+    /// Whether `error` means "try again shortly" rather than "this request is
+    /// wrong".
+    ///
+    /// Two families:
+    ///  * transport failures where no HTTP response came back at all — no
+    ///    network, the connection dropped or timed out, the host could not be
+    ///    resolved or connected to, the TLS handshake failed (a captive portal
+    ///    or a network switch mid-handshake), cellular data not allowed;
+    ///  * an answer that itself says "temporarily": 408, 502, 503, 504, and a
+    ///    429 rate limit — but NOT OpenAI's `insufficient_quota` 429, which no
+    ///    amount of waiting fixes.
+    ///
+    /// Everything else the server answered stays a hard, visible error: 401,
+    /// 403, 404, 400, 500 (a self-hosted server's "Failed to decode audio",
+    /// #147), an unparseable body, an empty result, a missing configuration.
+    /// A mistyped host (`cannotFindHost`) is indistinguishable from DNS being
+    /// down, so it counts as transient here; the record-start probe
+    /// (`probeRemoteBackendIfActive`) is what reports a host that never
+    /// resolves.
+    nonisolated static func isTransientRemoteFailure(_ error: Error) -> Bool {
+        if let remote = error as? RemoteWhisperEngine.RemoteError {
+            guard case .http(let status, let body) = remote else { return false }
+            switch status {
+            case 408, 502, 503, 504:
+                return true
+            case 429:
+                return !body.contains("insufficient_quota")
+            default:
+                return false
+            }
+        }
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .notConnectedToInternet,
+             .networkConnectionLost,
+             .timedOut,
+             .cannotConnectToHost,
+             .cannotFindHost,
+             .dnsLookupFailed,
+             .secureConnectionFailed,
+             .cannotLoadFromNetwork,
+             .resourceUnavailable,
+             .dataNotAllowed,
+             .internationalRoamingOff,
+             .callIsActive:
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Per-request idle timeout for a short clip: twice the audio's length,
+    /// at least 30 s, never more than the whole-recording hour. A live
+    /// utterance (≤ ~30 s, padded to 5 s) gets 30–60 s instead of the hour a
+    /// whole-recording upload needs — that hour is what let one stalled
+    /// connection hold the live queue and Stop's drain (#355).
+    nonisolated static func shortClipRequestTimeout(sampleCount: Int) -> TimeInterval {
+        let seconds = Double(sampleCount) / Double(WhisperAudioFormat.sampleRate)
+        return min(RemoteWhisperEngine.wholeRecordingTimeout, max(30, seconds * 2))
+    }
+
+    /// The live transcriber's entry point: the same routing as
+    /// `transcribeOnceSegments`, but a remote connectivity failure comes back
+    /// as `.connectionUnavailable` instead of an alert, so the caller can keep
+    /// the audio and retry it once the connection is back (#355). Hard
+    /// failures are surfaced through `lastError` exactly as before.
+    func transcribeLiveSegments(samples: [Float], language: String, audioCtx: Int32?) async -> LiveTranscriptionOutcome {
+        guard !cancellation.isStopped else { return .skipped }
         // Nothing was captured: don't hand it to any backend. The remote one
         // uploads a header-only file and gets back `HTTP 500: Failed to decode
         // audio.`, which the user reads as "the transcription server is down"
@@ -428,7 +583,7 @@ final class TranscriptionService: ObservableObject {
             if lastError == nil {
                 lastError = Self.noAudioCapturedMessage
             }
-            return []
+            return .skipped
         }
         // Remote backend: route dictation/live utterances to the configured
         // endpoint too, so the user's "global backend" choice holds for every
@@ -438,17 +593,21 @@ final class TranscriptionService: ObservableObject {
             guard remoteSettings.isConfigured,
                   let config = remoteSettings.currentConfig(for: language) else {
                 serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
-                return []
+                return .failed
             }
             await remoteEngine.configure(config)
+            guard !cancellation.isStopped else { return .skipped }
             do {
-                let segs = try await remoteEngine.transcribe(samples: samples,
-                                                             language: language,
-                                                             audioCtx: audioCtx,
-                                                             progress: nil,
-                                                             isCancelled: nil)
-                return segs
+                let segs = try await remoteEngine.transcribe(
+                    samples: samples,
+                    language: language,
+                    audioCtx: audioCtx,
+                    requestTimeout: Self.shortClipRequestTimeout(sampleCount: samples.count),
+                    isCancelled: { [cancellation] in cancellation.isStopped })
+                guard !cancellation.isStopped else { return .skipped }
+                return .transcribed(segs)
             } catch {
+                if cancellation.isStopped || error is CancellationError { return .skipped }
                 // Log at .error: a remote failure (401/transport/server) repeats
                 // on every utterance for the whole recording and silently empties
                 // the live pane. Error level so it's visible in `log show`
@@ -466,8 +625,17 @@ final class TranscriptionService: ObservableObject {
                 // for the banner. (Issue #213, CWE-532.)
                 serviceLog.error("""
                     transcribeOnceSegments(remote): FAILED \
+                    transient=\(Self.isTransientRemoteFailure(error), privacy: .public) \
                     error=\(RemoteWhisperEngine.RemoteError.logMessage(for: error), privacy: .public)
                     """)
+                // The server could not be reached, or is temporarily
+                // unavailable — not a configuration problem. Hand it back to
+                // the caller instead of the blocking alert: the live
+                // transcriber keeps the audio and retries it, and shows a
+                // non-blocking banner meanwhile (#355).
+                if Self.isTransientRemoteFailure(error) {
+                    return .connectionUnavailable(error.localizedDescription)
+                }
                 // Surface the failure instead of returning a silently-empty
                 // result that's indistinguishable from "no speech". Set once
                 // (only when nothing is already showing) so a per-utterance
@@ -477,14 +645,14 @@ final class TranscriptionService: ObservableObject {
                 if lastError == nil {
                     lastError = "Live transcription failed: \(error.localizedDescription)"
                 }
-                return []
+                return .failed
             }
         }
         let candidate = modelManager.model(for: language)
         guard let model = candidate,
               modelManager.isInstalled(model) else {
             serviceLog.log("transcribeOnceSegments: SKIP — model not installed for lang=\(language, privacy: .public) candidate=\(candidate?.name ?? "nil", privacy: .public) installed=\(self.modelManager.installed, privacy: .public)")
-            return []
+            return .failed
         }
         let modelURL = modelManager.url(for: model)
         let startedAt = Date()
@@ -492,19 +660,190 @@ final class TranscriptionService: ObservableObject {
         // Bugbot #3: make sure the preparation observer is installed
         // before `loadIfNeeded` — see `init` for the race.
         await observerSetupTask.value
+        guard !cancellation.isStopped else { return .skipped }
         do {
             try await engine.loadIfNeeded(modelURL: modelURL,
                                           displayName: model.displayName)
+            guard !cancellation.isStopped else { return .skipped }
             let segs = try await engine.transcribe(samples: samples,
                                                    language: language,
                                                    audioCtx: audioCtx,
                                                    progress: nil,
-                                                   isCancelled: nil)
+                                                   isCancelled: { [cancellation] in cancellation.isStopped })
+            guard !cancellation.isStopped else { return .skipped }
             serviceLog.log("transcribeOnceSegments: model=\(model.name, privacy: .public) lang=\(language, privacy: .public) samples=\(samples.count, privacy: .public) elapsed=\(Date().timeIntervalSince(startedAt), privacy: .public)s segs=\(segs.count, privacy: .public)")
-            return segs
+            return .transcribed(segs)
         } catch {
+            if cancellation.isStopped || error is CancellationError { return .skipped }
             serviceLog.error("transcribeOnceSegments: FAILED model=\(model.name, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
-            return []
+            return .failed
+        }
+    }
+
+
+    // MARK: - Untranscribed spans (#355)
+
+    /// What `transcribeSpans` came back with: the recovered segments, in
+    /// absolute recording time, unlabelled and with trimmed text; and the
+    /// spans that are still missing.
+    struct SpanTranscription {
+        var segments: [TranscriptSegment]
+        var unresolved: [UntranscribedSpan]
+        /// Whether the BACKEND failed for at least one span (unreachable or
+        /// refused). False when every unresolved span was only unreadable
+        /// audio — no server problem to report.
+        var backendFailed = false
+    }
+
+    /// Transcribe ONLY `spans` of the audio at `audioURL` — the utterances the
+    /// live path gave up on — through the same backend routing as the live
+    /// path. Used at finalize (`LiveTranscriber.recoverUntranscribedAudio`)
+    /// and by "Retry missing parts" (`retryUntranscribedSpans`); the
+    /// whole-WAV batch pass would re-key every speaker and drop the user's
+    /// names, and re-transcribe lines the user deleted.
+    ///
+    /// A span is resolved only when the backend actually ANSWERED for its
+    /// audio — an empty answer for real audio is silence, and fine. A slice
+    /// that cannot be read, reads empty or reads as digital silence is a
+    /// mismatch between the span and the file, not proof there was nothing
+    /// said, so it stays unresolved (and visible) rather than being dropped.
+    ///
+    /// The first span the server cannot be REACHED for ends the attempt:
+    /// every remaining span is returned unresolved without its own upload, so
+    /// an outage costs one request timeout, not one per span. A refusal is
+    /// per span (a 500 on one slice says nothing about the next), so it keeps
+    /// that span and moves on — otherwise "Retry missing parts" would hit the
+    /// same bad span first, forever, and never reach the others.
+    func transcribeSpans(_ spans: [UntranscribedSpan],
+                         audioURL: URL,
+                         language: String) async -> SpanTranscription {
+        var recovered: [TranscriptSegment] = []
+        var unresolved: [UntranscribedSpan] = []
+        var gaveUp = false
+        var backendFailed = false
+        for span in spans {
+            if gaveUp || cancellation.isStopped || !span.isRetryable {
+                unresolved.append(span)
+                continue
+            }
+            let samples: [Float]
+            do {
+                samples = try AudioConvert.loadAsWhisperSamples(url: audioURL, from: span.start, to: span.end)
+            } catch {
+                let ns = error as NSError
+                serviceLog.error("""
+                    transcribeSpans: could not read span \(span.start, privacy: .public)–\(span.end, privacy: .public)s \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]
+                    """)
+                unresolved.append(UntranscribedSpan(start: span.start, end: span.end, unreadable: true))
+                continue
+            }
+            // Nothing on disk for this span, or nothing audible in it. The
+            // live path only ever records spans of audio it heard, so this is
+            // the file and the span disagreeing — keep the gap visible rather
+            // than declaring it resolved. Not sent: the silence guard in
+            // `transcribeLiveSegments` would raise the "no audio was
+            // captured" alert for what is a perfectly good recording.
+            if samples.isEmpty || AudioSignal.isSilent(samples) {
+                serviceLog.error("""
+                    transcribeSpans: span \(span.start, privacy: .public)–\(span.end, privacy: .public)s \
+                    read \(samples.count, privacy: .public) samples with no signal — kept as missing
+                    """)
+                // Permanent: re-reading the same file gives the same answer,
+                // so it stays visible but is never retried.
+                unresolved.append(UntranscribedSpan(start: span.start, end: span.end, unreadable: true))
+                continue
+            }
+            let duration = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
+            let outcome = await transcribeLiveSegments(
+                samples: LiveTranscriber.paddedUtterance(samples),
+                language: language, audioCtx: nil)
+            switch outcome {
+            case .transcribed(let segs):
+                for seg in segs {
+                    let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    // Same rules as the live VAD path: drop text hallucinated
+                    // into the padding, clamp the end to the real audio.
+                    guard !text.isEmpty, seg.start < duration else { continue }
+                    recovered.append(TranscriptSegment(start: span.start + seg.start,
+                                                       end: span.start + min(seg.end, duration),
+                                                       text: text))
+                }
+            case .skipped:
+                unresolved.append(span)
+            case .failed:
+                unresolved.append(span)
+                backendFailed = true
+            case .connectionUnavailable:
+                unresolved.append(span)
+                backendFailed = true
+                gaveUp = true
+            }
+        }
+        serviceLog.log("""
+            transcribeSpans: \(spans.count, privacy: .public) spans → \
+            \(recovered.count, privacy: .public) segments, \(unresolved.count, privacy: .public) still missing \
+            gaveUp=\(gaveUp, privacy: .public)
+            """)
+        return SpanTranscription(segments: recovered, unresolved: unresolved,
+                                 backendFailed: backendFailed)
+    }
+
+    /// `incoming` merged into `existing` by start time. Ties keep `existing`
+    /// first, so the result is deterministic.
+    nonisolated static func insertedInTimeOrder<T>(_ incoming: [T],
+                                                   into existing: [T],
+                                                   start: (T) -> Double) -> [T] {
+        guard !incoming.isEmpty else { return existing }
+        return (existing + incoming).enumerated()
+            .sorted { (start($0.element), $0.offset) < (start($1.element), $1.offset) }
+            .map(\.element)
+    }
+
+    /// Recordings whose "Retry missing parts" is running. Changes only on a
+    /// user action, so it is safe on this App-level object.
+    @Published private(set) var spanRetryIDs: Set<UUID> = []
+
+    /// "Retry missing parts": transcribe the recording's `untranscribedSpans`
+    /// from its audio and insert what comes back into the transcript in time
+    /// order, keeping every existing line, speaker label and name. Spans that
+    /// still fail stay on the row. Does nothing while a full pass for the
+    /// recording is queued or running — that pass replaces the transcript
+    /// (and clears the spans) anyway.
+    func retryUntranscribedSpans(of recordingID: UUID) async {
+        guard !spanRetryIDs.contains(recordingID),
+              !isQueuedOrActive(recordingID),
+              let row = store.recordings.first(where: { $0.id == recordingID }),
+              let spans = row.untranscribedSpans, spans.contains(where: \.isRetryable) else { return }
+        spanRetryIDs.insert(recordingID)
+        defer { spanRetryIDs.remove(recordingID) }
+        let result = await transcribeSpans(spans,
+                                           audioURL: store.audioURL(for: row),
+                                           language: row.transcriptLanguage)
+        // Re-read: the user kept working while the uploads ran. Apply only if
+        // the row still has the same gaps — a full pass that ran meanwhile
+        // already replaced the whole transcript.
+        guard var live = store.recordings.first(where: { $0.id == recordingID }),
+              live.untranscribedSpans == spans,
+              !isQueuedOrActive(recordingID) else { return }
+        let recovered = result.segments
+        if !recovered.isEmpty {
+            live.segments = Self.insertedInTimeOrder(recovered, into: live.segments) { $0.start }
+            live.fullText = live.segments
+                .map { $0.text.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty }
+                .joined(separator: " ")
+        }
+        live.untranscribedSpans = result.unresolved.isEmpty ? nil : result.unresolved
+        store.update(live)
+        if !recovered.isEmpty, !live.isTrashed {
+            TranscriptExporter.writeSRT(for: live, in: store.recordingsDirectory)
+        }
+        // A user-initiated retry that recovered nothing because of the SERVER
+        // must say so. Unreadable audio is not a server problem: it is now
+        // marked on the span and shown in the note instead.
+        if result.backendFailed, recovered.isEmpty, lastError == nil {
+            lastError = "Couldn't transcribe the missing parts — the transcription server is still unreachable or refused them. They're kept on the recording; try again later."
         }
     }
 
@@ -560,13 +899,13 @@ final class TranscriptionService: ObservableObject {
     /// recording being re-diarized — the transcript text is already final
     /// here, so calling this "Transcribing" would mislead.
     func rediarizeSegments(wavURL: URL, segments: [TranscriptSegment], recordingID: UUID? = nil) async -> [TranscriptSegment]? {
-        guard diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
+        guard !cancellation.isStopped, diarizationSettings.isConfigured, !segments.isEmpty else { return nil }
         diarizingRecordingID = recordingID
         defer { diarizingRecordingID = nil }
         do {
             let turns = try await SpeakerDiarizer.diarize(wavURL: wavURL,
                                                           pythonPath: diarizationSettings.pythonPath)
-            guard !turns.isEmpty else { return nil }
+            guard !cancellation.isStopped, !turns.isEmpty else { return nil }
             var enriched = segments
             for i in enriched.indices {
                 enriched[i].speaker = SpeakerDiarizer.assignSpeaker(
@@ -594,37 +933,138 @@ final class TranscriptionService: ObservableObject {
     /// shutdown so the ggml-metal device tear-down happens before libc++
     /// global destructors run (which is what triggered SIGABRT on quit).
     func shutdown() async {
-        await engine.shutdown()
-        await remoteEngine.shutdown()
+        if let shutdownTask {
+            await shutdownTask.value
+            return
+        }
+        // Close admission before yielding. Keep persisted pending/running rows
+        // and audio intact so the existing launch recovery sweep can retry them.
+        cancellation.stopAll()
+        worker?.cancel() // also cancels the structured diarization subprocess
+        queue.removeAll()
+        retranscriptionIDs.removeAll()
+        publishPending()
+        isPreparingModel = false
+        preparationStatus = nil
+        let warming = Array(prewarmTasks.values)
+        warming.forEach { $0.cancel() }
+        let task = Task { [remoteEngine, engine] in
+            await remoteEngine.shutdown()
+            // Drain already-started prewarms before freeing local resources;
+            // otherwise a late model load could recreate them after teardown.
+            for warm in warming { await warm.value }
+            await engine.shutdown()
+        }
+        shutdownTask = task
+        await task.value
     }
 
     /// Abandon the transcription of `recordingID`. If it's still in the queue
     /// it's dropped; if it's the active job, the engine's abort_callback
     /// trips on the next poll and `whisper_full` unwinds in ~100ms instead
-    /// of running to the end. Idempotent — repeated calls are a no-op.
+    /// of running to the end (and the diarization subprocess is terminated —
+    /// see `withPolledCancellation`). Idempotent — repeated calls are a no-op.
+    ///
+    /// An id that is neither queued nor active is flagged ahead of time, so a
+    /// run enqueued after the cancel — the rename sheet's Discard can land
+    /// while `stopRecording` is still finalizing — is skipped. A QUEUED id is
+    /// not flagged: dropping it is the whole cancel, and a flag nothing
+    /// consumes would silently swallow the recording's next Transcribe (e.g.
+    /// after restoring it from Recently Deleted).
     ///
     /// We do NOT delete the recording from the store here. The caller (the
     /// rename-sheet's Cancel button) is the one that decides whether to
     /// discard the audio or keep it — keeping that policy out of the service
     /// means the service stays composable for other potential cancel paths.
     func cancel(recordingID: UUID) {
+        if queue.contains(where: { $0.id == recordingID }) {
+            queue.removeAll { $0.id == recordingID }
+            retranscriptionIDs.remove(recordingID)
+            publishPending()
+            return
+        }
         cancellation.insert(recordingID)
-        queue.removeAll { $0.id == recordingID }
-        publishPending()
+    }
+
+    /// "Stop Transcribing": the user wants this recording's transcription
+    /// off the CPU now and will start it again later. Stops the run — drops
+    /// it from the queue, or aborts it mid-pass, diarization subprocess
+    /// included — and parks the recording via
+    /// `RecordingStore.markTranscriptionDeferred`, which keeps it in the
+    /// library. Starting it again is the ordinary Transcribe action
+    /// (`prepareForRetranscription` + `enqueue`).
+    ///
+    /// Returns false, and changes nothing, when the recording is neither
+    /// queued nor being processed. Two reasons that matters:
+    ///  * Unlike `cancel`, this never flags an id ahead of time. A flag with
+    ///    no run to consume it outlives the click and silently swallows the
+    ///    user's NEXT Transcribe (`process` skips a flagged id) — fatal for an
+    ///    action whose whole point is "transcribe it later".
+    ///  * A row that is `.pending` but not yet enqueued is still being
+    ///    finalized (`QuickActionsController.stopRecording` enqueues it at the
+    ///    end), and that finalize would overwrite a deferral written now. The
+    ///    UI only offers Stop while `isQueuedOrActive` is true.
+    @discardableResult
+    func deferTranscription(of recordingID: UUID) -> Bool {
+        if queue.contains(where: { $0.id == recordingID }) {
+            // Never started: dropping it from the queue is the whole stop.
+            queue.removeAll { $0.id == recordingID }
+            retranscriptionIDs.remove(recordingID)
+            publishPending()
+        } else if processingID == recordingID {
+            // Mid-pass. whisper polls the flag through its abort callback and
+            // the diarization step polls it through `withPolledCancellation`;
+            // `process` then unwinds without writing a status, and `run()`
+            // clears the flag once it has.
+            cancellation.insert(recordingID)
+            stoppingRecordingID = recordingID
+        } else {
+            return false
+        }
+        serviceLog.log("deferred \(recordingID.uuidString.prefix(8), privacy: .public) — stopped by the user to transcribe later")
+        store.markTranscriptionDeferred(recordingID)
+        return true
+    }
+
+    /// Whether the recording is in the queue or being transcribed right now,
+    /// and not already stopping — i.e. whether Stop Transcribing has anything
+    /// left to do. The UI keys that control on this rather than on the row's
+    /// status: a `.pending` row that is still being finalized has no run yet.
+    ///
+    /// `processingID` counts as active: between the worker popping a job and
+    /// `activeRecordingID` being published there is a suspension
+    /// (`remoteEngine.configure`), and `deferTranscription` finds the run
+    /// there — so the control has to be offered there too, or it blinks out
+    /// for the length of a network round trip. A row that is queued AGAIN
+    /// while its previous run is still stopping (Transcribe clicked during
+    /// "Stopping…", see `enqueue`) is simply queued: the new run is what the
+    /// control would stop.
+    func isQueuedOrActive(_ recordingID: UUID) -> Bool {
+        if pendingIDs.contains(recordingID) { return true }
+        return (activeRecordingID == recordingID || processingID == recordingID)
+            && stoppingRecordingID != recordingID
     }
 
     // MARK: - Worker
 
     private func startWorkerIfNeeded() {
-        guard worker == nil else { return }
+        guard !cancellation.isStopped, worker == nil else { return }
         worker = Task { [weak self] in
             await self?.run()
         }
     }
 
     private func run() async {
-        while let next = popNext() {
+        while !cancellation.isStopped, !Task.isCancelled, let next = popNext() {
+            processingID = next.id
             await process(next)
+            processingID = nil
+            if stoppingRecordingID == next.id { stoppingRecordingID = nil }
+            // A stop that landed during this run belongs to this run, and the
+            // run is over. Most exits already consumed it; this catches the
+            // rest, so a flag can never outlive its run and swallow the
+            // recording's next Transcribe.
+            cancellation.remove(next.id)
         }
         worker = nil
     }
@@ -641,6 +1081,7 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func process(_ recording: Recording) async {
+        guard !cancellation.isStopped else { return }
         // The user may have hit Cancel between enqueue and now. Don't spin up
         // the model just to throw the result away.
         if cancellation.contains(recording.id) {
@@ -704,6 +1145,7 @@ final class TranscriptionService: ObservableObject {
                 return
             }
             await remoteEngine.configure(config)
+            guard !cancellation.isStopped else { return }
             localModel = nil
             // Label from the captured config, not remoteSettings — a Settings
             // edit mid-run must not change what's persisted to this
@@ -750,11 +1192,26 @@ final class TranscriptionService: ObservableObject {
         // user can rename/file/delete the row through. See `mergePassResult`.
         // (`working` is deliberately NOT re-seeded from the result: the pass must
         // keep transcribing the `language` it just resolved a model for.)
+        // A stop that landed during `remoteEngine.configure` must win: once
+        // the row reads `.running`, nothing would ever move it again (the
+        // cancelled pass writes no status by design). Checked right before
+        // the write, with no suspension in between, so it can't be missed.
+        if cancellation.contains(recording.id) {
+            serviceLog.log("""
+                skipped \(recording.id.uuidString.prefix(8), privacy: .public) \
+                (\(working.title, privacy: .private)): cancelled while preparing
+                """)
+            cancellation.remove(recording.id)
+            return
+        }
         working.status = .running
         working.modelName = modelDisplayName
         mergePassResult(id: recording.id) {
             $0.status = working.status
             $0.modelName = working.modelName
+            // A pass is starting, so an earlier "stopped, transcribe later"
+            // no longer describes this row.
+            $0.transcriptionDeferredAt = nil
         }
 
         let recordingID = recording.id
@@ -779,6 +1236,7 @@ final class TranscriptionService: ObservableObject {
         // Bugbot #3: make sure the preparation observer is installed
         // before `loadIfNeeded` — see `init` for the race.
         await observerSetupTask.value
+        guard !cancellation.isStopped else { return }
 
         do {
             // Local backend needs the whisper weights loaded (and the CoreML
@@ -788,6 +1246,13 @@ final class TranscriptionService: ObservableObject {
                 try await engine.loadIfNeeded(modelURL: modelManager.url(for: localModel),
                                               displayName: localModel.displayName)
             }
+            guard !cancellation.isStopped else { return }
+            // The model load can take a while (the first CoreML compile is
+            // ~13 s) and is not itself interruptible. A stop that arrived
+            // during it must not go on to start whisper and pyannote — nor
+            // reach the too-short branch below, which writes `.failed` and can
+            // auto-drop the recording outright.
+            if cancellation.contains(recordingID) { throw CancellationError() }
             // Resolve the audio URL from the freshly re-fetched `working`
             // record, NOT the stale `recording` snapshot captured at enqueue
             // time. A re-transcribe (right-click "Re-transcribe in …") enqueues
@@ -832,6 +1297,16 @@ final class TranscriptionService: ObservableObject {
                     (\(working.title, privacy: .private)) — too short or too quiet \
                     to be real speech
                     """)
+                // The exception to "silently": a re-run of a recording that
+                // already has a transcript must not swap it for nothing. It is
+                // undone as a failed re-run is undone, and reported the same
+                // way — through `lastError`, as the catch below reports a
+                // re-run that threw — since the user asked for it and would
+                // otherwise see an unchanged transcript with no explanation.
+                if settleUnusableRerun(
+                    id: recordingID,
+                    reason: "Re-transcription skipped: the audio is too short or too quiet to transcribe. The earlier transcript was kept."
+                ) { return }
                 working.status = .failed
                 working.fullText = ""
                 working.segments = []
@@ -863,16 +1338,29 @@ final class TranscriptionService: ObservableObject {
                 guard shouldDiarize else { return [] }
                 serviceLog.log("running speaker diarization…")
                 do {
-                    let turns = try await SpeakerDiarizer.diarize(
-                        wavURL: audioURL,
-                        pythonPath: diarPythonPath
-                    )
+                    // whisper sees a stop through its abort callback; the
+                    // pyannote subprocess only dies on Swift task cancellation
+                    // (`SpeakerDiarizer.runPython`). Bridge the two, or a
+                    // stopped pass keeps pyannote — the heavier half — running
+                    // to the end of the file, with the serial queue stalled
+                    // behind it.
+                    let turns = try await Self.withPolledCancellation(
+                        isCancelled: { [cancellation] in cancellation.contains(recordingID) }
+                    ) {
+                        try await SpeakerDiarizer.diarize(
+                            wavURL: audioURL,
+                            pythonPath: diarPythonPath
+                        )
+                    }
                     let speakerCount = Set(turns.map(\.speaker)).count
                     serviceLog.log("""
                         diarization found \(speakerCount, privacy: .public) speakers \
                         across \(turns.count, privacy: .public) turns
                         """)
                     return turns
+                } catch is CancellationError {
+                    serviceLog.log("speaker diarization stopped")
+                    return []
                 } catch {
                     // `SpeakerDiarizer.Error.diarizationFailed` wraps the
                     // Python subprocess's stderr verbatim, and that stderr
@@ -1000,6 +1488,16 @@ final class TranscriptionService: ObservableObject {
                 \(text.count, privacy: .public) chars
                 """)
 
+            // A re-run that came back with no text keeps the transcript it
+            // was meant to replace — an empty result is not a better one.
+            // Checked before anything is written or announced: the restored
+            // row may read `.completed`, and the completion work below (SRT,
+            // summary regeneration, compression) belongs to a new transcript.
+            if text.isEmpty, settleUnusableRerun(
+                id: recordingID,
+                reason: "Re-transcription produced no text. The earlier transcript was kept."
+            ) { return }
+
             working.segments = enrichedSegments
             // The batch pass minted fresh speaker IDs (new clustering, new
             // segment boundaries) with no alignment to the old ones, so any
@@ -1040,6 +1538,9 @@ final class TranscriptionService: ObservableObject {
                 $0.fullText = working.fullText
                 $0.duration = working.duration
                 $0.modelName = working.modelName
+                // A full pass transcribed the whole audio, so no part of it
+                // is missing any more (#355).
+                $0.untranscribedSpans = nil
                 // Only a pass that actually produced segments owns this. Such a
                 // pass re-keyed every SPEAKER_NN, so names bound to the old IDs
                 // would now label a different voice — hence the reset above. A
@@ -1049,6 +1550,11 @@ final class TranscriptionService: ObservableObject {
                 if !enrichedSegments.isEmpty {
                     clearedSpeakerNames = $0.speakerNames
                     $0.speakerNames = working.speakerNames
+                    // Pending name suggestions are keyed by the same old IDs
+                    // and would now point at a different voice. Unlike the
+                    // names they fold nothing into a profile, so they are
+                    // simply dropped; the post-pass suggester asks again.
+                    $0.speakerNameSuggestions = []
                 }
             }) else {
                 serviceLog.log("""
@@ -1074,7 +1580,9 @@ final class TranscriptionService: ObservableObject {
                     TranscriptExporter.writeSRT(for: persisted, in: store.recordingsDirectory)
                     announceCompletion(persisted,
                                        clearedSpeakerNames: clearedSpeakerNames,
-                                       wasRetranscription: hadSummaryBeforeRun)
+                                       wasRetranscription: Self.isRetranscription(
+                                           hadSummaryBeforeRun: hadSummaryBeforeRun,
+                                           persisted: persisted))
                 }
                 // Shrink storage: transcode the WAV to m4a now that
                 // transcription + diarization are done reading it. Runs in
@@ -1098,6 +1606,24 @@ final class TranscriptionService: ObservableObject {
                 """)
             cancellation.remove(recording.id)
         } catch {
+            guard !cancellation.isStopped else { return }
+            // A run the user stopped can still fail for an unrelated reason
+            // before it notices the stop — the model load, the remote upload's
+            // response. It was stopped all the same: its status was settled
+            // when the user stopped it (`markTranscriptionDeferred`), so
+            // writing `.failed` here would undo that (demoting a re-run's
+            // intact transcript), and an error banner would report a failure
+            // of something the user chose to stop.
+            if cancellation.contains(recordingID) {
+                let ns = error as NSError
+                serviceLog.log("""
+                    cancelled mid-run \(recordingID.uuidString.prefix(8), privacy: .public) \
+                    (\(working.title, privacy: .private)); it then failed \
+                    [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)] — not reported
+                    """)
+                cancellation.remove(recordingID)
+                return
+            }
             // The pass reads the recording's own audio and writes its
             // transcript, both under the (possibly user-chosen) recordings
             // directory with title-derived names — so a Cocoa error here
@@ -1116,7 +1642,11 @@ final class TranscriptionService: ObservableObject {
             // `speakerNames`/`segments`, which it never re-keyed. Merging onto
             // the live row also means a rename/re-file/soft-delete the user
             // made while the pass was failing survives (see `mergePassResult`).
-            mergePassResult(id: recording.id) { $0.status = .failed }
+            // A failed re-run is undone as a stop undoes it — the earlier
+            // transcript is still there, with its own status, language and
+            // model — and reported through `lastError` below
+            // (`Recording.settleFailedPass`).
+            mergePassResult(id: recording.id) { $0.settleFailedPass() }
             lastError = "Transcription failed: \(error.localizedDescription)"
         }
     }
@@ -1127,6 +1657,43 @@ final class TranscriptionService: ObservableObject {
     /// for `verbose_json`/`json`, which have no speaker field at all.
     static func hasSpeakerLabels(_ segments: [TranscriptSegment]) -> Bool {
         segments.contains { $0.speaker?.isEmpty == false }
+    }
+
+    /// Run `operation`, cancelling it — as Swift task cancellation — once
+    /// `isCancelled` reports true. The bridge between this service's polled
+    /// stop flag and work that only listens for task cancellation, chiefly the
+    /// pyannote subprocess (`SpeakerDiarizer.runPython` terminates it from its
+    /// cancellation handler). Same shape as `RemoteWhisperEngine`'s upload
+    /// watchdog, but structured: cancelling the CALLER (e.g. the `async let`
+    /// being torn down) reaches `operation` too.
+    ///
+    /// Throws `CancellationError` when the flag stopped it; otherwise returns
+    /// or throws whatever `operation` did. A stop is noticed within one
+    /// `interval`.
+    nonisolated static func withPolledCancellation<T: Sendable>(
+        every interval: Duration = .milliseconds(200),
+        isCancelled: @escaping @Sendable () -> Bool,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T?.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                // Throws out of the sleep once `operation` has finished and
+                // the group cancels this child — that error is discarded.
+                while !isCancelled() {
+                    try await Task.sleep(for: interval)
+                }
+                throw CancellationError()
+            }
+            defer { group.cancelAll() }
+            // Whichever child finishes first decides: `operation`'s value, or
+            // the watchdog's CancellationError (which cancels `operation` and
+            // waits for it to wind down before rethrowing).
+            guard let first = try await group.next(), let value = first else {
+                throw CancellationError()
+            }
+            return value
+        }
     }
 
     /// Re-key speaker labels in transcript order so the SET of labels
@@ -1145,8 +1712,49 @@ final class TranscriptionService: ObservableObject {
         SpeakerLabels.normalized(in: segments)
     }
 
+    /// Settle a re-transcription that produced no usable text — its audio
+    /// was rejected as too short or too quiet, or whisper returned nothing —
+    /// by undoing it exactly as a failed re-run is undone
+    /// (`Recording.settleFailedPass`): the earlier transcript, segments and
+    /// speaker names stay, and the status, language and model that describe
+    /// them come back. `reason` is reported through `lastError`.
+    ///
+    /// Returns false, changing nothing, unless the LIVE row is a re-run in
+    /// flight whose earlier transcript is still there
+    /// (`isRetranscriptionInFlight` + `hasTranscript`, the same test the
+    /// restore applies — asked of the restore itself, on a copy, so the
+    /// predicate lives in one place). A first transcription, or a re-run of a
+    /// row with no transcript to keep, then goes on to the caller's ordinary
+    /// empty-result handling. The check and the write share one main-actor
+    /// turn. A row the user sent to Recently Deleted mid-pass is settled the
+    /// same way but raises no alert, as a finished pass skips its user-facing
+    /// completion work for one.
+    private func settleUnusableRerun(id: UUID, reason: String) -> Bool {
+        guard var probe = store.recordings.first(where: { $0.id == id }),
+              probe.restoreRetranscriptionPriorState() else { return false }
+        serviceLog.log("""
+            \(id.uuidString.prefix(8), privacy: .public) re-run produced no usable \
+            text — keeping the earlier transcript
+            """)
+        mergePassResult(id: id) { $0.settleFailedPass() }
+        if !probe.isTrashed { lastError = reason }
+        return true
+    }
+
     private func markFailed(_ recording: Recording) {
-        mergePassResult(id: recording.id) { $0.status = .failed }
+        mergePassResult(id: recording.id) { $0.settleFailedPass() }
+    }
+
+    /// Whether the completion hook must force-regenerate the summary. True
+    /// when the row had a summary when the pass started — and ALSO when it
+    /// has one now, at completion: a summary stored while the pass ran (the
+    /// row's first summary, still in flight when this re-transcription was
+    /// queued) was built from the transcript this pass just replaced.
+    /// `summarizeIfNeeded` would skip such a row as "already summarized" and
+    /// leave the old transcript's summary showing as current (#318).
+    static func isRetranscription(hadSummaryBeforeRun: Bool, persisted: Recording) -> Bool {
+        hadSummaryBeforeRun
+            || !(persisted.summary ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     /// Tell the app a pass finished: the names it cleared first, the
@@ -1197,7 +1805,10 @@ final class TranscriptionService: ObservableObject {
     ///   would then label the wrong voice. A failed/rejected pass must leave it
     ///   alone.
     /// * **User-owned** — never written here; the live row always wins:
-    ///   `title`, `folder`, `deletedAt`, `summary`, `actionItems`.
+    ///   `title`, `folder`, `deletedAt`, `summary`, `actionItems`,
+    ///   `summaryLanguage` (the summary-language override is about what the
+    ///   user wants the summary written in, not what the transcript is in, so
+    ///   a re-transcription in the other language keeps it).
     /// * **Store-owned** — identity and provenance, also never written here:
     ///   `id`, `createdAt`, `source`, `audioFileName`, `appName`,
     ///   `voiceMemoUniqueID`, `voiceMemoFolderUUID`. (`audioFileName` in
@@ -1224,6 +1835,15 @@ final class TranscriptionService: ObservableObject {
     private func mergePassResult(id: UUID, _ apply: (inout Recording) -> Void) -> Recording? {
         guard var live = store.recordings.first(where: { $0.id == id }) else { return nil }
         apply(&live)
+        // A pass that settled the row ended the re-run, so what the row looked
+        // like before it (`Recording.retranscriptionPriorState`) is no longer
+        // anything a stop could restore — a stop needs a `.pending`/`.running`
+        // row. Cleared here, where every pass result goes through, rather than
+        // at each of the four terminal writes. The `.running` write at the
+        // start of a pass leaves it alone: the user may still stop that run.
+        if live.status == .completed || live.status == .failed {
+            live.retranscriptionPriorState = nil
+        }
         store.update(live)
         return live
     }
@@ -1305,6 +1925,17 @@ final class ProgressCoalescer: @unchecked Sendable {
 final class CancellationFlag: @unchecked Sendable {
     private let lock = NSLock()
     private var ids: Set<UUID> = []
+    private var stopped = false
+
+    var isStopped: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopped
+    }
+
+    func stopAll() {
+        lock.lock(); defer { lock.unlock() }
+        stopped = true
+    }
 
     func insert(_ id: UUID) {
         lock.lock(); defer { lock.unlock() }
@@ -1318,6 +1949,6 @@ final class CancellationFlag: @unchecked Sendable {
 
     func contains(_ id: UUID) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return ids.contains(id)
+        return stopped || ids.contains(id)
     }
 }

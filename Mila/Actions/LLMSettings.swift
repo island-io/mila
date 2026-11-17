@@ -318,6 +318,55 @@ final class LLMSettings: ObservableObject {
         didSet { defaults.set(summaryEnabled, forKey: Keys.summaryEnabled) }
     }
 
+    /// Whether Mila asks the LLM, after a recording finishes, which unnamed
+    /// speakers state their own name in the transcript ("Hi, I'm Dana") and
+    /// offers those as one-click suggestions (`SpeakerNameSuggester`,
+    /// issue #348). Only ever SUGGESTS — nothing is renamed, and nothing
+    /// reaches a voice profile, until the user accepts.
+    ///
+    /// **Default: whatever `summaryEnabled` is.** The call sends the same
+    /// transcript to the same provider the automatic summary already does, so
+    /// a user who lets Mila send transcripts automatically gets it, and a user
+    /// who switched automatic sending off (auto-summary off) does not start
+    /// sending them because of an upgrade. Nothing is sent at all unless the
+    /// provider is configured (`isSpeakerNameSuggestionReady`). Until the user
+    /// touches this switch it reads the CURRENT auto-summary value — live, in
+    /// this session and after a relaunch alike; the first explicit flip is
+    /// persisted and wins from then on.
+    var speakerNameSuggestionsEnabled: Bool {
+        get { speakerNameSuggestionsChoice ?? summaryEnabled }
+        set {
+            speakerNameSuggestionsChoice = newValue
+            defaults.set(newValue, forKey: Keys.speakerNameSuggestionsEnabled)
+        }
+    }
+
+    /// The user's explicit choice for `speakerNameSuggestionsEnabled`, or nil
+    /// while they have never touched the switch — in which case the effective
+    /// value is the CURRENT `summaryEnabled`, live, not a copy taken at
+    /// launch. `@Published` so a flip re-renders the switch; `summaryEnabled`
+    /// already publishes for the follow-along case.
+    @Published private var speakerNameSuggestionsChoice: Bool?
+
+    /// "Enabled AND ready" for speaker-name suggestions, per
+    /// `.claude/rules/feature-gates.md`: the switch is on and the provider
+    /// can actually be called. The one gate `SpeakerNameSuggester` consults.
+    var isSpeakerNameSuggestionReady: Bool {
+        speakerNameSuggestionsEnabled && isConfigured
+    }
+
+    /// The model name a background call should pass for `tool`: the
+    /// OpenAI-compatible endpoint's own model name, or Live AI's model
+    /// override for a CLI. One definition for every caller that makes this
+    /// choice (`LiveAISession.kick`, `RecordingSummarizer`,
+    /// `SpeakerNameSuggester`) — sending a CLI model name such as
+    /// "claude-sonnet-4-6" to an OpenAI endpoint 404s (celarent7/mila#4).
+    nonisolated static func backgroundModelName(tool: LLMTool,
+                                                openAIModelName: String,
+                                                liveAIModel: String) -> String {
+        tool == .openaiCompatible ? openAIModelName : liveAIModel
+    }
+
     /// Free-text extra CLI arguments appended to EVERY post-recording
     /// invocation (title suggestion, auto-summary, Send-action) as well as the
     /// test panel run — lets the user pin a model or pass debug/permission
@@ -574,6 +623,10 @@ final class LLMSettings: ObservableObject {
         // have never seen this key, silently disabling summaries for
         // everyone on upgrade. Treat "key absent" as true.
         self.summaryEnabled = (defaults.object(forKey: Keys.summaryEnabled) as? Bool) ?? true
+        // Absent → nil → the switch follows auto-summary, live (see
+        // `speakerNameSuggestionsEnabled`).
+        self.speakerNameSuggestionsChoice =
+            defaults.object(forKey: Keys.speakerNameSuggestionsEnabled) as? Bool
         self.cliTimeout = (defaults.object(forKey: Keys.cliTimeout) as? Double) ?? Self.defaultTimeout
         self.extraArgs = defaults.string(forKey: Keys.extraArgs) ?? ""
 
@@ -637,6 +690,7 @@ final class LLMSettings: ObservableObject {
         static let actionPrompt = "llm.action.prompt"
         static let actionTranscriptByPath = "llm.action.transcriptByPath"
         static let summaryEnabled = "llm.summary.enabled"
+        static let speakerNameSuggestionsEnabled = "llm.speakerNames.enabled"
         static let cliTimeout = "llm.cli.timeout"
         static let extraArgs = "llm.extraArgs"
         static let openAIProvider = "llm.openai.provider"

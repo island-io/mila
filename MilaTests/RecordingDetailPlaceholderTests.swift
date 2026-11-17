@@ -37,4 +37,23 @@ final class RecordingDetailPlaceholderTests: XCTestCase {
             "An id can transiently be both active and pending; the progress view must win."
         )
     }
+
+    /// A recording whose transcription the user stopped is stored `.failed`;
+    /// the placeholder has to say "stopped", not leave them guessing.
+    func test_stopped_recording_says_stopped() {
+        XCTAssertEqual(
+            RecordingDetailView.emptyTranscriptPlaceholder(isActive: false, isQueued: false, isDeferred: true),
+            .stopped
+        )
+    }
+
+    /// Transcribe was clicked again: the marker is cleared as the row is
+    /// queued, but the queue state must win even if the view sees both for a
+    /// frame.
+    func test_queued_wins_over_stopped() {
+        XCTAssertEqual(
+            RecordingDetailView.emptyTranscriptPlaceholder(isActive: false, isQueued: true, isDeferred: true),
+            .waitingInQueue
+        )
+    }
 }

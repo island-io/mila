@@ -40,11 +40,31 @@ struct LiveAIRecordingView: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
+            // Non-blocking, self-clearing: the remote server is unreachable
+            // but the recording carries on, and the live transcript catches
+            // up once the connection is back (#355). This used to be the
+            // modal "Transcription error" alert. Off the Home screen the
+            // floating recording chip carries the same state
+            // (`ConnectionDropIndicator`). Not during the hand-over below:
+            // until then the transcriber is still the previous meeting's.
+            if transcriber.isConnectionInterrupted, !actions.isAwaitingLivePipeline {
+                ConnectionInterruptedBanner()
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
             // Action items pane is rendered only when Live AI is on +
             // a CLI is configured. When AI is off the live transcript
             // takes the whole detail pane so the user still sees what
             // Mila is hearing in real time.
-            if aiActive {
+            //
+            // Neither pane is shown while this recording waits for the
+            // previous one's Stop to hand over the live pipeline (#356): until
+            // then the transcriber and Live AI session still hold the LAST
+            // meeting, which is being saved — showing it here would present
+            // it as this one, and renaming a speaker, deleting a line or
+            // editing the notes would change the recording being saved.
+            if actions.isAwaitingLivePipeline {
+                livePipelineHandoffPlaceholder
+            } else if aiActive {
                 VSplitView {
                     actionItemsPane
                         .frame(minHeight: 140)
@@ -195,6 +215,31 @@ struct LiveAIRecordingView: View {
                     .font(.callout)
             }
         }
+    }
+
+    // MARK: - Live pipeline hand-over
+
+    /// Stands in for both panes for the second or two between this
+    /// recording's capture coming up and the previous recording's Stop
+    /// releasing the live pipeline (`QuickActionsController.
+    /// isAwaitingLivePipeline`). The audio of that window is not lost: it is
+    /// held and transcribed the moment the hand-over happens.
+    private var livePipelineHandoffPlaceholder: some View {
+        VStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Finishing the previous recording…")
+                .font(.callout.weight(.semibold))
+            Text("This recording is already capturing. Its live transcript appears in a moment, from the start.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 380)
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("liveTranscript.awaitingPipeline")
     }
 
     // MARK: - Action items pane
@@ -639,6 +684,30 @@ struct LiveAIRecordingView: View {
     }
 }
 
+/// Inline warning shown while the remote transcription server is unreachable
+/// mid-recording (`LiveTranscriber.isConnectionInterrupted`, #355). Purely
+/// informational — nothing to dismiss: it goes away by itself once the server
+/// answers again, or when the recording stops.
+private struct ConnectionInterruptedBanner: View {
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "wifi.exclamationmark")
+                .foregroundStyle(.orange)
+            Text("Can't reach the transcription server. Recording continues — the live transcript will catch up when the connection is back.")
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("liveTranscript.connectionInterrupted")
+    }
+}
+
 /// Single line with a leading bullet. RTL-aware so Hebrew text flows
 /// right-to-left with the bullet on the right.
 private struct BulletLine: View {
@@ -797,7 +866,9 @@ struct RecordingPauseButton: View {
             }
         }
         .buttonStyle(.plain)
-        .disabled(actions.isFinalizingRecording)
+        // This recording's own stop, not `isFinalizingRecording` — since #356
+        // that can be the PREVIOUS recording's drain while this one records.
+        .disabled(actions.isStoppingRecording)
         .help(paused ? "Resume recording" : "Pause recording (audio during the pause isn't recorded)")
         .accessibilityLabel(paused ? "Resume recording" : "Pause recording")
         .accessibilityIdentifier(paused ? "recording.resume" : "recording.pause")

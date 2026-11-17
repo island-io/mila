@@ -97,28 +97,43 @@ struct HomeView: View {
     private var heroAction: some View {
         HeroRecordButton(
             isRecording: isRecording,
-            isFinalizing: actions.isFinalizingRecording,
+            startingSource: actions.startingSource,
+            isFinalizing: actions.isStoppingRecording,
             isPreparingModel: transcription.isPreparingModel,
             preparationStatus: transcription.preparationStatus,
             languageFlag: languageSettings.current.flagEmoji,
             languageName: languageSettings.current.displayName,
             microphoneEnabled: recordMicrophone,
             withSystemAudio: withSystemAudio,
+            // "Pressing Record will also run the LLM loop" — which it won't
+            // when the next recording skips the live pipeline.
             liveAIEnabled: liveAISettings.enabled && llmSettings.isConfigured
+                && liveAISettings.runsLivePipeline
         ) {
             Task { await actions.toggleRecord(microphone: recordMicrophone, appAudio: withSystemAudio) }
         }
         .frame(maxWidth: 460)
         // Belt-and-suspenders with the controller-side guard: greying
         // out the button gives the user immediate visual feedback that
-        // a tap during the drain won't do anything, instead of just
-        // silently swallowing it.
+        // a tap while the previous recording's WAV is being closed won't
+        // do anything, instead of just silently swallowing it. Only that
+        // brief stop blocks a new recording — the previous recording's
+        // live-transcript drain, summary, speaker pass and transcode all
+        // carry on in the background while the next one records (#356).
         //
         // Same idea for the first-time CoreML compile: a record press
         // during the compile window would start a recording the encoder
         // can't yet transcribe (segments=0). Block the button until the
         // engine reports ready.
-        .disabled(actions.isFinalizingRecording || transcription.isPreparingModel || !canRecord)
+        //
+        // And for the bring-up itself: on a Bluetooth mic `session.start`
+        // can take ~6 s (#291), during which this button used to look
+        // exactly as it did before the click. `isStartingRecording` is the
+        // controller's "click accepted, capture not up yet" — the button
+        // shows a spinner + "Starting…" and refuses the second click that
+        // used to run a second bring-up (#293).
+        .disabled(actions.isStoppingRecording || actions.isStartingRecording
+                  || transcription.isPreparingModel || !canRecord)
     }
 
     /// The two independent source toggles below the Record button:
@@ -161,7 +176,11 @@ struct HomeView: View {
         }
         .toggleStyle(.switch)
         .controlSize(.small)
-        .disabled(isRecording)
+        // Frozen from the accepted click onwards, not just from `.recording`:
+        // the source was chosen at the click, and flipping a toggle
+        // mid-bring-up would show a caption for a source other than the one
+        // actually coming up.
+        .disabled(isRecording || actions.isStartingRecording)
         .frame(maxWidth: 280, alignment: .leading)
     }
 
@@ -252,10 +271,25 @@ struct HomeView: View {
 /// circle — once you're recording you want it loud and unmissable.
 private struct HeroRecordButton: View {
     let isRecording: Bool
-    /// True while `stopRecording`'s inline drain is running. The button
-    /// is `.disabled` in this state (set by the caller) but we also want
-    /// the visible title/caption to say "Finalizing…" so the user
-    /// understands why pressing it again doesn't do anything.
+    /// Non-nil from the accepted Record click until capture is actually up
+    /// (`QuickActionsController.startingSource`). The caller disables the
+    /// button in this state; here it gets a spinner in the icon circle and
+    /// a "Starting…" title so a slow microphone bring-up (#291) reads as
+    /// "working on it" rather than "the click did nothing" (#293). The
+    /// value is the source the controller is bringing up, which is what the
+    /// caption describes — NOT `microphoneEnabled`: ⌘N and the meeting
+    /// prompt start a microphone capture with that toggle off (#321).
+    /// Mutually exclusive with `isRecording` and `isFinalizing` — the
+    /// controller publishes exactly one job state at a time.
+    let startingSource: RecordingSource?
+    private var isStarting: Bool { startingSource != nil }
+    /// True while `stopRecording` is closing the previous recording's WAV
+    /// and saving its row (`QuickActionsController.isStoppingRecording`) —
+    /// a fraction of a second, not the live-pipeline drain or anything
+    /// after it (#356). The button is `.disabled` in this state (set by the
+    /// caller) but we also want the visible title/caption to say
+    /// "Finalizing…" so the user understands why pressing it again doesn't
+    /// do anything.
     let isFinalizing: Bool
     /// True while the whisper engine is doing a noticeable first-time
     /// load — currently only the first CoreML compile of a sibling
@@ -298,6 +332,15 @@ private struct HeroRecordButton: View {
                             .progressViewStyle(.circular)
                             .controlSize(.small)
                             .accessibilityIdentifier("home.record.preparing.spinner")
+                    } else if isStarting {
+                        // Capture bring-up in flight (mic engine / system
+                        // audio stream). Same spinner, same footprint, its
+                        // own identifier so a UI test can tell the two
+                        // waits apart.
+                        ProgressView()
+                            .progressViewStyle(.circular)
+                            .controlSize(.small)
+                            .accessibilityIdentifier("home.record.starting.spinner")
                     } else if isRecording {
                         Circle()
                             .stroke(Color.white.opacity(0.5), lineWidth: 2)
@@ -396,6 +439,7 @@ private struct HeroRecordButton: View {
     private var titleText: String {
         if isPreparingModel { return "Preparing AI…" }
         if isFinalizing { return "Finalizing…" }
+        if isStarting { return "Starting…" }
         if isRecording { return "Recording…" }
         return liveAIEnabled ? "Transcribe and Summarize" : "Transcribe"
     }
@@ -408,7 +452,18 @@ private struct HeroRecordButton: View {
             return preparationStatus ?? "One-time setup (about 15 seconds)…"
         }
         if isFinalizing {
-            return "Saving transcript…"
+            return "Saving recording…"
+        }
+        if let startingSource {
+            // The slow leg is the microphone (Bluetooth format negotiation,
+            // #291); an app-only capture waits on ScreenCaptureKit instead.
+            // Keyed off the source actually being started, not the Home
+            // Microphone toggle: ⌘N and the meeting prompt bring the mic up
+            // with that toggle off (#321).
+            switch startingSource {
+            case .microphone, .meeting: return "Waiting for the microphone…"
+            case .systemAudio, .voiceMemo: return "Setting up audio capture…"
+            }
         }
         if isRecording {
             return "Tap to stop"

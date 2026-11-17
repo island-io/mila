@@ -28,10 +28,14 @@ import Foundation
 ///
 /// That call site is also the only moment when reading the live diarizer is
 /// sound. It sits after `awaitPending()` (so `intervals` are final) and
-/// before `liveDiarizer?.stop()`, inside the window `isFinalizingRecording`
-/// holds the next recording off — so the pool is guaranteed to still be this
-/// recording's. The old deferred `.onChange` had no such guarantee: a user
-/// hitting Record again promptly could `reset()` the pool first.
+/// before the drain disposes of the live diarizer, inside the window
+/// `isFinalizingRecording` marks the live singletons as the drain's. A new
+/// recording CAN start in that window (#356), but it is not handed the
+/// singletons until the drain clears the flag — its `reset()` of the pool is
+/// deferred to `QuickActionsController.releaseLivePipeline()` — so the pool is
+/// guaranteed to still be this recording's. The old deferred `.onChange` had
+/// no such guarantee: a user hitting Record again promptly could `reset()` the
+/// pool first.
 @MainActor
 final class RecognisedSpeakerAssigner {
 

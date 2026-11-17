@@ -368,10 +368,7 @@ final class LLMRunnerTests: XCTestCase {
             sleep 60
             """)
         defer {
-            if let pidText = try? String(contentsOf: pidFile, encoding: .utf8),
-               let pid = Int32(pidText.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                kill(pid, SIGKILL)
-            }
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
             try? FileManager.default.removeItem(at: pidFile)
             try? FileManager.default.removeItem(at: script)
         }
@@ -397,6 +394,235 @@ final class LLMRunnerTests: XCTestCase {
         // the point is "returns in seconds, not after the grandchild's 60s".
         XCTAssertLessThan(elapsed, 40,
                           "run() must not wait for the orphaned grandchild to release the pipes; took \(elapsed)s")
+        // And the grandchild is killed with it: the kill goes to the CLI's
+        // whole process group, not just its pid (#340).
+        if let pid = Self.readPID(pidFile) {
+            let dead = await Self.waitForExit(of: pid)
+            XCTAssertTrue(dead, "a timed-out CLI's helper must be killed with it, not left running")
+        } else {
+            XCTFail("the script never recorded its grandchild")
+        }
+    }
+
+    /// The child runs as the leader of its own process group. That is what
+    /// lets a timeout or a cancel kill the helpers a CLI spawns: the kill
+    /// goes to the group. It is Foundation's behaviour, not documented API,
+    /// so it is pinned here; if it ever changes, `processGroup(ledBy:)`
+    /// returns nil and the kill quietly falls back to the bare pid.
+    func test_cli_runs_as_the_leader_of_its_own_process_group() async throws {
+        let script = makeScript("""
+            #!/bin/sh
+            echo "$$ $(ps -o pgid= -p $$)"
+            """)
+        defer { try? FileManager.default.removeItem(at: script) }
+
+        let out = try await LLMRunner.run(tool: .claude,
+                                          prompt: "x",
+                                          transcript: "y",
+                                          executablePathOverride: script.path,
+                                          timeout: 30)
+        let parts = out.split(whereSeparator: \.isWhitespace).compactMap { Int32($0) }
+        XCTAssertEqual(parts.count, 2, "unexpected output: \(out)")
+        guard parts.count == 2 else { return }
+        XCTAssertEqual(parts[0], parts[1], "the CLI must lead its own process group")
+        XCTAssertNotEqual(parts[1], getpgrp(), "the CLI must not share Mila's process group")
+        XCTAssertNil(LLMRunner.processGroup(ledBy: getpid()),
+                     "processGroup(ledBy:) must never name Mila's own group")
+    }
+
+    /// Cancelling a run kills the helpers the CLI spawned, not just the CLI.
+    /// The cancel used to SIGTERM only the CLI's pid, so a helper (an MCP
+    /// server, a node child) ran on after the recording it worked for was
+    /// deleted. The helper here is a background `sleep` with its output sent
+    /// away from the pipes, so only the group kill can end it.
+    func test_cancel_kills_the_helpers_the_cli_spawned() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-helper-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 60 >/dev/null 2>&1 &
+            echo $! > "\(pidFile.path)"
+            sleep 60
+            """)
+        defer {
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude,
+                                    prompt: "x",
+                                    transcript: "y",
+                                    executablePathOverride: script.path,
+                                    timeout: 120)
+        }
+        let pid = try await Self.awaitPID(pidFile)
+
+        task.cancel()
+        let result = await task.result
+        if case .success(let out) = result {
+            XCTFail("Expected .cancelled, got output: \(out)")
+        }
+        let dead = await Self.waitForExit(of: pid)
+        XCTAssertTrue(dead, "a cancelled CLI's helper must be killed with it, not left running")
+    }
+
+    /// A helper that IGNORES SIGTERM is SIGKILLed by the sweep once the CLI
+    /// is gone: the group SIGTERM alone would leave it running.
+    func test_cancel_kills_a_helper_that_ignores_sigterm() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-stubborn-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sh -c "trap '' TERM; while :; do sleep 0.2; done" >/dev/null 2>&1 &
+            echo $! > "\(pidFile.path)"
+            sleep 60
+            """)
+        defer {
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude, prompt: "x", transcript: "y",
+                                    executablePathOverride: script.path, timeout: 120)
+        }
+        let pid = try await Self.awaitPID(pidFile)
+        // Let the helper's trap be installed before the cancel.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        task.cancel()
+        _ = await task.result
+        let dead = await Self.waitForExit(of: pid)
+        XCTAssertTrue(dead, "a helper that ignores SIGTERM must still be killed by the sweep")
+    }
+
+    /// A cancel that arrives after the CLI exited normally, while a helper
+    /// still holds the pipes, kills the helper and returns promptly. The
+    /// CLI is gone, so the cancel's own SIGTERM targets nothing; the run
+    /// used to sit out the whole 30s drain and leave the helper running.
+    func test_cancel_during_the_drain_after_a_normal_exit_kills_the_helper() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-drain-\(UUID().uuidString).pid")
+        let script = makeScript("""
+            #!/bin/sh
+            sleep 60 &
+            echo $! > "\(pidFile.path)"
+            echo done
+            """)
+        defer {
+            if let pid = Self.readPID(pidFile) { kill(pid, SIGKILL) }
+            try? FileManager.default.removeItem(at: pidFile)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude, prompt: "x", transcript: "y",
+                                    executablePathOverride: script.path, timeout: 120)
+        }
+        let pid = try await Self.awaitPID(pidFile)
+        // The script exits right after writing the pid; the helper (holding
+        // stdout) keeps the run in its drain.
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        let cancelledAt = Date()
+        task.cancel()
+        let result = await task.result
+        let elapsed = Date().timeIntervalSince(cancelledAt)
+        if case .success(let out) = result {
+            XCTFail("Expected .cancelled, got output: \(out)")
+        }
+        XCTAssertLessThan(elapsed, 20, "a cancel during the drain must not sit out the 30s bound; took \(elapsed)s")
+        let dead = await Self.waitForExit(of: pid)
+        XCTAssertTrue(dead, "the helper holding the pipes must be killed by the cancel")
+    }
+
+    /// Wait (bounded) for a test script to park its helper's pid in `url`.
+    private static func awaitPID(_ url: URL) async throws -> pid_t {
+        for _ in 0..<400 {
+            if let pid = readPID(url) { return pid }
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        return try XCTUnwrap(readPID(url), "the script never started its helper")
+    }
+
+    /// The pid a test script parked in `url`, once it has been written.
+    private static func readPID(_ url: URL) -> pid_t? {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        return pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    /// Poll until `pid` is gone, bounded. A killed helper is reparented to
+    /// launchd, which reaps it, so `kill(pid, 0)` starts failing shortly
+    /// after the SIGKILL.
+    private static func waitForExit(of pid: pid_t, seconds: TimeInterval = 15) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            if kill(pid, 0) != 0 { return true }
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        return kill(pid, 0) != 0
+    }
+
+    /// Cancelling a run whose CLI ignores SIGTERM must still end it in
+    /// seconds. The cancel path used to send SIGTERM and then wait for the
+    /// exit until the run's own deadline, so a child that ignored the signal
+    /// ran for the whole timeout — for a permanently deleted recording's
+    /// summary, holding one of `RecordingSummarizer`'s two slots (and the
+    /// LLM call) for nothing. Cancel now shares the timeout path's
+    /// SIGTERM -> grace -> SIGKILL escalation, with every wait bounded.
+    ///
+    /// The script traps TERM to nothing and loops on short sleeps, so the
+    /// only thing that can stop it before the 120s deadline is the SIGKILL;
+    /// the short sleeps mean no grandchild holds the pipes long after it.
+    func test_cancel_kills_a_child_that_ignores_sigterm() async throws {
+        let ready = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mila-llm-ready-\(UUID().uuidString)")
+        let script = makeScript("""
+            #!/bin/sh
+            trap '' TERM
+            : > "\(ready.path)"
+            i=0
+            while [ $i -lt 600 ]; do sleep 0.2; i=$((i+1)); done
+            """)
+        defer {
+            try? FileManager.default.removeItem(at: ready)
+            try? FileManager.default.removeItem(at: script)
+        }
+
+        let task = Task {
+            try await LLMRunner.run(tool: .claude,
+                                    prompt: "x",
+                                    transcript: "y",
+                                    executablePathOverride: script.path,
+                                    timeout: 120)
+        }
+        // Cancel only once the trap is installed, or the SIGTERM would end
+        // the shell and the test would pass without exercising the SIGKILL.
+        for _ in 0..<400 where !FileManager.default.fileExists(atPath: ready.path) {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ready.path),
+                      "the script never started")
+
+        let cancelledAt = Date()
+        task.cancel()
+        let result = await task.result
+        let elapsed = Date().timeIntervalSince(cancelledAt)
+
+        switch result {
+        case .success(let out):
+            XCTFail("Expected .cancelled, got output: \(out)")
+        case .failure(let error):
+            guard case LLMRunnerError.cancelled = error else {
+                XCTFail("Wrong error: \(error)")
+                return
+            }
+        }
+        // Generous CI bound (same flake class as the timeout tests): the
+        // point is "seconds after the cancel", not the 120s deadline.
+        XCTAssertLessThan(elapsed, 40,
+                          "a cancelled child that ignores SIGTERM must be killed, not waited out; took \(elapsed)s")
     }
 
     // MARK: - Real-CLI smoke tests

@@ -12,6 +12,21 @@ extension String {
     /// names embedded in a Hebrew sentence ("...אמרתי Cursor...") don't
     /// flip the verdict.
     var isPredominantlyHebrew: Bool {
+        let counts = hebrewAndLatinLetterCounts
+        return counts.hebrew > counts.latin
+    }
+
+    /// Whether `isPredominantlyHebrew` has anything to go on. For a string
+    /// with no letters of either script (empty, digits, punctuation) the
+    /// verdict is "not Hebrew" by default, which callers that want a
+    /// different fallback — e.g. the recording's own language — must be
+    /// able to tell apart from a genuine Latin-script majority.
+    var hasHebrewOrLatinLetters: Bool {
+        let counts = hebrewAndLatinLetterCounts
+        return counts.hebrew > 0 || counts.latin > 0
+    }
+
+    private var hebrewAndLatinLetterCounts: (hebrew: Int, latin: Int) {
         var hebrew = 0
         var latin = 0
         for scalar in self.unicodeScalars {
@@ -25,6 +40,6 @@ extension String {
                 latin += 1
             }
         }
-        return hebrew > latin
+        return (hebrew, latin)
     }
 }

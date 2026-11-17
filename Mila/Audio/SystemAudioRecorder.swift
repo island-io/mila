@@ -46,8 +46,21 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     /// leg" apart from a normal stop.
     @Published private(set) var lastStreamError: String?
 
-    let audioStream: AsyncStream<AVAudioPCMBuffer>
-    private let audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
+    /// The CURRENT session's buffers. Every `start()` installs a brand-new
+    /// stream, so read this after `start()` returns — the same contract as
+    /// `MicrophoneRecorder.audioStream`.
+    ///
+    /// It used to be a single `let` built in `init` and shared by every
+    /// recording for the life of the process. `RecordingSession.stop()`
+    /// cancels the task iterating it, and cancelling an `AsyncStream`'s
+    /// consumer TERMINATES the stream: from then on every `yield` returns
+    /// `.terminated` and every new `for await` ends at once. So only the
+    /// first app-audio or meeting recording after launch captured app audio;
+    /// each later one ran with a perfectly healthy SCStream whose buffers went
+    /// nowhere — an app-audio recording saved 0 samples ("too quiet to be real
+    /// speech"), and a meeting silently lost the other side of the call.
+    private(set) var audioStream: AsyncStream<AVAudioPCMBuffer>
+    private var audioContinuation: AsyncStream<AVAudioPCMBuffer>.Continuation
 
     private var stream: SCStream?
     private let audioOutput = AudioStreamOutput()
@@ -64,6 +77,12 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     private var restartAttempts = 0
     private let maxRestartAttempts = 5
     private(set) var restartCount = 0
+
+    /// Test seam: when set, replaces the ScreenCaptureKit bring-up so tests
+    /// can drive a session's stream lifecycle without a Screen Recording
+    /// grant or a display. Used for mid-session restarts too. Buffers are
+    /// then pushed in with `deliverForTesting(_:)`.
+    var bringUpOverride: (@MainActor () async throws -> Void)?
 
     /// Bumped by every `start()` and `stop()`. A restart loop captures the
     /// value it began with and abandons itself as soon as it no longer
@@ -98,6 +117,46 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         super.init()
         self.audioOutput.parent = self
         self.audioOutput.continuation = continuation
+    }
+
+    /// Finish the previous session's stream and install a fresh one — on the
+    /// sample queue, the only context the SCK callback reads `continuation`
+    /// from. Per SESSION, not per bring-up: a mid-session restart must keep
+    /// feeding the stream `RecordingSession` is already iterating.
+    private func installFreshStream() {
+        audioContinuation.finish()
+        var continuation: AsyncStream<AVAudioPCMBuffer>.Continuation!
+        audioStream = AsyncStream { continuation = $0 }
+        audioContinuation = continuation
+        let fresh: AsyncStream<AVAudioPCMBuffer>.Continuation = continuation
+        sampleQueue.sync { audioOutput.continuation = fresh }
+    }
+
+    /// Test seam: push a buffer through the same convert-and-yield path an
+    /// SCK audio callback takes, on the same serial queue.
+    func deliverForTesting(_ buffer: AVAudioPCMBuffer) {
+        sampleQueue.sync { audioOutput.deliver(buffer) }
+    }
+
+    /// Test seam: push a raw SCK-shaped sample buffer through the same
+    /// copy-validate-deliver path the stream callback takes.
+    func deliverSampleForTesting(_ sample: CMSampleBuffer) {
+        sampleQueue.sync { audioOutput.handleAudioSample(sample) }
+    }
+
+    /// Packets dropped as malformed since the last `stop()` (which reports
+    /// and resets the tally).
+    var rejectedPacketCount: Int {
+        sampleQueue.sync { audioOutput.rejectedPackets }
+    }
+
+    /// Log how many packets this session dropped, and reset the tally. Called
+    /// once the stream has stopped delivering (or was already gone).
+    private func reportRejectedPackets() {
+        let rejected = sampleQueue.sync { audioOutput.takeRejectedPacketCount() }
+        if rejected > 0 {
+            sysLog.error("dropped \(rejected, privacy: .public) malformed system-audio packet(s) this session — the first drop's reason was logged when it happened")
+        }
     }
 
     func refreshShareableContent() async {
@@ -143,15 +202,20 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
             || desc.contains("permission")
     }
 
-    func start() async throws {
+    /// `cancellation` — see `MicrophoneRecorder.start(cancellation:)`: once
+    /// tripped, the bring-up throws `CaptureStartCancellation.Cancelled`
+    /// instead of starting the stream (#328).
+    func start(cancellation: CaptureStartCancellation? = nil) async throws {
         guard !isRunning else { return }
+        try cancellation?.throwIfCancelled()
         captureEpoch += 1
         let epoch = captureEpoch
         wantsCapture = true
         restartAttempts = 0
         restartCount = 0
+        installFreshStream()
         do {
-            try await bringUpStream(epoch: epoch)
+            try await bringUpStream(epoch: epoch, cancellation: cancellation)
         } catch {
             wantsCapture = false
             throw error
@@ -168,7 +232,17 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
     /// stop/start cycle — can land in between, in which case the stream is
     /// released here rather than installed on top of a newer session's.
     @discardableResult
-    private func bringUpStream(epoch: Int) async throws -> Bool {
+    private func bringUpStream(epoch: Int,
+                               cancellation: CaptureStartCancellation? = nil) async throws -> Bool {
+        if let override = bringUpOverride {
+            sampleQueue.sync { audioOutput.resetConverter() }
+            try await override()
+            try cancellation?.throwIfCancelled()
+            guard epoch == captureEpoch else { return false }
+            self.isRunning = true
+            self.lastStreamError = nil
+            return true
+        }
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false,
@@ -216,6 +290,15 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         // sample queue, since that's the only context that touches it;
         // it's idle until startCapture below.
         sampleQueue.sync { audioOutput.resetConverter() }
+        // Last point a start abandoned during the shareable-content wait can
+        // stop without capture opening (#328). The stream was never started;
+        // detach the long-lived `audioOutput` from it and let it go.
+        if cancellation?.isCancelled == true {
+            try? stream.removeStreamOutput(audioOutput, type: .audio)
+            try? stream.removeStreamOutput(audioOutput, type: .screen)
+            sysLog.log("system-audio bring-up cancelled before startCapture — capture never opened")
+            throw CaptureStartCancellation.Cancelled()
+        }
         try await stream.startCapture()
         // Adopt only if this is still the session that asked. Assigning
         // `self.stream` unconditionally would drop a newer session's stream on
@@ -240,11 +323,17 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         // even if a new recording sets `wantsCapture` back to true meanwhile.
         wantsCapture = false
         captureEpoch += 1
+        // End this session's stream so its consumer's `for await` returns on
+        // its own. The next `start()` builds a new one either way.
+        audioContinuation.finish()
         // Deliberately NOT gated on `isRunning`: when SCK killed the stream
         // itself (`didStopWithError` flips isRunning to false), the old
         // `guard isRunning` made this a no-op and the dead SCStream stayed
         // retained for the app's lifetime.
         guard let stream else {
+            // No SCStream: SCK killed it, or this is the `bringUpOverride`
+            // test path, which never builds one.
+            reportRejectedPackets()
             isRunning = false
             level = 0
             return
@@ -257,6 +346,7 @@ final class SystemAudioRecorder: NSObject, ObservableObject {
         } catch {
             sysLog.error("stopCapture failed: \(error.localizedDescription, privacy: .public)")
         }
+        reportRejectedPackets()
         self.stream = nil
         self.isRunning = false
         self.level = 0
@@ -406,20 +496,58 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
         converter = nil
     }
 
+    /// Packets `SystemAudioPCM` refused since the last `takeRejectedPacketCount()`.
+    /// Only touched on the serial sample queue. Per-buffer hot path, so the
+    /// first rejection is logged with its reason and the rest are only
+    /// counted; `SystemAudioRecorder.stop()` reports the total — the same
+    /// first-one-then-a-count shape as the mic tap's conversion failures.
+    private(set) var rejectedPackets = 0
+
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
                 of type: SCStreamOutputType) {
-        guard type == .audio,
-              CMSampleBufferIsValid(sampleBuffer),
-              let buffer = sampleBuffer.toPCMBuffer() else { return }
+        guard type == .audio else { return }
+        handleAudioSample(sampleBuffer)
+    }
+
+    /// Copy one SCK audio packet into owned storage and deliver it, or count
+    /// and (the first time) log why it was dropped. Validity is checked once,
+    /// inside `SystemAudioPCM.copy`. Only called on the serial sample queue.
+    func handleAudioSample(_ sampleBuffer: CMSampleBuffer) {
+        switch SystemAudioPCM.copy(from: sampleBuffer) {
+        case .success(let buffer):
+            deliver(buffer)
+        case .failure(let rejection):
+            rejectedPackets += 1
+            if rejectedPackets == 1 {
+                sysLog.error("dropping system-audio packet: \(rejection.description, privacy: .public) — further drops this session are counted, not logged")
+            }
+        }
+    }
+
+    /// Return the drop count and start a fresh tally, so the next session
+    /// logs its own first rejection. Sample queue only.
+    func takeRejectedPacketCount() -> Int {
+        defer { rejectedPackets = 0 }
+        return rejectedPackets
+    }
+
+    /// Convert to whisper format and yield. Only called on the recorder's
+    /// serial sample queue.
+    func deliver(_ buffer: AVAudioPCMBuffer) {
         do {
             if converter == nil || converter?.inputFormat != buffer.format {
                 converter = StreamingWhisperConverter(inputFormat: buffer.format)
             }
             let converted = try converter?.convert(buffer)
                 ?? AudioConvert.toWhisperFormat(buffer)
-            continuation?.yield(converted)
+            // Metered before the yield only so the producer is done with the
+            // buffer once it is handed off. Not a safety requirement: every
+            // reader on both sides (`AudioMeter.level`, `AudioConvert.samples`)
+            // goes through the read-only `audioBufferList`, so a concurrent
+            // read by the consumer would not race a write here.
             let level = AudioMeter.level(from: converted)
+            continuation?.yield(converted)
             Task { @MainActor [weak parent] in
                 parent?.publishLevel(level)
             }
@@ -429,51 +557,99 @@ private final class AudioStreamOutput: NSObject, SCStreamOutput {
     }
 }
 
-private extension CMSampleBuffer {
-    /// Convert a CMSampleBuffer carrying audio (interleaved or planar) into an AVAudioPCMBuffer.
-    func toPCMBuffer() -> AVAudioPCMBuffer? {
-        guard let formatDesc = CMSampleBufferGetFormatDescription(self),
-              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else {
-            return nil
-        }
+/// Copy ScreenCaptureKit PCM into owned storage before asynchronous delivery.
+/// Core Media handles planar/interleaved lists and checks the source extent;
+/// never trust a source byte count as the capacity of a destination buffer.
+enum SystemAudioPCM {
+    /// Why a packet was dropped. The stream output logs the first one per
+    /// session and the total at stop, so a recording that loses its app-audio
+    /// leg packet by packet says why instead of going quiet.
+    enum Rejection: Error, Equatable, CustomStringConvertible {
+        case invalid
+        case dataNotReady
+        case missingFormatDescription
+        case notLinearPCM(formatID: AudioFormatID)
+        case noFrames
+        case unsupportedSampleRate(Double)
+        case tooManyFrames(Int, limit: Int)
+        case unsupportedFormat
+        case allocationFailed(frames: Int)
+        case copyFailed(OSStatus)
 
-        var asbdMutable = asbd.pointee
-        guard let avFormat = AVAudioFormat(streamDescription: &asbdMutable) else { return nil }
-
-        let frameCount = AVAudioFrameCount(CMSampleBufferGetNumSamples(self))
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: avFormat, frameCapacity: frameCount) else { return nil }
-        buffer.frameLength = frameCount
-
-        var blockBuffer: CMBlockBuffer?
-        var audioBufferList = AudioBufferList(mNumberBuffers: 1,
-                                              mBuffers: AudioBuffer(mNumberChannels: avFormat.channelCount,
-                                                                    mDataByteSize: 0,
-                                                                    mData: nil))
-
-        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
-            self,
-            bufferListSizeNeededOut: nil,
-            bufferListOut: &audioBufferList,
-            bufferListSize: MemoryLayout<AudioBufferList>.size,
-            blockBufferAllocator: nil,
-            blockBufferMemoryAllocator: nil,
-            flags: 0,
-            blockBufferOut: &blockBuffer)
-
-        guard status == noErr else { return nil }
-
-        let dest = buffer.mutableAudioBufferList
-        let srcList = UnsafeMutableAudioBufferListPointer(&audioBufferList)
-        let dstList = UnsafeMutableAudioBufferListPointer(dest)
-        for i in 0..<min(srcList.count, dstList.count) {
-            let src = srcList[i]
-            var dst = dstList[i]
-            dst.mDataByteSize = src.mDataByteSize
-            if let s = src.mData, let d = dst.mData {
-                memcpy(d, s, Int(src.mDataByteSize))
+        var description: String {
+            switch self {
+            case .invalid:
+                return "sample buffer is not valid"
+            case .dataNotReady:
+                return "sample buffer data is not ready"
+            case .missingFormatDescription:
+                return "no audio stream description"
+            case .notLinearPCM(let formatID):
+                return "not linear PCM (format ID \(formatID))"
+            case .noFrames:
+                return "packet has no frames"
+            case .unsupportedSampleRate(let rate):
+                return "unusable sample rate \(rate)"
+            case .tooManyFrames(let frames, let limit):
+                return "packet claims \(frames) frames, over the \(limit)-frame cap"
+            case .unsupportedFormat:
+                return "AVAudioFormat rejected the stream description"
+            case .allocationFailed(let frames):
+                return "could not allocate a \(frames)-frame buffer"
+            case .copyFailed(let status):
+                return "CMSampleBufferCopyPCMDataIntoAudioBufferList failed (OSStatus \(status))"
             }
-            dstList[i] = dst
         }
-        return buffer
+    }
+
+    /// Longest packet accepted, in seconds of audio at the packet's own
+    /// sample rate. SCK delivers ~10–20 ms at a time; the cap exists so a
+    /// corrupt frame count can't size a huge allocation on the sample queue
+    /// before the copy gets a chance to fail.
+    static let maxPacketSeconds: Double = 2
+
+    /// Frame cap for a packet at `sampleRate`, or nil for a rate no real
+    /// stream has (non-finite, non-positive, or above 1 MHz). Every value it
+    /// returns is far below `Int32.max`, which is what makes the narrowing
+    /// conversions in `copy(from:)` safe.
+    static func maxFrames(sampleRate: Double) -> Int? {
+        guard sampleRate.isFinite, sampleRate > 0, sampleRate <= 1_000_000 else { return nil }
+        return max(1, Int(sampleRate * maxPacketSeconds))
+    }
+
+    static func buffer(from sample: CMSampleBuffer) -> AVAudioPCMBuffer? {
+        try? copy(from: sample).get()
+    }
+
+    static func copy(from sample: CMSampleBuffer) -> Result<AVAudioPCMBuffer, Rejection> {
+        guard CMSampleBufferIsValid(sample) else { return .failure(.invalid) }
+        guard CMSampleBufferDataIsReady(sample) else { return .failure(.dataNotReady) }
+        guard let description = CMSampleBufferGetFormatDescription(sample),
+              let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description) else {
+            return .failure(.missingFormatDescription)
+        }
+        var streamDescription = asbd.pointee
+        guard streamDescription.mFormatID == kAudioFormatLinearPCM else {
+            return .failure(.notLinearPCM(formatID: streamDescription.mFormatID))
+        }
+        let frames = CMSampleBufferGetNumSamples(sample)
+        guard frames > 0 else { return .failure(.noFrames) }
+        guard let limit = maxFrames(sampleRate: streamDescription.mSampleRate) else {
+            return .failure(.unsupportedSampleRate(streamDescription.mSampleRate))
+        }
+        // Checked BEFORE allocating: the destination is sized from this count.
+        guard frames <= limit else { return .failure(.tooManyFrames(frames, limit: limit)) }
+        guard let format = AVAudioFormat(streamDescription: &streamDescription) else {
+            return .failure(.unsupportedFormat)
+        }
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format,
+                                            frameCapacity: AVAudioFrameCount(frames)) else {
+            return .failure(.allocationFailed(frames: frames))
+        }
+        buffer.frameLength = AVAudioFrameCount(frames)
+        let status = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sample, at: 0, frameCount: Int32(frames), into: buffer.mutableAudioBufferList)
+        guard status == noErr else { return .failure(.copyFailed(status)) }
+        return .success(buffer)
     }
 }

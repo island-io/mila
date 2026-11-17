@@ -125,10 +125,16 @@ final class RecordingLanguageSettings: ObservableObject {
 
     /// The active language. Setting an entry that isn't visible is ignored —
     /// the active language must always be one the pickers offer.
+    ///
+    /// When a configuration profile locks it (`ManagedSettings`), every write
+    /// is refused before anything is stored, published or persisted. The
+    /// toolbar picker is disabled then, so this only catches programmatic
+    /// writes.
     var current: RecordingLanguage {
         get { resolve(currentCode) }
         set {
-            guard let entry = configured(newValue.code) else { return }
+            guard !isManaged(.recordingLanguage),
+                  let entry = configured(newValue.code) else { return }
             currentCode = entry.code
         }
     }
@@ -136,12 +142,20 @@ final class RecordingLanguageSettings: ObservableObject {
     /// Entries the pickers offer, in list order.
     var visible: [RecordingLanguage] { languages.filter { !$0.isHidden } }
 
+    /// The administrator-forced fields, if any. Empty (`ManagedSettings.empty`)
+    /// unless `MilaApp` passes the system's managed preferences.
+    private let managed: ManagedSettings
+
+    /// Whether a configuration profile locks `field` (see `ManagedSettings`).
+    func isManaged(_ field: ManagedField) -> Bool { managed.isManaged(field) }
+
     private let defaults: UserDefaults
     private static let key = "recording.language"
     private static let listKey = "recording.languages"
 
-    init(defaults: UserDefaults = .standard) {
+    init(defaults: UserDefaults = .standard, managed: ManagedSettings = .empty) {
         self.defaults = defaults
+        self.managed = managed
 
         // Seed only when the key is ABSENT. Undecodable bytes (or a list with
         // nothing visible) fall back to the seeds in memory but are left on
@@ -169,9 +183,15 @@ final class RecordingLanguageSettings: ObservableObject {
         let resolved = raw.map { RecordingLanguage.resolve($0, in: loaded) }
         let active = resolved.flatMap { r in loaded.first { $0.code == r.code && !$0.isHidden } }?.code
             ?? firstVisible
-        self.currentCode = active
-        if let raw, raw != active {
-            defaults.set(active, forKey: Self.key)
+        if let forced = managed.recordingLanguage {
+            // The user's stored choice stays in `defaults` untouched, so
+            // removing the profile brings it back.
+            self.currentCode = forced.code
+        } else {
+            self.currentCode = active
+            if let raw, raw != active {
+                defaults.set(active, forKey: Self.key)
+            }
         }
     }
 
@@ -229,7 +249,7 @@ final class RecordingLanguageSettings: ObservableObject {
         else { return false }
         list[i].isHidden = true
         commit(list)
-        if currentCode == code, let first = visible.first {
+        if currentCode == code, !isManaged(.recordingLanguage), let first = visible.first {
             currentCode = first.code
         }
         return true

@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://island-io.github.io/mila/sitemap.xml

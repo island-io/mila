@@ -499,9 +499,9 @@ final class LiveAISession: ObservableObject {
             context: context)
         // OpenAI-compatible ticks use the endpoint's model name from
         // `LLMSettings.openAIModelName`; CLI ticks use Live AI's model override.
-        let model = (tool == .openaiCompatible)
-            ? llmSettings.openAIModelName
-            : liveAISettings.model
+        let model = LLMSettings.backgroundModelName(tool: tool,
+                                                    openAIModelName: llmSettings.openAIModelName,
+                                                    liveAIModel: liveAISettings.model)
         let useSession = (sessionID != nil)
         // Cold-start the first tick gets a longer timeout (see
         // `firstCallTimeoutSeconds`). All subsequent ticks use the

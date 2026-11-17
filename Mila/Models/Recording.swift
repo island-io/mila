@@ -39,6 +39,46 @@ enum TranscriptionStatus: String, Codable {
     case failed
 }
 
+/// A stretch of a recording's audio, in seconds from the start of the audio
+/// file, that is NOT in its transcript because transcribing it failed —
+/// the remote server was unreachable (or refused) for that utterance during
+/// the recording and still was when the recording was finalized (#355). The
+/// audio itself is on disk; "Retry missing parts" in the detail view
+/// transcribes just these spans and inserts the result in time order.
+struct UntranscribedSpan: Codable, Hashable, Sendable {
+    var start: Double
+    var end: Double
+    /// True once the span's audio could not be read back from the file (past
+    /// its end, unreadable, or digital silence where the live path heard
+    /// sound). No upload can fix that, so the span is shown but never offered
+    /// for retry again. Nil — and omitted from recordings.json — otherwise.
+    var unreadable: Bool?
+
+    init(start: Double, end: Double, unreadable: Bool? = nil) {
+        self.start = start
+        self.end = end
+        self.unreadable = unreadable == true ? true : nil
+    }
+
+    /// Whether "Retry missing parts" can still do anything for this span.
+    var isRetryable: Bool { isValid && unreadable != true }
+
+    /// Finite, non-negative and non-empty. recordings.json is user-editable
+    /// and synced; a NaN, infinite or inverted span would trap the first time
+    /// it is turned into a frame count or a displayed duration, so invalid
+    /// ones are dropped at decode and never written (`Recording.init(from:)`).
+    var isValid: Bool {
+        start.isFinite && end.isFinite && start >= 0 && end > start
+            && end <= Self.maxSeconds
+    }
+
+    /// No recording is longer than a day; anything past it is a corrupt row.
+    static let maxSeconds: Double = 24 * 60 * 60
+
+    /// Zero for an invalid span, so a sum over spans can never go NaN.
+    var duration: Double { isValid ? end - start : 0 }
+}
+
 struct Recording: Identifiable, Codable, Hashable {
     var id: UUID
     var title: String
@@ -109,6 +149,189 @@ struct Recording: Identifiable, Codable, Hashable {
     /// Empty for recordings whose speakers were never renamed.
     var speakerNames: [String: String]
 
+    /// Per-recording override of the language the AI summary and action
+    /// items are written in — a `RecordingLanguage` raw value (`"he"` /
+    /// `"en"`). nil means "follow Settings → AI Features → Output language",
+    /// which is what every recording has until the user picks a language
+    /// for it from the Summary language menu. Independent of `language`
+    /// (the whisper model): a Hebrew meeting can carry an English summary.
+    /// Survives re-transcription on purpose — it records what the user
+    /// asked for, not what the transcript happened to be in.
+    ///
+    /// Read through `summaryLanguageOverride`, which refuses anything that
+    /// is not one of the two known codes.
+    var summaryLanguage: String?
+
+    /// `summaryLanguage` as a `RecordingLanguage`, or nil when unset OR
+    /// unrecognised. Deliberately `init(rawValue:)` rather than
+    /// `RecordingLanguage.fromCode`: `fromCode` falls back to Hebrew for any
+    /// unknown string, which would turn a hand-edited `"fr"` in
+    /// recordings.json into a silent Hebrew override. Unknown → nil → the
+    /// global setting applies (`bugbot-rules/untrusted-persisted-data.md`).
+    var summaryLanguageOverride: RecordingLanguage? {
+        summaryLanguage.flatMap(RecordingLanguage.init(rawValue:))
+    }
+
+    /// Display name of the person who shared this recording, when it arrived
+    /// as a `.milashare` bundle rather than being recorded or imported here.
+    /// nil for everything Mila captured itself. Attribution only — it does
+    /// not change `source`, so a shared Zoom meeting is still a meeting.
+    var sharedBy: String?
+
+    /// When the bundle that brought this recording was exported (the
+    /// sender's clock). Set together with `sharedBy`, nil otherwise.
+    var sharedAt: Date?
+    /// When the user stopped this recording's transcription to run it later
+    /// ("Stop Transcribing"), before a full pass had finished — the row has no
+    /// transcript, or only a live draft. Set only
+    /// alongside `status == .failed`, which is what keeps the launch recovery
+    /// sweep from restarting the run; this marker is what lets the UI say
+    /// "stopped" instead of "failed". Cleared the moment a new pass starts.
+    ///
+    /// A field rather than a new `TranscriptionStatus` case on purpose: older
+    /// builds decode `status` strictly and load recordings.json all-or-nothing,
+    /// so one unknown status value would empty their whole library. An unknown
+    /// KEY is ignored instead — an older build just reads the row as `.failed`.
+    var transcriptionDeferredAt: Date?
+
+    /// What a recording that already held a transcript looked like before
+    /// the user started a re-transcription of it — the status, language and
+    /// model that describe the transcript still on the row. Captured by
+    /// `RecordingStore.prepareForRetranscription`, consumed by
+    /// `markTranscriptionDeferred` when the user stops the re-run (the row
+    /// goes back to exactly this, not to the language and model of the run
+    /// that never finished), and cleared when a pass settles the row.
+    ///
+    /// Persisted on the row, not held in memory, because the re-run can
+    /// outlive the process: "Re-transcribe in Hebrew" on an English
+    /// recording, quit, relaunch — the recovery sweep hands the `.pending`
+    /// row straight back to the worker, nothing calls
+    /// `prepareForRetranscription` again — and a Stop after that must still
+    /// know the transcript is English. In memory it didn't (island-io/mila#320).
+    ///
+    /// Non-nil only while the row is `.pending`/`.running` — a stop, a
+    /// failure or a finished pass clears it. A stale value, should one
+    /// survive (a crash between the status write and the clear), is
+    /// harmless: only a stop or a failed pass reads it, and both need a
+    /// `.pending`/`.running` row, which
+    /// only `prepareForRetranscription` (which overwrites it) or the launch
+    /// sweep (for which it is exactly right) produces.
+    struct RetranscriptionPriorState: Codable, Hashable {
+        var status: TranscriptionStatus
+        var language: String
+        var modelName: String?
+        var transcriptionDeferredAt: Date?
+    }
+
+    /// See `RetranscriptionPriorState`. Omitted from recordings.json when nil,
+    /// so a row that was never re-transcribed encodes byte-identically to
+    /// before the field existed; an older build ignores the key and reads the
+    /// row as it always did. Mirrored in MilaKit's `StoredRecording`.
+    var retranscriptionPriorState: RetranscriptionPriorState?
+
+    /// Names proposed for still-unnamed speakers, waiting for the user to
+    /// accept or dismiss them (issue #348) — see `SpeakerNameSuggestion`.
+    /// Never applied on their own: accepting one goes through
+    /// `RecordingStore.setSpeakerName`.
+    ///
+    /// Keyed by raw speaker id like `speakerNames`, so every pass that
+    /// re-keys the ids clears it alongside the names (`TranscriptionService`'s
+    /// pass merge, `QuickActionsController.applyRediarizedSpeakers`). Omitted
+    /// from recordings.json when empty, so a row with none encodes
+    /// byte-identically to before the field existed. Deliberately NOT
+    /// mirrored in MilaKit's `StoredRecording` nor carried in a `.milashare`
+    /// (see the allowlists in `StoredRecordingDriftTests` and
+    /// `ShareManifestTests`): both expose confirmed names only.
+    var speakerNameSuggestions: [SpeakerNameSuggestion]
+
+    /// Audio the transcript is missing because transcribing it failed during
+    /// the recording and again at finalize — see `UntranscribedSpan`. Nil (and
+    /// omitted from recordings.json, so every complete row encodes exactly as
+    /// before) when the transcript covers the whole recording. Cleared by a
+    /// successful full pass (which re-transcribes everything) and shrunk by
+    /// `TranscriptionService.retryUntranscribedSpans`. Mirrored in MilaKit's
+    /// `StoredRecording`.
+    var untranscribedSpans: [UntranscribedSpan]?
+
+    /// Total seconds of audio missing from the transcript.
+    var untranscribedSeconds: Double {
+        (untranscribedSpans ?? []).reduce(0) { $0 + $1.duration }
+    }
+
+    /// The part of `untranscribedSeconds` "Retry missing parts" can still try.
+    var retryableUntranscribedSeconds: Double {
+        (untranscribedSpans ?? []).filter(\.isRetryable).reduce(0) { $0 + $1.duration }
+    }
+
+    /// Whether the row holds any transcript text — what a re-run leaves in
+    /// place until it completes.
+    var hasTranscript: Bool {
+        !segments.isEmpty || !fullText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Whether a re-transcription of a row that already had a transcript is
+    /// queued or running, so the transcript on the row is still the EARLIER
+    /// one. Mirrors MilaKit's `StoredRecording.isRetranscriptionInFlight`.
+    var isRetranscriptionInFlight: Bool {
+        guard let before = retranscriptionPriorState else { return false }
+        return (status == .pending || status == .running)
+            && (before.status == .completed || before.status == .failed)
+    }
+
+    /// The language of the transcript the row currently holds: `language`,
+    /// except while a re-run is in flight, when `language` already names
+    /// the re-run's and the text is still the earlier transcript's
+    /// (island-io/mila#330). Mirrors MilaKit's `StoredRecording.transcriptLanguage`.
+    var transcriptLanguage: String {
+        if isRetranscriptionInFlight, let before = retranscriptionPriorState,
+           !before.language.isEmpty {
+            return before.language
+        }
+        return language
+    }
+
+    /// Undo a re-transcription that never produced a transcript: put back
+    /// the status, language, model and stopped marker that describe the
+    /// transcript still on the row (`retranscriptionPriorState`). Returns
+    /// false — changing nothing — unless a re-run is in flight
+    /// (`isRetranscriptionInFlight`: the row is `.pending`/`.running` and the
+    /// prior status is a settled one, which is all the writer ever captures)
+    /// and its earlier transcript is still there. Does not clear the prior
+    /// state; callers settle the row and clear it.
+    @discardableResult
+    mutating func restoreRetranscriptionPriorState() -> Bool {
+        guard isRetranscriptionInFlight, hasTranscript,
+              let before = retranscriptionPriorState else { return false }
+        status = before.status
+        language = before.language
+        modelName = before.modelName
+        transcriptionDeferredAt = before.transcriptionDeferredAt
+        return true
+    }
+
+    /// Settle a pass that FAILED (rather than being stopped). A re-run that
+    /// left the earlier transcript in place is undone exactly as a stop
+    /// undoes it (`restoreRetranscriptionPriorState`), so a failed
+    /// "Re-transcribe in Hebrew" leaves the English transcript English,
+    /// `.completed` and made by the earlier model — not labelled Hebrew,
+    /// rendered right-to-left, reported as Hebrew over MCP, and demoted to
+    /// `.failed`, which would switch off everything keyed on `.completed`
+    /// (island-io/mila#330). The failure itself is reported by the caller's
+    /// `lastError` alert. Anything else — a first transcription, or a row
+    /// with no transcript left — becomes `.failed`, as before.
+    ///
+    /// A second Re-transcribe picked while this run was in flight changed
+    /// `language` but queued nothing (`TranscriptionService.enqueue` refuses
+    /// a recording already in flight), so undoing to the earlier transcript
+    /// is right then too. The prior state is consumed either way: the row is
+    /// settled.
+    mutating func settleFailedPass() {
+        if !restoreRetranscriptionPriorState() {
+            status = .failed
+        }
+        retranscriptionPriorState = nil
+    }
+
     /// Sentinel stored in `voiceMemoFolderUUID` for memos imported from the
     /// Voice Memos "Unfiled" bucket, which has no real folder UUID. Keeps
     /// "imported from Unfiled" distinguishable from a legacy import whose
@@ -135,7 +358,14 @@ struct Recording: Identifiable, Codable, Hashable {
          actionItems: [ActionItem]? = nil,
          voiceMemoUniqueID: String? = nil,
          voiceMemoFolderUUID: String? = nil,
-         speakerNames: [String: String] = [:]) {
+         speakerNames: [String: String] = [:],
+         summaryLanguage: String? = nil,
+         sharedBy: String? = nil,
+         sharedAt: Date? = nil,
+         transcriptionDeferredAt: Date? = nil,
+         retranscriptionPriorState: RetranscriptionPriorState? = nil,
+         speakerNameSuggestions: [SpeakerNameSuggestion] = [],
+         untranscribedSpans: [UntranscribedSpan]? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -156,9 +386,22 @@ struct Recording: Identifiable, Codable, Hashable {
         self.voiceMemoUniqueID = voiceMemoUniqueID
         self.voiceMemoFolderUUID = voiceMemoFolderUUID
         self.speakerNames = speakerNames
+        self.summaryLanguage = summaryLanguage
+        self.sharedBy = sharedBy
+        self.sharedAt = sharedAt
+        self.transcriptionDeferredAt = transcriptionDeferredAt
+        self.retranscriptionPriorState = retranscriptionPriorState
+        self.speakerNameSuggestions = speakerNameSuggestions
+        self.untranscribedSpans = untranscribedSpans
     }
 
     var isTrashed: Bool { deletedAt != nil }
+
+    /// Whether this recording arrived from another Mila user's `.milashare`.
+    var isShared: Bool { sharedBy != nil }
+    /// The user stopped this recording's transcription and it has not run
+    /// since — see `transcriptionDeferredAt`.
+    var isTranscriptionDeferred: Bool { transcriptionDeferredAt != nil }
 
     /// File name (relative to recordings directory) of the sidecar `.txt`
     /// holding the plain-text transcript. Derived from `audioFileName` so a
@@ -192,7 +435,9 @@ struct Recording: Identifiable, Codable, Hashable {
              status, language, modelName, segments, deletedAt, folder, appName,
              appBundleID,
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
-             speakerNames
+             speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt,
+             retranscriptionPriorState, speakerNameSuggestions,
+             untranscribedSpans
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -219,6 +464,26 @@ struct Recording: Identifiable, Codable, Hashable {
         self.voiceMemoUniqueID = try c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
         self.voiceMemoFolderUUID = try c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
         self.speakerNames = try c.decodeIfPresent([String: String].self, forKey: .speakerNames) ?? [:]
+        self.summaryLanguage = try c.decodeIfPresent(String.self, forKey: .summaryLanguage)
+        self.sharedBy = try c.decodeIfPresent(String.self, forKey: .sharedBy)
+        self.sharedAt = try c.decodeIfPresent(Date.self, forKey: .sharedAt)
+        self.transcriptionDeferredAt = try c.decodeIfPresent(Date.self, forKey: .transcriptionDeferredAt)
+        // `try?`, not `try`: recordings.json loads all-or-nothing, so a prior
+        // state this build cannot read (a `status` value a newer build added,
+        // say) must not empty the whole library. Dropping it costs only what
+        // a relaunch used to cost — a stop parks the row as an ordinary
+        // stopped transcription instead of restoring it.
+        self.retranscriptionPriorState = try? c.decodeIfPresent(RetranscriptionPriorState.self,
+                                                                forKey: .retranscriptionPriorState)
+        // `try?` for the same all-or-nothing reason: unconfirmed suggestions
+        // are the cheapest thing on the row to lose.
+        self.speakerNameSuggestions = (try? c.decodeIfPresent([SpeakerNameSuggestion].self,
+                                                              forKey: .speakerNameSuggestions)) ?? []
+        // `try?` for the same all-or-nothing reason: losing this costs only
+        // the "Retry missing parts" note, never the library.
+        let spans = try? c.decodeIfPresent([UntranscribedSpan].self, forKey: .untranscribedSpans)
+        let validSpans = (spans ?? []).filter(\.isValid)
+        self.untranscribedSpans = validSpans.isEmpty ? nil : validSpans
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -246,6 +511,24 @@ struct Recording: Identifiable, Codable, Hashable {
         try c.encodeIfPresent(voiceMemoFolderUUID, forKey: .voiceMemoFolderUUID)
         if !speakerNames.isEmpty {
             try c.encode(speakerNames, forKey: .speakerNames)
+        }
+        // Omitted when nil so a recordings.json nobody has set an override
+        // in is byte-identical to what the previous release wrote.
+        try c.encodeIfPresent(summaryLanguage, forKey: .summaryLanguage)
+        // Omitted when nil so every recording Mila captured itself encodes
+        // byte-for-byte as before. Mirrored in MilaKit's `StoredRecording`.
+        try c.encodeIfPresent(sharedBy, forKey: .sharedBy)
+        try c.encodeIfPresent(sharedAt, forKey: .sharedAt)
+        try c.encodeIfPresent(transcriptionDeferredAt, forKey: .transcriptionDeferredAt)
+        try c.encodeIfPresent(retranscriptionPriorState, forKey: .retranscriptionPriorState)
+        // Omitted when empty — the common case — so a row with no pending
+        // suggestion is byte-identical to what the previous release wrote.
+        if !speakerNameSuggestions.isEmpty {
+            try c.encode(speakerNameSuggestions, forKey: .speakerNameSuggestions)
+        }
+        let validSpans = (untranscribedSpans ?? []).filter(\.isValid)
+        if !validSpans.isEmpty {
+            try c.encode(validSpans, forKey: .untranscribedSpans)
         }
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }

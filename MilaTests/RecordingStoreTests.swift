@@ -234,6 +234,40 @@ final class RecordingStoreTests: XCTestCase {
         XCTAssertEqual(store.recordings.first?.title, "Trimmed")
     }
 
+    // MARK: - Summary language override
+
+    /// `setSummaryLanguage` writes ONE field on the live row, persists it, and
+    /// hands the live row back for the caller to regenerate from. The point
+    /// of the helper is that a stale snapshot never gets written back, so
+    /// the test mutates the live row behind the caller's back first and
+    /// checks that mutation survives.
+    func test_setSummaryLanguage_persists_clears_and_leaves_other_fields_alone() {
+        let store = RecordingStore(rootDirectory: tempRoot)
+        let rec = Recording(title: "Sync", source: .meeting, audioFileName: "sync.wav")
+        store.add(rec)
+        // A change the caller's snapshot (`rec`) does not know about.
+        store.rename(rec, to: "Weekly sync")
+
+        let updated = store.setSummaryLanguage("he", recordingID: rec.id)
+        XCTAssertEqual(updated?.summaryLanguage, "he")
+        XCTAssertEqual(updated?.title, "Weekly sync",
+                       "the live row is returned, not the caller's snapshot")
+        XCTAssertEqual(updated?.audioFileName, "sync.wav")
+        XCTAssertEqual(updated?.status, .pending)
+
+        let reloaded = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(reloaded.recordings.first?.summaryLanguage, "he")
+        XCTAssertEqual(reloaded.recordings.first?.title, "Weekly sync")
+
+        // nil clears it, and the cleared state persists too.
+        XCTAssertNil(store.setSummaryLanguage(nil, recordingID: rec.id)?.summaryLanguage)
+        XCTAssertNil(RecordingStore(rootDirectory: tempRoot).recordings.first?.summaryLanguage)
+
+        // An unknown id writes nothing and says so.
+        XCTAssertNil(store.setSummaryLanguage("en", recordingID: UUID()))
+        XCTAssertNil(store.recordings.first?.summaryLanguage)
+    }
+
     // MARK: - Folder CRUD
 
     func test_create_folder_adds_and_sorts_alphabetically() {

@@ -25,7 +25,6 @@ architecture and conventions.
 - Run `make build` and `make test` locally first — CI must be green.
 - **Never commit secrets, credentials, tokens, or internal infrastructure
   details.** Push protection is enabled and will reject obvious secrets.
-- Note any user-facing change in the README changelog.
 
 ## Bugs and feature requests
 

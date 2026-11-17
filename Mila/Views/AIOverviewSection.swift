@@ -14,19 +14,22 @@ import AppKit
 /// `.regularMaterial` card. Both use `AIOverviewSection` below for the
 /// inner content (Summary header + body, Action items header + list).
 ///
-/// RTL: section-level decision matches the live view — prefer the
-/// actual text content (`isPredominantlyHebrew` over the summary +
-/// items blob) over `recordingLanguage`, so a conversation that
-/// happened in Hebrew with the dropdown stuck on English still aligns
-/// to the right edge.
+/// RTL: decided from the actual text content (`isPredominantlyHebrew`
+/// over the summary + items blob); `recordingLanguage` is only the
+/// fallback while there is no text yet — see `isRTL`. This no longer
+/// matches `LiveAIRecordingView.aiOutputIsRTL`, whose Auto branch checks
+/// `language == "he"` BEFORE looking at the text: the live view has no
+/// per-recording summary language, while here an English summary on a
+/// Hebrew recording is exactly what that override produces, and it must
+/// read left-to-right.
 struct AIOverviewSection: View {
     let summary: String?
     let items: [ActionItem]
     let recordingLanguage: String
     /// When set, the summary block exposes a "Regenerate summary"
-    /// context-menu action that calls this closure. Hidden in the
-    /// rename sheet (which doesn't have a summarizer to call) and
-    /// in views that don't pass it through.
+    /// context-menu action that calls this closure. Both hosts (the detail
+    /// view and the rename sheet) wire it; a view that doesn't pass it
+    /// through gets no entry.
     var onRegenerateSummary: (() -> Void)? = nil
     /// Forces the "Summarizing…" spinner UI without requiring an
     /// existing summary string — used while a regenerate / backfill
@@ -41,6 +44,25 @@ struct AIOverviewSection: View {
     /// transcript copy in the transcript area). The block's native
     /// right-click "Copy" stays in both places either way.
     var showsBlockCopyButtons: Bool = true
+    /// Per-recording summary language, for the "Summary language" submenu
+    /// next to "Regenerate summary". The submenu is shown only when
+    /// `onSetSummaryLanguage` is wired; `summaryLanguage` is the recording's
+    /// current override (nil = Default) and `globalOutputLanguage` labels
+    /// the Default entry. See `SummaryLanguageMenu`. Declared last so the
+    /// memberwise init keeps every existing call site's argument order.
+    var summaryLanguage: RecordingLanguage? = nil
+    var globalOutputLanguage: LiveAISettings.OutputLanguage = .auto
+    var onSetSummaryLanguage: ((RecordingLanguage?) -> Void)? = nil
+    /// True while the recording is queued for or inside a (re-)transcription
+    /// pass. Greys out "Regenerate summary" and the "Summary language"
+    /// submenu for its duration, matching the recording context menu's
+    /// `isBusy` gate on the same submenu. A regenerate started now would
+    /// summarise the transcript that is about to be replaced, and if it is
+    /// still in flight when the pass completes, the summarizer's in-flight
+    /// dedup drops the post-transcription regenerate — so the old-transcript
+    /// summary is what gets stored (Bugbot on #313). Declared last for the
+    /// same memberwise-init reason as above.
+    var isTranscribing: Bool = false
 
     /// True iff there's at least one non-empty piece to show. Callers
     /// can use this to collapse their wrapper (avoiding an empty card
@@ -51,8 +73,22 @@ struct AIOverviewSection: View {
     }
 
     private var sectionIsRTL: Bool {
+        Self.isRTL(summary: summary, items: items, recordingLanguage: recordingLanguage)
+    }
+
+    /// Text direction for the whole block, decided from what the AI actually
+    /// wrote. The recording's transcription language is only a fallback for
+    /// when there is nothing to read yet (the "Generating summary…"
+    /// placeholder). It used to be an unconditional OR, which pinned a Hebrew
+    /// recording's summary to the right edge even after the user asked for
+    /// it in English — the exact case the per-recording summary language
+    /// exists for. Static so the rule can be pinned without building the view.
+    static func isRTL(summary: String?, items: [ActionItem], recordingLanguage: String) -> Bool {
         let blob = (summary ?? "") + " " + items.map(\.text).joined(separator: " ")
-        return blob.isPredominantlyHebrew || recordingLanguage == "he"
+        if blob.hasHebrewOrLatinLetters {
+            return blob.isPredominantlyHebrew
+        }
+        return recordingLanguage == "he"
     }
 
     var body: some View {
@@ -137,8 +173,16 @@ struct AIOverviewSection: View {
                             Button("Regenerate summary") {
                                 onRegenerateSummary()
                             }
-                            .disabled(isSummarizing)
+                            .disabled(isSummarizing || isTranscribing)
                             .accessibilityIdentifier("detail.summary.regenerate")
+                        }
+                        if let onSetSummaryLanguage {
+                            SummaryLanguageMenu(
+                                current: summaryLanguage,
+                                global: globalOutputLanguage,
+                                isDisabled: isSummarizing || isTranscribing,
+                                onPick: onSetSummaryLanguage
+                            )
                         }
                     }
             } else if isSummarizing {

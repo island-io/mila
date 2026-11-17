@@ -101,6 +101,24 @@ final class SettingsNavigation {
     /// use it to become real navigation instead of prose — see
     /// `AIFeaturesSettingsTab.notConfiguredBanner`.
     var pendingTab: SettingsTab?
+
+    /// Set alongside `pendingTab` to also scroll that destination to one
+    /// section. Consumed by `SettingsView.detailPane` once the destination
+    /// it belongs to is showing.
+    var pendingAnchor: SettingsAnchor?
+}
+
+/// A section inside a Settings destination that a deep link can scroll to.
+enum SettingsAnchor: String, Hashable {
+    /// Speakers → Voice recognition: where the damaged-profiles notice lives
+    /// (#336), and where the main window's announcement of it points (#342).
+    case voiceRecognition = "settings.anchor.voiceRecognition"
+
+    var tab: SettingsTab {
+        switch self {
+        case .voiceRecognition: return .speakers
+        }
+    }
 }
 
 /// Standard `Settings` scene. Opened via `Cmd+,` from the menu bar, and via
@@ -255,15 +273,32 @@ struct SettingsView: View {
     // MARK: Detail
 
     private var detailPane: some View {
-        Group {
+        // The destination this pane is built for. The anchor check below
+        // compares against it, not the live `selectedTab`: a deep link that
+        // switches destination changes both at once, and the outgoing pane
+        // must not consume an anchor that belongs to the incoming one.
+        let paneTab = selectedTab
+        return Group {
             if selectedTab.providesOwnScrollView {
                 destination
                     .padding(Self.detailInset)
             } else {
-                ScrollView(.vertical) {
-                    destination
-                        .padding(Self.detailInset)
-                        .frame(maxWidth: .infinity, alignment: .topLeading)
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical) {
+                        destination
+                            .padding(Self.detailInset)
+                            .frame(maxWidth: .infinity, alignment: .topLeading)
+                    }
+                    // `initial`: a deep link that also switched the
+                    // destination arrives before this pane exists.
+                    .onChange(of: SettingsNavigation.shared.pendingAnchor, initial: true) { _, anchor in
+                        guard let anchor, anchor.tab == paneTab else { return }
+                        SettingsNavigation.shared.pendingAnchor = nil
+                        // Next turn, once the destination has laid out.
+                        DispatchQueue.main.async {
+                            withAnimation { proxy.scrollTo(anchor, anchor: .top) }
+                        }
+                    }
                 }
             }
         }
@@ -339,6 +374,7 @@ private struct AudioSettingsTab: View {
     @EnvironmentObject private var settings: AudioInputSettings
     @EnvironmentObject private var monitor: InputLevelMonitor
     @EnvironmentObject private var actions: QuickActionsController
+    @EnvironmentObject private var liveAI: LiveAISettings
     @State private var devices: [AudioDeviceManager.Device] = []
 
     /// Sentinel UID that means "follow the system default input". Picker's
@@ -407,7 +443,7 @@ private struct AudioSettingsTab: View {
                 }
                 // The ~47 Hz level is observed by the leaf below, not by
                 // this tab — see `InputLevelMonitor.meter`.
-                LiveInputLevelMeter(isLive: monitor.isRunning && !actions.isRecording)
+                LiveInputLevelMeter(isLive: monitor.isRunning && !captureOwnsInput)
             }
 
             Divider().padding(.vertical, 4)
@@ -423,6 +459,25 @@ private struct AudioSettingsTab: View {
                        isOn: $settings.adaptiveGainEnabled)
                     .toggleStyle(.switch)
                 Text("Boosts low-volume microphone input automatically when speech is captured. Disable if you prefer manual control of input levels.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Divider().padding(.vertical, 4)
+
+            // Live transcription. Here rather than under AI Features because
+            // it is about what a recording costs while it runs, not an LLM
+            // feature — and Live AI depends on it, not the other way round.
+            // Greyed out (not hidden) where the hardware gate already keeps
+            // live transcription off; the persisted value still round-trips.
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Transcribe while recording",
+                       isOn: $liveAI.transcribeWhileRecording)
+                    .toggleStyle(.switch)
+                    .disabled(!liveAI.isLiveAIAvailable)
+                    .accessibilityIdentifier("liveAI.transcribeWhileRecording.toggle")
+                Text(transcribeWhileRecordingCaption)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -445,13 +500,20 @@ private struct AudioSettingsTab: View {
             monitor.preferredUID = newValue
             Task { await monitor.restart() }
         }
-        .onChange(of: actions.isRecording) { _, _ in
+        .onChange(of: captureOwnsInput) { _, _ in
             Task { await refreshMonitor() }
         }
     }
 
+    /// True while a recording owns the input — and also while one is still
+    /// being brought up (`.starting`), so the meter pauses with the Record
+    /// click rather than ticking "Live" through the bring-up (#321).
+    private var captureOwnsInput: Bool {
+        actions.isRecording || actions.isStartingRecording
+    }
+
     private func refreshMonitor() async {
-        if actions.isRecording {
+        if captureOwnsInput {
             await monitor.stop()
         } else {
             await monitor.start()
@@ -459,10 +521,20 @@ private struct AudioSettingsTab: View {
     }
 
     private var meterStatusText: String {
+        if actions.isStartingRecording {
+            return "Paused — recording is starting"
+        }
         if actions.isRecording {
             return "Paused — recording in progress"
         }
         return monitor.isRunning ? "Live" : "Starting…"
+    }
+
+    private var transcribeWhileRecordingCaption: String {
+        if !liveAI.isLiveAIAvailable {
+            return "Not available on this Mac — recordings are transcribed after you stop. AI Features → Live AI mode has an override."
+        }
+        return "Shows the transcript live as people talk. Turn off to keep the CPU free during calls: Mila only records, then transcribes once you stop (no live transcript or Live AI). Takes effect from the next recording."
     }
 
     private var binding: Binding<String> {
@@ -839,6 +911,10 @@ private struct ModelsSettingsTab: View {
                 // one control on this destination that is present whichever
                 // backend is selected.
                 .accessibilityIdentifier("models.backend.picker")
+                .disabled(remote.isManaged(.backend))
+                if remote.isManaged(.backend) {
+                    ManagedSettingNote(field: .backend)
+                }
 
                 switch remote.backend {
                 case .local:
@@ -933,22 +1009,34 @@ private struct RemoteBackendSection: View {
                     TextField(RemoteTranscriptionSettings.defaultEndpoint, text: $remote.endpoint)
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
+                        .disabled(remote.isManaged(.endpoint))
                 }
-                Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Picking a model below fills this in; edit it to point at your own server.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if remote.isManaged(.endpoint) {
+                    ManagedSettingNote(field: .endpoint)
+                } else {
+                    Text("Base URL of an OpenAI-compatible API. Mila appends `/audio/transcriptions`. Picking a model below fills this in; edit it to point at your own server.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 modelPickerRow
 
                 fieldRow(label: "API key") {
-                    SecureField("Stored in your Keychain", text: $remote.apiKey)
+                    SecureField(apiKeyPlaceholder, text: $remote.apiKey)
                         .textFieldStyle(.roundedBorder)
+                        .disabled(remote.isManaged(.apiKey))
                 }
-                Text("Sent as a Bearer token and stored encrypted in the macOS Keychain — never written to disk in plaintext. Leave blank for self-hosted servers that don't require auth.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if remote.isManaged(.apiKey) {
+                    // Not the Keychain sentence: a managed token comes from the
+                    // profile and is never written there.
+                    ManagedSettingNote(field: .apiKey)
+                } else {
+                    Text("Sent as a Bearer token and stored encrypted in the macOS Keychain — never written to disk in plaintext. Leave blank for self-hosted servers that don't require auth.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             advancedDisclosure
@@ -991,6 +1079,9 @@ private struct RemoteBackendSection: View {
                     Section(group.displayName) {
                         ForEach(RemoteModelPreset.presets(in: group)) { preset in
                             Text(preset.displayName).tag(preset.id)
+                                // A preset on another server can't be taken
+                                // while the endpoint is managed (#360).
+                                .disabled(!remote.canApply(preset))
                         }
                     }
                 }
@@ -998,8 +1089,12 @@ private struct RemoteBackendSection: View {
             }
             .labelsHidden()
             .accessibilityIdentifier("remote.model.picker")
+            .disabled(remote.isManaged(.model))
         }
 
+        if remote.isManaged(.model) {
+            ManagedSettingNote(field: .model)
+        }
         if let preset = remote.selectedPreset {
             Text(preset.detail)
                 .font(.caption)
@@ -1036,7 +1131,12 @@ private struct RemoteBackendSection: View {
                     showAdvanced = true
                     return
                 }
-                remote.apply(preset)
+                // A refused preset changes nothing, so nothing publishes and
+                // the menu would keep showing the rejected choice. Nudge a
+                // re-render so `get` puts the stored model back.
+                if !remote.apply(preset) {
+                    remote.objectWillChange.send()
+                }
             }
         )
     }
@@ -1072,6 +1172,7 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("remote.model.custom")
+                        .disabled(remote.isManaged(.model))
                 }
                 Text("Any model id your server accepts. Mila derives the response format from the id — `gpt-*` ids are sent without timestamps, anything else as a Whisper-style request (`verbose_json`).")
                     .font(.caption)
@@ -1083,6 +1184,10 @@ private struct RemoteBackendSection: View {
                         .textFieldStyle(.roundedBorder)
                         .autocorrectionDisabled()
                         .accessibilityIdentifier("remote.model.english")
+                        .disabled(remote.isManaged(.englishModel))
+                }
+                if remote.isManaged(.englishModel) {
+                    ManagedSettingNote(field: .englishModel)
                 }
                 Text("Optional. Set this when the model above only handles Hebrew — an ivrit.ai server, for example, returns Hebrew words for English speech. Every language except Hebrew then uses this model instead. Leave blank for multilingual endpoints like OpenAI.")
                     .font(.caption)
@@ -1101,6 +1206,10 @@ private struct RemoteBackendSection: View {
         .onChange(of: remote.model) { _, _ in
             if remote.selectedPreset == nil { showAdvanced = true }
         }
+    }
+
+    private var apiKeyPlaceholder: String {
+        remote.isManaged(.apiKey) ? "Set by your organization" : "Stored in your Keychain"
     }
 
     private var privacyWarning: some View {
@@ -1743,6 +1852,7 @@ private struct AIFeaturesSettingsTab: View {
     // and flip every feature without expanding a thing.
     @State private var showSummary = false
     @State private var showName = false
+    @State private var showSpeakerNames = false
     @State private var showAction = false
     @State private var showLiveAI = false
 
@@ -1796,6 +1906,21 @@ private struct AIFeaturesSettingsTab: View {
                 }
                 Divider()
 
+                AIFeatureRow(title: "Speaker names",
+                             caption: "Suggest who's speaking when someone says their name.",
+                             help: "After a recording finishes, Mila asks your provider which unnamed speakers say their own name (\u{201C}Hi, I'm Dana\u{201D}) or are addressed by name right before they answer. Each answer must quote the transcript; anything without a quote is dropped. Names appear as suggestions above the transcript — nothing is renamed, and no voice profile learns anything, until you accept one.",
+                             isOn: $settings.speakerNameSuggestionsEnabled,
+                             toggleIdentifier: "llm.speakerNames.enabled.toggle",
+                             identifier: "ai.section.speakerNames",
+                             isExpanded: $showSpeakerNames) {
+                    Text("Sends the transcript, with its speaker labels, to your provider once per recording that has an unnamed speaker. Suggestions only: you accept or dismiss each one from the recording. Your own name is set in Settings → Speakers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: aiCaptionWidth, alignment: .leading)
+                }
+                Divider()
+
                 AIFeatureRow(title: "Send-to-LLM action",
                              caption: "Run your own prompt against a transcript.",
                              help: "Adds a Run-action button to the rename sheet. The prompt below is sent together with the transcript when you click it.",
@@ -1826,7 +1951,9 @@ private struct AIFeaturesSettingsTab: View {
                              // feature exists. The persisted value keeps
                              // round-tripping either way.
                              toggleDisabled: !liveAI.isLiveAIAvailable
-                                 || settings.liveAIDisabledByRemoteOpenAI,
+                                 || !liveAI.transcribeWhileRecording
+                                 || settings.liveAIDisabledByRemoteOpenAI
+                                 || liveAI.isManaged(.liveAIEnabled),
                              toggleIdentifier: "liveAI.enabled.toggle",
                              identifier: "ai.section.liveAI",
                              isExpanded: $showLiveAI) {
@@ -1894,8 +2021,17 @@ private struct AIFeaturesSettingsTab: View {
         if !liveAI.isLiveAIAvailable {
             return "Not available on this Mac — expand for the override."
         }
+        // Live AI reads the live transcript, so it can't run without one.
+        if !liveAI.transcribeWhileRecording {
+            return "Off while Transcribe while recording is off (Settings → Audio)."
+        }
         if settings.liveAIDisabledByRemoteOpenAI {
             return "Off while the provider is a remote endpoint."
+        }
+        // After the gates: a closed gate is the more useful thing to say, and
+        // it greys the switch out just the same.
+        if liveAI.isManaged(.liveAIEnabled) {
+            return "\(ManagedSettings.note)."
         }
         return "Show action items while the recording runs."
     }
@@ -1957,7 +2093,10 @@ private struct AIFeaturesSettingsTab: View {
                 Spacer(minLength: 0)
             }
             .font(.callout)
-            Text("Language the AI writes in, for every feature below. Auto follows what was spoken.")
+            // Names the features that actually substitute `{{LANGUAGE}}`
+            // (summary + action items, Live AI) — the name prompt and the
+            // Send action never did, so "every feature below" was wrong.
+            Text("Language of the summary, action items and Live AI output. Auto follows what was spoken. Right-click a recording to pick a different language for just that one.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2081,7 +2220,12 @@ private struct LiveAISection: View {
                     TextField(LiveAISettings.defaultModel, text: $settings.model)
                         .textFieldStyle(.roundedBorder)
                         .accessibilityIdentifier("liveAI.model")
-                    advancedCaption("Live loop only. Blank lets your CLI pick.")
+                        .disabled(settings.isManaged(.liveAIModel))
+                    if settings.isManaged(.liveAIModel) {
+                        ManagedSettingNote(field: .liveAIModel)
+                    } else {
+                        advancedCaption("Live loop only. Blank lets your CLI pick.")
+                    }
                 }
                 .help("Passed to the CLI as `--model` for the live loop only, so the cheap per-tick model doesn't have to be your default. Leave blank to let the CLI choose.")
 
@@ -2099,7 +2243,7 @@ private struct LiveAISection: View {
                 advancedToggle("Background mode (hide live pane)",
                                isOn: $settings.backgroundMode,
                                caption: "Stay on Home while recording.",
-                               help: "Transcription, speaker labels and the Live AI summary still run in the background and are saved when you stop. Useful on lower-power Macs, where rendering the live pane competes with whisper for CPU.")
+                               help: "Transcription, speaker labels and the Live AI summary still run in the background and are saved when you stop. Useful on lower-power Macs, where rendering the live pane competes with whisper for CPU. To take transcription off the CPU during calls altogether, turn off Transcribe while recording in Settings → Audio.")
 
                 advancedSlider("Update every",
                                value: $settings.chunkSeconds,
@@ -2360,6 +2504,10 @@ private struct DiarizationSettingsTabContent: View {
 
             Toggle("Enable speaker diarization", isOn: $diarization.isEnabled)
                 .accessibilityIdentifier("speakers.enable.toggle")
+                .disabled(diarization.isManaged(.diarizationEnabled))
+            if diarization.isManaged(.diarizationEnabled) {
+                ManagedSettingNote(field: .diarizationEnabled)
+            }
 
             if showingBootstrapCard {
                 bootstrapCard
@@ -2395,11 +2543,16 @@ private struct DiarizationSettingsTabContent: View {
 
             Divider()
 
+            YourNameSection()
+
+            Divider()
+
             KnownSpeakersSection()
 
             Divider()
 
             VoiceRecognitionSection(diarization: diarization)
+                .id(SettingsAnchor.voiceRecognition)
 
             Spacer()
         }
@@ -2534,18 +2687,84 @@ private struct DiarizationSettingsTabContent: View {
     }
 }
 
+/// Settings → Speakers → "Your name" (issue #348): who "me" is. Used only to
+/// SUGGEST a name for the single voice in a recording made from this Mac's
+/// microphone (or a Voice Memo) — see `SpeakerIdentitySettings` for why
+/// meetings are not covered. Committing the field also adds the name to the
+/// known-speakers list so it is one click away in every rename popover.
+private struct YourNameSection: View {
+    @EnvironmentObject private var identity: SpeakerIdentitySettings
+    @EnvironmentObject private var directory: SpeakerDirectory
+    /// Edited locally and written to `identity` only on Return / focus loss.
+    /// `identity` is an App-level `@StateObject`, so binding the field to it
+    /// directly would publish — and re-diff every scene — on each keystroke
+    /// (the CLAUDE.md #280 rule), plus write UserDefaults each time.
+    @State private var draft = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Your name")
+                .font(.callout.weight(.semibold))
+            Text("When a recording from your microphone has a single voice, Mila suggests your name for it. Accept it once with voice recognition on and Mila recognises you in later recordings, meetings included.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextField("Your name", text: $draft)
+                .textFieldStyle(.roundedBorder)
+                .focused($focused)
+                .onSubmit(commit)
+                .onChange(of: focused) { _, isFocused in
+                    if !isFocused { commit() }
+                }
+                .frame(maxWidth: 280)
+                .accessibilityIdentifier("speakers.myName.field")
+        }
+        .onAppear { draft = identity.myName }
+        // Closing Settings with the field still focused must not lose the edit.
+        .onDisappear(perform: commit)
+    }
+
+    private func commit() {
+        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Only on a real change: `@Published` announces every assignment,
+        // equal or not, so a blur with nothing edited must not write.
+        if identity.myName != trimmed { identity.myName = trimmed }
+        draft = trimmed
+        if !trimmed.isEmpty { directory.add(trimmed) }
+    }
+}
+
 /// "Known Speakers" — manage the persistent name list behind the
 /// transcript's speaker-rename popover. Names added here (or via the
 /// popover) are offered in every future recording's rename list.
 private struct KnownSpeakersSection: View {
     @EnvironmentObject private var directory: SpeakerDirectory
+    @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var newName = ""
+
+    /// A ✕ that found a voice profile behind the name, or could not tell:
+    /// the removal waits on the confirmation below. A plain name is removed
+    /// at once — nothing irreversible goes with it.
+    private struct PendingRemoval {
+        let name: String
+        let voice: SpeakerProfileStore.StoredVoice
+    }
+    @State private var pendingRemoval: PendingRemoval?
+    /// Why a voice profile was not (fully) deleted, shown under the list
+    /// until dismissed — never a claim that it was.
+    @State private var removalProblem: String?
+
+    private var isConfirmingRemoval: Binding<Bool> {
+        Binding(get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Known speakers")
                 .font(.callout.weight(.semibold))
-            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here doesn't change recordings it's already assigned to.")
+            Text("Names you can assign to speakers by clicking their label in a transcript. Removing a name here also deletes its voice profile, so it stops being recognised in new recordings; recordings it's already assigned to are unchanged.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2558,13 +2777,13 @@ private struct KnownSpeakersSection: View {
                                 Text(name)
                                 Spacer()
                                 Button {
-                                    directory.remove(name)
+                                    requestRemoval(of: name)
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
                                         .foregroundStyle(.secondary)
                                 }
                                 .buttonStyle(.borderless)
-                                .help("Remove \"\(name)\" from the list")
+                                .help("Remove \"\(name)\" from the list, and delete its voice profile if it has one")
                                 .accessibilityIdentifier("speakers.known.remove.\(name)")
                             }
                             .padding(.horizontal, 10)
@@ -2577,6 +2796,23 @@ private struct KnownSpeakersSection: View {
                 }
                 .frame(maxHeight: 120)
                 .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                .alert(removalTitle, isPresented: isConfirmingRemoval, presenting: pendingRemoval) { pending in
+                    // An unreadable file means only the name can go, so the
+                    // button says what it does and is not destructive.
+                    let deletesVoice = pending.voice != .unknown
+                    Button(deletesVoice ? "Delete" : "Remove",
+                           role: deletesVoice ? .destructive : nil) {
+                        confirmRemoval(pending)
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: { pending in
+                    Text(removalMessage(pending))
+                }
+            }
+
+            if let removalProblem {
+                VoiceDeletionProblemNote(message: removalProblem) { self.removalProblem = nil }
+                    .accessibilityIdentifier("speakers.known.voiceDeletionProblem")
             }
 
             HStack(spacing: 8) {
@@ -2596,11 +2832,98 @@ private struct KnownSpeakersSection: View {
             newName = ""
         }
     }
+
+    private var removalTitle: String {
+        guard let pending = pendingRemoval else { return "" }
+        switch pending.voice {
+        case .unknown: return "Remove “\(pending.name)”?"
+        case .stored, .notStored: return "Delete the voice profile for “\(pending.name)”?"
+        }
+    }
+
+    private func removalMessage(_ pending: PendingRemoval) -> String {
+        switch pending.voice {
+        case .unknown:
+            return "Mila can't read speaker-profiles.json right now, so it can't tell whether “\(pending.name)” has a voice profile, and can't delete one if it does. Only the name is removed; the file is left untouched. Delete Voice Profiles below removes every voice profile."
+        case .stored, .notStored:
+            return "Mila has a voice fingerprint for “\(pending.name)” and uses it to recognise them in new recordings. Removing the name deletes the fingerprint too. Speaker names already on your recordings are untouched. This can't be undone."
+        }
+    }
+
+    /// The ✕. The name list and the voice profiles are separate stores, and
+    /// recognition reads only the profiles, so dropping just the name left
+    /// the voice labelling speakers (#358). Deleting a trained voice is
+    /// irreversible, so that — and only that — asks first.
+    private func requestRemoval(of name: String) {
+        removalProblem = nil
+        let voice = profileStore.storedVoice(forSpeakerNamed: name)
+        switch voice {
+        case .notStored:
+            directory.remove(name)
+        case .stored, .unknown:
+            pendingRemoval = PendingRemoval(name: name, voice: voice)
+        }
+    }
+
+    /// The name always goes — that is what the user asked for, and it
+    /// cannot fail. What happened to the voice is reported as it is: a
+    /// profile that is gone only until relaunch, or could not be touched,
+    /// is never presented as deleted.
+    private func confirmRemoval(_ pending: PendingRemoval) {
+        let outcome = profileStore.forgetSpeaker(named: pending.name)
+        directory.remove(pending.name)
+        // The confirmation already said an unreadable file stops the delete.
+        if pending.voice == .unknown, outcome == .profileFileUnreadable { return }
+        removalProblem = voiceDeletionProblem(outcome, name: pending.name)
+    }
+}
+
+/// What to tell the user when a single voice-profile delete did not fully
+/// happen, or nil when it did (or there was nothing to delete).
+private func voiceDeletionProblem(_ outcome: SpeakerProfileStore.ProfileDeletionOutcome,
+                                  name: String) -> String? {
+    switch outcome {
+    case .deleted, .nothingToDelete:
+        return nil
+    case .deletedForThisSessionOnly:
+        return "Mila has stopped recognising “\(name)” for now, but couldn't save the change to speaker-profiles.json, so their voice profile will be back the next time Mila starts."
+    case .profileFileUnreadable:
+        return "The voice profile for “\(name)” couldn't be deleted from speaker-profiles.json: the file can't be read, so it was left untouched. Delete Voice Profiles below removes every voice profile."
+    case .notDeleted:
+        return "The voice profile for “\(name)” couldn't be deleted: speaker-profiles.json couldn't be written. It is still stored on this Mac."
+    }
+}
+
+/// The orange callout Settings → Speakers uses for a voice-profile delete
+/// that did not fully happen — the same look as the damaged-profiles notice.
+private struct VoiceDeletionProblemNote: View {
+    let message: String
+    let dismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Dismiss", action: dismiss)
+                    .font(.caption)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+    }
 }
 
 /// Settings → Speakers → voice recognition: the opt-in switch for
-/// cross-recording recognition, plus the delete path for whatever it has
-/// already stored. Sits below the known-speakers list.
+/// cross-recording recognition, plus the delete paths for whatever it has
+/// already stored: all of it at once, or (while on) one voice at a time,
+/// including voices whose name is not in Known speakers. Sits below the
+/// known-speakers list.
 ///
 /// The off-state footprint is deliberately one toggle and one caption — the
 /// shape `ObsidianSettingsSection.enableCard` uses, in the flat,
@@ -2625,6 +2948,18 @@ private struct VoiceRecognitionSection: View {
     @EnvironmentObject private var settings: VoiceRecognitionSettings
     @EnvironmentObject private var profileStore: SpeakerProfileStore
     @State private var showDeleteConfirmation = false
+    /// The single voice profile whose delete is waiting on confirmation.
+    @State private var pendingProfileDeletion: VoiceProfile?
+    /// Why the last single-profile delete did not fully happen.
+    @State private var profileDeletionProblem: String?
+    /// Only a Settings window in front stands in for the main-window banner
+    /// (#342); one left open in the background does not.
+    @Environment(\.controlActiveState) private var controlActiveState
+
+    private func hideAnnouncementIfInFront() {
+        guard controlActiveState == .key, profileStore.damagedProfilesAnnouncement != nil else { return }
+        profileStore.hideDamagedProfilesAnnouncement()
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -2634,7 +2969,7 @@ private struct VoiceRecognitionSection: View {
             Toggle("Recognise returning speakers by voice", isOn: $settings.isEnabled)
                 .accessibilityIdentifier("speakers.voiceRecognition.toggle")
 
-            Text("Naming a speaker also saves a voice fingerprint for them: 256 numbers describing how the voice sounds, written to speaker-profiles.json in Mila's Application Support folder. The audio is not part of it and a fingerprint can't be played back — but it is enough to pick the same person out of a later recording, which is the point of it. Nothing is uploaded: the fingerprints stay on this Mac and are left out of diagnostic reports. They describe everyone whose name you fill in, not only you, so turn this on only where that is yours to decide.")
+            Text("Naming a speaker also saves a voice fingerprint for them: 256 numbers describing how the voice sounds, written to speaker-profiles.json in Mila's Application Support folder. The audio is not part of it and a fingerprint can't be played back — but it is enough to pick the same person out of a later recording, which is the point of it. Nothing is uploaded: the fingerprints stay on this Mac — unless you tick “Include voice profiles” when sharing a recording, which copies the fingerprints for that recording's speakers into the share file — and they are left out of diagnostic reports. They describe everyone whose name you fill in, not only you, so turn this on only where that is yours to decide.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2647,6 +2982,19 @@ private struct VoiceRecognitionSection: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("speakers.voiceRecognition.waiting")
+            }
+
+            if let notice = profileStore.damagedProfilesNotice {
+                damagedProfilesNotice(notice)
+                    // Said here, so the main window need not say it too this
+                    // session (#342) — including an announcement raised
+                    // while this is already showing, e.g. by the toggle
+                    // above. Not recorded as seen: see
+                    // `hideDamagedProfilesAnnouncement`.
+                    .onChange(of: profileStore.damagedProfilesAnnouncement, initial: true) { _, _ in
+                        hideAnnouncementIfInFront()
+                    }
+                    .onChange(of: controlActiveState) { _, _ in hideAnnouncementIfInFront() }
             }
 
             if profileStore.hasStoredProfilesOnDisk {
@@ -2671,14 +3019,134 @@ private struct VoiceRecognitionSection: View {
                 } message: {
                     Text("This deletes speaker-profiles.json and every voice fingerprint in it. Speaker names already on your recordings are untouched, but nobody will be recognised in new ones. This can't be undone.")
                 }
+
+                // One voice at a time — including voices whose name is not
+                // (or no longer) in Known speakers, which the ✕ there cannot
+                // reach. Only while on: while off the file is never loaded,
+                // so there is nothing to list.
+                if settings.isEnabled, !profileStore.profiles.isEmpty {
+                    storedProfilesList
+                }
             }
+
+            if let profileDeletionProblem {
+                VoiceDeletionProblemNote(message: profileDeletionProblem) { self.profileDeletionProblem = nil }
+                    .accessibilityIdentifier("speakers.voiceRecognition.deletionProblem")
+            }
+        }
+        // The notice's "Show in Finder" sends the user off to fix things by
+        // hand; look again when they come back (#336).
+        .onAppear { profileStore.recheckDamagedProfiles() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            profileStore.recheckDamagedProfiles()
+        }
+    }
+
+    private var profileDeletionTitle: String {
+        guard let profile = pendingProfileDeletion else { return "" }
+        return "Delete the voice profile for “\(profile.name)”?"
+    }
+
+    private var isConfirmingProfileDeletion: Binding<Bool> {
+        Binding(get: { pendingProfileDeletion != nil },
+                set: { if !$0 { pendingProfileDeletion = nil } })
+    }
+
+    /// Every stored voice, each with its own delete — the same confirmation
+    /// Known speakers' ✕ asks for a trained voice.
+    private var storedProfilesList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(profileStore.profiles.sorted {
+                    $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
+                }) { profile in
+                    HStack {
+                        Text(profile.name)
+                            .font(.caption)
+                        Spacer()
+                        Button {
+                            profileDeletionProblem = nil
+                            pendingProfileDeletion = profile
+                        } label: {
+                            Image(systemName: "trash")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Delete the voice profile for \"\(profile.name)\"")
+                        .accessibilityIdentifier("speakers.voiceRecognition.profile.delete.\(profile.name)")
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("speakers.voiceRecognition.profile.row.\(profile.name)")
+                }
+            }
+            .padding(.vertical, 4)
+        }
+        .frame(maxHeight: 120)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .alert(profileDeletionTitle,
+               isPresented: isConfirmingProfileDeletion,
+               presenting: pendingProfileDeletion) { profile in
+            Button("Delete", role: .destructive) {
+                let outcome = profileStore.deleteProfile(id: profile.id)
+                profileDeletionProblem = voiceDeletionProblem(outcome, name: profile.name)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { profile in
+            Text("Mila uses this voice fingerprint to recognise “\(profile.name)” in new recordings. Deleting it means they won't be recognised again until you name them and Mila learns their voice anew. Known speakers and the speaker names already on your recordings are unchanged. This can't be undone.")
+        }
+    }
+
+    /// The profiles file could not be read (#336). Without this the voices
+    /// just stop being recognised and the backup sits unannounced in
+    /// Application Support. Same orange callout as the other warnings here.
+    private func damagedProfilesNotice(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(damagedProfilesMessage(notice))
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([notice.fileURL])
+                    }
+                    .accessibilityIdentifier("speakers.voiceRecognition.damaged.showInFinder")
+                    if case .setAside = notice {
+                        Button("Dismiss") { profileStore.dismissDamagedProfilesNotice() }
+                            .accessibilityIdentifier("speakers.voiceRecognition.damaged.dismiss")
+                    }
+                }
+                .font(.caption)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("speakers.voiceRecognition.damaged")
+    }
+
+    private func damagedProfilesMessage(_ notice: SpeakerProfileStore.DamagedProfilesNotice) -> String {
+        switch notice {
+        case .unreadable(let file):
+            return "Your saved voice profiles couldn't be loaded: \(file.lastPathComponent) can't be read, so nobody it describes will be recognised. The file is left untouched — before Mila writes any new voice profile, it renames this one to keep it as a backup."
+        case .setAside(let backup):
+            return "Your previous voice profiles couldn't be loaded, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
         }
     }
 
     /// While the feature is off the profiles file is deliberately never
-    /// parsed, so there is no count to show — only the fact that it exists.
+    /// loaded, so there is no count to show — only the fact that it exists.
     private var storedProfilesLabel: String {
         guard settings.isEnabled else {
+            // The file that failed to load is not "where you left off"; the
+            // notice above says what happened to it.
+            if case .unreadable = profileStore.damagedProfilesNotice {
+                return "Voice profile files are still stored on this Mac. They are only removed if you remove them."
+            }
             return "Voice profiles from an earlier session are still stored on this Mac. Turning the switch back on picks up where you left off; they are only removed if you remove them."
         }
         let n = profileStore.profiles.count
@@ -2713,6 +3181,10 @@ private struct MeetingsSettingsTab: View {
                 .controlSize(.regular)
                 // Meetings' per-section probe for `DetailLayoutUITests`.
                 .accessibilityIdentifier("meetings.enable.toggle")
+                .disabled(settings.isManaged(.meetingDetectionEnabled))
+                if settings.isManaged(.meetingDetectionEnabled) {
+                    ManagedSettingNote(field: .meetingDetectionEnabled)
+                }
 
                 Divider()
 
