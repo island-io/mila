@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import TranscriptionCore
 
 /// Persisted settings for the Live AI mode (split-pane recording with a
 /// background LLM loop emitting action items). Off by default — even with
@@ -240,32 +241,59 @@ final class LiveAISettings: ObservableObject {
         didSet { defaults.set(summaryPrompt, forKey: Keys.summaryPrompt) }
     }
 
-    enum OutputLanguage: String, CaseIterable, Identifiable {
-        case auto = "auto"
-        case english = "en"
-        case hebrew = "he"
+    /// What the AI's summary, action items and Live AI output are written
+    /// in: `auto`, or any language whisper knows (not only the ones in the
+    /// user's list — a choice survives the language being removed). Stored
+    /// under `liveAI.outputLanguage` as its raw value; the old enum's raw
+    /// values were already `auto`/`en`/`he`, so nothing needs migrating.
+    struct OutputLanguage: Hashable, Identifiable {
+        let rawValue: String
 
-        var id: String { rawValue }
+        private init(_ raw: String) { rawValue = raw }
 
-        /// Name we substitute into the prompt's `{{LANGUAGE}}` slot. For
-        /// `.auto` we tell the LLM to match whichever language the
-        /// transcript itself is in — that's the right default since
-        /// most users won't change the setting and a meeting in Hebrew
-        /// shouldn't get English action items.
-        var promptName: String {
-            switch self {
-            case .auto:    return "the same language as the transcript below"
-            case .english: return "English"
-            case .hebrew:  return "Hebrew"
-            }
+        static let auto = OutputLanguage("auto")
+        static let english = OutputLanguage("en")
+        static let hebrew = OutputLanguage("he")
+
+        /// `language` as an explicit output language.
+        init(_ language: RecordingLanguage) { rawValue = language.code }
+
+        /// Read a persisted value. The defaults plist is user-editable, so
+        /// anything other than `auto` or a whisper language code is Auto —
+        /// never a guessed language.
+        init(stored: String?) {
+            let raw = stored?.lowercased() ?? ""
+            self.rawValue = WhisperEngine.supportedLanguageCodes.contains(raw) ? raw : "auto"
         }
 
+        var id: String { rawValue }
+        var isAuto: Bool { rawValue == "auto" }
+
         var displayName: String {
-            switch self {
-            case .auto:    return "Auto"
-            case .english: return "English"
-            case .hebrew:  return "Hebrew"
+            isAuto ? "Auto" : RecordingLanguage.resolve(rawValue, in: RecordingLanguage.seeds).displayName
+        }
+
+        /// The concrete language name a prompt asks for. A concrete "Output
+        /// in Hebrew" is obeyed far more reliably by Claude / cursor-agent
+        /// than "match the transcript", so Auto is resolved here:
+        ///
+        /// - an explicit choice is used as-is;
+        /// - Auto on a language the user added (`ru`, `ar`, …) is that
+        ///   language — the recording's declared language is the best signal
+        ///   there, and the text heuristic only tells Hebrew from Latin;
+        /// - Auto on Hebrew or English reads the text, as it always has, so a
+        ///   Hebrew recording where people spoke English gets English;
+        /// - legacy (`auto`, `""`) and unknown codes say nothing about what
+        ///   was spoken, so they read the text too.
+        static func promptName(output: OutputLanguage, recordingCode: String, text: String) -> String {
+            if !output.isAuto { return output.displayName }
+            let base = recordingCode.lowercased()
+                .split(whereSeparator: { $0 == "-" || $0 == "_" })
+                .first.map(String.init) ?? ""
+            if !["he", "iw", "en"].contains(base), WhisperEngine.supportedLanguageCodes.contains(base) {
+                return RecordingLanguage.resolve(base, in: RecordingLanguage.seeds).displayName
             }
+            return text.isPredominantlyHebrew ? "Hebrew" : "English"
         }
     }
 
@@ -327,8 +355,7 @@ final class LiveAISettings: ObservableObject {
             defaults.set(true, forKey: Keys.simThresholdMigrated)
         }
         self.prompt = defaults.string(forKey: Keys.prompt) ?? Self.defaultPrompt
-        let langRaw = defaults.string(forKey: Keys.outputLanguage) ?? OutputLanguage.auto.rawValue
-        self.outputLanguage = OutputLanguage(rawValue: langRaw) ?? .auto
+        self.outputLanguage = OutputLanguage(stored: defaults.string(forKey: Keys.outputLanguage))
         // Migrate users still on the pre-1.8.x concise default up to the
         // richer `defaultSummaryPrompt`. A nil value (never set) or an exact
         // match of the old default both adopt the new default; any other

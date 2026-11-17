@@ -19,6 +19,7 @@ import SwiftUI
 /// `RecordingContextMenu` rather than a `Picker`: the selection is OPTIONAL
 /// (nil = Default), which a `Picker` over a non-optional enum doesn't model.
 struct SummaryLanguageMenu: View {
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
     /// The recording's current override; nil = following the global setting.
     let current: RecordingLanguage?
     /// The global output language, shown in the Default entry's label so the
@@ -39,7 +40,7 @@ struct SummaryLanguageMenu: View {
             }
             .accessibilityIdentifier("summaryLanguage.default")
             Divider()
-            ForEach(RecordingLanguage.summaryChoices) { lang in
+            ForEach(languageSettings.choices(including: current?.code)) { lang in
                 Button(label("\(lang.label)", selected: current?.code == lang.code)) {
                     onPick(lang)
                 }

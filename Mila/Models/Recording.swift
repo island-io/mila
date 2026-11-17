@@ -159,17 +159,17 @@ struct Recording: Identifiable, Codable, Hashable {
     /// asked for, not what the transcript happened to be in.
     ///
     /// Read through `summaryLanguageOverride`, which refuses anything that
-    /// is not one of the two known codes.
+    /// is not a whisper language code.
     var summaryLanguage: String?
 
     /// `summaryLanguage` as a `RecordingLanguage`, or nil when unset OR
-    /// unrecognised. Deliberately an exact match against `summaryChoices` rather than
-    /// `RecordingLanguage.fromCode`: `fromCode` falls back to Hebrew for any
-    /// unknown string, which would turn a hand-edited `"fr"` in
-    /// recordings.json into a silent Hebrew override. Unknown → nil → the
-    /// global setting applies (`bugbot-rules/untrusted-persisted-data.md`).
+    /// unrecognised. Strict (`RecordingLanguage.summaryLanguage(stored:)`),
+    /// not the lenient `resolve` used for a recording's own language: a
+    /// hand-edited junk value in recordings.json must not become a silent
+    /// override. Unknown → nil → the global setting applies
+    /// (`bugbot-rules/untrusted-persisted-data.md`).
     var summaryLanguageOverride: RecordingLanguage? {
-        summaryLanguage.flatMap { code in RecordingLanguage.summaryChoices.first { $0.code == code } }
+        summaryLanguage.flatMap { RecordingLanguage.summaryLanguage(stored: $0) }
     }
 
     /// Display name of the person who shared this recording, when it arrived

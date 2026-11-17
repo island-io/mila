@@ -118,15 +118,12 @@ struct LiveAIRecordingView: View {
     /// transcript pane: flipping layoutDirection mis-measured inside the
     /// split view / open sidebar and shoved Hebrew to the left.
     private var aiOutputIsRTL: Bool {
-        switch liveAISettings.outputLanguage {
-        case .hebrew: return true
-        case .english: return false
-        case .auto:
-            if RecordingLanguage.isRTL(code: language) { return true }
-            let combined = aiSession.summary + " "
-                + aiSession.actionItems.map(\.text).joined(separator: " ")
-            return combined.isPredominantlyRTL
-        }
+        let output = liveAISettings.outputLanguage
+        if !output.isAuto { return RecordingLanguage.isRTL(code: output.rawValue) }
+        if RecordingLanguage.isRTL(code: language) { return true }
+        let combined = aiSession.summary + " "
+            + aiSession.actionItems.map(\.text).joined(separator: " ")
+        return combined.isPredominantlyRTL
     }
 
     // MARK: - Header

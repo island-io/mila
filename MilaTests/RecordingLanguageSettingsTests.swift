@@ -368,4 +368,24 @@ final class RecordingLanguageSettingsTests: XCTestCase {
         XCTAssertEqual(RecordingLanguage.hebrew.label, "🇮🇱 Hebrew")
         XCTAssertEqual(RecordingLanguage(code: "ru").label, "Russian")
     }
+
+    // MARK: - Picker choices
+
+    func test_choices_are_the_visible_list() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        XCTAssertEqual(settings.choices(including: nil).map(\.code), ["he", "en"])
+        XCTAssertEqual(settings.choices(including: "en").map(\.code), ["he", "en"])
+    }
+
+    /// A summary language picked before its language was removed (or one a
+    /// shared recording brought in) keeps its ✓.
+    func test_choices_keep_a_selection_that_is_not_offered() {
+        let settings = RecordingLanguageSettings(defaults: defaults)
+        settings.add(code: "ru")
+        settings.update(RecordingLanguage(code: "ru", flagEmoji: "🇷🇺"))
+        settings.remove(code: "ru")
+        XCTAssertEqual(settings.choices(including: "ru").map(\.code), ["he", "en", "ru"])
+        XCTAssertEqual(settings.choices(including: "ru").last?.flagEmoji, "🇷🇺")
+        XCTAssertEqual(settings.choices(including: "fr").map(\.code), ["he", "en", "fr"])
+    }
 }

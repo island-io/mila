@@ -368,8 +368,9 @@ final class RecordingTests: XCTestCase {
     /// The per-recording summary-language override round-trips, is OMITTED
     /// from the JSON when unset (so an untouched recordings.json is written
     /// byte-for-byte as before), and a legacy record without the key decodes
-    /// to nil. The typed accessor accepts only the two known codes: anything
-    /// else in the file is treated as "no override", never as Hebrew.
+    /// to nil. The typed accessor accepts only codes whisper knows, exactly as
+    /// the app writes them: anything else in the file is treated as "no
+    /// override", never as Hebrew.
     func test_summaryLanguage_round_trips_is_omitted_when_nil_and_rejects_unknown_codes() throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -392,7 +393,7 @@ final class RecordingTests: XCTestCase {
                        "the summary language is independent of the transcription language")
 
         var unknown = overridden
-        unknown.summaryLanguage = "fr"
+        unknown.summaryLanguage = "klingon"
         XCTAssertNil(unknown.summaryLanguageOverride,
                      "an unrecognised persisted code is not an override (and not Hebrew)")
         unknown.summaryLanguage = "he-IL"

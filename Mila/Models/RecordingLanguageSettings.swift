@@ -88,10 +88,17 @@ struct RecordingLanguage: Identifiable, Hashable, Codable {
     /// The list a fresh install starts with, in picker order.
     static let seeds: [RecordingLanguage] = [.hebrew, .english]
 
-    /// The languages a summary can be written in (per-recording override and
-    /// `LiveAISettings.OutputLanguage`). Fixed to the seeds on purpose: it is
-    /// independent of the user's editable transcription list.
-    static let summaryChoices: [RecordingLanguage] = seeds
+    /// A recording's stored per-recording summary language
+    /// (`Recording.summaryLanguage`), or nil for "no override". Strict: only
+    /// a whisper code exactly as the app writes it. recordings.json and
+    /// .milashare files are untrusted, and a guessed language would be a
+    /// silent override (`bugbot-rules/untrusted-persisted-data.md`). Any
+    /// whisper language is accepted, not only the user's list, so a
+    /// colleague's Russian summary language survives sharing.
+    nonisolated static func summaryLanguage(stored code: String) -> RecordingLanguage? {
+        guard WhisperEngine.supportedLanguageCodes.contains(code) else { return nil }
+        return resolve(code, in: seeds)
+    }
 
     // MARK: - Resolution
 
@@ -224,6 +231,15 @@ final class RecordingLanguageSettings: ObservableObject {
     /// What a stored code means, hidden entries included. Never nil.
     func resolve(_ code: String) -> RecordingLanguage {
         RecordingLanguage.resolve(code, in: languages)
+    }
+
+    /// The entries a language picker offers: the visible list, plus `code`
+    /// at the end when it is set but no longer (or never) offered — a
+    /// summary or output language chosen before the user removed it still
+    /// shows its ✓ instead of silently looking unset.
+    func choices(including code: String?) -> [RecordingLanguage] {
+        guard let code, configured(code) == nil else { return visible }
+        return visible + [resolve(code)]
     }
 
     /// The languages a recording in `code` can be re-transcribed INTO: every

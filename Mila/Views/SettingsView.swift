@@ -1847,6 +1847,7 @@ private struct AIProviderSettingsTab: View {
 private struct AIFeaturesSettingsTab: View {
     @EnvironmentObject private var settings: LLMSettings
     @EnvironmentObject private var liveAI: LiveAISettings
+    @EnvironmentObject private var languageSettings: RecordingLanguageSettings
 
     // Nothing starts expanded: the point of this screen is that you can read
     // and flip every feature without expanding a thing.
@@ -2081,14 +2082,20 @@ private struct AIFeaturesSettingsTab: View {
             HStack(spacing: aiLabelGap) {
                 Text("Output language")
                     .frame(width: labelWidth, alignment: .leading)
+                // A menu, not segments: the list is the user's and can be
+                // long. A choice whose language was removed stays listed
+                // (and selected) until the user picks another.
                 Picker("Output language", selection: $liveAI.outputLanguage) {
-                    ForEach(LiveAISettings.OutputLanguage.allCases) { lang in
-                        Text(lang.displayName).tag(lang)
+                    Text(LiveAISettings.OutputLanguage.auto.displayName).tag(LiveAISettings.OutputLanguage.auto)
+                    Divider()
+                    let selected = liveAI.outputLanguage.isAuto ? nil : liveAI.outputLanguage.rawValue
+                    ForEach(languageSettings.choices(including: selected)) { lang in
+                        Text(lang.label).tag(LiveAISettings.OutputLanguage(lang))
                     }
                 }
-                .pickerStyle(.segmented)
+                .pickerStyle(.menu)
                 .labelsHidden()
-                .frame(maxWidth: 220)
+                .fixedSize()
                 .accessibilityIdentifier("ai.features.outputLanguage")
                 Spacer(minLength: 0)
             }
