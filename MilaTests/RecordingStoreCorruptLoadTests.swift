@@ -82,6 +82,56 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         XCTAssertEqual(store.libraryLoadIssue?.kind, .undecodable)
     }
 
+    /// A row that can't be decoded still has its audio on disk; that audio
+    /// comes back as a "Recovered recording" queued for transcription, and
+    /// the rewritten file loads cleanly on the next launch.
+    func test_a_dropped_row_with_audio_comes_back_as_a_recovered_recording() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        var rows = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
+        rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "lost.wav"])
+        try JSONSerialization.data(withJSONObject: rows).write(to: storeFile)
+        try Data(count: RecordingStore.emptyWAVByteCount + 1)
+            .write(to: tempRoot.appendingPathComponent("Recordings/lost.wav"))
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        let lost = try XCTUnwrap(relaunched.recordings.first { $0.audioFileName == "lost.wav" })
+        XCTAssertTrue(lost.title.hasPrefix("Recovered recording"))
+        XCTAssertEqual(lost.status, .pending)
+        XCTAssertEqual(relaunched.consumePendingRecoveryIDs(), [lost.id])
+        XCTAssertEqual(relaunched.libraryLoadIssue?.kind, .rowsDropped)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.droppedRows, 1)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredRecordings, 1)
+
+        let again = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertNil(again.libraryLoadIssue)
+        XCTAssertEqual(Set(again.recordings.map(\.audioFileName)), ["keep.wav", "lost.wav"])
+        XCTAssertEqual(try damagedBackups().count, 1)
+    }
+
+    /// With no audio to recover nothing else writes the store, so `load()`
+    /// itself must rewrite it — otherwise every launch copies the same
+    /// damaged file to yet another backup.
+    func test_a_damaged_file_is_backed_up_once_not_on_every_launch() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        var rows = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
+        rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "gone.wav"])
+        try JSONSerialization.data(withJSONObject: rows).write(to: storeFile)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredRecordings, 0)
+        _ = RecordingStore(rootDirectory: tempRoot)
+        let third = RecordingStore(rootDirectory: tempRoot)
+
+        XCTAssertNil(third.libraryLoadIssue)
+        XCTAssertEqual(third.recordings.map(\.title), ["Keep"])
+        XCTAssertEqual(try damagedBackups().count, 1)
+    }
+
     /// Closing the banner hides it; it must not lift the write guard, or the
     /// next mutation replaces the unreadable file with this session's list.
     func test_dismissing_the_unreadable_banner_keeps_the_file_untouched() throws {

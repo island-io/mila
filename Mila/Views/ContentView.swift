@@ -1011,10 +1011,25 @@ private struct LibraryLoadIssueBanner: View {
         case .unreadable:
             return "recordings.json exists but can't be read, so it is left untouched and changes won't be saved this session. Audio files on disk are recovered on the next launch."
         case .undecodable:
-            return "Audio files found on disk were re-added where possible. The damaged file was kept as a backup."
+            return recoveryNote(issue) + backupNote(issue)
         case .rowsDropped:
-            return "\(issue.droppedRows) recording(s) in recordings.json couldn't be decoded and are not shown. The original file was kept as a backup."
+            let rows = issue.droppedRows == 1 ? "1 entry" : "\(issue.droppedRows) entries"
+            return "\(rows) in recordings.json couldn't be read. " + recoveryNote(issue) + backupNote(issue)
         }
+    }
+
+    private func recoveryNote(_ issue: RecordingStore.LibraryLoadIssue) -> String {
+        switch issue.recoveredRecordings {
+        case 0: return "No audio files were found to recover."
+        case 1: return "1 audio file was found and re-added as a \u{201C}Recovered recording\u{201D}, which will be transcribed again."
+        default: return "\(issue.recoveredRecordings) audio files were found and re-added as \u{201C}Recovered recording\u{201D} entries, which will be transcribed again."
+        }
+    }
+
+    private func backupNote(_ issue: RecordingStore.LibraryLoadIssue) -> String {
+        issue.backup != nil
+            ? " The original file was kept as a backup."
+            : " A backup copy couldn't be made, so the file is left untouched and changes won't be saved this session."
     }
 }
 

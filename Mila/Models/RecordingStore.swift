@@ -1850,31 +1850,38 @@ final class RecordingStore: ObservableObject {
         decoder.dateDecodingStrategy = .iso8601
         var decoded: [Recording]
         var droppedRows = 0
+        var damage: LibraryLoadIssue.Kind?
         do {
             // Element by element: one row a build can't decode must not take
             // the rest of the library index with it.
             let lossy = try decoder.decode([LossyRecording].self, from: data)
             decoded = lossy.compactMap(\.value)
             droppedRows = lossy.count - decoded.count
+            if droppedRows > 0 {
+                recStoreLog.error("recordings.json: \(droppedRows, privacy: .public) row(s) could not be decoded")
+                damage = .rowsDropped
+            }
         } catch {
             // The array itself is unreadable (truncated / not JSON). Starting
-            // empty is the only option, but `persist()` will replace this
-            // file with whatever the session adds — so keep a copy first.
-            // Orphan recovery below still rebuilds rows from the audio.
+            // empty is the only option. Orphan recovery below still rebuilds
+            // rows from the audio.
             let ns = error as NSError
             recStoreLog.error("""
                 recordings.json could not be decoded \
                 (\(ns.domain, privacy: .public) \(ns.code, privacy: .public))
                 """)
             decoded = []
-            droppedRows = 0
-            libraryLoadIssue = LibraryLoadIssue(
-                kind: .undecodable, droppedRows: 0, backup: setAsideDamagedStore())
+            damage = .undecodable
         }
-        if droppedRows > 0 {
-            recStoreLog.error("recordings.json: \(droppedRows, privacy: .public) row(s) could not be decoded")
-            libraryLoadIssue = LibraryLoadIssue(
-                kind: .rowsDropped, droppedRows: droppedRows, backup: setAsideDamagedStore())
+        // Damaged: keep a copy before anything can replace the original. With
+        // the copy in hand, the file is rewritten from what DID load below, so
+        // the next launch reads it cleanly instead of copying it again. If
+        // the copy failed, the original is the only one left — writes stay
+        // off this session, exactly as for a file that can't be read at all.
+        var backup: URL?
+        if damage != nil {
+            backup = setAsideDamagedStore()
+            if backup == nil { storeIsUnreadable = true }
         }
 
         // Hydrate fullText from the sidecar `.txt`. For records persisted
@@ -1904,20 +1911,35 @@ final class RecordingStore: ObservableObject {
             }
         }
         self.recordings = decoded.sorted { $0.createdAt > $1.createdAt }
+        // A row that could not be decoded is not in `recordings`, so its
+        // `.wav` counts as an orphan here and comes back as a "Recovered
+        // recording" queued for transcription — deliberately: the audio is
+        // the user's data, the row was only its index entry.
         let recovered = recoverOrphanRecordings()
-        if needsMigration || !recovered.isEmpty {
-            persist()  // re-write JSON without inline fullText / with recovered entries
+        if let damage {
+            libraryLoadIssue = LibraryLoadIssue(
+                kind: damage, droppedRows: droppedRows,
+                recoveredRecordings: recovered.count, backup: backup)
+        }
+        if needsMigration || !recovered.isEmpty || damage != nil {
+            // Re-write JSON without inline fullText / with recovered entries /
+            // without the rows that could not be decoded (kept in `backup`).
+            persist()
         }
     }
 
     /// What `load()` could not read from `recordings.json`. `nil` when
     /// the file was missing or fully readable. The unreadable original is
     /// copied to `backup` BEFORE any write can replace it, so nothing is lost
-    /// by carrying on.
+    /// by carrying on; when that copy fails (`backup == nil` on a damaged
+    /// file) nothing is written this session.
     struct LibraryLoadIssue: Equatable {
         enum Kind: Equatable { case unreadable, undecodable, rowsDropped }
         let kind: Kind
         let droppedRows: Int
+        /// Audio files re-added as "Recovered recording" rows at this load —
+        /// the dropped rows' audio among them (plus any genuine crash orphan).
+        var recoveredRecordings: Int = 0
         let backup: URL?
     }
 
@@ -1928,8 +1950,9 @@ final class RecordingStore: ObservableObject {
     /// mutation replace the unreadable file with this session's list.
     func dismissLibraryLoadIssue() { libraryLoadIssue = nil }
 
-    /// `recordings.json` exists but could not be read this session, so
-    /// `persist()` must not replace it. Reset only by the next `load()`.
+    /// `recordings.json` exists but could not be read this session — or was
+    /// damaged and no backup copy could be made — so `persist()` must not
+    /// replace it. Reset only by the next `load()`.
     private(set) var storeIsUnreadable = false
 
     /// Decodes one array element, turning a failure into `nil` instead of
