@@ -345,11 +345,14 @@ struct ContentView: View {
                 // tests can run on any CI machine regardless of how
                 // its `hw.model` is reported.
                 LiveAIRecordingView()
-            } else if !search.trimmingCharacters(in: .whitespaces).isEmpty {
+            } else if !debouncedSearch.trimmingCharacters(in: .whitespaces).isEmpty {
                 // Home is a dashboard with no list to filter, so the
                 // toolbar search used to silently do nothing here. Route
                 // the query to the all-recordings list instead; clearing
-                // the field brings the dashboard back.
+                // the field brings the dashboard back. Keyed on the
+                // DEBOUNCED query: keyed on `search`, the first keystroke
+                // showed the list with an empty filter — the whole library,
+                // unfiltered — until the debounce caught up.
                 HistoryListView(category: .transcriptions, search: debouncedSearch, selection: $selection)
             } else {
                 HomeView(selection: $selection)
