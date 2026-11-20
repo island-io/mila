@@ -114,64 +114,20 @@ enum SpeakerDiarizer {
             throw Error.pythonNotFound(path)
         }
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = arguments
-        var env = ProcessInfo.processInfo.environment
-        if let extra = environment { env.merge(extra) { _, new in new } }
-        process.environment = env
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        // Task cancellation must reach the subprocess. Without this, a
-        // cancelled transcription (user hits Cancel / app shutdown) had no
-        // way to stop a running pyannote pass: `waitUntilExit()` blocked
-        // until the full diarization finished — minutes of CPU on a
-        // recording that may already be deleted, with the serial
-        // transcription queue stalled behind it the whole time.
-        let cancelled = OSAllocatedUnfairLock(initialState: false)
-        return try await withTaskCancellationHandler {
-            try await Task.detached(priority: .userInitiated) {
-                if cancelled.withLock({ $0 }) { throw CancellationError() }
-                try process.run()
-                // Close the narrow window where onCancel ran between the
-                // check above and `run()` — its terminate() hit a not-yet-
-                // launched process and was a no-op.
-                if cancelled.withLock({ $0 }) { process.terminate() }
-
-                // Drain both pipes in detached tasks to avoid deadlock.
-                // macOS pipe buffers are ~64 KB — if the subprocess
-                // fills stderr before we read it, it blocks on write()
-                // while we block on waitUntilExit().
-                let stdoutRead = Task.detached { stdout.fileHandleForReading.readDataToEndOfFile() }
-                let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
-
-                process.waitUntilExit()
-
-                // A SIGTERM'd run surfaces as cancellation, not as a
-                // "diarization failed (exit 15)" error banner. Checked
-                // BEFORE awaiting the drains: the output is discarded
-                // anyway, and `readDataToEndOfFile` only returns at EOF —
-                // which any pipe-inheriting straggler of the killed python
-                // could postpone indefinitely. The abandoned readers exit
-                // on their own when the pipes finally close.
-                if cancelled.withLock({ $0 }) { throw CancellationError() }
-
-                let result = PythonResult(
-                    stdout: await stdoutRead.value,
-                    stderr: await stderrRead.value,
-                    exitCode: process.terminationStatus
-                )
-                // Cancellation that landed while draining still wins.
-                if cancelled.withLock({ $0 }) { throw CancellationError() }
-                return result
-            }.value
-        } onCancel: {
-            cancelled.withLock { $0 = true }
-            if process.isRunning { process.terminate() }
+        // Waited on without parking cooperative-pool threads, and a Task
+        // cancel terminates the child (a cancelled transcription must not
+        // leave a pyannote pass burning CPU for minutes on a recording that
+        // may already be deleted) — see `SubprocessRunner`. No timeout: a
+        // diarization pass over a long recording is legitimately long.
+        do {
+            let result = try await SubprocessRunner.run(
+                executable: URL(fileURLWithPath: path),
+                arguments: arguments,
+                environment: environment)
+            return PythonResult(stdout: result.stdout, stderr: result.stderr,
+                                exitCode: result.exitCode)
+        } catch SubprocessRunner.Failure.launchFailed(let underlying) {
+            throw underlying
         }
     }
 
