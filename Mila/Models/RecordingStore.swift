@@ -4,6 +4,8 @@ import OSLog
 import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
+/// Brackets each `persist()` so Instruments shows what a whole-library write costs.
+private let recStoreSignposter = OSSignposter(logger: recStoreLog)
 
 /// Persists recordings + their metadata under Application Support/Mila.
 ///
@@ -1959,9 +1961,8 @@ final class RecordingStore: ObservableObject {
     @discardableResult
     private func persist() -> Bool {
         retryPendingTranscriptRewrites()
-        let signpost = OSSignposter(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
-        let interval = signpost.beginInterval("persist", id: signpost.makeSignpostID())
-        defer { signpost.endInterval("persist", interval) }
+        let interval = recStoreSignposter.beginInterval("persist", id: recStoreSignposter.makeSignpostID())
+        defer { recStoreSignposter.endInterval("persist", interval) }
         do {
             let data = try Self.encodeLibrary(recordings)
             try data.write(to: storeURL, options: .atomic)
