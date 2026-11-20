@@ -1941,17 +1941,29 @@ final class RecordingStore: ObservableObject {
         return "Recovered recording · \(f.string(from: date))"
     }
 
+    /// The on-disk encoding of `recordings.json`. Compact on purpose: every
+    /// store mutation re-encodes the whole library on the main actor, and
+    /// pretty-printing made each write both slower and several times larger
+    /// for no reader's benefit (`JSONDecoder` and `mila-mcp` ignore
+    /// whitespace). `.sortedKeys` stays so the output is byte-stable.
+    nonisolated static func encodeLibrary(_ recordings: [Recording]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(recordings)
+    }
+
     /// Returns whether `recordings.json` on disk now reflects the in-memory
     /// store. `false` means a separate process still reads the previous
     /// contents — see `update(_:)` for why that has to be reportable.
     @discardableResult
     private func persist() -> Bool {
         retryPendingTranscriptRewrites()
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let signpost = OSSignposter(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
+        let interval = signpost.beginInterval("persist", id: signpost.makeSignpostID())
+        defer { signpost.endInterval("persist", interval) }
         do {
-            let data = try encoder.encode(recordings)
+            let data = try Self.encodeLibrary(recordings)
             try data.write(to: storeURL, options: .atomic)
             return true
         } catch {
