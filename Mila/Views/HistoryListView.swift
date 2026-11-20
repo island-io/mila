@@ -134,25 +134,36 @@ struct BucketedRecordingsView: View {
             }
             .padding(.top, 60)
         } else {
-            // Lazy at both levels: a plain VStack builds a row view for every
-            // recording in the category, visible or not.
-            LazyVStack(alignment: .leading, spacing: 24) {
-                ForEach(buckets, id: \.label) { bucket in
-                    LazyVStack(alignment: .leading, spacing: 6) {
-                        Text(bucket.label)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, 4)
+            // ONE lazy stack whose children are the bucket headers and the
+            // rows themselves: a plain VStack built a row view for every
+            // recording in the category, visible or not. Do not nest lazy
+            // stacks or put the card background on one — an inner lazy stack
+            // gets no viewport of its own, so its height (and a background
+            // sized to it) is an estimate that jumps while scrolling. Each
+            // row draws its own slice of the card instead.
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(buckets.enumerated()), id: \.element.label) { bucketIndex, bucket in
+                    Text(bucket.label)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 4)
+                        .padding(.top, bucketIndex == 0 ? 0 : 24)
+                        .padding(.bottom, 6)
 
-                        LazyVStack(spacing: 0) {
-                            ForEach(Array(bucket.items.enumerated()), id: \.element.id) { idx, rec in
-                                HistoryRow(recording: rec, selection: $selection)
-                                if idx < bucket.items.count - 1 {
-                                    Divider().padding(.leading, 36)
-                                }
+                    ForEach(Array(bucket.items.enumerated()), id: \.element.id) { idx, rec in
+                        let isFirst = idx == 0
+                        let isLast = idx == bucket.items.count - 1
+                        VStack(spacing: 0) {
+                            HistoryRow(recording: rec, selection: $selection)
+                            if !isLast {
+                                Divider().padding(.leading, 36)
                             }
                         }
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                        .background(.regularMaterial, in: UnevenRoundedRectangle(
+                            topLeadingRadius: isFirst ? 10 : 0,
+                            bottomLeadingRadius: isLast ? 10 : 0,
+                            bottomTrailingRadius: isLast ? 10 : 0,
+                            topTrailingRadius: isFirst ? 10 : 0))
                     }
                 }
             }
