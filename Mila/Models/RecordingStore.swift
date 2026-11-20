@@ -1823,10 +1823,57 @@ final class RecordingStore: ObservableObject {
 
     private func load() {
         removeAudioTrimLeftovers()
-        guard let data = try? Data(contentsOf: storeURL) else { return }
+        libraryLoadIssue = nil
+        let data: Data
+        do {
+            data = try Data(contentsOf: storeURL)
+        } catch {
+            // A missing file is a fresh install; anything else (permissions,
+            // an offline volume) means the library exists but can't be read.
+            // Either way nothing is written here, but only the second case
+            // is worth telling the user about.
+            let ns = error as NSError
+            let isMissing = ns.domain == NSCocoaErrorDomain
+                && (ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError)
+            if !isMissing {
+                recStoreLog.error("""
+                    recordings.json could not be read \
+                    (\(ns.domain, privacy: .public) \(ns.code, privacy: .public))
+                    """)
+                libraryLoadIssue = LibraryLoadIssue(kind: .unreadable, droppedRows: 0, backup: nil)
+            }
+            return
+        }
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        guard var decoded = try? decoder.decode([Recording].self, from: data) else { return }
+        var decoded: [Recording]
+        var droppedRows = 0
+        do {
+            // Element by element: one row a build can't decode must not take
+            // the rest of the library index with it.
+            let lossy = try decoder.decode([LossyRecording].self, from: data)
+            decoded = lossy.compactMap(\.value)
+            droppedRows = lossy.count - decoded.count
+        } catch {
+            // The array itself is unreadable (truncated / not JSON). Starting
+            // empty is the only option, but `persist()` will replace this
+            // file with whatever the session adds — so keep a copy first.
+            // Orphan recovery below still rebuilds rows from the audio.
+            let ns = error as NSError
+            recStoreLog.error("""
+                recordings.json could not be decoded \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public))
+                """)
+            decoded = []
+            droppedRows = 0
+            libraryLoadIssue = LibraryLoadIssue(
+                kind: .undecodable, droppedRows: 0, backup: setAsideDamagedStore())
+        }
+        if droppedRows > 0 {
+            recStoreLog.error("recordings.json: \(droppedRows, privacy: .public) row(s) could not be decoded")
+            libraryLoadIssue = LibraryLoadIssue(
+                kind: .rowsDropped, droppedRows: droppedRows, backup: setAsideDamagedStore())
+        }
 
         // Hydrate fullText from the sidecar `.txt`. For records persisted
         // under the old "fullText inline" schema, the legacy decoder filled
@@ -1858,6 +1905,51 @@ final class RecordingStore: ObservableObject {
         let recovered = recoverOrphanRecordings()
         if needsMigration || !recovered.isEmpty {
             persist()  // re-write JSON without inline fullText / with recovered entries
+        }
+    }
+
+    /// What `load()` could not read from `recordings.json` (#new). `nil` when
+    /// the file was missing or fully readable. The unreadable original is
+    /// copied to `backup` BEFORE any write can replace it, so nothing is lost
+    /// by carrying on.
+    struct LibraryLoadIssue: Equatable {
+        enum Kind: Equatable { case unreadable, undecodable, rowsDropped }
+        let kind: Kind
+        let droppedRows: Int
+        let backup: URL?
+    }
+
+    @Published private(set) var libraryLoadIssue: LibraryLoadIssue?
+
+    func dismissLibraryLoadIssue() { libraryLoadIssue = nil }
+
+    /// Decodes one array element, turning a failure into `nil` instead of
+    /// failing the whole array.
+    private struct LossyRecording: Decodable {
+        let value: Recording?
+        init(from decoder: Decoder) throws {
+            value = try? Recording(from: decoder)
+        }
+    }
+
+    /// Copies the unreadable `recordings.json` to
+    /// `recordings.damaged-<timestamp>.json` next to it. A copy, not a move:
+    /// `mila-mcp` keeps reading the original until the app next writes.
+    private func setAsideDamagedStore() -> URL? {
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        let backup = storeURL.deletingLastPathComponent()
+            .appendingPathComponent("recordings.damaged-\(stamp).json")
+        do {
+            try fileManager.copyItem(at: storeURL, to: backup)
+            return backup
+        } catch {
+            let ns = error as NSError
+            recStoreLog.error("""
+                could not keep a copy of the unreadable recordings.json \
+                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public))
+                """)
+            return nil
         }
     }
 
@@ -1946,6 +2038,10 @@ final class RecordingStore: ObservableObject {
     /// contents — see `update(_:)` for why that has to be reportable.
     @discardableResult
     private func persist() -> Bool {
+        // An existing file we could not even read must not be replaced by
+        // this session's (near-empty) list. Audio written meanwhile is picked
+        // up by orphan recovery on the next launch.
+        if libraryLoadIssue?.kind == .unreadable { return false }
         retryPendingTranscriptRewrites()
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
