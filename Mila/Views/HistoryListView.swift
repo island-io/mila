@@ -134,15 +134,17 @@ struct BucketedRecordingsView: View {
             }
             .padding(.top, 60)
         } else {
-            VStack(alignment: .leading, spacing: 24) {
+            // Lazy at both levels: a plain VStack builds a row view for every
+            // recording in the category, visible or not.
+            LazyVStack(alignment: .leading, spacing: 24) {
                 ForEach(buckets, id: \.label) { bucket in
-                    VStack(alignment: .leading, spacing: 6) {
+                    LazyVStack(alignment: .leading, spacing: 6) {
                         Text(bucket.label)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(.secondary)
                             .padding(.leading, 4)
 
-                        VStack(spacing: 0) {
+                        LazyVStack(spacing: 0) {
                             ForEach(Array(bucket.items.enumerated()), id: \.element.id) { idx, rec in
                                 HistoryRow(recording: rec, selection: $selection)
                                 if idx < bucket.items.count - 1 {
@@ -344,10 +346,14 @@ struct RenameSheet: View {
 }
 
 func filterRecordings(_ recs: [Recording], search: String) -> [Recording] {
-    let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+    let q = search.trimmingCharacters(in: .whitespaces)
     guard !q.isEmpty else { return recs }
+    // `range(of:options:)` searches in place. `fullText.lowercased()` built a
+    // lowercased copy of every transcript in the library on each evaluation.
+    let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
     return recs.filter { r in
-        r.title.lowercased().contains(q) || r.fullText.lowercased().contains(q)
+        r.title.range(of: q, options: options) != nil
+            || r.fullText.range(of: q, options: options) != nil
     }
 }
 
