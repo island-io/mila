@@ -370,27 +370,27 @@ enum DiagnosticReporter {
     /// archive identical in shape to what Finder's "Compress" command
     /// makes — most familiar to non-technical recipients.
     static func zipDirectory(_ source: URL, to destination: URL) async throws {
-        try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
-            process.arguments = [
+        // Stderr is drained concurrently (the old code read it only after
+        // `waitUntilExit()`, the pattern the rules file forbids) and the wait
+        // no longer holds a cooperative-pool thread.
+        let result = try await SubprocessRunner.run(
+            executable: URL(fileURLWithPath: "/usr/bin/ditto"),
+            arguments: [
                 "-c", "-k",
                 "--sequesterRsrc",
                 "--keepParent",
                 source.path,
                 destination.path
-            ]
-            let errPipe = Pipe()
-            process.standardError = errPipe
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus != 0 {
-                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(),
-                                 encoding: .utf8) ?? ""
-                throw NSError(domain: "DiagnosticReporter", code: Int(process.terminationStatus),
-                              userInfo: [NSLocalizedDescriptionKey: "ditto failed: \(err)"])
-            }
-        }.value
+            ],
+            stdout: .discard,
+            timeout: 5 * 60)
+        if result.timedOut || result.exitCode != 0 {
+            let err = result.timedOut
+                ? "timed out"
+                : (String(data: result.stderr, encoding: .utf8) ?? "")
+            throw NSError(domain: "DiagnosticReporter", code: Int(result.exitCode),
+                          userInfo: [NSLocalizedDescriptionKey: "ditto failed: \(err)"])
+        }
     }
 }
 
