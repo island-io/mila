@@ -123,10 +123,8 @@ final class RecordingStore: ObservableObject {
             }
             return
         }
-        let appSupport = try! FileManager.default.url(for: .applicationSupportDirectory,
-                                                      in: .userDomainMask,
-                                                      appropriateFor: nil,
-                                                      create: true)
+        // Non-crashing lookup (temp-dir fallback) — see `AppSupportLocation`.
+        let appSupport = AppSupportLocation.directory()
         let newRoot = appSupport.appendingPathComponent("Mila", isDirectory: true)
         // Migration chain: prefer the newer IslandWhisper directory over the
         // older IvritWhisper directory. Whichever exists first in this list
