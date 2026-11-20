@@ -82,6 +82,25 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         XCTAssertEqual(store.libraryLoadIssue?.kind, .undecodable)
     }
 
+    /// Closing the banner hides it; it must not lift the write guard, or the
+    /// next mutation replaces the unreadable file with this session's list.
+    func test_dismissing_the_unreadable_banner_keeps_the_file_untouched() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "A", source: .microphone, audioFileName: "a.wav"))
+        let original = try Data(contentsOf: storeFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: storeFile.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storeFile.path) }
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.kind, .unreadable)
+        relaunched.dismissLibraryLoadIssue()
+        XCTAssertNil(relaunched.libraryLoadIssue)
+        relaunched.add(Recording(title: "B", source: .microphone, audioFileName: "b.wav"))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storeFile.path)
+        XCTAssertEqual(try Data(contentsOf: storeFile), original)
+    }
+
     func test_a_healthy_store_reports_no_issue_and_no_backup() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "A", source: .microphone, audioFileName: "a.wav"))
