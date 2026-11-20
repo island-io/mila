@@ -40,4 +40,15 @@ final class NormalizeTests: XCTestCase {
             XCTAssertLessThanOrEqual(s, 1.0)
         }
     }
+
+    func test_peakMagnitude_matches_the_allocating_formulation() {
+        let input: [Float] = [0.1, -0.7, 0.3, 0.69]
+        XCTAssertEqual(WhisperEngine.peakMagnitude(input), input.map { abs($0) }.max()!)
+        XCTAssertEqual(WhisperEngine.peakMagnitude([]), 0)
+        XCTAssertEqual(WhisperEngine.peakMagnitude([0, 0]), 0)
+    }
+
+    func test_peakMagnitude_ignores_nan() {
+        XCTAssertEqual(WhisperEngine.peakMagnitude([.nan, -0.4, 0.2]), 0.4)
+    }
 }

@@ -1266,7 +1266,8 @@ final class TranscriptionService: ObservableObject {
             let audioURL = store.audioURL(for: working)
             let samples = try AudioConvert.loadAsWhisperSamples(url: audioURL)
             let durationSeconds = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
-            let peak = samples.map { abs($0) }.max() ?? 0
+            // Allocation-free: `map { abs }.max()` copied the whole array.
+            let peak = WhisperEngine.peakMagnitude(samples)
             // The audio FILENAME is title-derived (`freshAudioURL`), so it is
             // `.private`; the sample count, duration and peak are the numbers
             // that make a silent-capture report diagnosable and stay public.
