@@ -17,6 +17,19 @@ final class DiarizationDependencyPinsTests: XCTestCase {
         }
     }
 
+    /// torch 2.2.2 has no wheels past cp312, so a 3.13 interpreter must get a
+    /// clear message instead of pip's "No matching distribution found".
+    func test_python_outside_the_pinned_range_is_refused_with_a_message() {
+        for ok in ["3.9", "3.11", "3.12\n"] {
+            XCTAssertNil(DiarizationDependencyPins.unsupportedPythonMessage(version: ok), ok)
+        }
+        for bad in ["3.8", "3.13", "3.14", "2.7"] {
+            XCTAssertNotNil(DiarizationDependencyPins.unsupportedPythonMessage(version: bad), bad)
+        }
+        XCTAssertNil(DiarizationDependencyPins.unsupportedPythonMessage(version: "garbage"),
+                     "an unparseable probe must fall through to pip")
+    }
+
     func test_bootstrap_wheels_use_the_shared_pins() {
         XCTAssertEqual(DiarizationBootstrap.torchVersion, DiarizationDependencyPins.torch)
         XCTAssertEqual(DiarizationBootstrap.torchaudioVersion, DiarizationDependencyPins.torchaudio)

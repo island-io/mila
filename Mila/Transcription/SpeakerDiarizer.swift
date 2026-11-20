@@ -189,6 +189,19 @@ enum SpeakerDiarizer {
         // `soundfile` is required as an audio backend — pyannote.audio
         // crashes at import time with IndexError if torchaudio finds no
         // backend, and `soundfile` is the most reliable one on macOS.
+        //
+        // The pins only resolve on Python 3.9–3.12; say so up front rather
+        // than surface pip's "No matching distribution found for torch".
+        // A failed probe falls through and lets pip report.
+        let probe = try await runPython(
+            path: pythonPath,
+            arguments: ["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]
+        )
+        if probe.exitCode == 0,
+           let message = DiarizationDependencyPins.unsupportedPythonMessage(
+               version: String(data: probe.stdout, encoding: .utf8) ?? "") {
+            throw Error.diarizationFailed(message)
+        }
         let result = try await runPython(
             path: pythonPath,
             arguments: installDependencyArguments
