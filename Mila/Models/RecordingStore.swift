@@ -1851,12 +1851,20 @@ final class RecordingStore: ObservableObject {
         var decoded: [Recording]
         var droppedRows = 0
         var damage: LibraryLoadIssue.Kind?
+        // Audio of dropped rows that were in Recently Deleted, keyed by file
+        // name, so recovery puts them back there instead of into the library.
+        var trashedOrphans: [String: Date] = [:]
         do {
             // Element by element: one row a build can't decode must not take
             // the rest of the library index with it.
             let lossy = try decoder.decode([LossyRecording].self, from: data)
             decoded = lossy.compactMap(\.value)
             droppedRows = lossy.count - decoded.count
+            for case let salvage? in lossy.map(\.salvage) {
+                if let name = salvage.audioFileName, let deletedAt = salvage.deletedAt {
+                    trashedOrphans[name] = deletedAt
+                }
+            }
             if droppedRows > 0 {
                 recStoreLog.error("recordings.json: \(droppedRows, privacy: .public) row(s) could not be decoded")
                 damage = .rowsDropped
@@ -1913,13 +1921,17 @@ final class RecordingStore: ObservableObject {
         self.recordings = decoded.sorted { $0.createdAt > $1.createdAt }
         // A row that could not be decoded is not in `recordings`, so its
         // `.wav` counts as an orphan here and comes back as a "Recovered
-        // recording" queued for transcription — deliberately: the audio is
-        // the user's data, the row was only its index entry.
-        let recovered = recoverOrphanRecordings()
+        // recording" — deliberately: the audio is the user's data, the row
+        // was only its index entry. Its `.txt` sidecar and, when the row
+        // still says so, its place in Recently Deleted come back with it.
+        let recovered = recoverOrphanRecordings(trashed: trashedOrphans)
         if let damage {
             libraryLoadIssue = LibraryLoadIssue(
                 kind: damage, droppedRows: droppedRows,
-                recoveredRecordings: recovered.count, backup: backup)
+                recoveredRecordings: recovered.count,
+                recoveredToTrash: recovered.filter { $0.deletedAt != nil }.count,
+                recoveredForTranscription: recovered.filter { $0.status == .pending }.count,
+                backup: backup)
         }
         if needsMigration || !recovered.isEmpty || damage != nil {
             // Re-write JSON without inline fullText / with recovered entries /
@@ -1940,6 +1952,10 @@ final class RecordingStore: ObservableObject {
         /// Audio files re-added as "Recovered recording" rows at this load —
         /// the dropped rows' audio among them (plus any genuine crash orphan).
         var recoveredRecordings: Int = 0
+        /// Of those, how many went back to Recently Deleted (their row was
+        /// trashed) and how many have no saved transcript and are queued.
+        var recoveredToTrash: Int = 0
+        var recoveredForTranscription: Int = 0
         let backup: URL?
     }
 
@@ -1959,8 +1975,31 @@ final class RecordingStore: ObservableObject {
     /// failing the whole array.
     private struct LossyRecording: Decodable {
         let value: Recording?
+        /// What could still be read from a row that failed to decode.
+        let salvage: Salvage?
         init(from decoder: Decoder) throws {
-            value = try? Recording(from: decoder)
+            if let recording = try? Recording(from: decoder) {
+                value = recording
+                salvage = nil
+            } else {
+                value = nil
+                salvage = try? Salvage(from: decoder)
+            }
+        }
+    }
+
+    /// The fields orphan recovery needs from a row that no longer decodes as
+    /// a `Recording`: which audio file it indexed and whether it was in
+    /// Recently Deleted. Each is read on its own so one bad field doesn't
+    /// hide the other.
+    private struct Salvage: Decodable {
+        let audioFileName: String?
+        let deletedAt: Date?
+        private enum CodingKeys: String, CodingKey { case audioFileName, deletedAt }
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            audioFileName = try? c.decodeIfPresent(String.self, forKey: .audioFileName)
+            deletedAt = try? c.decodeIfPresent(Date.self, forKey: .deletedAt)
         }
     }
 
@@ -2014,8 +2053,18 @@ final class RecordingStore: ObservableObject {
     /// in the list and so the launch-time recovery sweep can enqueue them
     /// for transcription. Returns the list of newly-added recordings so
     /// the caller can decide whether to re-persist.
+    ///
+    /// An orphan can also be the audio of a `recordings.json` row that failed
+    /// to decode. Two things then differ from a crash orphan:
+    /// - Its `.txt` sidecar may exist. That file is the only copy of the
+    ///   transcript (and of any edits to it), so it is loaded and the row is
+    ///   settled as `.completed` instead of re-transcribed, which would
+    ///   replace the file or, for a silent result, delete it.
+    /// - `trashed` names the audio of dropped rows that were in Recently
+    ///   Deleted (trash keeps its audio on disk until purged); those go back
+    ///   to the trash, not into the library, and are never queued.
     @discardableResult
-    private func recoverOrphanRecordings() -> [Recording] {
+    private func recoverOrphanRecordings(trashed: [String: Date] = [:]) -> [Recording] {
         let referenced = Set(recordings.map { $0.audioFileName })
         guard let entries = try? fileManager.contentsOfDirectory(
             at: recordingsDirectory,
@@ -2034,7 +2083,7 @@ final class RecordingStore: ObservableObject {
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
             if size <= Self.emptyWAVByteCount { continue }
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
-            let recovered = Recording(
+            var recovered = Recording(
                 title: recoveryTitle(at: mtime),
                 createdAt: mtime,
                 duration: 0,  // filled in by the transcription path
@@ -2042,9 +2091,21 @@ final class RecordingStore: ObservableObject {
                 audioFileName: name,
                 status: .pending
             )
+            if let text = try? String(contentsOf: transcriptURL(for: recovered), encoding: .utf8),
+               !text.isEmpty {
+                recovered.fullText = text
+                recovered.status = .completed
+            }
+            if let deletedAt = trashed[name] {
+                recovered.deletedAt = deletedAt
+                // Nothing in the trash is transcribed; a restore can retry.
+                if recovered.status == .pending { recovered.status = .failed }
+            }
             recordings.insert(recovered, at: 0)
             added.append(recovered)
-            pendingRecoveryIDs.append(recovered.id)
+            if recovered.status == .pending {
+                pendingRecoveryIDs.append(recovered.id)
+            }
             // `name` came off disk and is title-derived for anything that
             // arrived through the import path.
             recStoreLog.log("""

@@ -1019,11 +1019,26 @@ private struct LibraryLoadIssueBanner: View {
     }
 
     private func recoveryNote(_ issue: RecordingStore.LibraryLoadIssue) -> String {
-        switch issue.recoveredRecordings {
-        case 0: return "No audio files were found to recover."
-        case 1: return "1 audio file was found and re-added as a \u{201C}Recovered recording\u{201D}, which will be transcribed again."
-        default: return "\(issue.recoveredRecordings) audio files were found and re-added as \u{201C}Recovered recording\u{201D} entries, which will be transcribed again."
+        let n = issue.recoveredRecordings
+        guard n > 0 else { return "No audio files were found to recover." }
+        var note = n == 1
+            ? "1 audio file was found and re-added as a \u{201C}Recovered recording\u{201D}."
+            : "\(n) audio files were found and re-added as \u{201C}Recovered recording\u{201D} entries."
+        let trashed = issue.recoveredToTrash
+        if trashed > 0 {
+            note += trashed == n
+                ? (n == 1 ? " It was in Recently Deleted and is back there." : " They were in Recently Deleted and are back there.")
+                : " \(trashed) of them were in Recently Deleted and are back there."
         }
+        let queued = issue.recoveredForTranscription
+        if queued == n {
+            note += n == 1 ? " It will be transcribed again." : " They will be transcribed again."
+        } else if queued > 0 {
+            note += " Saved transcripts were kept; \(queued == 1 ? "1 recording" : "\(queued) recordings") without one will be transcribed again."
+        } else if n - trashed > 0 {
+            note += " Saved transcripts were kept."
+        }
+        return note
     }
 
     private func backupNote(_ issue: RecordingStore.LibraryLoadIssue) -> String {
