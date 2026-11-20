@@ -111,6 +111,59 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         XCTAssertEqual(try damagedBackups().count, 1)
     }
 
+    /// The `.txt` sidecar is the only copy of a transcript (and of edits to
+    /// it). A dropped row's recovery must load it, not re-transcribe over it.
+    func test_a_dropped_row_keeps_its_saved_transcript_and_is_not_retranscribed() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        var rows = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
+        rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "lost.wav"])
+        try JSONSerialization.data(withJSONObject: rows).write(to: storeFile)
+        let recordings = tempRoot.appendingPathComponent("Recordings")
+        try Data(count: RecordingStore.emptyWAVByteCount + 1)
+            .write(to: recordings.appendingPathComponent("lost.wav"))
+        let sidecar = recordings.appendingPathComponent("lost.txt")
+        try "Edited transcript".write(to: sidecar, atomically: true, encoding: .utf8)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        let lost = try XCTUnwrap(relaunched.recordings.first { $0.audioFileName == "lost.wav" })
+        XCTAssertTrue(lost.title.hasPrefix("Recovered recording"))
+        XCTAssertEqual(lost.status, .completed)
+        XCTAssertEqual(lost.fullText, "Edited transcript")
+        XCTAssertTrue(relaunched.consumePendingRecoveryIDs().isEmpty)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredRecordings, 1)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredForTranscription, 0)
+        XCTAssertEqual(try String(contentsOf: sidecar, encoding: .utf8), "Edited transcript")
+    }
+
+    /// Trash keeps its audio on disk until purged. A dropped row that was in
+    /// Recently Deleted must go back there, not reappear in the library.
+    func test_a_dropped_trashed_row_goes_back_to_recently_deleted() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        var rows = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
+        rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "trashed.wav",
+                     "deletedAt": "2026-11-01T10:00:00Z"])
+        try JSONSerialization.data(withJSONObject: rows).write(to: storeFile)
+        try Data(count: RecordingStore.emptyWAVByteCount + 1)
+            .write(to: tempRoot.appendingPathComponent("Recordings/trashed.wav"))
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        let trashed = try XCTUnwrap(relaunched.recordings.first { $0.audioFileName == "trashed.wav" })
+        XCTAssertEqual(trashed.deletedAt, ISO8601DateFormatter().date(from: "2026-11-01T10:00:00Z"))
+        XCTAssertNotEqual(trashed.status, .pending)
+        XCTAssertTrue(relaunched.consumePendingRecoveryIDs().isEmpty)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredToTrash, 1)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredForTranscription, 0)
+
+        let again = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertNotNil(again.recordings.first { $0.audioFileName == "trashed.wav" }?.deletedAt)
+    }
+
     /// With no audio to recover nothing else writes the store, so `load()`
     /// itself must rewrite it — otherwise every launch copies the same
     /// damaged file to yet another backup.
