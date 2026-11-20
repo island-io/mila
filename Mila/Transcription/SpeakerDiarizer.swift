@@ -177,14 +177,21 @@ enum SpeakerDiarizer {
 
     // MARK: - Public API
 
+    /// `pip` arguments for the user-Python install. Pinned through
+    /// `DiarizationDependencyPins` (no `--upgrade`: an exact `==` requirement
+    /// already moves an older or newer install onto the tested version, while
+    /// `--upgrade` would also float every transitive dependency).
+    static var installDependencyArguments: [String] {
+        ["-m", "pip", "install"] + DiarizationDependencyPins.userPythonRequirements
+    }
+
     static func installDependencies(pythonPath: String) async throws -> String {
         // `soundfile` is required as an audio backend — pyannote.audio
         // crashes at import time with IndexError if torchaudio finds no
         // backend, and `soundfile` is the most reliable one on macOS.
         let result = try await runPython(
             path: pythonPath,
-            arguments: ["-m", "pip", "install", "--upgrade",
-                        "pyannote.audio", "torch", "soundfile", "huggingface_hub<1.0"]
+            arguments: installDependencyArguments
         )
         let output = String(data: result.stdout, encoding: .utf8) ?? ""
         guard result.exitCode == 0 else {
