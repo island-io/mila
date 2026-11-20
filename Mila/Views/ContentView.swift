@@ -43,6 +43,7 @@ struct ContentView: View {
                     // A leaf view, so `ContentView` itself does not observe
                     // the profile store (#342).
                     DamagedVoiceProfilesBanner()
+                    LibraryLoadIssueBanner()
                 }
                 .padding(.top, 8)
 
@@ -949,6 +950,70 @@ private struct DamagedVoiceProfilesBanner: View {
             return "\(file.lastPathComponent) can't be read, so nobody saved in it will be recognised in new recordings. The file is left untouched. Settings → Speakers → Voice recognition has the details."
         case .setAside(let backup):
             return "Your earlier voice profiles couldn't be read, so speakers saved before then are no longer recognised. The unreadable file was kept as a backup: \(backup.lastPathComponent)."
+        }
+    }
+}
+
+/// Tells the user that `recordings.json` could not be fully read. The
+/// unreadable file is kept (copied to a `recordings.damaged-*.json` backup)
+/// before anything can overwrite it. A leaf view so `ContentView` does not
+/// observe the store for this.
+private struct LibraryLoadIssueBanner: View {
+    @EnvironmentObject private var store: RecordingStore
+
+    var body: some View {
+        if let issue = store.libraryLoadIssue {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title(issue)).font(.callout.weight(.semibold))
+                    Text(message(issue))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let backup = issue.backup {
+                        Button("Show backup in Finder") {
+                            NSWorkspace.shared.activateFileViewerSelecting([backup])
+                        }
+                        .controlSize(.small)
+                    }
+                }
+                Button { store.dismissLibraryLoadIssue() } label: {
+                    Image(systemName: "xmark").font(.system(size: 10, weight: .semibold))
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Close")
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(maxWidth: 480, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.orange.opacity(0.35), lineWidth: 1))
+            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            .padding(.horizontal, 16)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("main.libraryLoadIssue")
+        }
+    }
+
+    private func title(_ issue: RecordingStore.LibraryLoadIssue) -> String {
+        switch issue.kind {
+        case .unreadable: return "Your recordings list can't be read"
+        case .undecodable: return "Your recordings list is damaged"
+        case .rowsDropped: return "Some recordings couldn't be loaded"
+        }
+    }
+
+    private func message(_ issue: RecordingStore.LibraryLoadIssue) -> String {
+        switch issue.kind {
+        case .unreadable:
+            return "recordings.json exists but can't be read, so it is left untouched and changes won't be saved this session. Audio files on disk are recovered on the next launch."
+        case .undecodable:
+            return "Audio files found on disk were re-added where possible. The damaged file was kept as a backup."
+        case .rowsDropped:
+            return "\(issue.droppedRows) recording(s) in recordings.json couldn't be decoded and are not shown. The original file was kept as a backup."
         }
     }
 }
