@@ -135,12 +135,7 @@ final class DiarizationBootstrap: ObservableObject {
     /// demand. Living under Application Support means upgrades don't lose
     /// the install — only an explicit reinstall clears it.
     nonisolated static var userSitePackages: URL {
-        let appSupport = try! FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
+        let appSupport = AppSupportLocation.directory()
         return appSupport
             .appendingPathComponent("Mila", isDirectory: true)
             .appendingPathComponent("torch-site-packages", isDirectory: true)
