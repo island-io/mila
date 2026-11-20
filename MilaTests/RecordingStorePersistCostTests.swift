@@ -38,8 +38,12 @@ final class RecordingStorePersistCostTests: XCTestCase {
     }
 
     /// Not an assertion on speed (CI machines vary): it records, in the test
-    /// log, what one `persist()` costs at realistic library sizes.
+    /// log, what one `persist()` costs at realistic library sizes. Opt-in
+    /// (`MILA_PERSIST_COST=1`): it builds 1.2M segments and encodes them
+    /// twice, hundreds of MB and many seconds on every ordinary test run.
     func test_measure_encode_cost_at_realistic_sizes() throws {
+        try XCTSkipUnless(ProcessInfo.processInfo.environment["MILA_PERSIST_COST"] == "1",
+                          "Set MILA_PERSIST_COST=1 to print the persist() cost measurement.")
         for (count, segs) in [(500, 600), (2000, 600)] {
             let recs = library(recordings: count, segments: segs)
             let clock = ContinuousClock()
