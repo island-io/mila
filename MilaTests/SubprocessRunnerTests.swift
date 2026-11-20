@@ -58,7 +58,12 @@ final class SubprocessRunnerTests: XCTestCase {
         do {
             _ = try await SubprocessRunner.run(executable: URL(fileURLWithPath: "/nonexistent/tool"), arguments: [])
             XCTFail("expected a launch failure")
-        } catch SubprocessRunner.Failure.launchFailed {
+        } catch let failure as SubprocessRunner.Failure {
+            guard case .launchFailed(let underlying) = failure else { return XCTFail("unexpected \(failure)") }
+            // Callers that only read `localizedDescription` must get the
+            // Cocoa reason, not "SubprocessRunner.Failure error 0".
+            XCTAssertEqual(failure.localizedDescription, underlying.localizedDescription)
+            XCTAssertFalse(failure.localizedDescription.contains("SubprocessRunner"))
         } catch {
             XCTFail("unexpected \(error)")
         }
