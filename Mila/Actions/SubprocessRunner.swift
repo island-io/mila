@@ -44,8 +44,17 @@ enum SubprocessRunner {
         let timedOut: Bool
     }
 
-    enum Failure: Swift.Error {
+    /// `LocalizedError` so a caller that only reads `localizedDescription`
+    /// (bootstrap stages, diagnostics) shows the underlying Cocoa reason —
+    /// "The file “python3” doesn't exist." — not "SubprocessRunner.Failure error 0".
+    enum Failure: LocalizedError {
         case launchFailed(Swift.Error)
+
+        var errorDescription: String? {
+            switch self {
+            case .launchFailed(let underlying): return underlying.localizedDescription
+            }
+        }
     }
 
     /// How long to wait for a child to die after SIGTERM before SIGKILL.
