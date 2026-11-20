@@ -1824,6 +1824,7 @@ final class RecordingStore: ObservableObject {
     private func load() {
         removeAudioTrimLeftovers()
         libraryLoadIssue = nil
+        storeIsUnreadable = false
         let data: Data
         do {
             data = try Data(contentsOf: storeURL)
@@ -1841,6 +1842,7 @@ final class RecordingStore: ObservableObject {
                     (\(ns.domain, privacy: .public) \(ns.code, privacy: .public))
                     """)
                 libraryLoadIssue = LibraryLoadIssue(kind: .unreadable, droppedRows: 0, backup: nil)
+                storeIsUnreadable = true
             }
             return
         }
@@ -1908,7 +1910,7 @@ final class RecordingStore: ObservableObject {
         }
     }
 
-    /// What `load()` could not read from `recordings.json` (#new). `nil` when
+    /// What `load()` could not read from `recordings.json`. `nil` when
     /// the file was missing or fully readable. The unreadable original is
     /// copied to `backup` BEFORE any write can replace it, so nothing is lost
     /// by carrying on.
@@ -1921,7 +1923,14 @@ final class RecordingStore: ObservableObject {
 
     @Published private(set) var libraryLoadIssue: LibraryLoadIssue?
 
+    /// Hides the banner only. The write guard is `storeIsUnreadable`, which a
+    /// dismissal must not lift — otherwise closing the banner let the next
+    /// mutation replace the unreadable file with this session's list.
     func dismissLibraryLoadIssue() { libraryLoadIssue = nil }
+
+    /// `recordings.json` exists but could not be read this session, so
+    /// `persist()` must not replace it. Reset only by the next `load()`.
+    private(set) var storeIsUnreadable = false
 
     /// Decodes one array element, turning a failure into `nil` instead of
     /// failing the whole array.
@@ -2041,7 +2050,7 @@ final class RecordingStore: ObservableObject {
         // An existing file we could not even read must not be replaced by
         // this session's (near-empty) list. Audio written meanwhile is picked
         // up by orphan recovery on the next launch.
-        if libraryLoadIssue?.kind == .unreadable { return false }
+        if storeIsUnreadable { return false }
         retryPendingTranscriptRewrites()
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
