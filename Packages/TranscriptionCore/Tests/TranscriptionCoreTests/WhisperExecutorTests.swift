@@ -85,7 +85,7 @@ final class WhisperExecutorTests: XCTestCase {
 
     /// Polls until at least `count` jobs wait on the (parked) whisper thread.
     /// Callers pass the count they read before queueing plus their own jobs,
-    /// so a job queued by something else cannot stand in for one of theirs.
+    /// so a job that was already waiting cannot stand in for one of theirs.
     private func waitUntilQueued(_ count: Int) async throws {
         let deadline = Date().addingTimeInterval(10)
         while WhisperThreadExecutor.shared.queuedJobCount < count, Date() < deadline {

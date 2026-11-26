@@ -34,9 +34,7 @@ import Foundation
 /// task afterwards does not move it up. None of those callers sets a
 /// priority explicitly, so each job carries the priority of the task that
 /// made the call, and a lower-priority one (a batch pass enqueued from a
-/// background task, say) waits while higher-priority jobs are queued. Each
-/// of those callers has at most one whisper call in flight, so holding it
-/// back for long would take several higher-priority callers at once.
+/// background task, say) waits while higher-priority jobs are queued.
 ///
 /// **One thread, shared.** `static let shared` lives as long as the process,
 /// so the thread is never torn down and never leaks per instance. Every
