@@ -18,6 +18,13 @@ struct ContentView: View {
 
     @State private var selection: SidebarSelection? = .home
     @State private var search: String = ""
+    /// `search` after a short pause, handed to the recordings lists. Each
+    /// list re-filters every transcript whenever its body runs, and a new
+    /// query is one of the things that makes it run, so the query must not
+    /// follow every keystroke. This only debounces typing. Other updates that
+    /// re-render the list still re-filter it (#408 leaves a result cache for
+    /// later). Clearing the field applies at once.
+    @State private var debouncedSearch: String = ""
     /// Tracked so we can ping the AppKit chrome hack whenever the user
     /// toggles the sidebar. Without this, the sidebar's
     /// NSVisualEffectView is freshly added with default `.behindWindow`
@@ -91,6 +98,14 @@ struct ContentView: View {
             }
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Search")
+        .task(id: search) {
+            if search.trimmingCharacters(in: .whitespaces).isEmpty {
+                debouncedSearch = search
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(200))
+            if !Task.isCancelled { debouncedSearch = search }
+        }
         .alert(
             "Transcription error",
             isPresented: Binding(
@@ -333,12 +348,15 @@ struct ContentView: View {
                 // tests can run on any CI machine regardless of how
                 // its `hw.model` is reported.
                 LiveAIRecordingView()
-            } else if !search.trimmingCharacters(in: .whitespaces).isEmpty {
+            } else if !debouncedSearch.trimmingCharacters(in: .whitespaces).isEmpty {
                 // Home is a dashboard with no list to filter, so the
                 // toolbar search used to silently do nothing here. Route
                 // the query to the all-recordings list instead; clearing
-                // the field brings the dashboard back.
-                HistoryListView(category: .transcriptions, search: search, selection: $selection)
+                // the field brings the dashboard back. Keyed on the
+                // DEBOUNCED query: keyed on `search`, the first keystroke
+                // showed the list with an empty filter — the whole library,
+                // unfiltered — until the debounce caught up.
+                HistoryListView(category: .transcriptions, search: debouncedSearch, selection: $selection)
             } else {
                 HomeView(selection: $selection)
             }
@@ -347,11 +365,11 @@ struct ContentView: View {
         case .more:
             MoreView()
         case .category(let cat):
-            HistoryListView(category: cat, search: search, selection: $selection)
+            HistoryListView(category: cat, search: debouncedSearch, selection: $selection)
         case .defaultFolder:
-            DefaultFolderListView(search: search, selection: $selection)
+            DefaultFolderListView(search: debouncedSearch, selection: $selection)
         case .folder(let name):
-            FolderListView(folderName: name, search: search, selection: $selection)
+            FolderListView(folderName: name, search: debouncedSearch, selection: $selection)
         case .recording(let id):
             if let rec = store.recordings.first(where: { $0.id == id }) {
                 // .id(rec.id) forces SwiftUI to discard and rebuild the view

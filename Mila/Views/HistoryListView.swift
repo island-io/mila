@@ -134,23 +134,45 @@ struct BucketedRecordingsView: View {
             }
             .padding(.top, 60)
         } else {
-            VStack(alignment: .leading, spacing: 24) {
-                ForEach(buckets, id: \.label) { bucket in
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(bucket.label)
-                            .font(.subheadline.weight(.semibold))
-                            .foregroundStyle(.secondary)
-                            .padding(.leading, 4)
+            // ONE lazy stack whose children are the bucket headers and the
+            // rows themselves: a plain VStack built a row view for every
+            // recording in the category, visible or not. Do not nest lazy
+            // stacks or put the card background on one. An inner lazy stack
+            // gets no viewport of its own, so a background sized to it
+            // follows an estimated height and can be drawn in the wrong
+            // place while scrolling. Each row draws its own slice of the
+            // card instead, so the card always matches the rows that exist.
+            // Rows still vary in height (0-2 preview lines), so the scroll
+            // bar can adjust as rows not yet built are measured. That is
+            // normal for any lazy stack.
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(buckets.enumerated()), id: \.element.label) { bucketIndex, bucket in
+                    Text(bucket.label)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 4)
+                        .padding(.top, bucketIndex == 0 ? 0 : 24)
+                        .padding(.bottom, 6)
 
+                    ForEach(Array(bucket.items.enumerated()), id: \.element.id) { idx, rec in
+                        let isFirst = idx == 0
+                        let isLast = idx == bucket.items.count - 1
+                        let card = UnevenRoundedRectangle(
+                            topLeadingRadius: isFirst ? 10 : 0,
+                            bottomLeadingRadius: isLast ? 10 : 0,
+                            bottomTrailingRadius: isLast ? 10 : 0,
+                            topTrailingRadius: isFirst ? 10 : 0)
                         VStack(spacing: 0) {
-                            ForEach(Array(bucket.items.enumerated()), id: \.element.id) { idx, rec in
-                                HistoryRow(recording: rec, selection: $selection)
-                                if idx < bucket.items.count - 1 {
-                                    Divider().padding(.leading, 36)
-                                }
+                            HistoryRow(recording: rec, selection: $selection)
+                            if !isLast {
+                                Divider().padding(.leading, 36)
                             }
                         }
-                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 10))
+                        .background(.regularMaterial, in: card)
+                        // The row's hover and selection fill is a plain
+                        // rectangle. Clip it to the card, or the first and
+                        // last rows show square corners on hover.
+                        .clipShape(card)
                     }
                 }
             }
@@ -344,12 +366,27 @@ struct RenameSheet: View {
 }
 
 func filterRecordings(_ recs: [Recording], search: String) -> [Recording] {
-    let q = search.trimmingCharacters(in: .whitespaces).lowercased()
+    let q = search.trimmingCharacters(in: .whitespaces)
     guard !q.isEmpty else { return recs }
+    // Case- and diacritic-insensitive, searched in place. Keep `locale:`.
+    // Without it, Foundation compares character by character, which
+    // measured 3-5x SLOWER on a miss than the old `lowercased().contains`.
+    // Misses are the common case, since most transcripts don't match.
+    // With a locale it uses ICU's string search, which measured 3-4x FASTER
+    // than the old code on English and Hebrew transcripts alike (#408).
+    // The locale is FIXED, not `.current`. Under a Turkish locale "invoice"
+    // stops matching "INVOICE" (dotted/dotless i), and results would vary
+    // from Mac to Mac.
+    let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
     return recs.filter { r in
-        r.title.lowercased().contains(q) || r.fullText.lowercased().contains(q)
+        r.title.range(of: q, options: options, locale: searchLocale) != nil
+            || r.fullText.range(of: q, options: options, locale: searchLocale) != nil
     }
 }
+
+/// See `filterRecordings`: a fixed locale gives the same matching on every
+/// Mac and still takes Foundation's fast, locale-aware search path.
+private let searchLocale = Locale(identifier: "en_US_POSIX")
 
 struct DateBucket {
     let label: String
