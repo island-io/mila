@@ -28,10 +28,8 @@ final class DictationController: ObservableObject {
     @Published private(set) var lastLanguage: String = "he"
 
     private let recorder: MicrophoneRecorder
-    /// Every `MicrophoneRecorder.stop()` this controller has started and that
-    /// has not returned yet. A start is refused while there is one; see
-    /// `RecorderTeardowns`.
-    private let recorderTeardowns: RecorderTeardowns
+    /// `recorder.stop()`, unless a test stands in for it.
+    private let stopRecorderNow: @MainActor () async -> Void
     private var samples: [Float] = []
     private var streamTask: Task<Void, Never>?
     /// True while `start(action:)` is between its entry and setting
@@ -44,6 +42,16 @@ final class DictationController: ObservableObject {
     /// always has, and without this flag `toggle` would route a double-tap
     /// in that wait into a second stop.
     private var isStopping = false
+    /// Cancels waiting for the recorder they stopped. Such a cancel has
+    /// already set `.idle`, and a press in that wait must not start a new
+    /// dictation whose bring-up races the old engine's teardown on the same
+    /// recorder. Bounded by `recorderTeardownDeadline`, like `isStopping`.
+    private var cancelsTearingDown = 0
+    /// A stop or a cancel is waiting for the recorder to tear down. Every
+    /// press is ignored meanwhile (see `outcome(ofPress:state:isTearingDown:)`),
+    /// and the wait is bounded by `recorderTeardownDeadline`, so this always
+    /// clears.
+    private var isTearingDown: Bool { isStopping || cancelsTearingDown > 0 }
     /// Bumped by every `cancelInFlight` that acts. A stop compares it twice:
     ///  * across its recorder teardown — a sleep, screen-lock or quit cancel
     ///    can run in that wait (the state still reads `.recording`) and has
@@ -59,8 +67,8 @@ final class DictationController: ObservableObject {
     /// its own, and `engine.stop()` can block on the CoreAudio HAL queue
     /// (a Bluetooth mic mid-profile-switch). Past this, the stop carries on
     /// with the audio it already has, just as an in-time stop does (cancel
-    /// check included). The teardown keeps running — and the mic stays open
-    /// until it returns — and no new dictation starts until it has.
+    /// check included), and presses work again. The teardown keeps running,
+    /// and the mic stays open until it returns.
     static let recorderTeardownDeadline: TimeInterval = 10
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
@@ -101,7 +109,7 @@ final class DictationController: ObservableObject {
     /// so a full library blocks new clips consistently with Settings copy.
     var storageSettings: RecordingStorageSettings?
 
-    /// `registersHotkeys` and `recorderTeardowns` exist for tests: a test
+    /// `registersHotkeys` and `stopRecorder` exist for tests: a test
     /// controller must not take the host app's global hotkeys, and needs a
     /// recorder teardown it can hold.
     init(store: RecordingStore,
@@ -109,11 +117,10 @@ final class DictationController: ObservableObject {
          hotkeySettings: HotkeySettings,
          liveTranscriber: LiveTranscriber,
          registersHotkeys: Bool = true,
-         recorderTeardowns: RecorderTeardowns? = nil) {
+         stopRecorder: (@MainActor () async -> Void)? = nil) {
         let recorder = MicrophoneRecorder()
         self.recorder = recorder
-        self.recorderTeardowns = recorderTeardowns
-            ?? RecorderTeardowns(deadline: Self.recorderTeardownDeadline) { await recorder.stop() }
+        self.stopRecorderNow = stopRecorder ?? { await recorder.stop() }
         self.store = store
         self.transcription = transcription
         self.hotkeySettings = hotkeySettings
@@ -147,22 +154,12 @@ final class DictationController: ObservableObject {
             await start(action: action)
         case .stop:
             await stopAndTranscribe(action: action)
-        case .refuseStart:
-            // The beep is all the user hears, so leave the reason in the log.
-            if recorderTeardowns.isShuttingDown {
-                dictationLog.log("""
-                    dictation not started: the microphone hasn't finished shutting down from \
-                    the last dictation (teardowns=\(self.recorderTeardowns.outstanding))
-                    """)
-            } else {
-                dictationLog.log("dictation not started: the last dictation is still stopping")
-            }
-            NSSound.beep()
         case .ignore:
+            // The beep is all the user hears, so leave the reason in the log.
             dictationLog.log("""
                 press of \(action.rawValue, privacy: .public) ignored: \
                 state=\(String(describing: self.state), privacy: .public) \
-                stopping=\(self.isStopping)
+                stopping=\(self.isStopping) cancelling=\(self.cancelsTearingDown)
                 """)
             NSSound.beep()
         }
@@ -170,13 +167,10 @@ final class DictationController: ObservableObject {
 
     /// What a press of `action`'s hotkey would do right now.
     func pressOutcome(for action: HotkeyAction) -> PressOutcome {
-        Self.outcome(ofPress: action,
-                     state: state,
-                     isStopping: isStopping,
-                     isMicrophoneShuttingDown: recorderTeardowns.isShuttingDown)
+        Self.outcome(ofPress: action, state: state, isTearingDown: isTearingDown)
     }
 
-    enum PressOutcome: Equatable { case start, stop, refuseStart, ignore }
+    enum PressOutcome: Equatable { case start, stop, ignore }
 
     /// What a press of `action`'s hotkey does. Kept pure so the routing can
     /// be tested without a microphone.
@@ -188,20 +182,24 @@ final class DictationController: ObservableObject {
     /// while the first pass was still running — so a later press could start
     /// a new dictation that the first stop then knocked back to `.idle`.
     ///
-    /// No dictation starts while a recorder teardown is still running —
-    /// including one a stop or cancel stopped waiting for at the deadline —
-    /// or while a stop that a cancel overtook has yet to finish. The press
-    /// beeps instead (see `RecorderTeardowns` for why).
+    /// Nor does any press act while a stop or a cancel is still waiting for
+    /// the recorder to tear down, even though a cancel (or a cancel that
+    /// overtook a stop) has already set `.idle`: a new engine bring-up would
+    /// race the old engine's teardown on the same recorder. The press beeps.
+    /// The wait is bounded (`recorderTeardownDeadline`), so presses always
+    /// work again within that time. Past the deadline a new bring-up can
+    /// overlap a teardown that is still stuck; when both are blocked on the
+    /// same device, that start fails at the recorder's own bring-up timeout
+    /// and beeps, which beats ignoring presses until relaunch.
     static func outcome(ofPress action: HotkeyAction,
                         state: State,
-                        isStopping: Bool,
-                        isMicrophoneShuttingDown: Bool) -> PressOutcome {
+                        isTearingDown: Bool) -> PressOutcome {
         switch state {
-        case .idle where isStopping || isMicrophoneShuttingDown:
-            return .refuseStart
+        case .idle where isTearingDown:
+            return .ignore
         case .idle:
             return .start
-        case .recording(let active) where active == action && !isStopping:
+        case .recording(let active) where active == action && !isTearingDown:
             return .stop
         case .recording, .transcribing:
             return .ignore
@@ -242,15 +240,37 @@ final class DictationController: ObservableObject {
         return text.isEmpty ? .beep : .paste
     }
 
-    /// Wait for a recorder teardown that `recorderTeardowns.begin()` started,
-    /// for at most its deadline.
-    private func waitForRecorder(_ teardown: PendingTeardown, reason: String) async {
-        guard await !teardown.wait() else { return }
-        dictationLog.error("""
-            dictation \(reason, privacy: .public): the microphone had not finished shutting down \
-            after \(Int(self.recorderTeardowns.deadline), privacy: .public) s; carrying on \
-            without it, and no new dictation starts until it has
-            """)
+    /// Wait for `operation`, but for at most `seconds`. Returns true when it
+    /// finished in time. On a timeout the operation keeps running; its late
+    /// completion resumes nothing, so whatever follows it in the caller has
+    /// already moved on. Used to bound `MicrophoneRecorder.stop()`.
+    static func waitAtMost(_ seconds: TimeInterval,
+                           for operation: @escaping @MainActor () async -> Void) async -> Bool {
+        let race = DeadlineRace()
+        return await withCheckedContinuation { continuation in
+            race.continuation = continuation
+            race.timer = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                race.finish(inTime: false)
+            }
+            Task { @MainActor in
+                await operation()
+                race.finish(inTime: true)
+            }
+        }
+    }
+
+    /// Stop the recorder, waiting at most `recorderTeardownDeadline`.
+    private func stopRecorder(for reason: String) async {
+        let inTime = await Self.waitAtMost(Self.recorderTeardownDeadline) { [stopRecorderNow] in
+            await stopRecorderNow()
+        }
+        if !inTime {
+            dictationLog.error("""
+                dictation \(reason, privacy: .public): the microphone had not finished shutting down \
+                after \(Int(Self.recorderTeardownDeadline), privacy: .public) s; carrying on without it
+                """)
+        }
     }
 
     /// Stop any in-flight dictation immediately: sleep, screen lock and quit.
@@ -263,9 +283,13 @@ final class DictationController: ObservableObject {
     /// sends both the screen-lock and the sleep guard here — or a quit that
     /// arrives during that wait finds `.idle` and returns at once, with the
     /// live transcriber already stopped: no new live pass can start on the
-    /// engine that the quit shuts down next. No dictation starts until the
-    /// teardown has returned (`RecorderTeardowns`).
-    func cancelInFlight() async {
+    /// engine that the quit shuts down next. Presses are ignored during the
+    /// wait, which is bounded by `recorderTeardownDeadline`.
+    ///
+    /// Quit passes `waitingForMicrophone: false`: nothing it needs from the
+    /// cancel follows the wait, so it starts the recorder's teardown and goes
+    /// on, rather than holding the quit for a teardown stuck on the HAL.
+    func cancelInFlight(waitingForMicrophone: Bool = true) async {
         switch Self.cancelEffect(for: state) {
         case .none:
             return
@@ -274,12 +298,18 @@ final class DictationController: ObservableObject {
             dictationLog.log("dictation cancelled during its final pass: its text will not be pasted")
         case .dropCapture:
             // Bumped before the first await, so a stop already waiting for
-            // its own teardown sees this cancel when it resumes. The teardown
-            // is counted before `.idle` lets a press through.
+            // its own teardown sees this cancel when it resumes.
             cancelGeneration += 1
-            let teardown = recorderTeardowns.begin()
+            guard waitingForMicrophone else {
+                dropCapture()
+                Task { [stopRecorderNow] in await stopRecorderNow() }
+                return
+            }
+            // Counted before `.idle` lets a press through.
+            cancelsTearingDown += 1
             dropCapture()
-            await waitForRecorder(teardown, reason: "cancel")
+            await stopRecorder(for: "cancel")
+            cancelsTearingDown -= 1
         }
     }
 
@@ -483,7 +513,7 @@ final class DictationController: ObservableObject {
         // stop waiting for good. `MicrophoneRecorder.stop()` finishes the
         // audio stream before the part that can block, so nothing is yielded
         // after that point, timeout or not.
-        await waitForRecorder(recorderTeardowns.begin(), reason: "stop")
+        await stopRecorder(for: "stop")
         guard generation == cancelGeneration else {
             // A sleep, screen-lock or quit cancel ran during the teardown and
             // has already dropped this dictation: emptied the capture, hidden
@@ -775,90 +805,19 @@ final class DictationController: ObservableObject {
     }
 }
 
-/// The dictation recorder's teardowns that have not returned yet, each
-/// counted from `begin()` until `MicrophoneRecorder.stop()` actually returns
-/// — past the deadline too, when its stop or cancel has stopped waiting.
-///
-/// `DictationController` refuses to start a dictation while one is
-/// outstanding. The teardown runs `engine.stop()` in a `Task.detached` on
-/// the shared cooperative pool, and that can block there on the CoreAudio
-/// HAL (a Bluetooth mic mid-profile-switch). A new dictation's bring-up
-/// would block a second pool thread on the same device, its stop a third,
-/// and so on until the pool — every async task in the app — is starved.
-/// Refusing starts keeps the worst case at one stuck thread. A teardown that
-/// never returns therefore leaves dictation refusing starts until relaunch,
-/// as a stuck teardown did before #435 (when the stop itself never
-/// returned). A stop that gives up waiting goes through the same steps as
-/// one whose teardown returned in time, only later.
-///
-/// Main-actor only, so no lock is needed.
+/// One-shot resume for `DictationController.waitAtMost`: whichever of the
+/// operation and the timer finishes first resumes the waiter, and the other
+/// finds nothing left to resume. Main-actor only, so no lock is needed.
 @MainActor
-final class RecorderTeardowns {
-    let deadline: TimeInterval
-    private let teardown: @MainActor () async -> Void
-    private(set) var outstanding = 0
+private final class DeadlineRace {
+    var continuation: CheckedContinuation<Bool, Never>?
+    var timer: Task<Void, Never>?
 
-    var isShuttingDown: Bool { outstanding > 0 }
-
-    init(deadline: TimeInterval, teardown: @escaping @MainActor () async -> Void) {
-        self.deadline = deadline
-        self.teardown = teardown
-    }
-
-    /// Start a teardown, counted from this call. Synchronous, so a caller
-    /// counts it in the same turn as whatever it does next — a cancel
-    /// counts it before it sets `.idle` and lets a press through.
-    func begin() -> PendingTeardown {
-        outstanding += 1
-        let pending = PendingTeardown()
-        let started = Date()
-        pending.timer = Task { @MainActor [deadline] in
-            try? await Task.sleep(nanoseconds: UInt64(max(0, deadline) * 1_000_000_000))
-            pending.finish(inTime: false)
-        }
-        Task { @MainActor in
-            await self.teardown()
-            // The count drops and the race is decided in the same turn.
-            self.outstanding -= 1
-            if !pending.finish(inTime: true) {
-                dictationLog.log("""
-                    the microphone finished shutting down after \
-                    \(Int(Date().timeIntervalSince(started)), privacy: .public) s; \
-                    dictation can start again
-                    """)
-            }
-        }
-        return pending
-    }
-}
-
-/// One teardown started by `RecorderTeardowns.begin()`: whichever of the
-/// teardown and its deadline comes first decides `wait()`'s answer, and the
-/// other finds it decided. For a single waiter.
-@MainActor
-final class PendingTeardown {
-    fileprivate var timer: Task<Void, Never>?
-    private var result: Bool?
-    private var waiter: CheckedContinuation<Bool, Never>?
-
-    fileprivate init() {}
-
-    /// True when the teardown returned within the deadline. Returns as soon
-    /// as either has happened, and at once if one already has.
-    func wait() async -> Bool {
-        if let result { return result }
-        return await withCheckedContinuation { waiter = $0 }
-    }
-
-    /// Returns true when this call decided the race.
-    @discardableResult
-    fileprivate func finish(inTime: Bool) -> Bool {
-        guard result == nil else { return false }
-        result = inTime
+    func finish(inTime: Bool) {
+        guard let continuation else { return }
+        self.continuation = nil
         timer?.cancel()
         timer = nil
-        waiter?.resume(returning: inTime)
-        waiter = nil
-        return true
+        continuation.resume(returning: inTime)
     }
 }
