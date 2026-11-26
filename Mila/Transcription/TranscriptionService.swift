@@ -1562,7 +1562,10 @@ final class TranscriptionService: ObservableObject {
                         """)
                     return turns
                 } catch is CancellationError {
-                    serviceLog.log("speaker diarization stopped")
+                    // The pass was stopped, the queue is shutting down, or
+                    // transcription threw and leaving the scope cancelled this
+                    // child (see below).
+                    serviceLog.log("speaker diarization cancelled")
                     return []
                 } catch {
                     // `SpeakerDiarizer.Error.diarizationFailed` wraps the
@@ -1587,8 +1590,15 @@ final class TranscriptionService: ObservableObject {
             // this run so there's no cross-recording state to reset.
             let progressCoalescer = ProgressCoalescer()
 
-            async let transcribeTask = activeEngine.transcribe(
-                samples: samples,
+            // Called directly, not as a second `async let`: an `async let`
+            // captures `samples` by copying the reference, so the engine's
+            // in-place auto-gain would copy the whole recording again (#403).
+            // `consume` hands the only reference to the engine instead;
+            // diarization still runs concurrently as the child task above. If
+            // this throws, leaving the scope cancels that child, which stops
+            // pyannote rather than waiting for a result nobody reads.
+            let segments = try await activeEngine.transcribe(
+                samples: consume samples,
                 language: working.language,
                 // Batch path: imported files / post-record full-WAV
                 // transcription. We don't have a labelled fixture set
@@ -1619,7 +1629,7 @@ final class TranscriptionService: ObservableObject {
                 }
             )
 
-            let (speakerTurns, segments) = try await (diarizeTask, transcribeTask)
+            let speakerTurns = await diarizeTask
 
             // Cover the narrow window where transcription completed BEFORE the
             // user hit Cancel (so the abort_callback never tripped) but the
