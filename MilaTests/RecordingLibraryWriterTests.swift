@@ -258,9 +258,9 @@ final class RecordingLibraryWriterTests: XCTestCase {
 
     /// mila-mcp reads recordings.json. A recording the user just deleted must
     /// be gone from it when the call returns, not once a background encode
-    /// gets to it — so the deletions write synchronously. The background
-    /// writes are held throughout, so a deletion that went back to
-    /// `persist()` would leave nothing on disk here.
+    /// gets to it — so the deletions write synchronously. A rename is held
+    /// in the background throughout, so a deletion that went back to
+    /// `persist()` would queue behind it and not be on disk here.
     func test_deletions_are_on_disk_when_the_call_returns() throws {
         let (store, probe, writer) = storeWithHeldBackgroundWrites()
         defer {  // if an assertion below throws
@@ -271,16 +271,19 @@ final class RecordingLibraryWriterTests: XCTestCase {
         let gone = Recording(title: "gone", source: .microphone, audioFileName: "gone.wav")
         store.add(keep)
         store.add(gone)
+        XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["title"] as? String }, ["gone", "keep"],
+                       "an add is written before it returns")
+        store.rename(keep, to: "kept")
         XCTAssertTrue(probe.waitUntilHeld())
-        XCTAssertFalse(FileManager.default.fileExists(atPath: store.storeURL.path),
-                       "the adds are background writes, held")
+        XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["title"] as? String }, ["gone", "keep"],
+                       "the rename is a background write, held")
 
         store.softDelete(gone)
         let trashedRow = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "gone" })
         XCTAssertNotNil(trashedRow["deletedAt"], "Recently Deleted is not on disk yet")
 
         store.permanentlyDelete(try XCTUnwrap(store.recordings.first { $0.id == gone.id }))
-        XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["title"] as? String }, ["keep"])
+        XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["title"] as? String }, ["kept"])
 
         store.softDelete(keep)
         XCTAssertEqual(store.emptyTrash(), 1)
@@ -303,11 +306,12 @@ final class RecordingLibraryWriterTests: XCTestCase {
         XCTAssertNotNil(rows.first?["deletedAt"])
     }
 
-    /// A Voice Memo row's ID is what stops the next scan importing the memo
-    /// again, and a folder rename or delete must not come back after a
-    /// crash (`loadFolders()` re-adds any folder a row still names). So
-    /// these write before returning as well; background writes are held.
-    func test_voice_memo_adds_and_folder_changes_are_on_disk_when_the_call_returns() throws {
+    /// A new row cannot be rebuilt from its audio (title, source app,
+    /// folder, Live AI summary, a Voice Memo's ID), and a folder rename or
+    /// delete must not come back after a crash (`loadFolders()` re-adds any
+    /// folder a row still names). So these write before returning as well,
+    /// while a folder move is held in the background.
+    func test_adds_and_folder_changes_are_on_disk_when_the_call_returns() throws {
         let (store, probe, writer) = storeWithHeldBackgroundWrites()
         defer {
             probe.openBackground()
@@ -315,8 +319,10 @@ final class RecordingLibraryWriterTests: XCTestCase {
         }
         let plain = Recording(title: "plain", source: .microphone, audioFileName: "plain.wav")
         store.add(plain)
-        XCTAssertTrue(probe.waitUntilHeld())
         store.assign(plain, toFolder: "Work")  // background, held
+        XCTAssertTrue(probe.waitUntilHeld())
+        let filed = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "plain" })
+        XCTAssertNil(filed["folder"], "the folder move is a background write, held")
 
         var memo = Recording(title: "memo", source: .voiceMemo, audioFileName: "memo.wav")
         memo.voiceMemoUniqueID = "VM-1"
@@ -344,6 +350,7 @@ final class RecordingLibraryWriterTests: XCTestCase {
         }
         var rec = Recording(title: "before", source: .microphone, audioFileName: "a.wav")
         store.add(rec)
+        store.rename(rec, to: "renamed")  // background, held
         XCTAssertTrue(probe.waitUntilHeld())
         rec.title = "after"
 

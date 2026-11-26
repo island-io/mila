@@ -488,19 +488,16 @@ final class RecordingStore: ObservableObject {
         return recordingsDirectory.appendingPathComponent(base + ".wav")
     }
 
+    /// Written before returning, unlike an edit (#406). A crash before a
+    /// background write would lose the whole row, not one change to it:
+    /// orphan recovery brings back only the audio and `.txt`, without the
+    /// title, source app, folder, Live AI summary and action items, or a
+    /// Voice Memo's ID (so the next scan would import the memo again).
     func add(_ recording: Recording) {
         recordings.insert(recording, at: 0)
         writeTranscript(for: recording)
         writeSummary(for: recording)
-        if recording.voiceMemoUniqueID != nil {
-            // The row's Voice Memo ID is what keeps the next scan from
-            // importing the memo again. Orphan recovery would bring a lost
-            // row's audio back without it, so a crash before a background
-            // write would mean a duplicate import and transcription.
-            persistNow()
-        } else {
-            persist()
-        }
+        persistNow()
     }
 
     /// Returns whether the record a SEPARATE PROCESS would now read matches
@@ -2299,8 +2296,8 @@ final class RecordingStore: ObservableObject {
     ///   not stay listed there for as long as a background encode takes;
     /// - a folder rename or delete, written in the same turn as
     ///   `folders.json`, so a crash cannot bring the old folder back;
-    /// - adding a Voice Memo row, whose ID keeps the next scan from
-    ///   importing the memo again;
+    /// - `add`, since a lost row cannot be rebuilt from its audio (see
+    ///   there);
     /// - an audio trim, which has already replaced the file the row
     ///   describes.
     @discardableResult
