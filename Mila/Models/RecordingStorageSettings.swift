@@ -39,6 +39,9 @@ final class RecordingStorageSettings: ObservableObject {
     static let bookmarkKey = "storage.recordingsDirectoryBookmark"
     static let limitBytesKey = "storage.limitBytes"
     static let minDurationKey = "recordings.minDuration"
+    /// Persisted key for the "save and open recordings automatically"
+    /// preference (issue #288).
+    static let autoSaveKey = "recordings.autoSave"
     /// 5 GiB — generous for compressed (m4a) recordings (~20–30 MB/hour),
     /// so this is roughly 150+ hours before the cap bites.
     static let defaultLimitBytes: Int64 = 5 * 1024 * 1024 * 1024
@@ -77,6 +80,24 @@ final class RecordingStorageSettings: ObservableObject {
             if minDuration < 0 { minDuration = 0; return }
             guard minDuration != oldValue else { return }
             defaults.set(minDuration, forKey: Self.minDurationKey)
+        }
+    }
+
+    /// When on, stopping an ordinary recording saves it and opens it for
+    /// renaming instead of presenting the "Name this recording" sheet first
+    /// (issue #288). Off by default and persisted, so the choice sticks
+    /// across launches. Deliberately read ONCE at Stop entry
+    /// (`QuickActionsController.stopRecording`) so the decision is fixed by
+    /// the setting as it stood when the user hit Stop; a sleep stop ignores
+    /// it entirely and keeps the wake-up interruption alert.
+    ///
+    /// Unlike `minDuration`/`limitBytes` this is presentation-only: the saved
+    /// audio, transcript, sidecars and transcription queue are identical
+    /// either way.
+    @Published var autoSaveRecordings: Bool {
+        didSet {
+            guard autoSaveRecordings != oldValue else { return }
+            defaults.set(autoSaveRecordings, forKey: Self.autoSaveKey)
         }
     }
 
@@ -131,6 +152,9 @@ final class RecordingStorageSettings: ObservableObject {
         } else {
             self.minDuration = Self.defaultMinDuration
         }
+        // No migration: an install with no persisted value keeps the historical
+        // behaviour (ask for a name first), which is exactly `false`.
+        self.autoSaveRecordings = defaults.bool(forKey: Self.autoSaveKey)
         resolveAndStartAccessing()
     }
 

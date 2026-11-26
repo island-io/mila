@@ -105,6 +105,21 @@ final class QuickActionsController: ObservableObject {
     /// silently carries into the next one.
     @Published var nextRecordingTitle: String = ""
 
+    /// One-shot id of a recording saved by the auto-save preference
+    /// (`RecordingStorageSettings.autoSaveRecordings`). When on, an ordinary
+    /// Stop skips the rename sheet and publishes the new recording's id here;
+    /// `ContentView` consumes it and selects the row so the user can rename it
+    /// later. Cleared by the consumer; nil otherwise. A sleep stop never sets
+    /// it.
+    @Published var autoSaveRevealID: UUID?
+
+    /// Consume once, including when finalization has already removed the row.
+    func consumeAutoSaveReveal() -> UUID? {
+        guard let id = autoSaveRevealID else { return nil }
+        autoSaveRevealID = nil
+        return store.recordings.contains(where: { $0.id == id && !$0.isTrashed }) ? id : nil
+    }
+
     /// Populated when a recording was force-stopped because the Mac went
     /// to sleep (lid close on battery, low-battery sleep, etc.). Surfaced
     /// to ContentView as an alert on the next wake so the user knows why
@@ -1117,6 +1132,13 @@ final class QuickActionsController: ObservableObject {
             abandonLivePipelineClaim()
         }
         let captured = activeJob
+        let sleepReason = pendingSleepStopReason
+        // Snapshot the auto-save preference at Stop ENTRY — synchronously,
+        // before `session.stop()`'s first `await` — so the presentation
+        // decision is fixed by the setting as it stood when the user hit Stop,
+        // not by whatever it becomes while the (possibly long) finalize runs.
+        // A sleep stop never consults it (see the presentation branch below).
+        let autoSaveRecordings = sleepReason == nil && (storageSettings?.autoSaveRecordings ?? false)
         // Pinned at record start by `prepareLivePipeline()`. Every read of
         // the live singletons below is gated on it: when the live pipeline
         // did not run for THIS recording, nothing they hold can be this
@@ -1127,7 +1149,6 @@ final class QuickActionsController: ObservableObject {
         // live text into a final transcript and skip the batch pass.
         let runsLivePipeline = ownsLivePipeline && recordingRunsLivePipeline
         let durationBeforeStop = session.elapsed
-        let sleepReason = pendingSleepStopReason
         pendingSleepStopReason = nil
         // Always cancel the silence-watch BEFORE the engine teardown so a
         // late-arriving "no sound" warning doesn't fire on a recording the
@@ -1386,7 +1407,18 @@ final class QuickActionsController: ObservableObject {
             )
         }
         if sleepReason == nil {
-            postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
+            if autoSaveRecordings {
+                // Preferred "save and open" flow: keep the recording and put
+                // the user on it instead of blocking on a name. The rename
+                // sheet is skipped; the (optional) AI title still runs in the
+                // background, and ContentView reveals the row via the one-shot
+                // reveal id. `autoSuggestOnly` never touches `pending`.
+                postRecording.autoSuggestOnly(recording,
+                                              titleWasUserProvided: titleWasUserProvided)
+                autoSaveRevealID = recording.id
+            } else {
+                postRecording.present(recording, titleWasUserProvided: titleWasUserProvided)
+            }
         }
 
         // A recording that never had the live pipeline has nothing to drain,

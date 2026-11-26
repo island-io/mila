@@ -195,6 +195,22 @@ final class PostRecordingCoordinator: ObservableObject {
         armAutoSuggestTitle(for: recording)
     }
 
+    /// Auto-save path (issue #288): run the background title suggestion for a
+    /// recording that was saved WITHOUT showing the rename sheet. A narrow
+    /// wrapper around `armAutoSuggestTitle` — deliberately it never touches
+    /// `pending`, so it cannot open, replace or close a sheet, and it leaves
+    /// the in-flight task bookkeeping (`autoSuggestingIDs`) exactly as
+    /// `present` would.
+    ///
+    /// Skips the job when the user already named the recording, for the same
+    /// reason `present` does: the baseline guard in `applyAutoSuggestedTitle`
+    /// cannot protect a title the user typed, because that title IS the
+    /// baseline the suggestion would be compared against.
+    func autoSuggestOnly(_ recording: Recording, titleWasUserProvided: Bool = false) {
+        guard !titleWasUserProvided else { return }
+        armAutoSuggestTitle(for: recording)
+    }
+
     // MARK: - Background auto-suggest title
 
     /// Kick off background title suggestion for a freshly-added recording.
