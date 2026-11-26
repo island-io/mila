@@ -385,7 +385,8 @@ final class TranscriptionService: ObservableObject {
     /// prewarm got past its first check and is queued at the release barrier.
     var localModelUserCountForTesting: Int { localModelUsers }
 
-    /// Wait for every prewarm started so far. Test-only.
+    /// Wait for the prewarms tracked when this is called (a prewarm started
+    /// later is not included). Test-only.
     func waitForPrewarmsForTesting() async {
         for warm in Array(prewarmTasks.values) { await warm.value }
     }
@@ -441,7 +442,11 @@ final class TranscriptionService: ObservableObject {
             guard let self else { return }
             guard !cancellation.isStopped, !Task.isCancelled,
                   self.retainsLocalModel, !self.remoteSettings.isActive else {
-                serviceLog.log("prewarm: skipping \(displayName, privacy: .public) — stopped, or retention went off before the load")
+                serviceLog.log("""
+                    prewarm: skipping \(displayName, privacy: .public) before the load — \
+                    stopped=\(cancellation.isStopped) cancelled=\(Task.isCancelled) \
+                    retains=\(self.retainsLocalModel) remote=\(self.remoteSettings.isActive)
+                    """)
                 return
             }
             // Stay a counted local user for the load so a retention flip
@@ -453,7 +458,11 @@ final class TranscriptionService: ObservableObject {
                 // this waited means nobody wants the model any more.
                 guard !cancellation.isStopped, !Task.isCancelled,
                       self.retainsLocalModel, !self.remoteSettings.isActive else {
-                    serviceLog.log("prewarm: skipping \(displayName, privacy: .public) — stopped, or retention went off while it waited on a release")
+                    serviceLog.log("""
+                        prewarm: skipping \(displayName, privacy: .public) after waiting on a release — \
+                        stopped=\(cancellation.isStopped) cancelled=\(Task.isCancelled) \
+                        retains=\(self.retainsLocalModel) remote=\(self.remoteSettings.isActive)
+                        """)
                     return
                 }
                 do {
