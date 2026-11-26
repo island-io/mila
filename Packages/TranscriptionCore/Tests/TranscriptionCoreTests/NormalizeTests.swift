@@ -113,21 +113,31 @@ final class NormalizeTests: XCTestCase {
     }
 
     func test_transcribe_requirement_takes_ownership_across_the_actor_hop() async throws {
-        // `TranscriptionService` calls `transcribe(samples: consume samples)`
-        // through `any TranscribingEngine`. With the requirement declared
-        // `consuming`, the engine receives the caller's buffer itself, so its
-        // in-place gain does not copy. A borrowed parameter would leave the
-        // caller holding a second reference and the first write would copy
-        // the whole recording. This checks what the compiler builds, which
-        // the language does not promise: a toolchain that copies while
-        // forwarding the argument fails here, and on it #403's saving is gone.
+        // The same call shape `TranscriptionService` uses for the batch pass:
+        // `transcribe(samples: consume samples)` through `any
+        // TranscribingEngine`, across an actor hop, here into a probe engine.
+        // It does not run `TranscriptionService` itself, so it cannot catch
+        // that call site gaining a second holder of `samples`; it pins the
+        // protocol half. With the requirement declared `consuming`, the
+        // engine receives the caller's buffer itself, so its in-place gain
+        // does not copy. A borrowed parameter would leave the caller holding
+        // a second reference and the first write would copy the whole
+        // recording.
+        //
+        // Toolchain canary: this checks what the compiler builds, which the
+        // language does not promise. If it fails with no Mila change, the
+        // compiler now copies while forwarding the argument.
         let engine: any TranscribingEngine = OwnershipProbeEngine()
         let samples = [Float](repeating: 0.01, count: 16_000)
         let callerAddress = samples.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
         let probe = try await engine.transcribe(samples: consume samples, language: "en",
                                                 audioCtx: 0, progress: nil, isCancelled: nil)
         let addresses = probe.first?.text.split(separator: " ").compactMap { Int($0) } ?? []
-        XCTAssertEqual(addresses, [callerAddress, callerAddress])
+        XCTAssertEqual(addresses, [callerAddress, callerAddress], """
+            The engine did not receive the caller's buffer. If no Mila code \
+            changed, this toolchain copies a consumed argument across the \
+            existential/actor boundary, and #403's saving is gone on it.
+            """)
     }
 
     // MARK: - peakMagnitude
