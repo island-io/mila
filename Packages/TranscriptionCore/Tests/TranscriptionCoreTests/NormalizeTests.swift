@@ -132,6 +132,11 @@ final class NormalizeTests: XCTestCase {
         let callerAddress = samples.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
         let probe = try await engine.transcribe(samples: consume samples, language: "en",
                                                 audioCtx: 0, progress: nil, isCancelled: nil)
+        // Copy-on-write keeps a shared buffer's address until something
+        // writes to it, so the addresses only prove anything if the gain
+        // was actually applied.
+        XCTAssertEqual(probe.first?.start ?? 0, 0.2, accuracy: 1e-6,
+                       "the probe must write to the buffer (gain 20 on a 0.01 signal)")
         let addresses = probe.first?.text.split(separator: " ").compactMap { Int($0) } ?? []
         XCTAssertEqual(addresses, [callerAddress, callerAddress], """
             The engine did not receive the caller's buffer. If no Mila code \
@@ -161,7 +166,8 @@ final class NormalizeTests: XCTestCase {
 }
 
 /// Reports where its `samples` buffer lived on arrival and after the same
-/// in-place gain `WhisperEngine.transcribe` applies.
+/// in-place gain `WhisperEngine.transcribe` applies, and (as `start`) the
+/// first sample after that gain, which shows a write happened.
 private actor OwnershipProbeEngine: TranscribingEngine {
     func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
 
@@ -173,7 +179,8 @@ private actor OwnershipProbeEngine: TranscribingEngine {
         let arrived = samples.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
         WhisperEngine.normalize(&samples)
         let scaled = samples.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
-        return [TranscriptSegment(start: 0, end: 0, text: "\(arrived) \(scaled)")]
+        return [TranscriptSegment(start: Double(samples.first ?? 0), end: 0,
+                                  text: "\(arrived) \(scaled)")]
     }
 
     func shutdown() async {}

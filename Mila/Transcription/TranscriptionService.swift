@@ -1362,8 +1362,7 @@ final class TranscriptionService: ObservableObject {
                 } catch is CancellationError {
                     // The pass was stopped, the queue is shutting down, or
                     // transcription threw and leaving the scope cancelled this
-                    // child (see below). The outer catch's log says which,
-                    // except at shutdown, which may log nothing further.
+                    // child (see below).
                     serviceLog.log("speaker diarization cancelled")
                     return []
                 } catch {
