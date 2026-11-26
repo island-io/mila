@@ -107,6 +107,17 @@ public actor WhisperEngine {
 
     public init() {}
 
+    /// Runs this actor on `WhisperThreadExecutor.shared`, a dedicated thread,
+    /// instead of Swift's cooperative pool (#401). No isolated method contains
+    /// an `await`, so each one still runs start to finish without suspending
+    /// and `whisper_full` cannot be interleaved with the calls that free the
+    /// context. Keep it that way: an `await` inside this actor would let
+    /// `unload()` or `shutdown()` run in the gap, executor or not. See
+    /// `WhisperThreadExecutor`.
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        WhisperThreadExecutor.shared.asUnownedSerialExecutor()
+    }
+
     deinit {
         if let ctx { whisper_free(ctx) }
     }
