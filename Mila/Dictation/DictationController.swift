@@ -656,20 +656,14 @@ final class DictationController: ObservableObject {
         // window instead.
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
             // The state is `.idle` by now, so a screen lock in this delay
-            // cancels nothing: check the lock itself before typing ⌘V, which
-            // would otherwise go to the lock screen. (A lock in the moment
-            // between this check and the posted events is a gap no API
-            // closes.) The clipboard is written only after this check, so a
-            // skipped paste never touches it, exactly like a lock during the
-            // final pass (`.keepWithoutPasting`): the text is left to History.
-            guard !Self.isScreenLocked else {
+            // cancels nothing: `pasteUnlessLocked` checks the lock itself.
+            guard let priorContents = Self.pasteUnlessLocked(
+                text, into: pasteboard,
+                isScreenLocked: { Self.isScreenLocked },
+                typeCommandV: { Self.postCommandV() }) else {
                 dictationLog.log("dictation paste skipped: the screen locked before it was typed")
                 return
             }
-            let priorContents = Self.snapshotPasteboard(pasteboard)
-            pasteboard.clearContents()
-            pasteboard.setString(text, forType: .string)
-            Self.postCommandV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if !priorContents.isEmpty {
                     Self.restorePasteboard(pasteboard, from: priorContents)
@@ -714,6 +708,30 @@ final class DictationController: ObservableObject {
             return item
         }
         pasteboard.writeObjects(items)
+    }
+
+    /// The paste's last step, after the activation delay: unless the screen
+    /// is locked, put `text` on `pasteboard` and type ⌘V. Returns the earlier
+    /// clipboard to restore, or nil when the paste was skipped — and then
+    /// the clipboard was not touched, exactly like a lock during the final
+    /// pass (`.keepWithoutPasting`): the text is left to History, and no
+    /// transcript sits on a locked Mac's clipboard to sync elsewhere.
+    ///
+    /// The snapshot comes BEFORE the lock check: reading changes nothing,
+    /// and resolving another app's promised data can take a while, which
+    /// must not sit between the check and the keystrokes. What follows the
+    /// check is only the write and ⌘V; a lock in that moment is a gap no
+    /// API closes.
+    static func pasteUnlessLocked(_ text: String,
+                                  into pasteboard: NSPasteboard,
+                                  isScreenLocked: @MainActor () -> Bool,
+                                  typeCommandV: @MainActor () -> Void) -> [[NSPasteboard.PasteboardType: Data]]? {
+        let priorContents = snapshotPasteboard(pasteboard)
+        guard !isScreenLocked() else { return nil }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        typeCommandV()
+        return priorContents
     }
 
     /// Whether the login window's lock screen is up. The session dictionary

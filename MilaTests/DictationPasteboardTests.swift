@@ -50,6 +50,34 @@ final class DictationPasteboardTests: XCTestCase {
         XCTAssertEqual(pasteboard.pasteboardItems?.first?.string(forType: .string), "caption")
     }
 
+    /// A screen lock in the paste's activation delay must not type ⌘V into
+    /// the lock screen, and must leave the clipboard exactly as it was: the
+    /// transcript is never written, so nothing can sync it elsewhere, and the
+    /// user's own clipboard survives. Unlocked, the paste goes ahead as before.
+    func test_a_paste_at_a_locked_screen_never_touches_the_clipboard() throws {
+        pasteboard.clearContents()
+        pasteboard.setString("what the user copied", forType: .string)
+        var typed = 0
+
+        let skipped = DictationController.pasteUnlessLocked(
+            "the dictated text", into: pasteboard,
+            isScreenLocked: { true }, typeCommandV: { typed += 1 })
+        XCTAssertNil(skipped, "a locked screen skips the paste")
+        XCTAssertEqual(typed, 0, "no Cmd-V into the lock screen")
+        XCTAssertEqual(pasteboard.string(forType: .string), "what the user copied",
+                       "the clipboard is not touched")
+
+        let prior = DictationController.pasteUnlessLocked(
+            "the dictated text", into: pasteboard,
+            isScreenLocked: { false }, typeCommandV: { typed += 1 })
+        XCTAssertEqual(typed, 1)
+        XCTAssertEqual(pasteboard.string(forType: .string), "the dictated text")
+        let snapshot = try XCTUnwrap(prior, "an unlocked paste returns the earlier clipboard")
+        XCTAssertFalse(snapshot.isEmpty)
+        DictationController.restorePasteboard(pasteboard, from: snapshot)
+        XCTAssertEqual(pasteboard.string(forType: .string), "what the user copied")
+    }
+
     func test_multiple_items_round_trip() {
         pasteboard.clearContents()
         let a = NSPasteboardItem(); a.setString("first", forType: .string)
