@@ -1360,7 +1360,9 @@ final class TranscriptionService: ObservableObject {
                         """)
                     return turns
                 } catch is CancellationError {
-                    serviceLog.log("speaker diarization stopped")
+                    // Either the pass was stopped, or transcription threw and
+                    // leaving the scope cancelled this child (see below).
+                    serviceLog.log("speaker diarization stopped (pass stopped or transcription failed)")
                     return []
                 } catch {
                     // `SpeakerDiarizer.Error.diarizationFailed` wraps the

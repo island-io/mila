@@ -50,8 +50,9 @@ final class NormalizeTests: XCTestCase {
 
     // MARK: - In place (#403)
 
-    /// The copying `normalize` this replaced, verbatim. The in-place version
-    /// must produce the same bits for every input.
+    /// The copying `normalize` this replaced, with its `peakMagnitude` call
+    /// written out so the reference shares no code with what it checks. The
+    /// in-place version must produce the same bits for every input.
     private static func referenceNormalize(_ samples: [Float]) -> [Float] {
         guard !samples.isEmpty else { return samples }
         var peak: Float = 0
@@ -111,19 +112,21 @@ final class NormalizeTests: XCTestCase {
         XCTAssertEqual(samples[0], 0.2, accuracy: 1e-6)   // gain 20 was applied
     }
 
-    func test_transcribe_requirement_takes_ownership_across_the_actor_hop() async {
+    func test_transcribe_requirement_takes_ownership_across_the_actor_hop() async throws {
         // `TranscriptionService` calls `transcribe(samples: consume samples)`
         // through `any TranscribingEngine`. With the requirement declared
         // `consuming`, the engine receives the caller's buffer itself, so its
         // in-place gain does not copy. A borrowed parameter would leave the
         // caller holding a second reference and the first write would copy
-        // the whole recording.
+        // the whole recording. This checks what the compiler builds, which
+        // the language does not promise: a toolchain that copies while
+        // forwarding the argument fails here, and on it #403's saving is gone.
         let engine: any TranscribingEngine = OwnershipProbeEngine()
         let samples = [Float](repeating: 0.01, count: 16_000)
         let callerAddress = samples.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
-        let probe = try? await engine.transcribe(samples: consume samples, language: "en",
-                                                 audioCtx: 0, progress: nil, isCancelled: nil)
-        let addresses = probe?.first?.text.split(separator: " ").compactMap { Int($0) } ?? []
+        let probe = try await engine.transcribe(samples: consume samples, language: "en",
+                                                audioCtx: 0, progress: nil, isCancelled: nil)
+        let addresses = probe.first?.text.split(separator: " ").compactMap { Int($0) } ?? []
         XCTAssertEqual(addresses, [callerAddress, callerAddress])
     }
 
