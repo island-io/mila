@@ -481,8 +481,8 @@ final class DictationController: ObservableObject {
         stopLiveTranscription()
         // Bounded: a teardown stuck on the CoreAudio HAL must not leave this
         // stop waiting for good. `MicrophoneRecorder.stop()` finishes the
-        // audio stream before the part that can block, so no buffer reaches
-        // this dictation after the stop began, timeout or not.
+        // audio stream before the part that can block, so nothing is yielded
+        // after that point, timeout or not.
         await waitForRecorder(recorderTeardowns.begin(), reason: "stop")
         guard generation == cancelGeneration else {
             // A sleep, screen-lock or quit cancel ran during the teardown and
