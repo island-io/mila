@@ -54,7 +54,9 @@ import Foundation
 /// Rule this follows: `.claude/rules/python-subprocess.md` — anything that
 /// genuinely blocks gets a thread of its own, never a slot in a shared pool.
 final class WhisperThreadExecutor: SerialExecutor, @unchecked Sendable {
-    static let shared = WhisperThreadExecutor(name: "io.island.mila.whisper")
+    /// At most 15 bytes: Linux refuses a longer pthread name outright, and
+    /// the thread would keep the process's name instead.
+    static let shared = WhisperThreadExecutor(name: "mila.whisper")
 
     private let condition = NSCondition()
     /// Jobs not yet run, in arrival order. `nextJob()` takes the first one of

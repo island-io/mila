@@ -15,7 +15,7 @@ final class WhisperExecutorTests: XCTestCase {
         let other = WhisperEngine()
         let otherOnWhisperThread = await other.isOnWhisperThreadForTesting()
         XCTAssertTrue(otherOnWhisperThread)
-        XCTAssertEqual(WhisperThreadExecutor.shared.threadName, "io.island.mila.whisper")
+        XCTAssertEqual(WhisperThreadExecutor.shared.threadName, "mila.whisper")
     }
 
     func test_the_test_itself_is_not_on_the_whisper_thread() async {
