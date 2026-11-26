@@ -151,9 +151,12 @@ final class DictationController: ObservableObject {
     /// teardown on the same device, and that new dictation could not be
     /// stopped until the old stop finished. The press beeps; once the
     /// teardown returns, the old stop drops out and the next press starts.
-    /// A teardown that never returns keeps every press beeping, but in that
-    /// state a new bring-up would block on the same CoreAudio HAL queue and
-    /// fail after `bringUpTimeout` anyway (see `MicrophoneRecorder.stop`).
+    /// The cost: the recorder's teardown has no timeout, so one that never
+    /// returns leaves every press beeping until Mila is relaunched (each
+    /// logged with `stopping=true`). A hang there is usually the HAL queue a
+    /// new bring-up would block on too, but not necessarily — a fresh engine
+    /// on another input might have come up. Bounding that teardown belongs
+    /// in `MicrophoneRecorder.stop`, which meeting recordings share.
     static func outcome(ofPress action: HotkeyAction,
                         state: State,
                         isStopping: Bool) -> PressOutcome {
@@ -266,6 +269,12 @@ final class DictationController: ObservableObject {
         do {
             try await recorder.start()
         } catch {
+            let ns = error as NSError
+            dictationLog.error("""
+                dictation not started: mic bring-up failed \
+                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                \(error.localizedDescription, privacy: .private)
+                """)
             NSSound.beep()
             return
         }
