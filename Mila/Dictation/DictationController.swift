@@ -625,18 +625,17 @@ final class DictationController: ObservableObject {
 
     private func paste(_ text: String) {
         let pasteboard = NSPasteboard.general
-        let priorContents = Self.snapshotPasteboard(pasteboard)
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
 
         // Without Accessibility trust, CGEvent.post is silently dropped by
         // macOS — the user would see "I dictated, nothing happened" with no
         // explanation. Surface a one-shot alert and leave the text on the
         // clipboard so they can paste manually with ⌘V.
         guard AccessibilityPermission.isTrusted() else {
-            AccessibilityPermission.notifyMissing()
             // Do NOT restore the prior clipboard contents — the transcript
             // is the user's only path to the dictated text right now.
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            AccessibilityPermission.notifyMissing()
             targetApp = nil
             return
         }
@@ -660,19 +659,16 @@ final class DictationController: ObservableObject {
             // cancels nothing: check the lock itself before typing ⌘V, which
             // would otherwise go to the lock screen. (A lock in the moment
             // between this check and the posted events is a gap no API
-            // closes.) Skipped, the clipboard is put back at once to what it
-            // was, empty included, so the transcript is not left on it to
-            // sync to other devices; the text is left to History, as on a
-            // lock during the final pass (`.keepWithoutPasting`).
+            // closes.) The clipboard is written only after this check, so a
+            // skipped paste never touches it, exactly like a lock during the
+            // final pass (`.keepWithoutPasting`): the text is left to History.
             guard !Self.isScreenLocked else {
                 dictationLog.log("dictation paste skipped: the screen locked before it was typed")
-                if priorContents.isEmpty {
-                    pasteboard.clearContents()
-                } else {
-                    Self.restorePasteboard(pasteboard, from: priorContents)
-                }
                 return
             }
+            let priorContents = Self.snapshotPasteboard(pasteboard)
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
             Self.postCommandV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if !priorContents.isEmpty {
