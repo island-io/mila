@@ -74,6 +74,39 @@ final class SubprocessRunnerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(cancelledAt), 10)
     }
 
+    /// The child exits but leaves a process of its own holding the pipes, so
+    /// the post-exit drain would wait its whole 30 s grace. A cancel in that
+    /// window must end the wait and stop that process, not sit it out.
+    /// (`sh` stays up for half a second so its process group is read while
+    /// it is alive, as it is for any real child.)
+    func test_cancel_during_the_post_exit_drain_is_prompt_and_stops_the_straggler() async throws {
+        let pidFile = FileManager.default.temporaryDirectory
+            .appendingPathComponent("subprocess-straggler-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: pidFile) }
+        let task = Task {
+            try await SubprocessRunner.run(
+                executable: sh,
+                arguments: ["-c", "sleep 30 & echo $! > \"$0\"; sleep 0.5", pidFile.path])
+        }
+        try await Task.sleep(nanoseconds: 1_500_000_000)
+        let cancelledAt = Date()
+        task.cancel()
+        let result = await task.result
+        guard case .failure(let error) = result else { return XCTFail("expected cancellation") }
+        XCTAssertTrue(error is CancellationError, "\(error)")
+        XCTAssertLessThan(Date().timeIntervalSince(cancelledAt), 10)
+
+        let pidText = try String(contentsOf: pidFile, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let pid = try XCTUnwrap(pid_t(pidText), "pid file: \(pidText)")
+        // The straggler is reaped by launchd, not by us; give that a moment.
+        let deadline = Date().addingTimeInterval(5)
+        while kill(pid, 0) == 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNotEqual(kill(pid, 0), 0, "the process holding the pipes outlived the cancel")
+    }
+
     func test_launch_failure_is_reported() async {
         do {
             _ = try await SubprocessRunner.run(executable: URL(fileURLWithPath: "/nonexistent/tool"), arguments: [])

@@ -225,8 +225,11 @@ enum SubprocessRunner {
             let killed = timedOut || isCancelled
             if killed { terminate(process, group: group) }
 
-            let grace = killed ? SubprocessRunner.drainGraceAfterKill : SubprocessRunner.drainGraceAfterExit
-            if drained.wait(timeout: .now() + grace) == .timedOut, !killed {
+            if killed {
+                // The output is discarded (timed out or cancelled), so a short
+                // bound; a straggler holding the pipes was swept above.
+                _ = drained.wait(timeout: .now() + SubprocessRunner.drainGraceAfterKill)
+            } else if !drainAfterExit(drained, group: group), !isCancelled {
                 // The child exited but something still holds its stdout or
                 // stderr open (a process it started). Its own output arrived
                 // before it exited, so what was read is complete unless a
@@ -243,6 +246,28 @@ enum SubprocessRunner {
                 stderr: errBox.withLock { $0 },
                 exitCode: process.isRunning ? -1 : process.terminationStatus,
                 timedOut: timedOut)
+        }
+
+        /// Waits for the pipe readers after a normal exit: up to
+        /// `drainGraceAfterExit`, in short slices so a cancel arriving NOW is
+        /// seen. The child is already gone, so the cancel's own SIGTERM did
+        /// nothing; whatever still holds the pipes is a process it started,
+        /// and on cancel that group is swept and the kill path's short bound
+        /// applies, instead of a cancelled diarization holding the serial
+        /// transcription queue for the whole grace. Returns whether the
+        /// readers finished.
+        private func drainAfterExit(_ drained: DispatchGroup, group: pid_t?) -> Bool {
+            let deadline = DispatchTime.now() + SubprocessRunner.drainGraceAfterExit
+            while DispatchTime.now() < deadline {
+                if drained.wait(timeout: min(.now() + .milliseconds(250), deadline)) == .success {
+                    return true
+                }
+                if isCancelled {
+                    if let group { LLMRunner.terminateHelpers(of: group) }
+                    return drained.wait(timeout: .now() + SubprocessRunner.drainGraceAfterKill) == .success
+                }
+            }
+            return false
         }
 
         /// Waits until the child exits, the task is cancelled or `timeout`
