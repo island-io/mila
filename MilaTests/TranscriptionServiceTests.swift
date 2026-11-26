@@ -1254,12 +1254,10 @@ private final class Probe401URLProtocol: URLProtocol {
 /// the upload path at all.
 private actor CountingRemoteEngine: RemoteTranscribing {
     private(set) var transcribeCalls = 0
-    func configure(_ config: RemoteTranscriptionConfig) async {}
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
     func shutdown() async {}
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         transcribeCalls += 1
@@ -1271,12 +1269,10 @@ private actor CountingRemoteEngine: RemoteTranscribing {
 /// misconfigured remote backend so the live-path error-surfacing can be tested
 /// without a network round-trip.
 private actor ThrowingRemoteEngine: RemoteTranscribing {
-    func configure(_ config: RemoteTranscriptionConfig) async {}
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
     func shutdown() async {}
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         throw RemoteWhisperEngine.RemoteError.http(

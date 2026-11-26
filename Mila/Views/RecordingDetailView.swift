@@ -402,6 +402,14 @@ struct RecordingDetailView: View {
         /// but it has to say "stopped": the row is stored as `.failed`, and
         /// "No transcript yet" would leave the user wondering what happened.
         case stopped
+        /// Idle because the last pass FAILED, with the reason it failed
+        /// (`Recording.visibleTranscriptionFailureReason`, #376) — a server
+        /// refusal, a missing model, unusable audio. With the Transcribe
+        /// invitation when a retry could work, so the user can try again
+        /// once they've fixed the cause — but not for a reason that
+        /// describes the audio itself (`Recording.failureCanBeRetried`):
+        /// that retry fails the same way, a dead end.
+        case failed(reason: String, canRetry: Bool)
     }
 
     /// Decision for the empty-segments placeholder, split out as a pure
@@ -409,10 +417,16 @@ struct RecordingDetailView: View {
     /// case without building the view.
     static func emptyTranscriptPlaceholder(isActive: Bool,
                                            isQueued: Bool,
-                                           isDeferred: Bool = false) -> EmptyTranscriptPlaceholder? {
+                                           isDeferred: Bool = false,
+                                           failureReason: String? = nil) -> EmptyTranscriptPlaceholder? {
         if isActive { return nil }
         if isQueued { return .waitingInQueue }
-        return isDeferred ? .stopped : .clickTranscribe
+        if isDeferred { return .stopped }
+        if let failureReason {
+            return .failed(reason: failureReason,
+                           canRetry: Recording.failureCanBeRetried(failureReason))
+        }
+        return .clickTranscribe
     }
 
     /// "Stop Transcribing" — take the run off the CPU now, keep the recording,
@@ -516,9 +530,23 @@ struct RecordingDetailView: View {
             let placeholder = Self.emptyTranscriptPlaceholder(
                 isActive: transcription.activeRecordingID == recording.id && !queuedAgain,
                 isQueued: queuedAgain,
-                isDeferred: recording.isTranscriptionDeferred
+                isDeferred: recording.isTranscriptionDeferred,
+                failureReason: recording.visibleTranscriptionFailureReason
             )
-            if placeholder == .waitingInQueue {
+            if case .failed(let reason, let canRetry) = placeholder {
+                ContentUnavailableView {
+                    Label("Transcription failed", systemImage: "exclamationmark.triangle")
+                } description: {
+                    VStack(spacing: 8) {
+                        Text(reason)
+                            .textSelection(.enabled)
+                        if canRetry {
+                            Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to try again.")
+                        }
+                    }
+                }
+                .accessibilityIdentifier("recording.transcriptionFailed")
+            } else if placeholder == .waitingInQueue {
                 ContentUnavailableView {
                     Label("Waiting in queue", systemImage: "clock")
                 } description: {
@@ -569,6 +597,21 @@ struct RecordingDetailView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .accessibilityIdentifier("recording.transcriptionStopped")
+                    } else if let reason = recording.visibleTranscriptionFailureReason {
+                        // A live draft whose full pass failed keeps its text
+                        // on screen; without this it reads as a finished
+                        // transcript (#376).
+                        Label {
+                            Text("Transcription failed: \(reason)")
+                                .lineLimit(3)
+                                .help(reason)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                        }
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .accessibilityIdentifier("recording.transcriptionFailed")
                     } else if recording.untranscribedSpans?.isEmpty == false {
                         missingPartsNote
                     }

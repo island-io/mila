@@ -8,8 +8,8 @@ final class RemoteShutdownTests: XCTestCase {
         let fixture = RemoteShutdownFixture(hold: false)
         defer { fixture.cleanUp() }
         let engine = fixture.engine()
-        await engine.configure(fixture.config)
-        let result = try await engine.transcribe(samples: samples, language: "en", audioCtx: 0,
+        let config = fixture.config
+        let result = try await engine.transcribe(samples: samples, language: "en", config: config,
                                                  progress: nil, isCancelled: nil)
         XCTAssertEqual(result.first?.text, "Synthetic transcript.")
         XCTAssertEqual(fixture.probe.startCount, 1)
@@ -23,11 +23,11 @@ final class RemoteShutdownTests: XCTestCase {
             XCTFail("An engine shut down before entry must not encode audio")
             return Data()
         })
-        await engine.configure(fixture.config)
+        let config = fixture.config
         await engine.shutdown()
         await engine.shutdown()
         do {
-            _ = try await engine.transcribe(samples: samples, language: "en", audioCtx: 0,
+            _ = try await engine.transcribe(samples: samples, language: "en", config: config,
                                              progress: nil, isCancelled: nil)
             XCTFail("Expected cancellation")
         } catch is CancellationError {
@@ -42,12 +42,12 @@ final class RemoteShutdownTests: XCTestCase {
         let finished = expectation(description: "transcription returned")
         let gate = ShutdownEncodingGate(entered: entered)
         let engine = fixture.engine(encode: { _ in await gate.wait() })
-        await engine.configure(fixture.config)
+        let config = fixture.config
         let input = samples
         let call = Task {
             defer { finished.fulfill() }
             do {
-                _ = try await engine.transcribe(samples: input, language: "en", audioCtx: 0,
+                _ = try await engine.transcribe(samples: input, language: "en", config: config,
                                                  progress: nil, isCancelled: nil)
                 XCTFail("Expected shutdown cancellation")
             } catch is CancellationError {
@@ -73,21 +73,44 @@ final class RemoteShutdownTests: XCTestCase {
         await assertActiveUploadCancelled(by: .polledFlag)
     }
 
-    private enum CancelMethod { case shutdown, swiftTask, polledFlag }
+    // The same three on the clip path (a live utterance, a dictation), the
+    // service's other call into the engine.
 
-    private func assertActiveUploadCancelled(by method: CancelMethod) async {
+    func test_shutdown_cancels_active_clip_upload() async {
+        await assertActiveUploadCancelled(by: .shutdown, path: .clip)
+    }
+
+    func test_swift_task_cancellation_cancels_active_clip_upload() async {
+        await assertActiveUploadCancelled(by: .swiftTask, path: .clip)
+    }
+
+    func test_polled_cancellation_cancels_active_clip_upload() async {
+        await assertActiveUploadCancelled(by: .polledFlag, path: .clip)
+    }
+
+    private enum CancelMethod { case shutdown, swiftTask, polledFlag }
+    private enum CallPath { case wholeRecording, clip }
+
+    private func assertActiveUploadCancelled(by method: CancelMethod,
+                                             path: CallPath = .wholeRecording) async {
         let fixture = RemoteShutdownFixture(hold: true)
         defer { fixture.cleanUp() }
         let finished = expectation(description: "cancelled call returned")
         let engine = fixture.engine()
-        await engine.configure(fixture.config)
+        let config = fixture.config
         let cancelled = ShutdownTestFlag()
         let input = samples
         let call = Task {
             defer { finished.fulfill() }
             do {
-                _ = try await engine.transcribe(samples: input, language: "en", audioCtx: 0,
-                                                 progress: nil, isCancelled: { cancelled.value })
+                switch path {
+                case .wholeRecording:
+                    _ = try await engine.transcribe(samples: input, language: "en", config: config,
+                                                     progress: nil, isCancelled: { cancelled.value })
+                case .clip:
+                    _ = try await engine.transcribe(samples: input, language: "en", config: config,
+                                                     requestTimeout: 30, isCancelled: { cancelled.value })
+                }
                 XCTFail("Expected cancellation")
             } catch is CancellationError {
             } catch { XCTFail("Unexpected error: \(error)") }

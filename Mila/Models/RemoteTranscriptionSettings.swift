@@ -35,6 +35,14 @@ struct RemoteTranscriptionConfig: Sendable, Equatable {
     /// Model identifier the server expects, e.g. `whisper-1` (OpenAI) or
     /// `ivrit-ai/whisper-large-v3-turbo-ct2` (a self-hosted faster-whisper).
     var model: String
+    /// Whether the local pyannote pass will label this recording
+    /// (`DiarizationSettings.isConfigured`, set by `TranscriptionService` for
+    /// a whole-recording pass). It decides what becomes of a diarizing
+    /// model's speaker labels when a long recording goes out in several
+    /// requests (#376): dropped so the offline pass labels the whole
+    /// recording consistently, or kept, one set per request, when nothing
+    /// else will label it. See `RemoteWhisperEngine.transcribeInPieces`.
+    var offlineDiarization: Bool = false
 }
 
 /// User-configurable remote transcription backend. Opt-in, off by default.

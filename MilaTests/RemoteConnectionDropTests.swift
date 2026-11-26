@@ -120,7 +120,6 @@ final class RemoteConnectionDropTests: XCTestCase {
             // Out of credit is a 429 too, and no amount of waiting fixes it.
             RemoteWhisperEngine.RemoteError.http(
                 status: 429, body: #"{"error":{"code":"insufficient_quota","type":"insufficient_quota"}}"#),
-            RemoteWhisperEngine.RemoteError.notConfigured,
             RemoteWhisperEngine.RemoteError.badResponse,
             RemoteWhisperEngine.RemoteError.emptyResult,
             RemoteWhisperEngine.RemoteError.noAudioCaptured,
@@ -565,23 +564,21 @@ private actor FlakyRemoteEngine: RemoteTranscribing {
     func setFailure(_ error: (any Error)?) { failure = error }
     func failNextCall(with error: any Error) { nextCallFailure = error }
 
-    func configure(_ config: RemoteTranscriptionConfig) async {}
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
     func shutdown() async {}
 
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         requestTimeouts.append(requestTimeout)
-        return try await transcribe(samples: samples, language: language, audioCtx: audioCtx,
+        return try await transcribe(samples: samples, language: language, config: config,
                                     progress: nil, isCancelled: isCancelled)
     }
 
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         transcribeCalls += 1

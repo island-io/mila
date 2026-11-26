@@ -361,7 +361,7 @@ final class LogPrivacyRedactionTests: XCTestCase {
     /// undiagnosable for no gain.
     func test_remoteWhisperError_cases_without_a_server_body_are_not_redacted() {
         let cases: [RemoteWhisperEngine.RemoteError] = [
-            .notConfigured, .noAudioCaptured, .badResponse, .emptyResult
+            .noAudioCaptured, .badResponse, .emptyResult
         ]
         for error in cases {
             XCTAssertEqual(error.logDescription, error.errorDescription,

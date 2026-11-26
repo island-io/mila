@@ -120,15 +120,74 @@ enum AudioConvert {
     /// Read a wav/aiff/m4a file and convert all of its samples to Whisper format.
     static func loadAsWhisperSamples(url: URL) throws -> [Float] {
         let file = try AVAudioFile(forReading: url)
-        let totalFrames = AVAudioFrameCount(file.length)
-        guard totalFrames > 0,
-              let inputBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
-                                                 frameCapacity: totalFrames) else {
-            return []
-        }
-        try file.read(into: inputBuffer)
+        guard let inputBuffer = try readFrames(from: file, count: file.length) else { return [] }
         let converted = try toWhisperFormat(inputBuffer)
         return samples(from: converted)
+    }
+
+    /// Read `count` frames from `file`'s current position into one buffer,
+    /// or nil when there is nothing to read. Callers clamp `count` to the
+    /// file. See `readFrames(count:format:atEnd:read:)`.
+    static func readFrames(from file: AVAudioFile, count: AVAudioFramePosition) throws -> AVAudioPCMBuffer? {
+        try readFrames(count: count, format: file.processingFormat,
+                       atEnd: { file.framePosition >= file.length },
+                       read: { try file.read(into: $0, frameCount: $1) })
+    }
+
+    /// Fill one buffer with `count` frames from `read`, calling it again for
+    /// whatever a call left out.
+    ///
+    /// One `AVAudioFile.read(into:frameCount:)` is not enough: it can return
+    /// fewer frames than asked for before the end of the file. A single read
+    /// of a 400,000-frame 16 kHz float WAV returns 399,360 — 390 whole blocks
+    /// of 1024 — on macOS 26 and 27 alike, and a second read returns the
+    /// other 640. With one read, a WAV recording lost whatever followed its
+    /// last whole 1024-frame block (up to 64 ms), and its length came out
+    /// short of its audio (#376).
+    ///
+    /// Bounded like the read loops in `AudioCompressor` and `AudioTrimmer`:
+    /// it stops at `count`, at `atEnd`, or at a read that returns nothing,
+    /// since `read` throws on an attempt past the end of the file. The first
+    /// read's error is thrown; a LATER read's is not — those reads only add
+    /// to what the first one returned, so a failed one leaves exactly what a
+    /// single read returned before #376.
+    static func readFrames(count: AVAudioFramePosition,
+                           format: AVAudioFormat,
+                           atEnd: () -> Bool,
+                           read: (AVAudioPCMBuffer, AVAudioFrameCount) throws -> Void) throws -> AVAudioPCMBuffer? {
+        guard count > 0, let total = AVAudioFrameCount(exactly: count),
+              let whole = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: total) else {
+            return nil
+        }
+        try read(whole, total)
+        let bytesPerFrame = Int(format.streamDescription.pointee.mBytesPerFrame)
+        guard whole.frameLength < total, !atEnd(), bytesPerFrame > 0,
+              let chunk = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: total - whole.frameLength) else {
+            return whole
+        }
+        while whole.frameLength < total, !atEnd() {
+            let missing = total - whole.frameLength
+            do {
+                try read(chunk, missing)
+            } catch {
+                break
+            }
+            let got = min(chunk.frameLength, missing)
+            guard got > 0 else { break }
+            // Append the chunk after what `whole` already holds, buffer by
+            // buffer (one per channel when deinterleaved, one in all when
+            // interleaved — `mBytesPerFrame` is per buffer either way).
+            let destination = UnsafeMutableAudioBufferListPointer(whole.mutableAudioBufferList)
+            let source = UnsafeMutableAudioBufferListPointer(chunk.mutableAudioBufferList)
+            guard destination.count == source.count else { break }
+            let offset = Int(whole.frameLength) * bytesPerFrame
+            for index in 0..<destination.count {
+                guard let to = destination[index].mData, let from = source[index].mData else { return whole }
+                (to + offset).copyMemory(from: from, byteCount: Int(got) * bytesPerFrame)
+            }
+            whole.frameLength += got
+        }
+        return whole
     }
 
     /// Read only `[start, end)` seconds of a wav/aiff/m4a file and convert
@@ -145,13 +204,9 @@ enum AudioConvert {
         let length = Double(file.length)
         let startFrame = AVAudioFramePosition(min(length, max(0, start * rate).rounded(.down)))
         let endFrame = AVAudioFramePosition(min(length, max(0, end * rate).rounded(.up)))
-        guard endFrame > startFrame,
-              let inputBuffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat,
-                                                 frameCapacity: AVAudioFrameCount(endFrame - startFrame)) else {
-            return []
-        }
+        guard endFrame > startFrame else { return [] }
         file.framePosition = startFrame
-        try file.read(into: inputBuffer, frameCount: AVAudioFrameCount(endFrame - startFrame))
+        guard let inputBuffer = try readFrames(from: file, count: endFrame - startFrame) else { return [] }
         let converted = try toWhisperFormat(inputBuffer)
         return samples(from: converted)
     }

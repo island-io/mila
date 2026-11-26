@@ -231,9 +231,11 @@ final class TranscriptionService: ObservableObject {
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
     /// The recording `process(_:)` is working on, from the moment the worker
     /// pops it until `process` returns. Wider than `activeRecordingID`, which
-    /// is only published once the row has been flipped to `.running` — there
-    /// is a suspension (`remoteEngine.configure`) before that, and a stop that
-    /// lands in it must still find the run. See `deferTranscription(of:)`.
+    /// is only published once the row has been flipped to `.running`, so a
+    /// stop that arrives before that flip still finds the run. No suspension
+    /// precedes the flip today — the remote engine's `configure` did, until
+    /// the config went with the call (#376) — and this keeps one added later
+    /// safe. See `deferTranscription(of:)`.
     private var processingID: UUID?
 
     /// Recordings the user asked to abandon mid-run. Held in a thread-safe
@@ -768,13 +770,14 @@ final class TranscriptionService: ObservableObject {
                 serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
                 return .failed
             }
-            await remoteEngine.configure(config)
-            guard !cancellation.isStopped else { return .skipped }
             do {
+                // The clip's own config goes with the call: the engine also
+                // serves batch passes, possibly in another language and so
+                // to another model id (see `RemoteTranscribing`, #376).
                 let segs = try await remoteEngine.transcribe(
                     samples: samples,
                     language: language,
-                    audioCtx: audioCtx,
+                    config: config,
                     requestTimeout: Self.shortClipRequestTimeout(sampleCount: samples.count),
                     isCancelled: { [cancellation] in cancellation.isStopped })
                 guard !cancellation.isStopped else { return .skipped }
@@ -1223,11 +1226,9 @@ final class TranscriptionService: ObservableObject {
     /// status: a `.pending` row that is still being finalized has no run yet.
     ///
     /// `processingID` counts as active: between the worker popping a job and
-    /// `activeRecordingID` being published there is a suspension
-    /// (`remoteEngine.configure`), and `deferTranscription` finds the run
-    /// there — so the control has to be offered there too, or it blinks out
-    /// for the length of a network round trip. A row that is queued AGAIN
-    /// while its previous run is still stopping (Transcribe clicked during
+    /// `activeRecordingID` being published, `deferTranscription` already
+    /// finds the run, so the control is offered there too. A row that is
+    /// queued AGAIN while its previous run is still stopping (Transcribe clicked during
     /// "Stopping…", see `enqueue`) is simply queued: the new run is what the
     /// control would stop.
     func isQueuedOrActive(_ recordingID: UUID) -> Bool {
@@ -1334,20 +1335,31 @@ final class TranscriptionService: ObservableObject {
         // entirely (a remote-only user may never have downloaded a `.bin`);
         // local keeps the existing "is the model installed yet?" guards.
         let useRemote = remoteSettings.isActive
+        // One read for the pass: it decides both whether pyannote runs below
+        // and what the remote engine does with a diarizing model's labels
+        // (`offlineDiarization`), and those two must agree.
+        let shouldDiarize = diarizationSettings.isConfigured
         let localModel: WhisperModel?
         let modelDisplayName: String
+        // The config this pass's remote requests go out with, handed to the
+        // engine with the call (see `RemoteTranscribing`, #376).
+        let remoteConfig: RemoteTranscriptionConfig?
         if useRemote {
             // Language-routed: a server whose primary model is Hebrew-only (the
             // ivrit.ai finetune) needs the English model id for English audio,
             // or the transcript comes back with Hebrew words spliced in.
             guard remoteSettings.isConfigured,
-                  let config = remoteSettings.currentConfig(for: working.language) else {
-                lastError = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
-                markFailed(recording)
+                  var config = remoteSettings.currentConfig(for: working.language) else {
+                let reason = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
+                lastError = reason
+                markFailed(recording, reason: reason)
                 return
             }
-            await remoteEngine.configure(config)
-            guard !cancellation.isStopped else { return }
+            // What the engine does with a diarizing model's labels when a
+            // long recording goes out in pieces depends on whether pyannote
+            // will label it below (#376).
+            config.offlineDiarization = shouldDiarize
+            remoteConfig = config
             localModel = nil
             // Label from the captured config, not remoteSettings — a Settings
             // edit mid-run must not change what's persisted to this
@@ -1356,7 +1368,7 @@ final class TranscriptionService: ObservableObject {
         } else {
             guard let model = modelManager.model(for: working.language) else {
                 lastError = "No model selected."
-                markFailed(recording)
+                markFailed(recording, reason: "No transcription model is selected. Choose one in Settings → Models.")
                 return
             }
             guard modelManager.isInstalled(model) else {
@@ -1366,17 +1378,20 @@ final class TranscriptionService: ObservableObject {
                 // would promise a wait that never ends and would hide the one
                 // recovery there is (#264).
                 let declined = modelManager.isDeclined(model)
-                lastError = declined
+                let reason = declined
                     ? "\(model.displayName) was deleted. Download it again in Settings → Models."
                     : "Whisper model is still downloading. Try again once it's ready."
+                lastError = reason
                 serviceLog.log("skipped: model \(model.name, privacy: .public) not installed yet (declined=\(declined, privacy: .public))")
-                markFailed(recording)
+                markFailed(recording, reason: reason)
                 return
             }
             localModel = model
+            remoteConfig = nil
             modelDisplayName = model.displayName
         }
-        let activeEngine: any TranscribingEngine = useRemote ? remoteEngine : engine
+        let localEngine = engine
+        let passRemoteEngine = remoteEngine
 
         // Snapshot pre-run summary state so the completion hook can tell
         // the summarizer "this was a re-transcription, force-regenerate."
@@ -1390,11 +1405,10 @@ final class TranscriptionService: ObservableObject {
             .isEmpty
 
         // Flip the LIVE row to `.running` rather than writing the whole snapshot
-        // back — `await remoteEngine.configure` above is a suspension point the
-        // user can rename/file/delete the row through. See `mergePassResult`.
+        // back. See `mergePassResult`.
         // (`working` is deliberately NOT re-seeded from the result: the pass must
         // keep transcribing the `language` it just resolved a model for.)
-        // A stop that landed during `remoteEngine.configure` must win: once
+        // A stop that arrived before this point must win: once
         // the row reads `.running`, nothing would ever move it again (the
         // cancelled pass writes no status by design). Checked right before
         // the write, with no suspension in between, so it can't be missed.
@@ -1412,8 +1426,10 @@ final class TranscriptionService: ObservableObject {
             $0.status = working.status
             $0.modelName = working.modelName
             // A pass is starting, so an earlier "stopped, transcribe later"
-            // no longer describes this row.
+            // — or an earlier failure's reason (#376) — no longer describes
+            // this row.
             $0.transcriptionDeferredAt = nil
+            $0.transcriptionFailureReason = nil
         }
 
         let recordingID = recording.id
@@ -1443,7 +1459,7 @@ final class TranscriptionService: ObservableObject {
         do {
             // Local backend needs the whisper weights loaded (and the CoreML
             // encoder compiled) before transcribing. The remote engine has no
-            // weights — `configure` already ran above.
+            // weights to load.
             if let localModel {
                 try await engine.loadIfNeeded(modelURL: modelManager.url(for: localModel),
                                               displayName: localModel.displayName)
@@ -1508,7 +1524,8 @@ final class TranscriptionService: ObservableObject {
                 // otherwise see an unchanged transcript with no explanation.
                 if settleUnusableRerun(
                     id: recordingID,
-                    reason: "Re-transcription skipped: the audio is too short or too quiet to transcribe. The earlier transcript was kept."
+                    alert: "Re-transcription skipped: the audio is too short or too quiet to transcribe. The earlier transcript was kept.",
+                    rowReason: Recording.unusableAudioFailureReason
                 ) { return }
                 working.status = .failed
                 working.fullText = ""
@@ -1526,6 +1543,7 @@ final class TranscriptionService: ObservableObject {
                     $0.status = working.status
                     $0.fullText = working.fullText
                     $0.segments = working.segments
+                    $0.transcriptionFailureReason = Recording.unusableAudioFailureReason
                 }
                 return
             }
@@ -1534,7 +1552,6 @@ final class TranscriptionService: ObservableObject {
             // transcription (in-process via ggml). They use independent
             // compute paths (Python/MPS vs whisper.cpp/Metal) and both read
             // from the same WAV file, so parallelism is safe and saves time.
-            let shouldDiarize = diarizationSettings.isConfigured
             let diarPythonPath = diarizationSettings.pythonPath
 
             async let diarizeTask: [SpeakerTurn] = {
@@ -1590,45 +1607,65 @@ final class TranscriptionService: ObservableObject {
             // this run so there's no cross-recording state to reset.
             let progressCoalescer = ProgressCoalescer()
 
+            let onProgress: @Sendable (Float) -> Void = { [weak self, progressCoalescer] p in
+                // Cheap, lock-guarded, no allocation on the hot path.
+                // Only schedule a main-actor flush when one isn't already
+                // pending — that's what caps the flood.
+                guard progressCoalescer.offer(Double(p)) else { return }
+                Task { @MainActor [weak self, progressCoalescer] in
+                    let latest = progressCoalescer.flush()
+                    guard let self, self.activeRecordingID == recordingID else { return }
+                    self.progress = latest
+                }
+            }
+            // Polled by whisper.cpp's abort_callback between every
+            // compute step. Reads against the lock-protected flag set so
+            // the cross-thread access is sound.
+            let isCancelled: @Sendable () -> Bool = { [cancellation] in
+                cancellation.contains(recordingID)
+            }
+
             // Called directly, not as a second `async let`: an `async let`
             // captures `samples` by copying the reference, so the engine's
             // in-place auto-gain would copy the whole recording again (#403).
             // `consume` hands the only reference to the engine instead;
-            // diarization still runs concurrently as the child task above. If
-            // this throws, leaving the scope cancels that child, which stops
-            // pyannote rather than waiting for a result nobody reads.
-            let segments = try await activeEngine.transcribe(
-                samples: consume samples,
-                language: working.language,
-                // Batch path: imported files / post-record full-WAV
-                // transcription. We don't have a labelled fixture set
-                // for this distribution (variable length, mic, noise
-                // profile), so opt out of the live-VAD-tuned audio_ctx
-                // truncation and use whisper's default 1500-token
-                // context. This is a deliberate fix from PR #32 review:
-                // applying the formula here regressed WER on the CI
-                // e2e short-clip case (en_numbers_and_dates 5.17s,
-                // 0.29 → 0.36 on ggml-tiny).
-                audioCtx: 0,
-                progress: { [weak self, progressCoalescer] p in
-                    // Cheap, lock-guarded, no allocation on the hot path.
-                    // Only schedule a main-actor flush when one isn't already
-                    // pending — that's what caps the flood.
-                    guard progressCoalescer.offer(Double(p)) else { return }
-                    Task { @MainActor [weak self, progressCoalescer] in
-                        let latest = progressCoalescer.flush()
-                        guard let self, self.activeRecordingID == recordingID else { return }
-                        self.progress = latest
-                    }
-                },
-                // Polled by whisper.cpp's abort_callback between every
-                // compute step. Reads against the lock-protected flag set so
-                // the cross-thread access is sound.
-                isCancelled: { [cancellation] in
-                    cancellation.contains(recordingID)
-                }
-            )
-
+            // diarization still runs concurrently as the child task above.
+            //
+            // Transcription is awaited first, so a transcription that FAILS is
+            // reported the moment it fails (#376): awaiting diarization first
+            // held a remote refusal that came back in seconds until pyannote
+            // had finished the whole file — minutes to hours on a long
+            // recording, with the row reading "running" and 0 segments all
+            // along. A throw here leaves the scope with `diarizeTask`
+            // un-awaited, which cancels it, and `SpeakerDiarizer.runPython`
+            // terminates the subprocess on cancellation. A pass that succeeds
+            // still waits for diarization exactly as before.
+            let segments: [TranscriptSegment]
+            if let remoteConfig {
+                // The pass's own config goes with the call (#376).
+                segments = try await passRemoteEngine.transcribe(
+                    samples: consume samples,
+                    language: working.language,
+                    config: remoteConfig,
+                    progress: onProgress,
+                    isCancelled: isCancelled)
+            } else {
+                segments = try await localEngine.transcribe(
+                    samples: consume samples,
+                    language: working.language,
+                    // Batch path: imported files / post-record full-WAV
+                    // transcription. We don't have a labelled fixture set
+                    // for this distribution (variable length, mic, noise
+                    // profile), so opt out of the live-VAD-tuned audio_ctx
+                    // truncation and use whisper's default 1500-token
+                    // context. This is a deliberate fix from PR #32 review:
+                    // applying the formula here regressed WER on the CI
+                    // e2e short-clip case (en_numbers_and_dates 5.17s,
+                    // 0.29 → 0.36 on ggml-tiny).
+                    audioCtx: 0,
+                    progress: onProgress,
+                    isCancelled: isCancelled)
+            }
             let speakerTurns = await diarizeTask
 
             // Cover the narrow window where transcription completed BEFORE the
@@ -1708,7 +1745,8 @@ final class TranscriptionService: ObservableObject {
             // summary regeneration, compression) belongs to a new transcript.
             if text.isEmpty, settleUnusableRerun(
                 id: recordingID,
-                reason: "Re-transcription produced no text. The earlier transcript was kept."
+                alert: "Re-transcription produced no text. The earlier transcript was kept.",
+                rowReason: Self.noSpeechReason
             ) { return }
 
             working.segments = enrichedSegments
@@ -1719,8 +1757,13 @@ final class TranscriptionService: ObservableObject {
             // re-transcribes of a renamed recording hit this in practice.
             working.speakerNames = [:]
             working.fullText = text
+            // Never shorter than the audio this pass just decoded: a
+            // transcript ends at the last words, and a quiet tail (or, for a
+            // remote recording sent in pieces, a last piece with no words in
+            // it, #376) must not cut the recording's length — playback, seek
+            // and the list all read it.
             if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
-                working.duration = lastEnd
+                working.duration = max(lastEnd, durationSeconds)
             }
             working.status = text.isEmpty ? .failed : .completed
             // Auto-drop accidental short+empty captures (issue #61): a clip
@@ -1751,6 +1794,8 @@ final class TranscriptionService: ObservableObject {
                 $0.fullText = working.fullText
                 $0.duration = working.duration
                 $0.modelName = working.modelName
+                $0.transcriptionFailureReason = working.status == .failed
+                    ? Self.noSpeechReason : nil
                 // A full pass transcribed the whole audio, so no part of it
                 // is missing any more (#355).
                 $0.untranscribedSpans = nil
@@ -1850,6 +1895,16 @@ final class TranscriptionService: ObservableObject {
                 [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
                 \(error.localizedDescription, privacy: .private)
                 """)
+            // A remote refusal has a log-safe form that keeps what the line
+            // above has to hide — the HTTP status — without the server's
+            // bytes (`RemoteError.logDescription`, #213). Without it a failed
+            // Voice Memo upload left no trace a user could send us (#376).
+            if let remoteError = error as? RemoteWhisperEngine.RemoteError {
+                serviceLog.error("""
+                    remote transcription of \(recordingID.uuidString.prefix(8), privacy: .public) \
+                    failed: \(remoteError.logDescription, privacy: .public)
+                    """)
+            }
             // A failed pass produced no transcript, so `status` is the ONLY
             // field it owns here — in particular it must not overwrite
             // `speakerNames`/`segments`, which it never re-keyed. Merging onto
@@ -1858,9 +1913,13 @@ final class TranscriptionService: ObservableObject {
             // A failed re-run is undone as a stop undoes it — the earlier
             // transcript is still there, with its own status, language and
             // model — and reported through `lastError` below
-            // (`Recording.settleFailedPass`).
-            mergePassResult(id: recording.id) { $0.settleFailedPass() }
-            lastError = "Transcription failed: \(error.localizedDescription)"
+            // (`Recording.settleFailedPass`). A pass that leaves the row
+            // `.failed` also keeps the reason on it (#376): `lastError` is
+            // one alert, and a background pass (a Voice Memo import, the
+            // launch recovery) usually raises it with nobody looking.
+            let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            mergePassResult(id: recording.id) { $0.settleFailedPass(reason: reason) }
+            lastError = "Transcription failed: \(reason)"
         }
     }
 
@@ -1930,7 +1989,8 @@ final class TranscriptionService: ObservableObject {
     /// by undoing it exactly as a failed re-run is undone
     /// (`Recording.settleFailedPass`): the earlier transcript, segments and
     /// speaker names stay, and the status, language and model that describe
-    /// them come back. `reason` is reported through `lastError`.
+    /// them come back. `alert` is reported through `lastError`; `rowReason`
+    /// is kept on a row restored to `.failed`.
     ///
     /// Returns false, changing nothing, unless the LIVE row is a re-run in
     /// flight whose earlier transcript is still there
@@ -1942,21 +2002,30 @@ final class TranscriptionService: ObservableObject {
     /// turn. A row the user sent to Recently Deleted mid-pass is settled the
     /// same way but raises no alert, as a finished pass skips its user-facing
     /// completion work for one.
-    private func settleUnusableRerun(id: UUID, reason: String) -> Bool {
+    private func settleUnusableRerun(id: UUID, alert: String, rowReason: String) -> Bool {
         guard var probe = store.recordings.first(where: { $0.id == id }),
               probe.restoreRetranscriptionPriorState() else { return false }
         serviceLog.log("""
             \(id.uuidString.prefix(8), privacy: .public) re-run produced no usable \
             text — keeping the earlier transcript
             """)
-        mergePassResult(id: id) { $0.settleFailedPass() }
-        if !probe.isTrashed { lastError = reason }
+        // A reason goes on the row too: a re-run of a draft that had already
+        // failed is restored to `.failed`, and has to keep saying why once
+        // the alert is gone (a row restored to `.completed` keeps none). The
+        // row's own wording, not the alert's: the alert reports what this
+        // re-run did, the row says what is wrong with the recording, and the
+        // header shows it after "Transcription failed:".
+        mergePassResult(id: id) { $0.settleFailedPass(reason: rowReason) }
+        if !probe.isTrashed { lastError = alert }
         return true
     }
 
-    private func markFailed(_ recording: Recording) {
-        mergePassResult(id: recording.id) { $0.settleFailedPass() }
+    private func markFailed(_ recording: Recording, reason: String) {
+        mergePassResult(id: recording.id) { $0.settleFailedPass(reason: reason) }
     }
+
+    /// Kept on a row whose pass finished without a single word.
+    static let noSpeechReason = "No speech was recognized in the audio."
 
     /// Whether the completion hook must force-regenerate the summary. True
     /// when the row had a summary when the pass started — and ALSO when it

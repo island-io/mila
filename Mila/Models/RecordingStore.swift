@@ -762,6 +762,9 @@ final class RecordingStore: ObservableObject {
         recordings[idx].status = .pending
         // The user is starting the run they earlier put off.
         recordings[idx].transcriptionDeferredAt = nil
+        // …or retrying the one that failed: its reason no longer describes
+        // the row (#376).
+        recordings[idx].transcriptionFailureReason = nil
         persist()
         return recordings[idx]
     }
