@@ -2880,7 +2880,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
                     await actions.stopBecauseOfSleep()
                 }
             }
-            if let dictation = self.dictation, case .recording = dictation.state {
+            // `.transcribing` too: the pass cannot be stopped, but its paste
+            // must be (see `DictationController.cancelInFlight`).
+            if let dictation = self.dictation, dictation.state != .idle {
                 print("Sleep guard: cancelling dictation before system sleeps")
                 await dictation.cancelInFlight()
             }
@@ -2921,7 +2923,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             print("Screen-lock guard: stopping active recording (\(reason))")
             await actions.stopRecording()
         }
-        if let dictation, case .recording = dictation.state {
+        // `.transcribing` too: a pass still running when the screen locks
+        // would otherwise paste into the lock screen once it finishes.
+        if let dictation, dictation.state != .idle {
             print("Screen-lock guard: cancelling active dictation (\(reason))")
             await dictation.cancelInFlight()
         }

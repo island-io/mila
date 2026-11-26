@@ -68,27 +68,80 @@ final class DictationControllerTests: XCTestCase {
                        "Hebrew dictation must load the ivrit.ai large-v3 model")
     }
 
-    /// A hotkey press routes on the state AND on whether a stop is already
-    /// tearing the recorder down. The state reads `.recording` through that
-    /// wait, so a double-tap used to run a second stop: a second final pass
-    /// over empty audio that beeped and set `.idle` under the first one
-    /// (#435 review).
-    func test_a_second_press_while_the_stop_is_in_progress_is_ignored() {
+    /// A hotkey press routes on the state AND on whether a stop or a cancel
+    /// is still tearing the recorder down. The state reads `.recording`
+    /// through that wait, so a double-tap used to run a second stop: a second
+    /// final pass over empty audio that beeped and set `.idle` under the
+    /// first one (#435 review). During a cancel's teardown a press would have
+    /// transcribed, and pasted, the capture the cancel is dropping.
+    func test_a_second_press_while_the_recorder_tears_down_is_ignored() {
         let english = HotkeyAction.dictateEnglish
-        func press(_ state: DictationController.State, stopping: Bool = false) -> DictationController.PressOutcome {
-            DictationController.outcome(ofPress: english, state: state, isStopping: stopping)
+        func press(_ state: DictationController.State, tearingDown: Bool = false) -> DictationController.PressOutcome {
+            DictationController.outcome(ofPress: english, state: state, isTearingDown: tearingDown)
         }
         XCTAssertEqual(press(.idle), .start)
         XCTAssertEqual(press(.recording(english)), .stop, "the first press of the same hotkey stops")
-        XCTAssertEqual(press(.recording(english), stopping: true), .ignore,
-                       "a second press while that stop is still running must not stop again")
-        XCTAssertEqual(press(.idle, stopping: true), .ignore,
-                       "no new dictation while a stop is still tearing the recorder down, even after a cancel set .idle")
-        XCTAssertEqual(DictationController.outcome(ofPress: .dictateHebrew, state: .idle, isStopping: true),
+        XCTAssertEqual(press(.recording(english), tearingDown: true), .ignore,
+                       "a press while a stop or cancel is still tearing down must not run a stop")
+        XCTAssertEqual(press(.idle, tearingDown: true), .ignore,
+                       "no new dictation while the recorder is still tearing down, even after a cancel set .idle")
+        XCTAssertEqual(DictationController.outcome(ofPress: .dictateHebrew, state: .idle, isTearingDown: true),
                        .ignore, "whichever language's hotkey is pressed")
         XCTAssertEqual(press(.transcribing(english)), .ignore)
         XCTAssertEqual(press(.recording(.dictateHebrew)), .ignore,
                        "the other language's hotkey never stops a dictation")
+    }
+
+    /// A sleep, screen lock or quit during capture drops the dictation, as
+    /// before. During the final pass it cannot stop whisper, but it must stop
+    /// the paste: a synthesized Cmd-V into a locked screen types the
+    /// transcript into the password field. The dictation is still saved, so
+    /// nothing the user said is lost, and there is no beep either.
+    func test_a_cancel_during_the_final_pass_stops_only_the_paste() {
+        let english = HotkeyAction.dictateEnglish
+        XCTAssertEqual(DictationController.cancelEffect(for: .idle), .none)
+        XCTAssertEqual(DictationController.cancelEffect(for: .recording(english)), .dropCapture)
+        XCTAssertEqual(DictationController.cancelEffect(for: .transcribing(english)), .suppressPaste,
+                       "a cancel during the final pass must not be a no-op")
+
+        XCTAssertEqual(DictationController.finalPassOutcome(text: "hello", cancelledDuringPass: false), .paste)
+        XCTAssertEqual(DictationController.finalPassOutcome(text: "", cancelledDuringPass: false), .beep)
+        XCTAssertEqual(DictationController.finalPassOutcome(text: "hello", cancelledDuringPass: true),
+                       .keepWithoutPasting, "no paste after a sleep, screen lock or quit")
+        XCTAssertEqual(DictationController.finalPassOutcome(text: "", cancelledDuringPass: true),
+                       .keepWithoutPasting)
+    }
+
+    /// The recorder's teardown has no timeout of its own and can block on
+    /// the CoreAudio HAL. A stop or cancel waits for it at most
+    /// `recorderTeardownDeadline`, then carries on, so a teardown that never
+    /// returns cannot leave every later press ignored until relaunch. Its
+    /// completion after the deadline must change nothing: in particular it
+    /// must not resume the wait a second time, which would trap.
+    func test_a_teardown_that_overruns_the_deadline_is_left_behind() async {
+        let teardown = HeldTeardown()
+        let started = Date()
+        let inTime = await DictationController.waitAtMost(0.1) {
+            await teardown.run()
+        }
+        XCTAssertFalse(inTime, "the wait must give up at the deadline")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5,
+                          "the wait must end at the deadline, not with the teardown")
+        XCTAssertTrue(teardown.isRunning, "the teardown itself keeps running")
+
+        teardown.finish()
+        let deadline = Date().addingTimeInterval(5)
+        while !teardown.didFinish, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(teardown.didFinish, "the late completion ran, and was a no-op")
+
+        let quick = Date()
+        let fast = await DictationController.waitAtMost(30) {}
+        XCTAssertTrue(fast, "a teardown that returns in time is reported as such")
+        XCTAssertLessThan(Date().timeIntervalSince(quick), 5,
+                          "a teardown that returns at once must not wait for the deadline")
+        XCTAssertGreaterThan(DictationController.recorderTeardownDeadline, 0)
     }
 
     /// The TranscriptionService must forward `shutdown` to the engine. This
@@ -99,5 +152,24 @@ final class DictationControllerTests: XCTestCase {
         await service.shutdown()
         let count = await stub.shutdownCount
         XCTAssertEqual(count, 1)
+    }
+}
+
+/// A recorder teardown that does not return until the test says so.
+@MainActor
+private final class HeldTeardown {
+    private(set) var isRunning = false
+    private(set) var didFinish = false
+    private var release: CheckedContinuation<Void, Never>?
+
+    func run() async {
+        isRunning = true
+        await withCheckedContinuation { release = $0 }
+        didFinish = true
+    }
+
+    func finish() {
+        release?.resume()
+        release = nil
     }
 }
