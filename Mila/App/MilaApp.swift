@@ -2935,10 +2935,11 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // Stop any active recording / dictation cleanly so AVAudioEngine and
         // SCStream release the user's mic / screen-recording grant.
         await session?.cancelAll()
-        // Not behind a sleep or screen-lock cancel still tearing down: that
-        // one cleans up by itself, and the quit must not wait out its stuck
-        // teardown.
-        await dictation?.cancelInFlight(waitsForACancelInProgress: false)
+        // A sleep or screen-lock cancel still tearing down is waited for,
+        // but briefly: a healthy teardown is done well within 2 s, and a
+        // stuck one must not hold the quit for its whole 10 s deadline (it
+        // still cleans up by itself).
+        await dictation?.cancelInFlight(joinDeadline: 2)
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.
         modelManager?.shutdown()

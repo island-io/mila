@@ -158,10 +158,30 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(bodies.count, 1, "one teardown and one cleanup")
         XCTAssertFalse(cancels.isRunning, "presses work again once that one is done")
 
-        // The next cancel (a later dictation's) runs its own body.
+        // The next cancel (a later dictation's) runs its own body, and a
+        // quit's bounded join gives up on a teardown that is stuck.
         let ranAgain = await cancels.runOrJoin { bodies.count += 1 }
         XCTAssertTrue(ranAgain)
         XCTAssertEqual(bodies.count, 2)
+
+        let stuck = HeldTeardown()
+        let stuckCancel = Task { @MainActor in
+            await cancels.runOrJoin { await stuck.run() }
+        }
+        let stuckDeadline = Date().addingTimeInterval(5)
+        while !stuck.isRunning, Date() < stuckDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let started = Date()
+        let joinedInTime = await DictationController.waitAtMost(0.1) {
+            await cancels.runOrJoin {}
+        }
+        XCTAssertFalse(joinedInTime, "a quit's bounded join stops waiting for a stuck teardown")
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertTrue(cancels.isRunning, "the stuck cancel itself carries on")
+        stuck.finish()
+        _ = await stuckCancel.value
+        XCTAssertFalse(cancels.isRunning)
     }
 
     /// The recorder's teardown has no timeout of its own and can block on
