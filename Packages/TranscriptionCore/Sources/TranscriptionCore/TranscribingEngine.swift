@@ -40,7 +40,13 @@ public protocol TranscribingEngine: Sendable {
     ///     paths whose quality has not been validated against truncation
     ///     (dictation, imported-file batch transcription).
     ///   * any positive Int32 → explicit override (advanced / testing).
-    func transcribe(samples: [Float],
+    ///
+    /// `samples` is `consuming`: the engine owns the buffer for the call and
+    /// may write into it (`WhisperEngine`'s auto-gain scales it in place,
+    /// #403). Pass `consume buffer` when the caller is done with a large
+    /// recording, or the engine's first write copies it. A conformer that
+    /// only reads the samples may declare the parameter without `consuming`.
+    func transcribe(samples: consuming [Float],
                     language: String,
                     audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,

@@ -228,7 +228,12 @@ public actor WhisperEngine {
     ///   * `0`    → pass through whisper's default 1500-token (= 30s) context.
     ///     Use for dictation and imported-file batch paths (no truncation).
     ///   * positive Int32 → explicit override.
-    public func transcribe(samples rawSamples: [Float],
+    ///
+    /// `samples` is `consuming` because the auto-gain scales it in place
+    /// (`normalize`, #403): a caller that passes `consume buffer` keeps no
+    /// second copy of the recording alive. A caller that passes a plain
+    /// array still works; copy-on-write copies it here, as before.
+    public func transcribe(samples: consuming [Float],
                     language: String,
                     audioCtx: Int32? = nil,
                     progress: (@Sendable (Float) -> Void)?,
@@ -238,8 +243,9 @@ public actor WhisperEngine {
         }
 
         // Auto-gain: if the recording is quiet, boost so whisper isn't fooled
-        // into thinking it's silence. Capped to a safe ceiling.
-        let samples = Self.normalize(rawSamples)
+        // into thinking it's silence. Capped to a safe ceiling. In place: a
+        // caller that hands the buffer over (`consume`) pays for no copy.
+        Self.normalize(&samples)
         let peak = Self.peakMagnitude(samples)
         let durationSeconds = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
         print(String(format: "Whisper: transcribing %.2fs of audio, peak=%.3f, lang=%@",
@@ -533,16 +539,28 @@ public actor WhisperEngine {
 
     /// Apply auto-gain so quiet recordings still hit Whisper's speech threshold.
     /// Targets a peak around 0.5 (≈ -6 dB), capped so we never amplify noise more than 20×.
-    static func normalize(_ samples: [Float]) -> [Float] {
-        guard !samples.isEmpty else { return samples }
+    ///
+    /// Scales `samples` where they are (#403). Returning a scaled copy held two
+    /// full-size buffers for the whole `whisper_full` run, about 230 MB each
+    /// for an hour of audio. The write only stays in place if the caller hands
+    /// over a uniquely referenced array; otherwise copy-on-write copies it
+    /// here once, which is no worse than before. `transcribe(samples:)` takes
+    /// its samples `consuming` so the batch path can do that.
+    ///
+    /// The per-sample expression is the one the copying version used, so the
+    /// output is bit-for-bit the same, NaN included (`min`/`max` map a NaN
+    /// sample to 1). `vDSP_vclip` would pass NaN through, and Accelerate is
+    /// not available on Linux, where TranscriptionCore also builds.
+    static func normalize(_ samples: inout [Float]) {
+        guard !samples.isEmpty else { return }
         let peak = peakMagnitude(samples)
-        guard peak > 0 else { return samples }
+        guard peak > 0 else { return }
         let target: Float = 0.5
         let gain = min(target / peak, 20.0)
-        if gain <= 1.05 { return samples }
-        var out = samples
-        for i in 0..<out.count { out[i] = max(-1, min(1, out[i] * gain)) }
-        return out
+        if gain <= 1.05 { return }
+        samples.withUnsafeMutableBufferPointer { buf in
+            for i in buf.indices { buf[i] = max(-1, min(1, buf[i] * gain)) }
+        }
     }
 }
 
