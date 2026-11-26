@@ -10,6 +10,11 @@ import PackageDescription
 /// call profile mid-bring-up aborted the whole app). This package exists so
 /// those call sites can turn the exception into an ordinary Swift error.
 ///
+/// A raising call that takes an object argument (a tap block, say) gets its
+/// own wrapper here that makes the call from Objective-C, not a Swift closure
+/// passed to `catching`: the raise would unwind through that closure's frame
+/// and skip its releases, leaking the argument (#427).
+///
 /// A package rather than a bridging header on the app target: the test
 /// bundle and any future target get it with a plain `import`, and it is
 /// tested on its own with `swift test`, no app host needed.

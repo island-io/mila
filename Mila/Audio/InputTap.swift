@@ -19,13 +19,19 @@ enum InputTap {
 
     /// `node.installTap(onBus: 0, …)`, with the exception it raises turned
     /// into a thrown error. Nothing is installed when it throws.
+    ///
+    /// Not `ObjCException.catching { node.installTap(…) }`: there the raise
+    /// unwinds through the Swift closure that bridged `block` to an ObjC
+    /// block, that frame's release never runs, and every refused tap leaked
+    /// its block and all it captures — the recorder's converter, stream
+    /// continuation and gain (#427). The ObjC wrapper makes the call itself,
+    /// so the bridging happens here, in a frame that returns normally.
     static func install(on node: AVAudioNode,
                         bufferSize: AVAudioFrameCount,
                         format: AVAudioFormat,
                         block: @escaping AVAudioNodeTapBlock) throws {
-        try ObjCException.catching {
-            node.installTap(onBus: 0, bufferSize: bufferSize, format: format, block: block)
-        }
+        try ObjCException.installTap(on: node, bus: 0, bufferSize: bufferSize,
+                                     format: format, block: block)
     }
 
     /// Install with `initial`; if that is refused and the node now reports a
