@@ -12,7 +12,10 @@ env:
 
 jobs:
   e2e:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: once ubuntu-latest moved to 26.04, the held
+    # setup-swift v2.4.0 below fails every run with 'Version "26.04" of Ubuntu
+    # is not supported'. Move this forward together with setup-swift.
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
 
     steps:
