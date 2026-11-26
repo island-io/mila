@@ -319,10 +319,18 @@ final class RecordingLibraryWriterTests: XCTestCase {
         }
         let plain = Recording(title: "plain", source: .microphone, audioFileName: "plain.wav")
         store.add(plain)
-        store.assign(plain, toFolder: "Work")  // background, held
+        XCTAssertEqual(store.createFolder("Work"), "Work")
+        store.assign(plain, toFolder: "Work")  // an existing folder: background, held
         XCTAssertTrue(probe.waitUntilHeld())
         let filed = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "plain" })
         XCTAssertNil(filed["folder"], "the folder move is a background write, held")
+
+        // A move that creates its folder writes both files in the same turn.
+        let other = Recording(title: "other", source: .microphone, audioFileName: "other.wav")
+        store.add(other)
+        store.assign(other, toFolder: "Q4")
+        let movedToNew = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "other" })
+        XCTAssertEqual(movedToNew["folder"] as? String, "Q4", "the new folder is in folders.json but the move is not on disk")
 
         var memo = Recording(title: "memo", source: .voiceMemo, audioFileName: "memo.wav")
         memo.voiceMemoUniqueID = "VM-1"

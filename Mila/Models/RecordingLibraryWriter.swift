@@ -28,10 +28,8 @@ private let writerSignposter = OSSignposter(logger: writerLog)
 ///
 /// **Synchronous path.** `writeNow` encodes on the calling thread and
 /// reports whether the file now holds that state. `RecordingStore` uses it
-/// through `persistNow()`, whose doc lists the callers: ones that act on
-/// the answer, deletions that must reach mila-mcp before the call returns,
-/// and changes a crash must not undo (an add, a folder rename or delete,
-/// an audio trim).
+/// through `persistNow()`; the list of callers, and why each one needs it,
+/// is kept there.
 ///
 /// **Quit.** On `NSApplication.willTerminateNotification` the writer waits
 /// for queued writes to finish, so a change made just before quitting is

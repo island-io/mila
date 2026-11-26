@@ -854,7 +854,7 @@ final class RecordingStore: ObservableObject {
 
     /// Add `suggestions` to a recording's pending speaker-name suggestions,
     /// replacing any existing suggestion for the same speaker. Returns whether
-    /// anything changed (and was handed to the background writer).
+    /// anything changed in memory; the write goes through `persist()`.
     ///
     /// Only suggestions that can still be acted on are kept — the speaker has
     /// lines in the transcript and no name yet — so a name that landed from
@@ -1500,8 +1500,10 @@ final class RecordingStore: ObservableObject {
             folders.append(target)
             folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             persistFolders()
+            persistNow()  // same turn as folders.json, as in `renameFolder`
+        } else {
+            persist()
         }
-        persist()
     }
 
     /// Persist (or clear) the `.txt` sidecar for a recording. Empty text
@@ -2304,8 +2306,9 @@ final class RecordingStore: ObservableObject {
     ///   permanent delete; emptying the trash):
     ///   mila-mcp reads recordings.json, and a row the user just deleted must
     ///   not stay listed there for as long as a background encode takes;
-    /// - a folder rename or delete, written in the same turn as
-    ///   `folders.json`, so a crash cannot bring the old folder back;
+    /// - a folder rename or delete, and a move that creates a folder,
+    ///   written in the same turn as `folders.json`, so a crash cannot
+    ///   bring an old folder back or leave a new one empty;
     /// - naming, merging or retiring a speaker, whose voice-profile hooks
     ///   have already saved `speaker-profiles.json` (a crash must not keep
     ///   the fold and lose the name), reattaching a name after a re-key (the
