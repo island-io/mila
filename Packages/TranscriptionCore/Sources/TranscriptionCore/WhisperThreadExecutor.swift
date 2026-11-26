@@ -58,8 +58,9 @@ final class WhisperThreadExecutor: SerialExecutor, @unchecked Sendable {
 
     private let condition = NSCondition()
     /// Jobs not yet run, in arrival order. `nextJob()` takes the first one of
-    /// the highest priority. Only the few callers of one engine queue here,
-    /// so the queue stays short and a linear scan is the right cost.
+    /// the highest priority. Only the callers of every `WhisperEngine` (the
+    /// app has one) queue here, so the queue stays short and a linear scan
+    /// is the right cost.
     private var jobs: [UnownedJob] = []
     /// Written once, in `init`, before the thread starts.
     private var thread: Thread!
