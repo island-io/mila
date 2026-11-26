@@ -34,6 +34,28 @@ final class DictationControllerTests: XCTestCase {
         try await super.tearDown()
     }
 
+    /// A controller that leaves the host app's global hotkeys alone and
+    /// tears its recorder down through `recorderTeardowns`.
+    private func makeController(recorderTeardowns: RecorderTeardowns) -> (DictationController, LiveTranscriber) {
+        let live = LiveTranscriber(transcription: service)
+        let controller = DictationController(store: store,
+                                             transcription: service,
+                                             hotkeySettings: hotkeys,
+                                             liveTranscriber: live,
+                                             registersHotkeys: false,
+                                             recorderTeardowns: recorderTeardowns)
+        return (controller, live)
+    }
+
+    /// Polls `condition` for up to `timeout` seconds; returns its last value.
+    private func eventually(_ condition: () -> Bool, timeout: TimeInterval = 5) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return condition()
+    }
+
     /// `transcribeOnce` must route Hebrew audio to the ivrit.ai model and
     /// English audio to the OpenAI turbo, even when a different model is
     /// "selected" globally. This is the dictation-language plumbing the new
@@ -68,25 +90,32 @@ final class DictationControllerTests: XCTestCase {
                        "Hebrew dictation must load the ivrit.ai large-v3 model")
     }
 
-    /// A hotkey press routes on the state AND on whether a stop or a cancel
-    /// is still tearing the recorder down. The state reads `.recording`
-    /// through that wait, so a double-tap used to run a second stop: a second
-    /// final pass over empty audio that beeped and set `.idle` under the
-    /// first one (#435 review). During a cancel's teardown a press would have
-    /// transcribed, and pasted, the capture the cancel is dropping.
-    func test_a_second_press_while_the_recorder_tears_down_is_ignored() {
+    /// A hotkey press routes on the state, on whether a stop is still under
+    /// way, and on whether a recorder teardown is still running. The state
+    /// reads `.recording` while a stop tears the recorder down, so a
+    /// double-tap used to run a second stop: a second final pass over empty
+    /// audio that beeped and set `.idle` under the first one (#435 review).
+    /// And a start while an earlier teardown is still stuck on the CoreAudio
+    /// HAL would block another cooperative-pool thread on the same device.
+    func test_a_press_while_the_recorder_tears_down_routes_safely() {
         let english = HotkeyAction.dictateEnglish
-        func press(_ state: DictationController.State, tearingDown: Bool = false) -> DictationController.PressOutcome {
-            DictationController.outcome(ofPress: english, state: state, isTearingDown: tearingDown)
+        func press(_ state: DictationController.State,
+                   stopping: Bool = false,
+                   shuttingDown: Bool = false) -> DictationController.PressOutcome {
+            DictationController.outcome(ofPress: english, state: state,
+                                        isStopping: stopping, isMicrophoneShuttingDown: shuttingDown)
         }
         XCTAssertEqual(press(.idle), .start)
         XCTAssertEqual(press(.recording(english)), .stop, "the first press of the same hotkey stops")
-        XCTAssertEqual(press(.recording(english), tearingDown: true), .ignore,
-                       "a press while a stop or cancel is still tearing down must not run a stop")
-        XCTAssertEqual(press(.idle, tearingDown: true), .ignore,
-                       "no new dictation while the recorder is still tearing down, even after a cancel set .idle")
-        XCTAssertEqual(DictationController.outcome(ofPress: .dictateHebrew, state: .idle, isTearingDown: true),
-                       .ignore, "whichever language's hotkey is pressed")
+        XCTAssertEqual(press(.recording(english), stopping: true), .ignore,
+                       "a press while that stop is still tearing down must not run a second stop")
+        XCTAssertEqual(press(.idle, stopping: true), .refuseStart,
+                       "no new dictation until a stop that a cancel overtook has finished")
+        XCTAssertEqual(press(.idle, shuttingDown: true), .refuseStart,
+                       "no new dictation while a recorder teardown is still running")
+        XCTAssertEqual(DictationController.outcome(ofPress: .dictateHebrew, state: .idle,
+                                                   isStopping: false, isMicrophoneShuttingDown: true),
+                       .refuseStart, "whichever language's hotkey is pressed")
         XCTAssertEqual(press(.transcribing(english)), .ignore)
         XCTAssertEqual(press(.recording(.dictateHebrew)), .ignore,
                        "the other language's hotkey never stops a dictation")
@@ -113,111 +142,94 @@ final class DictationControllerTests: XCTestCase {
     }
 
     /// Closing the lid sends both the screen-lock and the sleep guard to
-    /// `cancelInFlight`. The second cancel's `stop()` returns at once, so
-    /// when it ran its own teardown it cleared the cancelling flag and set
-    /// `.idle` while the first was still waiting; a dictation started then
-    /// was torn down by the first cancel's cleanup when it resumed (#435
-    /// review). The second cancel must join the first: one teardown and one
-    /// cleanup, and presses stay ignored until that one is done.
-    func test_a_second_cancel_joins_the_first_instead_of_finishing_early() async {
-        let cancels = JoinedRun()
+    /// `cancelInFlight`, and a quit can follow while the first cancel is
+    /// still waiting for the microphone. The quit then shuts the engine down,
+    /// so nothing of the dictation may still be running by the time it
+    /// returns: a live pass ticking into a torn-down engine aborts the
+    /// process (#435 review: a quit that gave up joining the first cancel
+    /// returned before that cancel had stopped the live transcriber). A
+    /// cancel therefore does everything it does to the dictation before it
+    /// waits, and whatever arrives second finds `.idle` and returns at once.
+    func test_a_quit_during_a_slow_cancel_finds_the_live_transcriber_stopped() async {
         let teardown = HeldTeardown()
-        let bodies = RunCounter()
+        let teardowns = RecorderTeardowns(deadline: 30, teardown: teardown.run)
+        let (controller, live) = makeController(recorderTeardowns: teardowns)
+        controller.beginRecordingForTesting(.dictateEnglish)
+        XCTAssertTrue(live.isRunning, "setup: the live transcriber is running")
 
-        let first = Task { @MainActor in
-            await cancels.runOrJoin {
-                bodies.count += 1
-                await teardown.run()
-            }
-        }
-        let deadline = Date().addingTimeInterval(5)
-        while !teardown.isRunning, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        guard teardown.isRunning else {
+        let sleepCancel = Task { @MainActor in await controller.cancelInFlight() }
+        guard await eventually({ teardown.isRunning }) else {
             teardown.finish()
-            _ = await first.value
-            return XCTFail("setup: the first cancel never reached its teardown")
+            await sleepCancel.value
+            return XCTFail("setup: the cancel never reached the recorder teardown")
         }
-        XCTAssertTrue(cancels.isRunning, "setup: the first cancel is tearing down")
+        XCTAssertFalse(live.isRunning,
+                       "the cancel stops the live transcriber before it waits for the microphone")
+        XCTAssertEqual(controller.state, .idle)
 
-        let second = Task { @MainActor () -> Bool in
-            let ran = await cancels.runOrJoin { bodies.count += 1 }
-            bodies.secondReturned = true
-            return ran
+        let quitReturned = Flag()
+        let quit = Task { @MainActor in
+            await controller.cancelInFlight()
+            quitReturned.isSet = true
         }
-        try? await Task.sleep(nanoseconds: 200_000_000)
-        XCTAssertFalse(bodies.secondReturned, "the second cancel waits for the first's teardown")
-        XCTAssertTrue(cancels.isRunning, "presses stay ignored while the first is still waiting")
+        let returnedInTime = await eventually({ quitReturned.isSet })
+        XCTAssertTrue(returnedInTime, "the quit does not wait for the first cancel's stuck teardown")
+        XCTAssertFalse(teardown.didFinish, "the first cancel is still waiting for the microphone")
+        XCTAssertFalse(live.isRunning, "nothing of the dictation is running when the quit returns")
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .refuseStart,
+                       "no new dictation while the microphone is still shutting down")
 
         teardown.finish()
-        let firstRan = await first.value
-        let secondRan = await second.value
-        XCTAssertTrue(firstRan)
-        XCTAssertFalse(secondRan, "the second cancel joined instead of running its own cleanup")
-        XCTAssertEqual(bodies.count, 1, "one teardown and one cleanup")
-        XCTAssertFalse(cancels.isRunning, "presses work again once that one is done")
-
-        // The next cancel (a later dictation's) runs its own body, and a
-        // quit's bounded join gives up on a teardown that is stuck.
-        let ranAgain = await cancels.runOrJoin { bodies.count += 1 }
-        XCTAssertTrue(ranAgain)
-        XCTAssertEqual(bodies.count, 2)
-
-        let stuck = HeldTeardown()
-        let stuckCancel = Task { @MainActor in
-            await cancels.runOrJoin { await stuck.run() }
-        }
-        let stuckDeadline = Date().addingTimeInterval(5)
-        while !stuck.isRunning, Date() < stuckDeadline {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        guard stuck.isRunning else {
-            stuck.finish()
-            _ = await stuckCancel.value
-            return XCTFail("setup: the stuck cancel never reached its teardown")
-        }
-        let started = Date()
-        let joinedInTime = await DictationController.waitAtMost(0.1) {
-            await cancels.runOrJoin {}
-        }
-        XCTAssertFalse(joinedInTime, "a quit's bounded join stops waiting for a stuck teardown")
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
-        XCTAssertTrue(cancels.isRunning, "the stuck cancel itself carries on")
-        stuck.finish()
-        _ = await stuckCancel.value
-        XCTAssertFalse(cancels.isRunning)
+        await sleepCancel.value
+        await quit.value
+        XCTAssertFalse(teardowns.isShuttingDown)
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .start,
+                       "dictation starts again once the teardown has returned")
     }
 
-    /// The recorder's teardown has no timeout of its own and can block on
-    /// the CoreAudio HAL. A stop or cancel waits for it at most
-    /// `recorderTeardownDeadline`, then carries on, so a teardown that never
-    /// returns cannot leave every later press ignored until relaunch. Its
-    /// completion after the deadline must change nothing: in particular it
-    /// must not resume the wait a second time, which would trap.
-    func test_a_teardown_that_overruns_the_deadline_is_left_behind() async {
+    /// The recorder's teardown has no timeout of its own and runs
+    /// `engine.stop()` on the shared cooperative pool, where it can block on
+    /// the CoreAudio HAL. A stop or cancel waits for it at most its deadline
+    /// and then carries on; a new dictation would block another pool thread
+    /// on the same device, so starts stay refused until the teardown has
+    /// actually returned, and work again as soon as it has.
+    func test_a_start_is_refused_until_an_overdue_teardown_returns() async {
         let teardown = HeldTeardown()
+        let teardowns = RecorderTeardowns(deadline: 0.1, teardown: teardown.run)
+        let (controller, live) = makeController(recorderTeardowns: teardowns)
+        controller.beginRecordingForTesting(.dictateHebrew)
+
         let started = Date()
-        let inTime = await DictationController.waitAtMost(0.1) {
-            await teardown.run()
-        }
-        XCTAssertFalse(inTime, "the wait must give up at the deadline")
+        await controller.cancelInFlight()
         XCTAssertLessThan(Date().timeIntervalSince(started), 5,
-                          "the wait must end at the deadline, not with the teardown")
-        XCTAssertTrue(teardown.isRunning, "the teardown itself keeps running")
+                          "the cancel stops waiting at the deadline, not with the teardown")
+        XCTAssertFalse(teardown.didFinish, "the teardown itself is still stuck")
+        XCTAssertFalse(live.isRunning)
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertTrue(teardowns.isShuttingDown)
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .refuseStart,
+                       "no start while the overdue teardown is still running")
+        XCTAssertEqual(controller.pressOutcome(for: .dictateHebrew), .refuseStart)
 
         teardown.finish()
-        let deadline = Date().addingTimeInterval(5)
-        while !teardown.didFinish, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertTrue(teardown.didFinish, "the late completion ran, and was a no-op")
+        let reenabled = await eventually({ !teardowns.isShuttingDown })
+        XCTAssertTrue(reenabled, "the teardown's late return is counted")
+        XCTAssertTrue(teardown.didFinish)
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .start,
+                       "starts work again once the teardown has returned")
 
-        let quick = Date()
-        let fast = await DictationController.waitAtMost(30) {}
-        XCTAssertTrue(fast, "a teardown that returns in time is reported as such")
-        XCTAssertLessThan(Date().timeIntervalSince(quick), 5,
-                          "a teardown that returns at once must not wait for the deadline")
+        // A teardown that returns in time is reported as such, without
+        // waiting for the deadline, and counted only while it runs.
+        let quick = RecorderTeardowns(deadline: 30) {}
+        let quickStart = Date()
+        let pending = quick.begin()
+        XCTAssertTrue(quick.isShuttingDown, "counted from begin(), before it has run")
+        let inTime = await pending.wait()
+        XCTAssertTrue(inTime)
+        XCTAssertLessThan(Date().timeIntervalSince(quickStart), 5)
+        XCTAssertFalse(quick.isShuttingDown)
+        let again = await pending.wait()
+        XCTAssertTrue(again, "a second look at a decided teardown returns at once")
         XCTAssertGreaterThan(DictationController.recorderTeardownDeadline, 0)
     }
 
@@ -257,9 +269,7 @@ private final class HeldTeardown {
     }
 }
 
-/// What the cancel bodies in the join test did.
 @MainActor
-private final class RunCounter {
-    var count = 0
-    var secondReturned = false
+private final class Flag {
+    var isSet = false
 }
