@@ -68,6 +68,25 @@ final class DictationControllerTests: XCTestCase {
                        "Hebrew dictation must load the ivrit.ai large-v3 model")
     }
 
+    /// A hotkey press routes on the state AND on whether a stop is already
+    /// tearing the recorder down. The state reads `.recording` through that
+    /// wait (so sleep and screen lock can still cancel), so a double-tap used
+    /// to run a second stop: a second final pass over empty audio that beeped
+    /// and set `.idle` under the first one (#435 review).
+    func test_a_second_press_while_the_stop_is_in_progress_is_ignored() {
+        let english = HotkeyAction.dictateEnglish
+        func press(_ state: DictationController.State, stopping: Bool = false) -> DictationController.PressOutcome {
+            DictationController.outcome(ofPress: english, state: state, isStopping: stopping)
+        }
+        XCTAssertEqual(press(.idle), .start)
+        XCTAssertEqual(press(.recording(english)), .stop, "the first press of the same hotkey stops")
+        XCTAssertEqual(press(.recording(english), stopping: true), .ignore,
+                       "a second press while that stop is still running must not stop again")
+        XCTAssertEqual(press(.transcribing(english)), .ignore)
+        XCTAssertEqual(press(.recording(.dictateHebrew)), .ignore,
+                       "the other language's hotkey never stops a dictation")
+    }
+
     /// The TranscriptionService must forward `shutdown` to the engine. This
     /// is the fix path for the on-quit `ggml_abort` crash documented in the
     /// AppDelegate — without it, libc++ destroys the metal-device vector at

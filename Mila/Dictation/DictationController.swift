@@ -34,6 +34,13 @@ final class DictationController: ObservableObject {
     /// `state = .recording` — the two awaits in that window (mic permission,
     /// engine bring-up) are where a hotkey double-press could re-enter.
     private var isStarting = false
+    /// True from the moment `stopAndTranscribe` begins until the state has
+    /// moved on to `.transcribing`. The state stays `.recording` while the
+    /// recorder tears down — on purpose, so the sleep and screen-lock guards
+    /// (`cancelInFlight`, which acts only on `.recording`) still cover that
+    /// wait — and without this flag `toggle` would route a double-tap into a
+    /// second stop.
+    private var isStopping = false
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
     /// mode releases an idle model (#393), so without it every dictation
@@ -104,13 +111,37 @@ final class DictationController: ObservableObject {
     /// already in flight, this call is ignored (we don't want to interleave
     /// languages).
     func toggle(action: HotkeyAction) async {
+        switch Self.outcome(ofPress: action, state: state, isStopping: isStopping) {
+        case .start:
+            await start(action: action)
+        case .stop:
+            await stopAndTranscribe(action: action)
+        case .ignore:
+            NSSound.beep()
+        }
+    }
+
+    enum PressOutcome: Equatable { case start, stop, ignore }
+
+    /// What a press of `action`'s hotkey does. Kept pure so the routing can
+    /// be tested without a microphone.
+    ///
+    /// Only the language being recorded can stop it, and only once: a second
+    /// press while that stop is still tearing the recorder down is ignored,
+    /// like a press during `.transcribing`. Routing it to a second stop ran
+    /// a second final pass over empty audio, which beeped and set `.idle`
+    /// while the first pass was still running — so a later press could start
+    /// a new dictation that the first stop then knocked back to `.idle`.
+    static func outcome(ofPress action: HotkeyAction,
+                        state: State,
+                        isStopping: Bool) -> PressOutcome {
         switch state {
         case .idle:
-            await start(action: action)
-        case .recording(let active) where active == action:
-            await stopAndTranscribe(action: action)
+            return .start
+        case .recording(let active) where active == action && !isStopping:
+            return .stop
         case .recording, .transcribing:
-            NSSound.beep()
+            return .ignore
         }
     }
 
@@ -250,17 +281,19 @@ final class DictationController: ObservableObject {
     }
 
     private func stopAndTranscribe(action: HotkeyAction) async {
-        // Take this dictation's model hold BEFORE the first await, and end
-        // only that one. `toggle` routes a press here for as long as the
-        // state reads `.recording`, which lasts through `recorder.stop()`, so
-        // a double-tap can run two stops. Ending whatever `modelHold` carried
-        // by the time a stop finished could end the NEXT dictation's hold;
-        // this way the second stop finds nil and ends nothing.
+        // Mark the stop and take this dictation's model hold BEFORE the first
+        // await. The state reads `.recording` until `recorder.stop()` returns
+        // (so sleep and screen lock can still cancel), and `isStopping` is
+        // what turns a double-tap in that window away instead of running a
+        // second stop. The hold moves into a local so this stop ends exactly
+        // the hold it took, whatever `modelHold` carries by the time it does.
+        isStopping = true
         let hold = modelHold
         modelHold = nil
         await recorder.stop()
         streamTask?.cancel(); streamTask = nil
         state = .transcribing(action)
+        isStopping = false
         DictationOverlayWindow.shared.setBusy(true)
 
         let captured = samples
