@@ -847,7 +847,25 @@ final class ModelLifecycleTests: XCTestCase {
         XCTAssertEqual(remoteCalls, 1, "the remote job ran while the preload was still loading")
         XCTAssertEqual(requests, 1, "only the preload has asked the local engine for a model")
 
+        // "Retry missing parts" on the remote backend: the same.
+        let spanAudio = root.appendingPathComponent("spans.wav")
+        try TestSupport.writeSineWav(at: spanAudio, durationSeconds: 1)
+        let spans = Task {
+            await mixed.transcribeSpans([UntranscribedSpan(start: 0, end: 1)],
+                                        audioURL: spanAudio, language: "he")
+        }
+        deadline = Date().addingTimeInterval(10)
+        while await remoteEngine.calls < 2, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let spanCalls = await remoteEngine.calls
+        let stillLoading = await localStub.loadCallCount
+        XCTAssertEqual(spanCalls, 2, "the remote span retry ran while the preload was still loading")
+        XCTAssertEqual(stillLoading, 1, "setup: the preload is still inside its load")
+
         await localStub.openLoadGate()
+        let retried = await spans.value
+        XCTAssertTrue(retried.unresolved.isEmpty, "the remote backend answered for the span")
         await mixed.waitForIdle()
         await mixed.endLocalModelHold(hold)?.value
         await mixed.shutdown()
