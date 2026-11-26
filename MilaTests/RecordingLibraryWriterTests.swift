@@ -225,6 +225,13 @@ final class RecordingLibraryWriterTests: XCTestCase {
         store.softDelete(keep)
         XCTAssertEqual(store.emptyTrash(), 1)
         XCTAssertTrue(try rowsOnDisk(of: store).isEmpty)
+
+        // Stop on a queued transcription moves it to Recently Deleted too.
+        let stopped = Recording(title: "stopped", source: .microphone, audioFileName: "stopped.wav")
+        store.add(stopped)
+        store.stopTranscription(stopped)
+        let stoppedRow = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "stopped" })
+        XCTAssertNotNil(stoppedRow["deletedAt"], "a stopped transcription is not in Recently Deleted on disk yet")
     }
 
     /// `update` reports whether a separate process now reads the new row

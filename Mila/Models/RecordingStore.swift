@@ -1591,7 +1591,8 @@ final class RecordingStore: ObservableObject {
         recordings[idx].deletedAt = Date()
         // Settled: nothing left for a stop to undo.
         recordings[idx].retranscriptionPriorState = nil
-        persist()
+        // A deletion, like `softDelete`: on disk before mila-mcp can list it.
+        persistNow()
     }
 
     /// "Stop Transcribing": the user stopped a queued/active transcription to
@@ -2287,7 +2288,8 @@ final class RecordingStore: ObservableObject {
     ///   `completed` handoff), `upsertImported` (the import's commit point),
     ///   `settleUnsavedTranscriptEdit`, a compression about to delete its
     ///   source WAV, and `load()`'s rewrite of a damaged file;
-    /// - deletions (Recently Deleted, permanent delete, emptying the trash):
+    /// - deletions (Recently Deleted, including a stopped transcription;
+    ///   permanent delete; emptying the trash):
     ///   mila-mcp reads recordings.json, and a row the user just deleted must
     ///   not stay listed there for as long as a background encode takes;
     /// - an audio trim, which has already replaced the file the row
@@ -2301,7 +2303,8 @@ final class RecordingStore: ObservableObject {
 
     /// Blocks until every write `persist()` has handed off has finished.
     /// For tests that read `recordings.json` (or point mila-mcp's reader at
-    /// it) right after a mutation; `load()` does the same on its own.
+    /// it) right after a mutation, and for Settings before it gives up the
+    /// current folder's security scope; `load()` does the same on its own.
     func waitForPendingWrites() {
         writer.drain()
     }
