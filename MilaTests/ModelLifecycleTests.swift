@@ -15,7 +15,9 @@ import TranscriptionCore
 ///  * live retention keeps it warm across jobs;
 ///  * a release can never land between a load and its transcribe, or take the
 ///    model away from an overlapping one-shot/batch user;
-///  * failures and cancellations still release the retain.
+///  * failures and cancellations still release the retain;
+///  * a dictation preloads its model when it starts, its final pass reuses
+///    it, and it is released once the dictation ends however it ends (#434).
 @MainActor
 final class ModelLifecycleTests: XCTestCase {
 
@@ -55,9 +57,15 @@ final class ModelLifecycleTests: XCTestCase {
     override func tearDown() async throws {
         // Never leave a gated transcribe holding a task into teardown.
         if let stub = stub {
+            await stub.openLoadGate()
             await stub.openUnloadGate()
             await stub.openTranscribeGate(count: 10_000)
         }
+        // A test that fails between `beginLocalModelHold` and its end would
+        // leave the hold's task parked for good, retaining the service, store
+        // and stub for the rest of the bundle. Shutdown ends and drains every
+        // hold; it is idempotent for tests that already shut down.
+        await service?.shutdown()
         if let root = root { try? FileManager.default.removeItem(at: root) }
         try await super.tearDown()
     }
@@ -443,10 +451,525 @@ final class ModelLifecycleTests: XCTestCase {
         XCTAssertFalse(loaded)
     }
 
+    // MARK: - Dictation preload (#434)
+    //
+    // `DictationController` begins a hold when a start is accepted and ends it
+    // after its final `transcribeOnce`, or on cancel / a failed start. These
+    // drive the same calls in the same order without a microphone.
+
+    func test_dictationHold_preloadsTheDictationModelAsSoonAsItBegins() async throws {
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"),
+                                 "batch-only mode must preload for dictation")
+        XCTAssertEqual(service.localModelUserCountForTesting, 1,
+                       "the hold is counted before begin returns, so no release can start under it")
+        await waitForLoad(1)
+        let loaded = await stub.isModelLoaded
+        let model = await stub.loadedModel
+        let hebrew = try XCTUnwrap(manager.model(for: "he"))
+        XCTAssertTrue(loaded, "the model loads while the user is still speaking")
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: hebrew).lastPathComponent,
+                       "the preload warms the model the final pass resolves for the language")
+        let transcribes = await stub.transcribeEnteredCount
+        XCTAssertEqual(transcribes, 0, "a preload loads only")
+
+        await service.endLocalModelHold(hold)?.value
+    }
+
+    func test_dictationFinalPassReusesThePreloadAndTheEndReleasesIt() async throws {
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"))
+        await waitForLoad(1)
+
+        let text = await service.transcribeOnce(samples: noisySamples, language: "he")
+        XCTAssertEqual(text, "stub")
+        let requests = await stub.loadRequestCount
+        let loads = await stub.loadCallCount
+        var unloads = await stub.unloadCount
+        var loaded = await stub.isModelLoaded
+        XCTAssertEqual(requests, 2, "the final pass still asks for the model…")
+        XCTAssertEqual(loads, 1, "…but must not load it a second time")
+        XCTAssertEqual(unloads, 0, "the final pass ending must not release a model the dictation still holds")
+        XCTAssertTrue(loaded)
+
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        loaded = await stub.isModelLoaded
+        XCTAssertEqual(unloads, 1, "batch-only mode releases the model once the dictation ends")
+        XCTAssertFalse(loaded)
+        XCTAssertEqual(service.localModelUserCountForTesting, 0)
+    }
+
+    /// The second press can come before a large model has finished loading.
+    /// The final pass must wait for the preload rather than load again, and
+    /// the hold keeps the model through it.
+    func test_dictationStoppedBeforeThePreloadFinishesWaitsForItInsteadOfReloading() async throws {
+        await stub.closeLoadGate()
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"))
+        await waitForLoad(1)
+
+        let svc = service!
+        let samples = noisySamples
+        let finalPass = Task { await svc.transcribeOnce(samples: samples, language: "he") }
+        await waitForLocalModelUsers(2)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let queued = await stub.callsWaitingBehindHeldLoad
+        let requests = await stub.loadRequestCount
+        XCTAssertEqual(queued, 0, "the final pass waits at admission, not on the engine")
+        XCTAssertEqual(requests, 1, "nothing but the preload has reached the engine yet")
+
+        await stub.openLoadGate()
+        let text = await finalPass.value
+        XCTAssertEqual(text, "stub")
+        let loads = await stub.loadCallCount
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(loads, 1, "one load per dictation, even when stopped mid-preload")
+        XCTAssertEqual(unloads, 0)
+
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        let duringLoad = await stub.unloadsDuringLoad
+        XCTAssertEqual(unloads, 1)
+        XCTAssertEqual(duringLoad, 0)
+    }
+
+    func test_cancelledDictationReleasesThePreloadedModel() async throws {
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        await waitForLoad(1)
+
+        // Cancel (or a start that failed after the hold was taken): the hold
+        // ends with no final pass.
+        await service.endLocalModelHold(hold)?.value
+        let unloads = await stub.unloadCount
+        let loaded = await stub.isModelLoaded
+        let transcribes = await stub.transcribeEnteredCount
+        XCTAssertEqual(unloads, 1, "a cancelled dictation must not strand the model")
+        XCTAssertFalse(loaded)
+        XCTAssertEqual(transcribes, 0)
+        XCTAssertEqual(service.localModelUserCountForTesting, 0)
+    }
+
+    /// A dictation cancelled while a large model is still loading: the load
+    /// cannot be interrupted, so the use must outlive the end until the load
+    /// returns. Releasing at the end itself would queue an unload beside the
+    /// load — the straddle the lifetime rules forbid.
+    func test_dictationEndedMidPreloadReleasesOnlyAfterTheLoadReturns() async throws {
+        await stub.closeLoadGate()
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"))
+        await waitForLoad(1)
+
+        let ending = service.endLocalModelHold(hold)
+        XCTAssertNotNil(ending, "the hold is still winding down while its load is held")
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        var unloads = await stub.unloadCount
+        var duringLoad = await stub.unloadsDuringLoad
+        XCTAssertEqual(unloads, 0)
+        XCTAssertEqual(duringLoad, 0, "no unload may be issued while the preload is loading")
+        XCTAssertEqual(service.localModelUserCountForTesting, 1,
+                       "the hold's use lasts until its load has returned")
+
+        await stub.openLoadGate()
+        await ending?.value
+        unloads = await stub.unloadCount
+        duringLoad = await stub.unloadsDuringLoad
+        let loaded = await stub.isModelLoaded
+        XCTAssertEqual(unloads, 1, "the model is released once the load it was ended during returns")
+        XCTAssertEqual(duringLoad, 0)
+        XCTAssertFalse(loaded)
+    }
+
+    /// A dictation that starts while an idle release is still unloading goes
+    /// through the same admission as every other user: no preload may enter
+    /// an engine whose unload is suspended.
+    func test_dictationHoldWaitsForAnInFlightReleaseBeforePreloading() async throws {
+        try await holdAReleaseInFlight()
+        let baselineRequests = await stub.loadRequestCount
+
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let requestsDuringRelease = await stub.loadRequestCount
+        XCTAssertEqual(requestsDuringRelease, baselineRequests,
+                       "the preload must wait for the release in flight to finish")
+
+        await stub.openUnloadGate()
+        await waitForLoad(2)
+        let loaded = await stub.isModelLoaded
+        XCTAssertTrue(loaded, "admitted after the release, the preload loads the model again")
+
+        await service.endLocalModelHold(hold)?.value
+        let unloads = await stub.unloadCount
+        let finalLoaded = await stub.isModelLoaded
+        XCTAssertEqual(unloads, 2, "the original release, then the dictation's own")
+        XCTAssertFalse(finalLoaded)
+    }
+
+    /// The preload warms the model the final pass will resolve, decided when
+    /// the preload runs rather than when the hold began: here the Hebrew
+    /// model finishes installing while the hold waits out a release.
+    func test_dictationPreloadResolvesTheModelWhenItRuns() async throws {
+        try FileManager.default.removeItem(at: manager.url(for: .ivritLarge))
+        manager.refreshInstalled()
+        try await holdAReleaseInFlight()
+
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"),
+                                 "the selected fallback model is installed")
+        try TestSupport.installFakeModel(into: manager, model: .ivritLarge)
+        await stub.openUnloadGate()
+        await waitForLoad(2)
+        let model = await stub.loadedModel
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: .ivritLarge).lastPathComponent,
+                       "the preload warms what the final pass would now ask for")
+
+        await service.endLocalModelHold(hold)?.value
+    }
+
+    /// A start that fails (mic refused, engine bring-up error) while its hold
+    /// is still queued behind a release must not load anything afterwards.
+    func test_dictationHoldEndedBeforeAdmissionNeverLoads() async throws {
+        try await holdAReleaseInFlight()
+        let baselineRequests = await stub.loadRequestCount
+
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        let ending = service.endLocalModelHold(hold)
+        await stub.openUnloadGate()
+        await ending?.value
+        await service.waitForIdle()
+
+        let requests = await stub.loadRequestCount
+        let loaded = await stub.isModelLoaded
+        XCTAssertEqual(requests, baselineRequests, "an ended hold must not preload")
+        XCTAssertFalse(loaded)
+        XCTAssertEqual(service.localModelUserCountForTesting, 0)
+    }
+
+    /// Ending the same hold twice must not take a second user's count: here
+    /// that would release the model under an in-flight one-shot transcribe.
+    func test_endingADictationHoldTwiceDoesNotDropAnotherUsersRetain() async throws {
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        await waitForLoad(1)
+        await stub.closeTranscribeGate()
+        let svc = service!
+        let samples = noisySamples
+        let oneShot = Task { await svc.transcribeOnce(samples: samples, language: "en") }
+        await stub.waitUntilTranscribeEntered(1)
+        XCTAssertEqual(service.localModelUserCountForTesting, 2)
+
+        await service.endLocalModelHold(hold)?.value
+        XCTAssertNil(service.endLocalModelHold(hold), "a second end is a no-op")
+        XCTAssertEqual(service.localModelUserCountForTesting, 1,
+                       "only the in-flight transcribe is still counted")
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 0, "the model must survive under the in-flight transcribe")
+
+        await stub.openTranscribeGate(count: 1)
+        _ = await oneShot.value
+        await service.waitForIdle()
+        unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 1)
+    }
+
+    /// Live mode (`retainsLocalModel`) must behave exactly as before: no
+    /// hold, no extra load at dictation start, and the warm model stays.
+    func test_liveModeTakesNoDictationHold() async throws {
+        service.retainsLocalModel = true
+        XCTAssertNil(service.beginLocalModelHold(language: "he"))
+        XCTAssertEqual(service.localModelUserCountForTesting, 0)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        var requests = await stub.loadRequestCount
+        XCTAssertEqual(requests, 0, "live mode must not load anything at dictation start")
+
+        let text = await service.transcribeOnce(samples: noisySamples, language: "he")
+        XCTAssertEqual(text, "stub")
+        await service.waitForIdle()
+        requests = await stub.loadRequestCount
+        let unloads = await stub.unloadCount
+        let loaded = await stub.isModelLoaded
+        XCTAssertEqual(requests, 1, "the final pass loads on demand, as in live mode before")
+        XCTAssertEqual(unloads, 0, "live mode keeps the model warm after a dictation")
+        XCTAssertTrue(loaded)
+    }
+
+    func test_remoteBackendTakesNoDictationHold() async throws {
+        let suiteName = "ModelLifecycleTests.remote.\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let remote = RemoteTranscriptionSettings(defaults: suite,
+                                                 apiKeyKeychainKey: suiteName + ".unused-key")
+        remote.backend = .remote
+        let remoteStub = StubWhisperEngine()
+        let remoteService = TranscriptionService(
+            store: store,
+            modelManager: manager,
+            diarizationSettings: DiarizationSettings(
+                defaults: .init(suiteName: "ModelLifecycleTests.diarization")!),
+            remoteSettings: remote,
+            engine: remoteStub)
+        remoteService.retainsLocalModel = false
+
+        XCTAssertNil(remoteService.beginLocalModelHold(language: "he"),
+                     "the remote backend never touches the local engine")
+        XCTAssertEqual(remoteService.localModelUserCountForTesting, 0)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let requests = await remoteStub.loadRequestCount
+        XCTAssertEqual(requests, 0)
+        await remoteService.shutdown()
+    }
+
+    /// A batch job is between its own load and transcribe while a dictation
+    /// in another language starts. The engine keeps one context, so a
+    /// preload queued there would swap the model under the job. With anyone
+    /// else mid-flight the dictation leaves the load to its final pass, and
+    /// its hold still keeps the model from being released when the job ends.
+    func test_dictationHoldSkipsThePreloadWhileAnotherLocalUserIsActive() async throws {
+        await stub.closeTranscribeGate()
+        let fixture = try TestRecordingFixture.make(in: store, title: "Batch", language: "he")
+        service.enqueue(fixture.recording)
+        await stub.waitUntilTranscribeEntered(1)
+        let jobRequests = await stub.loadRequestCount
+        XCTAssertEqual(jobRequests, 1, "setup: the job has loaded its model")
+
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        XCTAssertEqual(service.localModelUserCountForTesting, 2)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        var requests = await stub.loadRequestCount
+        let hebrew = try XCTUnwrap(manager.model(for: "he"))
+        var model = await stub.loadedModel
+        XCTAssertEqual(requests, jobRequests, "no preload while another local user is mid-flight")
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: hebrew).lastPathComponent,
+                       "the job's model must still be the one loaded")
+
+        await stub.openTranscribeGate(count: 1)
+        await service.waitForIdle()
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 0, "the dictation's hold keeps the model past the job's end")
+
+        // The final pass then loads its own model on demand, as before.
+        let text = await service.transcribeOnce(samples: noisySamples, language: "en")
+        XCTAssertEqual(text, "stub")
+        requests = await stub.loadRequestCount
+        model = await stub.loadedModel
+        let english = try XCTUnwrap(manager.model(for: "en"))
+        XCTAssertEqual(requests, jobRequests + 1)
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: english).lastPathComponent)
+
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 1, "released once the dictation ends")
+    }
+
+    /// The other order: the dictation's preload is already loading when a
+    /// batch job in another language starts. The job is counted at once but
+    /// must not reach the engine until the preload's load has returned —
+    /// otherwise the engine's priority order could run the job's load before
+    /// the preload's and the preload would swap the model under the job.
+    func test_otherUsersWaitForADictationPreloadBeforeTouchingTheEngine() async throws {
+        await stub.closeLoadGate()
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        await waitForLoad(1)
+
+        let fixture = try TestRecordingFixture.make(in: store, title: "Batch", language: "he")
+        service.enqueue(fixture.recording)
+        await waitForLocalModelUsers(2)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let queued = await stub.callsWaitingBehindHeldLoad
+        var requests = await stub.loadRequestCount
+        XCTAssertEqual(queued, 0, "the job must wait before touching the engine, not beside the preload's load")
+        XCTAssertEqual(requests, 1, "only the preload has asked the engine for a model")
+
+        await stub.openLoadGate()
+        await service.waitForIdle()
+        let completed = store.recordings.first { $0.id == fixture.recording.id }
+        XCTAssertEqual(completed?.status, .completed)
+        requests = await stub.loadRequestCount
+        let loads = await stub.loadCallCount
+        let model = await stub.loadedModel
+        let hebrew = try XCTUnwrap(manager.model(for: "he"))
+        XCTAssertEqual(requests, 2)
+        XCTAssertEqual(loads, 2, "the job loads its own model once admitted")
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: hebrew).lastPathComponent,
+                       "the job was transcribed with the model it asked for")
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 0, "the dictation's hold keeps the model past the job's end")
+
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 1)
+    }
+
+    /// The batch worker is counted before it knows its job's backend, so it
+    /// must not be parked behind a dictation preload at admission: a job sent
+    /// to the remote backend never calls the local engine and has nothing to
+    /// wait for. Only a local job waits, at the top of `process`, before its
+    /// row reads `.running`.
+    func test_aRemoteJobIsNotHeldBehindADictationPreload() async throws {
+        let suiteName = "ModelLifecycleTests.remoteJob.\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let remote = RemoteTranscriptionSettings(defaults: suite,
+                                                 apiKeyKeychainKey: suiteName + ".unused-key")
+        remote.endpoint = "http://localhost:8080/v1"
+        remote.model = "whisper-1"
+        remote.backend = .local
+        let diarization = DiarizationSettings(defaults: suite)
+        diarization.isEnabled = false
+        let localStub = StubWhisperEngine()
+        let remoteEngine = CountingRemoteEngine()
+        let mixed = TranscriptionService(
+            store: store,
+            modelManager: manager,
+            diarizationSettings: diarization,
+            remoteSettings: remote,
+            engine: localStub,
+            remoteEngine: remoteEngine)
+        mixed.retainsLocalModel = false
+        // Never leave the preload parked behind a closed gate if an assertion
+        // below fails: the service, store and stub would outlive the test.
+        addTeardownBlock { @MainActor in
+            await localStub.openLoadGate()
+            await mixed.shutdown()
+        }
+
+        await localStub.closeLoadGate()
+        let hold = try XCTUnwrap(mixed.beginLocalModelHold(language: "en"))
+        var deadline = Date().addingTimeInterval(15)
+        while await localStub.loadCallCount < 1, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let preloads = await localStub.loadCallCount
+        XCTAssertEqual(preloads, 1, "setup: the dictation's preload is inside its load")
+
+        remote.backend = .remote
+        let fixture = try TestRecordingFixture.make(in: store, title: "Remote", language: "he")
+        mixed.enqueue(fixture.recording)
+        deadline = Date().addingTimeInterval(10)
+        while await remoteEngine.calls < 1, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let remoteCalls = await remoteEngine.calls
+        let requests = await localStub.loadRequestCount
+        XCTAssertEqual(remoteCalls, 1, "the remote job ran while the preload was still loading")
+        XCTAssertEqual(requests, 1, "only the preload has asked the local engine for a model")
+
+        // "Retry missing parts" on the remote backend: the same.
+        let spanAudio = root.appendingPathComponent("spans.wav")
+        try TestSupport.writeSineWav(at: spanAudio, durationSeconds: 1)
+        let spans = Task {
+            await mixed.transcribeSpans([UntranscribedSpan(start: 0, end: 1)],
+                                        audioURL: spanAudio, language: "he")
+        }
+        deadline = Date().addingTimeInterval(10)
+        while await remoteEngine.calls < 2, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let spanCalls = await remoteEngine.calls
+        let stillLoading = await localStub.loadCallCount
+        XCTAssertEqual(spanCalls, 2, "the remote span retry ran while the preload was still loading")
+        XCTAssertEqual(stillLoading, 1, "setup: the preload is still inside its load")
+
+        await localStub.openLoadGate()
+        let retried = await spans.value
+        XCTAssertTrue(retried.unresolved.isEmpty, "the remote backend answered for the span")
+        await mixed.waitForIdle()
+        await mixed.endLocalModelHold(hold)?.value
+        await mixed.shutdown()
+    }
+
+    /// A job enqueued in the same turn the dictation starts: its worker has
+    /// not counted itself when the hold's task checks for other users, but
+    /// it is about to load its own model, so the preload would only make it
+    /// wait and then be swapped out. A queued job counts as another user.
+    func test_dictationHoldSkipsThePreloadWhileAJobIsQueued() async throws {
+        await stub.closeTranscribeGate()
+        let fixture = try TestRecordingFixture.make(in: store, title: "Batch", language: "he")
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        service.enqueue(fixture.recording)
+        await stub.waitUntilTranscribeEntered(1)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let requests = await stub.loadRequestCount
+        let loads = await stub.loadCallCount
+        let model = await stub.loadedModel
+        let hebrew = try XCTUnwrap(manager.model(for: "he"))
+        XCTAssertEqual(requests, 1, "only the job asks for a model")
+        XCTAssertEqual(loads, 1)
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: hebrew).lastPathComponent)
+
+        await stub.openTranscribeGate(count: 1)
+        await service.waitForIdle()
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 0, "the hold keeps the model past the job's end")
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 1)
+    }
+
+    func test_dictationHoldIsRefusedWhenNoModelIsInstalled() throws {
+        // `model(for:)` falls back to any installed selected model, so the
+        // final pass skips only when nothing usable is installed at all.
+        for model in [WhisperModel.ivritLarge, .openaiTurbo] {
+            try FileManager.default.removeItem(at: manager.url(for: model))
+        }
+        manager.refreshInstalled()
+        let resolved = manager.model(for: "he")
+        XCTAssertFalse(resolved.map { manager.isInstalled($0) } ?? false,
+                       "setup must leave Hebrew with no installed model")
+        XCTAssertNil(service.beginLocalModelHold(language: "he"),
+                     "nothing to preload when the final pass would skip")
+        XCTAssertEqual(service.localModelUserCountForTesting, 0)
+    }
+
+    /// Quitting mid-dictation: shutdown ends the hold itself, and frees the
+    /// engine only after a preload still loading has returned — a late load
+    /// would otherwise recreate the context after teardown.
+    func test_shutdownEndsADictationHoldAndWaitsForItsPreload() async throws {
+        await stub.closeLoadGate()
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"))
+        await waitForLoad(1)
+
+        let svc = service!
+        let down = Task { await svc.shutdown() }
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        var shutdowns = await stub.shutdownCount
+        XCTAssertEqual(shutdowns, 0, "the engine must not be torn down under a preload")
+
+        await stub.openLoadGate()
+        await down.value
+        shutdowns = await stub.shutdownCount
+        let loaded = await stub.isModelLoaded
+        XCTAssertEqual(shutdowns, 1)
+        XCTAssertFalse(loaded, "nothing may be left loaded after shutdown")
+        XCTAssertNil(service.endLocalModelHold(hold),
+                     "the dictation's own end after shutdown is a no-op")
+        XCTAssertNil(service.beginLocalModelHold(language: "he"),
+                     "no new hold once the service is shutting down")
+    }
+
     // MARK: - Helpers
+
+    /// Warm the model with retention on, then switch retention off with the
+    /// unload gate closed, so a release is suspended inside `engine.unload()`
+    /// when this returns. The caller opens the gate.
+    private func holdAReleaseInFlight() async throws {
+        service.retainsLocalModel = true
+        _ = await service.transcribeOnce(samples: noisySamples, language: "en")
+        await stub.closeUnloadGate()
+        service.updateLocalModelRetention(false)
+        let deadline = Date().addingTimeInterval(10)
+        while await stub.unloadEnteredCount == 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let entered = await stub.unloadEnteredCount
+        XCTAssertEqual(entered, 1, "setup must hold an actual unload in flight")
+    }
 
     private var noisySamples: [Float] {
         Array(repeating: Float(0.2), count: 16_000)
+    }
+
+    private func waitForLocalModelUsers(_ target: Int, timeout: TimeInterval = 10) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while service.localModelUserCountForTesting < target, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(service.localModelUserCountForTesting, target,
+                       "setup must count \(target) local-model user(s)")
     }
 
     private func waitForLoad(_ target: Int, timeout: TimeInterval = 15) async {
@@ -461,3 +984,17 @@ final class ModelLifecycleTests: XCTestCase {
 }
 
 private struct LifecycleBoom: Error {}
+
+/// Counts whole-recording remote requests; no network.
+private actor CountingRemoteEngine: RemoteTranscribing {
+    private(set) var calls = 0
+    func shutdown() async {}
+    func transcribe(samples: [Float], language: String, config: RemoteTranscriptionConfig,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        calls += 1
+        // Empty keeps the job clear of the post-success audio compression,
+        // which has nothing to do with admission.
+        return []
+    }
+}

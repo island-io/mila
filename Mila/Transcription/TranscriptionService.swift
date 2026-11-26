@@ -215,11 +215,12 @@ final class TranscriptionService: ObservableObject {
     var retainsLocalModel = true
 
     /// Local-engine users currently holding the model — the batch worker for a
-    /// whole recording, one live utterance, dictation, a span-recovery pass,
-    /// or a prewarm load. Incremented synchronously on the main actor BEFORE
-    /// the engine is touched, so an idle release can never observe zero users
-    /// in the gap between a load and the transcribe that needs it, and ending
-    /// one user cannot discard another.
+    /// whole recording, one live utterance, dictation (its preload hold and its
+    /// final pass), a span-recovery pass, or a prewarm load. Incremented
+    /// synchronously on the main actor BEFORE the engine is touched, so an
+    /// idle release can never observe zero users in the gap between a load
+    /// and the transcribe that needs it, and ending one user cannot discard
+    /// another.
     private var localModelUsers = 0
 
     /// True while this service is awaiting `engine.unload()`. `waitForIdle`
@@ -229,6 +230,26 @@ final class TranscriptionService: ObservableObject {
     /// They are resumed when it finishes and then re-check, because a new
     /// user may have loaded the model during the unload.
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Dictation holds that have not been ended yet (see
+    /// `beginLocalModelHold`). Ending one removes it here first, which is what
+    /// makes a second end of the same hold a no-op.
+    private var activeModelHolds: Set<UUID> = []
+    /// A hold's body, parked once its preload is done, until the hold ends.
+    private var modelHoldWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    /// True while a dictation hold's preload is inside `engine.loadIfNeeded`.
+    /// Every newly counted user that will call the local engine waits until it
+    /// returns — at admission, or (the batch worker, whose job may be remote)
+    /// at the top of `process`; see the sole-user check in
+    /// `beginLocalModelHold`.
+    private var isDictationPreloading = false
+    /// Users waiting out `isDictationPreloading` (`waitForDictationPreload`).
+    private var preloadWaiters: [CheckedContinuation<Void, Never>] = []
+    /// Each hold's task — admission, preload, park, then handing the use back
+    /// — until it has fully finished, ended or not. `shutdown` drains these as
+    /// it drains prewarms, so a preload's load cannot outlive the teardown.
+    private var modelHoldTasks: [UUID: Task<Void, Never>] = [:]
+
     /// The recording `process(_:)` is working on, from the moment the worker
     /// pops it until `process` returns. Wider than `activeRecordingID`, which
     /// is only published once the row has been flipped to `.running`, so a
@@ -315,13 +336,40 @@ final class TranscriptionService: ObservableObject {
     /// Run `body` as one local-model user. The retain is taken before any
     /// engine call, so a release triggered by some other user finishing can
     /// never land between this body's `loadIfNeeded` and its `transcribe`.
-    private func withLocalModelUse<T>(_ body: () async throws -> T) async rethrows -> T {
+    ///
+    /// `waitsForDictationPreload: false` is for a caller that may not touch
+    /// the local engine at all — the batch worker, whose job can go to the
+    /// remote backend — and so must not sit behind a local load it does not
+    /// need. Such a caller must call `waitForDictationPreload()` itself once
+    /// it knows it is local, before its first local engine call.
+    private func withLocalModelUse<T>(waitsForDictationPreload: Bool = true,
+                                      _ body: () async throws -> T) async rethrows -> T {
         localModelUsers += 1
+        return try await continueCountedLocalModelUse(waitsForDictationPreload: waitsForDictationPreload, body)
+    }
+
+    /// The rest of `withLocalModelUse`, for a user that has ALREADY been
+    /// counted in `localModelUsers`: admission, the body, then handing the use
+    /// back. Exists for `beginLocalModelHold`, which has to count its user
+    /// synchronously in a non-async call and run the body later in a task.
+    /// Every caller must have incremented `localModelUsers` exactly once for
+    /// this call; the matching decrement happens here.
+    private func continueCountedLocalModelUse<T>(waitsForDictationPreload: Bool = true,
+                                                 _ body: () async throws -> T) async rethrows -> T {
         // Admission waits for an in-flight release to FINISH, rather than
         // assuming the engine executor processes independent calls FIFO.
         // Counting this user first prevents another cleanup from overtaking it.
-        while isReleasingLocalModel {
-            await withCheckedContinuation { releaseWaiters.append($0) }
+        // It also waits out a dictation preload's load (#434), so no user can
+        // queue its own load + transcribe beside that load — unless the caller
+        // takes that wait itself, later, only if it turns out to need the
+        // local engine. The two never overlap: a release needs zero users, a
+        // preload counts as one.
+        while isReleasingLocalModel || (waitsForDictationPreload && isDictationPreloading) {
+            if isReleasingLocalModel {
+                await withCheckedContinuation { releaseWaiters.append($0) }
+            } else {
+                await waitForDictationPreload()
+            }
         }
         do {
             let value = try await body()
@@ -333,6 +381,16 @@ final class TranscriptionService: ObservableObject {
         }
     }
 
+    /// Wait until no dictation preload is inside `engine.loadIfNeeded`. For a
+    /// counted user only: being counted is what keeps a NEW preload from
+    /// starting (a preload needs to be the sole user), so once this returns
+    /// the engine is this user's to queue on.
+    private func waitForDictationPreload() async {
+        while isDictationPreloading {
+            await withCheckedContinuation { preloadWaiters.append($0) }
+        }
+    }
+
     private func endLocalModelUse() async {
         localModelUsers = max(0, localModelUsers - 1)
         await releaseLocalModelIfIdle()
@@ -341,10 +399,12 @@ final class TranscriptionService: ObservableObject {
     /// True when nothing is using, queueing or expecting the local model.
     ///
     /// `retainsLocalModel` keeps it warm for live transcription; selecting
-    /// the remote backend releases it regardless, because nothing local is
-    /// going to call the engine. `queue`/`processingID` are what stop an
-    /// unload BETWEEN two queued recordings (the next job must not pay a
-    /// reload), and `activeRecordingID` covers the moment a stopped worker's
+    /// the remote backend releases it regardless of that preference, because
+    /// nothing local is going to call the engine. Not from under a counted
+    /// user, though: a batch job or a dictation's hold that began before the
+    /// switch keeps the model until it ends. `queue`/`processingID` are what
+    /// stop an unload BETWEEN two queued recordings (the next job must not pay
+    /// a reload), and `activeRecordingID` covers the moment a stopped worker's
     /// UI slot is still being cleared.
     private func canReleaseLocalModel() -> Bool {
         if retainsLocalModel && !remoteSettings.isActive { return false }
@@ -487,6 +547,184 @@ final class TranscriptionService: ObservableObject {
         }
     }
 
+    // MARK: - Dictation model hold (#434)
+
+    /// A dictation's claim on the local model, from the moment its capture
+    /// starts until its final one-shot pass has run. Opaque on purpose: only
+    /// `beginLocalModelHold` makes one, and `endLocalModelHold` ends it.
+    struct LocalModelHold: Equatable {
+        fileprivate let id: UUID
+    }
+
+    /// Start loading the model a dictation in `language` will need, and keep
+    /// it loaded until `endLocalModelHold` is called with the returned hold.
+    ///
+    /// **Why.** Dictation transcribes once, on the second hotkey press. In
+    /// batch-only mode nothing keeps the model resident (#393), so without
+    /// this every dictation paid the whole load — seconds for a large model —
+    /// AFTER the user had stopped speaking, and released it straight away.
+    /// Holding from the start overlaps the load with the mic coming up and
+    /// the user speaking, and the hold keeps the model in place for the live
+    /// overlay's ticks and the final pass. Ending the hold is what still
+    /// releases it in batch-only mode: the model is resident while a dictation
+    /// runs, not whenever a dictation hotkey is configured.
+    ///
+    /// **Lifetime.** The hold is one ordinary local-model user. It is counted
+    /// HERE, synchronously, exactly as `withLocalModelUse` counts before its
+    /// first suspension, so from this call on no idle release can start; one
+    /// already in flight is waited out by the same admission every other user
+    /// goes through (`continueCountedLocalModelUse`) before the preload
+    /// touches the engine. The use is handed back only once the hold has been
+    /// ended AND the preload's load has returned, so ending a hold mid-load
+    /// can never put an unload beside that load. `shutdown` ends every hold.
+    ///
+    /// The preload itself runs only while the hold is the sole local user;
+    /// with a batch job (or any other user) mid-flight or queued it is
+    /// skipped and the final pass loads on demand, and while it loads no
+    /// other user is admitted, so a dictation start can never swap the model
+    /// out between another user's load and its transcribe. The model is
+    /// resolved again when the preload runs. See the comment at the check.
+    ///
+    /// Returns nil — and takes nothing — when there is nothing to preload or
+    /// nothing to change: live retention (`retainsLocalModel`) already keeps
+    /// the model warm and must behave exactly as before, the remote backend
+    /// never touches the local engine, the service is shutting down, or the
+    /// language has no installed model (the final pass would skip too).
+    ///
+    /// The caller must end every non-nil hold exactly once; a second end of
+    /// the same hold is a no-op, so it cannot take another user's count.
+    func beginLocalModelHold(language: String) -> LocalModelHold? {
+        guard !cancellation.isStopped else { return nil }
+        guard !retainsLocalModel, !remoteSettings.isActive else {
+            serviceLog.log("""
+                dictation hold: none for lang=\(language, privacy: .public) — \
+                retains=\(self.retainsLocalModel) remote=\(self.remoteSettings.isActive)
+                """)
+            return nil
+        }
+        // The same resolution and install gate as the local branch of
+        // `transcribeLiveSegments`, so the preload warms exactly the model the
+        // final pass will ask for — and nothing when that pass would skip.
+        guard let model = modelManager.model(for: language),
+              modelManager.isInstalled(model) else {
+            serviceLog.log("dictation hold: none — no installed model for lang=\(language, privacy: .public)")
+            return nil
+        }
+        let observerTask: Task<Void, Never> = observerSetupTask
+        let id = UUID()
+        localModelUsers += 1
+        activeModelHolds.insert(id)
+        // No model name here: the preload resolves it again when it runs.
+        serviceLog.log("dictation hold: taken for lang=\(language, privacy: .public)")
+        // Weak, as in `prewarm`: a hold whose task has not run yet must not be
+        // what keeps a released service alive. Once running, the task holds
+        // the service until the hold ends, which `shutdown` guarantees.
+        modelHoldTasks[id] = Task { [weak self, engine, cancellation] in
+            // Bugbot #3: the preparation observer must be installed before
+            // the first `loadIfNeeded` — see `init`.
+            await observerTask.value
+            guard let self else { return }
+            await self.continueCountedLocalModelUse {
+                // Admission may have waited out a release. Re-check before a
+                // load that can take seconds: a hold ended in the meantime (a
+                // cancelled or failed start), a shutdown, live retention
+                // switched on (live mode loads on demand, as before) or the
+                // remote backend selected all mean nobody needs this load.
+                //
+                // And preload only while this hold is the ONLY local user.
+                // The engine keeps one context, and a user's `loadIfNeeded`
+                // and `transcribe` are two engine calls: another model's load
+                // queued between them swaps the context, so a batch job could
+                // be transcribed by the dictation's model. That race predates
+                // this hold — the dictation's own final pass can hit it — but
+                // a preload must not add a second trigger. When anyone else
+                // is mid-flight, the final pass loads on demand as before,
+                // and the hold still keeps whatever is loaded from being
+                // released when they finish. A queued job whose worker has
+                // not counted itself yet is treated the same way (the
+                // `queue`/`processingID` test `canReleaseLocalModel` uses):
+                // it would load its own model straight after the preload.
+                //
+                // The check alone would leave a gap: a user counted just after
+                // it could still get its load onto the engine's queue ahead of
+                // the preload's, which the executor's priority order allows.
+                // So `isDictationPreloading` is raised in the same turn as the
+                // check and holds every newly counted user that will call the
+                // local engine until the preload's load has returned.
+                //
+                // The model is resolved again here, as late as possible, so a
+                // download that finished or a model changed in Settings while
+                // admission waited is what gets warmed.
+                let current = self.modelManager.model(for: language)
+                    .flatMap { self.modelManager.isInstalled($0) ? $0 : nil }
+                if let current, self.activeModelHolds.contains(id), !cancellation.isStopped,
+                   !self.retainsLocalModel, !self.remoteSettings.isActive,
+                   self.localModelUsers == 1, self.queue.isEmpty, self.processingID == nil {
+                    let modelURL = self.modelManager.url(for: current)
+                    let displayName = current.displayName
+                    self.isDictationPreloading = true
+                    do {
+                        try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
+                        serviceLog.log("dictation hold: preloaded \(displayName, privacy: .public)")
+                    } catch {
+                        // Best-effort, like prewarm: the final pass retries
+                        // the load and reports a failure through its own path.
+                        serviceLog.error("""
+                            dictation hold: preload failed for \(displayName, privacy: .public) \
+                            (the final pass will retry): \(error.localizedDescription, privacy: .public)
+                            """)
+                    }
+                    self.isDictationPreloading = false
+                    let admitted = self.preloadWaiters
+                    self.preloadWaiters.removeAll()
+                    admitted.forEach { $0.resume() }
+                } else {
+                    serviceLog.log("""
+                        dictation hold: skipping the preload for lang=\(language, privacy: .public) \
+                        (\(current?.displayName ?? "no installed model", privacy: .public)) — \
+                        held=\(self.activeModelHolds.contains(id)) \
+                        stopped=\(cancellation.isStopped) retains=\(self.retainsLocalModel) \
+                        remote=\(self.remoteSettings.isActive) users=\(self.localModelUsers, privacy: .public) \
+                        queued=\(self.queue.count, privacy: .public) processing=\(self.processingID != nil)
+                        """)
+                }
+                await self.waitForModelHoldToEnd(id)
+            }
+            self.modelHoldTasks[id] = nil
+        }
+        return LocalModelHold(id: id)
+    }
+
+    /// End `hold`: the dictation's final pass has run, or it was cancelled,
+    /// failed to start, or is being torn down. Once the hold's preload has
+    /// returned, its use is handed back, which releases the model in
+    /// batch-only mode if nothing else is using it.
+    ///
+    /// Idempotent: ending a hold that already ended does nothing. Returns the
+    /// hold's task while it is still winding down, so a caller (tests) can
+    /// await the release; nil once it has finished.
+    @discardableResult
+    func endLocalModelHold(_ hold: LocalModelHold) -> Task<Void, Never>? {
+        if activeModelHolds.remove(hold.id) != nil {
+            modelHoldWaiters.removeValue(forKey: hold.id)?.resume()
+        }
+        return modelHoldTasks[hold.id]
+    }
+
+    /// Park a hold's body until `endLocalModelHold` ends it. Returns at once
+    /// for a hold that already ended — including one ended before its task
+    /// first ran.
+    private func waitForModelHoldToEnd(_ id: UUID) async {
+        guard activeModelHolds.contains(id) else { return }
+        await withCheckedContinuation { modelHoldWaiters[id] = $0 }
+    }
+
+    /// A hold has been ended but its task has not finished handing the model
+    /// back yet. `waitForIdle` waits this out, as it waits out a release.
+    private var isModelHoldWindingDown: Bool {
+        modelHoldTasks.keys.contains { !activeModelHolds.contains($0) }
+    }
+
     // MARK: - Public API
 
     /// IDs enqueued as a manual re-transcribe. Consumed by `process` to make
@@ -552,10 +790,13 @@ final class TranscriptionService: ObservableObject {
         let deadline = Date().addingTimeInterval(timeout)
         // `worker`/`isReleasingLocalModel` carry the tail the queue state
         // alone can't see: the worker has popped its last job but is still
-        // writing the result or handing the model back.
+        // writing the result or handing the model back. An ENDED dictation
+        // hold is the same kind of tail; one still in force is not waited
+        // for — it lasts as long as its dictation, not as long as any work.
         while Date() < deadline {
             if worker == nil,
                !isReleasingLocalModel,
+               !isModelHoldWindingDown,
                activeRecordingID == nil,
                queue.isEmpty { return }
             try? await Task.sleep(nanoseconds: 20_000_000)
@@ -902,8 +1143,11 @@ final class TranscriptionService: ObservableObject {
         // local use (via `transcribeLiveSegments`), but without this outer
         // user a release could unload between spans — a reload per utterance
         // — and, worse, a gap where an idle release and the next span's load
-        // could interleave.
-        return await withLocalModelUse {
+        // could interleave. This outer use never calls the engine itself, and
+        // on the remote backend nothing here does, so it does not wait out a
+        // dictation preload (#434); a local span's own use in
+        // `transcribeLiveSegments` waits at admission instead.
+        return await withLocalModelUse(waitsForDictationPreload: false) {
             await transcribeSpansHoldingModel(spans, audioURL: audioURL, language: language)
         }
     }
@@ -1142,11 +1386,25 @@ final class TranscriptionService: ObservableObject {
         preparationStatus = nil
         let warming = Array(prewarmTasks.values)
         warming.forEach { $0.cancel() }
+        // End every dictation hold, whoever owns it: a parked hold would
+        // otherwise never finish, and the drain below waits for each one.
+        // Its owner's own end later is a no-op. A hold whose task has not
+        // started yet skips its preload (`activeModelHolds` is checked first).
+        // Users parked behind a preload still loading (at admission, or a
+        // local batch job at the top of `process`) are let in when its load
+        // returns, and then see the stop and skip.
+        let holding = Array(modelHoldTasks.values)
+        for id in activeModelHolds {
+            modelHoldWaiters.removeValue(forKey: id)?.resume()
+        }
+        activeModelHolds.removeAll()
         let task = Task { [remoteEngine, engine] in
             await remoteEngine.shutdown()
-            // Drain already-started prewarms before freeing local resources;
-            // otherwise a late model load could recreate them after teardown.
+            // Drain already-started prewarms and dictation preloads before
+            // freeing local resources; otherwise a late model load could
+            // recreate them after teardown.
             for warm in warming { await warm.value }
+            for hold in holding { await hold.value }
             await engine.shutdown()
         }
         shutdownTask = task
@@ -1252,8 +1510,10 @@ final class TranscriptionService: ObservableObject {
             // Hold the local model for the whole job (load + transcribe +
             // diarization). Ending it is what may release an idle model, and
             // the queue check inside `canReleaseLocalModel` keeps a queued
-            // next job from paying a reload.
-            await withLocalModelUse {
+            // next job from paying a reload. A dictation preload is waited out
+            // at the top of `process`, by a local job only: a job sent to the
+            // remote backend must not sit behind a local load it never uses.
+            await withLocalModelUse(waitsForDictationPreload: false) {
                 await process(next)
             }
             processingID = nil
@@ -1284,6 +1544,16 @@ final class TranscriptionService: ObservableObject {
     }
 
     private func process(_ recording: Recording) async {
+        // Admission let this job past a dictation preload because it might go
+        // to the remote backend (see `run`). A local one waits it out here,
+        // before its snapshot and its `.running` flip, so the row reads
+        // queued meanwhile and a Stop in that wait is caught just below
+        // (#434). Nothing suspends between this check and the backend choice
+        // further down, so the job that skips the wait is the job that goes
+        // remote; and being counted keeps a new preload from starting after it.
+        if !remoteSettings.isActive {
+            await waitForDictationPreload()
+        }
         guard !cancellation.isStopped else { return }
         // The user may have hit Cancel between enqueue and now. Don't spin up
         // the model just to throw the result away.

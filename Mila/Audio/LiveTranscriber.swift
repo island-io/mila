@@ -178,6 +178,9 @@ final class LiveTranscriber: ObservableObject {
     private var deletedRanges: [(start: Double, end: Double)] = []
     private var inFlight: Task<Void, Never>?
     private var tickTask: Task<Void, Never>?
+    /// Whether `start(language:)` has armed passes that `stop()` has not
+    /// torn down yet: the fixed-window tick, or the VAD detector.
+    var isRunning: Bool { tickTask != nil || detector != nil }
     private var language: String = "he"
     /// Incremented on every `stop()` — and so on every `reset()` and
     /// `start()`, which begin with one. A `transcribeUtterance` call

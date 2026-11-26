@@ -27,13 +27,67 @@ final class DictationController: ObservableObject {
     /// to Hebrew on a fresh install to preserve the pre-rename UX.
     @Published private(set) var lastLanguage: String = "he"
 
-    private let recorder = MicrophoneRecorder()
+    private let recorder: MicrophoneRecorder
+    /// `recorder.stop()`, unless a test stands in for it.
+    private let stopRecorderNow: @MainActor () async -> Void
+    /// `recorderTeardownDeadline`, unless a test shortens it.
+    private let teardownDeadline: TimeInterval
     private var samples: [Float] = []
     private var streamTask: Task<Void, Never>?
     /// True while `start(action:)` is between its entry and setting
     /// `state = .recording` — the two awaits in that window (mic permission,
     /// engine bring-up) are where a hotkey double-press could re-enter.
     private var isStarting = false
+    /// True from the moment `stopAndTranscribe` begins until it has either
+    /// moved the state on to `.transcribing` or dropped out after a cancel.
+    /// The state stays `.recording` while the recorder tears down, as it
+    /// always has, and without this flag `toggle` would route a double-tap
+    /// in that wait into a second stop.
+    private var isStopping = false
+    /// Cancels waiting for the recorder they stopped. Such a cancel has
+    /// already set `.idle`, and a press in that wait must not start a new
+    /// dictation whose bring-up races the old engine's teardown on the same
+    /// recorder. Bounded by `recorderTeardownDeadline`, like `isStopping`.
+    private var cancelsTearingDown = 0
+    /// A stop or a cancel is waiting for the recorder to tear down. Every
+    /// press is ignored meanwhile (see `outcome(ofPress:state:isTearingDown:)`),
+    /// and the wait is bounded by `recorderTeardownDeadline`, so this always
+    /// clears.
+    private var isTearingDown: Bool { isStopping || cancelsTearingDown > 0 }
+    /// Set by `beginShutdown()` when Mila starts quitting, and never cleared.
+    private var isShuttingDown = false
+    /// The first press during a quit is logged; the rest are not.
+    private var loggedPressWhileQuitting = false
+    /// Bumped by every `cancelInFlight` that acts. A stop compares it twice:
+    ///  * across its recorder teardown — a sleep, screen-lock or quit cancel
+    ///    can run in that wait (the state still reads `.recording`) and has
+    ///    then already dropped the dictation, so the stop must not
+    ///    transcribe, paste or touch the state;
+    ///  * after its final pass — a cancel during `.transcribing` cannot stop
+    ///    a whisper pass already running, but its text must not be pasted:
+    ///    a synthesized ⌘V into a locked screen types into the password field.
+    private var cancelGeneration = 0
+
+    /// How long a stop or cancel waits for `MicrophoneRecorder.stop()` to
+    /// finish tearing the audio engine down. That teardown has no timeout of
+    /// its own, and `engine.stop()` can block on the CoreAudio HAL queue
+    /// (a Bluetooth mic mid-profile-switch). Past this, the stop carries on
+    /// with the audio it already has, just as an in-time stop does (cancel
+    /// check included), and presses work again. The teardown keeps running,
+    /// and the mic stays open until it returns.
+    static let recorderTeardownDeadline: TimeInterval = 10
+
+    /// This dictation's claim on the local Whisper model (#434). Batch-only
+    /// mode releases an idle model (#393), so without it every dictation
+    /// loaded the model only once the user had finished speaking. Taken once
+    /// mic access is granted, so the load overlaps with the mic coming up and
+    /// the user speaking; handed to this property once capture is running,
+    /// and ended exactly once — by the stop that takes it out of here (after
+    /// its final transcription), or on cancel. A start that fails ends its
+    /// own hold before it returns. Nil in live
+    /// mode and on the remote backend (see
+    /// `TranscriptionService.beginLocalModelHold`).
+    private var modelHold: TranscriptionService.LocalModelHold?
 
     /// Live transcriber used to surface partial transcripts in the
     /// dictation overlay AND to remove the post-release transcription
@@ -61,14 +115,25 @@ final class DictationController: ObservableObject {
     /// so a full library blocks new clips consistently with Settings copy.
     var storageSettings: RecordingStorageSettings?
 
+    /// `registersHotkeys`, `stopRecorder` and `teardownDeadline` exist for
+    /// tests: a test controller must not take the host app's global hotkeys,
+    /// and needs a recorder teardown it can hold and a short deadline.
     init(store: RecordingStore,
          transcription: TranscriptionService,
          hotkeySettings: HotkeySettings,
-         liveTranscriber: LiveTranscriber) {
+         liveTranscriber: LiveTranscriber,
+         registersHotkeys: Bool = true,
+         stopRecorder: (@MainActor () async -> Void)? = nil,
+         teardownDeadline: TimeInterval = DictationController.recorderTeardownDeadline) {
+        let recorder = MicrophoneRecorder()
+        self.recorder = recorder
+        self.stopRecorderNow = stopRecorder ?? { await recorder.stop() }
+        self.teardownDeadline = teardownDeadline
         self.store = store
         self.transcription = transcription
         self.hotkeySettings = hotkeySettings
         self.liveTranscriber = liveTranscriber
+        guard registersHotkeys else { return }
         registerHotkeys()
         bindingsObserver = hotkeySettings.$bindings
             .dropFirst()
@@ -92,30 +157,238 @@ final class DictationController: ObservableObject {
     /// already in flight, this call is ignored (we don't want to interleave
     /// languages).
     func toggle(action: HotkeyAction) async {
-        switch state {
-        case .idle:
+        switch pressOutcome(for: action) {
+        case .start:
             await start(action: action)
-        case .recording(let active) where active == action:
+        case .stop:
             await stopAndTranscribe(action: action)
-        case .recording, .transcribing:
+        case .ignore:
+            // The beep is all the user hears, so leave the reason in the log.
+            dictationLog.log("""
+                press of \(action.rawValue, privacy: .public) ignored: \
+                state=\(String(describing: self.state), privacy: .public) \
+                stopping=\(self.isStopping) cancelling=\(self.cancelsTearingDown)
+                """)
             NSSound.beep()
+        case .quitting:
+            // No beep: Mila is on its way out.
+            if !loggedPressWhileQuitting {
+                loggedPressWhileQuitting = true
+                dictationLog.log("press of \(action.rawValue, privacy: .public) ignored: Mila is quitting")
+            }
         }
     }
 
-    /// Stop any in-flight dictation immediately. Used by the AppDelegate
-    /// during graceful shutdown.
+    /// What a press of `action`'s hotkey would do right now.
+    func pressOutcome(for action: HotkeyAction) -> PressOutcome {
+        if isShuttingDown { return .quitting }
+        return Self.outcome(ofPress: action, state: state, isTearingDown: isTearingDown)
+    }
+
+    /// `quitting`: `beginShutdown()` has run. Every press does nothing,
+    /// whatever the state.
+    enum PressOutcome: Equatable { case start, stop, ignore, quitting }
+
+    /// The first thing the quit does, before it awaits anything: from here
+    /// on every press does nothing. Without it a press in one of the quit's
+    /// suspensions after the dictation cancel started a dictation that
+    /// nothing would stop, with the mic open until exit and a live
+    /// transcriber calling a transcription service that is shutting down.
+    /// Synchronous, so it is in effect before the quit's first await; never
+    /// undone.
+    func beginShutdown() {
+        isShuttingDown = true
+    }
+
+    /// What a press of `action`'s hotkey does. Kept pure so the routing can
+    /// be tested without a microphone.
+    ///
+    /// Only the language being recorded can stop it, and only once: a second
+    /// press while that stop is still tearing the recorder down is ignored,
+    /// like a press during `.transcribing`. Routing it to a second stop ran
+    /// a second final pass over empty audio, which beeped and set `.idle`
+    /// while the first pass was still running — so a later press could start
+    /// a new dictation that the first stop then knocked back to `.idle`.
+    ///
+    /// Nor does any press act while a stop or a cancel is still waiting for
+    /// the recorder to tear down, even though a cancel (or a cancel that
+    /// overtook a stop) has already set `.idle`: a new engine bring-up would
+    /// race the old engine's teardown on the same recorder. The press beeps.
+    /// The wait is bounded (`recorderTeardownDeadline`), so presses always
+    /// work again within that time. Past the deadline a new bring-up can
+    /// overlap a teardown that is still stuck; when both are blocked on the
+    /// same device, that start fails at the recorder's own bring-up timeout
+    /// and beeps, which beats ignoring presses until relaunch. Each such
+    /// bring-up leaves a cooperative-pool thread parked on the device, as any
+    /// timed-out bring-up does; moving the recorder's blocking CoreAudio
+    /// calls onto dedicated threads is a follow-up.
+    static func outcome(ofPress action: HotkeyAction,
+                        state: State,
+                        isTearingDown: Bool) -> PressOutcome {
+        switch state {
+        case .idle where isTearingDown:
+            return .ignore
+        case .idle:
+            return .start
+        case .recording(let active) where active == action && !isTearingDown:
+            return .stop
+        case .recording, .transcribing:
+            return .ignore
+        }
+    }
+
+    enum CancelEffect: Equatable {
+        /// Nothing in flight.
+        case none
+        /// Capture is running: stop it and drop what it captured.
+        case dropCapture
+        /// The final pass is already running: let it finish but do not paste
+        /// its text. The dictation is still saved to History (on quit the
+        /// service's shutdown ends the pass early, so that row has no text,
+        /// as before).
+        case suppressPaste
+    }
+
+    /// What `cancelInFlight` does in `state`. Kept pure so it can be tested
+    /// without a microphone: a sleep or screen lock during `.transcribing`
+    /// used to do nothing, and the pass then pasted into the locked screen.
+    static func cancelEffect(for state: State) -> CancelEffect {
+        switch state {
+        case .idle: return .none
+        case .recording: return .dropCapture
+        case .transcribing: return .suppressPaste
+        }
+    }
+
+    enum FinalPassOutcome: Equatable { case paste, beep, keepWithoutPasting }
+
+    /// What a stop does with its final pass's `text`. A cancel that arrived
+    /// during the pass (sleep, screen lock, quit) means no paste; the stop
+    /// still saves the dictation to History, and beeps if the screen is not
+    /// locked, as for any dictation that pasted nothing.
+    static func finalPassOutcome(text: String, cancelledDuringPass: Bool) -> FinalPassOutcome {
+        if cancelledDuringPass { return .keepWithoutPasting }
+        return text.isEmpty ? .beep : .paste
+    }
+
+    /// Wait for `operation`, but for at most `seconds`. Returns true when it
+    /// finished in time. On a timeout the operation keeps running; its late
+    /// completion resumes nothing, so whatever follows it in the caller has
+    /// already moved on, and runs `onLateReturn` instead. Used to bound
+    /// `MicrophoneRecorder.stop()`.
+    static func waitAtMost(_ seconds: TimeInterval,
+                           for operation: @escaping @MainActor () async -> Void,
+                           onLateReturn: (@MainActor () -> Void)? = nil) async -> Bool {
+        let race = DeadlineRace()
+        return await withCheckedContinuation { continuation in
+            race.continuation = continuation
+            race.timer = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+                race.finish(inTime: false)
+            }
+            Task { @MainActor in
+                await operation()
+                if !race.finish(inTime: true) { onLateReturn?() }
+            }
+        }
+    }
+
+    /// Stop the recorder, waiting at most `teardownDeadline`
+    /// (`recorderTeardownDeadline` outside tests).
+    private func stopRecorder(for reason: String) async {
+        let started = Date()
+        let deadline = teardownDeadline
+        let inTime = await Self.waitAtMost(deadline, for: { [stopRecorderNow] in
+            await stopRecorderNow()
+        }, onLateReturn: {
+            // Nothing waits for it any more, so log how long the mic stayed open.
+            dictationLog.log("""
+                dictation \(reason, privacy: .public): the microphone finished shutting down \
+                after \(Int(Date().timeIntervalSince(started)), privacy: .public) s
+                """)
+        })
+        if !inTime {
+            dictationLog.error("""
+                dictation \(reason, privacy: .public): the microphone had not finished shutting down \
+                after \(Int(deadline), privacy: .public) s; carrying on without it
+                """)
+        }
+    }
+
+    /// Stop any in-flight dictation immediately: sleep, screen lock and quit.
+    /// During capture the dictation is dropped; during its final pass only
+    /// the paste is (see `CancelEffect`).
+    ///
+    /// Everything a cancel does to the dictation happens before its first
+    /// await (`dropCapture()` is synchronous), and what it then waits for is
+    /// only the recorder's teardown. So a second cancel — closing the lid
+    /// sends both the screen-lock and the sleep guard here — or a quit that
+    /// arrives during that wait finds `.idle` and returns at once, with the
+    /// live transcriber already stopped: no new live pass can start on the
+    /// engine that the quit shuts down next. Presses are ignored during the
+    /// wait, which is bounded by `recorderTeardownDeadline`.
     func cancelInFlight() async {
-        guard case .recording = state else { return }
-        await recorder.stop()
+        switch Self.cancelEffect(for: state) {
+        case .none:
+            return
+        case .suppressPaste:
+            cancelGeneration += 1
+            dictationLog.log("dictation cancelled during its final pass: its text will not be pasted")
+        case .dropCapture:
+            // Bumped before the first await, so a stop already waiting for
+            // its own teardown sees this cancel when it resumes.
+            cancelGeneration += 1
+            // Counted before `.idle` lets a press through.
+            cancelsTearingDown += 1
+            dropCapture()
+            await stopRecorder(for: "cancel")
+            cancelsTearingDown -= 1
+        }
+    }
+
+    /// Everything a cancel does to a dictation in capture. Not `async`, so
+    /// no other main-actor work can run between its first line and its last.
+    private func dropCapture() {
         streamTask?.cancel(); streamTask = nil
-        liveTextObserver?.cancel(); liveTextObserver = nil
-        _ = liveTranscriber.stop()
+        stopLiveTranscription()
         samples.removeAll(keepingCapacity: true)
         targetApp = nil
+        // Nothing will be transcribed: let batch-only mode release the model.
+        endModelHold()
         DictationOverlayWindow.shared.hide()
         state = .idle
         level = 0
     }
+
+    /// The live transcriber only feeds the overlay's partial text. Every
+    /// stop and cancel ends it before its first await, so no live pass
+    /// starts after that point — nor after a quit's `transcription.shutdown()`.
+    /// Audio still arriving from the recorder is only buffered by a stopped
+    /// transcriber, which never passes it to the engine.
+    private func stopLiveTranscription() {
+        liveTextObserver?.cancel()
+        liveTextObserver = nil
+        _ = liveTranscriber.stop()
+    }
+
+    /// End this dictation's model hold, if it has one. Safe to call more than
+    /// once: the property is cleared first, and the service ignores a hold
+    /// that already ended.
+    private func endModelHold() {
+        guard let hold = modelHold else { return }
+        modelHold = nil
+        transcription.endLocalModelHold(hold)
+    }
+
+    #if DEBUG
+    /// Tests only: leave the controller as a successful `start(action:)`
+    /// does — `.recording(action)` with the live transcriber running —
+    /// without a microphone.
+    func beginRecordingForTesting(_ action: HotkeyAction) {
+        state = .recording(action)
+        liveTranscriber.start(language: action.languageCode)
+    }
+    #endif
 
     // MARK: - Recording
 
@@ -127,6 +400,7 @@ final class DictationController: ObservableObject {
         // first without cancelling it and the recorder was restarted
         // mid-flight. Set synchronously, so the second entry bails.
         guard !isStarting else {
+            dictationLog.log("press of \(action.rawValue, privacy: .public) ignored: a start is already in progress")
             NSSound.beep()
             return
         }
@@ -137,6 +411,7 @@ final class DictationController: ObservableObject {
         // (consistent with Settings copy). A beep is the right-sized signal
         // for the hotkey flow — rare edge, and the user can free space.
         if let storageSettings, store.currentUsageBytes() >= storageSettings.limitBytes {
+            dictationLog.log("dictation not started: the recordings folder is at its storage limit")
             NSSound.beep()
             return
         }
@@ -162,16 +437,73 @@ final class DictationController: ObservableObject {
         }
 
         guard await recorder.requestAccess() else {
+            dictationLog.log("dictation not started: microphone access was not granted")
+            targetApp = nil
             NSSound.beep()
             return
         }
+        // A quit that began during the permission prompt: no preload, no mic.
+        guard !isShuttingDown else {
+            dictationLog.log("dictation not started: Mila is quitting")
+            targetApp = nil
+            return
+        }
+
+        // Start loading the model the final pass will use now, so the load
+        // overlaps with the mic coming up and the user speaking instead of
+        // following the second press (#434). After the permission check, not
+        // before it: on a first dictation the system prompt can stay up for a
+        // long time, and a denial would throw the whole load away. Once access
+        // is granted that check returns at once, so nothing is lost here.
+        // This call owns the hold until capture is running; every return
+        // before that point ends it, so a failed start cannot strand it.
+        let hold = transcription.beginLocalModelHold(language: action.languageCode)
+        var holdHandedOff = false
+        defer {
+            if !holdHandedOff, let hold { transcription.endLocalModelHold(hold) }
+        }
+
         samples.removeAll(keepingCapacity: true)
         do {
             try await recorder.start()
         } catch {
+            // Name the failure publicly: the bridged code of a Swift enum
+            // with payloads does not follow declaration order, so
+            // "MicrophoneError 0" alone misleads. The device name stays in
+            // the private description.
+            let kind: String
+            switch error as? MicrophoneError {
+            case .noInputDevice?: kind = "no input device"
+            case .bringUpTimedOut(_, let timeout)?: kind = "bring-up timed out after \(timeout) s"
+            case .tapInstallFailed?: kind = "input tap refused"
+            case nil:
+                let ns = error as NSError
+                kind = "\(ns.domain) \(ns.code)"
+            }
+            dictationLog.error("""
+                dictation not started: mic bring-up failed (\(kind, privacy: .public)): \
+                \(error.localizedDescription, privacy: .private)
+                """)
+            targetApp = nil
             NSSound.beep()
             return
         }
+        // A quit that began while the mic was coming up found `.idle` and
+        // cancelled nothing. Stop the mic instead of capturing behind it.
+        // (A sleep or screen lock in that window still lets the start go on:
+        // their guards skip `.idle` too. A known gap.)
+        guard !isShuttingDown else {
+            dictationLog.log("dictation not started: Mila is quitting")
+            targetApp = nil
+            await stopRecorder(for: "quit")
+            return
+        }
+        // At most one hold per controller. Every end path clears the previous
+        // dictation's before going idle, so this only guards against a future
+        // path that forgets to — ending the old one rather than leaking it.
+        endModelHold()
+        modelHold = hold
+        holdHandedOff = true
         state = .recording(action)
         lastLanguage = action.languageCode
         DictationOverlayWindow.shared.show()
@@ -196,6 +528,15 @@ final class DictationController: ObservableObject {
                 let chunk = AudioConvert.samples(from: buffer)
                 let lvl = AudioMeter.level(from: buffer)
                 await MainActor.run {
+                    // A cancel (`dropCapture()`) cancels this task before
+                    // the recorder has stopped, and a buffer already handed
+                    // to it must not refill `samples` or the level after the
+                    // cleanup. Checked on the main actor, where the cancel
+                    // runs. A stop cancels this task only after its
+                    // teardown wait and its final pass reads `samples` in
+                    // that same turn, so a buffer this drops was never part
+                    // of that pass.
+                    guard !Task.isCancelled else { return }
                     self.samples.append(contentsOf: chunk)
                     self.level = lvl
                     DictationOverlayWindow.shared.updateLevel(lvl)
@@ -206,16 +547,39 @@ final class DictationController: ObservableObject {
     }
 
     private func stopAndTranscribe(action: HotkeyAction) async {
-        await recorder.stop()
+        // Mark the stop and take this dictation's model hold BEFORE the first
+        // await. The state reads `.recording` until the recorder has torn
+        // down, and `isStopping` is what turns a double-tap in that window
+        // away instead of running a second stop. The hold moves into a local
+        // so this stop ends exactly the hold it took, whatever `modelHold`
+        // carries by the time it does.
+        isStopping = true
+        let generation = cancelGeneration
+        let hold = modelHold
+        modelHold = nil
+        stopLiveTranscription()
+        // Bounded: a teardown stuck on the CoreAudio HAL must not leave this
+        // stop waiting for good. `MicrophoneRecorder.stop()` finishes the
+        // audio stream before the part that can block, so nothing is yielded
+        // after that point, timeout or not.
+        await stopRecorder(for: "stop")
+        guard generation == cancelGeneration else {
+            // A sleep, screen-lock or quit cancel ran during the teardown and
+            // has already dropped this dictation: emptied the capture, hidden
+            // the overlay and set `.idle`. Hand back only this stop's own hold
+            // and leave everything else as the cancel left it — no final pass
+            // over the leftovers, no "no audio" error, and above all no paste.
+            isStopping = false
+            if let hold { transcription.endLocalModelHold(hold) }
+            return
+        }
         streamTask?.cancel(); streamTask = nil
         state = .transcribing(action)
+        isStopping = false
         DictationOverlayWindow.shared.setBusy(true)
 
         let captured = samples
         samples.removeAll(keepingCapacity: true)
-        liveTextObserver?.cancel()
-        liveTextObserver = nil
-        _ = liveTranscriber.stop()
 
         // ALWAYS do a final one-shot pass over the full captured audio.
         // We tried using `LiveTranscriber.formattedTranscript` as the
@@ -238,15 +602,31 @@ final class DictationController: ObservableObject {
         let text = await transcription.transcribeOnce(samples: captured,
                                                       language: action.languageCode,
                                                       audioCtx: 0)
+        // The final pass has run, so this dictation no longer needs the
+        // model: batch-only mode releases it once nothing else is using it.
+        if let hold { transcription.endLocalModelHold(hold) }
 
         DictationOverlayWindow.shared.hide()
         state = .idle
         level = 0
 
-        if !text.isEmpty {
+        // A sleep, screen lock or quit during the pass cannot stop it, but it
+        // does stop the paste: ⌘V into a locked screen types the transcript
+        // into the password field.
+        switch Self.finalPassOutcome(text: text,
+                                     cancelledDuringPass: generation != cancelGeneration) {
+        case .paste:
             paste(text)
-        } else {
+        case .beep:
             NSSound.beep()
+        case .keepWithoutPasting:
+            // The beep is the only sign that nothing was pasted: after a
+            // sleep without a screen lock the user is back at the app they
+            // dictated into, and the text is only in History. On a locked
+            // screen nobody is there to hear it.
+            targetApp = nil
+            if !Self.isScreenLocked { NSSound.beep() }
+            dictationLog.log("dictation finished after a sleep, screen lock or quit: not pasted")
         }
 
         await persistDictation(samples: captured, text: text, action: action)
@@ -326,18 +706,25 @@ final class DictationController: ObservableObject {
 
     private func paste(_ text: String) {
         let pasteboard = NSPasteboard.general
-        let priorContents = Self.snapshotPasteboard(pasteboard)
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
 
         // Without Accessibility trust, CGEvent.post is silently dropped by
         // macOS — the user would see "I dictated, nothing happened" with no
         // explanation. Surface a one-shot alert and leave the text on the
         // clipboard so they can paste manually with ⌘V.
         guard AccessibilityPermission.isTrusted() else {
-            AccessibilityPermission.notifyMissing()
+            // The same rule as `pasteUnlessLocked`: a locked screen gets no
+            // transcript on its clipboard (and no alert promising one). The
+            // text is in History.
+            guard !Self.isScreenLocked else {
+                dictationLog.log("dictation not copied to the clipboard: the screen is locked")
+                targetApp = nil
+                return
+            }
             // Do NOT restore the prior clipboard contents — the transcript
             // is the user's only path to the dictated text right now.
+            pasteboard.clearContents()
+            pasteboard.setString(text, forType: .string)
+            AccessibilityPermission.notifyMissing()
             targetApp = nil
             return
         }
@@ -357,7 +744,15 @@ final class DictationController: ObservableObject {
         // can race the activation and land in the previously-frontmost
         // window instead.
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
-            Self.postCommandV()
+            // The state is `.idle` by now, so a screen lock in this delay
+            // cancels nothing: `pasteUnlessLocked` checks the lock itself.
+            guard let priorContents = Self.pasteUnlessLocked(
+                text, into: pasteboard,
+                isScreenLocked: { Self.isScreenLocked },
+                typeCommandV: { Self.postCommandV() }) else {
+                dictationLog.log("dictation paste skipped: the screen locked before it was typed")
+                return
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if !priorContents.isEmpty {
                     Self.restorePasteboard(pasteboard, from: priorContents)
@@ -404,6 +799,38 @@ final class DictationController: ObservableObject {
         pasteboard.writeObjects(items)
     }
 
+    /// The paste's last step, after the activation delay: unless the screen
+    /// is locked, put `text` on `pasteboard` and type ⌘V. Returns the earlier
+    /// clipboard to restore, or nil when the paste was skipped — and then
+    /// the clipboard was not touched, exactly like a lock during the final
+    /// pass (`.keepWithoutPasting`): the text is left to History, and no
+    /// transcript sits on a locked Mac's clipboard to sync elsewhere.
+    ///
+    /// The snapshot comes BEFORE the lock check: reading changes nothing,
+    /// and resolving another app's promised data can take a while, which
+    /// must not sit between the check and the keystrokes. What follows the
+    /// check is only the write and ⌘V; a lock in that moment is a gap no
+    /// API closes.
+    static func pasteUnlessLocked(_ text: String,
+                                  into pasteboard: NSPasteboard,
+                                  isScreenLocked: @MainActor () -> Bool,
+                                  typeCommandV: @MainActor () -> Void) -> [[NSPasteboard.PasteboardType: Data]]? {
+        let priorContents = snapshotPasteboard(pasteboard)
+        guard !isScreenLocked() else { return nil }
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        typeCommandV()
+        return priorContents
+    }
+
+    /// Whether the login window's lock screen is up. The session dictionary
+    /// carries `CGSSessionScreenIsLocked` only while it is; a missing key or
+    /// dictionary reads as unlocked, so this can only ever skip a paste.
+    private static var isScreenLocked: Bool {
+        guard let session = CGSessionCopyCurrentDictionary() as? [String: Any] else { return false }
+        return (session["CGSSessionScreenIsLocked"] as? Bool) ?? false
+    }
+
     /// Synthesize a Cmd+V at the HID event-tap level. Requires the process
     /// to be Accessibility-trusted; the caller is responsible for that
     /// check (see `AccessibilityPermission.isTrusted()`).
@@ -424,5 +851,25 @@ final class DictationController: ObservableObject {
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
         cmdUp?.post(tap: .cghidEventTap)
+    }
+}
+
+/// One-shot resume for `DictationController.waitAtMost`: whichever of the
+/// operation and the timer finishes first resumes the waiter, and the other
+/// finds nothing left to resume. Main-actor only, so no lock is needed.
+@MainActor
+private final class DeadlineRace {
+    var continuation: CheckedContinuation<Bool, Never>?
+    var timer: Task<Void, Never>?
+
+    /// Returns whether this call resumed the waiter.
+    @discardableResult
+    func finish(inTime: Bool) -> Bool {
+        guard let continuation else { return false }
+        self.continuation = nil
+        timer?.cancel()
+        timer = nil
+        continuation.resume(returning: inTime)
+        return true
     }
 }

@@ -2880,7 +2880,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
                     await actions.stopBecauseOfSleep()
                 }
             }
-            if let dictation = self.dictation, case .recording = dictation.state {
+            // `.transcribing` too: the pass cannot be stopped, but its paste
+            // must be (see `DictationController.cancelInFlight`).
+            if let dictation = self.dictation, dictation.state != .idle {
                 print("Sleep guard: cancelling dictation before system sleeps")
                 await dictation.cancelInFlight()
             }
@@ -2921,16 +2923,31 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
             print("Screen-lock guard: stopping active recording (\(reason))")
             await actions.stopRecording()
         }
-        if let dictation, case .recording = dictation.state {
+        // `.transcribing` too: a pass still running when the screen locks
+        // would otherwise paste into the lock screen once it finishes.
+        if let dictation, dictation.state != .idle {
             print("Screen-lock guard: cancelling active dictation (\(reason))")
             await dictation.cancelInFlight()
         }
     }
 
     private func gracefulShutdown() async {
+        // Before the first await: from here on a dictation hotkey does
+        // nothing. A dictation started in one of the suspensions below would
+        // come after the dictation cancel, and nothing would stop it.
+        dictation?.beginShutdown()
         // Stop any active recording / dictation cleanly so AVAudioEngine and
         // SCStream release the user's mic / screen-recording grant.
         await session?.cancelAll()
+        // The cancel stops the dictation's live transcriber before its first
+        // await, so no new live pass starts on the engine that
+        // `transcription.shutdown()` frees below; it then waits for the mic's
+        // teardown, for at most `DictationController.recorderTeardownDeadline`.
+        // A sleep or screen-lock cancel still waiting for the microphone has
+        // already set the state to `.idle`, and then this returns at once. A
+        // dictation still starting when the quit began reads `.idle` too and
+        // is not cancelled here, nor waited for: it stops its own mic if that
+        // comes up before the process exits, and the exit releases it if not.
         await dictation?.cancelInFlight()
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.
