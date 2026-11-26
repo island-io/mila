@@ -56,20 +56,44 @@ final class ObjCExceptionTests: XCTestCase {
         let player = AVAudioPlayerNode()
         engine.attach(player)
         let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
-        try ObjCException.catching {
-            player.installTap(onBus: 0, bufferSize: 4800, format: format) { _, _ in }
-        }
-        XCTAssertThrowsError(try ObjCException.catching {
-            player.installTap(onBus: 0, bufferSize: 4800, format: format) { _, _ in }
-        }) { error in
+        try ObjCException.installTap(on: player, bus: 0, bufferSize: 4800, format: format) { _, _ in }
+        XCTAssertThrowsError(try ObjCException.installTap(on: player, bus: 0, bufferSize: 4800,
+                                                          format: format) { _, _ in }) { error in
             XCTAssertEqual((error as NSError).domain, ObjCExceptionErrorDomain)
+            XCTAssertNotNil((error as NSError).userInfo[ObjCExceptionNameKey] as? String)
         }
         // The raise left AVFAudio's graph consistent: the first tap can still
         // be removed and a fresh one installed.
         player.removeTap(onBus: 0)
-        try ObjCException.catching {
-            player.installTap(onBus: 0, bufferSize: 4800, format: format) { _, _ in }
-        }
+        try ObjCException.installTap(on: player, bus: 0, bufferSize: 4800, format: format) { _, _ in }
         player.removeTap(onBus: 0)
+    }
+
+    private final class Canary {}
+
+    /// #427: a refused tap must free the block it was handed, and with it
+    /// everything the block captures (in the recorder: the converter, the
+    /// stream continuation, the gain). Through
+    /// `catching { node.installTap(…) }` it never was — the raise unwound
+    /// through the Swift closure that had bridged the block, skipping that
+    /// frame's release — so every refused tap leaked.
+    func test_a_refused_installTap_frees_the_block_it_was_handed() throws {
+        let engine = AVAudioEngine()
+        let player = AVAudioPlayerNode()
+        engine.attach(player)
+        let format = try XCTUnwrap(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        // Occupy the bus, so the install under test is refused.
+        try ObjCException.installTap(on: player, bus: 0, bufferSize: 4800, format: format) { _, _ in }
+        defer { player.removeTap(onBus: 0) }
+
+        weak var captured: Canary?
+        autoreleasepool {
+            let canary = Canary()
+            captured = canary
+            let installed = (try? ObjCException.installTap(on: player, bus: 0, bufferSize: 4800,
+                                                           format: format) { _, _ in _ = canary }) != nil
+            XCTAssertFalse(installed, "the bus was occupied, so this install must be refused")
+        }
+        XCTAssertNil(captured, "the refused tap's block (and what it captured) was leaked")
     }
 }
