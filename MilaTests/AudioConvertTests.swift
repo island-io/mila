@@ -138,6 +138,76 @@ final class AudioConvertTests: XCTestCase {
                       "Pass-through must return the same instance (documented contract — callers copy before mutating)")
     }
 
+    /// A 25 s recording written by `writeWhisperWAV` and read back by
+    /// `loadAsWhisperSamples` came back 640 frames short on CI's macOS 26
+    /// image (#376) — 399,360 = 390 × 1024. Measures every step separately
+    /// so the message says which side loses the frames.
+    func test_whisper_wav_round_trips_every_frame() throws {
+        let frames = 400_000
+        let samples = (0..<frames).map { 0.3 * Float(sin(Double($0) / 10)) }
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wav-roundtrip-\(UUID())", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        func dataFrames(_ url: URL) -> Int {
+            guard let bytes = try? [UInt8](Data(contentsOf: url)), bytes.count >= 12 else { return -1 }
+            func u32(_ o: Int) -> Int {
+                Int(bytes[o]) | Int(bytes[o + 1]) << 8 | Int(bytes[o + 2]) << 16 | Int(bytes[o + 3]) << 24
+            }
+            var offset = 12
+            while offset + 8 <= bytes.count {
+                let size = u32(offset + 4)
+                if bytes[offset..<offset + 4].elementsEqual("data".utf8) {
+                    return size / 4 * 1_000_000 + (bytes.count - offset - 8) / 4
+                }
+                offset += 8 + size + (size & 1)
+            }
+            return -2
+        }
+        var report: [String] = []
+
+        let plain = dir.appendingPathComponent("plain.wav")
+        try AudioConvert.writeWhisperWAV(samples: samples, to: plain)
+        report.append("written(header*1e6+payload)=\(dataFrames(plain))")
+        report.append("AVAudioFile.length=\((try? AVAudioFile(forReading: plain).length) ?? -1)")
+        report.append("WAVReader=\((try? WAVReader.loadSamples(url: plain).count) ?? -1)")
+        let loaded = try AudioConvert.loadAsWhisperSamples(url: plain)
+        report.append("loadAsWhisperSamples=\(loaded.count)")
+        if let file = try? AVAudioFile(forReading: plain),
+           let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(frames)) {
+            var total = 0
+            while file.framePosition < file.length {
+                try file.read(into: buffer)
+                if buffer.frameLength == 0 { break }
+                total += Int(buffer.frameLength)
+            }
+            report.append("readLoop=\(total)")
+        }
+
+        let pooled = dir.appendingPathComponent("pooled.wav")
+        try autoreleasepool { try AudioConvert.writeWhisperWAV(samples: samples, to: pooled) }
+        report.append("pooledWrite=\(dataFrames(pooled))")
+
+        if #available(macOS 15.0, *) {
+            let closed = dir.appendingPathComponent("closed.wav")
+            let format = WhisperAudioFormat.pcmFloat32
+            let file = try AVAudioFile(forWriting: closed, settings: format.settings,
+                                       commonFormat: .pcmFormatFloat32, interleaved: false)
+            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)))
+            buffer.frameLength = AVAudioFrameCount(frames)
+            samples.withUnsafeBufferPointer { buffer.floatChannelData![0].update(from: $0.baseAddress!, count: frames) }
+            try file.write(from: buffer)
+            report.append("beforeClose=\(dataFrames(closed))")
+            file.close()
+            report.append("closedWrite=\(dataFrames(closed))")
+        }
+
+        let message = report.joined(separator: " ")
+        print("[wav-roundtrip] \(message)")
+        XCTAssertEqual(loaded.count, frames, message)
+    }
+
     // MARK: - Helpers
 
     private func makeBuffer(format: AVAudioFormat,
