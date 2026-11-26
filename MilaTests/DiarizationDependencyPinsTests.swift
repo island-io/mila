@@ -30,6 +30,15 @@ final class DiarizationDependencyPinsTests: XCTestCase {
                      "an unparseable probe must fall through to pip")
     }
 
+    /// Nothing ran, so the refusal must not read "Speaker diarization
+    /// failed", and it holds only version numbers, so the log keeps it.
+    func test_unsupported_python_error_is_shown_and_logged_as_is() throws {
+        let message = try XCTUnwrap(DiarizationDependencyPins.unsupportedPythonMessage(version: "3.13"))
+        let error = SpeakerDiarizer.Error.unsupportedPython(message)
+        XCTAssertEqual(error.localizedDescription, message)
+        XCTAssertEqual(error.logDescription, message)
+    }
+
     func test_bootstrap_wheels_use_the_shared_pins() {
         XCTAssertEqual(DiarizationBootstrap.torchVersion, DiarizationDependencyPins.torch)
         XCTAssertEqual(DiarizationBootstrap.torchaudioVersion, DiarizationDependencyPins.torchaudio)
@@ -55,5 +64,12 @@ final class DiarizationDependencyPinsTests: XCTestCase {
         XCTAssertEqual(value("PYANNOTE_VERSION"), DiarizationDependencyPins.pyannoteAudio)
         XCTAssertEqual(value("TORCH_VERSION"), DiarizationDependencyPins.torch)
         XCTAssertEqual(value("TORCHAUDIO_VERSION"), DiarizationDependencyPins.torchaudio)
+        // The resolver constraints are literal lines in the script's heredoc.
+        // numpy is the pin that has already broken a release (1.9.7).
+        let lines = Set(text.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) })
+        XCTAssertTrue(lines.contains("numpy\(DiarizationDependencyPins.numpy)"),
+                      "build-diarization-bundle.sh must constrain numpy like the app does")
+        XCTAssertTrue(lines.contains("huggingface_hub\(DiarizationDependencyPins.huggingfaceHub)"),
+                      "build-diarization-bundle.sh must constrain huggingface_hub like the app does")
     }
 }

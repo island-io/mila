@@ -34,6 +34,11 @@ enum SpeakerDiarizer {
     enum Error: Swift.Error, LocalizedError {
         case pythonNotFound(String)
         case diarizationFailed(String)
+        /// The configured interpreter can't take the pinned stack
+        /// (`DiarizationDependencyPins.unsupportedPythonMessage`). Nothing
+        /// ran, so it is not a "diarization failed", and the message is built
+        /// from version numbers alone, so it is safe to log as is.
+        case unsupportedPython(String)
 
         var errorDescription: String? {
             switch self {
@@ -41,6 +46,8 @@ enum SpeakerDiarizer {
                 return "Python not found at \(path). Install Python 3 with pyannote.audio."
             case .diarizationFailed(let msg):
                 return "Speaker diarization failed: \(msg)"
+            case .unsupportedPython(let msg):
+                return msg
             }
         }
 
@@ -62,7 +69,7 @@ enum SpeakerDiarizer {
         /// it is the entire diagnostic.
         var logDescription: String {
             switch self {
-            case .pythonNotFound:
+            case .pythonNotFound, .unsupportedPython:
                 return errorDescription ?? "\(self)"
             case .diarizationFailed(let msg):
                 return "Speaker diarization failed (\(msg.utf8.count)B of subprocess output withheld)"
@@ -200,7 +207,7 @@ enum SpeakerDiarizer {
         if probe.exitCode == 0,
            let message = DiarizationDependencyPins.unsupportedPythonMessage(
                version: String(data: probe.stdout, encoding: .utf8) ?? "") {
-            throw Error.diarizationFailed(message)
+            throw Error.unsupportedPython(message)
         }
         let result = try await runPython(
             path: pythonPath,
