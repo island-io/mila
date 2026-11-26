@@ -107,11 +107,25 @@ public actor WhisperEngine {
 
     public init() {}
 
+    /// Runs this actor on `WhisperThreadExecutor.shared`, a dedicated thread,
+    /// instead of Swift's cooperative pool (#401). No isolated method contains
+    /// an `await`, so each one still runs start to finish without suspending
+    /// and `whisper_full` cannot be interleaved with the calls that free the
+    /// context. Keep it that way: an `await` inside this actor would let
+    /// `unload()` or `shutdown()` run in the gap, executor or not. See
+    /// `WhisperThreadExecutor`.
+    public nonisolated var unownedExecutor: UnownedSerialExecutor {
+        WhisperThreadExecutor.shared.asUnownedSerialExecutor()
+    }
+
     deinit {
         if let ctx { whisper_free(ctx) }
     }
 
-    public func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) {
+    /// `async` for the reason `unload()` is: a synchronous version loses to
+    /// the protocol's async no-op default when called on a `WhisperEngine`
+    /// value from async code.
+    public func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) async {
         self.preparationObserver = observer
     }
 
@@ -133,12 +147,9 @@ public actor WhisperEngine {
             }
             whisperNotice("Reloading \(displayName) — sibling .mlmodelc now available, was loaded without CoreML")
         }
-        if let ctx {
-            whisper_free(ctx)
-            self.ctx = nil
-            self.loadedPath = nil
-        }
-        self.coreMLStatus = .unavailable
+        // The same cleanup `unload()` does, so a reload that then fails
+        // leaves no field describing the model it just freed.
+        freeContext()
         var params = whisper_context_default_params()
         #if canImport(Metal)
         params.use_gpu = true
@@ -366,17 +377,30 @@ public actor WhisperEngine {
     /// while the app is still in a normal state (rather than during static
     /// destruction at `exit()`-time, which is what triggered the crash).
     public func shutdown() {
-        unload()
+        freeContext()
     }
 
     /// Release the model context without making the engine terminal: a later
     /// `loadIfNeeded` reloads it. This is the idle-release counterpart to
     /// `shutdown` — same bytes freed, but named for a service that keeps
-    /// accepting work. Resetting `coreMLStatus` matters: the next load
-    /// re-derives it from whisper.cpp's init log, and a stale `.loaded`
-    /// would make the CoreML-specific `audio_ctx` override fire before the
-    /// new context has actually engaged CoreML.
-    public func unload() {
+    /// accepting work.
+    ///
+    /// `async` although nothing in it suspends. `TranscribingEngine` gives
+    /// `unload() async` a no-op default, and from async code Swift prefers an
+    /// async overload over a synchronous one, so with a synchronous `unload()`
+    /// here `await engine.unload()` on a `WhisperEngine`-typed value called
+    /// the no-op and freed nothing. Calls through `any TranscribingEngine`
+    /// (`TranscriptionService`) were never affected: they dispatch to the
+    /// witness, which is this method either way.
+    public func unload() async {
+        freeContext()
+    }
+
+    /// Resetting `coreMLStatus` matters: the next load re-derives it from
+    /// whisper.cpp's init log, and a stale `.loaded` would make the
+    /// CoreML-specific `audio_ctx` override fire before the new context has
+    /// actually engaged CoreML.
+    private func freeContext() {
         if let ctx {
             whisper_free(ctx)
             self.ctx = nil

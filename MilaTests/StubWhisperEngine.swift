@@ -69,7 +69,10 @@ actor StubWhisperEngine: TranscribingEngine {
 
     private var preparationObserver: (@Sendable (Bool, String?) -> Void)?
 
-    func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) {
+    /// `async`, as on `WhisperEngine`: a synchronous version loses overload
+    /// resolution to the protocol's async no-op default when called on a
+    /// `StubWhisperEngine` value from async code.
+    func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) async {
         self.preparationObserver = observer
     }
 
