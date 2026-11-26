@@ -229,16 +229,19 @@ enum SubprocessRunner {
                 // The output is discarded (timed out or cancelled), so a short
                 // bound; a straggler holding the pipes was swept above.
                 _ = drained.wait(timeout: .now() + SubprocessRunner.drainGraceAfterKill)
-            } else if !drainAfterExit(drained, group: group), !isCancelled {
+            } else if !drainAfterExit(drained) {
                 // The child exited but something still holds its stdout or
-                // stderr open (a process it started). Its own output arrived
-                // before it exited, so what was read is complete unless a
-                // reader was starved for the whole grace; say so either way.
-                subprocessLog.error("\(self.executable.lastPathComponent, privacy: .public): pipe drain timed out after exit; returning the output read so far")
+                // stderr open (a process it started), and either the grace ran
+                // out or the task was cancelled. Its own output arrived before
+                // it exited, so what was read is complete unless a reader was
+                // starved for the whole grace; say so unless it is a cancel.
+                if !isCancelled {
+                    subprocessLog.error("\(self.executable.lastPathComponent, privacy: .public): pipe drain timed out after exit; returning the output read so far")
+                }
                 // Every caller runs a one-shot tool, so a process still in its
-                // group 30 s after it exited is a stray: stop it rather than
-                // leave it, and the two readers blocked on it, for the life of
-                // the app. Then give the readers the kill path's short bound.
+                // group at this point is a stray: stop it rather than leave it,
+                // and the two readers blocked on it, for the life of the app.
+                // Then give the readers the kill path's short bound.
                 if let group { LLMRunner.terminateHelpers(of: group) }
                 _ = drained.wait(timeout: .now() + SubprocessRunner.drainGraceAfterKill)
             }
@@ -258,20 +261,18 @@ enum SubprocessRunner {
         /// `drainGraceAfterExit`, in short slices so a cancel arriving NOW is
         /// seen. The child is already gone, so the cancel's own SIGTERM did
         /// nothing; whatever still holds the pipes is a process it started,
-        /// and on cancel that group is swept and the kill path's short bound
-        /// applies, instead of a cancelled diarization holding the serial
-        /// transcription queue for the whole grace. Returns whether the
-        /// readers finished.
-        private func drainAfterExit(_ drained: DispatchGroup, group: pid_t?) -> Bool {
+        /// and returning early lets the caller sweep that group, instead of a
+        /// cancelled diarization holding the serial transcription queue for
+        /// the whole grace. Returns whether the readers finished; on `false`
+        /// (grace over, or cancelled) the caller sweeps, so the two cases
+        /// cannot take different branches.
+        private func drainAfterExit(_ drained: DispatchGroup) -> Bool {
             let deadline = DispatchTime.now() + SubprocessRunner.drainGraceAfterExit
             while DispatchTime.now() < deadline {
                 if drained.wait(timeout: min(.now() + .milliseconds(250), deadline)) == .success {
                     return true
                 }
-                if isCancelled {
-                    if let group { LLMRunner.terminateHelpers(of: group) }
-                    return drained.wait(timeout: .now() + SubprocessRunner.drainGraceAfterKill) == .success
-                }
+                if isCancelled { return false }
             }
             return false
         }

@@ -329,6 +329,7 @@ final class DiarizationBootstrap: ObservableObject {
             stdout: .discard,
             timeout: Self.pipInstallTimeout)
         if result.timedOut {
+            discardKilledInstall()
             throw NSError(domain: "DiarizationBootstrap", code: 5, userInfo: [
                 NSLocalizedDescriptionKey: "pip install \(spec) timed out"
             ])
@@ -339,6 +340,17 @@ final class DiarizationBootstrap: ObservableObject {
                 NSLocalizedDescriptionKey: "pip install \(spec) failed: \(msg.prefix(500))"
             ])
         }
+    }
+
+    /// A `pip install --target` killed by the timeout can leave a half-moved
+    /// tree whose torch/torchaudio `__init__.py` makes `refreshReadyState`
+    /// report ready on the next launch (the hazard `reinstall()` names).
+    /// `SubprocessRunner` has killed pip's whole process group by the time it
+    /// returns, so nothing is writing here; wipe it so the next bootstrap
+    /// starts clean, as `reinstall()` does.
+    private func discardKilledInstall() {
+        try? fileManager.removeItem(at: sitePackagesURL)
+        isReady = false
     }
 
     /// Upper bound for a pip install of the diarization stack: a ~60 MB torch
@@ -364,6 +376,7 @@ final class DiarizationBootstrap: ObservableObject {
             stdout: .discard,
             timeout: Self.pipInstallTimeout)
         if result.timedOut {
+            discardKilledInstall()
             throw NSError(domain: "DiarizationBootstrap", code: 6, userInfo: [
                 NSLocalizedDescriptionKey: "pip install timed out"
             ])
