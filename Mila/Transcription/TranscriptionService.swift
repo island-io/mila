@@ -412,7 +412,10 @@ final class TranscriptionService: ObservableObject {
         // first CoreML compile) at launch. The first real transcription after
         // Stop loads on demand instead.
         guard retainsLocalModel, !remoteSettings.isActive else {
-            serviceLog.log("prewarm: skipping — local model retention is off for lang=\(language, privacy: .public)")
+            serviceLog.log("""
+                prewarm: skipping for lang=\(language, privacy: .public) — \
+                retains=\(self.retainsLocalModel) remote=\(self.remoteSettings.isActive)
+                """)
             return
         }
         guard let model = modelManager.model(for: language),
