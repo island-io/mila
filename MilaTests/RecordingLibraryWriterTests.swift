@@ -45,7 +45,7 @@ private final class EncodeProbe: @unchecked Sendable {
                 lock.unlock()
                 if !open {
                     started.signal()
-                    if backgroundGate.wait(timeout: .now() + 30) == .timedOut {
+                    if backgroundGate.wait(timeout: .now() + 10) == .timedOut {
                         lock.lock()
                         timedOut = true
                         lock.unlock()
@@ -67,11 +67,13 @@ private final class EncodeProbe: @unchecked Sendable {
     }
 
     /// Lets every background encode through, the one held now included.
+    /// Safe to call more than once.
     func openBackground() {
         lock.lock()
+        let wasOpen = backgroundOpen
         backgroundOpen = true
         lock.unlock()
-        backgroundGate.signal()
+        if !wasOpen { backgroundGate.signal() }
     }
 
     /// Whether the held encode has begun.
@@ -290,7 +292,7 @@ final class RecordingLibraryWriterTests: XCTestCase {
         store.stopTranscription(stopped)
         let stoppedRow = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "stopped" })
         XCTAssertNotNil(stoppedRow["deletedAt"], "a stopped transcription is not in Recently Deleted on disk yet")
-        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background write was let through mid-test")
+        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background hold ran out, so the test did not run against held writes")
 
         // The held write is older than all of that, so letting it finish
         // must not put the deleted rows back.
@@ -317,7 +319,7 @@ final class RecordingLibraryWriterTests: XCTestCase {
 
         XCTAssertTrue(store.update(rec))
         XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["title"] as? String }, ["after"])
-        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background write was let through mid-test")
+        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background hold ran out, so the test did not run against held writes")
     }
 
     /// A rename is handed off, and a store opened on the same folder (a
