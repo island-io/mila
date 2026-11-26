@@ -34,18 +34,19 @@ final class DictationController: ObservableObject {
     /// `state = .recording` — the two awaits in that window (mic permission,
     /// engine bring-up) are where a hotkey double-press could re-enter.
     private var isStarting = false
-    /// True from the moment `stopAndTranscribe` begins until the state has
-    /// moved on to `.transcribing`. The state stays `.recording` while the
-    /// recorder tears down, as it always has, and without this flag `toggle`
-    /// would route a double-tap in that wait into a second stop.
-    ///
-    /// A sleep or screen-lock `cancelInFlight` in the same wait still runs:
-    /// `MicrophoneRecorder.stop()` returns at once for it (the stop already
-    /// cleared `isRunning`), so it empties the capture and sets `.idle`
-    /// before the stop resumes. The stop then transcribes nothing, beeps and
-    /// pastes nothing. A press in that `.idle` is ignored too, so no new
-    /// dictation can start under a stop that has not finished.
+    /// True from the moment `stopAndTranscribe` begins until it has either
+    /// moved the state on to `.transcribing` or dropped out after a cancel.
+    /// The state stays `.recording` while the recorder tears down, as it
+    /// always has, and without this flag `toggle` would route a double-tap
+    /// in that wait into a second stop.
     private var isStopping = false
+    /// Bumped by every `cancelInFlight` that acts. A stop compares it across
+    /// its recorder teardown: a sleep, screen-lock or quit cancel can run in
+    /// that wait (the state still reads `.recording`, and the recorder's
+    /// `stop()` returns at once for it), and has then already dropped the
+    /// dictation, so the stop must not go on to transcribe, paste or touch
+    /// the state.
+    private var cancelGeneration = 0
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
     /// mode releases an idle model (#393), so without it every dictation
@@ -137,16 +138,10 @@ final class DictationController: ObservableObject {
     /// a second final pass over empty audio, which beeped and set `.idle`
     /// while the first pass was still running — so a later press could start
     /// a new dictation that the first stop then knocked back to `.idle`.
-    /// For the same reason no press starts a dictation while a stop is still
-    /// tearing down, even if a sleep or screen-lock cancel set `.idle` under
-    /// it: the stop resumes into `.transcribing` and would take that new
-    /// dictation's stream and samples, and strand its model hold.
     static func outcome(ofPress action: HotkeyAction,
                         state: State,
                         isStopping: Bool) -> PressOutcome {
         switch state {
-        case .idle where isStopping:
-            return .ignore
         case .idle:
             return .start
         case .recording(let active) where active == action && !isStopping:
@@ -160,6 +155,7 @@ final class DictationController: ObservableObject {
     /// during graceful shutdown.
     func cancelInFlight() async {
         guard case .recording = state else { return }
+        cancelGeneration += 1
         await recorder.stop()
         streamTask?.cancel(); streamTask = nil
         liveTextObserver?.cancel(); liveTextObserver = nil
@@ -299,9 +295,21 @@ final class DictationController: ObservableObject {
         // this stop ends exactly the hold it took, whatever `modelHold`
         // carries by the time it does.
         isStopping = true
+        let generation = cancelGeneration
         let hold = modelHold
         modelHold = nil
         await recorder.stop()
+        guard generation == cancelGeneration else {
+            // A sleep, screen-lock or quit cancel ran during the teardown and
+            // has already dropped this dictation: emptied the capture, hidden
+            // the overlay and set `.idle` (a new dictation may even have
+            // started since). Hand back only this stop's own hold and leave
+            // everything else as the cancel left it — no final pass over the
+            // leftovers, no "no audio" error, and above all no paste.
+            isStopping = false
+            if let hold { transcription.endLocalModelHold(hold) }
+            return
+        }
         streamTask?.cancel(); streamTask = nil
         state = .transcribing(action)
         isStopping = false
