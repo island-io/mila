@@ -2946,7 +2946,8 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // A sleep or screen-lock cancel still waiting for the microphone has
         // already set the state to `.idle`, and then this returns at once. A
         // dictation still starting when the quit began reads `.idle` too and
-        // is not cancelled here; it stops its own mic once that is up.
+        // is not cancelled here, nor waited for: it stops its own mic if that
+        // comes up before the process exits, and the exit releases it if not.
         await dictation?.cancelInFlight()
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.

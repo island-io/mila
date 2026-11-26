@@ -442,6 +442,12 @@ final class DictationController: ObservableObject {
             NSSound.beep()
             return
         }
+        // A quit that began during the permission prompt: no preload, no mic.
+        guard !isShuttingDown else {
+            dictationLog.log("dictation not started: Mila is quitting")
+            targetApp = nil
+            return
+        }
 
         // Start loading the model the final pass will use now, so the load
         // overlaps with the mic coming up and the user speaking instead of
@@ -484,6 +490,8 @@ final class DictationController: ObservableObject {
         }
         // A quit that began while the mic was coming up found `.idle` and
         // cancelled nothing. Stop the mic instead of capturing behind it.
+        // (A sleep or screen lock in that window still lets the start go on:
+        // their guards skip `.idle` too. A known gap.)
         guard !isShuttingDown else {
             dictationLog.log("dictation not started: Mila is quitting")
             targetApp = nil

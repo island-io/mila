@@ -187,7 +187,7 @@ final class DictationControllerTests: XCTestCase {
     /// teardown ignore every press until relaunch.
     func test_presses_work_again_once_a_cancel_stops_waiting_for_a_stuck_microphone() async {
         let teardown = HeldTeardown()
-        let (controller, live) = makeController(stopRecorder: teardown.run, teardownDeadline: 2)
+        let (controller, live) = makeController(stopRecorder: teardown.run, teardownDeadline: 1)
         controller.beginRecordingForTesting(.dictateHebrew)
 
         let cancelReturned = Flag()
@@ -200,8 +200,13 @@ final class DictationControllerTests: XCTestCase {
             await cancel.value
             return XCTFail("setup: the cancel never reached the recorder teardown")
         }
-        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .ignore,
-                       "presses are ignored while the cancel waits")
+        // Pinned unconditionally, with a teardown that cannot time out, by
+        // the quit test above; here only while the 1 s deadline has not
+        // passed yet, so a stalled runner cannot fail it.
+        if !cancelReturned.isSet {
+            XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .ignore,
+                           "presses are ignored while the cancel waits")
+        }
         let returnedInTime = await eventually({ cancelReturned.isSet })
         XCTAssertTrue(returnedInTime, "the cancel stops waiting at the deadline")
         XCTAssertFalse(teardown.didFinish, "the teardown itself is still stuck")
