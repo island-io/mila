@@ -175,7 +175,7 @@ final class DictationControllerTests: XCTestCase {
         let returnedInTime = await eventually({ quitReturned.isSet })
         XCTAssertTrue(returnedInTime, "the quit does not wait for the first cancel's stuck teardown")
         XCTAssertFalse(teardown.didFinish, "the first cancel is still waiting for the microphone")
-        XCTAssertFalse(live.isRunning, "nothing of the dictation is running when the quit returns")
+        XCTAssertFalse(live.isRunning, "the live transcriber is stopped when the quit returns")
         XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .refuseStart,
                        "no new dictation while the microphone is still shutting down")
 

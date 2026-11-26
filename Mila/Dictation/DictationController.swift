@@ -149,11 +149,14 @@ final class DictationController: ObservableObject {
             await stopAndTranscribe(action: action)
         case .refuseStart:
             // The beep is all the user hears, so leave the reason in the log.
-            dictationLog.log("""
-                dictation not started: the microphone hasn't finished shutting down from the \
-                last dictation (stopping=\(self.isStopping), \
-                teardowns=\(self.recorderTeardowns.outstanding))
-                """)
+            if recorderTeardowns.isShuttingDown {
+                dictationLog.log("""
+                    dictation not started: the microphone hasn't finished shutting down from \
+                    the last dictation (teardowns=\(self.recorderTeardowns.outstanding))
+                    """)
+            } else {
+                dictationLog.log("dictation not started: the last dictation is still stopping")
+            }
             NSSound.beep()
         case .ignore:
             dictationLog.log("""
@@ -258,10 +261,10 @@ final class DictationController: ObservableObject {
     /// await (`dropCapture()` is synchronous), and what it then waits for is
     /// only the recorder's teardown. So a second cancel — closing the lid
     /// sends both the screen-lock and the sleep guard here — or a quit that
-    /// arrives during that wait finds `.idle` and returns at once, and
-    /// nothing of the dictation is left running: in particular no live pass
-    /// can still tick into the engine that the quit shuts down next. No
-    /// dictation starts until the teardown has returned (`RecorderTeardowns`).
+    /// arrives during that wait finds `.idle` and returns at once, with the
+    /// live transcriber already stopped: no new live pass can start on the
+    /// engine that the quit shuts down next. No dictation starts until the
+    /// teardown has returned (`RecorderTeardowns`).
     func cancelInFlight() async {
         switch Self.cancelEffect(for: state) {
         case .none:
@@ -446,6 +449,13 @@ final class DictationController: ObservableObject {
                 let chunk = AudioConvert.samples(from: buffer)
                 let lvl = AudioMeter.level(from: buffer)
                 await MainActor.run {
+                    // A cancel drops the capture before the recorder has
+                    // stopped (`dropCapture()`), and a buffer already handed
+                    // to this task must not refill `samples` or the level
+                    // after it. Checked on the main actor, where the cancel
+                    // runs. A stop cancels this task only once the recorder
+                    // has drained.
+                    guard !Task.isCancelled else { return }
                     self.samples.append(contentsOf: chunk)
                     self.level = lvl
                     DictationOverlayWindow.shared.updateLevel(lvl)
@@ -772,7 +782,10 @@ final class DictationController: ObservableObject {
 /// HAL (a Bluetooth mic mid-profile-switch). A new dictation's bring-up
 /// would block a second pool thread on the same device, its stop a third,
 /// and so on until the pool — every async task in the app — is starved.
-/// Refusing starts keeps the worst case at one stuck thread.
+/// Refusing starts keeps the worst case at one stuck thread. A teardown that
+/// never returns therefore leaves dictation refusing starts until relaunch,
+/// as a stuck teardown did before #435 (when the stop itself never
+/// returned); the dictation it ended is still transcribed and pasted.
 ///
 /// Main-actor only, so no lock is needed.
 @MainActor

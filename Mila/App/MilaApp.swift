@@ -2935,11 +2935,11 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // Stop any active recording / dictation cleanly so AVAudioEngine and
         // SCStream release the user's mic / screen-recording grant.
         await session?.cancelAll()
-        // The cancel stops everything of the dictation that can reach the
-        // engine (its live transcriber included) before its first await, so
-        // nothing of it is still running into `transcription.shutdown()`
-        // below. A sleep or screen-lock cancel still waiting for the
-        // microphone leaves the state `.idle`, and this returns at once.
+        // The cancel stops the dictation's live transcriber before its first
+        // await, so no new live pass starts on the engine that
+        // `transcription.shutdown()` frees below. A sleep or screen-lock
+        // cancel still waiting for the microphone has already left the state
+        // `.idle`, and then this returns at once.
         await dictation?.cancelInFlight()
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.
