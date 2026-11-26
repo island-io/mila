@@ -4,7 +4,8 @@ import OSLog
 import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
-/// Brackets each `persist()` so Instruments shows what a whole-library write costs.
+/// Brackets the encode + write in each `persist()` so Instruments shows what a
+/// whole-library write costs. (Retried sidecar rewrites run before it opens.)
 private let recStoreSignposter = OSSignposter(logger: recStoreLog)
 
 /// Persists recordings + their metadata under Application Support/Mila.
@@ -1945,9 +1946,11 @@ final class RecordingStore: ObservableObject {
 
     /// The on-disk encoding of `recordings.json`. Compact on purpose: every
     /// store mutation re-encodes the whole library on the main actor, and
-    /// pretty-printing made each write both slower and several times larger
-    /// for no reader's benefit (`JSONDecoder` and `mila-mcp` ignore
-    /// whitespace). `.sortedKeys` stays so the output is byte-stable.
+    /// pretty-printing made each write about 40% larger (and a little
+    /// slower) for no reader's benefit (`JSONDecoder` and `mila-mcp` ignore
+    /// whitespace). The encode time is driven by the segment count, not the
+    /// formatting; #406 tracks the real fix. `.sortedKeys` stays so the
+    /// output is byte-stable.
     nonisolated static func encodeLibrary(_ recordings: [Recording]) throws -> Data {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

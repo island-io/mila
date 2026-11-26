@@ -37,6 +37,19 @@ final class RecordingStorePersistCostTests: XCTestCase {
         XCTAssertEqual(try RecordingStore.encodeLibrary(recs), try RecordingStore.encodeLibrary(recs))
     }
 
+    /// Two encodes in one process agree whatever the key order, so the test
+    /// above can't tell whether `.sortedKeys` is on. Across launches it is
+    /// what keeps dictionary-valued fields (`speakerNames`) from coming out
+    /// in a different order each time. `Recording.encode(to:)` writes `id`
+    /// first; sorted, `audioFileName` comes first.
+    func test_encoding_sorts_keys() throws {
+        var rec = Recording(title: "T", source: .microphone, audioFileName: "a.wav")
+        rec.speakerNames = ["SPEAKER_01": "Bea", "SPEAKER_00": "Avi"]
+        let text = String(decoding: try RecordingStore.encodeLibrary([rec]), as: UTF8.self)
+        XCTAssertTrue(text.hasPrefix(#"[{"audioFileName":"a.wav""#), text)
+        XCTAssertTrue(text.contains(#""speakerNames":{"SPEAKER_00":"Avi","SPEAKER_01":"Bea"}"#), text)
+    }
+
     /// Not an assertion on speed (CI machines vary): it records, in the test
     /// log, what one `persist()` costs at realistic library sizes. Opt-in
     /// (`MILA_PERSIST_COST=1`): it builds 1.2M segments and encodes them
