@@ -971,7 +971,10 @@ final class RecordingStore: ObservableObject {
         // `onSpeakerUnnamed` to correct the profile it went into.
         guard recordings[idx].speakerNames[rawID] == nil else { return }
         recordings[idx].speakerNames[rawID] = trimmed
-        persist()
+        // Synchronous like `setSpeakerName`: the profile already holds this
+        // speaker's contribution, so a name lost to a crash would be typed
+        // again and fold it a second time.
+        persistNow()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
@@ -2305,8 +2308,9 @@ final class RecordingStore: ObservableObject {
     ///   `folders.json`, so a crash cannot bring the old folder back;
     /// - naming, merging or retiring a speaker, whose voice-profile hooks
     ///   have already saved `speaker-profiles.json` (a crash must not keep
-    ///   the fold and lose the name), and deferring a transcription, which
-    ///   the launch sweep would otherwise restart;
+    ///   the fold and lose the name), reattaching a name after a re-key (the
+    ///   profile already holds that voice), and deferring a transcription,
+    ///   which the launch sweep would otherwise restart;
     /// - `add`, since a lost row cannot be rebuilt from its audio (see
     ///   there);
     /// - an audio trim, which has already replaced the file the row

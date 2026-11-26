@@ -601,7 +601,6 @@ final class SpeakerCorrectionActionsTests: XCTestCase {
         let w = makeWorld(segments: [segment("SPEAKER_00", 0, "one")])
 
         w.store.reattachSpeakerName("Carol", toSpeaker: "SPEAKER_00", recordingID: w.recordingID)
-        w.store.waitForPendingWrites()
 
         let onDisk = String(decoding: try Data(contentsOf: w.store.storeURL), as: UTF8.self)
         XCTAssertTrue(onDisk.contains("Carol"), "recordings.json still has no Carol in it")
