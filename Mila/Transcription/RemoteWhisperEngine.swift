@@ -251,13 +251,17 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     /// Replaces `ResponseFormat.maxRequestSeconds`, so tests can exercise
     /// the split with seconds of audio instead of minutes. Nil in production.
     private let maxChunkSecondsOverride: TimeInterval?
+    /// How long to wait before each retry of a piece that failed
+    /// transiently — one entry per retry. See `transcribeInPieces`.
+    private let pieceRetryDelays: [TimeInterval]
     private var isShutDown = false
 
     init(session: URLSession? = nil,
          encodeAudio: @escaping @Sendable ([Float]) async throws -> Data = {
              try await RemoteWhisperEngine.encodeM4A(samples: $0)
          },
-         maxChunkSeconds: TimeInterval? = nil) {
+         maxChunkSeconds: TimeInterval? = nil,
+         pieceRetryDelays: [TimeInterval] = RemoteWhisperEngine.defaultPieceRetryDelays) {
         let configuration = URLSessionConfiguration.default
         // A long meeting can take a while to transcribe server-side; the
         // resource timeout has to clear the whole round trip, not just the
@@ -267,6 +271,7 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         self.session = session ?? URLSession(configuration: configuration)
         self.encodeAudio = encodeAudio
         self.maxChunkSecondsOverride = maxChunkSeconds
+        self.pieceRetryDelays = pieceRetryDelays
     }
 
     func configure(_ config: RemoteTranscriptionConfig) {
@@ -307,24 +312,42 @@ actor RemoteWhisperEngine: RemoteTranscribing {
                     audioCtx: Int32?,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try await upload(samples: samples, language: language, progress: nil,
-                         isCancelled: isCancelled, requestTimeout: requestTimeout)
+        try checkCancellation(isCancelled)
+        guard let config else { throw RemoteError.notConfigured }
+        return try await upload(samples: samples, language: language, config: config, progress: nil,
+                                isCancelled: isCancelled, requestTimeout: requestTimeout)
     }
 
     /// The longest any one request may sit waiting for an answer. See the
     /// per-request override in `upload`.
     static let wholeRecordingTimeout: TimeInterval = 60 * 60
 
-    /// Idle timeout for one piece of a whole-recording transcription: twice
-    /// the piece's length, at least two minutes. The server sends nothing
-    /// while it transcribes, so this has to outlast its think time — a
-    /// self-hosted CPU server can take about as long as the audio — but no
-    /// more: a piece is at most ten minutes, so a server that stopped
-    /// answering fails the recording in minutes, not the hour a single
-    /// whole-file request was allowed (#376).
+    /// Idle timeout for one piece of a whole-recording transcription: five
+    /// times the piece's length, at least five minutes, at most the hour. The
+    /// server sends nothing while it transcribes, so this has to outlast its
+    /// think time — a self-hosted CPU server can run well below real time —
+    /// but no more: a piece is at most ten minutes, so a server that stopped
+    /// answering fails the recording within the hour instead of holding it
+    /// for as long as the whole file was allowed (#376).
     static func pieceRequestTimeout(audioSeconds: Double) -> TimeInterval {
         guard audioSeconds.isFinite else { return wholeRecordingTimeout }
-        return min(wholeRecordingTimeout, max(120, audioSeconds * 2))
+        return min(wholeRecordingTimeout, max(300, audioSeconds * 5))
+    }
+
+    /// The waits before the first and the second retry of a piece that
+    /// failed transiently. A 74-minute memo is about twenty requests; one
+    /// proxy 502 among them must not throw away the rest and make the user
+    /// pay for all of them again.
+    static let defaultPieceRetryDelays: [TimeInterval] = [5, 20]
+
+    /// Whether a piece that failed with `error` is worth sending again: the
+    /// live path's notion of transient (`isTransientRemoteFailure` — a
+    /// dropped connection, 408/429/502/503/504) minus a timeout. A piece that
+    /// already waited `pieceRequestTimeout` for an answer would only wait as
+    /// long again.
+    static func pieceFailureIsRetryable(_ error: Error) -> Bool {
+        if let urlError = error as? URLError, urlError.code == .timedOut { return false }
+        return TranscriptionService.isTransientRemoteFailure(error)
     }
 
     /// Transcribe a whole recording as a series of requests, each no longer
@@ -335,20 +358,28 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     /// The pieces are cut at pauses (`AudioChunkPlanner`) and sent in order;
     /// each answer is moved onto the recording's clock (`placed`).
     ///
-    /// * The first piece the server refuses ends the run, and its error is
-    ///   what the caller reports. Later pieces would most likely be refused
-    ///   the same way, and a half-transcribed recording must not pass as
-    ///   finished.
+    /// * Every piece goes to the server, key and model configured when the
+    ///   pass began. This actor also serves live clips, whose `configure`
+    ///   can arrive between two pieces; a recording must not be stitched
+    ///   from two servers' answers.
+    /// * A piece that fails transiently is retried (`pieceRetryDelays`,
+    ///   `pieceFailureIsRetryable`). Any other failure — and a transient one
+    ///   that outlasts the retries — ends the run, and its error is what the
+    ///   caller reports. Later pieces would most likely fail the same way,
+    ///   and a half-transcribed recording must not pass as finished.
     /// * A piece of pure digital silence is not sent (`upload` would refuse
     ///   it as "no audio captured"), and a piece the server answers with no
     ///   words contributes nothing. Only a recording with no words ANYWHERE
     ///   is `emptyResult`, as it was for one request.
-    /// * Server-side speaker labels (`gpt-4o-transcribe-diarize`) are kept
-    ///   only when a single piece produced every line: each request labels
-    ///   its own speakers from "A", so "A" in one piece is not "A" in the
-    ///   next. Without them the offline pyannote pass labels the recording,
-    ///   as it does for every other model. A wrong label is worse than none:
-    ///   a name given to a speaker is learned into a voice profile.
+    /// * Server-side speaker labels (`gpt-4o-transcribe-diarize`) name one
+    ///   request's voices: "A" in one piece is not "A" in the next. So each
+    ///   piece's speakers get numbers of their own (`speakersRenumbered`) —
+    ///   one voice may then carry several labels, but two voices never share
+    ///   one, and a name given to a label is learned into a voice profile.
+    ///   When the offline pyannote pass will run
+    ///   (`RemoteTranscriptionConfig.offlineDiarization`), labels from
+    ///   several pieces are dropped instead, so that pass labels the whole
+    ///   recording consistently (server labels would otherwise win over it).
     private func transcribeInPieces(samples: [Float],
                                     language: String,
                                     progress: (@Sendable (Float) -> Void)?,
@@ -373,6 +404,7 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         let total = Double(samples.count)
         var stitched: [TranscriptSegment] = []
         var piecesWithText = 0
+        var speakersUsed = 0
         for (index, range) in pieces.enumerated() {
             try checkCancellation(isCancelled)
             let piece = Array(samples[range])
@@ -389,38 +421,95 @@ actor RemoteWhisperEngine: RemoteTranscribing {
             let pieceProgress: (@Sendable (Float) -> Void)? = progress.map { report in
                 { @Sendable fraction in report(Float(base + Double(fraction) * share)) }
             }
-            let segments: [TranscriptSegment]
-            do {
-                segments = try await upload(samples: piece, language: language,
-                                            progress: pieceProgress, isCancelled: isCancelled,
-                                            requestTimeout: Self.pieceRequestTimeout(audioSeconds: length))
-            } catch RemoteError.emptyResult where pieces.count > 1 {
-                // A stretch with no speech in it — music, a break. That is
-                // this piece's answer, not the recording's.
-                continue
-            } catch {
-                if !(error is CancellationError) {
-                    remoteLog.error("""
+            var segments: [TranscriptSegment] = []
+            var retries = 0
+            while true {
+                do {
+                    segments = try await upload(samples: piece, language: language, config: config,
+                                                progress: pieceProgress, isCancelled: isCancelled,
+                                                requestTimeout: Self.pieceRequestTimeout(audioSeconds: length))
+                    break
+                } catch RemoteError.emptyResult where pieces.count > 1 {
+                    // A stretch with no speech in it — music, a break. That
+                    // is this piece's answer, not the recording's.
+                    segments = []
+                    break
+                } catch let error where retries < pieceRetryDelays.count
+                            && Self.pieceFailureIsRetryable(error) {
+                    let delay = pieceRetryDelays[retries]
+                    retries += 1
+                    remoteLog.log("""
                         transcribe: piece \(index + 1, privacy: .public)/\(pieces.count, privacy: .public) \
-                        at \(Int(offset), privacy: .public)s FAILED — \
-                        \(RemoteError.logMessage(for: error), privacy: .public)
+                        failed transiently (\(RemoteError.logMessage(for: error), privacy: .public)) — \
+                        retry \(retries, privacy: .public) in \(Int(delay), privacy: .public)s
                         """)
+                    try await pauseBeforeRetry(seconds: delay, isCancelled: isCancelled)
+                } catch {
+                    if !(error is CancellationError) {
+                        remoteLog.error("""
+                            transcribe: piece \(index + 1, privacy: .public)/\(pieces.count, privacy: .public) \
+                            at \(Int(offset), privacy: .public)s FAILED — \
+                            \(RemoteError.logMessage(for: error), privacy: .public)
+                            """)
+                    }
+                    throw error
                 }
-                throw error
             }
             let placed = Self.placed(segments, at: offset, length: length, after: stitched.last)
             if !placed.isEmpty { piecesWithText += 1 }
-            stitched.append(contentsOf: placed)
+            stitched.append(contentsOf: Self.speakersRenumbered(placed, after: &speakersUsed))
         }
 
         guard !stitched.isEmpty else { throw RemoteError.emptyResult }
         if piecesWithText > 1, stitched.contains(where: { $0.speaker != nil }) {
-            remoteLog.log("transcribe: dropping the per-request speaker labels of \(piecesWithText, privacy: .public) pieces — they don't name the same voices across requests")
-            for i in stitched.indices { stitched[i].speaker = nil }
+            if config.offlineDiarization {
+                remoteLog.log("transcribe: dropping the per-request speaker labels of \(piecesWithText, privacy: .public) pieces — the offline pass labels the whole recording")
+                for i in stitched.indices { stitched[i].speaker = nil }
+            } else {
+                remoteLog.log("transcribe: keeping \(speakersUsed, privacy: .public) per-request speaker labels from \(piecesWithText, privacy: .public) pieces — numbered apart, since requests don't share voices")
+            }
         }
         progress?(1.0)
         remoteLog.log("transcribe: ok segs=\(stitched.count, privacy: .public) pieces=\(pieces.count, privacy: .public)")
         return stitched
+    }
+
+    /// Wait `seconds` before a retry, looking every 200 ms at the batch
+    /// Cancel flag and at shutdown, so a stop is not held up by the wait.
+    private func pauseBeforeRetry(seconds: TimeInterval,
+                                  isCancelled: (@Sendable () -> Bool)?) async throws {
+        var remaining = seconds
+        while remaining > 0 {
+            try checkCancellation(isCancelled)
+            let step = min(remaining, 0.2)
+            try await Task.sleep(nanoseconds: UInt64(step * 1_000_000_000))
+            remaining -= step
+        }
+        try checkCancellation(isCancelled)
+    }
+
+    /// One piece's speaker labels, renumbered to follow the `used` labels
+    /// earlier pieces took, in order of first appearance (`used` is advanced
+    /// past them). A label from one request never collides with another
+    /// request's: each request diarizes on its own. The first piece with
+    /// labels keeps `SPEAKER_00`, `SPEAKER_01`, … — a recording sent as one
+    /// request is labelled exactly as before.
+    static func speakersRenumbered(_ segments: [TranscriptSegment],
+                                   after used: inout Int) -> [TranscriptSegment] {
+        var mapping: [String: String] = [:]
+        var output = segments
+        for i in output.indices {
+            guard let label = output[i].speaker, !label.isEmpty else { continue }
+            if let renumbered = mapping[label] {
+                output[i].speaker = renumbered
+            } else {
+                let renumbered = String(format: "SPEAKER_%02d", used)
+                used += 1
+                mapping[label] = renumbered
+                output[i].speaker = renumbered
+            }
+        }
+        return output
     }
 
     /// `segments` — one piece's answer, timed from the start of the piece —
@@ -456,13 +545,16 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         return placed
     }
 
+    /// One request, to the server `config` names — passed in, never re-read
+    /// from the actor: a `configure` for a live clip can arrive while an
+    /// earlier request is in flight (#376).
     private func upload(samples: [Float],
                         language: String,
+                        config: RemoteTranscriptionConfig,
                         progress: (@Sendable (Float) -> Void)?,
                         isCancelled: (@Sendable () -> Bool)?,
                         requestTimeout: TimeInterval) async throws -> [TranscriptSegment] {
         try checkCancellation(isCancelled)
-        guard let config else { throw RemoteError.notConfigured }
 
         // Never POST audio with nothing in it. A capture session that
         // delivered zero frames encodes to a header-only file, and the server

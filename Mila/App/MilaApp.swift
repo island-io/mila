@@ -2309,7 +2309,7 @@ struct MilaApp: App {
                 // the row goes back to describing it; anything else becomes
                 // `.failed`. Consumes `retranscriptionPriorState` either way
                 // (`Recording.settleFailedPass`).
-                fixed.settleFailedPass(reason: "The recording's audio file is missing, so it can't be transcribed.")
+                fixed.settleFailedPass(reason: Recording.missingAudioFailureReason)
                 statusChanged.append(fixed)
                 appLog.log("""
                     reset stale \(recording.status.rawValue, privacy: .public) \

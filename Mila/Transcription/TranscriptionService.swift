@@ -1139,12 +1139,17 @@ final class TranscriptionService: ObservableObject {
             // ivrit.ai finetune) needs the English model id for English audio,
             // or the transcript comes back with Hebrew words spliced in.
             guard remoteSettings.isConfigured,
-                  let config = remoteSettings.currentConfig(for: working.language) else {
+                  var config = remoteSettings.currentConfig(for: working.language) else {
                 let reason = "Remote transcription is selected but not configured. Open Settings → Models to set the endpoint and API key."
                 lastError = reason
                 markFailed(recording, reason: reason)
                 return
             }
+            // What the engine does with a diarizing model's labels when a
+            // long recording goes out in pieces depends on whether pyannote
+            // will label it below (#376) — the same setting `shouldDiarize`
+            // reads.
+            config.offlineDiarization = diarizationSettings.isConfigured
             await remoteEngine.configure(config)
             guard !cancellation.isStopped else { return }
             localModel = nil
@@ -1327,7 +1332,7 @@ final class TranscriptionService: ObservableObject {
                     $0.status = working.status
                     $0.fullText = working.fullText
                     $0.segments = working.segments
-                    $0.transcriptionFailureReason = Self.unusableAudioReason
+                    $0.transcriptionFailureReason = Recording.unusableAudioFailureReason
                 }
                 return
             }
@@ -1521,8 +1526,13 @@ final class TranscriptionService: ObservableObject {
             // re-transcribes of a renamed recording hit this in practice.
             working.speakerNames = [:]
             working.fullText = text
+            // Never shorter than the audio this pass just decoded: a
+            // transcript ends at the last words, and a quiet tail (or, for a
+            // remote recording sent in pieces, a last piece with no words in
+            // it, #376) must not cut the recording's length — playback, seek
+            // and the list all read it.
             if let lastEnd = enrichedSegments.last?.end, lastEnd > 0 {
-                working.duration = lastEnd
+                working.duration = max(lastEnd, durationSeconds)
             }
             working.status = text.isEmpty ? .failed : .completed
             // Auto-drop accidental short+empty captures (issue #61): a clip
@@ -1775,10 +1785,6 @@ final class TranscriptionService: ObservableObject {
     private func markFailed(_ recording: Recording, reason: String) {
         mergePassResult(id: recording.id) { $0.settleFailedPass(reason: reason) }
     }
-
-    /// Kept on a row whose audio was rejected before transcription
-    /// (`minimumAudioDurationSeconds` / `minimumAudioPeak`).
-    static let unusableAudioReason = "The audio is too short or too quiet to transcribe."
 
     /// Kept on a row whose pass finished without a single word.
     static let noSpeechReason = "No speech was recognized in the audio."

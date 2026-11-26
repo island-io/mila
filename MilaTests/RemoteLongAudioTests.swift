@@ -92,17 +92,45 @@ final class RemotePieceTranscriptionTests: XCTestCase {
         XCTAssertEqual(segments[2].end, cut + 1, accuracy: 0.001)
     }
 
+    private static let diarized = #"{"segments":[{"start":0,"end":1,"text":" hi","speaker":"A"},{"start":1,"end":2,"text":" yo","speaker":"B"},{"start":2,"end":3,"text":" hi again","speaker":"A"}]}"#
+
     /// `gpt-4o-transcribe-diarize` labels each request's speakers from "A",
-    /// so labels from two pieces don't name the same people. Dropping them
-    /// hands the recording to the offline pass instead of mislabelling it.
-    func test_server_speaker_labels_are_dropped_when_they_come_from_several_pieces() async throws {
-        let diarized = #"{"segments":[{"start":0,"end":1,"text":" hi","speaker":"A"},{"start":1,"end":2,"text":" yo","speaker":"B"}]}"#
+    /// so "A" in two pieces need not be the same person. With nothing else
+    /// to label the recording, each piece's voices get labels of their own:
+    /// one person may end up with several, but two people never share one.
+    func test_server_speaker_labels_from_several_pieces_are_numbered_apart() async throws {
         let fixture = PieceServerFixture(model: "gpt-4o-transcribe-diarize",
-                                         replies: [.ok(diarized), .ok(diarized), .ok(diarized)])
+                                         replies: [.ok(Self.diarized), .ok(Self.diarized), .ok(Self.diarized)])
         defer { fixture.cleanUp() }
         let segments = try await fixture.transcribe(threePieceAudio())
-        XCTAssertEqual(segments.count, 6)
+        XCTAssertEqual(segments.map(\.speaker), [
+            "SPEAKER_00", "SPEAKER_01", "SPEAKER_00",
+            "SPEAKER_02", "SPEAKER_03", "SPEAKER_02",
+            "SPEAKER_04", "SPEAKER_05", "SPEAKER_04",
+        ])
+    }
+
+    /// When pyannote will label the recording, labels from several requests
+    /// are dropped: server labels win over the offline pass (#180), and
+    /// pyannote's are consistent across the whole recording.
+    func test_server_speaker_labels_from_several_pieces_give_way_to_the_offline_pass() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-transcribe-diarize",
+                                         replies: [.ok(Self.diarized), .ok(Self.diarized), .ok(Self.diarized)],
+                                         offlineDiarization: true)
+        defer { fixture.cleanUp() }
+        let segments = try await fixture.transcribe(threePieceAudio())
+        XCTAssertEqual(segments.count, 9)
         XCTAssertTrue(segments.allSatisfy { $0.speaker == nil }, "\(segments.map(\.speaker))")
+    }
+
+    /// Only one piece had words: its labels describe the whole recording.
+    func test_labels_survive_when_one_piece_produced_every_line() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-transcribe-diarize",
+                                         replies: [.ok(#"{"text":""}"#), .ok(Self.diarized), .ok(#"{"text":""}"#)],
+                                         offlineDiarization: true)
+        defer { fixture.cleanUp() }
+        let segments = try await fixture.transcribe(threePieceAudio())
+        XCTAssertEqual(segments.map(\.speaker), ["SPEAKER_00", "SPEAKER_01", "SPEAKER_00"])
     }
 
     func test_server_speaker_labels_are_kept_when_one_request_covers_the_recording() async throws {
@@ -136,6 +164,99 @@ final class RemotePieceTranscriptionTests: XCTestCase {
                           error.errorDescription ?? "")
         }
         XCTAssertEqual(fixture.server.requestCount, 2, "no request after the refusal")
+    }
+
+    /// One proxy hiccup among twenty requests must not throw away the
+    /// pieces already transcribed.
+    func test_a_transient_failure_is_retried_and_the_run_completes() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [
+            .ok(#"{"text":"one"}"#),
+            .init(status: 502, body: "Bad Gateway"),
+            .ok(#"{"text":"two"}"#),
+            .ok(#"{"text":"three"}"#),
+        ])
+        defer { fixture.cleanUp() }
+        let segments = try await fixture.transcribe(threePieceAudio())
+        XCTAssertEqual(segments.map(\.text).joined(), "one two three")
+        XCTAssertEqual(fixture.server.requestCount, 4)
+        XCTAssertEqual(fixture.encoded.pieceSampleCounts.count, 4, "the retry sends the same piece again")
+        XCTAssertEqual(fixture.encoded.pieceSampleCounts[1], fixture.encoded.pieceSampleCounts[2])
+    }
+
+    func test_a_transient_failure_that_persists_fails_after_the_retries() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [
+            .ok(#"{"text":"one"}"#),
+            .init(status: 503, body: "Unavailable"),
+            .init(status: 503, body: "Unavailable"),
+            .init(status: 503, body: "Unavailable"),
+            .ok(#"{"text":"never asked"}"#),
+        ])
+        defer { fixture.cleanUp() }
+        do {
+            _ = try await fixture.transcribe(threePieceAudio())
+            XCTFail("A piece that keeps failing must fail the transcription")
+        } catch RemoteWhisperEngine.RemoteError.http(let status, _) {
+            XCTAssertEqual(status, 503)
+        }
+        XCTAssertEqual(fixture.server.requestCount, 4, "one try and two retries, then stop")
+    }
+
+    /// Out of credit is a 429 too, and no amount of waiting fixes it.
+    func test_a_quota_refusal_is_not_retried() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [
+            .init(status: 429, body: #"{"error":{"message":"You exceeded your current quota.","code":"insufficient_quota"}}"#),
+            .ok(#"{"text":"never asked"}"#),
+        ])
+        defer { fixture.cleanUp() }
+        do {
+            _ = try await fixture.transcribe(threePieceAudio())
+            XCTFail("A quota refusal must fail the transcription")
+        } catch RemoteWhisperEngine.RemoteError.http(let status, _) {
+            XCTAssertEqual(status, 429)
+        }
+        XCTAssertEqual(fixture.server.requestCount, 1)
+    }
+
+    func test_only_transient_failures_are_retried() {
+        XCTAssertTrue(RemoteWhisperEngine.pieceFailureIsRetryable(
+            RemoteWhisperEngine.RemoteError.http(status: 502, body: "")))
+        XCTAssertTrue(RemoteWhisperEngine.pieceFailureIsRetryable(URLError(.networkConnectionLost)))
+        XCTAssertFalse(RemoteWhisperEngine.pieceFailureIsRetryable(URLError(.timedOut)),
+                       "a piece that already waited its full timeout would only wait as long again")
+        XCTAssertFalse(RemoteWhisperEngine.pieceFailureIsRetryable(
+            RemoteWhisperEngine.RemoteError.http(status: 400, body: Self.inputTooLarge)))
+        XCTAssertFalse(RemoteWhisperEngine.pieceFailureIsRetryable(
+            RemoteWhisperEngine.RemoteError.http(status: 401, body: "")))
+        XCTAssertFalse(RemoteWhisperEngine.pieceFailureIsRetryable(CancellationError()))
+    }
+
+    /// The engine also serves live clips, and their `configure` can arrive
+    /// between two pieces. Every piece of one recording still goes to the
+    /// server it started with.
+    func test_every_piece_goes_to_the_server_the_pass_started_with() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [
+            .ok(#"{"text":"one"}"#), .ok(#"{"text":"two"}"#), .ok(#"{"text":"three"}"#),
+        ])
+        let elsewhere = PieceServerFixture(model: "whisper-1", replies: [])
+        defer { fixture.cleanUp(); elsewhere.cleanUp() }
+        let engine = fixture.engine
+        let otherConfig = elsewhere.config
+        fixture.server.beforeReply = { requestNumber in
+            guard requestNumber == 1 else { return }
+            // Reconfigure while the first piece's request is in flight. The
+            // wait is bounded, and the actor is free: it is suspended on
+            // this very request.
+            let done = DispatchSemaphore(value: 0)
+            Task {
+                await engine.configure(otherConfig)
+                done.signal()
+            }
+            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
+        }
+        let segments = try await fixture.transcribe(threePieceAudio())
+        XCTAssertEqual(segments.map(\.text).joined(), "one two three")
+        XCTAssertEqual(fixture.server.requestCount, 3)
+        XCTAssertEqual(elsewhere.server.requestCount, 0, "no piece went to the newly configured server")
     }
 
     /// A stretch of exact digital silence inside a real recording is not
@@ -203,12 +324,12 @@ final class RemotePieceTranscriptionTests: XCTestCase {
         XCTAssertLessThan(Format.json.maxRequestSeconds, 1500)
     }
 
-    /// Each piece's wait is bounded by its own length — minutes, not the hour
-    /// one whole-file request was allowed.
+    /// Each piece's wait follows its own length — room for a server well
+    /// below real time, but bounded, never more than the hour.
     func test_piece_request_timeout_scales_with_the_piece() {
-        XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 10), 120)
-        XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 240), 480)
-        XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 600), 1200)
+        XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 10), 300)
+        XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 240), 1200)
+        XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 600), 3000)
         XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: 10_000),
                        RemoteWhisperEngine.wholeRecordingTimeout)
         XCTAssertEqual(RemoteWhisperEngine.pieceRequestTimeout(audioSeconds: .nan),
@@ -349,6 +470,25 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
         XCTAssertNil(service.lastError)
     }
 
+    /// The transcript ends at the last words; the recording does not. A
+    /// last piece with nothing said in it must not shorten the recording —
+    /// playback, seek and the list all read its length.
+    func test_a_wordless_last_piece_keeps_the_recordings_full_length() async throws {
+        let service = makeService(model: "gpt-4o-mini-transcribe", replies: [
+            .ok(#"{"text":"one"}"#), .ok(#"{"text":"two"}"#), .ok(#"{"text":""}"#),
+        ])
+        let recording = try addVoiceMemo(threePieceAudio())
+
+        service.enqueue(recording)
+        await service.waitForIdle()
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == recording.id })
+        XCTAssertEqual(row.status, .completed)
+        XCTAssertEqual(row.fullText, "one two")
+        XCTAssertLessThan(try XCTUnwrap(row.segments.last?.end), 18)
+        XCTAssertEqual(row.duration, 25, accuracy: 0.01)
+    }
+
     /// The row the issue describes: `failed`, 0 segments, no reason. Now the
     /// server's refusal is on the row itself, not only in a one-time alert.
     func test_a_refusal_leaves_the_row_failed_with_the_servers_reason() async throws {
@@ -426,6 +566,19 @@ final class TranscriptionFailureReasonTests: XCTestCase {
         XCTAssertNil(recording.transcriptionFailureReason)
     }
 
+    /// A live draft whose full pass had failed, re-run and failed again: the
+    /// row goes back to `.failed` with its draft, and must still say why.
+    func test_a_failed_rerun_restored_to_failed_keeps_this_runs_reason() {
+        var recording = row()
+        recording.segments = [TranscriptSegment(start: 0, end: 1, text: "draft")]
+        recording.fullText = "draft"
+        recording.retranscriptionPriorState = .init(status: .failed, language: "he", modelName: nil)
+        recording.settleFailedPass(reason: "Remote server returned HTTP 400.")
+        XCTAssertEqual(recording.status, .failed)
+        XCTAssertEqual(recording.fullText, "draft")
+        XCTAssertEqual(recording.visibleTranscriptionFailureReason, "Remote server returned HTTP 400.")
+    }
+
     func test_a_stopped_or_blank_reason_is_not_shown() {
         var recording = row(status: .failed)
         recording.transcriptionFailureReason = "   "
@@ -490,15 +643,25 @@ final class ScriptedTranscriptionServer: @unchecked Sendable {
     private let lock = NSLock()
     private var replies: [ScriptedReply]
     private var requests = 0
+    private var hook: (@Sendable (Int) -> Void)?
     init(_ replies: [ScriptedReply]) { self.replies = replies }
     var requestCount: Int { lock.lock(); defer { lock.unlock() }; return requests }
+    /// Runs with each request's number (from 1) before it is answered.
+    var beforeReply: (@Sendable (Int) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return hook }
+        set { lock.lock(); hook = newValue; lock.unlock() }
+    }
     func nextReply() -> ScriptedReply {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         requests += 1
-        guard !replies.isEmpty else {
-            return .init(status: 500, body: #"{"error":{"message":"script exhausted"}}"#)
-        }
-        return replies.removeFirst()
+        let number = requests
+        let hook = self.hook
+        let reply: ScriptedReply = replies.isEmpty
+            ? .init(status: 500, body: #"{"error":{"message":"script exhausted"}}"#)
+            : replies.removeFirst()
+        lock.unlock()
+        hook?(number)
+        return reply
     }
 }
 
@@ -517,7 +680,8 @@ final class ProgressLog: @unchecked Sendable {
     func append(_ value: Float) { lock.lock(); log.append(value); lock.unlock() }
 }
 
-/// A `RemoteWhisperEngine` with a 10 s piece limit, talking to a scripted
+/// A `RemoteWhisperEngine` with a 10 s piece limit and two immediate
+/// retries, talking to a scripted
 /// server on its own `.invalid` host through a real `URLSession`.
 struct PieceServerFixture {
     let config: RemoteTranscriptionConfig
@@ -527,11 +691,12 @@ struct PieceServerFixture {
     private let session: URLSession
     private let host: String
 
-    init(model: String, replies: [ScriptedReply]) {
+    init(model: String, replies: [ScriptedReply], offlineDiarization: Bool = false) {
         let host = "pieces-\(UUID().uuidString.lowercased()).invalid"
         self.host = host
         config = RemoteTranscriptionConfig(endpoint: URL(string: "https://\(host)/v1")!,
-                                           apiKey: "", model: model)
+                                           apiKey: "", model: model,
+                                           offlineDiarization: offlineDiarization)
         let server = ScriptedTranscriptionServer(replies)
         self.server = server
         ScriptedTranscriptionURLProtocol.register(server, host: host)
@@ -546,7 +711,9 @@ struct PieceServerFixture {
                                          encoded.record(samples)
                                          return Data([1, 2, 3])
                                      },
-                                     maxChunkSeconds: 10)
+                                     maxChunkSeconds: 10,
+                                     // Retries without the production waits.
+                                     pieceRetryDelays: [0, 0])
     }
 
     func transcribe(_ samples: [Float],

@@ -404,9 +404,12 @@ struct RecordingDetailView: View {
         case stopped
         /// Idle because the last pass FAILED, with the reason it failed
         /// (`Recording.visibleTranscriptionFailureReason`, #376) — a server
-        /// refusal, a missing model, unusable audio. The same Transcribe
-        /// invitation, so the user can retry once they've fixed the cause.
-        case failed(reason: String)
+        /// refusal, a missing model, unusable audio. With the Transcribe
+        /// invitation when a retry could work, so the user can try again
+        /// once they've fixed the cause — but not for a reason that
+        /// describes the audio itself (`Recording.failureCanBeRetried`):
+        /// that retry fails the same way, a dead end.
+        case failed(reason: String, canRetry: Bool)
     }
 
     /// Decision for the empty-segments placeholder, split out as a pure
@@ -419,7 +422,10 @@ struct RecordingDetailView: View {
         if isActive { return nil }
         if isQueued { return .waitingInQueue }
         if isDeferred { return .stopped }
-        if let failureReason { return .failed(reason: failureReason) }
+        if let failureReason {
+            return .failed(reason: failureReason,
+                           canRetry: Recording.failureCanBeRetried(failureReason))
+        }
         return .clickTranscribe
     }
 
@@ -527,14 +533,16 @@ struct RecordingDetailView: View {
                 isDeferred: recording.isTranscriptionDeferred,
                 failureReason: recording.visibleTranscriptionFailureReason
             )
-            if case .failed(let reason) = placeholder {
+            if case .failed(let reason, let canRetry) = placeholder {
                 ContentUnavailableView {
                     Label("Transcription failed", systemImage: "exclamationmark.triangle")
                 } description: {
                     VStack(spacing: 8) {
                         Text(reason)
                             .textSelection(.enabled)
-                        Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to try again.")
+                        if canRetry {
+                            Text("Click \(Image(systemName: "text.badge.checkmark")) Transcribe to try again.")
+                        }
                     }
                 }
                 .accessibilityIdentifier("recording.transcriptionFailed")

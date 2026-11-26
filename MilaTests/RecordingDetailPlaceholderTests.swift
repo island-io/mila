@@ -64,8 +64,20 @@ final class RecordingDetailPlaceholderTests: XCTestCase {
             RecordingDetailView.emptyTranscriptPlaceholder(
                 isActive: false, isQueued: false,
                 failureReason: "Remote server returned HTTP 400."),
-            .failed(reason: "Remote server returned HTTP 400.")
+            .failed(reason: "Remote server returned HTTP 400.", canRetry: true)
         )
+    }
+
+    /// Missing or unusable audio fails the same way on every retry, so the
+    /// placeholder must not send the user to Transcribe for it.
+    func test_a_failure_of_the_audio_itself_offers_no_retry() {
+        for reason in [Recording.missingAudioFailureReason, Recording.unusableAudioFailureReason] {
+            XCTAssertEqual(
+                RecordingDetailView.emptyTranscriptPlaceholder(isActive: false, isQueued: false,
+                                                               failureReason: reason),
+                .failed(reason: reason, canRetry: false)
+            )
+        }
     }
 
     /// A retry is queued: the old failure no longer describes the row.

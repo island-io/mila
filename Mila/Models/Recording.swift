@@ -288,6 +288,20 @@ struct Recording: Identifiable, Codable, Hashable {
     /// bloating recordings.json.
     static let maxFailureReasonLength = 500
 
+    /// Set by the launch sweep when a row's audio is gone (`MilaApp`).
+    static let missingAudioFailureReason =
+        "The recording's audio file is missing, so it can't be transcribed."
+    /// Set by `TranscriptionService` for audio too short or quiet to send.
+    static let unusableAudioFailureReason =
+        "The audio is too short or too quiet to transcribe."
+
+    /// Whether running Transcribe again could change the outcome. The two
+    /// reasons above describe the audio itself, so a retry fails the same
+    /// way — the failed placeholder must not point the user at it.
+    static func failureCanBeRetried(_ reason: String) -> Bool {
+        reason != missingAudioFailureReason && reason != unusableAudioFailureReason
+    }
+
     /// Total seconds of audio missing from the transcript.
     var untranscribedSeconds: Double {
         (untranscribedSpans ?? []).reduce(0) { $0 + $1.duration }
@@ -355,8 +369,11 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `lastError` alert. Anything else — a first transcription, or a row
     /// with no transcript left — becomes `.failed`, as before, and keeps
     /// `reason` (`transcriptionFailureReason`) so the row can say why after
-    /// the alert is gone (#376). A restored row is not failed, so it keeps
-    /// no reason.
+    /// the alert is gone (#376). A row restored to `.completed` is not
+    /// failed, so it keeps no reason; one restored to `.failed` — a live
+    /// draft whose full pass had already failed — is failed again, and keeps
+    /// this run's reason (the earlier one was cleared when the re-run was
+    /// queued, and no longer describes the latest attempt anyway).
     ///
     /// A second Re-transcribe picked while this run was in flight changed
     /// `language` but queued nothing (`TranscriptionService.enqueue` refuses
@@ -364,14 +381,12 @@ struct Recording: Identifiable, Codable, Hashable {
     /// is right then too. The prior state is consumed either way: the row is
     /// settled.
     mutating func settleFailedPass(reason: String? = nil) {
-        if restoreRetranscriptionPriorState() {
-            transcriptionFailureReason = nil
-        } else {
+        if !restoreRetranscriptionPriorState() {
             status = .failed
-            transcriptionFailureReason = reason.map {
-                String($0.prefix(Self.maxFailureReasonLength))
-            }
         }
+        transcriptionFailureReason = status == .failed
+            ? reason.map { String($0.prefix(Self.maxFailureReasonLength)) }
+            : nil
         retranscriptionPriorState = nil
     }
 
