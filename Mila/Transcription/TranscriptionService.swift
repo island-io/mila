@@ -380,6 +380,17 @@ final class TranscriptionService: ObservableObject {
         waiters.forEach { $0.resume() }
     }
 
+    #if DEBUG
+    /// Local-model users counted right now. Test-only: lets a test prove a
+    /// prewarm got past its first check and is queued at the release barrier.
+    var localModelUserCountForTesting: Int { localModelUsers }
+
+    /// Wait for every prewarm started so far. Test-only.
+    func waitForPrewarmsForTesting() async {
+        for warm in Array(prewarmTasks.values) { await warm.value }
+    }
+    #endif
+
     // MARK: - Prewarm
 
     /// Pre-load the user's default model on the engine actor. Called
@@ -427,8 +438,12 @@ final class TranscriptionService: ObservableObject {
             // engine actor, but await ordering between two independent
             // Tasks is undefined, so we make it explicit here.
             await observerTask.value
-            guard let self, !cancellation.isStopped, !Task.isCancelled,
-                  self.retainsLocalModel, !self.remoteSettings.isActive else { return }
+            guard let self else { return }
+            guard !cancellation.isStopped, !Task.isCancelled,
+                  self.retainsLocalModel, !self.remoteSettings.isActive else {
+                serviceLog.log("prewarm: skipping \(displayName, privacy: .public) — stopped, or retention went off before the load")
+                return
+            }
             // Stay a counted local user for the load so a retention flip
             // during the (possibly ~13s) CoreML compile cannot unload under it.
             await self.withLocalModelUse {
@@ -437,7 +452,10 @@ final class TranscriptionService: ObservableObject {
                 // ~13 s: a shutdown, or retention switched back off, while
                 // this waited means nobody wants the model any more.
                 guard !cancellation.isStopped, !Task.isCancelled,
-                      self.retainsLocalModel, !self.remoteSettings.isActive else { return }
+                      self.retainsLocalModel, !self.remoteSettings.isActive else {
+                    serviceLog.log("prewarm: skipping \(displayName, privacy: .public) — stopped, or retention went off while it waited on a release")
+                    return
+                }
                 do {
                     try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
                     serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")

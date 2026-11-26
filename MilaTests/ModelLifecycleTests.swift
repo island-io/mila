@@ -394,10 +394,16 @@ final class ModelLifecycleTests: XCTestCase {
         XCTAssertEqual(entered, 1, "setup must hold an actual unload in flight")
 
         // Retention back on: the prewarm passes its first check and queues
-        // behind the release in flight.
+        // behind the release in flight. Being counted as a user is the proof
+        // it got that far; the closed unload gate holds it there.
         let on = service.updateLocalModelRetention(true)
         service.prewarm(language: "he")
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        let queuedBy = Date().addingTimeInterval(10)
+        while service.localModelUserCountForTesting == 0, Date() < queuedBy {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(service.localModelUserCountForTesting, 1,
+                       "setup must queue the prewarm behind the release in flight")
         let baselineRequests = await stub.loadRequestCount
 
         // ...and off again before that release finishes.
@@ -406,7 +412,7 @@ final class ModelLifecycleTests: XCTestCase {
         await release.value
         await on.value
         await off.value
-        try? await Task.sleep(nanoseconds: 200_000_000)
+        await service.waitForPrewarmsForTesting()
 
         let requests = await stub.loadRequestCount
         let loaded = await stub.isModelLoaded
