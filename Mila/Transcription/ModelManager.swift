@@ -552,17 +552,21 @@ extension ModelManager: URLSessionDownloadDelegate {
         defer { try? FileManager.default.removeItem(at: extractRoot) }
 
         do {
-            try await Task.detached(priority: .userInitiated) { [extractRoot] in
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/usr/bin/unzip")
-                p.arguments = ["-q", tempCopy.path, "-d", extractRoot.path]
-                try p.run()
-                p.waitUntilExit()
-                if p.terminationStatus != 0 {
-                    throw NSError(domain: "ModelManager.CoreML", code: Int(p.terminationStatus),
-                                  userInfo: [NSLocalizedDescriptionKey: "unzip exited \(p.terminationStatus)"])
-                }
-            }.value
+            // Bounded and cancellable (it was an unbounded `waitUntilExit()`
+            // on a cooperative-pool thread). The largest encoder archive is
+            // ~1.1 GB and extracts in well under a minute on any supported
+            // Mac; fifteen minutes is for a hung `unzip`, not a slow disk.
+            let unzip = try await SubprocessRunner.run(
+                executable: URL(fileURLWithPath: "/usr/bin/unzip"),
+                arguments: ["-q", tempCopy.path, "-d", extractRoot.path],
+                stdout: .discard,
+                stderr: .discard,
+                timeout: 15 * 60)
+            if unzip.timedOut || unzip.exitCode != 0 {
+                throw NSError(domain: "ModelManager.CoreML", code: Int(unzip.exitCode),
+                              userInfo: [NSLocalizedDescriptionKey:
+                                unzip.timedOut ? "unzip timed out" : "unzip exited \(unzip.exitCode)"])
+            }
         } catch {
             modelLogger.error("CoreML download \(model.name, privacy: .public): unzip failed: \(error.localizedDescription, privacy: .public)")
             try? FileManager.default.removeItem(at: tempCopy)

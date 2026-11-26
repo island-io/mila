@@ -3,7 +3,7 @@
 When integrating Python ML pipelines (pyannote.audio, torch, speechbrain) into this macOS app:
 
 ## Process Setup
-- Use `Process` with `Task.detached(priority: .userInitiated)` to avoid blocking the main actor
+- Run the child with `SubprocessRunner.run` (`Mila/Actions/SubprocessRunner.swift`). It implements everything below (drain-before-wait, `terminationHandler` + backstop, bounded waits on dedicated threads, SIGTERM then SIGKILL of the process group on timeout or Task cancel), so the main actor and the cooperative pool are never blocked. Do not hand-roll a `Task.detached` around `waitUntilExit()`: that parks a cooperative-pool thread for the child's whole life (#399).
 - Pass the Python script inline via `-c` argument, not as a file path -- app bundle path resolution is fragile
 - Diarization models are bundled in the app — the models directory path is passed as a CLI argument to the inline script
 - Always capture stdout and stderr into separate Pipes
@@ -19,18 +19,9 @@ Python ML libraries (torch, speechbrain, pyannote) emit copious warnings and pro
 
 This is not theoretical: it caused transcription to hang at 100% on files longer than ~25 minutes (PR #15), because pyannote's stderr logging exceeded the buffer on long runs.
 
-**Correct pattern:**
-```swift
-let stdoutRead = Task.detached { stdout.fileHandleForReading.readDataToEndOfFile() }
-let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
+**Correct pattern:** start a reader per captured pipe BEFORE waiting for the exit, each on a thread of its own, and wait for them with a bounded wait afterwards. `SubprocessRunner` does exactly this; use it rather than writing the sequence again. A stream nobody reads goes to `FileHandle.nullDevice`, never to an unread `Pipe()`.
 
-process.waitUntilExit()
-
-let stdoutData = await stdoutRead.value
-let stderrData = await stderrRead.value
-```
-
-**Why `Task.detached` instead of `DispatchGroup`:** In Swift 6 strict concurrency, calling `DispatchGroup.wait()` inside an async context triggers a warning (blocking a cooperative thread). `Task.detached` with `await` is the idiomatic async-safe alternative.
+The earlier version of this file recommended `Task.detached { readDataToEndOfFile() }` plus `waitUntilExit()` inside another detached task. That ordering avoids the deadlock, but every one of those calls blocks a thread of the Swift cooperative pool (one per core) until the child exits, so a minutes-long diarization pass or pip install starved every other `async` task in the app (#399). See "Never Park a Blocking Subprocess Wait" below.
 
 **Wrong pattern (will deadlock on large output):**
 ```swift

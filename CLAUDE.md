@@ -35,8 +35,8 @@ New app-wide settings (like `DiarizationSettings`) must be:
 When calling Python ML pipelines from Swift via `Process`:
 - Use inline Python scripts via `-c` argument (not bundled .py files) for the main pipeline -- this avoids path-resolution issues with app bundles
 - Always separate stdout (JSON data) from stderr (diagnostic logs) -- pyannote and torch emit warnings to stderr that corrupt JSON parsing
-- **Drain both pipes concurrently BEFORE `waitUntilExit()`** -- macOS pipe buffers are ~64 KB; if the subprocess fills a pipe before the parent reads, both sides deadlock. Use `Task.detached` to read pipes, then await after `waitUntilExit()`. See `.claude/rules/python-subprocess.md` for the correct pattern.
-- Run Python processes on `Task.detached(priority: .userInitiated)` to avoid blocking the main actor
+- **Drain both pipes concurrently BEFORE waiting for the exit** -- macOS pipe buffers are ~64 KB; if the subprocess fills a pipe before the parent reads, both sides deadlock.
+- **Run children through `SubprocessRunner.run`** (`Mila/Actions/SubprocessRunner.swift`), not a `Task.detached` that calls `waitUntilExit()` / `readDataToEndOfFile()`: those park threads of the Swift cooperative pool for the child's whole life (#399). The runner drains both pipes and waits on dedicated threads in bounded slices, and turns a timeout or a Task cancel into SIGTERM then SIGKILL of the child's process group. With `timeout: nil` it waits until the exit or a cancel, so pass a timeout unless the caller can be cancelled. See `.claude/rules/python-subprocess.md`.
 - Diarization models are bundled in the app (no HuggingFace token needed). The inline script receives the bundle models path as a CLI argument and loads the pipeline from a local config.yaml with `Pipeline.from_pretrained()`
 - **Bundled model directory names must preserve the original HuggingFace model ID structure.** pyannote dispatches embedding backends via substring matching on the path (e.g., `"pyannote"` -> torch, `"wespeaker"` -> ONNX). See `.claude/rules/python-subprocess.md` for details.
 

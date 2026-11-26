@@ -67,10 +67,15 @@ import Foundation
 /// | `RenameRecordingSheet` "Suggest" | one modal sheet, guarded by `isFetchingName` | 1 |
 /// | `LLMSettings.diagnose` (Settings → Test) | one Settings panel, user-driven | 1 |
 /// | `ProcessGitCommandRunner` via `ObsidianGitSyncer` | an `actor`, and `sync` issues its commands sequentially | 1 |
+/// | `SpeakerDiarizer.runPython` via `SubprocessRunner` | `diarize` runs on the serial transcription queue; `embedSpeakers` runs once per finished pass or user rename (`OfflineVoiceEmbedder`); health check and installs are user-driven from Settings | a few |
+/// | `DiarizationBootstrap` pip installs + codesign via `SubprocessRunner` | one `inFlightBootstrap`, and its steps run sequentially | 1 |
+/// | `ModelManager` CoreML `unzip` via `SubprocessRunner` | one per finished encoder download, user-driven | 1 |
+/// | `DiagnosticReporter` `ditto` via `SubprocessRunner` | one "Send diagnostics" action, user-driven | 1 |
 ///
 /// Even with every one of those in flight at once — a batch summary sweep
-/// during a live meeting while an Obsidian sync runs — that is ~7 children and
-/// ~28 threads, transient, against a per-process limit in the hundreds.
+/// during a live meeting while an Obsidian sync runs, plus a diarization pass
+/// and a bootstrap — that is ~10-12 children and under 50 threads, transient,
+/// against a per-process limit in the hundreds.
 ///
 /// Note this is the SAME bound as before. The old code created exactly the same
 /// number of work items; the only difference is that they used to contend for a
