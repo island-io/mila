@@ -5,6 +5,9 @@ import OSLog
 import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
+/// Brackets the encode + write in each `persist()` so Instruments shows what a
+/// whole-library write costs. (Retried sidecar rewrites run before it opens.)
+private let recStoreSignposter = OSSignposter(logger: recStoreLog)
 
 /// Persists recordings + their metadata under Application Support/Mila.
 ///
@@ -2212,6 +2215,20 @@ final class RecordingStore: ObservableObject {
         return "Recovered recording · \(f.string(from: date))"
     }
 
+    /// The on-disk encoding of `recordings.json`. Compact on purpose: every
+    /// store mutation re-encodes the whole library on the main actor, and
+    /// pretty-printing made each write about 40% larger (and a little
+    /// slower) for no reader's benefit (`JSONDecoder` and `mila-mcp` ignore
+    /// whitespace). The encode time is driven by the segment count, not the
+    /// formatting; #406 tracks the real fix. `.sortedKeys` stays so the
+    /// output is byte-stable.
+    nonisolated static func encodeLibrary(_ recordings: [Recording]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(recordings)
+    }
+
     /// Returns whether `recordings.json` on disk now reflects the in-memory
     /// store. `false` means a separate process still reads the previous
     /// contents — see `update(_:)` for why that has to be reportable.
@@ -2222,11 +2239,10 @@ final class RecordingStore: ObservableObject {
         // up by orphan recovery on the next launch.
         if storeIsUnreadable { return false }
         retryPendingTranscriptRewrites()
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let interval = recStoreSignposter.beginInterval("persist", id: recStoreSignposter.makeSignpostID())
+        defer { recStoreSignposter.endInterval("persist", interval) }
         do {
-            let data = try encoder.encode(recordings)
+            let data = try Self.encodeLibrary(recordings)
             try data.write(to: storeURL, options: .atomic)
             return true
         } catch {
