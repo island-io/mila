@@ -658,12 +658,11 @@ final class DictationController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
             // The state is `.idle` by now, so a screen lock in this delay
             // cancels nothing: check the lock itself before typing ⌘V, which
-            // would otherwise go to the lock screen. The clipboard is restored
-            // either way, so both lock paths keep one policy: a lock during
-            // the final pass (`.keepWithoutPasting`) never touches the
-            // clipboard and leaves the text to History, and so does this one.
-            // The earlier clipboard exists nowhere else, and the transcript
-            // left behind would also sync to the user's other devices.
+            // would otherwise go to the lock screen. The clipboard is then
+            // handled exactly as after a paste (restored below when it had
+            // something on it), and the text is left to History, as on a
+            // lock during the final pass (`.keepWithoutPasting`): the earlier
+            // clipboard exists nowhere else.
             if Self.isScreenLocked {
                 dictationLog.log("dictation paste skipped: the screen locked before it was typed")
             } else {
