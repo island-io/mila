@@ -537,6 +537,35 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
         XCTAssertNil(row.transcriptionFailureReason)
         XCTAssertNil(row.visibleTranscriptionFailureReason)
     }
+
+    /// A live draft whose full pass had failed, re-run on audio too quiet to
+    /// send: the re-run is undone back to the failed draft, and the draft
+    /// must still say why it is not a finished transcript.
+    func test_an_unusable_rerun_of_a_failed_draft_keeps_a_reason() async throws {
+        let service = makeService(model: "gpt-4o-mini-transcribe", replies: [])
+        let url = store.freshAudioURL(suggestedName: "Quiet draft")
+        // Peak 0.001, under `TranscriptionService.minimumAudioPeak`.
+        let quiet = (0..<32_000).map { 0.001 * Float(sin(2 * Double.pi * 220 * Double($0) / 16_000)) }
+        try AudioConvert.writeWhisperWAV(samples: quiet, to: url)
+        let draft = Recording(title: "Quiet draft", duration: 2, source: .microphone,
+                              audioFileName: url.lastPathComponent, status: .failed,
+                              language: "he",
+                              segments: [TranscriptSegment(start: 0, end: 1, text: "live draft")],
+                              fullText: "live draft",
+                              transcriptionFailureReason: "Remote server returned HTTP 401.")
+        store.add(draft)
+
+        let retry = try XCTUnwrap(store.prepareForRetranscription(id: draft.id))
+        service.enqueue(retry, isRetranscription: true)
+        await service.waitForIdle()
+
+        let row = try XCTUnwrap(store.recordings.first { $0.id == draft.id })
+        XCTAssertEqual(row.status, .failed)
+        XCTAssertEqual(row.fullText, "live draft", "the draft is kept")
+        let reason = try XCTUnwrap(row.visibleTranscriptionFailureReason)
+        XCTAssertTrue(reason.contains("too short or too quiet"), reason)
+        XCTAssertEqual(fixture?.server.requestCount, 0, "nothing was sent")
+    }
 }
 
 // MARK: - The reason on the row

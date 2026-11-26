@@ -1758,7 +1758,8 @@ final class TranscriptionService: ObservableObject {
     /// by undoing it exactly as a failed re-run is undone
     /// (`Recording.settleFailedPass`): the earlier transcript, segments and
     /// speaker names stay, and the status, language and model that describe
-    /// them come back. `reason` is reported through `lastError`.
+    /// them come back. `reason` is reported through `lastError`, and kept on
+    /// a row restored to `.failed`.
     ///
     /// Returns false, changing nothing, unless the LIVE row is a re-run in
     /// flight whose earlier transcript is still there
@@ -1777,7 +1778,10 @@ final class TranscriptionService: ObservableObject {
             \(id.uuidString.prefix(8), privacy: .public) re-run produced no usable \
             text — keeping the earlier transcript
             """)
-        mergePassResult(id: id) { $0.settleFailedPass() }
+        // The reason goes on the row too: a re-run of a draft that had
+        // already failed is restored to `.failed`, and has to keep saying why
+        // once the alert is gone (a row restored to `.completed` keeps none).
+        mergePassResult(id: id) { $0.settleFailedPass(reason: reason) }
         if !probe.isTrashed { lastError = reason }
         return true
     }
