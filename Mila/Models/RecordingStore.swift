@@ -84,7 +84,7 @@ final class RecordingStore: ObservableObject {
 
     private let fileManager = FileManager.default
     /// Writes `recordings.json` off the main actor; see `persist()`.
-    private let writer = RecordingLibraryWriter.shared
+    private let writer: RecordingLibraryWriter
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
     /// alongside the `Recordings/` subdir (legacy layout); on a custom
@@ -193,7 +193,11 @@ final class RecordingStore: ObservableObject {
     /// keeping test instances (temp roots) isolated automatically.
     let originalRootDirectory: URL
 
-    init(rootDirectory: URL) {
+    /// `writer` is a seam for tests that hold a background write to see
+    /// which mutations are on disk without it. The app uses `.shared`, so
+    /// every store over the same file shares one write ordering.
+    init(rootDirectory: URL, writer: RecordingLibraryWriter = .shared) {
+        self.writer = writer
         self.originalRootDirectory = rootDirectory
         let defaultRecs = rootDirectory.appendingPathComponent("Recordings", isDirectory: true)
         self.defaultRecordingsDirectory = defaultRecs
@@ -1558,21 +1562,6 @@ final class RecordingStore: ObservableObject {
         }
     }
 
-    /// Mark a queued/in-progress recording as no longer transcribing after the
-    /// user cancelled it from the Queue. We land it in `.failed` — the existing
-    /// terminal state — rather than adding a dedicated `.cancelled` case: the
-    /// Queue only keeps `.pending`/`.running` rows, so a cancelled item drops
-    /// out of the Queue either way, and every status-rendering site (list rows,
-    /// detail view) already handles `.failed`. The recording + its audio stay on
-    /// disk so the user can still re-transcribe it later; use
-    /// `permanentlyDelete` when they want it gone.
-    ///
-    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
-    /// engine's abort flag so the in-flight whisper pass unwinds. That path
-    /// deliberately leaves the store status alone (the discard coordinator owns
-    /// the delete), so a Queue-level cancel must flip the status itself —
-    /// otherwise a `.running` item would sit in the Queue forever. No-op if the
-    /// recording is already in a terminal state.
     /// Stop a queued/active transcription from the Queue and move the
     /// recording to "Recently Deleted" rather than leaving a `.failed` row
     /// cluttering the list. The status also flips to a terminal `.failed` so
@@ -1581,9 +1570,13 @@ final class RecordingStore: ObservableObject {
     /// recordings and re-transcriptions of already-completed recordings — the
     /// user gets their content back from the trash if they hit Stop by
     /// mistake. No-op if the recording is already terminal (guards a stale
-    /// click racing a just-finished run). Paired with
-    /// `TranscriptionService.cancel(recordingID:)`, which trips the engine's
-    /// abort flag so the in-flight whisper pass unwinds.
+    /// click racing a just-finished run).
+    ///
+    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
+    /// engine's abort flag so the in-flight whisper pass unwinds. That path
+    /// deliberately leaves the store status alone (the discard coordinator owns
+    /// the delete), so a Queue-level stop must flip the status itself —
+    /// otherwise a `.running` item would sit in the Queue forever.
     func stopTranscription(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }

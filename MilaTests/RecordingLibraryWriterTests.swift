@@ -5,6 +5,10 @@ import XCTest
 /// snapshot whose first title is `"hold"` until `release()`, so a test can
 /// line writes up behind one that is still running, and fails the encode of
 /// one whose first title is `"fail"`. Every wait is bounded.
+///
+/// With `holdingBackgroundEncodes`, it also holds every encode that runs
+/// off the main thread (the writer's queue) until `openBackground()`, so a
+/// store test can see what is on disk with no background write behind it.
 private final class EncodeProbe: @unchecked Sendable {
     struct Refused: Error {}
 
@@ -12,6 +16,13 @@ private final class EncodeProbe: @unchecked Sendable {
     private var log: [[String]] = []
     private let gate = DispatchSemaphore(value: 0)
     private let started = DispatchSemaphore(value: 0)
+    private let holdsBackground: Bool
+    private var backgroundOpen = false
+    private let backgroundGate = DispatchSemaphore(value: 0)
+
+    init(holdingBackgroundEncodes: Bool = false) {
+        holdsBackground = holdingBackgroundEncodes
+    }
 
     var encoded: [[String]] {
         lock.lock()
@@ -28,8 +39,25 @@ private final class EncodeProbe: @unchecked Sendable {
             started.signal()
             _ = gate.wait(timeout: .now() + 10)
         }
+        if holdsBackground && !Thread.isMainThread {
+            lock.lock()
+            let open = backgroundOpen
+            lock.unlock()
+            if !open {
+                started.signal()
+                _ = backgroundGate.wait(timeout: .now() + 10)
+            }
+        }
         if titles.first == "fail" { throw Refused() }
         return try RecordingStore.encodeLibrary(recordings)
+    }
+
+    /// Lets every background encode through, the one held now included.
+    func openBackground() {
+        lock.lock()
+        backgroundOpen = true
+        lock.unlock()
+        backgroundGate.signal()
     }
 
     /// Whether the held encode has begun.
@@ -204,16 +232,29 @@ final class RecordingLibraryWriterTests: XCTestCase {
 
     // MARK: - RecordingStore
 
+    /// A store whose background writes are held until `probe.openBackground()`,
+    /// so whatever is on disk got there before the call returned.
+    private func storeWithHeldBackgroundWrites() -> (RecordingStore, EncodeProbe, RecordingLibraryWriter) {
+        let probe = EncodeProbe(holdingBackgroundEncodes: true)
+        let writer = RecordingLibraryWriter(encode: { try probe.encode($0) })
+        return (RecordingStore(rootDirectory: root, writer: writer), probe, writer)
+    }
+
     /// mila-mcp reads recordings.json. A recording the user just deleted must
     /// be gone from it when the call returns, not once a background encode
-    /// gets to it — so the deletions write synchronously. No
-    /// `waitForPendingWrites()` here on purpose.
+    /// gets to it — so the deletions write synchronously. The background
+    /// writes are held throughout, so a deletion that went back to
+    /// `persist()` would leave nothing on disk here.
     func test_deletions_are_on_disk_when_the_call_returns() throws {
-        let store = RecordingStore(rootDirectory: root)
+        let (store, probe, writer) = storeWithHeldBackgroundWrites()
+        defer { probe.openBackground() }  // if an assertion below throws
         let keep = Recording(title: "keep", source: .microphone, audioFileName: "keep.wav")
         let gone = Recording(title: "gone", source: .microphone, audioFileName: "gone.wav")
         store.add(keep)
         store.add(gone)
+        XCTAssertTrue(probe.waitUntilHeld())
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.storeURL.path),
+                       "the adds are background writes, held")
 
         store.softDelete(gone)
         let trashedRow = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "gone" })
@@ -232,15 +273,28 @@ final class RecordingLibraryWriterTests: XCTestCase {
         store.stopTranscription(stopped)
         let stoppedRow = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "stopped" })
         XCTAssertNotNil(stoppedRow["deletedAt"], "a stopped transcription is not in Recently Deleted on disk yet")
+
+        // The held write is older than all of that, so letting it finish
+        // must not put the deleted rows back.
+        probe.openBackground()
+        writer.drain()
+        let rows = try rowsOnDisk(of: store)
+        XCTAssertEqual(rows.compactMap { $0["title"] as? String }, ["stopped"])
+        XCTAssertNotNil(rows.first?["deletedAt"])
     }
 
     /// `update` reports whether a separate process now reads the new row
     /// (the live sidecar's `completed` handoff depends on it), so a `true`
     /// has to mean the row is already in the file.
     func test_update_is_on_disk_when_it_reports_success() throws {
-        let store = RecordingStore(rootDirectory: root)
+        let (store, probe, writer) = storeWithHeldBackgroundWrites()
+        defer {
+            probe.openBackground()
+            writer.drain()
+        }
         var rec = Recording(title: "before", source: .microphone, audioFileName: "a.wav")
         store.add(rec)
+        XCTAssertTrue(probe.waitUntilHeld())
         rec.title = "after"
 
         XCTAssertTrue(store.update(rec))
