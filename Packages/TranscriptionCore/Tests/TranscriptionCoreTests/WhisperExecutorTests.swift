@@ -41,10 +41,11 @@ final class WhisperExecutorTests: XCTestCase {
 
         let running = try await blockWhisperThread(engine, log: log, release: release)
 
+        let queued = WhisperThreadExecutor.shared.queuedJobCount
         let unload = Task { await engine.unload(); log.append("unload") }
         let shutdown = Task { await engine.shutdown(); log.append("shutdown") }
         // Both reached the whisper thread and are waiting behind the call.
-        try await waitUntilQueued(2)
+        try await waitUntilQueued(queued + 2)
         XCTAssertEqual(log.events, ["entered"], "free ran while a whisper call was in flight")
 
         log.append("released")
@@ -68,10 +69,11 @@ final class WhisperExecutorTests: XCTestCase {
 
         // The low-priority job reaches the queue first, so arrival order
         // alone would run it first.
+        let queued = WhisperThreadExecutor.shared.queuedJobCount
         let low = Task(priority: .low) { await engine.appendForTesting("low", to: log) }
-        try await waitUntilQueued(1)
+        try await waitUntilQueued(queued + 1)
         let high = Task(priority: .high) { await engine.appendForTesting("high", to: log) }
-        try await waitUntilQueued(2)
+        try await waitUntilQueued(queued + 2)
         XCTAssertEqual(log.events, ["entered"])
 
         release.signal()
@@ -82,6 +84,8 @@ final class WhisperExecutorTests: XCTestCase {
     }
 
     /// Polls until at least `count` jobs wait on the (parked) whisper thread.
+    /// Callers pass the count they read before queueing plus their own jobs,
+    /// so a job queued by something else cannot stand in for one of theirs.
     private func waitUntilQueued(_ count: Int) async throws {
         let deadline = Date().addingTimeInterval(10)
         while WhisperThreadExecutor.shared.queuedJobCount < count, Date() < deadline {

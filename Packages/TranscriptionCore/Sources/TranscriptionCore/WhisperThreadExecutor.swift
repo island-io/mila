@@ -28,13 +28,15 @@ import Foundation
 /// queue. What a custom executor cannot do is escalate: a high-priority task
 /// that waits on a running job does not raise this thread's QoS. The thread
 /// runs at a fixed `.userInitiated`, the level whisper's callers (the batch
-/// worker, live utterances, dictation, prewarm: all tasks the main actor
-/// starts) run at anyway, and escalation could never preempt a running
-/// `whisper_full` in any case. A waiting job's rank is its priority when it
-/// was queued: escalating its task afterwards does not move it up, so a
-/// steady stream of higher-priority jobs could hold a lower one back. None
-/// of whisper's callers in the app sets a priority (each inherits the main
-/// actor's), so in practice the order is arrival order.
+/// worker, live utterances, dictation, prewarm) usually run at, and
+/// escalation could never preempt a running `whisper_full` in any case.
+/// A waiting job's rank is its priority when it was queued: escalating its
+/// task afterwards does not move it up. None of those callers sets a
+/// priority explicitly, so each job carries the priority of the task that
+/// made the call, and a lower-priority one (a batch pass enqueued from a
+/// background task, say) waits while higher-priority jobs are queued. Each
+/// of those callers has at most one whisper call in flight, so holding it
+/// back for long would take several higher-priority callers at once.
 ///
 /// **One thread, shared.** `static let shared` lives as long as the process,
 /// so the thread is never torn down and never leaks per instance. Every
@@ -44,9 +46,11 @@ import Foundation
 /// not run here is the `whisper_free` in `WhisperEngine.deinit`, which runs
 /// on whichever thread drops the last reference, as it always has. The app
 /// never drops its engine. `SileroVAD`'s `whisper_vad_*` calls do not run
-/// here either: they use their own CPU-only VAD context, take milliseconds
-/// per utterance, and stay on that actor's default executor, concurrent with
-/// this thread as they were before #401.
+/// here either, and are unchanged by #401: its model load (in its
+/// synchronous `init`) and free (in `deinit`) run on the caller's thread,
+/// and its speech check runs on that actor's default executor, concurrent
+/// with this thread. All of them are short, CPU-only, and on their own VAD
+/// context.
 ///
 /// Rule this follows: `.claude/rules/python-subprocess.md` — anything that
 /// genuinely blocks gets a thread of its own, never a slot in a shared pool.
