@@ -96,10 +96,11 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     /// (issue #179).
     ///
     /// True for all four CLIs: each is an agentic coding tool whose whole
-    /// premise is reading the local filesystem, and each is launched with
-    /// workspace trust already granted (`cursor-agent -f`, `gemini
-    /// --skip-trust`) so a read in the sandbox cwd's world doesn't stall on a
-    /// prompt Mila would never see.
+    /// premise is reading the local filesystem. cursor-agent and gemini are
+    /// launched with workspace trust granted in argv (`cursor-agent -f`,
+    /// `gemini --skip-trust`) so a read in the sandbox cwd doesn't stall on a
+    /// prompt Mila would never see. `agy` gets no trust flag: in `-p` mode it
+    /// ran headless from Mila's sandbox dir when it was added (#380).
     ///
     /// False for `.openaiCompatible` — a remote HTTP endpoint has no filesystem
     /// — and for `.none`, which runs nothing. This is the "must never apply to
@@ -378,7 +379,18 @@ final class LLMSettings: ObservableObject {
     nonisolated static func backgroundModelName(tool: LLMTool,
                                                 openAIModelName: String,
                                                 liveAIModel: String) -> String {
-        tool == .openaiCompatible ? openAIModelName : liveAIModel
+        switch tool {
+        case .openaiCompatible:
+            return openAIModelName
+        case .gemini, .agy:
+            // Live AI's default model is a Claude model ID
+            // (`LiveAISettings.defaultModel`), which is not a name the gemini
+            // or agy CLI is documented to accept. Pass no model, so the CLI
+            // uses its own default, unless the user typed a model of their own.
+            return liveAIModel == LiveAISettings.defaultModel ? "" : liveAIModel
+        case .none, .claude, .cursor:
+            return liveAIModel
+        }
     }
 
     /// Free-text extra CLI arguments appended to EVERY post-recording

@@ -995,6 +995,24 @@ final class LLMRunnerTests: XCTestCase {
         XCTAssertEqual(args, ["-p", "Summarize"])
     }
 
+    @MainActor
+    func test_background_model_drops_the_claude_default_for_gemini_and_agy() {
+        for tool in [LLMTool.gemini, .agy] {
+            XCTAssertEqual(
+                LLMSettings.backgroundModelName(tool: tool, openAIModelName: "gpt-4o-mini",
+                                                liveAIModel: LiveAISettings.defaultModel),
+                "", "\(tool) must not be sent the Claude default model")
+            XCTAssertEqual(
+                LLMSettings.backgroundModelName(tool: tool, openAIModelName: "gpt-4o-mini",
+                                                liveAIModel: "gemini-2.5-flash"),
+                "gemini-2.5-flash", "a model the user typed for \(tool) is kept")
+        }
+        XCTAssertEqual(
+            LLMSettings.backgroundModelName(tool: .claude, openAIModelName: "gpt-4o-mini",
+                                            liveAIModel: LiveAISettings.defaultModel),
+            LiveAISettings.defaultModel)
+    }
+
     // MARK: - Executable lookup directories
 
     func test_searchDirectories_includes_version_manager_bins() {
