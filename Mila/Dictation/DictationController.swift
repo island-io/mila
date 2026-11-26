@@ -453,8 +453,8 @@ final class DictationController: ObservableObject {
                     // stopped (`dropCapture()`), and a buffer already handed
                     // to this task must not refill `samples` or the level
                     // after it. Checked on the main actor, where the cancel
-                    // runs. A stop cancels this task only once the recorder
-                    // has drained.
+                    // runs. A stop cancels this task only once its wait for
+                    // the recorder teardown has returned or timed out.
                     guard !Task.isCancelled else { return }
                     self.samples.append(contentsOf: chunk)
                     self.level = lvl
@@ -785,7 +785,8 @@ final class DictationController: ObservableObject {
 /// Refusing starts keeps the worst case at one stuck thread. A teardown that
 /// never returns therefore leaves dictation refusing starts until relaunch,
 /// as a stuck teardown did before #435 (when the stop itself never
-/// returned); the dictation it ended is still transcribed and pasted.
+/// returned). A dictation that a stop ended is still transcribed, and pasted
+/// unless a sleep, screen lock or quit intervened.
 ///
 /// Main-actor only, so no lock is needed.
 @MainActor

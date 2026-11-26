@@ -2938,8 +2938,8 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // The cancel stops the dictation's live transcriber before its first
         // await, so no new live pass starts on the engine that
         // `transcription.shutdown()` frees below. A sleep or screen-lock
-        // cancel still waiting for the microphone has already left the state
-        // `.idle`, and then this returns at once.
+        // cancel still waiting for the microphone has already set the state
+        // to `.idle`, and then this returns at once.
         await dictation?.cancelInFlight()
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.
