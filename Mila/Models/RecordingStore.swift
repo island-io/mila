@@ -194,8 +194,9 @@ final class RecordingStore: ObservableObject {
     let originalRootDirectory: URL
 
     /// `writer` is a seam for tests that hold a background write to see
-    /// which mutations are on disk without it. The app uses `.shared`, so
-    /// every store over the same file shares one write ordering.
+    /// which mutations are on disk without it. The app must use `.shared`:
+    /// write ordering holds only between stores that share a writer, and
+    /// `BundleRelocator` drains `.shared` before its hard exit.
     init(rootDirectory: URL, writer: RecordingLibraryWriter = .shared) {
         self.writer = writer
         self.originalRootDirectory = rootDirectory

@@ -37,8 +37,10 @@ private let writerSignposter = OSSignposter(logger: writerLog)
 /// not lost. A crash or a kill is not covered: a change handed off less
 /// than one encode before it is lost.
 final class RecordingLibraryWriter: @unchecked Sendable {
-    /// The one the app uses. One per process, so every `RecordingStore`
-    /// over the same file shares the ordering above.
+    /// The one the app uses. The ordering above holds only between stores
+    /// that share a writer, and `BundleRelocator` drains this one before
+    /// its hard exit, so every app store must use it. Only tests pass
+    /// another (`RecordingStore.init(rootDirectory:writer:)`).
     static let shared = RecordingLibraryWriter()
 
     typealias Encode = @Sendable ([Recording]) throws -> Data

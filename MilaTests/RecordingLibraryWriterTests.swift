@@ -6,9 +6,11 @@ import XCTest
 /// line writes up behind one that is still running, and fails the encode of
 /// one whose first title is `"fail"`. Every wait is bounded.
 ///
-/// With `holdingBackgroundEncodes`, it also holds every encode that runs
+/// With `holdingBackgroundEncodes`, it instead holds every encode that runs
 /// off the main thread (the writer's queue) until `openBackground()`, so a
 /// store test can see what is on disk with no background write behind it.
+/// That hold is bounded too; `backgroundHoldTimedOut` says whether it ran
+/// out, which would make the test's "held" premise false.
 private final class EncodeProbe: @unchecked Sendable {
     struct Refused: Error {}
 
@@ -18,6 +20,7 @@ private final class EncodeProbe: @unchecked Sendable {
     private let started = DispatchSemaphore(value: 0)
     private let holdsBackground: Bool
     private var backgroundOpen = false
+    private var timedOut = false
     private let backgroundGate = DispatchSemaphore(value: 0)
 
     init(holdingBackgroundEncodes: Bool = false) {
@@ -35,21 +38,32 @@ private final class EncodeProbe: @unchecked Sendable {
         lock.lock()
         log.append(titles)
         lock.unlock()
-        if titles.first == "hold" {
+        if holdsBackground {
+            if !Thread.isMainThread {
+                lock.lock()
+                let open = backgroundOpen
+                lock.unlock()
+                if !open {
+                    started.signal()
+                    if backgroundGate.wait(timeout: .now() + 30) == .timedOut {
+                        lock.lock()
+                        timedOut = true
+                        lock.unlock()
+                    }
+                }
+            }
+        } else if titles.first == "hold" {
             started.signal()
             _ = gate.wait(timeout: .now() + 10)
         }
-        if holdsBackground && !Thread.isMainThread {
-            lock.lock()
-            let open = backgroundOpen
-            lock.unlock()
-            if !open {
-                started.signal()
-                _ = backgroundGate.wait(timeout: .now() + 10)
-            }
-        }
         if titles.first == "fail" { throw Refused() }
         return try RecordingStore.encodeLibrary(recordings)
+    }
+
+    var backgroundHoldTimedOut: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return timedOut
     }
 
     /// Lets every background encode through, the one held now included.
@@ -247,7 +261,10 @@ final class RecordingLibraryWriterTests: XCTestCase {
     /// `persist()` would leave nothing on disk here.
     func test_deletions_are_on_disk_when_the_call_returns() throws {
         let (store, probe, writer) = storeWithHeldBackgroundWrites()
-        defer { probe.openBackground() }  // if an assertion below throws
+        defer {  // if an assertion below throws
+            probe.openBackground()
+            writer.drain()
+        }
         let keep = Recording(title: "keep", source: .microphone, audioFileName: "keep.wav")
         let gone = Recording(title: "gone", source: .microphone, audioFileName: "gone.wav")
         store.add(keep)
@@ -273,6 +290,7 @@ final class RecordingLibraryWriterTests: XCTestCase {
         store.stopTranscription(stopped)
         let stoppedRow = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "stopped" })
         XCTAssertNotNil(stoppedRow["deletedAt"], "a stopped transcription is not in Recently Deleted on disk yet")
+        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background write was let through mid-test")
 
         // The held write is older than all of that, so letting it finish
         // must not put the deleted rows back.
@@ -299,6 +317,7 @@ final class RecordingLibraryWriterTests: XCTestCase {
 
         XCTAssertTrue(store.update(rec))
         XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["title"] as? String }, ["after"])
+        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background write was let through mid-test")
     }
 
     /// A rename is handed off, and a store opened on the same folder (a
