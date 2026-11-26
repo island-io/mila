@@ -247,6 +247,7 @@ final class DictationController: ObservableObject {
 
         guard await recorder.requestAccess() else {
             dictationLog.log("dictation not started: microphone access was not granted")
+            targetApp = nil
             NSSound.beep()
             return
         }
@@ -269,12 +270,24 @@ final class DictationController: ObservableObject {
         do {
             try await recorder.start()
         } catch {
-            let ns = error as NSError
+            // Name the failure publicly: the bridged code of a Swift enum
+            // with payloads does not follow declaration order, so
+            // "MicrophoneError 0" alone misleads. The device name stays in
+            // the private description.
+            let kind: String
+            switch error as? MicrophoneError {
+            case .noInputDevice?: kind = "no input device"
+            case .bringUpTimedOut(_, let timeout)?: kind = "bring-up timed out after \(timeout) s"
+            case .tapInstallFailed?: kind = "input tap refused"
+            case nil:
+                let ns = error as NSError
+                kind = "\(ns.domain) \(ns.code)"
+            }
             dictationLog.error("""
-                dictation not started: mic bring-up failed \
-                [\(ns.domain, privacy: .public) \(ns.code, privacy: .public)]: \
+                dictation not started: mic bring-up failed (\(kind, privacy: .public)): \
                 \(error.localizedDescription, privacy: .private)
                 """)
+            targetApp = nil
             NSSound.beep()
             return
         }
