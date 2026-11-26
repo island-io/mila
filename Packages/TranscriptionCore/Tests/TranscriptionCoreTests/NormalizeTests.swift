@@ -126,12 +126,18 @@ final class NormalizeTests: XCTestCase {
         //
         // Toolchain canary: this checks what the compiler builds, which the
         // language does not promise. If it fails with no Mila change, the
-        // compiler now copies while forwarding the argument. Swift 6.2
-        // (Xcode 26) and 6.4 (Xcode 27) pass it in debug and release. Swift
-        // 5.10, which only the Linux package-test job uses, does not: there
-        // the argument still arrives with a second reference, so the gain
-        // copies, which is the cost from before #403 and nothing worse. The
-        // app is built only with Xcode, so 5.x skips the address check.
+        // compiler now copies while forwarding the argument. The 6.2
+        // (Xcode 26) and 6.4 (Xcode 27) compilers pass it in debug and
+        // release. The 5.10 compiler (the Linux package-test job's) does
+        // not: there the argument still arrives with a second reference, so
+        // the gain copies, which is the cost from before #403 and nothing
+        // worse. The gate below is on the COMPILER version, on any OS, not
+        // on the language mode: the app builds in Swift 5 mode
+        // (`SWIFT_VERSION` 5.10) with Xcode's Swift 6 compiler, and a
+        // pre-6 compiler skips the address check wherever it runs. No CI job
+        // runs this check on a Swift 6 compiler (TranscriptionCore's tests
+        // run in CI only on Linux), so `make package-test` on a Mac is what
+        // exercises it.
         let engine: any TranscribingEngine = OwnershipProbeEngine()
         let samples = [Float](repeating: 0.01, count: 16_000)
         let callerAddress = samples.withUnsafeBufferPointer { Int(bitPattern: $0.baseAddress) }
@@ -145,8 +151,9 @@ final class NormalizeTests: XCTestCase {
         #if compiler(<6.0)
         _ = callerAddress
         throw XCTSkip("""
-            Swift 5.x keeps a second reference to a consumed argument across \
-            this call, so the in-place gain copies; the app is built with Swift 6.
+            A pre-6 Swift compiler keeps a second reference to a consumed \
+            argument across this call, so the in-place gain copies. The app \
+            is built with Xcode's Swift 6 compiler, where this check runs.
             """)
         #else
         let addresses = probe.first?.text.split(separator: " ").compactMap { Int($0) } ?? []
