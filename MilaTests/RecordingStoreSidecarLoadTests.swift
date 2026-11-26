@@ -2,7 +2,7 @@ import XCTest
 @testable import Mila
 
 /// Launch hydrates every transcript sidecar; the reads run concurrently but
-/// the result must be identical to reading them one by one (plan item 6).
+/// the result must be identical to reading them one by one (#410).
 @MainActor
 final class RecordingStoreSidecarLoadTests: XCTestCase {
 
