@@ -75,6 +75,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     case claude
     case cursor
     case gemini
+    case agy
     case openaiCompatible = "openai_compatible"
 
     var id: String { rawValue }
@@ -85,6 +86,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         case .claude:          return "Claude (claude CLI)"
         case .cursor:          return "Cursor (cursor-agent CLI)"
         case .gemini:          return "Gemini (gemini CLI)"
+        case .agy:             return "Antigravity (agy CLI)"
         case .openaiCompatible: return "OpenAI Compatible"
         }
     }
@@ -93,11 +95,12 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     /// file we name in the prompt. Gates `TranscriptDelivery.reference`
     /// (issue #179).
     ///
-    /// True for all three CLIs: each is an agentic coding tool whose whole
-    /// premise is reading the local filesystem, and each is launched with
-    /// workspace trust already granted (`cursor-agent -f`, `gemini
-    /// --skip-trust`) so a read in the sandbox cwd's world doesn't stall on a
-    /// prompt Mila would never see.
+    /// True for all four CLIs: each is an agentic coding tool whose whole
+    /// premise is reading the local filesystem. cursor-agent and gemini are
+    /// launched with workspace trust granted in argv (`cursor-agent -f`,
+    /// `gemini --skip-trust`) so a read in the sandbox cwd doesn't stall on a
+    /// prompt Mila would never see. `agy` gets no trust flag: in `-p` mode it
+    /// ran headless from Mila's sandbox dir when it was added (#380).
     ///
     /// False for `.openaiCompatible` — a remote HTTP endpoint has no filesystem
     /// — and for `.none`, which runs nothing. This is the "must never apply to
@@ -106,8 +109,8 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
     /// apart on it.
     var readsLocalFiles: Bool {
         switch self {
-        case .claude, .cursor, .gemini: return true
-        case .none, .openaiCompatible:  return false
+        case .claude, .cursor, .gemini, .agy: return true
+        case .none, .openaiCompatible:        return false
         }
     }
 
@@ -120,6 +123,7 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
         case .claude:          return "claude"
         case .cursor:          return "cursor-agent"
         case .gemini:          return "gemini"
+        case .agy:             return "agy"
         case .openaiCompatible: return ""
         }
     }
@@ -192,6 +196,17 @@ enum LLMTool: String, CaseIterable, Identifiable, Codable {
                 args.append(contentsOf: ["-m", m])
             }
             // session intentionally ignored — gemini's -p mode has no
+            // documented conversation-resume flag.
+            return args
+        case .agy:
+            // `agy -p <prompt>` runs one-shot and prints the answer to
+            // stdout. `--model` pins a specific model (e.g. gemini-3.8-flash-high);
+            // the CLI's configured default is used when omitted.
+            var args: [String] = ["-p", prompt]
+            if hasModel, let m = trimmedModel {
+                args.append(contentsOf: ["--model", m])
+            }
+            // session intentionally ignored — agy's -p mode has no
             // documented conversation-resume flag.
             return args
         }
@@ -364,7 +379,18 @@ final class LLMSettings: ObservableObject {
     nonisolated static func backgroundModelName(tool: LLMTool,
                                                 openAIModelName: String,
                                                 liveAIModel: String) -> String {
-        tool == .openaiCompatible ? openAIModelName : liveAIModel
+        switch tool {
+        case .openaiCompatible:
+            return openAIModelName
+        case .gemini, .agy:
+            // Live AI's default model is a Claude model ID
+            // (`LiveAISettings.defaultModel`), which is not a name the gemini
+            // or agy CLI is documented to accept. Pass no model, so the CLI
+            // uses its own default, unless the user typed a model of their own.
+            return liveAIModel == LiveAISettings.defaultModel ? "" : liveAIModel
+        case .none, .claude, .cursor:
+            return liveAIModel
+        }
     }
 
     /// Free-text extra CLI arguments appended to EVERY post-recording

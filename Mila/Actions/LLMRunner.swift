@@ -1768,7 +1768,8 @@ enum LLMRunner {
     /// Nothing durable lives here, so sweeping costs nothing: conversations are
     /// in `~/.claude/projects/<slug>` (never touched, so `--resume` still
     /// works) and workspace trust is granted per-invocation in argv
-    /// (`cursor-agent -f`, `gemini --skip-trust`), not by state in the cwd.
+    /// (`cursor-agent -f`, `gemini --skip-trust`; `agy -p` needs no flag), not
+    /// by state in the cwd.
     ///
     /// The directory itself is created on demand and never removed — only its
     /// contents are swept. `Process.run()` fails outright if
@@ -1971,7 +1972,7 @@ enum LLMRunner {
 
     /// Walk the user's `$PATH` plus a few common shell-managed locations
     /// (`~/.local/bin`, `/opt/homebrew/bin`, …). GUI apps on macOS inherit
-    /// a stripped-down PATH from launchd, so claude/cursor/gemini installed by
+    /// a stripped-down PATH from launchd, so claude/cursor/gemini/agy installed by
     /// Homebrew or a node version manager are typically *not* on the
     /// inherited PATH — falling back to the well-known directories prevents
     /// the "works in Terminal, not in Mila" footgun.
