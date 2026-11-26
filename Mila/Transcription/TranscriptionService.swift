@@ -557,10 +557,11 @@ final class TranscriptionService: ObservableObject {
     /// can never put an unload beside that load. `shutdown` ends every hold.
     ///
     /// The preload itself runs only while the hold is the sole local user;
-    /// with a batch job (or any other user) mid-flight it is skipped and the
-    /// final pass loads on demand, and while it loads no other user is
-    /// admitted, so a dictation start can never swap the model out between
-    /// another user's load and its transcribe. See the comment at the check.
+    /// with a batch job (or any other user) mid-flight or queued it is
+    /// skipped and the final pass loads on demand, and while it loads no
+    /// other user is admitted, so a dictation start can never swap the model
+    /// out between another user's load and its transcribe. The model is
+    /// resolved again when the preload runs. See the comment at the check.
     ///
     /// Returns nil — and takes nothing — when there is nothing to preload or
     /// nothing to change: live retention (`retainsLocalModel`) already keeps
@@ -587,7 +588,6 @@ final class TranscriptionService: ObservableObject {
             serviceLog.log("dictation hold: none — no installed model for lang=\(language, privacy: .public)")
             return nil
         }
-        let modelURL = modelManager.url(for: model)
         let displayName = model.displayName
         let observerTask: Task<Void, Never> = observerSetupTask
         let id = UUID()
@@ -614,7 +614,10 @@ final class TranscriptionService: ObservableObject {
                 // a preload must not add a second trigger. When anyone else
                 // is mid-flight, the final pass loads on demand as before,
                 // and the hold still keeps whatever is loaded from being
-                // released when they finish.
+                // released when they finish. A queued job whose worker has
+                // not counted itself yet is treated the same way (the
+                // `queue`/`processingID` test `canReleaseLocalModel` uses):
+                // it would load its own model straight after the preload.
                 //
                 // The check alone would leave a gap: a user counted just after
                 // it could still get its load onto the engine's queue ahead of
@@ -622,9 +625,17 @@ final class TranscriptionService: ObservableObject {
                 // So `isDictationPreloading` is raised in the same turn as the
                 // check and holds every newly counted user at admission until
                 // the preload's load has returned.
-                if self.activeModelHolds.contains(id), !cancellation.isStopped,
+                //
+                // The model is resolved again here, as late as possible, so a
+                // download that finished or a model changed in Settings while
+                // admission waited is what gets warmed.
+                let current = self.modelManager.model(for: language)
+                    .flatMap { self.modelManager.isInstalled($0) ? $0 : nil }
+                if let current, self.activeModelHolds.contains(id), !cancellation.isStopped,
                    !self.retainsLocalModel, !self.remoteSettings.isActive,
-                   self.localModelUsers == 1 {
+                   self.localModelUsers == 1, self.queue.isEmpty, self.processingID == nil {
+                    let modelURL = self.modelManager.url(for: current)
+                    let displayName = current.displayName
                     self.isDictationPreloading = true
                     do {
                         try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
@@ -644,9 +655,10 @@ final class TranscriptionService: ObservableObject {
                 } else {
                     serviceLog.log("""
                         dictation hold: skipping the preload of \(displayName, privacy: .public) — \
-                        held=\(self.activeModelHolds.contains(id)) stopped=\(cancellation.isStopped) \
-                        retains=\(self.retainsLocalModel) remote=\(self.remoteSettings.isActive) \
-                        users=\(self.localModelUsers, privacy: .public)
+                        installed=\(current != nil) held=\(self.activeModelHolds.contains(id)) \
+                        stopped=\(cancellation.isStopped) retains=\(self.retainsLocalModel) \
+                        remote=\(self.remoteSettings.isActive) users=\(self.localModelUsers, privacy: .public) \
+                        queued=\(self.queue.count, privacy: .public) processing=\(self.processingID != nil)
                         """)
                 }
                 await self.waitForModelHoldToEnd(id)

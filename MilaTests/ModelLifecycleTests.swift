@@ -601,6 +601,26 @@ final class ModelLifecycleTests: XCTestCase {
         XCTAssertFalse(finalLoaded)
     }
 
+    /// The preload warms the model the final pass will resolve, decided when
+    /// the preload runs rather than when the hold began: here the Hebrew
+    /// model finishes installing while the hold waits out a release.
+    func test_dictationPreloadResolvesTheModelWhenItRuns() async throws {
+        try FileManager.default.removeItem(at: manager.url(for: .ivritLarge))
+        manager.refreshInstalled()
+        try await holdAReleaseInFlight()
+
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "he"),
+                                 "the selected fallback model is installed")
+        try TestSupport.installFakeModel(into: manager, model: .ivritLarge)
+        await stub.openUnloadGate()
+        await waitForLoad(2)
+        let model = await stub.loadedModel
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: .ivritLarge).lastPathComponent,
+                       "the preload warms what the final pass would now ask for")
+
+        await service.endLocalModelHold(hold)?.value
+    }
+
     /// A start that fails (mic refused, engine bring-up error) while its hold
     /// is still queued behind a release must not load anything afterwards.
     func test_dictationHoldEndedBeforeAdmissionNeverLoads() async throws {
@@ -769,6 +789,34 @@ final class ModelLifecycleTests: XCTestCase {
         var unloads = await stub.unloadCount
         XCTAssertEqual(unloads, 0, "the dictation's hold keeps the model past the job's end")
 
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 1)
+    }
+
+    /// A job enqueued in the same turn the dictation starts: its worker has
+    /// not counted itself when the hold's task checks for other users, but
+    /// it is about to load its own model, so the preload would only make it
+    /// wait and then be swapped out. A queued job counts as another user.
+    func test_dictationHoldSkipsThePreloadWhileAJobIsQueued() async throws {
+        await stub.closeTranscribeGate()
+        let fixture = try TestRecordingFixture.make(in: store, title: "Batch", language: "he")
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        service.enqueue(fixture.recording)
+        await stub.waitUntilTranscribeEntered(1)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let requests = await stub.loadRequestCount
+        let loads = await stub.loadCallCount
+        let model = await stub.loadedModel
+        let hebrew = try XCTUnwrap(manager.model(for: "he"))
+        XCTAssertEqual(requests, 1, "only the job asks for a model")
+        XCTAssertEqual(loads, 1)
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: hebrew).lastPathComponent)
+
+        await stub.openTranscribeGate(count: 1)
+        await service.waitForIdle()
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 0, "the hold keeps the model past the job's end")
         await service.endLocalModelHold(hold)?.value
         unloads = await stub.unloadCount
         XCTAssertEqual(unloads, 1)
