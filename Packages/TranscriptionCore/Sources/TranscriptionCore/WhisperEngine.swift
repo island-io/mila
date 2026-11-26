@@ -360,12 +360,24 @@ public actor WhisperEngine {
     /// while the app is still in a normal state (rather than during static
     /// destruction at `exit()`-time, which is what triggered the crash).
     public func shutdown() {
+        unload()
+    }
+
+    /// Release the model context without making the engine terminal: a later
+    /// `loadIfNeeded` reloads it. This is the idle-release counterpart to
+    /// `shutdown` — same bytes freed, but named for a service that keeps
+    /// accepting work. Resetting `coreMLStatus` matters: the next load
+    /// re-derives it from whisper.cpp's init log, and a stale `.loaded`
+    /// would make the CoreML-specific `audio_ctx` override fire before the
+    /// new context has actually engaged CoreML.
+    public func unload() {
         if let ctx {
             whisper_free(ctx)
             self.ctx = nil
             self.loadedPath = nil
             self.modelName = nil
         }
+        self.coreMLStatus = .unavailable
     }
 
     // MARK: - Internal

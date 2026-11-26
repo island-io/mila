@@ -47,6 +47,16 @@ public protocol TranscribingEngine: Sendable {
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment]
     func shutdown() async
 
+    /// Free the loaded model (if any) while keeping the engine usable: the
+    /// next `loadIfNeeded` loads it again. Unlike `shutdown`, which is the
+    /// one-way teardown for process exit, this is safe to call while idle so
+    /// a batch-only session can hand the model's memory back between uses.
+    ///
+    /// Implementations must be no-ops when nothing is loaded. The default
+    /// implementation is a no-op for engines that hold no reclaimable state
+    /// (test stubs, remote engines).
+    func unload() async
+
     /// CoreML status after the most recent successful `loadIfNeeded`. The
     /// default implementation returns `.unavailable` so non-whisper engines
     /// (stubs in tests) opt out without boilerplate.
@@ -73,6 +83,10 @@ extension TranscribingEngine {
     }
 
     public func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) async {
+        // no-op default
+    }
+
+    public func unload() async {
         // no-op default
     }
 }

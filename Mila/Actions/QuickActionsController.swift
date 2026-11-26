@@ -206,8 +206,8 @@ final class QuickActionsController: ObservableObject {
     /// ordering note in `stopRecording` at `store.add`.
     var liveSidecarWriter: LiveTranscriptSidecarWriter?
 
-    /// Whether the recording in progress (or the last one) runs the live
-    /// pipeline — live whisper, live diarizer, Live AI. Decided ONCE per
+    /// Whether the recording in progress (or the one being started) runs the
+    /// live pipeline — live whisper, live diarizer, Live AI. Decided ONCE per
     /// recording by `prepareLivePipeline()`, synchronously and before capture
     /// starts, from `LiveAISettings.runsLivePipeline` (hardware gate AND the
     /// user's "Transcribe while recording" setting). `wireLiveAIPipeline` and
@@ -215,8 +215,16 @@ final class QuickActionsController: ObservableObject {
     /// settings: re-reading would let a toggle flipped mid-call swap the
     /// recording view under the user, or leave the view and the pipeline
     /// disagreeing about a recording the async state observer wired a moment
-    /// after the settings changed. Published once per recording start, so it
-    /// stays well clear of the App-level churn rule.
+    /// after the settings changed.
+    ///
+    /// `beginStarting` sets it provisionally from the same settings, so
+    /// nothing reads the previous recording's answer while a start waits on
+    /// the permission check. A start that ends without recording leaves its
+    /// provisional value behind: with no recording active or starting, the
+    /// value describes the last ATTEMPTED start, and no reader consults it
+    /// then (every reader gates on a recording being up or starting). Both
+    /// writes happen only on a change, so this publishes at most twice per
+    /// start and usually not at all, well clear of the App-level churn rule.
     @Published private(set) var recordingRunsLivePipeline = false
 
     /// True while `stopRecording` OWNS THE LIVE SINGLETONS
@@ -595,7 +603,10 @@ final class QuickActionsController: ObservableObject {
         // value, so `false` here is not a harmless default: it would discard
         // the live transcript and speaker names of a recording whose pipeline
         // did run. In the app the settings are always injected.
-        recordingRunsLivePipeline = liveAISettings?.runsLivePipeline ?? true
+        let runsLivePipeline = liveAISettings?.runsLivePipeline ?? true
+        if recordingRunsLivePipeline != runsLivePipeline {
+            recordingRunsLivePipeline = runsLivePipeline
+        }
         liveAISessionStartedByRelease = false
         // The previous recording's drain is still reading these (issue #356):
         // clearing them now would hand it an empty transcript and pool to save
@@ -732,6 +743,33 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
+    /// Whether a whisper model load in progress should refuse a record start.
+    ///
+    /// The gate exists for the LIVE pipeline: a recording started while the
+    /// encoder is still compiling would feed live utterances to a model that
+    /// is not ready. A recording that skips the live pipeline does not touch
+    /// the model until its batch pass, which simply waits for the load. In
+    /// batch-only mode the model is loaded on demand after every Stop
+    /// (#393), so gating on any load would silently drop the next record start
+    /// (a hotkey, a menu command, a back-to-back meeting's auto-start) for
+    /// the length of every reload. `HomeView` greys the Record button on the
+    /// same value.
+    var modelPreparationBlocksRecordStart: Bool {
+        Self.modelPreparationBlocksRecordStart(
+            isPreparingModel: transcription.isPreparingModel,
+            nextRecordingRunsLivePipeline: liveAISettings?.runsLivePipeline ?? true)
+    }
+
+    /// Pure form of `modelPreparationBlocksRecordStart`, for tests.
+    /// `nextRecordingRunsLivePipeline` is the decision `prepareLivePipeline`
+    /// will snapshot for the recording being started.
+    nonisolated static func modelPreparationBlocksRecordStart(
+        isPreparingModel: Bool,
+        nextRecordingRunsLivePipeline: Bool
+    ) -> Bool {
+        isPreparingModel && nextRecordingRunsLivePipeline
+    }
+
     private func startRecording(withSystemAudio: Bool) async {
         // Controller-side counterpart to HomeView's
         // `.disabled(... transcription.isPreparingModel)`. The button
@@ -741,7 +779,7 @@ final class QuickActionsController: ObservableObject {
         // encoder can't yet transcribe — the user would speak for a
         // minute and get `segments=0` while the model finishes compiling.
         // Mirror the `isStoppingRecording` guard in `toggleRecord`.
-        guard !transcription.isPreparingModel else {
+        guard !modelPreparationBlocksRecordStart else {
             quickActionsLog.log("startRecording ignored — model still preparing (Neural Engine compile)")
             return
         }
@@ -847,6 +885,19 @@ final class QuickActionsController: ObservableObject {
         }
         pendingStartAbandonReason = nil
         startCancellation = CaptureStartCancellation()
+        // Provisional live decision for the recording being started.
+        // `prepareLivePipeline` takes the real snapshot after the permission
+        // check, which can wait on a system prompt; until then
+        // `recordingRunsLivePipeline` would still hold the PREVIOUS
+        // recording's answer, and MilaApp keeps or loads the local whisper
+        // model on it while a start is in flight (#393). Written only on a
+        // change, since `@Published` publishes on every write. The previous
+        // recording's stop read its own copy before releasing `activeJob`,
+        // so nothing still needs the old value.
+        let provisional = liveAISettings?.runsLivePipeline ?? true
+        if recordingRunsLivePipeline != provisional {
+            recordingRunsLivePipeline = provisional
+        }
         activeJob = .starting(source)
         return true
     }
@@ -970,7 +1021,7 @@ final class QuickActionsController: ObservableObject {
         isAppPickerShown = false
         // Same Neural-Engine-preparing guard as `startRecording` — the
         // app-audio entry point isn't behind the gated Home button.
-        guard !transcription.isPreparingModel else {
+        guard !modelPreparationBlocksRecordStart else {
             quickActionsLog.log("startAppRecording ignored — model still preparing (Neural Engine compile)")
             return
         }
