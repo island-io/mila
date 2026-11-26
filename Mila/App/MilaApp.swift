@@ -2939,7 +2939,9 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         // await, so no new live pass starts on the engine that
         // `transcription.shutdown()` frees below. A sleep or screen-lock
         // cancel still waiting for the microphone has already set the state
-        // to `.idle`, and then this returns at once.
+        // to `.idle`, and then this returns at once. A dictation still
+        // starting also reads `.idle` until its mic is up and is not
+        // cancelled here — a known gap, shared with sleep and screen lock.
         await dictation?.cancelInFlight()
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.

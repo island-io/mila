@@ -449,12 +449,11 @@ final class DictationController: ObservableObject {
                 let chunk = AudioConvert.samples(from: buffer)
                 let lvl = AudioMeter.level(from: buffer)
                 await MainActor.run {
-                    // A cancel drops the capture before the recorder has
-                    // stopped (`dropCapture()`), and a buffer already handed
-                    // to this task must not refill `samples` or the level
-                    // after it. Checked on the main actor, where the cancel
-                    // runs. A stop cancels this task only once its wait for
-                    // the recorder teardown has returned or timed out.
+                    // A cancel (`dropCapture()`) cancels this task before
+                    // the recorder has stopped, and a buffer already handed
+                    // to it must not refill `samples` or the level after the
+                    // cleanup. Checked on the main actor, where the cancel
+                    // runs.
                     guard !Task.isCancelled else { return }
                     self.samples.append(contentsOf: chunk)
                     self.level = lvl
@@ -785,8 +784,8 @@ final class DictationController: ObservableObject {
 /// Refusing starts keeps the worst case at one stuck thread. A teardown that
 /// never returns therefore leaves dictation refusing starts until relaunch,
 /// as a stuck teardown did before #435 (when the stop itself never
-/// returned). A dictation that a stop ended is still transcribed, and pasted
-/// unless a sleep, screen lock or quit intervened.
+/// returned). A stop that gives up waiting carries on as usual with what it
+/// captured.
 ///
 /// Main-actor only, so no lock is needed.
 @MainActor
