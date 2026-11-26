@@ -16,6 +16,7 @@ A macOS (Swift/SwiftUI) local transcription app built on whisper.cpp, with optio
   - `MilaTests/` — unit tests
   - `Packages/TranscriptionCore/` — cross-platform Swift package: WhisperEngine (whisper.cpp bindings), WAVReader, WER calculator, and E2E transcription test fixtures
   - `Packages/MilaKit/` — zero-dependency Swift package shared by the app and the `mila-mcp` helper: TranscriptFormatter, the read-only `StoredRecording` mirror of recordings.json, `MilaStoreReader`, the live-transcript snapshot schema, and the MCP tool handlers
+  - `Packages/ObjCExceptionCatcher/` — the app's only Objective-C: a `@try/@catch` shim (`try ObjCException.catching { … }`) for framework calls that raise an `NSException` on a recoverable runtime condition — `AVAudioEngine.installTap` on a stale format (#385), via `Mila/Audio/InputTap.swift`. An `NSException` unwinding into Swift aborts the process
   - `MilaMCP/` — the `mila-mcp` executable (MCP stdio server over Mila's transcriptions), embedded at `Mila.app/Contents/MacOS/mila-mcp`; see `docs/mcp.md`
   - `scripts/` — release/build scripts (make-dmg.sh, etc.)
   - `site/` — the public one-pager, published into the `gh-pages` branch next to the Sparkle `appcast.xml` by `.github/workflows/pages.yml`. Never switch the Pages source to "GitHub Actions": pushes to `gh-pages` would stop being served and the update feed would freeze. See `docs/website.md`

@@ -43,6 +43,13 @@ jobs:
         working-directory: Packages/MilaKit
         run: swift test
 
+      # Same reasoning: the app links ObjCExceptionCatcher but its tests are
+      # in no Xcode scheme. They are the only check that a real AVAudioEngine
+      # `installTap` raise is caught rather than aborting the process (#385).
+      - name: Run ObjCExceptionCatcher package tests
+        working-directory: Packages/ObjCExceptionCatcher
+        run: swift test
+
       - name: Install xcodegen
         run: brew install xcodegen
 

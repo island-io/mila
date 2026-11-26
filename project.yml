@@ -137,6 +137,10 @@ packages:
     path: Packages/TranscriptionCore
   MilaKit:
     path: Packages/MilaKit
+  # @try/@catch shim so an NSException from AVAudioEngine (installTap on a
+  # stale format, #385) becomes a Swift error instead of aborting the app.
+  ObjCExceptionCatcher:
+    path: Packages/ObjCExceptionCatcher
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     revision: 066e75a8b3e99962685d6a90cdd5293ebffd9261
@@ -266,6 +270,8 @@ targets:
         product: TranscriptionCore
       - package: MilaKit
         product: MilaKit
+      - package: ObjCExceptionCatcher
+        product: ObjCExceptionCatcher
       - package: Sparkle
         product: Sparkle
       # Build-order only: the post-build script below copies the helper

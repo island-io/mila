@@ -71,8 +71,22 @@ final class InputLevelMonitor: ObservableObject {
             }
             let format = input.inputFormat(forBus: 0)
             guard format.sampleRate > 0 else { return nil }
-            input.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
-                onLevel(AudioMeter.level(from: buffer))
+            // Same exposure as the recorder (#385): a Bluetooth device that
+            // re-negotiates between the read above and the tap makes
+            // `installTap` raise, which would abort the app from the Home
+            // screen meter. The meter only reads levels, so the block is
+            // format-agnostic.
+            do {
+                _ = try InputTap.installFollowingFormatChange(
+                    initial: format,
+                    currentFormat: { input.inputFormat(forBus: 0) },
+                    install: { tapFormat in
+                        try InputTap.install(on: input, bufferSize: 1024, format: tapFormat) { buffer, _ in
+                            onLevel(AudioMeter.level(from: buffer))
+                        }
+                    })
+            } catch {
+                return nil
             }
             engine.prepare()
             do {
