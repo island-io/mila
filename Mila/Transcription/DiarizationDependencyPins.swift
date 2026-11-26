@@ -45,9 +45,9 @@ enum DiarizationDependencyPins {
             .split(separator: ".").compactMap { Int($0) }
         guard parts.count >= 2 else { return nil }
         if parts[0] == 3 && supportedPythonMinors.contains(parts[1]) { return nil }
+        let range = "3.\(supportedPythonMinors.lowerBound)–3.\(supportedPythonMinors.upperBound)"
         return "Python \(parts[0]).\(parts[1]) can't install the pinned speaker-detection stack "
-            + "(torch \(torch) ships wheels for Python 3.\(supportedPythonMinors.lowerBound)–"
-            + "3.\(supportedPythonMinors.upperBound) only). Choose a Python 3."
-            + "\(supportedPythonMinors.lowerBound)–3.\(supportedPythonMinors.upperBound) interpreter."
+            + "(pyannote.audio \(pyannoteAudio) with torch \(torch) installs on Python \(range) only). "
+            + "Choose a Python \(range) interpreter."
     }
 }

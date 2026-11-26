@@ -33,6 +33,9 @@ final class DiarizationDependencyPinsTests: XCTestCase {
     func test_bootstrap_wheels_use_the_shared_pins() {
         XCTAssertEqual(DiarizationBootstrap.torchVersion, DiarizationDependencyPins.torch)
         XCTAssertEqual(DiarizationBootstrap.torchaudioVersion, DiarizationDependencyPins.torchaudio)
+        XCTAssertTrue(DiarizationBootstrap.extraInstallSpecs.contains("numpy\(DiarizationDependencyPins.numpy)"))
+        XCTAssertFalse(DiarizationBootstrap.extraInstallSpecs.contains { $0.hasPrefix("numpy") && $0 != "numpy\(DiarizationDependencyPins.numpy)" },
+                       "the bootstrap's numpy constraint must come from the shared table")
     }
 
     /// The bundle script resolves the shipped site-packages under its own

@@ -60,7 +60,7 @@ final class DiarizationBootstrap: ObservableObject {
     /// (The runtime self-heal still handles any *other* transitive dep
     /// that may surface later.)
     static let extraInstallSpecs: [String] = [
-        "numpy<2",
+        "numpy\(DiarizationDependencyPins.numpy)",
         "matplotlib",
         "Pillow",
         "pyparsing",
