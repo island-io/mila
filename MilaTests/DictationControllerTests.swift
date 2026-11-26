@@ -187,7 +187,7 @@ final class DictationControllerTests: XCTestCase {
     /// teardown ignore every press until relaunch.
     func test_presses_work_again_once_a_cancel_stops_waiting_for_a_stuck_microphone() async {
         let teardown = HeldTeardown()
-        let (controller, live) = makeController(stopRecorder: teardown.run, teardownDeadline: 0.1)
+        let (controller, live) = makeController(stopRecorder: teardown.run, teardownDeadline: 2)
         controller.beginRecordingForTesting(.dictateHebrew)
 
         let cancelReturned = Flag()
@@ -200,10 +200,8 @@ final class DictationControllerTests: XCTestCase {
             await cancel.value
             return XCTFail("setup: the cancel never reached the recorder teardown")
         }
-        if !cancelReturned.isSet {
-            XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .ignore,
-                           "presses are ignored while the cancel waits")
-        }
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .ignore,
+                       "presses are ignored while the cancel waits")
         let returnedInTime = await eventually({ cancelReturned.isSet })
         XCTAssertTrue(returnedInTime, "the cancel stops waiting at the deadline")
         XCTAssertFalse(teardown.didFinish, "the teardown itself is still stuck")
@@ -217,6 +215,32 @@ final class DictationControllerTests: XCTestCase {
         await cancel.value
     }
 
+    /// Quit calls `beginShutdown()` before anything else, and from then on no
+    /// press starts a dictation: not even once the quit's own cancel has set
+    /// `.idle` and the microphone has shut down, which is when one used to
+    /// (#435 review). That dictation came after the quit's cancel, so its
+    /// mic stayed open until exit.
+    func test_a_press_after_quit_begins_does_not_start_a_dictation() async {
+        let (controller, live) = makeController(stopRecorder: {})
+        controller.beginRecordingForTesting(.dictateEnglish)
+
+        controller.beginShutdown()
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .quitting,
+                       "not even the hotkey that would stop the recording")
+        await controller.cancelInFlight()
+        XCTAssertEqual(controller.state, .idle)
+        XCTAssertFalse(live.isRunning, "the quit's cancel still drops the dictation")
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .quitting)
+        XCTAssertEqual(controller.pressOutcome(for: .dictateHebrew), .quitting)
+
+        // Only press once the routing is known to do nothing: a regression
+        // to `.start` would ask for the real microphone here.
+        guard controller.pressOutcome(for: .dictateHebrew) == .quitting else { return }
+        await controller.toggle(action: .dictateHebrew)
+        XCTAssertEqual(controller.state, .idle, "the press started nothing")
+        XCTAssertFalse(live.isRunning)
+    }
+
     /// The recorder's teardown has no timeout of its own and can block on
     /// the CoreAudio HAL. A stop or cancel waits for it at most
     /// `recorderTeardownDeadline`, then carries on, so a teardown that never
@@ -225,22 +249,27 @@ final class DictationControllerTests: XCTestCase {
     /// must not resume the wait a second time, which would trap.
     func test_a_teardown_that_overruns_the_deadline_is_left_behind() async {
         let teardown = HeldTeardown()
+        let lateReturn = Flag()
         let started = Date()
-        let inTime = await DictationController.waitAtMost(0.1) {
+        let inTime = await DictationController.waitAtMost(0.1, for: {
             await teardown.run()
-        }
+        }, onLateReturn: { lateReturn.isSet = true })
         XCTAssertFalse(inTime, "the wait must give up at the deadline")
         XCTAssertLessThan(Date().timeIntervalSince(started), 5,
                           "the wait must end at the deadline, not with the teardown")
         XCTAssertTrue(teardown.isRunning, "the teardown itself keeps running")
 
+        XCTAssertFalse(lateReturn.isSet)
         teardown.finish()
-        let finished = await eventually({ teardown.didFinish })
-        XCTAssertTrue(finished, "the late completion ran, and was a no-op")
+        let reported = await eventually({ lateReturn.isSet })
+        XCTAssertTrue(reported, "the late completion is reported, and resumes nothing")
+        XCTAssertTrue(teardown.didFinish)
 
         let quick = Date()
-        let fast = await DictationController.waitAtMost(30) {}
+        let onTime = Flag()
+        let fast = await DictationController.waitAtMost(30, for: {}, onLateReturn: { onTime.isSet = true })
         XCTAssertTrue(fast, "a teardown that returns in time is reported as such")
+        XCTAssertFalse(onTime.isSet, "a return in time is not a late one")
         XCTAssertLessThan(Date().timeIntervalSince(quick), 5,
                           "a teardown that returns at once must not wait for the deadline")
         XCTAssertGreaterThan(DictationController.recorderTeardownDeadline, 0)

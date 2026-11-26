@@ -2932,17 +2932,21 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func gracefulShutdown() async {
+        // Before the first await: from here on a dictation hotkey does
+        // nothing. A dictation started in one of the suspensions below would
+        // come after the dictation cancel, and nothing would stop it.
+        dictation?.beginShutdown()
         // Stop any active recording / dictation cleanly so AVAudioEngine and
         // SCStream release the user's mic / screen-recording grant.
         await session?.cancelAll()
         // The cancel stops the dictation's live transcriber before its first
         // await, so no new live pass starts on the engine that
         // `transcription.shutdown()` frees below; it then waits for the mic's
-        // teardown, for at most 10 s. A sleep or screen-lock cancel still
-        // waiting for the microphone has already set the state to `.idle`,
-        // and then this returns at once. A dictation still starting also
-        // reads `.idle` until its mic is up and is not cancelled here — a
-        // known gap, shared with sleep and screen lock.
+        // teardown, for at most `DictationController.recorderTeardownDeadline`.
+        // A sleep or screen-lock cancel still waiting for the microphone has
+        // already set the state to `.idle`, and then this returns at once. A
+        // dictation still starting when the quit began reads `.idle` too and
+        // is not cancelled here; it stops its own mic once that is up.
         await dictation?.cancelInFlight()
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.

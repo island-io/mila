@@ -54,6 +54,10 @@ final class DictationController: ObservableObject {
     /// and the wait is bounded by `recorderTeardownDeadline`, so this always
     /// clears.
     private var isTearingDown: Bool { isStopping || cancelsTearingDown > 0 }
+    /// Set by `beginShutdown()` when Mila starts quitting, and never cleared.
+    private var isShuttingDown = false
+    /// The first press during a quit is logged; the rest are not.
+    private var loggedPressWhileQuitting = false
     /// Bumped by every `cancelInFlight` that acts. A stop compares it twice:
     ///  * across its recorder teardown — a sleep, screen-lock or quit cancel
     ///    can run in that wait (the state still reads `.recording`) and has
@@ -166,15 +170,35 @@ final class DictationController: ObservableObject {
                 stopping=\(self.isStopping) cancelling=\(self.cancelsTearingDown)
                 """)
             NSSound.beep()
+        case .quitting:
+            // No beep: Mila is on its way out.
+            if !loggedPressWhileQuitting {
+                loggedPressWhileQuitting = true
+                dictationLog.log("press of \(action.rawValue, privacy: .public) ignored: Mila is quitting")
+            }
         }
     }
 
     /// What a press of `action`'s hotkey would do right now.
     func pressOutcome(for action: HotkeyAction) -> PressOutcome {
-        Self.outcome(ofPress: action, state: state, isTearingDown: isTearingDown)
+        if isShuttingDown { return .quitting }
+        return Self.outcome(ofPress: action, state: state, isTearingDown: isTearingDown)
     }
 
-    enum PressOutcome: Equatable { case start, stop, ignore }
+    /// `quitting`: `beginShutdown()` has run. Every press does nothing,
+    /// whatever the state.
+    enum PressOutcome: Equatable { case start, stop, ignore, quitting }
+
+    /// The first thing the quit does, before it awaits anything: from here
+    /// on every press does nothing. Without it a press in one of the quit's
+    /// suspensions after the dictation cancel started a dictation that
+    /// nothing would stop, with the mic open until exit and a live
+    /// transcriber calling a transcription service that is shutting down.
+    /// Synchronous, so it is in effect before the quit's first await; never
+    /// undone.
+    func beginShutdown() {
+        isShuttingDown = true
+    }
 
     /// What a press of `action`'s hotkey does. Kept pure so the routing can
     /// be tested without a microphone.
@@ -250,9 +274,11 @@ final class DictationController: ObservableObject {
     /// Wait for `operation`, but for at most `seconds`. Returns true when it
     /// finished in time. On a timeout the operation keeps running; its late
     /// completion resumes nothing, so whatever follows it in the caller has
-    /// already moved on. Used to bound `MicrophoneRecorder.stop()`.
+    /// already moved on, and runs `onLateReturn` instead. Used to bound
+    /// `MicrophoneRecorder.stop()`.
     static func waitAtMost(_ seconds: TimeInterval,
-                           for operation: @escaping @MainActor () async -> Void) async -> Bool {
+                           for operation: @escaping @MainActor () async -> Void,
+                           onLateReturn: (@MainActor () -> Void)? = nil) async -> Bool {
         let race = DeadlineRace()
         return await withCheckedContinuation { continuation in
             race.continuation = continuation
@@ -262,27 +288,25 @@ final class DictationController: ObservableObject {
             }
             Task { @MainActor in
                 await operation()
-                race.finish(inTime: true)
+                if !race.finish(inTime: true) { onLateReturn?() }
             }
         }
     }
 
-    /// Stop the recorder, waiting at most `recorderTeardownDeadline`.
+    /// Stop the recorder, waiting at most `teardownDeadline`
+    /// (`recorderTeardownDeadline` outside tests).
     private func stopRecorder(for reason: String) async {
         let started = Date()
         let deadline = teardownDeadline
-        let inTime = await Self.waitAtMost(deadline) { [stopRecorderNow] in
+        let inTime = await Self.waitAtMost(deadline, for: { [stopRecorderNow] in
             await stopRecorderNow()
-            // Nothing waits for a teardown past the deadline, so log when it
-            // does return: how long the mic stayed open.
-            let elapsed = Date().timeIntervalSince(started)
-            if elapsed >= deadline {
-                dictationLog.log("""
-                    dictation \(reason, privacy: .public): the microphone finished shutting down \
-                    after \(Int(elapsed), privacy: .public) s
-                    """)
-            }
-        }
+        }, onLateReturn: {
+            // Nothing waits for it any more, so log how long the mic stayed open.
+            dictationLog.log("""
+                dictation \(reason, privacy: .public): the microphone finished shutting down \
+                after \(Int(Date().timeIntervalSince(started)), privacy: .public) s
+                """)
+        })
         if !inTime {
             dictationLog.error("""
                 dictation \(reason, privacy: .public): the microphone had not finished shutting down \
@@ -456,6 +480,14 @@ final class DictationController: ObservableObject {
                 """)
             targetApp = nil
             NSSound.beep()
+            return
+        }
+        // A quit that began while the mic was coming up found `.idle` and
+        // cancelled nothing. Stop the mic instead of capturing behind it.
+        guard !isShuttingDown else {
+            dictationLog.log("dictation not started: Mila is quitting")
+            targetApp = nil
+            await stopRecorder(for: "quit")
             return
         }
         // At most one hold per controller. Every end path clears the previous
@@ -822,11 +854,14 @@ private final class DeadlineRace {
     var continuation: CheckedContinuation<Bool, Never>?
     var timer: Task<Void, Never>?
 
-    func finish(inTime: Bool) {
-        guard let continuation else { return }
+    /// Returns whether this call resumed the waiter.
+    @discardableResult
+    func finish(inTime: Bool) -> Bool {
+        guard let continuation else { return false }
         self.continuation = nil
         timer?.cancel()
         timer = nil
         continuation.resume(returning: inTime)
+        return true
     }
 }
