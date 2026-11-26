@@ -58,10 +58,10 @@ final class DictationController: ObservableObject {
     /// finish tearing the audio engine down. That teardown has no timeout of
     /// its own, and `engine.stop()` can block on the CoreAudio HAL queue
     /// (a Bluetooth mic mid-profile-switch). Past this, the stop carries on
-    /// with the audio already captured — capture ended before the teardown
-    /// started — through the same steps as an in-time stop, only later. The
-    /// teardown keeps running, and no new dictation starts until it has
-    /// returned.
+    /// with the audio already captured — capture ends in the teardown's first,
+    /// synchronous step, before the part that can block — through the same
+    /// final pass, paste and save as an in-time stop. The teardown keeps
+    /// running, and no new dictation starts until it has returned.
     static let recorderTeardownDeadline: TimeInterval = 10
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
@@ -481,8 +481,9 @@ final class DictationController: ObservableObject {
         modelHold = nil
         stopLiveTranscription()
         // Bounded: a teardown stuck on the CoreAudio HAL must not leave this
-        // stop waiting for good. Capture has already ended by the time the
-        // teardown starts, so `samples` holds the whole dictation either way.
+        // stop waiting for good. Capture ends in the teardown's first,
+        // synchronous step, before the part that can block, so a timeout
+        // costs no audio.
         await waitForRecorder(recorderTeardowns.begin(), reason: "stop")
         guard generation == cancelGeneration else {
             // A sleep, screen-lock or quit cancel ran during the teardown and
