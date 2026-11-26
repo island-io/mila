@@ -53,9 +53,7 @@ final class AudioConvertTests: XCTestCase {
             AVLinearPCMIsNonInterleaved: false
         ]
         // Write in a nested scope so the writer is deallocated (and the header
-        // is finalized) before we read the file back. AVAudioFile may not flush
-        // its very last buffer on deinit, so we write more than we need and
-        // assert on a generous lower bound.
+        // is finalized) before we read the file back.
         try {
             let file = try AVAudioFile(forWriting: wavURL, settings: settings,
                                        commonFormat: .pcmFormatFloat32, interleaved: false)
@@ -63,10 +61,12 @@ final class AudioConvertTests: XCTestCase {
             try file.write(from: buffer)
         }()
 
+        // Every frame. This used to allow a shortfall, blamed on the writer
+        // not flushing its last buffer; the frames were on disk all along, and
+        // it was the single read that stopped short (#376, see
+        // `test_whisper_wav_round_trips_every_frame`).
         let samples = try AudioConvert.loadAsWhisperSamples(url: wavURL)
-        XCTAssertGreaterThan(samples.count, 24_000,
-                             "Expected most of the 32k samples to round trip")
-        XCTAssertLessThanOrEqual(samples.count, 32_000)
+        XCTAssertEqual(samples.count, 32_000)
         XCTAssertGreaterThan(samples.map { abs($0) }.max() ?? 0, 0.4)
     }
 
@@ -138,77 +138,117 @@ final class AudioConvertTests: XCTestCase {
                       "Pass-through must return the same instance (documented contract — callers copy before mutating)")
     }
 
-    /// A 25 s recording written by `writeWhisperWAV` and read back by
-    /// `loadAsWhisperSamples` came back 640 frames short on CI's macOS 26
-    /// image (#376) — 399,360 = 390 × 1024. Measures every step separately
-    /// so the message says which side loses the frames.
+    /// The whole loader, on a real file: a 25 s WAV written by
+    /// `writeWhisperWAV` comes back with every frame, whole and by range. It
+    /// used to come back 640 frames short (399,360 = 390 × 1024): the file
+    /// held all 400,000 — header, payload, `AVAudioFile.length` and
+    /// `WAVReader` all said so on CI — but one `read(into:)` stopped at the
+    /// last whole block of 1024 (#376). The `readFrames` tests below pin the
+    /// loop itself, without a file.
     func test_whisper_wav_round_trips_every_frame() throws {
         let frames = 400_000
-        let samples = (0..<frames).map { 0.3 * Float(sin(Double($0) / 10)) }
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("wav-roundtrip-\(UUID())", isDirectory: true)
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
+        let written = (0..<frames).map { 0.3 * Float(sin(Double($0) / 10)) }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("wav-roundtrip-\(UUID()).wav")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try AudioConvert.writeWhisperWAV(samples: written, to: url)
 
-        func dataFrames(_ url: URL) -> Int {
-            guard let bytes = try? [UInt8](Data(contentsOf: url)), bytes.count >= 12 else { return -1 }
-            func u32(_ o: Int) -> Int {
-                Int(bytes[o]) | Int(bytes[o + 1]) << 8 | Int(bytes[o + 2]) << 16 | Int(bytes[o + 3]) << 24
-            }
-            var offset = 12
-            while offset + 8 <= bytes.count {
-                let size = u32(offset + 4)
-                if bytes[offset..<offset + 4].elementsEqual("data".utf8) {
-                    return size / 4 * 1_000_000 + (bytes.count - offset - 8) / 4
-                }
-                offset += 8 + size + (size & 1)
-            }
-            return -2
+        let whole = try AudioConvert.loadAsWhisperSamples(url: url)
+        XCTAssertEqual(whole.count, frames)
+        XCTAssertEqual(whole.suffix(640), written.suffix(640), "the end of the audio, not just its length")
+
+        let ranged = try AudioConvert.loadAsWhisperSamples(url: url, from: 0, to: 25)
+        XCTAssertEqual(ranged.count, frames)
+    }
+
+    /// What `AVAudioFile` does with a WAV: a read asked for N frames returns
+    /// only the whole blocks of 1024, and the rest on the next call. Both
+    /// channels of a deinterleaved buffer must come back whole and in order.
+    func test_readFrames_keeps_reading_after_a_short_read() throws {
+        let source = BlockReader(frames: 400_000, channels: 2)
+        let buffer = try XCTUnwrap(AudioConvert.readFrames(
+            count: 400_000, format: source.format, atEnd: { source.atEnd }, read: source.read))
+
+        XCTAssertEqual(source.calls, 2, "399,360 frames, then the last 640")
+        XCTAssertEqual(Int(buffer.frameLength), 400_000)
+        for channel in 0..<2 {
+            let read = Array(UnsafeBufferPointer(start: buffer.floatChannelData![channel], count: 400_000))
+            XCTAssertEqual(read, source.data[channel], "channel \(channel)")
         }
-        var report: [String] = []
+    }
 
-        let plain = dir.appendingPathComponent("plain.wav")
-        try AudioConvert.writeWhisperWAV(samples: samples, to: plain)
-        report.append("written(header*1e6+payload)=\(dataFrames(plain))")
-        report.append("AVAudioFile.length=\((try? AVAudioFile(forReading: plain).length) ?? -1)")
-        report.append("WAVReader=\((try? WAVReader.loadSamples(url: plain).count) ?? -1)")
-        let loaded = try AudioConvert.loadAsWhisperSamples(url: plain)
-        report.append("loadAsWhisperSamples=\(loaded.count)")
-        if let file = try? AVAudioFile(forReading: plain),
-           let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(frames)) {
-            var total = 0
-            while file.framePosition < file.length {
-                try file.read(into: buffer)
-                if buffer.frameLength == 0 { break }
-                total += Int(buffer.frameLength)
-            }
-            report.append("readLoop=\(total)")
-        }
+    /// A later read only adds to the first one, so its failure must not turn
+    /// a load that one read used to complete into an error.
+    func test_readFrames_keeps_the_first_read_when_a_later_read_fails() throws {
+        let source = BlockReader(frames: 10_000, channels: 1)
+        source.failOnCall = 2
+        let buffer = try XCTUnwrap(AudioConvert.readFrames(
+            count: 10_000, format: source.format, atEnd: { source.atEnd }, read: source.read))
+        XCTAssertEqual(Int(buffer.frameLength), 9_216, "the 9 whole blocks the first read returned")
+    }
 
-        let pooled = dir.appendingPathComponent("pooled.wav")
-        try autoreleasepool { try AudioConvert.writeWhisperWAV(samples: samples, to: pooled) }
-        report.append("pooledWrite=\(dataFrames(pooled))")
+    func test_readFrames_throws_when_the_first_read_fails() {
+        let source = BlockReader(frames: 10_000, channels: 1)
+        source.failOnCall = 1
+        XCTAssertThrowsError(try AudioConvert.readFrames(
+            count: 10_000, format: source.format, atEnd: { source.atEnd }, read: source.read))
+    }
 
-        if #available(macOS 15.0, *) {
-            let closed = dir.appendingPathComponent("closed.wav")
-            let format = WhisperAudioFormat.pcmFloat32
-            let file = try AVAudioFile(forWriting: closed, settings: format.settings,
-                                       commonFormat: .pcmFormatFloat32, interleaved: false)
-            let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames)))
-            buffer.frameLength = AVAudioFrameCount(frames)
-            samples.withUnsafeBufferPointer { buffer.floatChannelData![0].update(from: $0.baseAddress!, count: frames) }
-            try file.write(from: buffer)
-            report.append("beforeClose=\(dataFrames(closed))")
-            file.close()
-            report.append("closedWrite=\(dataFrames(closed))")
-        }
+    /// A read that returns nothing ends the loop instead of spinning on it.
+    func test_readFrames_stops_at_an_empty_read() throws {
+        let source = BlockReader(frames: 10_000, channels: 1)
+        source.emptyAfterFirstCall = true
+        let buffer = try XCTUnwrap(AudioConvert.readFrames(
+            count: 10_000, format: source.format, atEnd: { source.atEnd }, read: source.read))
+        XCTAssertEqual(Int(buffer.frameLength), 9_216)
+        XCTAssertEqual(source.calls, 2)
+    }
 
-        let message = report.joined(separator: " ")
-        print("[wav-roundtrip] \(message)")
-        XCTAssertEqual(loaded.count, frames, message)
+    func test_readFrames_returns_nil_for_nothing_to_read() throws {
+        let source = BlockReader(frames: 0, channels: 1)
+        XCTAssertNil(try AudioConvert.readFrames(
+            count: 0, format: source.format, atEnd: { source.atEnd }, read: source.read))
+        XCTAssertEqual(source.calls, 0)
     }
 
     // MARK: - Helpers
+
+    /// Stands in for `AVAudioFile.read(into:frameCount:)` as it behaves on a
+    /// WAV: asked for 1024 frames or more, it fills only whole blocks of 1024
+    /// and leaves the rest for the next call.
+    private final class BlockReader {
+        let format: AVAudioFormat
+        let data: [[Float]]
+        private var position = 0
+        private(set) var calls = 0
+        var failOnCall: Int?
+        var emptyAfterFirstCall = false
+
+        init(frames: Int, channels: Int) {
+            format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                                   channels: AVAudioChannelCount(channels), interleaved: false)!
+            data = (0..<channels).map { channel in
+                (0..<frames).map { Float(channel * 1_000_000 + $0) }
+            }
+        }
+
+        var atEnd: Bool { position >= (data.first?.count ?? 0) }
+
+        func read(_ buffer: AVAudioPCMBuffer, _ frameCount: AVAudioFrameCount) throws {
+            calls += 1
+            if calls == failOnCall { throw NSError(domain: "BlockReader", code: calls) }
+            var count = min(Int(frameCount), (data.first?.count ?? 0) - position)
+            if count >= 1024 { count -= count % 1024 }
+            if emptyAfterFirstCall && calls > 1 { count = 0 }
+            for (channel, samples) in data.enumerated() {
+                samples.withUnsafeBufferPointer {
+                    buffer.floatChannelData![channel].update(from: $0.baseAddress! + position, count: count)
+                }
+            }
+            buffer.frameLength = AVAudioFrameCount(count)
+            position += count
+        }
+    }
 
     private func makeBuffer(format: AVAudioFormat,
                             sineHz: Double,
