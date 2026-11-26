@@ -151,6 +151,9 @@ final class DictationController: ObservableObject {
     /// teardown on the same device, and that new dictation could not be
     /// stopped until the old stop finished. The press beeps; once the
     /// teardown returns, the old stop drops out and the next press starts.
+    /// A teardown that never returns keeps every press beeping, but in that
+    /// state a new bring-up would block on the same CoreAudio HAL queue and
+    /// fail after `bringUpTimeout` anyway (see `MicrophoneRecorder.stop`).
     static func outcome(ofPress action: HotkeyAction,
                         state: State,
                         isStopping: Bool) -> PressOutcome {
@@ -203,6 +206,7 @@ final class DictationController: ObservableObject {
         // first without cancelling it and the recorder was restarted
         // mid-flight. Set synchronously, so the second entry bails.
         guard !isStarting else {
+            dictationLog.log("press of \(action.rawValue, privacy: .public) ignored: a start is already in progress")
             NSSound.beep()
             return
         }
@@ -213,6 +217,7 @@ final class DictationController: ObservableObject {
         // (consistent with Settings copy). A beep is the right-sized signal
         // for the hotkey flow — rare edge, and the user can free space.
         if let storageSettings, store.currentUsageBytes() >= storageSettings.limitBytes {
+            dictationLog.log("dictation not started: the recordings folder is at its storage limit")
             NSSound.beep()
             return
         }
@@ -238,6 +243,7 @@ final class DictationController: ObservableObject {
         }
 
         guard await recorder.requestAccess() else {
+            dictationLog.log("dictation not started: microphone access was not granted")
             NSSound.beep()
             return
         }
