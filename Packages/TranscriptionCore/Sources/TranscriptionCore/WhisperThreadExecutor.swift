@@ -34,7 +34,8 @@ import Foundation
 /// task afterwards does not move it up. None of those callers sets a
 /// priority explicitly, so each job carries the priority of the task that
 /// made the call, and a lower-priority one (a batch pass enqueued from a
-/// background task, say) waits while higher-priority jobs are queued.
+/// background task, say) waits for as long as higher-priority jobs keep
+/// arriving.
 ///
 /// **One thread, shared.** `static let shared` lives as long as the process,
 /// so the thread is never torn down and never leaks per instance. Every
@@ -57,8 +58,8 @@ final class WhisperThreadExecutor: SerialExecutor, @unchecked Sendable {
 
     private let condition = NSCondition()
     /// Jobs not yet run, in arrival order. `nextJob()` takes the first one of
-    /// the highest priority. The queue holds a handful of jobs at most (one
-    /// per caller waiting on the engine), so a linear scan is the right cost.
+    /// the highest priority. Only the few callers of one engine queue here,
+    /// so the queue stays short and a linear scan is the right cost.
     private var jobs: [UnownedJob] = []
     /// Written once, in `init`, before the thread starts.
     private var thread: Thread!
