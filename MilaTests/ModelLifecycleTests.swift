@@ -99,6 +99,35 @@ final class ModelLifecycleTests: XCTestCase {
             remoteActive: false))
     }
 
+    func test_retentionMatrix_finalizeRetainsEvenWhenTheNewRecordingIsBatchOnly() {
+        // Deliberate: since #356 a batch-only recording can start during a
+        // live recording's drain and overwrite `recordingRunsLivePipeline`
+        // while that drain still needs the model. Finalize alone retains;
+        // the release then waits for it to clear.
+        XCTAssertTrue(MilaApp.localModelRetentionRequired(
+            livePipelineEnabled: false,
+            recordingRunsLivePipeline: false,
+            recordingActive: true,
+            stoppingOrFinalizing: true,
+            remoteActive: false))
+    }
+
+    // MARK: - Record-start gate
+
+    func test_modelPreparation_blocksRecordStartOnlyForALiveRecording() {
+        // Live: a recording started mid-compile would feed a model that is
+        // not ready, so the start is refused.
+        XCTAssertTrue(QuickActionsController.modelPreparationBlocksRecordStart(
+            isPreparingModel: true, nextRecordingRunsLivePipeline: true))
+        // Batch-only: the model loads on demand after every Stop (#393). The
+        // next recording does not use it until its own batch pass, so the
+        // reload must not drop a hotkey or auto-record start.
+        XCTAssertFalse(QuickActionsController.modelPreparationBlocksRecordStart(
+            isPreparingModel: true, nextRecordingRunsLivePipeline: false))
+        XCTAssertFalse(QuickActionsController.modelPreparationBlocksRecordStart(
+            isPreparingModel: false, nextRecordingRunsLivePipeline: true))
+    }
+
     func test_retentionMatrix_liveModePinsAndRemoteReleases() {
         XCTAssertTrue(MilaApp.localModelRetentionRequired(
             livePipelineEnabled: true,

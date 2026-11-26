@@ -99,7 +99,10 @@ struct HomeView: View {
             isRecording: isRecording,
             startingSource: actions.startingSource,
             isFinalizing: actions.isStoppingRecording,
-            isPreparingModel: transcription.isPreparingModel,
+            // Only a load that would refuse the record start shows as
+            // "Preparing AI…": in batch-only mode the model loads on demand
+            // after every Stop, and recording is allowed meanwhile.
+            isPreparingModel: actions.modelPreparationBlocksRecordStart,
             preparationStatus: transcription.preparationStatus,
             languageFlag: languageSettings.current.flagEmoji,
             languageName: languageSettings.current.displayName,
@@ -133,7 +136,7 @@ struct HomeView: View {
         // shows a spinner + "Starting…" and refuses the second click that
         // used to run a second bring-up (#293).
         .disabled(actions.isStoppingRecording || actions.isStartingRecording
-                  || transcription.isPreparingModel || !canRecord)
+                  || actions.modelPreparationBlocksRecordStart || !canRecord)
     }
 
     /// The two independent source toggles below the Record button:

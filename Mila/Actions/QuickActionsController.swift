@@ -732,6 +732,33 @@ final class QuickActionsController: ObservableObject {
         }
     }
 
+    /// Whether a whisper model load in progress should refuse a record start.
+    ///
+    /// The gate exists for the LIVE pipeline: a recording started while the
+    /// encoder is still compiling would feed live utterances to a model that
+    /// is not ready. A recording that skips the live pipeline does not touch
+    /// the model until its batch pass, which simply waits for the load. In
+    /// batch-only mode the model is loaded on demand after every Stop
+    /// (#393), so gating on any load would silently drop the next record start
+    /// (a hotkey, a menu command, a back-to-back meeting's auto-start) for
+    /// the length of every reload. `HomeView` greys the Record button on the
+    /// same value.
+    var modelPreparationBlocksRecordStart: Bool {
+        Self.modelPreparationBlocksRecordStart(
+            isPreparingModel: transcription.isPreparingModel,
+            nextRecordingRunsLivePipeline: liveAISettings?.runsLivePipeline ?? true)
+    }
+
+    /// Pure form of `modelPreparationBlocksRecordStart`, for tests.
+    /// `nextRecordingRunsLivePipeline` is the decision `prepareLivePipeline`
+    /// will snapshot for the recording being started.
+    nonisolated static func modelPreparationBlocksRecordStart(
+        isPreparingModel: Bool,
+        nextRecordingRunsLivePipeline: Bool
+    ) -> Bool {
+        isPreparingModel && nextRecordingRunsLivePipeline
+    }
+
     private func startRecording(withSystemAudio: Bool) async {
         // Controller-side counterpart to HomeView's
         // `.disabled(... transcription.isPreparingModel)`. The button
@@ -741,7 +768,7 @@ final class QuickActionsController: ObservableObject {
         // encoder can't yet transcribe — the user would speak for a
         // minute and get `segments=0` while the model finishes compiling.
         // Mirror the `isStoppingRecording` guard in `toggleRecord`.
-        guard !transcription.isPreparingModel else {
+        guard !modelPreparationBlocksRecordStart else {
             quickActionsLog.log("startRecording ignored — model still preparing (Neural Engine compile)")
             return
         }
@@ -970,7 +997,7 @@ final class QuickActionsController: ObservableObject {
         isAppPickerShown = false
         // Same Neural-Engine-preparing guard as `startRecording` — the
         // app-audio entry point isn't behind the gated Home button.
-        guard !transcription.isPreparingModel else {
+        guard !modelPreparationBlocksRecordStart else {
             quickActionsLog.log("startAppRecording ignored — model still preparing (Neural Engine compile)")
             return
         }

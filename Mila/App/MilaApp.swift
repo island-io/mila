@@ -1124,7 +1124,11 @@ struct MilaApp: App {
                 .task { prewarmDefaultModel() }
                 // Observe the combined decision once: six separate modifiers
                 // push this large window expression past Swift's type-check limit.
-                .onChange(of: needsWarmLocalModel) { _, _ in
+                // `initial: true` re-syncs whenever this window (re)appears:
+                // the app keeps running with the window closed, and a value
+                // that changed meanwhile (live transcription toggled in
+                // Settings) would otherwise never fire `onChange` again.
+                .onChange(of: needsWarmLocalModel, initial: true) { _, _ in
                     syncLocalModelRetention()
                 }
                 .task { await diarizationSettings.runHealthCheck() }
@@ -1280,6 +1284,14 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                // The live-transcription toggle lives here, and this window
+                // can be open while the main window is closed (whose own
+                // `onChange` then isn't running). Syncing from both scenes is
+                // idempotent: `syncLocalModelRetention` only prewarms on a
+                // false → true change of `retainsLocalModel`.
+                .onChange(of: needsWarmLocalModel, initial: true) { _, _ in
+                    syncLocalModelRetention()
+                }
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
         // `SettingsView`; since #177 it is a resizable sidebar window whose
@@ -2401,6 +2413,13 @@ struct MilaApp: App {
     /// app: the case that matters most is live transcription ON at record
     /// start and switched OFF mid-recording — the recording must keep its warm
     /// model until it stops and its drain finishes, then release it.
+    ///
+    /// `stoppingOrFinalizing` retains on its own, even for a recording that
+    /// never ran the live pipeline, on purpose: since #356 a new recording can
+    /// start during the previous one's drain, and `prepareLivePipeline` then
+    /// overwrites `recordingRunsLivePipeline` with the NEW recording's
+    /// decision while the old live drain still needs the model. The cost in
+    /// batch-only mode is only that a release waits for finalize to clear.
     static func localModelRetentionRequired(
         livePipelineEnabled: Bool,
         recordingRunsLivePipeline: Bool,
