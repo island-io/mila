@@ -35,18 +35,11 @@ final class WhisperExecutorTests: XCTestCase {
         let engine = WhisperEngine()
         let log = EventLog()
         let release = DispatchSemaphore(value: 0)
+        // However this test exits, never leave the shared whisper thread
+        // parked: every later test that touches a `WhisperEngine` would hang.
+        defer { release.signal() }
 
-        let running = Task {
-            await engine.blockForTesting(entered: { log.append("entered") }, release: release)
-            log.append("call returned")
-        }
-        // Polled rather than awaited on an expectation, so the wait parks no
-        // thread and needs nothing beyond what corelibs XCTest has on Linux.
-        let deadline = Date().addingTimeInterval(10)
-        while log.events.isEmpty, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertEqual(log.events, ["entered"], "the blocking call never started")
+        let running = try await blockWhisperThread(engine, log: log, release: release)
 
         let unload = Task { await engine.unload(); log.append("unload") }
         let shutdown = Task { await engine.shutdown(); log.append("shutdown") }
@@ -62,6 +55,50 @@ final class WhisperExecutorTests: XCTestCase {
         XCTAssertEqual(Array(log.events.prefix(2)), ["entered", "released"])
         XCTAssertEqual(Set(log.events.dropFirst(2)), ["call returned", "unload", "shutdown"])
     }
+
+    /// Waiting jobs run highest priority first, as on the default actor
+    /// executor, rather than strictly in arrival order.
+    func test_waiting_jobs_run_highest_priority_first() async throws {
+        let engine = WhisperEngine()
+        let log = EventLog()
+        let release = DispatchSemaphore(value: 0)
+        defer { release.signal() }
+
+        let running = try await blockWhisperThread(engine, log: log, release: release)
+
+        let low = Task(priority: .low) { await engine.appendForTesting("low", to: log) }
+        // Let the low-priority job reach the queue first.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        let high = Task(priority: .high) { await engine.appendForTesting("high", to: log) }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(log.events, ["entered"])
+
+        release.signal()
+        await running.value
+        await low.value
+        await high.value
+        XCTAssertEqual(log.events.filter { $0 == "low" || $0 == "high" }, ["high", "low"])
+    }
+
+    /// Parks the whisper thread inside an isolated engine call, the way
+    /// `whisper_full` does, and returns once it is parked. The call returns
+    /// when `release` is signalled (or after 30 s, so a broken test cannot
+    /// hold the thread forever).
+    private func blockWhisperThread(_ engine: WhisperEngine, log: EventLog,
+                                    release: DispatchSemaphore) async throws -> Task<Void, Never> {
+        let running = Task {
+            await engine.blockForTesting(entered: { log.append("entered") }, release: release)
+            log.append("call returned")
+        }
+        // Polled rather than awaited on an expectation, so the wait parks no
+        // thread and needs nothing beyond what corelibs XCTest has on Linux.
+        let deadline = Date().addingTimeInterval(10)
+        while log.events.isEmpty, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(log.events, ["entered"], "the blocking call never started")
+        return running
+    }
 }
 
 extension WhisperEngine {
@@ -69,7 +106,11 @@ extension WhisperEngine {
     /// way `whisper_full` does until `release` is signalled.
     func blockForTesting(entered: @Sendable () -> Void, release: DispatchSemaphore) {
         entered()
-        release.wait()
+        _ = release.wait(timeout: .now() + 30)
+    }
+
+    fileprivate func appendForTesting(_ event: String, to log: EventLog) {
+        log.append(event)
     }
 
     func isOnWhisperThreadForTesting() -> Bool {
