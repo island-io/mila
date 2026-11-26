@@ -267,12 +267,21 @@ final class DictationController: ObservableObject {
     /// Stop any in-flight dictation immediately: sleep, screen lock and quit.
     /// During capture the dictation is dropped; during its final pass only
     /// the paste is (see `CancelEffect`).
-    func cancelInFlight() async {
+    ///
+    /// `waitsForACancelInProgress: false` is for quit: a cancel already
+    /// tearing down cleans up on its own, nothing can start a new dictation
+    /// once the app is terminating, and joining would hold the quit for up
+    /// to `recorderTeardownDeadline` behind a stuck teardown.
+    func cancelInFlight(waitsForACancelInProgress: Bool = true) async {
         // A second cancel while the first is still tearing down (the state
         // reads `.recording` throughout) waits for that one and returns with
         // it: one teardown, one cleanup, and presses stay ignored until both
         // are done.
         if cancelTeardown.isRunning {
+            guard waitsForACancelInProgress else {
+                dictationLog.log("dictation cancel: a cancel is already in progress; not waiting for it")
+                return
+            }
             dictationLog.log("dictation cancel: joining the cancel already in progress")
             await cancelTeardown.runOrJoin {}
             return
@@ -640,14 +649,14 @@ final class DictationController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
             // The state is `.idle` by now, so a screen lock in this delay
             // cancels nothing: check the lock itself before typing ⌘V, which
-            // would otherwise go to the lock screen. Skipped, the transcript
-            // stays on the clipboard for after the unlock, as when
-            // Accessibility is missing: no restore over it.
-            guard !Self.isScreenLocked else {
+            // would otherwise go to the lock screen. The clipboard is still
+            // restored: the transcript is in History, and the user's earlier
+            // clipboard is nowhere else.
+            if Self.isScreenLocked {
                 dictationLog.log("dictation paste skipped: the screen locked before it was typed")
-                return
+            } else {
+                Self.postCommandV()
             }
-            Self.postCommandV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if !priorContents.isEmpty {
                     Self.restorePasteboard(pasteboard, from: priorContents)
@@ -741,7 +750,15 @@ final class JoinedRun {
     @discardableResult
     func runOrJoin(_ body: @MainActor () async -> Void) async -> Bool {
         if joiners != nil {
-            await withCheckedContinuation { joiners?.append($0) }
+            await withCheckedContinuation { continuation in
+                // Same turn as the check above, so the run is still going;
+                // resume at once rather than drop the continuation if not.
+                if joiners != nil {
+                    joiners?.append(continuation)
+                } else {
+                    continuation.resume()
+                }
+            }
             return false
         }
         joiners = []

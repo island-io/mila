@@ -112,12 +112,6 @@ final class DictationControllerTests: XCTestCase {
                        .keepWithoutPasting)
     }
 
-    /// The recorder's teardown has no timeout of its own and can block on
-    /// the CoreAudio HAL. A stop or cancel waits for it at most
-    /// `recorderTeardownDeadline`, then carries on, so a teardown that never
-    /// returns cannot leave every later press ignored until relaunch. Its
-    /// completion after the deadline must change nothing: in particular it
-    /// must not resume the wait a second time, which would trap.
     /// Closing the lid sends both the screen-lock and the sleep guard to
     /// `cancelInFlight`. The second cancel's `stop()` returns at once, so
     /// when it ran its own teardown it cleared the cancelling flag and set
@@ -139,6 +133,11 @@ final class DictationControllerTests: XCTestCase {
         let deadline = Date().addingTimeInterval(5)
         while !teardown.isRunning, Date() < deadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        guard teardown.isRunning else {
+            teardown.finish()
+            _ = await first.value
+            return XCTFail("setup: the first cancel never reached its teardown")
         }
         XCTAssertTrue(cancels.isRunning, "setup: the first cancel is tearing down")
 
@@ -165,6 +164,12 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(bodies.count, 2)
     }
 
+    /// The recorder's teardown has no timeout of its own and can block on
+    /// the CoreAudio HAL. A stop or cancel waits for it at most
+    /// `recorderTeardownDeadline`, then carries on, so a teardown that never
+    /// returns cannot leave every later press ignored until relaunch. Its
+    /// completion after the deadline must change nothing: in particular it
+    /// must not resume the wait a second time, which would trap.
     func test_a_teardown_that_overruns_the_deadline_is_left_behind() async {
         let teardown = HeldTeardown()
         let started = Date()
@@ -207,15 +212,21 @@ final class DictationControllerTests: XCTestCase {
 private final class HeldTeardown {
     private(set) var isRunning = false
     private(set) var didFinish = false
+    private var released = false
     private var release: CheckedContinuation<Void, Never>?
 
     func run() async {
         isRunning = true
-        await withCheckedContinuation { release = $0 }
+        if !released {
+            await withCheckedContinuation { release = $0 }
+        }
         didFinish = true
     }
 
+    /// Lets `run` return, now or (if it has not started yet) at once when it
+    /// does, so a test that bails out early never leaves it parked.
     func finish() {
+        released = true
         release?.resume()
         release = nil
     }
