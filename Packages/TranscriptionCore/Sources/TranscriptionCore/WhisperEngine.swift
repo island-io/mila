@@ -240,7 +240,7 @@ public actor WhisperEngine {
         // Auto-gain: if the recording is quiet, boost so whisper isn't fooled
         // into thinking it's silence. Capped to a safe ceiling.
         let samples = Self.normalize(rawSamples)
-        let peak = samples.map { abs($0) }.max() ?? 0
+        let peak = Self.peakMagnitude(samples)
         let durationSeconds = Double(samples.count) / Double(WhisperAudioFormat.sampleRate)
         print(String(format: "Whisper: transcribing %.2fs of audio, peak=%.3f, lang=%@",
                      durationSeconds, peak, language))
@@ -513,12 +513,29 @@ public actor WhisperEngine {
         return .unavailable
     }
 
+    /// Largest absolute sample value, computed without allocating.
+    ///
+    /// `samples.map { abs($0) }.max()` builds a second full-size array first
+    /// — 460 MB for a 2-hour recording at 16 kHz — only to throw it away.
+    /// NaN samples are skipped (`a > peak` is false for NaN), as `normalize`'s
+    /// own loop already did. That differs from `map { abs }.max()` in one
+    /// case: `max()` seeds with the first element, so a buffer that STARTS
+    /// with NaN used to report a NaN peak. It now reports the largest finite
+    /// magnitude (0 for an all-NaN buffer), which the silence guard reads as
+    /// silent instead of letting NaN slip past `peak < minimumAudioPeak`.
+    public static func peakMagnitude(_ samples: [Float]) -> Float {
+        samples.withUnsafeBufferPointer { buf in
+            var peak: Float = 0
+            for s in buf { let a = abs(s); if a > peak { peak = a } }
+            return peak
+        }
+    }
+
     /// Apply auto-gain so quiet recordings still hit Whisper's speech threshold.
     /// Targets a peak around 0.5 (≈ -6 dB), capped so we never amplify noise more than 20×.
     static func normalize(_ samples: [Float]) -> [Float] {
         guard !samples.isEmpty else { return samples }
-        var peak: Float = 0
-        for s in samples { let a = abs(s); if a > peak { peak = a } }
+        let peak = peakMagnitude(samples)
         guard peak > 0 else { return samples }
         let target: Float = 0.5
         let gain = min(target / peak, 20.0)
