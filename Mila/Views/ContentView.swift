@@ -19,8 +19,11 @@ struct ContentView: View {
     @State private var selection: SidebarSelection? = .home
     @State private var search: String = ""
     /// `search` after a short pause, handed to the recordings lists. Each
-    /// list re-filters every transcript when it changes, so it must not
-    /// follow every keystroke. Clearing the field applies at once.
+    /// list re-filters every transcript whenever its body runs, and a new
+    /// query is one of the things that makes it run, so the query must not
+    /// follow every keystroke. This only debounces typing. Other updates that
+    /// re-render the list still re-filter it (#408 leaves a result cache for
+    /// later). Clearing the field applies at once.
     @State private var debouncedSearch: String = ""
     /// Tracked so we can ping the AppKit chrome hack whenever the user
     /// toggles the sidebar. Without this, the sidebar's

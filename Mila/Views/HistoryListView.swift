@@ -374,13 +374,19 @@ func filterRecordings(_ recs: [Recording], search: String) -> [Recording] {
     // Misses are the common case, since most transcripts don't match.
     // With a locale it uses ICU's string search, which measured 3-4x FASTER
     // than the old code on English and Hebrew transcripts alike (#408).
+    // The locale is FIXED, not `.current`. Under a Turkish locale "invoice"
+    // stops matching "INVOICE" (dotted/dotless i), and results would vary
+    // from Mac to Mac.
     let options: String.CompareOptions = [.caseInsensitive, .diacriticInsensitive]
-    let locale = Locale.current
     return recs.filter { r in
-        r.title.range(of: q, options: options, locale: locale) != nil
-            || r.fullText.range(of: q, options: options, locale: locale) != nil
+        r.title.range(of: q, options: options, locale: searchLocale) != nil
+            || r.fullText.range(of: q, options: options, locale: searchLocale) != nil
     }
 }
+
+/// See `filterRecordings`: a fixed locale gives the same matching on every
+/// Mac and still takes Foundation's fast, locale-aware search path.
+private let searchLocale = Locale(identifier: "en_US_POSIX")
 
 struct DateBucket {
     let label: String
