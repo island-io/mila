@@ -36,14 +36,16 @@ final class DictationControllerTests: XCTestCase {
 
     /// A controller that leaves the host app's global hotkeys alone and
     /// tears its recorder down through `stopRecorder`.
-    private func makeController(stopRecorder: @escaping @MainActor () async -> Void) -> (DictationController, LiveTranscriber) {
+    private func makeController(stopRecorder: @escaping @MainActor () async -> Void,
+                                teardownDeadline: TimeInterval = 30) -> (DictationController, LiveTranscriber) {
         let live = LiveTranscriber(transcription: service)
         let controller = DictationController(store: store,
                                              transcription: service,
                                              hotkeySettings: hotkeys,
                                              liveTranscriber: live,
                                              registersHotkeys: false,
-                                             stopRecorder: stopRecorder)
+                                             stopRecorder: stopRecorder,
+                                             teardownDeadline: teardownDeadline)
         return (controller, live)
     }
 
@@ -162,7 +164,7 @@ final class DictationControllerTests: XCTestCase {
 
         let quitReturned = Flag()
         let quit = Task { @MainActor in
-            await controller.cancelInFlight(waitingForMicrophone: false)
+            await controller.cancelInFlight()
             quitReturned.isSet = true
         }
         let returnedInTime = await eventually({ quitReturned.isSet })
@@ -179,30 +181,40 @@ final class DictationControllerTests: XCTestCase {
                        "presses work again once that wait is over")
     }
 
-    /// Quit cancels a dictation still capturing without waiting for the
-    /// microphone: nothing it needs from the cancel follows that wait, and a
-    /// teardown stuck on the CoreAudio HAL would otherwise hold the quit for
-    /// the whole deadline. The live transcriber is stopped before it returns
-    /// all the same, and the teardown is started.
-    func test_a_quit_during_capture_does_not_wait_for_a_stuck_microphone() async {
+    /// A cancel whose recorder teardown never returns ignores presses only
+    /// until the deadline; after it they start dictations again. Leaving
+    /// `cancelsTearingDown` raised on that path would make one stuck
+    /// teardown ignore every press until relaunch.
+    func test_presses_work_again_once_a_cancel_stops_waiting_for_a_stuck_microphone() async {
         let teardown = HeldTeardown()
-        let (controller, live) = makeController(stopRecorder: teardown.run)
+        let (controller, live) = makeController(stopRecorder: teardown.run, teardownDeadline: 0.1)
         controller.beginRecordingForTesting(.dictateHebrew)
 
-        let quitReturned = Flag()
-        let quit = Task { @MainActor in
-            await controller.cancelInFlight(waitingForMicrophone: false)
-            quitReturned.isSet = true
+        let cancelReturned = Flag()
+        let cancel = Task { @MainActor in
+            await controller.cancelInFlight()
+            cancelReturned.isSet = true
         }
-        let returnedInTime = await eventually({ quitReturned.isSet })
-        XCTAssertTrue(returnedInTime, "the quit does not wait for its own stuck teardown")
-        XCTAssertFalse(live.isRunning, "the live transcriber is stopped when the quit returns")
+        guard await eventually({ teardown.isRunning }) else {
+            teardown.finish()
+            await cancel.value
+            return XCTFail("setup: the cancel never reached the recorder teardown")
+        }
+        if !cancelReturned.isSet {
+            XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .ignore,
+                           "presses are ignored while the cancel waits")
+        }
+        let returnedInTime = await eventually({ cancelReturned.isSet })
+        XCTAssertTrue(returnedInTime, "the cancel stops waiting at the deadline")
+        XCTAssertFalse(teardown.didFinish, "the teardown itself is still stuck")
+        XCTAssertFalse(live.isRunning)
         XCTAssertEqual(controller.state, .idle)
-        let teardownStarted = await eventually({ teardown.isRunning })
-        XCTAssertTrue(teardownStarted, "the microphone's teardown is still started")
+        XCTAssertEqual(controller.pressOutcome(for: .dictateEnglish), .start,
+                       "presses start dictations again after the deadline")
+        XCTAssertEqual(controller.pressOutcome(for: .dictateHebrew), .start)
 
         teardown.finish()
-        await quit.value
+        await cancel.value
     }
 
     /// The recorder's teardown has no timeout of its own and can block on
