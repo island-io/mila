@@ -166,9 +166,15 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         LiveTranscriptSnapshot.read(root: tempRoot)
     }
 
-    private func reader() -> MilaStoreReader { MilaStoreReader(root: tempRoot) }
+    // These read the files the way mila-mcp does, so they first wait for any
+    // `recordings.json` write the store handed to its background writer.
+    private func reader() -> MilaStoreReader {
+        store.waitForPendingWrites()
+        return MilaStoreReader(root: tempRoot)
+    }
 
     private func callTool(_ tool: String, _ args: [String: Any]) throws -> [String: Any] {
+        store.waitForPendingWrites()
         let raw = try MilaMCPToolHandlers(root: tempRoot).handle(tool: tool, arguments: args)
         return try XCTUnwrap(JSONSerialization.jsonObject(with: Data(raw.utf8)) as? [String: Any])
     }
@@ -176,6 +182,7 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
     /// Every readable file under the store root, as text. Unreadable files
     /// (the audio) are skipped rather than failing the sweep.
     private func allTextOnDisk() -> [(path: String, text: String)] {
+        store.waitForPendingWrites()
         var found: [(path: String, text: String)] = []
         let keys: [URLResourceKey] = [.isRegularFileKey]
         guard let walker = FileManager.default.enumerator(
@@ -254,6 +261,7 @@ final class LiveTranscriptLineDeleteTests: XCTestCase {
         XCTAssertFalse(saved.fullText.contains(Self.deletedLine))
 
         // 2. recordings.json.
+        store.waitForPendingWrites()
         let storeJSON = try String(contentsOf: tempRoot.appendingPathComponent("recordings.json"),
                                    encoding: .utf8)
         XCTAssertTrue(storeJSON.contains(Self.keptLine), "precondition: the row really was persisted")

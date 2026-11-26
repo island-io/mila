@@ -147,7 +147,10 @@ enum BundleRelocator {
         // Hard-exit rather than NSApp.terminate to skip the graceful-
         // shutdown sequence (whisper.cpp tear-down etc). The helper
         // waits on our PID via `kill -0`; the faster we exit, the less
-        // visible the gap between quit and relaunch.
+        // visible the gap between quit and relaunch. `exit` skips
+        // `willTerminateNotification`, so finish any recordings.json write
+        // still on the background writer first (#406).
+        RecordingLibraryWriter.shared.drain()
         exit(0)
     }
 }

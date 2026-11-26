@@ -298,6 +298,12 @@ struct StorageSettingsTab: View {
             lastError = "That folder is reserved for whisper models. Please pick a different location."
             return
         }
+        // Finish any recordings.json write still queued for the current
+        // folder before `setDirectory` stops accessing it (#406). Mila is
+        // not sandboxed, but for a folder macOS privacy protects (Desktop,
+        // Documents, a removable or network volume) the bookmark's scope
+        // is what lets it write there.
+        store.waitForPendingWrites()
         guard storage.setDirectory(url) else {
             lastError = "Couldn't save that folder. Try a different location (some network/cloud volumes can't be bookmarked)."
             return
@@ -315,6 +321,7 @@ struct StorageSettingsTab: View {
             return
         }
         lastError = nil
+        store.waitForPendingWrites()  // as in `applyChosenDirectory`
         storage.clearDirectory()
         store.relocateRecordings(to: nil)
     }

@@ -27,8 +27,9 @@ final class LiveTranscriptSidecarWriter: ObservableObject {
     /// ever be “Mila”, no title or user-chosen path can reach them, and a
     /// readable message is what makes a broken MCP handoff diagnosable. Same
     /// established exception as `store-location.json` and `persistTombstones`
-    /// in `RecordingStore`; contrast `persist()` / `persistFolders()` there,
-    /// which follow the user's chosen directory and therefore redact.
+    /// in `RecordingStore`; contrast `RecordingLibraryWriter` and
+    /// `persistFolders()`, which follow the user's chosen directory and
+    /// therefore redact.
     /// (Issue #213.)
     private let root: URL
     private let minWriteInterval: TimeInterval

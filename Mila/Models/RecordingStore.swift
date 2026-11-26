@@ -5,9 +5,6 @@ import OSLog
 import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
-/// Brackets the encode + write in each `persist()` so Instruments shows what a
-/// whole-library write costs. (Retried sidecar rewrites run before it opens.)
-private let recStoreSignposter = OSSignposter(logger: recStoreLog)
 
 /// Persists recordings + their metadata under Application Support/Mila.
 ///
@@ -86,6 +83,8 @@ final class RecordingStore: ObservableObject {
     let permanentlyDeleted = PassthroughSubject<[UUID], Never>()
 
     private let fileManager = FileManager.default
+    /// Writes `recordings.json` off the main actor; see `persist()`.
+    private let writer: RecordingLibraryWriter
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
     /// alongside the `Recordings/` subdir (legacy layout); on a custom
@@ -194,7 +193,12 @@ final class RecordingStore: ObservableObject {
     /// keeping test instances (temp roots) isolated automatically.
     let originalRootDirectory: URL
 
-    init(rootDirectory: URL) {
+    /// `writer` is a seam for tests that hold a background write to see
+    /// which mutations are on disk without it. The app must use `.shared`:
+    /// write ordering holds only between stores that share a writer, and
+    /// `BundleRelocator` drains `.shared` before its hard exit.
+    init(rootDirectory: URL, writer: RecordingLibraryWriter = .shared) {
+        self.writer = writer
         self.originalRootDirectory = rootDirectory
         let defaultRecs = rootDirectory.appendingPathComponent("Recordings", isDirectory: true)
         self.defaultRecordingsDirectory = defaultRecs
@@ -421,7 +425,7 @@ final class RecordingStore: ObservableObject {
         // nothing, and the next launch's orphan sweep finds only `.wav`
         // files. Either way the WAV is the copy that can be found again, so
         // keep it and drop the `.m4a`.
-        guard persist() else {
+        guard persistNow() else {
             recordings[idx].audioFileName = rec.audioFileName
             try? FileManager.default.removeItem(at: dst)
             recStoreLog.error("compressRecordingAudio for \(id, privacy: .public): recordings.json not written; kept the WAV")
@@ -484,11 +488,16 @@ final class RecordingStore: ObservableObject {
         return recordingsDirectory.appendingPathComponent(base + ".wav")
     }
 
+    /// Written before returning, unlike an edit (#406). A crash before a
+    /// background write would lose the whole row, not one change to it:
+    /// orphan recovery brings back only the audio and `.txt`, without the
+    /// title, source app, folder, Live AI summary and action items, or a
+    /// Voice Memo's ID (so the next scan would import the memo again).
     func add(_ recording: Recording) {
         recordings.insert(recording, at: 0)
         writeTranscript(for: recording)
         writeSummary(for: recording)
-        persist()
+        persistNow()
     }
 
     /// Returns whether the record a SEPARATE PROCESS would now read matches
@@ -514,7 +523,7 @@ final class RecordingStore: ObservableObject {
         recordings[idx] = recording
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        let persisted = persist()
+        let persisted = persistNow()
         return transcriptWritten && persisted
     }
 
@@ -564,7 +573,7 @@ final class RecordingStore: ObservableObject {
         }
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        guard persist() else {
+        guard persistNow() else {
             recordings = before
             // The imported recording's sidecars derive from a freshly minted
             // audio name, so they are new files and removing them cannot
@@ -832,7 +841,10 @@ final class RecordingStore: ObservableObject {
         if let i = recordings.firstIndex(where: { $0.id == recordingID }) {
             recordings[i].speakerNameSuggestions.removeAll { $0.speaker == rawID }
         }
-        persist()
+        // The hooks above have already saved the voice profile. A background
+        // write would let a crash keep the fold but lose the name, and naming
+        // the speaker again would fold the same observation twice (#406).
+        persistNow()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
@@ -842,7 +854,7 @@ final class RecordingStore: ObservableObject {
 
     /// Add `suggestions` to a recording's pending speaker-name suggestions,
     /// replacing any existing suggestion for the same speaker. Returns whether
-    /// anything changed (and was persisted).
+    /// anything changed in memory; the write goes through `persist()`.
     ///
     /// Only suggestions that can still be acted on are kept — the speaker has
     /// lines in the transcript and no name yet — so a name that landed from
@@ -959,7 +971,10 @@ final class RecordingStore: ObservableObject {
         // `onSpeakerUnnamed` to correct the profile it went into.
         guard recordings[idx].speakerNames[rawID] == nil else { return }
         recordings[idx].speakerNames[rawID] = trimmed
-        persist()
+        // Synchronous like `setSpeakerName`: the profile already holds this
+        // speaker's contribution, so a name lost to a crash would be typed
+        // again and fold it a second time.
+        persistNow()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
@@ -989,7 +1004,7 @@ final class RecordingStore: ObservableObject {
             }
         }
         retireSpeaker(sourceRawID, into: targetRawID, at: idx, recordingID: recordingID)
-        persist()
+        persistNow()  // the profile hooks have run: see `setSpeakerName`
         // Re-resolve: `retireSpeaker` ran caller-supplied hooks, and an index
         // held across a callback is only valid while nothing reorders or
         // removes a row. Nothing wired today does, which is exactly why this
@@ -1017,8 +1032,10 @@ final class RecordingStore: ObservableObject {
             // now the target — the same thing a merge does, and it gets the
             // same bookkeeping.
             retireSpeaker(prev, into: targetRawID, at: recIdx, recordingID: recordingID)
+            persistNow()  // the profile hooks have run: see `setSpeakerName`
+        } else {
+            persist()
         }
-        persist()
         writeSRTIfCompleted(recordingID)
     }
 
@@ -1297,7 +1314,7 @@ final class RecordingStore: ObservableObject {
                 transcriptRewritesPending.insert(recording.id)
             }
         }
-        let persisted = persist()
+        let persisted = persistNow()
         let sidecarStale = transcriptRewritesPending.contains(recording.id)
         if !persisted {
             recStoreLog.error("transcript edit on \(recording.id, privacy: .public): recordings.json not saved")
@@ -1445,7 +1462,10 @@ final class RecordingStore: ObservableObject {
             return .failed
         }
         recordings[idx].duration = written
-        persist()
+        // Synchronous: the audio swap above cannot be undone, so the row
+        // that describes it is written in the same turn rather than left to
+        // the background writer (rare, user-initiated).
+        persistNow()
         audioRevisions[recordingID, default: 0] += 1
         recStoreLog.log("trimmed audio of \(recordingID, privacy: .public) to \(written, privacy: .public)s")
         return .trimmed(duration: written)
@@ -1480,8 +1500,10 @@ final class RecordingStore: ObservableObject {
             folders.append(target)
             folders.sort { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
             persistFolders()
+            persistNow()  // same turn as folders.json, as in `renameFolder`
+        } else {
+            persist()
         }
-        persist()
     }
 
     /// Persist (or clear) the `.txt` sidecar for a recording. Empty text
@@ -1556,21 +1578,6 @@ final class RecordingStore: ObservableObject {
         }
     }
 
-    /// Mark a queued/in-progress recording as no longer transcribing after the
-    /// user cancelled it from the Queue. We land it in `.failed` — the existing
-    /// terminal state — rather than adding a dedicated `.cancelled` case: the
-    /// Queue only keeps `.pending`/`.running` rows, so a cancelled item drops
-    /// out of the Queue either way, and every status-rendering site (list rows,
-    /// detail view) already handles `.failed`. The recording + its audio stay on
-    /// disk so the user can still re-transcribe it later; use
-    /// `permanentlyDelete` when they want it gone.
-    ///
-    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
-    /// engine's abort flag so the in-flight whisper pass unwinds. That path
-    /// deliberately leaves the store status alone (the discard coordinator owns
-    /// the delete), so a Queue-level cancel must flip the status itself —
-    /// otherwise a `.running` item would sit in the Queue forever. No-op if the
-    /// recording is already in a terminal state.
     /// Stop a queued/active transcription from the Queue and move the
     /// recording to "Recently Deleted" rather than leaving a `.failed` row
     /// cluttering the list. The status also flips to a terminal `.failed` so
@@ -1579,9 +1586,13 @@ final class RecordingStore: ObservableObject {
     /// recordings and re-transcriptions of already-completed recordings — the
     /// user gets their content back from the trash if they hit Stop by
     /// mistake. No-op if the recording is already terminal (guards a stale
-    /// click racing a just-finished run). Paired with
-    /// `TranscriptionService.cancel(recordingID:)`, which trips the engine's
-    /// abort flag so the in-flight whisper pass unwinds.
+    /// click racing a just-finished run).
+    ///
+    /// Paired with `TranscriptionService.cancel(recordingID:)`, which trips the
+    /// engine's abort flag so the in-flight whisper pass unwinds. That path
+    /// deliberately leaves the store status alone (the discard coordinator owns
+    /// the delete), so a Queue-level stop must flip the status itself —
+    /// otherwise a `.running` item would sit in the Queue forever.
     func stopTranscription(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         guard recordings[idx].status == .pending || recordings[idx].status == .running else { return }
@@ -1589,7 +1600,8 @@ final class RecordingStore: ObservableObject {
         recordings[idx].deletedAt = Date()
         // Settled: nothing left for a stop to undo.
         recordings[idx].retranscriptionPriorState = nil
-        persist()
+        // A deletion, like `softDelete`: on disk before mila-mcp can list it.
+        persistNow()
     }
 
     /// "Stop Transcribing": the user stopped a queued/active transcription to
@@ -1636,14 +1648,16 @@ final class RecordingStore: ObservableObject {
         // Consumed either way: the row is settled, there is no re-run left
         // to undo.
         recordings[idx].retranscriptionPriorState = nil
-        persist()
+        // On disk now, as in `stopTranscription`: a row still `.pending` or
+        // `.running` in the file is one the launch sweep restarts.
+        persistNow()
     }
 
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
     func softDelete(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         recordings[idx].deletedAt = Date()
-        persist()
+        persistNow()
     }
 
     /// Restore from "Recently Deleted".
@@ -1672,7 +1686,7 @@ final class RecordingStore: ObservableObject {
             voiceMemoTombstones.insert(memoID)
             persistTombstones()
         }
-        persist()
+        persistNow()
         permanentlyDeleted.send([recording.id])
     }
 
@@ -1712,7 +1726,7 @@ final class RecordingStore: ObservableObject {
         let trashedIDs = Set(trashed.map(\.id))
         recordings.removeAll { trashedIDs.contains($0.id) }
         if tombstonedAny { persistTombstones() }
-        persist()
+        persistNow()
         permanentlyDeleted.send(trashed.map(\.id))
         return trashed.count
     }
@@ -1767,7 +1781,7 @@ final class RecordingStore: ObservableObject {
             recordings[idx].deletedAt = now
             count += 1
         }
-        if count > 0 { persist() }
+        if count > 0 { persistNow() }
         return count
     }
 
@@ -1818,8 +1832,11 @@ final class RecordingStore: ObservableObject {
         for i in recordings.indices where recordings[i].folder == oldName {
             recordings[i].folder = trimmed
         }
+        // Both files in the same turn: `loadFolders()` re-adds every folder
+        // a row still names, so a background write of the rows would let a
+        // crash in between bring the old name back.
         persistFolders()
-        persist()
+        persistNow()
         return trimmed
     }
 
@@ -1831,10 +1848,15 @@ final class RecordingStore: ObservableObject {
             recordings[i].folder = nil
         }
         persistFolders()
-        persist()
+        persistNow()  // as in `renameFolder`: a deleted folder stays deleted
     }
 
     private func load() {
+        // A write handed to the background writer may still be on its way
+        // to this file: a relocate back to a folder this session wrote to,
+        // or a second store over the same folder (tests). Read what was
+        // handed off, not what was on disk before it.
+        writer.drain()
         removeAudioTrimLeftovers()
         libraryLoadIssue = nil
         storeIsUnreadable = false
@@ -1959,7 +1981,7 @@ final class RecordingStore: ObservableObject {
         if needsMigration || !recovered.isEmpty || damage != nil {
             // Re-write JSON without inline fullText / with recovered entries /
             // without the rows that could not be decoded (kept in `backup`).
-            persist()
+            persistNow()
         }
     }
 
@@ -2239,12 +2261,12 @@ final class RecordingStore: ObservableObject {
     }
 
     /// The on-disk encoding of `recordings.json`. Compact on purpose: every
-    /// store mutation re-encodes the whole library on the main actor, and
+    /// store mutation re-encodes the whole library (off the main actor for
+    /// most of them since #406, see `RecordingLibraryWriter`), and
     /// pretty-printing made each write about 40% larger (and a little
     /// slower) for no reader's benefit (`JSONDecoder` and `mila-mcp` ignore
     /// whitespace). The encode time is driven by the segment count, not the
-    /// formatting; #406 tracks the real fix. `.sortedKeys` stays so the
-    /// output is byte-stable.
+    /// formatting. `.sortedKeys` stays so the output is byte-stable.
     nonisolated static func encodeLibrary(_ recordings: [Recording]) throws -> Data {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -2252,47 +2274,63 @@ final class RecordingStore: ObservableObject {
         return try encoder.encode(recordings)
     }
 
-    /// Returns whether `recordings.json` on disk now reflects the in-memory
-    /// store. `false` means a separate process still reads the previous
-    /// contents — see `update(_:)` for why that has to be reportable.
-    @discardableResult
-    private func persist() -> Bool {
+    /// Hand the library to the background writer and return at once (#406).
+    /// The encode and the write happen off the main actor, and a burst of
+    /// mutations is written once (`RecordingLibraryWriter`). Nothing is
+    /// reported back: use `persistNow()` where a caller acts on whether the
+    /// write succeeded, or where the change must be on disk before the call
+    /// returns.
+    private func persist() {
+        // Sidecars only, never recordings.json, so this runs even while
+        // writes to the store are off: orphan recovery reads a `.txt` back
+        // as the transcript, and a stale one would bring deleted lines back.
+        retryPendingTranscriptRewrites()
         // An existing file we could not even read must not be replaced by
         // this session's (near-empty) list. Audio written meanwhile is picked
         // up by orphan recovery on the next launch.
+        if storeIsUnreadable { return }
+        writer.enqueue(recordings, to: storeURL)
+    }
+
+    /// Encode and write the library before returning, and report whether
+    /// `recordings.json` on disk now reflects the in-memory store. `false`
+    /// means a separate process still reads the previous contents — see
+    /// `update(_:)` for why that has to be reportable.
+    ///
+    /// Synchronous on purpose, for these callers:
+    /// - ones that act on the answer: `update` (the live sidecar's
+    ///   `completed` handoff), `upsertImported` (the import's commit point),
+    ///   `settleUnsavedTranscriptEdit`, a compression about to delete its
+    ///   source WAV, and `load()`'s rewrite of a damaged file;
+    /// - deletions (Recently Deleted, including a stopped transcription;
+    ///   permanent delete; emptying the trash):
+    ///   mila-mcp reads recordings.json, and a row the user just deleted must
+    ///   not stay listed there for as long as a background encode takes;
+    /// - a folder rename or delete, and a move that creates a folder,
+    ///   written in the same turn as `folders.json`, so a crash cannot
+    ///   bring an old folder back or leave a new one empty;
+    /// - naming, merging or retiring a speaker, whose voice-profile hooks
+    ///   have already saved `speaker-profiles.json` (a crash must not keep
+    ///   the fold and lose the name), reattaching a name after a re-key (the
+    ///   profile already holds that voice), and deferring a transcription,
+    ///   which the launch sweep would otherwise restart;
+    /// - `add`, since a lost row cannot be rebuilt from its audio (see
+    ///   there);
+    /// - an audio trim, which has already replaced the file the row
+    ///   describes.
+    @discardableResult
+    private func persistNow() -> Bool {
+        retryPendingTranscriptRewrites()  // as in `persist()`
         if storeIsUnreadable { return false }
-        retryPendingTranscriptRewrites()
-        let interval = recStoreSignposter.beginInterval("persist", id: recStoreSignposter.makeSignpostID())
-        defer { recStoreSignposter.endInterval("persist", interval) }
-        do {
-            let data = try Self.encodeLibrary(recordings)
-            try data.write(to: storeURL, options: .atomic)
-            return true
-        } catch {
-            // `.private` on the description — and this one really did need it,
-            // contrary to the exception I claimed last round. `storeURL`
-            // follows the user's chosen storage directory (see
-            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER in
-            // the message: "You don't have permission to save the file
-            // “recordings.json” in the folder “Acme Corp”." That is the same
-            // mechanism that leaked recording titles, and a folder the user
-            // picked can name a client, an employer or a project. Reasoning
-            // about the fixed FILENAME and stopping there was the mistake.
-            // (CodeRabbit on #183, CWE-532.)
-            //
-            // Domain + code stay public so a real failure is still diagnosable
-            // without the path: they are what separates "no permission"
-            // (NSCocoaErrorDomain 513) from a full disk or a missing
-            // directory. The filename is a literal, so naming WHICH write
-            // failed reveals nothing.
-            let ns = error as NSError
-            recStoreLog.error("""
-                persist failed for recordings.json \
-                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
-                \(error.localizedDescription, privacy: .private)
-                """)
-            return false
-        }
+        return writer.writeNow(recordings, to: storeURL)
+    }
+
+    /// Blocks until every write `persist()` has handed off has finished.
+    /// For tests that read `recordings.json` (or point mila-mcp's reader at
+    /// it) right after a mutation, and for Settings before it gives up the
+    /// current folder's security scope; `load()` does the same on its own.
+    func waitForPendingWrites() {
+        writer.drain()
     }
 
     // MARK: - Voice-memo tombstones
@@ -2324,7 +2362,7 @@ final class RecordingStore: ObservableObject {
             // `relocateRecordings` never moves (it moves `recordingsDirectory`
             // / `storeURL` / `foldersURL` and leaves this alone), so the folder
             // Cocoa quotes in the message can only ever be “Mila”. Contrast
-            // `persist()` / `persistFolders()` below, which follow the user's
+            // `RecordingLibraryWriter` and `persistFolders()`, which follow the user's
             // chosen directory and therefore redact. Was a bare `print`, which
             // is public with no annotation to reason about at all.
             // (Issue #213.)
@@ -2355,7 +2393,7 @@ final class RecordingStore: ObservableObject {
             let data = try encoder.encode(folders)
             try data.write(to: foldersURL, options: .atomic)
         } catch {
-            // Same treatment as `persist()` above, and for the same reason:
+            // Same treatment as `RecordingLibraryWriter`'s, and for the same reason:
             // `foldersURL` follows the user's chosen storage directory (see
             // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER
             // in the message — "You don't have permission to save the file
