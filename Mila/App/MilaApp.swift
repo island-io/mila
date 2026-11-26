@@ -2937,8 +2937,8 @@ final class MilaAppDelegate: NSObject, NSApplicationDelegate {
         await session?.cancelAll()
         // A sleep or screen-lock cancel still tearing down is waited for,
         // but briefly: a healthy teardown is done well within 2 s, and a
-        // stuck one must not hold the quit for its whole 10 s deadline (it
-        // still cleans up by itself).
+        // stuck one must not hold the quit for its whole 10 s deadline (the
+        // process exit releases the device).
         await dictation?.cancelInFlight(joinDeadline: 2)
         // Tear down the URLSession <-> ModelManager retain cycle and cancel
         // in-flight downloads.

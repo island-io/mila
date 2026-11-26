@@ -172,6 +172,11 @@ final class DictationControllerTests: XCTestCase {
         while !stuck.isRunning, Date() < stuckDeadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+        guard stuck.isRunning else {
+            stuck.finish()
+            _ = await stuckCancel.value
+            return XCTFail("setup: the stuck cancel never reached its teardown")
+        }
         let started = Date()
         let joinedInTime = await DictationController.waitAtMost(0.1) {
             await cancels.runOrJoin {}
