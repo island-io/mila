@@ -46,9 +46,15 @@ final class NormalizeTests: XCTestCase {
         XCTAssertEqual(WhisperEngine.peakMagnitude(input), input.map { abs($0) }.max()!)
         XCTAssertEqual(WhisperEngine.peakMagnitude([]), 0)
         XCTAssertEqual(WhisperEngine.peakMagnitude([0, 0]), 0)
+        // A NaN after the first element never won `max()` either.
+        let midNaN: [Float] = [-0.4, .nan, 0.2]
+        XCTAssertEqual(WhisperEngine.peakMagnitude(midNaN), midNaN.map { abs($0) }.max()!)
     }
 
+    /// Deliberate change for a LEADING NaN: `max()` seeded with it and
+    /// returned NaN; the helper skips it like `normalize`'s loop always did.
     func test_peakMagnitude_ignores_nan() {
         XCTAssertEqual(WhisperEngine.peakMagnitude([.nan, -0.4, 0.2]), 0.4)
+        XCTAssertEqual(WhisperEngine.peakMagnitude([.nan, .nan]), 0)
     }
 }

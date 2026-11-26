@@ -517,7 +517,12 @@ public actor WhisperEngine {
     ///
     /// `samples.map { abs($0) }.max()` builds a second full-size array first
     /// — 460 MB for a 2-hour recording at 16 kHz — only to throw it away.
-    /// NaN samples never win the comparison, as before.
+    /// NaN samples are skipped (`a > peak` is false for NaN), as `normalize`'s
+    /// own loop already did. That differs from `map { abs }.max()` in one
+    /// case: `max()` seeds with the first element, so a buffer that STARTS
+    /// with NaN used to report a NaN peak. It now reports the largest finite
+    /// magnitude (0 for an all-NaN buffer), which the silence guard reads as
+    /// silent instead of letting NaN slip past `peak < minimumAudioPeak`.
     public static func peakMagnitude(_ samples: [Float]) -> Float {
         samples.withUnsafeBufferPointer { buf in
             var peak: Float = 0
