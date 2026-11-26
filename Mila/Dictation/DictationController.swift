@@ -59,8 +59,9 @@ final class DictationController: ObservableObject {
     /// its own, and `engine.stop()` can block on the CoreAudio HAL queue
     /// (a Bluetooth mic mid-profile-switch). Past this, the stop carries on
     /// with the audio already captured — capture ended before the teardown
-    /// started — and transcribes and pastes it as usual. The teardown keeps
-    /// running, and no new dictation starts until it has returned.
+    /// started — exactly as it would had the teardown returned in time. The
+    /// teardown keeps running, and no new dictation starts until it has
+    /// returned.
     static let recorderTeardownDeadline: TimeInterval = 10
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
@@ -453,7 +454,8 @@ final class DictationController: ObservableObject {
                     // the recorder has stopped, and a buffer already handed
                     // to it must not refill `samples` or the level after the
                     // cleanup. Checked on the main actor, where the cancel
-                    // runs.
+                    // runs. A stop leaves this task running through its
+                    // teardown wait, so audio delivered meanwhile is kept.
                     guard !Task.isCancelled else { return }
                     self.samples.append(contentsOf: chunk)
                     self.level = lvl
@@ -784,8 +786,8 @@ final class DictationController: ObservableObject {
 /// Refusing starts keeps the worst case at one stuck thread. A teardown that
 /// never returns therefore leaves dictation refusing starts until relaunch,
 /// as a stuck teardown did before #435 (when the stop itself never
-/// returned). A stop that gives up waiting carries on as usual with what it
-/// captured.
+/// returned). A stop that gives up waiting goes on with what it captured
+/// exactly as one whose teardown returned in time.
 ///
 /// Main-actor only, so no lock is needed.
 @MainActor
