@@ -841,7 +841,10 @@ final class RecordingStore: ObservableObject {
         if let i = recordings.firstIndex(where: { $0.id == recordingID }) {
             recordings[i].speakerNameSuggestions.removeAll { $0.speaker == rawID }
         }
-        persist()
+        // The hooks above have already saved the voice profile. A background
+        // write would let a crash keep the fold but lose the name, and naming
+        // the speaker again would fold the same observation twice (#406).
+        persistNow()
         if recordings[idx].status == .completed {
             TranscriptExporter.writeSRT(for: recordings[idx], in: recordingsDirectory)
         }
@@ -851,7 +854,7 @@ final class RecordingStore: ObservableObject {
 
     /// Add `suggestions` to a recording's pending speaker-name suggestions,
     /// replacing any existing suggestion for the same speaker. Returns whether
-    /// anything changed (and was persisted).
+    /// anything changed (and was handed to the background writer).
     ///
     /// Only suggestions that can still be acted on are kept — the speaker has
     /// lines in the transcript and no name yet — so a name that landed from
@@ -998,7 +1001,7 @@ final class RecordingStore: ObservableObject {
             }
         }
         retireSpeaker(sourceRawID, into: targetRawID, at: idx, recordingID: recordingID)
-        persist()
+        persistNow()  // the profile hooks have run: see `setSpeakerName`
         // Re-resolve: `retireSpeaker` ran caller-supplied hooks, and an index
         // held across a callback is only valid while nothing reorders or
         // removes a row. Nothing wired today does, which is exactly why this
@@ -1026,8 +1029,10 @@ final class RecordingStore: ObservableObject {
             // now the target — the same thing a merge does, and it gets the
             // same bookkeeping.
             retireSpeaker(prev, into: targetRawID, at: recIdx, recordingID: recordingID)
+            persistNow()  // the profile hooks have run: see `setSpeakerName`
+        } else {
+            persist()
         }
-        persist()
         writeSRTIfCompleted(recordingID)
     }
 
@@ -1638,7 +1643,9 @@ final class RecordingStore: ObservableObject {
         // Consumed either way: the row is settled, there is no re-run left
         // to undo.
         recordings[idx].retranscriptionPriorState = nil
-        persist()
+        // On disk now, as in `stopTranscription`: a row still `.pending` or
+        // `.running` in the file is one the launch sweep restarts.
+        persistNow()
     }
 
     /// Move to "Recently Deleted". The audio file stays on disk until permanent delete.
@@ -2296,6 +2303,10 @@ final class RecordingStore: ObservableObject {
     ///   not stay listed there for as long as a background encode takes;
     /// - a folder rename or delete, written in the same turn as
     ///   `folders.json`, so a crash cannot bring the old folder back;
+    /// - naming, merging or retiring a speaker, whose voice-profile hooks
+    ///   have already saved `speaker-profiles.json` (a crash must not keep
+    ///   the fold and lose the name), and deferring a transcription, which
+    ///   the launch sweep would otherwise restart;
     /// - `add`, since a lost row cannot be rebuilt from its audio (see
     ///   there);
     /// - an audio trim, which has already replaced the file the row

@@ -339,6 +339,32 @@ final class RecordingLibraryWriterTests: XCTestCase {
         XCTAssertFalse(probe.backgroundHoldTimedOut, "a background hold ran out, so the test did not run against held writes")
     }
 
+    /// Naming a speaker saves the voice profile first, so the name has to be
+    /// on disk with it: otherwise a crash keeps the fold, loses the name, and
+    /// naming the speaker again folds the same observation twice. "Stop
+    /// Transcribing" must be on disk too, or the launch sweep restarts the
+    /// pass. A rename is held in the background throughout.
+    func test_speaker_naming_and_a_deferral_are_on_disk_when_the_call_returns() throws {
+        let (store, probe, writer) = storeWithHeldBackgroundWrites()
+        defer {
+            probe.openBackground()
+            writer.drain()
+        }
+        let rec = Recording(title: "meeting", source: .microphone, audioFileName: "m.wav")
+        store.add(rec)
+        store.rename(rec, to: "renamed")  // background, held
+        XCTAssertTrue(probe.waitUntilHeld())
+
+        store.setSpeakerName("Dana", forSpeaker: "SPEAKER_00", recordingID: rec.id)
+        let named = try XCTUnwrap(rowsOnDisk(of: store).first)
+        XCTAssertEqual((named["speakerNames"] as? [String: String])?["SPEAKER_00"], "Dana")
+
+        store.markTranscriptionDeferred(rec.id)
+        let deferred = try XCTUnwrap(rowsOnDisk(of: store).first)
+        XCTAssertEqual(deferred["status"] as? String, "failed", "a deferred pass is still pending on disk")
+        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background hold ran out, so the test did not run against held writes")
+    }
+
     /// `update` reports whether a separate process now reads the new row
     /// (the live sidecar's `completed` handoff depends on it), so a `true`
     /// has to mean the row is already in the file.
