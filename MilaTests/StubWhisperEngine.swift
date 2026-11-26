@@ -65,6 +65,28 @@ actor StubWhisperEngine: TranscribingEngine {
     private var transcribeGateWaiters: [CheckedContinuation<Void, Never>] = []
     private var transcribeEntryWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
 
+    // MARK: - Load gate
+
+    /// Lets a test hold a REAL load (not the same-path early return) mid-way,
+    /// e.g. to end a dictation's model hold, or press its hotkey again, while
+    /// the preload is still running. `WhisperEngine.loadIfNeeded` never
+    /// suspends, so on the real actor a second load or an unload cannot start
+    /// until the load in progress has returned. While a gated load is held,
+    /// the stub makes every other `loadIfNeeded`, `transcribe`, `unload` and
+    /// `shutdown` wait for it the same way, so the gate does not invent
+    /// interleavings the app can't have.
+    private var loadGateClosed = false
+    private var loadGateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var heldLoadInFlight = false
+    private var behindHeldLoad: [CheckedContinuation<Void, Never>] = []
+    /// `unload()` calls that arrived while a gated load was in flight. On the
+    /// real engine that unload runs right after the load and frees the model
+    /// its caller had just asked for — the straddle the service's lifetime
+    /// rules exist to prevent. A correct service keeps this at 0.
+    private(set) var unloadsDuringLoad = 0
+    /// Engine calls currently queued behind a held load.
+    var callsWaitingBehindHeldLoad: Int { behindHeldLoad.count }
+
     // MARK: - Preparation observer
 
     private var preparationObserver: (@Sendable (Bool, String?) -> Void)?
@@ -79,6 +101,7 @@ actor StubWhisperEngine: TranscribingEngine {
     // MARK: - TranscribingEngine
 
     func loadIfNeeded(modelURL: URL, displayName: String) async throws {
+        await waitBehindHeldLoad()
         loadRequestCount += 1
         let previousPath = loadedModel
         loadedModel = modelURL
@@ -101,6 +124,16 @@ actor StubWhisperEngine: TranscribingEngine {
         // returns without touching the context. Only a real load counts.
         guard !isModelLoaded || previousPath != modelURL else { return }
         loadCallCount += 1
+        if loadGateClosed {
+            heldLoadInFlight = true
+            await withCheckedContinuation { loadGateWaiters.append($0) }
+            isModelLoaded = true
+            heldLoadInFlight = false
+            let waiting = behindHeldLoad
+            behindHeldLoad.removeAll()
+            waiting.forEach { $0.resume() }
+            return
+        }
         if loadDelay > 0 {
             preparationObserver?(true, loadPreparationStatus)
             try? await Task.sleep(nanoseconds: UInt64(loadDelay * 1_000_000_000))
@@ -114,6 +147,7 @@ actor StubWhisperEngine: TranscribingEngine {
                     audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        await waitBehindHeldLoad()
         if let err = nextError {
             nextError = nil
             throw err
@@ -149,6 +183,8 @@ actor StubWhisperEngine: TranscribingEngine {
     }
 
     func unload() async {
+        if heldLoadInFlight { unloadsDuringLoad += 1 }
+        await waitBehindHeldLoad()
         guard isModelLoaded else { return }
         unloadCount += 1
         unloadEnteredCount += 1
@@ -159,7 +195,10 @@ actor StubWhisperEngine: TranscribingEngine {
     }
 
     func shutdown() async {
+        // Counted on entry: a shutdown that arrives while a gated load is
+        // held shows up here before that load has finished.
         shutdownCount += 1
+        await waitBehindHeldLoad()
         isModelLoaded = false
     }
 
@@ -173,6 +212,22 @@ actor StubWhisperEngine: TranscribingEngine {
     func setLoadDelay(_ d: Double) { loadDelay = d }
     func setLoadError(_ e: Error?) { loadError = e }
     func setLoadPreparationStatus(_ s: String?) { loadPreparationStatus = s }
+
+    /// Hold every subsequent real load at the gate until `openLoadGate`.
+    func closeLoadGate() { loadGateClosed = true }
+
+    func openLoadGate() {
+        loadGateClosed = false
+        let waiters = loadGateWaiters
+        loadGateWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+
+    private func waitBehindHeldLoad() async {
+        while heldLoadInFlight {
+            await withCheckedContinuation { behindHeldLoad.append($0) }
+        }
+    }
 
     func closeUnloadGate() { unloadGateClosed = true }
 
@@ -225,6 +280,7 @@ actor StubWhisperEngine: TranscribingEngine {
         loadedModel = nil
         isModelLoaded = false
         unloadCount = 0
+        unloadsDuringLoad = 0
         transcribeCalls.removeAll()
         concurrentInFlight = 0
         maxConcurrentInFlight = 0

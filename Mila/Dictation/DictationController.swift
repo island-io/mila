@@ -35,6 +35,17 @@ final class DictationController: ObservableObject {
     /// engine bring-up) are where a hotkey double-press could re-enter.
     private var isStarting = false
 
+    /// This dictation's claim on the local Whisper model (#434). Batch-only
+    /// mode releases an idle model (#393), so without it every dictation
+    /// loaded the model only once the user had finished speaking. Taken when
+    /// a start is accepted, so the load overlaps with the mic coming up and
+    /// the user speaking; handed to this property once capture is running,
+    /// and ended exactly once — after the final transcription, or on cancel.
+    /// A start that fails ends its own hold before it returns. Nil in live
+    /// mode and on the remote backend (see
+    /// `TranscriptionService.beginLocalModelHold`).
+    private var modelHold: TranscriptionService.LocalModelHold?
+
     /// Live transcriber used to surface partial transcripts in the
     /// dictation overlay AND to remove the post-release transcription
     /// wait. We rely on it being the *same instance* across dictations
@@ -112,9 +123,20 @@ final class DictationController: ObservableObject {
         _ = liveTranscriber.stop()
         samples.removeAll(keepingCapacity: true)
         targetApp = nil
+        // Nothing will be transcribed: let batch-only mode release the model.
+        endModelHold()
         DictationOverlayWindow.shared.hide()
         state = .idle
         level = 0
+    }
+
+    /// End this dictation's model hold, if it has one. Safe to call more than
+    /// once: the property is cleared first, and the service ignores a hold
+    /// that already ended.
+    private func endModelHold() {
+        guard let hold = modelHold else { return }
+        modelHold = nil
+        transcription.endLocalModelHold(hold)
     }
 
     // MARK: - Recording
@@ -161,6 +183,17 @@ final class DictationController: ObservableObject {
             AccessibilityPermission.requestPromptIfNeeded()
         }
 
+        // Start loading the model the final pass will use now, before the
+        // first await, so the load overlaps with the mic coming up and the
+        // user speaking instead of following the second press (#434). This
+        // call owns the hold until capture is running; every return before
+        // that point ends it here, so a failed start cannot strand the model.
+        let hold = transcription.beginLocalModelHold(language: action.languageCode)
+        var holdHandedOff = false
+        defer {
+            if !holdHandedOff, let hold { transcription.endLocalModelHold(hold) }
+        }
+
         guard await recorder.requestAccess() else {
             NSSound.beep()
             return
@@ -172,6 +205,12 @@ final class DictationController: ObservableObject {
             NSSound.beep()
             return
         }
+        // At most one hold per controller. Every end path clears the previous
+        // dictation's before going idle, so this only guards against a future
+        // path that forgets to — ending the old one rather than leaking it.
+        endModelHold()
+        modelHold = hold
+        holdHandedOff = true
         state = .recording(action)
         lastLanguage = action.languageCode
         DictationOverlayWindow.shared.show()
@@ -238,6 +277,9 @@ final class DictationController: ObservableObject {
         let text = await transcription.transcribeOnce(samples: captured,
                                                       language: action.languageCode,
                                                       audioCtx: 0)
+        // The final pass has run, so this dictation no longer needs the
+        // model: batch-only mode releases it once nothing else is using it.
+        endModelHold()
 
         DictationOverlayWindow.shared.hide()
         state = .idle
