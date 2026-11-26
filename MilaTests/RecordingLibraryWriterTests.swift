@@ -303,6 +303,36 @@ final class RecordingLibraryWriterTests: XCTestCase {
         XCTAssertNotNil(rows.first?["deletedAt"])
     }
 
+    /// A Voice Memo row's ID is what stops the next scan importing the memo
+    /// again, and a folder rename or delete must not come back after a
+    /// crash (`loadFolders()` re-adds any folder a row still names). So
+    /// these write before returning as well; background writes are held.
+    func test_voice_memo_adds_and_folder_changes_are_on_disk_when_the_call_returns() throws {
+        let (store, probe, writer) = storeWithHeldBackgroundWrites()
+        defer {
+            probe.openBackground()
+            writer.drain()
+        }
+        let plain = Recording(title: "plain", source: .microphone, audioFileName: "plain.wav")
+        store.add(plain)
+        XCTAssertTrue(probe.waitUntilHeld())
+        store.assign(plain, toFolder: "Work")  // background, held
+
+        var memo = Recording(title: "memo", source: .voiceMemo, audioFileName: "memo.wav")
+        memo.voiceMemoUniqueID = "VM-1"
+        store.add(memo)
+        XCTAssertEqual(try rowsOnDisk(of: store).compactMap { $0["voiceMemoUniqueID"] as? String }, ["VM-1"])
+
+        XCTAssertEqual(store.renameFolder("Work", to: "Projects"), "Projects")
+        let renamed = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "plain" })
+        XCTAssertEqual(renamed["folder"] as? String, "Projects")
+
+        store.deleteFolder("Projects")
+        let unfiled = try XCTUnwrap(rowsOnDisk(of: store).first { $0["title"] as? String == "plain" })
+        XCTAssertNil(unfiled["folder"], "the deleted folder is still named on disk")
+        XCTAssertFalse(probe.backgroundHoldTimedOut, "a background hold ran out, so the test did not run against held writes")
+    }
+
     /// `update` reports whether a separate process now reads the new row
     /// (the live sidecar's `completed` handoff depends on it), so a `true`
     /// has to mean the row is already in the file.

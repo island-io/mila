@@ -492,7 +492,15 @@ final class RecordingStore: ObservableObject {
         recordings.insert(recording, at: 0)
         writeTranscript(for: recording)
         writeSummary(for: recording)
-        persist()
+        if recording.voiceMemoUniqueID != nil {
+            // The row's Voice Memo ID is what keeps the next scan from
+            // importing the memo again. Orphan recovery would bring a lost
+            // row's audio back without it, so a crash before a background
+            // write would mean a duplicate import and transcription.
+            persistNow()
+        } else {
+            persist()
+        }
     }
 
     /// Returns whether the record a SEPARATE PROCESS would now read matches
@@ -1815,8 +1823,11 @@ final class RecordingStore: ObservableObject {
         for i in recordings.indices where recordings[i].folder == oldName {
             recordings[i].folder = trimmed
         }
+        // Both files in the same turn: `loadFolders()` re-adds every folder
+        // a row still names, so a background write of the rows would let a
+        // crash in between bring the old name back.
         persistFolders()
-        persist()
+        persistNow()
         return trimmed
     }
 
@@ -1828,7 +1839,7 @@ final class RecordingStore: ObservableObject {
             recordings[i].folder = nil
         }
         persistFolders()
-        persist()
+        persistNow()  // as in `renameFolder`: a deleted folder stays deleted
     }
 
     private func load() {
@@ -2277,7 +2288,7 @@ final class RecordingStore: ObservableObject {
     /// means a separate process still reads the previous contents — see
     /// `update(_:)` for why that has to be reportable.
     ///
-    /// Synchronous on purpose, for three kinds of caller:
+    /// Synchronous on purpose, for these callers:
     /// - ones that act on the answer: `update` (the live sidecar's
     ///   `completed` handoff), `upsertImported` (the import's commit point),
     ///   `settleUnsavedTranscriptEdit`, a compression about to delete its
@@ -2286,6 +2297,10 @@ final class RecordingStore: ObservableObject {
     ///   permanent delete; emptying the trash):
     ///   mila-mcp reads recordings.json, and a row the user just deleted must
     ///   not stay listed there for as long as a background encode takes;
+    /// - a folder rename or delete, written in the same turn as
+    ///   `folders.json`, so a crash cannot bring the old folder back;
+    /// - adding a Voice Memo row, whose ID keeps the next scan from
+    ///   importing the memo again;
     /// - an audio trim, which has already replaced the file the row
     ///   describes.
     @discardableResult
@@ -2332,7 +2347,7 @@ final class RecordingStore: ObservableObject {
             // `relocateRecordings` never moves (it moves `recordingsDirectory`
             // / `storeURL` / `foldersURL` and leaves this alone), so the folder
             // Cocoa quotes in the message can only ever be “Mila”. Contrast
-            // `persist()` / `persistFolders()` below, which follow the user's
+            // `RecordingLibraryWriter` and `persistFolders()`, which follow the user's
             // chosen directory and therefore redact. Was a bare `print`, which
             // is public with no annotation to reason about at all.
             // (Issue #213.)
@@ -2363,7 +2378,7 @@ final class RecordingStore: ObservableObject {
             let data = try encoder.encode(folders)
             try data.write(to: foldersURL, options: .atomic)
         } catch {
-            // Same treatment as `persist()` above, and for the same reason:
+            // Same treatment as `RecordingLibraryWriter`'s, and for the same reason:
             // `foldersURL` follows the user's chosen storage directory (see
             // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER
             // in the message — "You don't have permission to save the file
