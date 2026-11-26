@@ -58,9 +58,6 @@ final class RecordingStoreUpsertTests: XCTestCase {
     func test_upsert_rolls_back_when_the_store_cannot_be_written() throws {
         let store = RecordingStore(rootDirectory: root)
         store.add(recording("existing", at: 50))
-        // `add` hands its write to the background writer; let it finish
-        // before the file is swapped out from under it.
-        store.waitForPendingWrites()
         // Make recordings.json a directory so the atomic write cannot land.
         try? FileManager.default.removeItem(at: store.storeURL)
         try FileManager.default.createDirectory(at: store.storeURL, withIntermediateDirectories: true)
