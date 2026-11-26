@@ -30,15 +30,23 @@ import Foundation
 /// runs at a fixed `.userInitiated`, the level whisper's callers (the batch
 /// worker, live utterances, dictation, prewarm: all tasks the main actor
 /// starts) run at anyway, and escalation could never preempt a running
-/// `whisper_full` in any case.
+/// `whisper_full` in any case. A waiting job's rank is its priority when it
+/// was queued: escalating its task afterwards does not move it up, so a
+/// steady stream of higher-priority jobs could hold a lower one back. None
+/// of whisper's callers in the app sets a priority (each inherits the main
+/// actor's), so in practice the order is arrival order.
 ///
 /// **One thread, shared.** `static let shared` lives as long as the process,
 /// so the thread is never torn down and never leaks per instance. Every
 /// `WhisperEngine` shares it (the app has exactly one), which serializes
 /// whisper work across instances; whisper.cpp's Metal backend is process-global
-/// state anyway. The one whisper.cpp call that does not run here is the
-/// `whisper_free` in `WhisperEngine.deinit`, which runs on whichever thread
-/// drops the last reference, as it always has. The app never drops its engine.
+/// state anyway. Of `WhisperEngine`'s whisper.cpp calls, the one that does
+/// not run here is the `whisper_free` in `WhisperEngine.deinit`, which runs
+/// on whichever thread drops the last reference, as it always has. The app
+/// never drops its engine. `SileroVAD`'s `whisper_vad_*` calls do not run
+/// here either: they use their own CPU-only VAD context, take milliseconds
+/// per utterance, and stay on that actor's default executor, concurrent with
+/// this thread as they were before #401.
 ///
 /// Rule this follows: `.claude/rules/python-subprocess.md` — anything that
 /// genuinely blocks gets a thread of its own, never a slot in a shared pool.
@@ -72,6 +80,13 @@ final class WhisperThreadExecutor: SerialExecutor, @unchecked Sendable {
     var isCurrentThread: Bool { Thread.current === thread }
 
     var threadName: String? { thread.name }
+
+    /// Jobs waiting to run (not counting the one running). For tests.
+    var queuedJobCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return jobs.count
+    }
 
     func enqueue(_ job: consuming ExecutorJob) {
         let job = UnownedJob(job)

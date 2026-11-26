@@ -43,8 +43,8 @@ final class WhisperExecutorTests: XCTestCase {
 
         let unload = Task { await engine.unload(); log.append("unload") }
         let shutdown = Task { await engine.shutdown(); log.append("shutdown") }
-        // Give both every chance to run early if they could.
-        try await Task.sleep(nanoseconds: 300_000_000)
+        // Both reached the whisper thread and are waiting behind the call.
+        try await waitUntilQueued(2)
         XCTAssertEqual(log.events, ["entered"], "free ran while a whisper call was in flight")
 
         log.append("released")
@@ -66,11 +66,12 @@ final class WhisperExecutorTests: XCTestCase {
 
         let running = try await blockWhisperThread(engine, log: log, release: release)
 
+        // The low-priority job reaches the queue first, so arrival order
+        // alone would run it first.
         let low = Task(priority: .low) { await engine.appendForTesting("low", to: log) }
-        // Let the low-priority job reach the queue first.
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await waitUntilQueued(1)
         let high = Task(priority: .high) { await engine.appendForTesting("high", to: log) }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        try await waitUntilQueued(2)
         XCTAssertEqual(log.events, ["entered"])
 
         release.signal()
@@ -78,6 +79,16 @@ final class WhisperExecutorTests: XCTestCase {
         await low.value
         await high.value
         XCTAssertEqual(log.events.filter { $0 == "low" || $0 == "high" }, ["high", "low"])
+    }
+
+    /// Polls until at least `count` jobs wait on the (parked) whisper thread.
+    private func waitUntilQueued(_ count: Int) async throws {
+        let deadline = Date().addingTimeInterval(10)
+        while WhisperThreadExecutor.shared.queuedJobCount < count, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertGreaterThanOrEqual(WhisperThreadExecutor.shared.queuedJobCount, count,
+                                    "jobs never reached the whisper thread's queue")
     }
 
     /// Parks the whisper thread inside an isolated engine call, the way
