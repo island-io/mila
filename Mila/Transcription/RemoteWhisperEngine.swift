@@ -56,10 +56,10 @@ extension RemoteTranscribing {
     }
 }
 
-/// A `TranscribingEngine` that offloads transcription to an OpenAI-compatible
-/// `/v1/audio/transcriptions` endpoint instead of running whisper.cpp locally.
+/// Transcription on an OpenAI-compatible `/v1/audio/transcriptions` endpoint
+/// instead of whisper.cpp locally.
 ///
-/// The protocol hands us 16 kHz mono `Float` samples (the same buffer the
+/// The service hands us 16 kHz mono `Float` samples (the same buffer the
 /// local engine would consume), so the recording's audio never has to be
 /// re-read from disk — we encode the samples to a compact AAC/`.m4a` blob and
 /// upload that. The requested `response_format` is chosen from the model
@@ -68,15 +68,11 @@ extension RemoteTranscribing {
 /// `TranscriptSegment` and keep diarization / SRT-export working exactly as
 /// they do for the local path.
 ///
-/// The app hands the config (endpoint, key, model) over with every call
-/// (`RemoteTranscribing`). `configure(_:)` and the config-less
-/// `TranscribingEngine` methods read a config kept on the actor instead; they
-/// remain for a caller that owns its engine outright (the tests, the E2E
-/// harness), and the app does not call them — see `RemoteTranscribing` for
-/// why a shared engine must not keep one.
-actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
+/// The config (endpoint, key, model) comes with every call, and the engine
+/// keeps none of its own: one engine serves live clips and whole-recording
+/// passes at once (see `RemoteTranscribing`).
+actor RemoteWhisperEngine: RemoteTranscribing {
     enum RemoteError: LocalizedError {
-        case notConfigured
         case noAudioCaptured
         case http(status: Int, body: String)
         case badResponse
@@ -84,8 +80,6 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
 
         var errorDescription: String? {
             switch self {
-            case .notConfigured:
-                return "Remote transcription endpoint is not configured."
             case .noAudioCaptured:
                 return "No audio was captured, so there was nothing to transcribe. Check that the input in Settings ▸ Audio Input is connected and not muted."
             case .http(let status, let body):
@@ -132,7 +126,7 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
                     (\(body.utf8.count)B of server response withheld — it can \
                     quote your API key)
                     """
-            case .notConfigured, .noAudioCaptured, .badResponse, .emptyResult:
+            case .noAudioCaptured, .badResponse, .emptyResult:
                 return errorDescription ?? "\(self)"
             }
         }
@@ -263,9 +257,6 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
         }
     }
 
-    /// Set by `configure(_:)`; read only by the config-less
-    /// `TranscribingEngine` entry points, which the app does not use.
-    private var config: RemoteTranscriptionConfig?
     private let session: URLSession
     private let encodeAudio: @Sendable ([Float]) async throws -> Data
     /// Replaces `ResponseFormat.maxRequestSeconds`, so tests can exercise
@@ -294,19 +285,7 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
         self.pieceRetryDelays = pieceRetryDelays
     }
 
-    func configure(_ config: RemoteTranscriptionConfig) {
-        self.config = config
-    }
-
-    // MARK: - TranscribingEngine
-
-    /// No local weights to load. The connectivity check lives in
-    /// `RemoteTranscriptionSettings.testConnection()`; here we just confirm
-    /// the engine was configured.
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {
-        try checkCancellation(nil)
-        guard config != nil else { throw RemoteError.notConfigured }
-    }
+    // MARK: - RemoteTranscribing
 
     func shutdown() async {
         guard !isShutDown else { return }
@@ -325,18 +304,6 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         try await transcribeInPieces(samples: samples, language: language, config: config,
                                      progress: progress, isCancelled: isCancelled)
-    }
-
-    /// The same, with the config `configure(_:)` set. Not used by the app.
-    func transcribe(samples: [Float],
-                    language: String,
-                    audioCtx: Int32?,
-                    progress: (@Sendable (Float) -> Void)?,
-                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try checkCancellation(isCancelled)
-        guard let config else { throw RemoteError.notConfigured }
-        return try await transcribeInPieces(samples: samples, language: language, config: config,
-                                            progress: progress, isCancelled: isCancelled)
     }
 
     func transcribe(samples: [Float],
@@ -389,9 +356,8 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
     /// The pieces are cut at pauses (`AudioChunkPlanner`) and sent in order;
     /// each answer is moved onto the recording's clock (`placed`).
     ///
-    /// * Every piece goes to the server, key and model in `config`, never
-    ///   the actor's own (see `RemoteTranscribing`): a recording must not be
-    ///   stitched from two servers' answers.
+    /// * Every piece goes to the server, key and model in `config`: a
+    ///   recording must not be stitched from two servers' answers.
     /// * A piece that fails transiently is retried (`pieceRetryDelays`,
     ///   `pieceFailureIsRetryable`). Any other failure — and a transient one
     ///   that outlasts the retries — ends the run, and its error is what the
@@ -575,8 +541,7 @@ actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
         return placed
     }
 
-    /// One request, to the server `config` names — passed in, never read
-    /// from the actor (see `RemoteTranscribing`, #376).
+    /// One request, to the server `config` names.
     private func upload(samples: [Float],
                         language: String,
                         config: RemoteTranscriptionConfig,

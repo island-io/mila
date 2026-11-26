@@ -230,73 +230,19 @@ final class RemotePieceTranscriptionTests: XCTestCase {
         XCTAssertFalse(RemoteWhisperEngine.pieceFailureIsRetryable(CancellationError()))
     }
 
-    /// The engine also serves live clips, and their `configure` can arrive
-    /// between two pieces. Every piece of one recording still goes to the
-    /// server it started with.
-    func test_every_piece_goes_to_the_server_the_pass_started_with() async throws {
-        let fixture = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [
-            .ok(#"{"text":"one"}"#), .ok(#"{"text":"two"}"#), .ok(#"{"text":"three"}"#),
-        ])
-        let elsewhere = PieceServerFixture(model: "whisper-1", replies: [])
-        defer { fixture.cleanUp(); elsewhere.cleanUp() }
-        let engine = fixture.engine
-        let otherConfig = elsewhere.config
-        fixture.server.beforeReply = { requestNumber in
-            guard requestNumber == 1 else { return }
-            // Reconfigure while the first piece's request is in flight. The
-            // wait is bounded, and the actor is free: it is suspended on
-            // this very request.
-            let done = DispatchSemaphore(value: 0)
-            Task {
-                await engine.configure(otherConfig)
-                done.signal()
-            }
-            XCTAssertEqual(done.wait(timeout: .now() + 10), .success)
-        }
-        let segments = try await fixture.transcribe(threePieceAudio())
-        XCTAssertEqual(segments.map(\.text).joined(), "one two three")
-        XCTAssertEqual(fixture.server.requestCount, 3)
-        XCTAssertEqual(elsewhere.server.requestCount, 0, "no piece went to the newly configured server")
-    }
-
-    /// The batch pass hands the engine its own config with the call. A
-    /// config left on the engine by someone else (here a live clip's) must
-    /// neither send the recording to that server nor lose the pass's
-    /// `offlineDiarization`.
-    func test_a_pass_given_its_config_ignores_the_engines_current_one() async throws {
-        let fixture = PieceServerFixture(model: "gpt-4o-transcribe-diarize",
-                                         replies: [.ok(Self.diarized), .ok(Self.diarized), .ok(Self.diarized)],
-                                         offlineDiarization: true)
-        let live = PieceServerFixture(model: "whisper-1", replies: [])
-        defer { fixture.cleanUp(); live.cleanUp() }
-        await fixture.engine.configure(live.config)
+    /// The clip path is one request to the server its config names, however
+    /// long the clip: only the whole-recording path splits.
+    func test_a_clip_is_one_request_to_its_configs_server() async throws {
+        let fixture = PieceServerFixture(model: "gpt-4o-mini-transcribe",
+                                         replies: [.ok(#"{"text":"shalom"}"#)])
+        defer { fixture.cleanUp() }
 
         let segments = try await fixture.engine.transcribe(
             samples: threePieceAudio(), language: "he", config: fixture.config,
-            progress: nil, isCancelled: nil)
-
-        XCTAssertEqual(fixture.server.requestCount, 3)
-        XCTAssertEqual(live.server.requestCount, 0, "nothing went to the live clip's server")
-        XCTAssertEqual(segments.count, 9)
-        XCTAssertTrue(segments.allSatisfy { $0.speaker == nil },
-                      "the pass's offlineDiarization still applies: \(segments.map(\.speaker))")
-    }
-
-    /// The clip path the same way: a config left on the engine by someone
-    /// else (here an English pass's) does not redirect a clip handed its own.
-    func test_a_clip_given_its_config_ignores_the_engines_current_one() async throws {
-        let clip = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [.ok(#"{"text":"shalom"}"#)])
-        let pass = PieceServerFixture(model: "whisper-1", replies: [])
-        defer { clip.cleanUp(); pass.cleanUp() }
-        await clip.engine.configure(pass.config)
-
-        let segments = try await clip.engine.transcribe(
-            samples: tone(5), language: "he", config: clip.config,
             requestTimeout: 30, isCancelled: nil)
 
         XCTAssertEqual(segments.map(\.text).joined(), "shalom")
-        XCTAssertEqual(clip.server.requestCount, 1)
-        XCTAssertEqual(pass.server.requestCount, 0, "nothing went to the pass's server")
+        XCTAssertEqual(fixture.server.requestCount, 1)
     }
 
     /// A stretch of exact digital silence inside a real recording is not
@@ -810,25 +756,15 @@ final class ScriptedTranscriptionServer: @unchecked Sendable {
     private let lock = NSLock()
     private var replies: [ScriptedReply]
     private var requests = 0
-    private var hook: (@Sendable (Int) -> Void)?
     init(_ replies: [ScriptedReply]) { self.replies = replies }
     var requestCount: Int { lock.lock(); defer { lock.unlock() }; return requests }
-    /// Runs with each request's number (from 1) before it is answered.
-    var beforeReply: (@Sendable (Int) -> Void)? {
-        get { lock.lock(); defer { lock.unlock() }; return hook }
-        set { lock.lock(); hook = newValue; lock.unlock() }
-    }
     func nextReply() -> ScriptedReply {
         lock.lock()
+        defer { lock.unlock() }
         requests += 1
-        let number = requests
-        let hook = self.hook
-        let reply: ScriptedReply = replies.isEmpty
+        return replies.isEmpty
             ? .init(status: 500, body: #"{"error":{"message":"script exhausted"}}"#)
             : replies.removeFirst()
-        lock.unlock()
-        hook?(number)
-        return reply
     }
 }
 

@@ -598,14 +598,14 @@ final class RemoteWhisperEngineParsingTests: XCTestCase {
     /// leaked; `.noAudioCaptured` proves it refused before the request.
     func test_refusesToUploadEmptyAudio() async {
         let engine = RemoteWhisperEngine()
-        await engine.configure(RemoteTranscriptionConfig(
+        let config = RemoteTranscriptionConfig(
             endpoint: URL(string: "http://127.0.0.1:1/v1")!,
             apiKey: "",
-            model: "whisper-1"))
+            model: "whisper-1")
 
         do {
             _ = try await engine.transcribe(samples: [], language: "en",
-                                            audioCtx: 0, progress: nil, isCancelled: nil)
+                                            config: config, progress: nil, isCancelled: nil)
             XCTFail("Expected .noAudioCaptured; the engine uploaded empty audio")
         } catch let error as RemoteWhisperEngine.RemoteError {
             guard case .noAudioCaptured = error else {

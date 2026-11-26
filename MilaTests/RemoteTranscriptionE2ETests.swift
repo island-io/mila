@@ -58,16 +58,16 @@ final class RemoteTranscriptionE2ETests: XCTestCase {
     func test_roundTrip_uploadsAndParsesSegments() async throws {
         try XCTSkipIf(isRealServer, "echo-mock assertions don't apply to a real transcription server.")
         let engine = RemoteWhisperEngine()
-        await engine.configure(RemoteTranscriptionConfig(
+        let config = RemoteTranscriptionConfig(
             endpoint: endpoint,
             apiKey: "test-key-123",
             model: "mila-echo-model"
-        ))
+        )
 
         let segments = try await engine.transcribe(
             samples: sineSamples(),
             language: "he",
-            audioCtx: 0,
+            config: config,
             progress: nil,
             isCancelled: nil
         )
@@ -84,16 +84,16 @@ final class RemoteTranscriptionE2ETests: XCTestCase {
     func test_autoLanguage_isOmitted() async throws {
         try XCTSkipIf(isRealServer, "echo-mock assertions don't apply to a real transcription server.")
         let engine = RemoteWhisperEngine()
-        await engine.configure(RemoteTranscriptionConfig(
+        let config = RemoteTranscriptionConfig(
             endpoint: endpoint,
             apiKey: "test-key-123",
             model: "m"
-        ))
+        )
 
         let segments = try await engine.transcribe(
             samples: sineSamples(),
             language: "auto",
-            audioCtx: 0,
+            config: config,
             progress: nil,
             isCancelled: nil
         )

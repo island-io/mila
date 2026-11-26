@@ -120,7 +120,6 @@ final class RemoteConnectionDropTests: XCTestCase {
             // Out of credit is a 429 too, and no amount of waiting fixes it.
             RemoteWhisperEngine.RemoteError.http(
                 status: 429, body: #"{"error":{"code":"insufficient_quota","type":"insufficient_quota"}}"#),
-            RemoteWhisperEngine.RemoteError.notConfigured,
             RemoteWhisperEngine.RemoteError.badResponse,
             RemoteWhisperEngine.RemoteError.emptyResult,
             RemoteWhisperEngine.RemoteError.noAudioCaptured,

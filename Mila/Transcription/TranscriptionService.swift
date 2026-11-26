@@ -1422,7 +1422,6 @@ final class TranscriptionService: ObservableObject {
 
             async let transcribeTask: [TranscriptSegment] = {
                 if let remoteConfig {
-                    // Not the engine's current config: see `remoteConfig`.
                     return try await passRemoteEngine.transcribe(
                         samples: samples, language: language, config: remoteConfig,
                         progress: onProgress, isCancelled: isCancelled)
