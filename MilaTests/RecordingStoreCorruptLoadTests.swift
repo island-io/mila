@@ -211,4 +211,104 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         XCTAssertNil(relaunched.libraryLoadIssue)
         XCTAssertTrue(try damagedBackups().isEmpty)
     }
+
+    /// Appends `row` to recordings.json as written by a healthy store holding
+    /// one "Keep" recording. `row` carries an invalid `id`, so it no longer
+    /// decodes as a `Recording`.
+    private func writeStoreWithDroppedRow(_ row: [String: Any]) throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        var rows = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
+        rows.append(row.merging(["id": "not-a-uuid", "title": 42]) { _, bad in bad })
+        try JSONSerialization.data(withJSONObject: rows).write(to: storeFile)
+    }
+
+    private var recordingsDir: URL { tempRoot.appendingPathComponent("Recordings") }
+
+    /// Compressed and imported audio is `.m4a`. A dropped row that names one
+    /// comes back too, with its summary (or the next `update` deletes the
+    /// summary sidecar for being empty) and its Voice Memos identity (or the
+    /// next sync imports the memo a second time).
+    func test_a_dropped_m4a_row_comes_back_with_its_summary_and_memo_identity() throws {
+        try writeStoreWithDroppedRow(["audioFileName": "memo.m4a", "source": "voiceMemo",
+                                      "voiceMemoUniqueID": "memo-1", "voiceMemoFolderUUID": "folder-1"])
+        try Data(count: 1024).write(to: recordingsDir.appendingPathComponent("memo.m4a"))
+        try "Transcript".write(to: recordingsDir.appendingPathComponent("memo.txt"),
+                               atomically: true, encoding: .utf8)
+        let summaryFile = recordingsDir.appendingPathComponent("memo.summary.txt")
+        try "Summary".write(to: summaryFile, atomically: true, encoding: .utf8)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        var memo = try XCTUnwrap(relaunched.recordings.first { $0.audioFileName == "memo.m4a" })
+        XCTAssertEqual(memo.status, .completed)
+        XCTAssertEqual(memo.fullText, "Transcript")
+        XCTAssertEqual(memo.summary, "Summary")
+        XCTAssertEqual(memo.source, .voiceMemo)
+        XCTAssertEqual(memo.voiceMemoUniqueID, "memo-1")
+        XCTAssertEqual(memo.voiceMemoFolderUUID, "folder-1")
+        XCTAssertEqual(relaunched.libraryLoadIssue?.recoveredRecordings, 1)
+
+        memo.title = "Renamed"
+        relaunched.update(memo)
+        XCTAssertEqual(try String(contentsOf: summaryFile, encoding: .utf8), "Summary")
+    }
+
+    /// An unreferenced `.m4a` that no dropped row names is a compression that
+    /// stopped before its save; a `.wav` sharing a live row's base name is
+    /// the source a finished compression didn't get to delete. Neither is a
+    /// recording of its own, and the second would share the live row's
+    /// sidecars.
+    func test_compression_leftovers_are_not_recovered_as_recordings() throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "Compressed", source: .microphone, audioFileName: "done.m4a"))
+        try Data(count: RecordingStore.emptyWAVByteCount + 1)
+            .write(to: recordingsDir.appendingPathComponent("done.wav"))
+        try Data(count: 1024).write(to: recordingsDir.appendingPathComponent("stray.m4a"))
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        XCTAssertEqual(relaunched.recordings.map(\.audioFileName), ["done.m4a"])
+        XCTAssertTrue(relaunched.consumePendingRecoveryIDs().isEmpty)
+    }
+
+    /// No transcription pass runs for a row settled from its saved
+    /// transcript, so its length has to come from the audio file.
+    func test_a_recovered_row_that_is_not_retranscribed_gets_its_duration() throws {
+        try writeStoreWithDroppedRow(["audioFileName": "lost.wav"])
+        try TestSupport.writeSineWav(at: recordingsDir.appendingPathComponent("lost.wav"),
+                                     durationSeconds: 2)
+        try "Text".write(to: recordingsDir.appendingPathComponent("lost.txt"),
+                         atomically: true, encoding: .utf8)
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        let lost = try XCTUnwrap(relaunched.recordings.first { $0.audioFileName == "lost.wav" })
+        XCTAssertEqual(lost.status, .completed)
+        XCTAssertEqual(lost.duration, 2, accuracy: 0.01)
+    }
+
+    /// While writes are off, compressing a recording made this session must
+    /// keep its WAV: recordings.json can't name the `.m4a`, and the next
+    /// launch's orphan sweep finds only `.wav` files.
+    func test_compression_keeps_the_wav_while_writes_are_off() async throws {
+        let first = RecordingStore(rootDirectory: tempRoot)
+        first.add(Recording(title: "A", source: .microphone, audioFileName: "a.wav"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: storeFile.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storeFile.path) }
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+        XCTAssertEqual(relaunched.libraryLoadIssue?.kind, .unreadable)
+
+        let wav = recordingsDir.appendingPathComponent("new.wav")
+        try TestSupport.writeSineWav(at: wav)
+        let rec = Recording(title: "New", source: .microphone, audioFileName: "new.wav", status: .completed)
+        relaunched.add(rec)
+        await relaunched.compressRecordingAudio(id: rec.id)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: wav.path))
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: recordingsDir.appendingPathComponent("new.m4a").path))
+        XCTAssertEqual(relaunched.recordings.first { $0.id == rec.id }?.audioFileName, "new.wav")
+    }
 }

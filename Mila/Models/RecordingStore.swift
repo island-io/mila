@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 import Combine
 import OSLog
 import MilaKit
@@ -413,7 +414,18 @@ final class RecordingStore: ObservableObject {
             return
         }
         recordings[idx].audioFileName = dstName
-        persist()
+        // Delete the WAV only once recordings.json names the `.m4a`. When the
+        // write is refused (`storeIsUnreadable`) or fails, the file on disk
+        // still names the WAV — or, for a row this session could not save,
+        // nothing, and the next launch's orphan sweep finds only `.wav`
+        // files. Either way the WAV is the copy that can be found again, so
+        // keep it and drop the `.m4a`.
+        guard persist() else {
+            recordings[idx].audioFileName = rec.audioFileName
+            try? FileManager.default.removeItem(at: dst)
+            recStoreLog.error("compressRecordingAudio for \(id, privacy: .public): recordings.json not written; kept the WAV")
+            return
+        }
         try? FileManager.default.removeItem(at: src)
         recStoreLog.log("compressed recording \(id, privacy: .public) → \(dstName, privacy: .private)")
     }
@@ -1830,9 +1842,11 @@ final class RecordingStore: ObservableObject {
             data = try Data(contentsOf: storeURL)
         } catch {
             // A missing file is a fresh install; anything else (permissions,
-            // an offline volume) means the library exists but can't be read.
-            // Either way nothing is written here, but only the second case
-            // is worth telling the user about.
+            // an unreadable or evicted file) means the library exists but
+            // can't be read. Either way nothing is written here, but only the
+            // second case is worth telling the user about. A relocated store
+            // on a volume that isn't mounted reads as "no such file", so it
+            // is treated as the first case — as it was before this check.
             let ns = error as NSError
             let isMissing = ns.domain == NSCocoaErrorDomain
                 && (ns.code == NSFileReadNoSuchFileError || ns.code == NSFileNoSuchFileError)
@@ -1851,9 +1865,10 @@ final class RecordingStore: ObservableObject {
         var decoded: [Recording]
         var droppedRows = 0
         var damage: LibraryLoadIssue.Kind?
-        // Audio of dropped rows that were in Recently Deleted, keyed by file
-        // name, so recovery puts them back there instead of into the library.
-        var trashedOrphans: [String: Date] = [:]
+        // What could still be read from each dropped row, keyed by its audio
+        // file name, so recovery can rebuild the row around that audio (see
+        // `recoverOrphanRecordings`).
+        var salvaged: [String: Salvage] = [:]
         do {
             // Element by element: one row a build can't decode must not take
             // the rest of the library index with it.
@@ -1861,9 +1876,7 @@ final class RecordingStore: ObservableObject {
             decoded = lossy.compactMap(\.value)
             droppedRows = lossy.count - decoded.count
             for case let salvage? in lossy.map(\.salvage) {
-                if let name = salvage.audioFileName, let deletedAt = salvage.deletedAt {
-                    trashedOrphans[name] = deletedAt
-                }
+                if let name = salvage.audioFileName { salvaged[name] = salvage }
             }
             if droppedRows > 0 {
                 recStoreLog.error("recordings.json: \(droppedRows, privacy: .public) row(s) could not be decoded")
@@ -1920,11 +1933,11 @@ final class RecordingStore: ObservableObject {
         }
         self.recordings = decoded.sorted { $0.createdAt > $1.createdAt }
         // A row that could not be decoded is not in `recordings`, so its
-        // `.wav` counts as an orphan here and comes back as a "Recovered
+        // audio counts as an orphan here and comes back as a "Recovered
         // recording" — deliberately: the audio is the user's data, the row
-        // was only its index entry. Its `.txt` sidecar and, when the row
-        // still says so, its place in Recently Deleted come back with it.
-        let recovered = recoverOrphanRecordings(trashed: trashedOrphans)
+        // was only its index entry. Its sidecars and, when the row still
+        // says so, its place in Recently Deleted come back with it.
+        let recovered = recoverOrphanRecordings(salvaged: salvaged)
         if let damage {
             libraryLoadIssue = LibraryLoadIssue(
                 kind: damage, droppedRows: droppedRows,
@@ -1989,28 +2002,42 @@ final class RecordingStore: ObservableObject {
     }
 
     /// The fields orphan recovery needs from a row that no longer decodes as
-    /// a `Recording`: which audio file it indexed and whether it was in
-    /// Recently Deleted. Each is read on its own so one bad field doesn't
-    /// hide the other.
+    /// a `Recording`: which audio file it indexed, whether it was in
+    /// Recently Deleted, where it came from, and the Voice Memos identity the
+    /// importer dedups on — without that, the next sync imports the memo a
+    /// second time, and a trashed memo comes back live. Each is read on its
+    /// own so one bad field doesn't hide the others.
     private struct Salvage: Decodable {
         let audioFileName: String?
         let deletedAt: Date?
-        private enum CodingKeys: String, CodingKey { case audioFileName, deletedAt }
+        let source: RecordingSource?
+        let voiceMemoUniqueID: String?
+        let voiceMemoFolderUUID: String?
+        private enum CodingKeys: String, CodingKey {
+            case audioFileName, deletedAt, source, voiceMemoUniqueID, voiceMemoFolderUUID
+        }
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             audioFileName = try? c.decodeIfPresent(String.self, forKey: .audioFileName)
             deletedAt = try? c.decodeIfPresent(Date.self, forKey: .deletedAt)
+            source = try? c.decodeIfPresent(RecordingSource.self, forKey: .source)
+            voiceMemoUniqueID = try? c.decodeIfPresent(String.self, forKey: .voiceMemoUniqueID)
+            voiceMemoFolderUUID = try? c.decodeIfPresent(String.self, forKey: .voiceMemoFolderUUID)
         }
     }
 
     /// Copies the unreadable `recordings.json` to
-    /// `recordings.damaged-<timestamp>.json` next to it. A copy, not a move:
-    /// `mila-mcp` keeps reading the original until the app next writes.
+    /// `recordings.damaged-<timestamp>-<suffix>.json` next to it. A copy, not
+    /// a move: `mila-mcp` keeps reading the original until the app next
+    /// writes. The random suffix keeps a second damaged load in the same
+    /// second (a relocate right after launch) from colliding with the first
+    /// copy — a failed copy turns writes off for the session.
     private func setAsideDamagedStore() -> URL? {
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
+        let suffix = String(UUID().uuidString.prefix(6))
         let backup = storeURL.deletingLastPathComponent()
-            .appendingPathComponent("recordings.damaged-\(stamp).json")
+            .appendingPathComponent("recordings.damaged-\(stamp)-\(suffix).json")
         do {
             try fileManager.copyItem(at: storeURL, to: backup)
             return backup
@@ -2055,51 +2082,85 @@ final class RecordingStore: ObservableObject {
     /// the caller can decide whether to re-persist.
     ///
     /// An orphan can also be the audio of a `recordings.json` row that failed
-    /// to decode. Two things then differ from a crash orphan:
-    /// - Its `.txt` sidecar may exist. That file is the only copy of the
-    ///   transcript (and of any edits to it), so it is loaded and the row is
-    ///   settled as `.completed` instead of re-transcribed, which would
-    ///   replace the file or, for a silent result, delete it.
-    /// - `trashed` names the audio of dropped rows that were in Recently
-    ///   Deleted (trash keeps its audio on disk until purged); those go back
-    ///   to the trash, not into the library, and are never queued.
+    /// to decode (`salvaged`, keyed by audio file name). That changes four
+    /// things:
+    /// - Its audio may be a compressed or imported `.m4a`, so a salvaged name
+    ///   is recovered whatever its extension. Only names the row itself
+    ///   gave are widened this way: an unreferenced `.m4a` that no dropped
+    ///   row names is a half-finished compression, not a recording.
+    /// - Its `.txt` and `.summary.txt` sidecars may exist. They are the only
+    ///   copies of the transcript (and of any edits to it) and of the
+    ///   summary, so they are loaded and the row is settled as `.completed`
+    ///   instead of re-transcribed — which would replace the transcript or,
+    ///   for a silent result, delete it — and the next `update` does not
+    ///   delete the summary sidecar for being empty.
+    /// - A dropped row that was in Recently Deleted (trash keeps its audio on
+    ///   disk until purged) goes back to the trash, not into the library,
+    ///   and is never queued.
+    /// - Its source and Voice Memos identity come back with it, so the next
+    ///   Voice Memos sync sees the memo as already imported.
+    ///
+    /// A `.wav` whose base name a recording already uses with another
+    /// extension is skipped: it is the source a compression left behind when
+    /// the app quit between saving the `.m4a` and deleting the `.wav`, and
+    /// recovering it would add a duplicate sharing the live row's sidecars.
     @discardableResult
-    private func recoverOrphanRecordings(trashed: [String: Date] = [:]) -> [Recording] {
+    private func recoverOrphanRecordings(salvaged: [String: Salvage] = [:]) -> [Recording] {
         let referenced = Set(recordings.map { $0.audioFileName })
+        let referencedBases = Set(recordings.map { ($0.audioFileName as NSString).deletingPathExtension })
         guard let entries = try? fileManager.contentsOfDirectory(
             at: recordingsDirectory,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
         var added: [Recording] = []
-        for url in entries where url.pathExtension.lowercased() == "wav" {
+        for url in entries {
+            // `name` comes off disk, never from the JSON, so a salvaged
+            // `audioFileName` can only pick among files already in the folder.
             let name = url.lastPathComponent
+            let ext = url.pathExtension.lowercased()
+            let salvage = salvaged[name]
+            guard ext == "wav" || (salvage != nil && AudioTrimmer.supportedExtensions.contains(ext)) else { continue }
             if referenced.contains(name) { continue }
+            if referencedBases.contains((name as NSString).deletingPathExtension) { continue }
             // Skip captures that hold no audio. The threshold is a byte count
             // rather than a decoded frame count on purpose: a genuinely crashed
             // recording has an UNFINALIZED header claiming zero frames while
             // its samples are on disk, so asking AVAudioFile how long it is
             // would discard exactly the recordings this sweep exists to save.
             let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            if size <= Self.emptyWAVByteCount { continue }
+            if size <= (ext == "wav" ? Self.emptyWAVByteCount : 0) { continue }
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
             var recovered = Recording(
                 title: recoveryTitle(at: mtime),
                 createdAt: mtime,
                 duration: 0,  // filled in by the transcription path
-                source: .microphone,  // best guess; the original source isn't recoverable
+                // Best guess for a crash orphan; a dropped row may still say.
+                source: salvage?.source ?? .microphone,
                 audioFileName: name,
                 status: .pending
             )
+            recovered.voiceMemoUniqueID = salvage?.voiceMemoUniqueID
+            recovered.voiceMemoFolderUUID = salvage?.voiceMemoFolderUUID
             if let text = try? String(contentsOf: transcriptURL(for: recovered), encoding: .utf8),
                !text.isEmpty {
                 recovered.fullText = text
                 recovered.status = .completed
             }
-            if let deletedAt = trashed[name] {
+            if let summary = try? String(contentsOf: summaryURL(for: recovered), encoding: .utf8),
+               !summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                recovered.summary = summary
+            }
+            if let deletedAt = salvage?.deletedAt {
                 recovered.deletedAt = deletedAt
                 // Nothing in the trash is transcribed; a restore can retry.
                 if recovered.status == .pending { recovered.status = .failed }
+            }
+            if recovered.status != .pending {
+                // No transcription pass will fill this in. The file's header
+                // is final here (it was a finished recording), unlike a crash
+                // orphan's.
+                recovered.duration = Self.finalizedAudioDuration(at: url)
             }
             recordings.insert(recovered, at: 0)
             added.append(recovered)
@@ -2117,6 +2178,17 @@ final class RecordingStore: ObservableObject {
             recordings.sort { $0.createdAt > $1.createdAt }
         }
         return added
+    }
+
+    /// Length in seconds of an audio file with a finished header, or 0 when
+    /// it can't be read. The sample rate is checked before it divides: the
+    /// file is whatever is on disk.
+    private static func finalizedAudioDuration(at url: URL) -> Double {
+        guard let file = try? AVAudioFile(forReading: url) else { return 0 }
+        let rate = file.processingFormat.sampleRate
+        guard rate.isFinite, rate > 0 else { return 0 }
+        let seconds = Double(file.length) / rate
+        return seconds.isFinite && seconds > 0 ? seconds : 0
     }
 
     private func recoveryTitle(at date: Date) -> String {

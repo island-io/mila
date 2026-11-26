@@ -1009,7 +1009,7 @@ private struct LibraryLoadIssueBanner: View {
     private func message(_ issue: RecordingStore.LibraryLoadIssue) -> String {
         switch issue.kind {
         case .unreadable:
-            return "recordings.json exists but can't be read, so it is left untouched and changes won't be saved this session. Audio files on disk are recovered on the next launch."
+            return "recordings.json exists but can't be read, so it is left untouched and changes won't be saved this session. Recordings made now stay on disk and come back as \u{201C}Recovered recording\u{201D} entries, without their titles, once the list can be read again."
         case .undecodable:
             return recoveryNote(issue) + backupNote(issue)
         case .rowsDropped:
@@ -1032,9 +1032,9 @@ private struct LibraryLoadIssueBanner: View {
         }
         let queued = issue.recoveredForTranscription
         if queued == n {
-            note += n == 1 ? " It will be transcribed again." : " They will be transcribed again."
+            note += n == 1 ? " It will be transcribed." : " They will be transcribed."
         } else if queued > 0 {
-            note += " Saved transcripts were kept; \(queued == 1 ? "1 recording" : "\(queued) recordings") without one will be transcribed again."
+            note += " Saved transcripts were kept; \(queued == 1 ? "1 recording" : "\(queued) recordings") without one will be transcribed."
         } else if n - trashed > 0 {
             note += " Saved transcripts were kept."
         }
