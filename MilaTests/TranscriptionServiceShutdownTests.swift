@@ -75,10 +75,8 @@ private struct AdmissionFixture {
 
 private actor AdmissionProbeRemoteEngine: RemoteTranscribing {
     private(set) var calls = 0
-    func configure(_ config: RemoteTranscriptionConfig) async {}
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
     func shutdown() async {}
-    func transcribe(samples: [Float], language: String, audioCtx: Int32?,
+    func transcribe(samples: [Float], language: String, config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         calls += 1
@@ -130,22 +128,17 @@ extension TranscriptionServiceShutdownTests {
         }
     }
 
-    func test_shutdown_during_configure_does_not_start_remote_transcription() async throws {
-        let fixture = try ServiceShutdownFixture(stage: .configure)
+    /// A one-shot call after shutdown never reaches the engine. (The engine
+    /// used to be `configure`d first, a suspension a shutdown could arrive in;
+    /// the config now goes with the call, so the only gate is the one on
+    /// entry.)
+    func test_one_shot_after_shutdown_does_not_start_remote_transcription() async throws {
+        let fixture = try ServiceShutdownFixture(stage: .none)
         defer { fixture.cleanUp() }
-        let completed = expectation(description: "configure returned")
-        // A one-shot call is independently scheduled, rather than owned by the queue worker.
-        let call = Task {
-            defer { completed.fulfill() }
-            let result = await fixture.service.transcribeOnceSegments(
-                samples: Array(repeating: 0.2, count: 16_000), language: "en", audioCtx: 0)
-            XCTAssertTrue(result.isEmpty)
-        }
-        await fulfillment(of: [fixture.remote.gate.entered], timeout: 10)
         await fixture.service.shutdown()
-        await fixture.remote.gate.release()
-        await fulfillment(of: [completed], timeout: 10)
-        call.cancel()
+        let result = await fixture.service.transcribeOnceSegments(
+            samples: Array(repeating: 0.2, count: 16_000), language: "en", audioCtx: 0)
+        XCTAssertTrue(result.isEmpty)
         let calls = await fixture.remote.transcribeCalls
         XCTAssertEqual(calls, 0)
         XCTAssertNil(fixture.service.lastError)
@@ -211,7 +204,7 @@ extension TranscriptionServiceShutdownTests {
     }
 }
 
-private enum ShutdownEngineStage: Equatable { case none, configure, load, transcribe }
+private enum ShutdownEngineStage: Equatable { case none, load, transcribe }
 private enum ShutdownEngineOutcome: Equatable { case empty, failure }
 
 private actor ServiceShutdownGate {
@@ -229,7 +222,7 @@ private actor ServiceShutdownGate {
     }
 }
 
-private actor ShutdownControlledEngine: RemoteTranscribing {
+private actor ShutdownControlledEngine: RemoteTranscribing, TranscribingEngine {
     nonisolated let gate = ServiceShutdownGate()
     nonisolated let didShutdown = XCTestExpectation(description: "engine shutdown called")
     private let stage: ShutdownEngineStage
@@ -242,14 +235,18 @@ private actor ShutdownControlledEngine: RemoteTranscribing {
     init(stage: ShutdownEngineStage, outcome: ShutdownEngineOutcome = .empty) {
         self.stage = stage; self.outcome = outcome
     }
-    func configure(_ config: RemoteTranscriptionConfig) async {
-        if stage == .configure { await gate.wait() }
-    }
     func loadIfNeeded(modelURL: URL, displayName: String) async throws {
         loadCalls += 1
         if stage == .load { await gate.wait() }
     }
     func shutdown() async { shutdownCalls += 1; didShutdown.fulfill() }
+    /// The remote role: the same barrier as the local one.
+    func transcribe(samples: [Float], language: String, config: RemoteTranscriptionConfig,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await transcribe(samples: samples, language: language, audioCtx: 0,
+                             progress: progress, isCancelled: isCancelled)
+    }
     func transcribe(samples: [Float], language: String, audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {

@@ -259,17 +259,16 @@ final class RemotePieceTranscriptionTests: XCTestCase {
         XCTAssertEqual(elsewhere.server.requestCount, 0, "no piece went to the newly configured server")
     }
 
-    /// The batch pass hands the engine its own config with the call. A live
-    /// clip's `configure` that arrived after the pass's own — before the
-    /// first piece went out — must neither send the recording to the live
-    /// clip's server nor lose the pass's `offlineDiarization`.
+    /// The batch pass hands the engine its own config with the call. A
+    /// config left on the engine by someone else (here a live clip's) must
+    /// neither send the recording to that server nor lose the pass's
+    /// `offlineDiarization`.
     func test_a_pass_given_its_config_ignores_the_engines_current_one() async throws {
         let fixture = PieceServerFixture(model: "gpt-4o-transcribe-diarize",
                                          replies: [.ok(Self.diarized), .ok(Self.diarized), .ok(Self.diarized)],
                                          offlineDiarization: true)
         let live = PieceServerFixture(model: "whisper-1", replies: [])
         defer { fixture.cleanUp(); live.cleanUp() }
-        await fixture.engine.configure(fixture.config)
         await fixture.engine.configure(live.config)
 
         let segments = try await fixture.engine.transcribe(
@@ -281,6 +280,23 @@ final class RemotePieceTranscriptionTests: XCTestCase {
         XCTAssertEqual(segments.count, 9)
         XCTAssertTrue(segments.allSatisfy { $0.speaker == nil },
                       "the pass's offlineDiarization still applies: \(segments.map(\.speaker))")
+    }
+
+    /// The clip path the same way: a config left on the engine by someone
+    /// else (here an English pass's) does not redirect a clip handed its own.
+    func test_a_clip_given_its_config_ignores_the_engines_current_one() async throws {
+        let clip = PieceServerFixture(model: "gpt-4o-mini-transcribe", replies: [.ok(#"{"text":"shalom"}"#)])
+        let pass = PieceServerFixture(model: "whisper-1", replies: [])
+        defer { clip.cleanUp(); pass.cleanUp() }
+        await clip.engine.configure(pass.config)
+
+        let segments = try await clip.engine.transcribe(
+            samples: tone(5), language: "he", config: clip.config,
+            requestTimeout: 30, isCancelled: nil)
+
+        XCTAssertEqual(segments.map(\.text).joined(), "shalom")
+        XCTAssertEqual(clip.server.requestCount, 1)
+        XCTAssertEqual(pass.server.requestCount, 0, "nothing went to the pass's server")
     }
 
     /// A stretch of exact digital silence inside a real recording is not
@@ -427,7 +443,7 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
         try await super.tearDown()
     }
 
-    private func makeService(model: String, replies: [ScriptedReply],
+    private func makeService(model: String, englishModel: String? = nil, replies: [ScriptedReply],
                              remoteEngine: (any RemoteTranscribing)? = nil) -> TranscriptionService {
         let server = PieceServerFixture(model: model, replies: replies)
         fixture = server
@@ -440,6 +456,7 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
         // touches the Keychain or the network.
         remote.endpoint = server.config.endpoint.absoluteString
         remote.model = model
+        if let englishModel { remote.englishModel = englishModel }
         let diarizationSuite = "\(label).diarization"
         UserDefaults(suiteName: diarizationSuite)!.removePersistentDomain(forName: diarizationSuite)
         return TranscriptionService(
@@ -452,14 +469,14 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
     }
 
     /// An imported Voice Memo: audio on disk, no transcript yet.
-    private func addVoiceMemo(_ samples: [Float]) throws -> Recording {
+    private func addVoiceMemo(_ samples: [Float], language: String = "he") throws -> Recording {
         let url = store.freshAudioURL(suggestedName: "Long memo")
         try AudioConvert.writeWhisperWAV(samples: samples, to: url)
         let recording = Recording(title: "Long memo",
                                   duration: Double(samples.count) / WhisperAudioFormat.sampleRate,
                                   source: .voiceMemo,
                                   audioFileName: url.lastPathComponent,
-                                  language: "he")
+                                  language: language)
         store.add(recording)
         return recording
     }
@@ -472,23 +489,50 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
             + [Float](repeating: 0, count: 8_000) + tone(7.5)
     }
 
-    /// The pass sends the recording with the config it resolved, not with
-    /// whatever the shared engine holds once the call arrives: a live clip's
-    /// `configure` can come in between the two.
+    /// The pass hands the engine the config it resolved, with the call.
     func test_the_pass_hands_the_engine_its_own_config() async throws {
-        let liveClip = RemoteTranscriptionConfig(endpoint: URL(string: "https://live-clip.invalid/v1")!,
-                                                 apiKey: "", model: "whisper-1")
-        let engine = LiveClipReconfiguredEngine(liveClip: liveClip)
+        let engine = ConfigRecordingRemoteEngine()
         let service = makeService(model: "gpt-4o-mini-transcribe", replies: [], remoteEngine: engine)
         let recording = try addVoiceMemo(threePieceAudio())
 
         service.enqueue(recording)
         await service.waitForIdle()
 
-        let used = await engine.usedConfig
-        XCTAssertEqual(used?.model, "gpt-4o-mini-transcribe")
-        XCTAssertEqual(used?.endpoint.host, fixture?.config.endpoint.host)
-        XCTAssertEqual(used?.offlineDiarization, false, "diarization is not set up in this suite")
+        let passes = await engine.passConfigs
+        XCTAssertEqual(passes.count, 1)
+        XCTAssertEqual(passes.first?.model, "gpt-4o-mini-transcribe")
+        XCTAssertEqual(passes.first?.endpoint.host, fixture?.config.endpoint.host)
+        XCTAssertEqual(passes.first?.offlineDiarization, false, "diarization is not set up in this suite")
+        let clips = await engine.clipConfigs
+        XCTAssertTrue(clips.isEmpty)
+        XCTAssertEqual(store.recordings.first { $0.id == recording.id }?.status, .completed)
+    }
+
+    /// One engine serves both paths at once. A Hebrew live clip that comes
+    /// in while an English import is being transcribed goes to the Hebrew
+    /// model, and the import to the English one: each call carries its own
+    /// config, so neither can pick up the other's.
+    func test_a_live_clip_during_a_pass_goes_out_with_its_own_config() async throws {
+        let engine = ConfigRecordingRemoteEngine(holdPasses: true)
+        let service = makeService(model: "gpt-4o-mini-transcribe", englishModel: "whisper-1",
+                                  replies: [], remoteEngine: engine)
+        let recording = try addVoiceMemo(threePieceAudio(), language: "en")
+
+        service.enqueue(recording)
+        await fulfillment(of: [engine.passEntered], timeout: 10)
+        let utterance = (0..<48_000).map { 0.3 * Float(sin(2 * Double.pi * 220 * Double($0) / 16_000)) }
+        let outcome = await service.transcribeLiveSegments(samples: utterance, language: "he", audioCtx: nil)
+        await engine.releasePasses()
+        await service.waitForIdle()
+
+        guard case .transcribed(let segments) = outcome else {
+            return XCTFail("the clip was not transcribed: \(outcome)")
+        }
+        XCTAssertEqual(segments.map(\.text), ["clip"])
+        let clips = await engine.clipConfigs
+        XCTAssertEqual(clips.map(\.model), ["gpt-4o-mini-transcribe"], "the Hebrew clip's model")
+        let passes = await engine.passConfigs
+        XCTAssertEqual(passes.map(\.model), ["whisper-1"], "the English import's model")
         XCTAssertEqual(store.recordings.first { $0.id == recording.id }?.status, .completed)
     }
 
@@ -616,38 +660,49 @@ final class RemoteLongRecordingServiceTests: XCTestCase {
     }
 }
 
-/// A remote engine that a live clip reconfigures the moment the batch pass
-/// has configured it: whatever the pass `configure`s, the engine ends up
-/// holding `liveClip`. Records the config a whole-recording request would
-/// go out with — the one handed over with the call, or, through the plain
-/// `transcribe`, the engine's current one.
-private actor LiveClipReconfiguredEngine: RemoteTranscribing {
-    let liveClip: RemoteTranscriptionConfig
-    private var current: RemoteTranscriptionConfig?
-    private(set) var usedConfig: RemoteTranscriptionConfig?
+/// A remote engine that records the config each call was handed, per path.
+/// With `holdPasses`, a whole-recording call waits inside the engine until
+/// `releasePasses()`, so a test can send a live clip while a pass is in
+/// flight. Implements both paths itself — no protocol default — so a call
+/// shows up under the path it actually took.
+private actor ConfigRecordingRemoteEngine: RemoteTranscribing {
+    nonisolated let passEntered = XCTestExpectation(description: "a pass reached the engine")
+    private let holdPasses: Bool
+    private var released = false
+    private var held: CheckedContinuation<Void, Never>?
+    private(set) var passConfigs: [RemoteTranscriptionConfig] = []
+    private(set) var clipConfigs: [RemoteTranscriptionConfig] = []
 
-    init(liveClip: RemoteTranscriptionConfig) { self.liveClip = liveClip }
+    init(holdPasses: Bool = false) { self.holdPasses = holdPasses }
 
-    func configure(_ config: RemoteTranscriptionConfig) async { current = liveClip }
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
-    func shutdown() async {}
-
-    func transcribe(samples: [Float],
-                    language: String,
-                    audioCtx: Int32?,
-                    progress: (@Sendable (Float) -> Void)?,
-                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        usedConfig = current
-        return [TranscriptSegment(start: 0, end: 1, text: "uploaded")]
+    func releasePasses() {
+        released = true
+        held?.resume()
+        held = nil
     }
+
+    func shutdown() async {}
 
     func transcribe(samples: [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        usedConfig = config
-        return [TranscriptSegment(start: 0, end: 1, text: "uploaded")]
+        passConfigs.append(config)
+        if holdPasses, !released {
+            passEntered.fulfill()
+            await withCheckedContinuation { held = $0 }
+        }
+        return [TranscriptSegment(start: 0, end: 1, text: "pass")]
+    }
+
+    func transcribe(samples: [Float],
+                    language: String,
+                    config: RemoteTranscriptionConfig,
+                    requestTimeout: TimeInterval,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        clipConfigs.append(config)
+        return [TranscriptSegment(start: 0, end: 1, text: "clip")]
     }
 }
 
@@ -830,9 +885,8 @@ struct PieceServerFixture {
 
     func transcribe(_ samples: [Float],
                     progress: (@Sendable (Float) -> Void)? = nil) async throws -> [TranscriptSegment] {
-        await engine.configure(config)
-        return try await engine.transcribe(samples: samples, language: "he", audioCtx: 0,
-                                           progress: progress, isCancelled: nil)
+        try await engine.transcribe(samples: samples, language: "he", config: config,
+                                    progress: progress, isCancelled: nil)
     }
 
     func cleanUp() {

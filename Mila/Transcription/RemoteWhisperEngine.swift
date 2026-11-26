@@ -5,60 +5,53 @@ import TranscriptionCore
 private let remoteLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
                                category: "RemoteWhisperEngine")
 
-/// Injection seam for `TranscriptionService`: the remote engine refines
-/// `TranscribingEngine` with the remote-specific `configure(_:)` step the
-/// service calls before each run. Pulling it behind a protocol lets tests
-/// substitute an engine that fails deterministically (e.g. a simulated HTTP
-/// 401) without a real network round-trip — which is exactly the failure mode
-/// that previously went uncaught (a misconfigured remote key silently emptied
-/// the live transcript). `RemoteWhisperEngine` is the only production conformer.
-protocol RemoteTranscribing: TranscribingEngine {
-    func configure(_ config: RemoteTranscriptionConfig) async
-
+/// Injection seam for `TranscriptionService`: the two requests the service
+/// makes of a remote server, each carrying the config it goes out with.
+/// Pulling it behind a protocol lets tests substitute an engine that fails
+/// deterministically (e.g. a simulated HTTP 401) without a real network
+/// round-trip — which is exactly the failure mode that previously went
+/// uncaught (a misconfigured remote key silently emptied the live
+/// transcript). `RemoteWhisperEngine` is the only production conformer.
+///
+/// The config travels WITH each call, never as state set beforehand (#376).
+/// One engine serves live clips and whole-recording passes at once, in
+/// different languages and so with different model ids; a `configure` step
+/// followed by a separate call let one caller's `configure` arrive between the
+/// other's two steps, and send its audio to the wrong model — a Hebrew
+/// utterance to an English import's model, or a long recording to a live
+/// clip's, without the pass's `offlineDiarization`.
+protocol RemoteTranscribing: Sendable {
     /// One short clip (a live utterance, a dictation, a missing span) with
-    /// an explicit per-request idle timeout, sent as ONE request. The plain
-    /// `transcribe` is the whole-recording path: it splits long audio into
-    /// several requests (#376), each with a timeout sized to its piece; a
-    /// live clip must fail in seconds instead, or a connection that silently
-    /// stops answering holds the live queue — and Stop's drain — for an hour
+    /// an explicit per-request idle timeout, sent as ONE request. A live
+    /// clip must fail in seconds, or a connection that silently stops
+    /// answering holds the live queue — and Stop's drain — for an hour
     /// (#355).
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment]
 
-    /// The whole-recording path with the pass's own `config` (#376). The
-    /// plain `transcribe` reads the actor's current config, which a live
-    /// clip's `configure` can replace between the batch pass configuring
-    /// the engine and its call arriving — sending the recording to the live
-    /// clip's model, and losing the pass's `offlineDiarization`.
+    /// A whole recording: split into several requests where it is long
+    /// (#376), each with a timeout sized to its piece.
     func transcribe(samples: [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment]
+
+    func shutdown() async
 }
 
 extension RemoteTranscribing {
-    /// Test doubles have no server to pick, and the service has already
-    /// `configure`d them for the pass.
+    /// Test doubles have no network, so the timeout means nothing to them.
+    /// The config still reaches them: a double can check what it was handed.
     func transcribe(samples: [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
-                    progress: (@Sendable (Float) -> Void)?,
-                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try await transcribe(samples: samples, language: language, audioCtx: 0,
-                             progress: progress, isCancelled: isCancelled)
-    }
-
-    /// Test doubles have no network, so the timeout means nothing to them.
-    func transcribe(samples: [Float],
-                    language: String,
-                    audioCtx: Int32?,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try await transcribe(samples: samples, language: language, audioCtx: audioCtx,
+        try await transcribe(samples: samples, language: language, config: config,
                              progress: nil, isCancelled: isCancelled)
     }
 }
@@ -75,10 +68,13 @@ extension RemoteTranscribing {
 /// `TranscriptSegment` and keep diarization / SRT-export working exactly as
 /// they do for the local path.
 ///
-/// Config (endpoint, key, model) is injected via `configure(_:)` before each
-/// transcription — the protocol's `transcribe` signature is fixed by the local
-/// engine, so the remote-specific bits ride alongside on the actor's state.
-actor RemoteWhisperEngine: RemoteTranscribing {
+/// The app hands the config (endpoint, key, model) over with every call
+/// (`RemoteTranscribing`). `configure(_:)` and the config-less
+/// `TranscribingEngine` methods read a config kept on the actor instead; they
+/// remain for a caller that owns its engine outright (the tests, the E2E
+/// harness), and the app does not call them — see `RemoteTranscribing` for
+/// why a shared engine must not keep one.
+actor RemoteWhisperEngine: RemoteTranscribing, TranscribingEngine {
     enum RemoteError: LocalizedError {
         case notConfigured
         case noAudioCaptured
@@ -267,6 +263,8 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         }
     }
 
+    /// Set by `configure(_:)`; read only by the config-less
+    /// `TranscribingEngine` entry points, which the app does not use.
     private var config: RemoteTranscriptionConfig?
     private let session: URLSession
     private let encodeAudio: @Sendable ([Float]) async throws -> Data
@@ -319,8 +317,17 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     /// The whole-recording path (imported files, Voice Memos, the batch pass
     /// after a recording): split into pieces the server accepts, sent one
     /// after another, stitched back onto the recording's clock. See
-    /// `transcribeInPieces`. Uses the config current when the call arrives;
-    /// the batch pass passes its own instead (the `config:` overload).
+    /// `transcribeInPieces`.
+    func transcribe(samples: [Float],
+                    language: String,
+                    config: RemoteTranscriptionConfig,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try await transcribeInPieces(samples: samples, language: language, config: config,
+                                     progress: progress, isCancelled: isCancelled)
+    }
+
+    /// The same, with the config `configure(_:)` set. Not used by the app.
     func transcribe(samples: [Float],
                     language: String,
                     audioCtx: Int32?,
@@ -335,19 +342,9 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     func transcribe(samples: [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
-                    progress: (@Sendable (Float) -> Void)?,
-                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try await transcribeInPieces(samples: samples, language: language, config: config,
-                                     progress: progress, isCancelled: isCancelled)
-    }
-
-    func transcribe(samples: [Float],
-                    language: String,
-                    audioCtx: Int32?,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         try checkCancellation(isCancelled)
-        guard let config else { throw RemoteError.notConfigured }
         return try await upload(samples: samples, language: language, config: config, progress: nil,
                                 isCancelled: isCancelled, requestTimeout: requestTimeout)
     }
@@ -393,9 +390,8 @@ actor RemoteWhisperEngine: RemoteTranscribing {
     /// each answer is moved onto the recording's clock (`placed`).
     ///
     /// * Every piece goes to the server, key and model in `config`, never
-    ///   the actor's current one. This actor also serves live clips, whose
-    ///   `configure` can arrive between two pieces — or before the first; a
-    ///   recording must not be stitched from two servers' answers.
+    ///   the actor's own (see `RemoteTranscribing`): a recording must not be
+    ///   stitched from two servers' answers.
     /// * A piece that fails transiently is retried (`pieceRetryDelays`,
     ///   `pieceFailureIsRetryable`). Any other failure — and a transient one
     ///   that outlasts the retries — ends the run, and its error is what the
@@ -579,9 +575,8 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         return placed
     }
 
-    /// One request, to the server `config` names — passed in, never re-read
-    /// from the actor: a `configure` for a live clip can arrive while an
-    /// earlier request is in flight (#376).
+    /// One request, to the server `config` names — passed in, never read
+    /// from the actor (see `RemoteTranscribing`, #376).
     private func upload(samples: [Float],
                         language: String,
                         config: RemoteTranscriptionConfig,

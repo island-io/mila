@@ -565,23 +565,21 @@ private actor FlakyRemoteEngine: RemoteTranscribing {
     func setFailure(_ error: (any Error)?) { failure = error }
     func failNextCall(with error: any Error) { nextCallFailure = error }
 
-    func configure(_ config: RemoteTranscriptionConfig) async {}
-    func loadIfNeeded(modelURL: URL, displayName: String) async throws {}
     func shutdown() async {}
 
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         requestTimeouts.append(requestTimeout)
-        return try await transcribe(samples: samples, language: language, audioCtx: audioCtx,
+        return try await transcribe(samples: samples, language: language, config: config,
                                     progress: nil, isCancelled: isCancelled)
     }
 
     func transcribe(samples: [Float],
                     language: String,
-                    audioCtx: Int32?,
+                    config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
         transcribeCalls += 1

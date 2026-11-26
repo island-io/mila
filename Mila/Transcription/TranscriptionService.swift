@@ -198,9 +198,11 @@ final class TranscriptionService: ObservableObject {
     private var prewarmTasks: [UUID: Task<Void, Never>] = [:]
     /// The recording `process(_:)` is working on, from the moment the worker
     /// pops it until `process` returns. Wider than `activeRecordingID`, which
-    /// is only published once the row has been flipped to `.running` — there
-    /// is a suspension (`remoteEngine.configure`) before that, and a stop that
-    /// lands in it must still find the run. See `deferTranscription(of:)`.
+    /// is only published once the row has been flipped to `.running`, so a
+    /// stop that arrives before that flip still finds the run. No suspension
+    /// precedes the flip today — the remote engine's `configure` did, until
+    /// the config went with the call (#376) — and this keeps one added later
+    /// safe. See `deferTranscription(of:)`.
     private var processingID: UUID?
 
     /// Recordings the user asked to abandon mid-run. Held in a thread-safe
@@ -595,13 +597,14 @@ final class TranscriptionService: ObservableObject {
                 serviceLog.log("transcribeOnceSegments: SKIP — remote backend active but not configured")
                 return .failed
             }
-            await remoteEngine.configure(config)
-            guard !cancellation.isStopped else { return .skipped }
             do {
+                // The clip's own config goes with the call: the engine also
+                // serves batch passes, possibly in another language and so
+                // to another model id (see `RemoteTranscribing`, #376).
                 let segs = try await remoteEngine.transcribe(
                     samples: samples,
                     language: language,
-                    audioCtx: audioCtx,
+                    config: config,
                     requestTimeout: Self.shortClipRequestTimeout(sampleCount: samples.count),
                     isCancelled: { [cancellation] in cancellation.isStopped })
                 guard !cancellation.isStopped else { return .skipped }
@@ -1032,11 +1035,9 @@ final class TranscriptionService: ObservableObject {
     /// status: a `.pending` row that is still being finalized has no run yet.
     ///
     /// `processingID` counts as active: between the worker popping a job and
-    /// `activeRecordingID` being published there is a suspension
-    /// (`remoteEngine.configure`), and `deferTranscription` finds the run
-    /// there — so the control has to be offered there too, or it blinks out
-    /// for the length of a network round trip. A row that is queued AGAIN
-    /// while its previous run is still stopping (Transcribe clicked during
+    /// `activeRecordingID` being published, `deferTranscription` already
+    /// finds the run, so the control is offered there too. A row that is
+    /// queued AGAIN while its previous run is still stopping (Transcribe clicked during
     /// "Stopping…", see `enqueue`) is simply queued: the new run is what the
     /// control would stop.
     func isQueuedOrActive(_ recordingID: UUID) -> Bool {
@@ -1138,10 +1139,8 @@ final class TranscriptionService: ObservableObject {
         let shouldDiarize = diarizationSettings.isConfigured
         let localModel: WhisperModel?
         let modelDisplayName: String
-        // The config this pass's remote requests go out with. Handed to the
-        // engine with the call rather than read back from it: the engine is
-        // shared with live clips, whose `configure` can replace it between
-        // this pass's `configure` and its transcription (#376).
+        // The config this pass's remote requests go out with, handed to the
+        // engine with the call (see `RemoteTranscribing`, #376).
         let remoteConfig: RemoteTranscriptionConfig?
         if useRemote {
             // Language-routed: a server whose primary model is Hebrew-only (the
@@ -1159,8 +1158,6 @@ final class TranscriptionService: ObservableObject {
             // will label it below (#376).
             config.offlineDiarization = shouldDiarize
             remoteConfig = config
-            await remoteEngine.configure(config)
-            guard !cancellation.isStopped else { return }
             localModel = nil
             // Label from the captured config, not remoteSettings — a Settings
             // edit mid-run must not change what's persisted to this
@@ -1206,11 +1203,10 @@ final class TranscriptionService: ObservableObject {
             .isEmpty
 
         // Flip the LIVE row to `.running` rather than writing the whole snapshot
-        // back — `await remoteEngine.configure` above is a suspension point the
-        // user can rename/file/delete the row through. See `mergePassResult`.
+        // back. See `mergePassResult`.
         // (`working` is deliberately NOT re-seeded from the result: the pass must
         // keep transcribing the `language` it just resolved a model for.)
-        // A stop that landed during `remoteEngine.configure` must win: once
+        // A stop that arrived before this point must win: once
         // the row reads `.running`, nothing would ever move it again (the
         // cancelled pass writes no status by design). Checked right before
         // the write, with no suspension in between, so it can't be missed.
@@ -1261,7 +1257,7 @@ final class TranscriptionService: ObservableObject {
         do {
             // Local backend needs the whisper weights loaded (and the CoreML
             // encoder compiled) before transcribing. The remote engine has no
-            // weights — `configure` already ran above.
+            // weights to load.
             if let localModel {
                 try await engine.loadIfNeeded(modelURL: modelManager.url(for: localModel),
                                               displayName: localModel.displayName)
