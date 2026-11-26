@@ -389,6 +389,7 @@ final class QuickActionsControllerTests: XCTestCase {
         await controller.awaitFinalizeTails()
 
         let stored = try XCTUnwrap(savedRecording(for: url))
+        store.waitForPendingWrites()
         let reader = MilaStoreReader(recordingsDirectory: store.recordingsDirectory,
                                      storeFileURL: store.storeURL)
 

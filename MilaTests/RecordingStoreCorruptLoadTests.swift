@@ -7,6 +7,9 @@ import XCTest
 final class RecordingStoreCorruptLoadTests: XCTestCase {
 
     private var tempRoot: URL!
+    /// Read or altered right after `add`, which hands its write to the
+    /// background writer (#406): each test waits for it first. A relaunched
+    /// store needs no wait, since `load()` does the same.
     private var storeFile: URL { tempRoot.appendingPathComponent("recordings.json") }
 
     override func setUp() {
@@ -35,6 +38,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "A", source: .microphone, audioFileName: "a.wav"))
         first.add(Recording(title: "B", source: .microphone, audioFileName: "b.wav"))
+        first.waitForPendingWrites()
         let original = try Data(contentsOf: storeFile)
         try original.prefix(original.count / 2).write(to: storeFile)
         let truncated = try Data(contentsOf: storeFile)
@@ -56,6 +60,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "Keep 1", source: .microphone, audioFileName: "a.wav"))
         first.add(Recording(title: "Keep 2", source: .microphone, audioFileName: "b.wav"))
+        first.waitForPendingWrites()
         var rows = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
         rows.append(["id": "not-a-uuid", "title": 42])
@@ -88,6 +93,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     func test_a_dropped_row_with_audio_comes_back_as_a_recovered_recording() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        first.waitForPendingWrites()
         var rows = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
         rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "lost.wav"])
@@ -116,6 +122,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     func test_a_dropped_row_keeps_its_saved_transcript_and_is_not_retranscribed() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        first.waitForPendingWrites()
         var rows = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
         rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "lost.wav"])
@@ -143,6 +150,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     func test_a_dropped_trashed_row_goes_back_to_recently_deleted() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        first.waitForPendingWrites()
         var rows = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
         rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "trashed.wav",
@@ -170,6 +178,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     func test_a_damaged_file_is_backed_up_once_not_on_every_launch() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        first.waitForPendingWrites()
         var rows = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
         rows.append(["id": "not-a-uuid", "title": 42, "audioFileName": "gone.wav"])
@@ -190,6 +199,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     func test_dismissing_the_unreadable_banner_keeps_the_file_untouched() throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "A", source: .microphone, audioFileName: "a.wav"))
+        first.waitForPendingWrites()
         let original = try Data(contentsOf: storeFile)
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: storeFile.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storeFile.path) }
@@ -218,6 +228,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     private func writeStoreWithDroppedRow(_ row: [String: Any]) throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "Keep", source: .microphone, audioFileName: "keep.wav"))
+        first.waitForPendingWrites()
         var rows = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: storeFile)) as? [[String: Any]])
         rows.append(row.merging(["id": "not-a-uuid", "title": 42]) { _, bad in bad })
@@ -313,6 +324,7 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
     func test_compression_keeps_the_wav_while_writes_are_off() async throws {
         let first = RecordingStore(rootDirectory: tempRoot)
         first.add(Recording(title: "A", source: .microphone, audioFileName: "a.wav"))
+        first.waitForPendingWrites()
         try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: storeFile.path)
         defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: storeFile.path) }
         let relaunched = RecordingStore(rootDirectory: tempRoot)

@@ -5,9 +5,6 @@ import OSLog
 import MilaKit
 
 private let recStoreLog = Logger(subsystem: "io.island.whisper.IslandWhisper", category: "RecordingStore")
-/// Brackets the encode + write in each `persist()` so Instruments shows what a
-/// whole-library write costs. (Retried sidecar rewrites run before it opens.)
-private let recStoreSignposter = OSSignposter(logger: recStoreLog)
 
 /// Persists recordings + their metadata under Application Support/Mila.
 ///
@@ -86,6 +83,8 @@ final class RecordingStore: ObservableObject {
     let permanentlyDeleted = PassthroughSubject<[UUID], Never>()
 
     private let fileManager = FileManager.default
+    /// Writes `recordings.json` off the main actor; see `persist()`.
+    private let writer = RecordingLibraryWriter.shared
     /// `storeURL` and `foldersURL` move with `recordingsDirectory` on
     /// every `relocateRecordings` call. On the default path they live
     /// alongside the `Recordings/` subdir (legacy layout); on a custom
@@ -421,7 +420,7 @@ final class RecordingStore: ObservableObject {
         // nothing, and the next launch's orphan sweep finds only `.wav`
         // files. Either way the WAV is the copy that can be found again, so
         // keep it and drop the `.m4a`.
-        guard persist() else {
+        guard persistNow() else {
             recordings[idx].audioFileName = rec.audioFileName
             try? FileManager.default.removeItem(at: dst)
             recStoreLog.error("compressRecordingAudio for \(id, privacy: .public): recordings.json not written; kept the WAV")
@@ -514,7 +513,7 @@ final class RecordingStore: ObservableObject {
         recordings[idx] = recording
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        let persisted = persist()
+        let persisted = persistNow()
         return transcriptWritten && persisted
     }
 
@@ -564,7 +563,7 @@ final class RecordingStore: ObservableObject {
         }
         let transcriptWritten = writeTranscript(for: recording)
         writeSummary(for: recording)
-        guard persist() else {
+        guard persistNow() else {
             recordings = before
             // The imported recording's sidecars derive from a freshly minted
             // audio name, so they are new files and removing them cannot
@@ -1297,7 +1296,7 @@ final class RecordingStore: ObservableObject {
                 transcriptRewritesPending.insert(recording.id)
             }
         }
-        let persisted = persist()
+        let persisted = persistNow()
         let sidecarStale = transcriptRewritesPending.contains(recording.id)
         if !persisted {
             recStoreLog.error("transcript edit on \(recording.id, privacy: .public): recordings.json not saved")
@@ -1445,7 +1444,10 @@ final class RecordingStore: ObservableObject {
             return .failed
         }
         recordings[idx].duration = written
-        persist()
+        // Synchronous: the audio swap above cannot be undone, so the row
+        // that describes it is written in the same turn rather than left to
+        // the background writer (rare, user-initiated).
+        persistNow()
         audioRevisions[recordingID, default: 0] += 1
         recStoreLog.log("trimmed audio of \(recordingID, privacy: .public) to \(written, privacy: .public)s")
         return .trimmed(duration: written)
@@ -1643,7 +1645,7 @@ final class RecordingStore: ObservableObject {
     func softDelete(_ recording: Recording) {
         guard let idx = recordings.firstIndex(where: { $0.id == recording.id }) else { return }
         recordings[idx].deletedAt = Date()
-        persist()
+        persistNow()
     }
 
     /// Restore from "Recently Deleted".
@@ -1672,7 +1674,7 @@ final class RecordingStore: ObservableObject {
             voiceMemoTombstones.insert(memoID)
             persistTombstones()
         }
-        persist()
+        persistNow()
         permanentlyDeleted.send([recording.id])
     }
 
@@ -1712,7 +1714,7 @@ final class RecordingStore: ObservableObject {
         let trashedIDs = Set(trashed.map(\.id))
         recordings.removeAll { trashedIDs.contains($0.id) }
         if tombstonedAny { persistTombstones() }
-        persist()
+        persistNow()
         permanentlyDeleted.send(trashed.map(\.id))
         return trashed.count
     }
@@ -1767,7 +1769,7 @@ final class RecordingStore: ObservableObject {
             recordings[idx].deletedAt = now
             count += 1
         }
-        if count > 0 { persist() }
+        if count > 0 { persistNow() }
         return count
     }
 
@@ -1835,6 +1837,11 @@ final class RecordingStore: ObservableObject {
     }
 
     private func load() {
+        // A write handed to the background writer may still be on its way
+        // to this file: a relocate back to a folder this session wrote to,
+        // or a second store over the same folder (tests). Read what was
+        // handed off, not what was on disk before it.
+        writer.drain()
         removeAudioTrimLeftovers()
         libraryLoadIssue = nil
         storeIsUnreadable = false
@@ -1959,7 +1966,7 @@ final class RecordingStore: ObservableObject {
         if needsMigration || !recovered.isEmpty || damage != nil {
             // Re-write JSON without inline fullText / with recovered entries /
             // without the rows that could not be decoded (kept in `backup`).
-            persist()
+            persistNow()
         }
     }
 
@@ -2239,12 +2246,12 @@ final class RecordingStore: ObservableObject {
     }
 
     /// The on-disk encoding of `recordings.json`. Compact on purpose: every
-    /// store mutation re-encodes the whole library on the main actor, and
+    /// store mutation re-encodes the whole library (off the main actor for
+    /// most of them since #406, see `RecordingLibraryWriter`), and
     /// pretty-printing made each write about 40% larger (and a little
     /// slower) for no reader's benefit (`JSONDecoder` and `mila-mcp` ignore
     /// whitespace). The encode time is driven by the segment count, not the
-    /// formatting; #406 tracks the real fix. `.sortedKeys` stays so the
-    /// output is byte-stable.
+    /// formatting. `.sortedKeys` stays so the output is byte-stable.
     nonisolated static func encodeLibrary(_ recordings: [Recording]) throws -> Data {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
@@ -2252,47 +2259,51 @@ final class RecordingStore: ObservableObject {
         return try encoder.encode(recordings)
     }
 
-    /// Returns whether `recordings.json` on disk now reflects the in-memory
-    /// store. `false` means a separate process still reads the previous
-    /// contents — see `update(_:)` for why that has to be reportable.
-    @discardableResult
-    private func persist() -> Bool {
+    /// Hand the library to the background writer and return at once (#406).
+    /// The encode and the write happen off the main actor, and a burst of
+    /// mutations is written once (`RecordingLibraryWriter`). Nothing is
+    /// reported back: use `persistNow()` where a caller acts on whether the
+    /// write succeeded, or where the change must be on disk before the call
+    /// returns.
+    private func persist() {
+        // Sidecars only, never recordings.json, so this runs even while
+        // writes to the store are off: orphan recovery reads a `.txt` back
+        // as the transcript, and a stale one would bring deleted lines back.
+        retryPendingTranscriptRewrites()
         // An existing file we could not even read must not be replaced by
         // this session's (near-empty) list. Audio written meanwhile is picked
         // up by orphan recovery on the next launch.
+        if storeIsUnreadable { return }
+        writer.enqueue(recordings, to: storeURL)
+    }
+
+    /// Encode and write the library before returning, and report whether
+    /// `recordings.json` on disk now reflects the in-memory store. `false`
+    /// means a separate process still reads the previous contents — see
+    /// `update(_:)` for why that has to be reportable.
+    ///
+    /// Synchronous on purpose, for three kinds of caller:
+    /// - ones that act on the answer: `update` (the live sidecar's
+    ///   `completed` handoff), `upsertImported` (the import's commit point),
+    ///   `settleUnsavedTranscriptEdit`, a compression about to delete its
+    ///   source WAV, and `load()`'s rewrite of a damaged file;
+    /// - deletions (Recently Deleted, permanent delete, emptying the trash):
+    ///   mila-mcp reads recordings.json, and a row the user just deleted must
+    ///   not stay listed there for as long as a background encode takes;
+    /// - an audio trim, which has already replaced the file the row
+    ///   describes.
+    @discardableResult
+    private func persistNow() -> Bool {
+        retryPendingTranscriptRewrites()  // as in `persist()`
         if storeIsUnreadable { return false }
-        retryPendingTranscriptRewrites()
-        let interval = recStoreSignposter.beginInterval("persist", id: recStoreSignposter.makeSignpostID())
-        defer { recStoreSignposter.endInterval("persist", interval) }
-        do {
-            let data = try Self.encodeLibrary(recordings)
-            try data.write(to: storeURL, options: .atomic)
-            return true
-        } catch {
-            // `.private` on the description — and this one really did need it,
-            // contrary to the exception I claimed last round. `storeURL`
-            // follows the user's chosen storage directory (see
-            // `relocateRecordings`), and Cocoa quotes the CONTAINING FOLDER in
-            // the message: "You don't have permission to save the file
-            // “recordings.json” in the folder “Acme Corp”." That is the same
-            // mechanism that leaked recording titles, and a folder the user
-            // picked can name a client, an employer or a project. Reasoning
-            // about the fixed FILENAME and stopping there was the mistake.
-            // (CodeRabbit on #183, CWE-532.)
-            //
-            // Domain + code stay public so a real failure is still diagnosable
-            // without the path: they are what separates "no permission"
-            // (NSCocoaErrorDomain 513) from a full disk or a missing
-            // directory. The filename is a literal, so naming WHICH write
-            // failed reveals nothing.
-            let ns = error as NSError
-            recStoreLog.error("""
-                persist failed for recordings.json \
-                (\(ns.domain, privacy: .public) \(ns.code, privacy: .public)): \
-                \(error.localizedDescription, privacy: .private)
-                """)
-            return false
-        }
+        return writer.writeNow(recordings, to: storeURL)
+    }
+
+    /// Blocks until every write `persist()` has handed off has finished.
+    /// For tests that read `recordings.json` (or point mila-mcp's reader at
+    /// it) right after a mutation; `load()` does the same on its own.
+    func waitForPendingWrites() {
+        writer.drain()
     }
 
     // MARK: - Voice-memo tombstones
