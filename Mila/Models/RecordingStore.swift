@@ -1911,9 +1911,18 @@ final class RecordingStore: ObservableObject {
         // it in already — we migrate those to a sidecar on first sight so
         // future writes are consistent.
         var needsMigration = false
+        // The sidecar reads are independent, so issue them concurrently: one
+        // sequential `String(contentsOf:)` per recording made launch time grow
+        // linearly with library size (and with per-file latency on a store
+        // relocated to a network or external volume). The merge below stays
+        // sequential and unchanged, so `fullText` is still complete before
+        // `init` returns — every `fullText` reader (search, summary backfill,
+        // export, the sidecar rewrite in `update`) keeps seeing the real text,
+        // which a deferred hydration would not guarantee.
+        let sidecarURLs = decoded.map { transcriptURL(for: $0) }
+        let sidecarTexts = Self.readSidecars(sidecarURLs)
         for i in decoded.indices {
-            let url = transcriptURL(for: decoded[i])
-            if let text = try? String(contentsOf: url, encoding: .utf8) {
+            if let text = sidecarTexts[i] {
                 decoded[i].fullText = text
             } else if !decoded[i].fullText.isEmpty {
                 // Legacy record with inline text — keep what we decoded and
@@ -2050,6 +2059,20 @@ final class RecordingStore: ObservableObject {
                 """)
             return nil
         }
+    }
+
+    /// Reads `urls` concurrently; element `i` is the file's text, or `nil`
+    /// when it is missing or unreadable. Order matches `urls`.
+    nonisolated static func readSidecars(_ urls: [URL]) -> [String?] {
+        guard urls.count > 1 else { return urls.map { try? String(contentsOf: $0, encoding: .utf8) } }
+        var results = [String?](repeating: nil, count: urls.count)
+        results.withUnsafeMutableBufferPointer { out in
+            let slots = out  // each iteration writes only its own slot
+            DispatchQueue.concurrentPerform(iterations: urls.count) { i in
+                slots[i] = try? String(contentsOf: urls[i], encoding: .utf8)
+            }
+        }
+        return results
     }
 
     /// IDs of recordings that were re-created from orphan .wav files at
