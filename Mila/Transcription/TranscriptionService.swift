@@ -237,6 +237,12 @@ final class TranscriptionService: ObservableObject {
     private var activeModelHolds: Set<UUID> = []
     /// A hold's body, parked once its preload is done, until the hold ends.
     private var modelHoldWaiters: [UUID: CheckedContinuation<Void, Never>] = [:]
+    /// True while a dictation hold's preload is inside `engine.loadIfNeeded`.
+    /// Admission keeps every newly counted local user out until it returns;
+    /// see the sole-user check in `beginLocalModelHold`.
+    private var isDictationPreloading = false
+    /// Users held at admission by `isDictationPreloading`.
+    private var preloadWaiters: [CheckedContinuation<Void, Never>] = []
     /// Each hold's task — admission, preload, park, then handing the use back
     /// — until it has fully finished, ended or not. `shutdown` drains these as
     /// it drains prewarms, so a preload's load cannot outlive the teardown.
@@ -343,8 +349,15 @@ final class TranscriptionService: ObservableObject {
         // Admission waits for an in-flight release to FINISH, rather than
         // assuming the engine executor processes independent calls FIFO.
         // Counting this user first prevents another cleanup from overtaking it.
-        while isReleasingLocalModel {
-            await withCheckedContinuation { releaseWaiters.append($0) }
+        // It also waits out a dictation preload's load (#434), so no user can
+        // queue its own load + transcribe beside that load. The two never
+        // overlap: a release needs zero users, a preload counts as one.
+        while isReleasingLocalModel || isDictationPreloading {
+            if isReleasingLocalModel {
+                await withCheckedContinuation { releaseWaiters.append($0) }
+            } else {
+                await withCheckedContinuation { preloadWaiters.append($0) }
+            }
         }
         do {
             let value = try await body()
@@ -545,9 +558,9 @@ final class TranscriptionService: ObservableObject {
     ///
     /// The preload itself runs only while the hold is the sole local user;
     /// with a batch job (or any other user) mid-flight it is skipped and the
-    /// final pass loads on demand, so a dictation start can never swap the
-    /// model out between that job's load and its transcribe. See the comment
-    /// at the check.
+    /// final pass loads on demand, and while it loads no other user is
+    /// admitted, so a dictation start can never swap the model out between
+    /// another user's load and its transcribe. See the comment at the check.
     ///
     /// Returns nil — and takes nothing — when there is nothing to preload or
     /// nothing to change: live retention (`retainsLocalModel`) already keeps
@@ -602,9 +615,17 @@ final class TranscriptionService: ObservableObject {
                 // is mid-flight, the final pass loads on demand as before,
                 // and the hold still keeps whatever is loaded from being
                 // released when they finish.
+                //
+                // The check alone would leave a gap: a user counted just after
+                // it could still get its load onto the engine's queue ahead of
+                // the preload's, which the executor's priority order allows.
+                // So `isDictationPreloading` is raised in the same turn as the
+                // check and holds every newly counted user at admission until
+                // the preload's load has returned.
                 if self.activeModelHolds.contains(id), !cancellation.isStopped,
                    !self.retainsLocalModel, !self.remoteSettings.isActive,
                    self.localModelUsers == 1 {
+                    self.isDictationPreloading = true
                     do {
                         try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
                         serviceLog.log("dictation hold: preloaded \(displayName, privacy: .public)")
@@ -616,6 +637,10 @@ final class TranscriptionService: ObservableObject {
                             (the final pass will retry): \(error.localizedDescription, privacy: .public)
                             """)
                     }
+                    self.isDictationPreloading = false
+                    let admitted = self.preloadWaiters
+                    self.preloadWaiters.removeAll()
+                    admitted.forEach { $0.resume() }
                 } else {
                     serviceLog.log("""
                         dictation hold: skipping the preload of \(displayName, privacy: .public) — \
@@ -1323,6 +1348,8 @@ final class TranscriptionService: ObservableObject {
         // otherwise never finish, and the drain below waits for each one.
         // Its owner's own end later is a no-op. A hold whose task has not
         // started yet skips its preload (`activeModelHolds` is checked first).
+        // Users parked at admission behind a preload still loading are let
+        // in when its load returns, and then see the stop and skip.
         let holding = Array(modelHoldTasks.values)
         for id in activeModelHolds {
             modelHoldWaiters.removeValue(forKey: id)?.resume()

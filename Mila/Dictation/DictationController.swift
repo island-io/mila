@@ -250,18 +250,17 @@ final class DictationController: ObservableObject {
     }
 
     private func stopAndTranscribe(action: HotkeyAction) async {
-        // Take this dictation's model hold and leave `.recording` BEFORE the
-        // first await. `toggle` routes a press here for as long as the state
-        // reads `.recording`, so a double-tap during `recorder.stop()` used
-        // to run a second stop — a second final pass over empty audio — and
-        // that stop would have ended whatever hold `modelHold` carried by the
-        // time it finished, possibly the NEXT dictation's. Now the second
-        // press beeps, and each stop ends only the hold it took.
+        // Take this dictation's model hold BEFORE the first await, and end
+        // only that one. `toggle` routes a press here for as long as the
+        // state reads `.recording`, which lasts through `recorder.stop()`, so
+        // a double-tap can run two stops. Ending whatever `modelHold` carried
+        // by the time a stop finished could end the NEXT dictation's hold;
+        // this way the second stop finds nil and ends nothing.
         let hold = modelHold
         modelHold = nil
-        state = .transcribing(action)
         await recorder.stop()
         streamTask?.cancel(); streamTask = nil
+        state = .transcribing(action)
         DictationOverlayWindow.shared.setBusy(true)
 
         let captured = samples

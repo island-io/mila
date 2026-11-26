@@ -509,12 +509,12 @@ final class ModelLifecycleTests: XCTestCase {
         let svc = service!
         let samples = noisySamples
         let finalPass = Task { await svc.transcribeOnce(samples: samples, language: "he") }
-        let deadline = Date().addingTimeInterval(10)
-        while await stub.callsWaitingBehindHeldLoad == 0, Date() < deadline {
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
+        await waitForLocalModelUsers(2)
+        try? await Task.sleep(nanoseconds: 100_000_000)
         let queued = await stub.callsWaitingBehindHeldLoad
-        XCTAssertEqual(queued, 1, "setup must queue the final pass behind the preload in progress")
+        let requests = await stub.loadRequestCount
+        XCTAssertEqual(queued, 0, "the final pass waits at admission, not on the engine")
+        XCTAssertEqual(requests, 1, "nothing but the preload has reached the engine yet")
 
         await stub.openLoadGate()
         let text = await finalPass.value
@@ -735,6 +735,45 @@ final class ModelLifecycleTests: XCTestCase {
         XCTAssertEqual(unloads, 1, "released once the dictation ends")
     }
 
+    /// The other order: the dictation's preload is already loading when a
+    /// batch job in another language starts. The job is counted at once but
+    /// must not reach the engine until the preload's load has returned —
+    /// otherwise the engine's priority order could run the job's load before
+    /// the preload's and the preload would swap the model under the job.
+    func test_otherUsersWaitForADictationPreloadBeforeTouchingTheEngine() async throws {
+        await stub.closeLoadGate()
+        let hold = try XCTUnwrap(service.beginLocalModelHold(language: "en"))
+        await waitForLoad(1)
+
+        let fixture = try TestRecordingFixture.make(in: store, title: "Batch", language: "he")
+        service.enqueue(fixture.recording)
+        await waitForLocalModelUsers(2)
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        let queued = await stub.callsWaitingBehindHeldLoad
+        var requests = await stub.loadRequestCount
+        XCTAssertEqual(queued, 0, "the job must wait at admission, not beside the preload's load")
+        XCTAssertEqual(requests, 1, "only the preload has asked the engine for a model")
+
+        await stub.openLoadGate()
+        await service.waitForIdle()
+        let completed = store.recordings.first { $0.id == fixture.recording.id }
+        XCTAssertEqual(completed?.status, .completed)
+        requests = await stub.loadRequestCount
+        let loads = await stub.loadCallCount
+        let model = await stub.loadedModel
+        let hebrew = try XCTUnwrap(manager.model(for: "he"))
+        XCTAssertEqual(requests, 2)
+        XCTAssertEqual(loads, 2, "the job loads its own model once admitted")
+        XCTAssertEqual(model?.lastPathComponent, manager.url(for: hebrew).lastPathComponent,
+                       "the job was transcribed with the model it asked for")
+        var unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 0, "the dictation's hold keeps the model past the job's end")
+
+        await service.endLocalModelHold(hold)?.value
+        unloads = await stub.unloadCount
+        XCTAssertEqual(unloads, 1)
+    }
+
     func test_dictationHoldIsRefusedWhenNoModelIsInstalled() throws {
         // `model(for:)` falls back to any installed selected model, so the
         // final pass skips only when nothing usable is installed at all.
@@ -796,6 +835,15 @@ final class ModelLifecycleTests: XCTestCase {
 
     private var noisySamples: [Float] {
         Array(repeating: Float(0.2), count: 16_000)
+    }
+
+    private func waitForLocalModelUsers(_ target: Int, timeout: TimeInterval = 10) async {
+        let deadline = Date().addingTimeInterval(timeout)
+        while service.localModelUserCountForTesting < target, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(service.localModelUserCountForTesting, target,
+                       "setup must count \(target) local-model user(s)")
     }
 
     private func waitForLoad(_ target: Int, timeout: TimeInterval = 15) async {
