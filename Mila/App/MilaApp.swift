@@ -2387,7 +2387,7 @@ struct MilaApp: App {
     /// preparation banner shows BEFORE the user reaches for the
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
-    private func prewarmDefaultModel() {
+    private func prewarmDefaultModel(forLiveRecording: Bool = false) {
         // Skip prewarm under any XCTest hosting (UI or unit tests). No test
         // relies on a launch-time warm — the transcription E2E tests pass
         // `--ui-test-tiny-model-path=` and load on demand — so warming the
@@ -2404,7 +2404,10 @@ struct MilaApp: App {
         guard !remoteTranscriptionSettings.isActive else { return }
         // Batch-only mode (live transcription OFF) must not preload the
         // model at launch. The first real transcription after Stop loads it.
-        guard liveAISettings.runsLivePipeline else { return }
+        // The exception is a recording that already snapshotted the live
+        // pipeline: it runs live whatever the setting says now, so it needs
+        // the model warm even after the user switched live transcription off.
+        guard liveAISettings.runsLivePipeline || forLiveRecording else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
     }
 
@@ -2437,14 +2440,24 @@ struct MilaApp: App {
     /// recording keeps its snapshotted pipeline through Stop even when the
     /// user changes the setting to OFF partway through the recording.
     private var needsWarmLocalModel: Bool {
-        let liveRecording = session.state == .recording || session.state == .paused
         let postStop = actions.isStoppingRecording || actions.isFinalizingRecording
         return Self.localModelRetentionRequired(
             livePipelineEnabled: liveAISettings.runsLivePipeline,
             recordingRunsLivePipeline: actions.recordingRunsLivePipeline,
-            recordingActive: liveRecording,
+            recordingActive: recordingCaptureActive,
             stoppingOrFinalizing: postStop,
             remoteActive: remoteTranscriptionSettings.isActive)
+    }
+
+    /// A capture is up or being brought up. The bring-up counts:
+    /// `prepareLivePipeline` snapshots `recordingRunsLivePipeline` BEFORE
+    /// `session.start`, which can take seconds on a Bluetooth mic (#291)
+    /// while `session.state` is still `.idle`. Without it, switching live
+    /// transcription off in that window released the model the recording
+    /// was about to run live on.
+    private var recordingCaptureActive: Bool {
+        session.state == .recording || session.state == .paused
+            || actions.isStartingRecording
     }
 
     /// Apply preference changes synchronously. Turning retention back on also
@@ -2454,7 +2467,10 @@ struct MilaApp: App {
         let retains = needsWarmLocalModel
         let wasRetaining = transcription.retainsLocalModel
         transcription.updateLocalModelRetention(retains)
-        if retains, !wasRetaining { prewarmDefaultModel() }
+        if retains, !wasRetaining {
+            prewarmDefaultModel(
+                forLiveRecording: actions.recordingRunsLivePipeline && recordingCaptureActive)
+        }
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest
