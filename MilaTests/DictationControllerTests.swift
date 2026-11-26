@@ -82,6 +82,8 @@ final class DictationControllerTests: XCTestCase {
         XCTAssertEqual(press(.recording(english)), .stop, "the first press of the same hotkey stops")
         XCTAssertEqual(press(.recording(english), stopping: true), .ignore,
                        "a second press while that stop is still running must not stop again")
+        XCTAssertEqual(press(.idle, stopping: true), .ignore,
+                       "no new dictation while a stop is still tearing the recorder down, even after a cancel set .idle")
         XCTAssertEqual(press(.transcribing(english)), .ignore)
         XCTAssertEqual(press(.recording(.dictateHebrew)), .ignore,
                        "the other language's hotkey never stops a dictation")

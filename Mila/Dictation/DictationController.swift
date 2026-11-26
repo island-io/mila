@@ -38,7 +38,8 @@ final class DictationController: ObservableObject {
     /// moved the state on to `.transcribing` or dropped out after a cancel.
     /// The state stays `.recording` while the recorder tears down, as it
     /// always has, and without this flag `toggle` would route a double-tap
-    /// in that wait into a second stop.
+    /// in that wait into a second stop. Every press is ignored while it is
+    /// set; see `outcome(ofPress:state:isStopping:)`.
     private var isStopping = false
     /// Bumped by every `cancelInFlight` that acts. A stop compares it across
     /// its recorder teardown: a sleep, screen-lock or quit cancel can run in
@@ -123,6 +124,11 @@ final class DictationController: ObservableObject {
         case .stop:
             await stopAndTranscribe(action: action)
         case .ignore:
+            // The beep is all the user hears, so leave the reason in the log.
+            dictationLog.log("""
+                press of \(action.rawValue, privacy: .public) ignored: \
+                state=\(String(describing: self.state), privacy: .public) stopping=\(self.isStopping)
+                """)
             NSSound.beep()
         }
     }
@@ -138,10 +144,19 @@ final class DictationController: ObservableObject {
     /// a second final pass over empty audio, which beeped and set `.idle`
     /// while the first pass was still running — so a later press could start
     /// a new dictation that the first stop then knocked back to `.idle`.
+    ///
+    /// Nor does a press start a dictation while a stop is still tearing the
+    /// recorder down, even when a sleep or screen-lock cancel has already set
+    /// `.idle` under it: a new engine bring-up would race the old engine's
+    /// teardown on the same device, and that new dictation could not be
+    /// stopped until the old stop finished. The press beeps; once the
+    /// teardown returns, the old stop drops out and the next press starts.
     static func outcome(ofPress action: HotkeyAction,
                         state: State,
                         isStopping: Bool) -> PressOutcome {
         switch state {
+        case .idle where isStopping:
+            return .ignore
         case .idle:
             return .start
         case .recording(let active) where active == action && !isStopping:
@@ -302,10 +317,9 @@ final class DictationController: ObservableObject {
         guard generation == cancelGeneration else {
             // A sleep, screen-lock or quit cancel ran during the teardown and
             // has already dropped this dictation: emptied the capture, hidden
-            // the overlay and set `.idle` (a new dictation may even have
-            // started since). Hand back only this stop's own hold and leave
-            // everything else as the cancel left it — no final pass over the
-            // leftovers, no "no audio" error, and above all no paste.
+            // the overlay and set `.idle`. Hand back only this stop's own hold
+            // and leave everything else as the cancel left it — no final pass
+            // over the leftovers, no "no audio" error, and above all no paste.
             isStopping = false
             if let hold { transcription.endLocalModelHold(hold) }
             return
