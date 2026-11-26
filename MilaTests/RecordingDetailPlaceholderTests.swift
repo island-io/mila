@@ -56,4 +56,37 @@ final class RecordingDetailPlaceholderTests: XCTestCase {
             .waitingInQueue
         )
     }
+
+    /// #376: a failed transcription used to show "No transcript yet" with
+    /// nothing saying it had failed, let alone why.
+    func test_failed_recording_says_why() {
+        XCTAssertEqual(
+            RecordingDetailView.emptyTranscriptPlaceholder(
+                isActive: false, isQueued: false,
+                failureReason: "Remote server returned HTTP 400."),
+            .failed(reason: "Remote server returned HTTP 400.")
+        )
+    }
+
+    /// A retry is queued: the old failure no longer describes the row.
+    func test_queued_and_active_win_over_failed() {
+        XCTAssertEqual(
+            RecordingDetailView.emptyTranscriptPlaceholder(isActive: false, isQueued: true,
+                                                           failureReason: "refused"),
+            .waitingInQueue
+        )
+        XCTAssertNil(
+            RecordingDetailView.emptyTranscriptPlaceholder(isActive: true, isQueued: false,
+                                                           failureReason: "refused")
+        )
+    }
+
+    /// A stopped run says stopped, whatever an earlier run's failure said.
+    func test_stopped_wins_over_failed() {
+        XCTAssertEqual(
+            RecordingDetailView.emptyTranscriptPlaceholder(isActive: false, isQueued: false,
+                                                           isDeferred: true, failureReason: "refused"),
+            .stopped
+        )
+    }
 }

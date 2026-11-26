@@ -222,6 +222,12 @@ private struct HistoryRow: View {
                     if recording.isTranscriptionDeferred {
                         Text("·")
                         Text("Not transcribed")
+                    } else if let reason = recording.visibleTranscriptionFailureReason {
+                        // Same cue for a pass that failed, with the reason a
+                        // hover away (#376).
+                        Text("·")
+                        Text("Transcription failed")
+                            .help(reason)
                     }
                     if transcription.activeRecordingID == recording.id,
                        transcription.stoppingRecordingID != recording.id {

@@ -76,7 +76,10 @@ final class StoredRecordingDriftTests: XCTestCase {
                                       evidence: "hi there, John here", origin: .transcript),
             ],
             untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5),
-                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)]
+                                 UntranscribedSpan(start: 20, end: 21, unreadable: true)],
+            // Not a state a real row is ever in either (the reason goes with
+            // `.failed`) — set so the key-set test sees the key.
+            transcriptionFailureReason: "Remote server returned HTTP 400."
         )
     }
 
@@ -104,6 +107,11 @@ final class StoredRecordingDriftTests: XCTestCase {
         // client present it as fact. Once accepted it IS a `speakerNames`
         // entry, which is mirrored.
         "speakerNameSuggestions",
+        // Why the last transcription failed (#376), for the row in the app.
+        // It can quote a transcription server's response — a 401 from
+        // OpenAI quotes the (masked) API key — so it stays out of what an
+        // MCP client can read. A client sees the row's `status`.
+        "transcriptionFailureReason",
     ]
 
     func test_fully_populated_recording_round_trips_into_stored_recording() throws {

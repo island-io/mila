@@ -253,6 +253,41 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `StoredRecording`.
     var untranscribedSpans: [UntranscribedSpan]?
 
+    /// Why the last transcription pass failed, in words the user can act on
+    /// — the server's own refusal ("Remote server returned HTTP 400: …
+    /// too large for this model"), a missing model, unusable audio (#376).
+    /// Before this a failed pass left only `.failed`, and the reason lived
+    /// in a one-time alert that a background run (a Voice Memo import, the
+    /// launch recovery sweep) usually raised with nobody looking.
+    ///
+    /// Set only together with `status == .failed` (`settleFailedPass`) and
+    /// cleared when a new pass starts. Read it through
+    /// `visibleTranscriptionFailureReason`, which also hides it under a
+    /// stopped transcription. Omitted from recordings.json when nil, so
+    /// every row that never failed encodes exactly as before.
+    ///
+    /// Deliberately NOT mirrored in MilaKit's `StoredRecording` nor carried
+    /// in a `.milashare` (see the allowlists in `StoredRecordingDriftTests`
+    /// and `ShareManifestTests`): it can quote a transcription server's
+    /// response, and a 401 from OpenAI quotes the (masked) API key. It is the
+    /// user's own failure for their own screen, not an MCP client's data.
+    var transcriptionFailureReason: String?
+
+    /// `transcriptionFailureReason` when it describes the row as it is now:
+    /// a failed, not stopped, transcription with a non-blank reason.
+    var visibleTranscriptionFailureReason: String? {
+        guard status == .failed, !isTranscriptionDeferred,
+              let reason = transcriptionFailureReason?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !reason.isEmpty else { return nil }
+        return reason
+    }
+
+    /// Longest stored failure reason. A server's error message is someone
+    /// else's text of unbounded length; this keeps a pathological one from
+    /// bloating recordings.json.
+    static let maxFailureReasonLength = 500
+
     /// Total seconds of audio missing from the transcript.
     var untranscribedSeconds: Double {
         (untranscribedSpans ?? []).reduce(0) { $0 + $1.duration }
@@ -318,16 +353,24 @@ struct Recording: Identifiable, Codable, Hashable {
     /// `.failed`, which would switch off everything keyed on `.completed`
     /// (island-io/mila#330). The failure itself is reported by the caller's
     /// `lastError` alert. Anything else — a first transcription, or a row
-    /// with no transcript left — becomes `.failed`, as before.
+    /// with no transcript left — becomes `.failed`, as before, and keeps
+    /// `reason` (`transcriptionFailureReason`) so the row can say why after
+    /// the alert is gone (#376). A restored row is not failed, so it keeps
+    /// no reason.
     ///
     /// A second Re-transcribe picked while this run was in flight changed
     /// `language` but queued nothing (`TranscriptionService.enqueue` refuses
     /// a recording already in flight), so undoing to the earlier transcript
     /// is right then too. The prior state is consumed either way: the row is
     /// settled.
-    mutating func settleFailedPass() {
-        if !restoreRetranscriptionPriorState() {
+    mutating func settleFailedPass(reason: String? = nil) {
+        if restoreRetranscriptionPriorState() {
+            transcriptionFailureReason = nil
+        } else {
             status = .failed
+            transcriptionFailureReason = reason.map {
+                String($0.prefix(Self.maxFailureReasonLength))
+            }
         }
         retranscriptionPriorState = nil
     }
@@ -365,7 +408,8 @@ struct Recording: Identifiable, Codable, Hashable {
          transcriptionDeferredAt: Date? = nil,
          retranscriptionPriorState: RetranscriptionPriorState? = nil,
          speakerNameSuggestions: [SpeakerNameSuggestion] = [],
-         untranscribedSpans: [UntranscribedSpan]? = nil) {
+         untranscribedSpans: [UntranscribedSpan]? = nil,
+         transcriptionFailureReason: String? = nil) {
         self.id = id
         self.title = title
         self.createdAt = createdAt
@@ -393,6 +437,7 @@ struct Recording: Identifiable, Codable, Hashable {
         self.retranscriptionPriorState = retranscriptionPriorState
         self.speakerNameSuggestions = speakerNameSuggestions
         self.untranscribedSpans = untranscribedSpans
+        self.transcriptionFailureReason = transcriptionFailureReason
     }
 
     var isTrashed: Bool { deletedAt != nil }
@@ -437,7 +482,7 @@ struct Recording: Identifiable, Codable, Hashable {
              summary, actionItems, voiceMemoUniqueID, voiceMemoFolderUUID,
              speakerNames, summaryLanguage, sharedBy, sharedAt, transcriptionDeferredAt,
              retranscriptionPriorState, speakerNameSuggestions,
-             untranscribedSpans
+             untranscribedSpans, transcriptionFailureReason
         // `fullText` deliberately excluded — lives in a sidecar .txt file.
         // Legacy records that had it inline are decoded via the custom init.
         case fullText
@@ -484,6 +529,10 @@ struct Recording: Identifiable, Codable, Hashable {
         let spans = try? c.decodeIfPresent([UntranscribedSpan].self, forKey: .untranscribedSpans)
         let validSpans = (spans ?? []).filter(\.isValid)
         self.untranscribedSpans = validSpans.isEmpty ? nil : validSpans
+        // `try?` for the same all-or-nothing reason: losing this costs only
+        // the explanation under a failed row, never the library.
+        self.transcriptionFailureReason = (try? c.decodeIfPresent(String.self,
+                                                                  forKey: .transcriptionFailureReason)) ?? nil
         // Legacy records still have fullText inline; new records leave it
         // empty here and RecordingStore loads it from the sidecar .txt.
         self.fullText = try c.decodeIfPresent(String.self, forKey: .fullText) ?? ""
@@ -530,6 +579,9 @@ struct Recording: Identifiable, Codable, Hashable {
         if !validSpans.isEmpty {
             try c.encode(validSpans, forKey: .untranscribedSpans)
         }
+        // Omitted when nil — every row that never failed — so those encode
+        // byte-identically to what the previous release wrote.
+        try c.encodeIfPresent(transcriptionFailureReason, forKey: .transcriptionFailureReason)
         // fullText intentionally omitted — sidecar .txt is the source of truth.
     }
 

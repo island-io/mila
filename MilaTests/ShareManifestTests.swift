@@ -241,7 +241,9 @@ final class ShareManifestTests: XCTestCase {
                                       evidence: "hi there, John here", origin: .transcript),
             ],
             // Local repair bookkeeping; set so the key-set test sees the key.
-            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)])
+            untranscribedSpans: [UntranscribedSpan(start: 12, end: 15.5)],
+            // The sender's last failure; set so the key-set test sees the key.
+            transcriptionFailureReason: "Remote server returned HTTP 400.")
     }
 
     func test_payload_strips_machine_specific_fields_and_keeps_content() throws {
@@ -345,6 +347,11 @@ final class ShareManifestTests: XCTestCase {
             // The receiver imports the transcript as sent; a full
             // re-transcription on their side covers the whole audio anyway.
             "untranscribedSpans",
+            // Why the SENDER's last transcription failed (#376). It can quote
+            // the sender's transcription server, API key mask included, and
+            // the receiver imports a completed transcript, which has no
+            // failure to explain.
+            "transcriptionFailureReason",
         ]
         let storeEncoder = JSONEncoder()
         storeEncoder.dateEncodingStrategy = .iso8601

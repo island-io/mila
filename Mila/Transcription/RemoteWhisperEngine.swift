@@ -16,10 +16,12 @@ protocol RemoteTranscribing: TranscribingEngine {
     func configure(_ config: RemoteTranscriptionConfig) async
 
     /// One short clip (a live utterance, a dictation, a missing span) with
-    /// an explicit per-request idle timeout. The plain `transcribe` keeps the
-    /// 1-hour timeout a whole-recording upload needs; a live clip must fail
-    /// in seconds instead, or a connection that silently stops answering
-    /// holds the live queue — and Stop's drain — for an hour (#355).
+    /// an explicit per-request idle timeout, sent as ONE request. The plain
+    /// `transcribe` is the whole-recording path: it splits long audio into
+    /// several requests (#376), each with a timeout sized to its piece; a
+    /// live clip must fail in seconds instead, or a connection that silently
+    /// stops answering holds the live queue — and Stop's drain — for an hour
+    /// (#355).
     func transcribe(samples: [Float],
                     language: String,
                     audioCtx: Int32?,
@@ -215,17 +217,47 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         /// 30s — without it the API answers "chunking_strategy is required".
         /// No other format takes the parameter.
         var needsChunkingStrategy: Bool { self == .diarizedJSON }
+
+        /// The most audio one whole-recording request carries; longer audio
+        /// is split into several requests (`AudioChunkPlanner`, #376).
+        ///
+        ///  * `gpt-*transcribe` (`json`, `diarized_json`): **4 minutes.** The
+        ///    API refuses roughly 25 minutes or more outright
+        ///    (`input_too_large` — every Voice Memo of 49 minutes or more
+        ///    failed this way), and the models stop writing at 2,000 output
+        ///    tokens, which is about eight minutes of English speech and less
+        ///    of Hebrew — past that the transcript comes back cut short with
+        ///    no error. Four minutes keeps a fast speaker well under the
+        ///    output cap.
+        ///  * Whisper (`verbose_json`: `whisper-1`, self-hosted servers):
+        ///    **10 minutes.** Whisper decodes in 30-second windows, so it has
+        ///    no output cap to stay under; the bound keeps each request's wait
+        ///    short and its file small.
+        ///
+        /// File size follows from duration: uploads are 32 kbps AAC
+        /// (`AudioCompressor`), so 10 minutes is about 2.4 MB, a tenth of
+        /// OpenAI's 25 MB request limit.
+        var maxRequestSeconds: TimeInterval {
+            switch self {
+            case .verboseJSON:           return 10 * 60
+            case .json, .diarizedJSON:   return 4 * 60
+            }
+        }
     }
 
     private var config: RemoteTranscriptionConfig?
     private let session: URLSession
     private let encodeAudio: @Sendable ([Float]) async throws -> Data
+    /// Replaces `ResponseFormat.maxRequestSeconds`, so tests can exercise
+    /// the split with seconds of audio instead of minutes. Nil in production.
+    private let maxChunkSecondsOverride: TimeInterval?
     private var isShutDown = false
 
     init(session: URLSession? = nil,
          encodeAudio: @escaping @Sendable ([Float]) async throws -> Data = {
              try await RemoteWhisperEngine.encodeM4A(samples: $0)
-         }) {
+         },
+         maxChunkSeconds: TimeInterval? = nil) {
         let configuration = URLSessionConfiguration.default
         // A long meeting can take a while to transcribe server-side; the
         // resource timeout has to clear the whole round trip, not just the
@@ -234,6 +266,7 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         configuration.timeoutIntervalForResource = 60 * 60
         self.session = session ?? URLSession(configuration: configuration)
         self.encodeAudio = encodeAudio
+        self.maxChunkSecondsOverride = maxChunkSeconds
     }
 
     func configure(_ config: RemoteTranscriptionConfig) {
@@ -256,13 +289,17 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         session.invalidateAndCancel()
     }
 
+    /// The whole-recording path (imported files, Voice Memos, the batch pass
+    /// after a recording): split into pieces the server accepts, sent one
+    /// after another, stitched back onto the recording's clock. See
+    /// `transcribeInPieces`.
     func transcribe(samples: [Float],
                     language: String,
                     audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try await upload(samples: samples, language: language, progress: progress,
-                         isCancelled: isCancelled, requestTimeout: Self.wholeRecordingTimeout)
+        try await transcribeInPieces(samples: samples, language: language,
+                                     progress: progress, isCancelled: isCancelled)
     }
 
     func transcribe(samples: [Float],
@@ -274,8 +311,150 @@ actor RemoteWhisperEngine: RemoteTranscribing {
                          isCancelled: isCancelled, requestTimeout: requestTimeout)
     }
 
-    /// See the per-request override in `upload`.
+    /// The longest any one request may sit waiting for an answer. See the
+    /// per-request override in `upload`.
     static let wholeRecordingTimeout: TimeInterval = 60 * 60
+
+    /// Idle timeout for one piece of a whole-recording transcription: twice
+    /// the piece's length, at least two minutes. The server sends nothing
+    /// while it transcribes, so this has to outlast its think time — a
+    /// self-hosted CPU server can take about as long as the audio — but no
+    /// more: a piece is at most ten minutes, so a server that stopped
+    /// answering fails the recording in minutes, not the hour a single
+    /// whole-file request was allowed (#376).
+    static func pieceRequestTimeout(audioSeconds: Double) -> TimeInterval {
+        guard audioSeconds.isFinite else { return wholeRecordingTimeout }
+        return min(wholeRecordingTimeout, max(120, audioSeconds * 2))
+    }
+
+    /// Transcribe a whole recording as a series of requests, each no longer
+    /// than `ResponseFormat.maxRequestSeconds` (#376).
+    ///
+    /// One request for the whole file was the bug: past the server's limits
+    /// it was refused (`input_too_large`), or came back silently truncated.
+    /// The pieces are cut at pauses (`AudioChunkPlanner`) and sent in order;
+    /// each answer is moved onto the recording's clock (`placed`).
+    ///
+    /// * The first piece the server refuses ends the run, and its error is
+    ///   what the caller reports. Later pieces would most likely be refused
+    ///   the same way, and a half-transcribed recording must not pass as
+    ///   finished.
+    /// * A piece of pure digital silence is not sent (`upload` would refuse
+    ///   it as "no audio captured"), and a piece the server answers with no
+    ///   words contributes nothing. Only a recording with no words ANYWHERE
+    ///   is `emptyResult`, as it was for one request.
+    /// * Server-side speaker labels (`gpt-4o-transcribe-diarize`) are kept
+    ///   only when a single piece produced every line: each request labels
+    ///   its own speakers from "A", so "A" in one piece is not "A" in the
+    ///   next. Without them the offline pyannote pass labels the recording,
+    ///   as it does for every other model. A wrong label is worse than none:
+    ///   a name given to a speaker is learned into a voice profile.
+    private func transcribeInPieces(samples: [Float],
+                                    language: String,
+                                    progress: (@Sendable (Float) -> Void)?,
+                                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        try checkCancellation(isCancelled)
+        guard let config else { throw RemoteError.notConfigured }
+        // The guard `upload` applies per request (issue #147), applied to the
+        // whole recording first: a silent piece inside a real recording is
+        // skipped below, but a recording that is ALL silence is a capture
+        // failure and has to say so.
+        guard !AudioSignal.isSilent(samples) else {
+            remoteLog.error("transcribe: REFUSING to upload \(samples.count, privacy: .public) samples with no signal — nothing was captured")
+            throw RemoteError.noAudioCaptured
+        }
+
+        let limit = maxChunkSecondsOverride ?? ResponseFormat.forModel(config.model).maxRequestSeconds
+        let sampleRate = WhisperAudioFormat.sampleRate
+        let pieces = AudioChunkPlanner.plan(samples: samples, sampleRate: sampleRate,
+                                            maxChunkSeconds: limit)
+        remoteLog.log("transcribe: \(samples.count, privacy: .public) samples → \(pieces.count, privacy: .public) request(s) of ≤ \(Int(limit), privacy: .public)s")
+
+        let total = Double(samples.count)
+        var stitched: [TranscriptSegment] = []
+        var piecesWithText = 0
+        for (index, range) in pieces.enumerated() {
+            try checkCancellation(isCancelled)
+            let piece = Array(samples[range])
+            let offset = Double(range.lowerBound) / sampleRate
+            let length = Double(range.count) / sampleRate
+            if AudioSignal.isSilent(piece) {
+                remoteLog.log("transcribe: piece \(index + 1, privacy: .public)/\(pieces.count, privacy: .public) is digital silence — not sent")
+                continue
+            }
+            // This piece's share of the bar, so progress climbs once across
+            // the whole recording instead of restarting with every request.
+            let base = Double(range.lowerBound) / total
+            let share = Double(range.count) / total
+            let pieceProgress: (@Sendable (Float) -> Void)? = progress.map { report in
+                { @Sendable fraction in report(Float(base + Double(fraction) * share)) }
+            }
+            let segments: [TranscriptSegment]
+            do {
+                segments = try await upload(samples: piece, language: language,
+                                            progress: pieceProgress, isCancelled: isCancelled,
+                                            requestTimeout: Self.pieceRequestTimeout(audioSeconds: length))
+            } catch RemoteError.emptyResult where pieces.count > 1 {
+                // A stretch with no speech in it — music, a break. That is
+                // this piece's answer, not the recording's.
+                continue
+            } catch {
+                if !(error is CancellationError) {
+                    remoteLog.error("""
+                        transcribe: piece \(index + 1, privacy: .public)/\(pieces.count, privacy: .public) \
+                        at \(Int(offset), privacy: .public)s FAILED — \
+                        \(RemoteError.logMessage(for: error), privacy: .public)
+                        """)
+                }
+                throw error
+            }
+            let placed = Self.placed(segments, at: offset, length: length, after: stitched.last)
+            if !placed.isEmpty { piecesWithText += 1 }
+            stitched.append(contentsOf: placed)
+        }
+
+        guard !stitched.isEmpty else { throw RemoteError.emptyResult }
+        if piecesWithText > 1, stitched.contains(where: { $0.speaker != nil }) {
+            remoteLog.log("transcribe: dropping the per-request speaker labels of \(piecesWithText, privacy: .public) pieces — they don't name the same voices across requests")
+            for i in stitched.indices { stitched[i].speaker = nil }
+        }
+        progress?(1.0)
+        remoteLog.log("transcribe: ok segs=\(stitched.count, privacy: .public) pieces=\(pieces.count, privacy: .public)")
+        return stitched
+    }
+
+    /// `segments` — one piece's answer, timed from the start of the piece —
+    /// moved onto the recording's clock.
+    ///
+    /// Times are clamped into the piece, so a server that reports a little
+    /// past the end of its audio can't overlap the next piece. A response
+    /// with no timing at all (`json`: a single segment with no end) spans its
+    /// whole piece rather than collapsing to a point at the piece's start.
+    /// The first line of a piece gets a leading space when neither it nor
+    /// the previous piece's last line has whitespace at the seam, because
+    /// the transcript text is the segments joined with no separator.
+    static func placed(_ segments: [TranscriptSegment], at offset: Double, length: Double,
+                       after previous: TranscriptSegment?) -> [TranscriptSegment] {
+        let length = length.isFinite ? max(0, length) : 0
+        func clamped(_ t: Double) -> Double { t.isFinite ? min(max(0, t), length) : 0 }
+        let untimed = segments.count == 1 && !(segments[0].end > segments[0].start)
+        var placed: [TranscriptSegment] = []
+        placed.reserveCapacity(segments.count)
+        for segment in segments {
+            var start = clamped(segment.start)
+            var end = max(start, clamped(segment.end))
+            if untimed { start = 0; end = length }
+            var text = segment.text
+            if placed.isEmpty, let previous,
+               let last = previous.text.last, !last.isWhitespace,
+               let first = text.first, !first.isWhitespace {
+                text = " " + text
+            }
+            placed.append(TranscriptSegment(start: offset + start, end: offset + end,
+                                            text: text, speaker: segment.speaker))
+        }
+        return placed
+    }
 
     private func upload(samples: [Float],
                         language: String,
@@ -308,11 +487,12 @@ actor RemoteWhisperEngine: RemoteTranscribing {
         // OpenAI-compatible server sends zero bytes while it transcribes —
         // after the upload finishes, a long recording routinely stays silent
         // well past 120s of server-side processing, which failed the whole
-        // transcription with "The request timed out". Override per-request so
-        // only the 1-hour resource timeout bounds the wait; the short idle
-        // timeout still applies to everything else on this session. Short
-        // clips (`transcribe(…requestTimeout:)`) pass their own, much shorter
-        // bound: a live utterance is answered in seconds or not at all.
+        // transcription with "The request timed out". Override per-request
+        // with a bound sized to the audio: a piece of a whole recording gets
+        // `pieceRequestTimeout` (minutes, #376), and a short clip
+        // (`transcribe(…requestTimeout:)`) a much shorter one — a live
+        // utterance is answered in seconds or not at all. The short idle
+        // timeout still applies to everything else on this session.
         request.timeoutInterval = requestTimeout
         request.setValue("multipart/form-data; boundary=\(boundary)",
                          forHTTPHeaderField: "Content-Type")
