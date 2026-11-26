@@ -77,6 +77,11 @@ final class ObjCExceptionTests: XCTestCase {
     /// `catching { node.installTap(…) }` it never was — the raise unwound
     /// through the Swift closure that had bridged the block, skipping that
     /// frame's release — so every refused tap leaked.
+    ///
+    /// The refusal here is the occupied bus; the #385 one (format mismatch)
+    /// needs a device that re-negotiates. What this pins is the caller's
+    /// side — no Swift frame between the raise and the `@catch` — which does
+    /// not depend on where inside AVFAudio the raise comes from.
     func test_a_refused_installTap_frees_the_block_it_was_handed() throws {
         let engine = AVAudioEngine()
         let player = AVAudioPlayerNode()
@@ -91,7 +96,11 @@ final class ObjCExceptionTests: XCTestCase {
             let canary = Canary()
             captured = canary
             let installed = (try? ObjCException.installTap(on: player, bus: 0, bufferSize: 4800,
-                                                           format: format) { _, _ in _ = canary }) != nil
+                                                           format: format) { _, _ in
+                // A use the optimizer must keep, so the canary stays
+                // reachable only through the block in a `-c release` run too.
+                withExtendedLifetime(canary) {}
+            }) != nil
             XCTAssertFalse(installed, "the bus was occupied, so this install must be refused")
         }
         XCTAssertNil(captured, "the refused tap's block (and what it captured) was leaked")

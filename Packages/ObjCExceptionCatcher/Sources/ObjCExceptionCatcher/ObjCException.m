@@ -32,6 +32,10 @@ static NSError *ObjCExceptionError(NSException *exception) {
                   format:(AVAudioFormat *)format
                    block:(AVAudioNodeTapBlock)block
                    error:(NSError **)error {
+    // Keep this @try body to the one message send on the parameters. ARC is
+    // not exception-safe here (no -fobjc-arc-exceptions): a temporary it
+    // retained inside the body would have its release skipped by the raise,
+    // which is the leak #427 removed from the Swift side.
     @try {
         [node installTapOnBus:bus bufferSize:bufferSize format:format block:block];
         return YES;

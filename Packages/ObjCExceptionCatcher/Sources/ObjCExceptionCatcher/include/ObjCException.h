@@ -39,7 +39,8 @@ FOUNDATION_EXPORT NSString * const ObjCExceptionNameKey;
 /// The call is made here rather than in a Swift closure handed to
 /// `catching:` so that no Swift frame sits between the raise and the
 /// `@catch`: the caller bridges its tap closure to a block in a frame that
-/// returns normally, and a refused tap frees it (#427).
+/// returns normally, so a refused tap no longer strands the caller's
+/// reference to it (#427).
 + (BOOL)installTapOnNode:(AVAudioNode *)node
                      bus:(AVAudioNodeBus)bus
               bufferSize:(AVAudioFrameCount)bufferSize
