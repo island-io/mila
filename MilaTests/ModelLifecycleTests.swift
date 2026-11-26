@@ -771,7 +771,7 @@ final class ModelLifecycleTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 100_000_000)
         let queued = await stub.callsWaitingBehindHeldLoad
         var requests = await stub.loadRequestCount
-        XCTAssertEqual(queued, 0, "the job must wait at admission, not beside the preload's load")
+        XCTAssertEqual(queued, 0, "the job must wait before touching the engine, not beside the preload's load")
         XCTAssertEqual(requests, 1, "only the preload has asked the engine for a model")
 
         await stub.openLoadGate()
@@ -792,6 +792,65 @@ final class ModelLifecycleTests: XCTestCase {
         await service.endLocalModelHold(hold)?.value
         unloads = await stub.unloadCount
         XCTAssertEqual(unloads, 1)
+    }
+
+    /// The batch worker is counted before it knows its job's backend, so it
+    /// must not be parked behind a dictation preload at admission: a job sent
+    /// to the remote backend never calls the local engine and has nothing to
+    /// wait for. Only a local job waits, right before its own load.
+    func test_aRemoteJobIsNotHeldBehindADictationPreload() async throws {
+        let suiteName = "ModelLifecycleTests.remoteJob.\(UUID().uuidString)"
+        let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { suite.removePersistentDomain(forName: suiteName) }
+        let remote = RemoteTranscriptionSettings(defaults: suite,
+                                                 apiKeyKeychainKey: suiteName + ".unused-key")
+        remote.endpoint = "http://localhost:8080/v1"
+        remote.model = "whisper-1"
+        remote.backend = .local
+        let diarization = DiarizationSettings(defaults: suite)
+        diarization.isEnabled = false
+        let localStub = StubWhisperEngine()
+        let remoteEngine = CountingRemoteEngine()
+        let mixed = TranscriptionService(
+            store: store,
+            modelManager: manager,
+            diarizationSettings: diarization,
+            remoteSettings: remote,
+            engine: localStub,
+            remoteEngine: remoteEngine)
+        mixed.retainsLocalModel = false
+        // Never leave the preload parked behind a closed gate if an assertion
+        // below fails: the service, store and stub would outlive the test.
+        addTeardownBlock { @MainActor in
+            await localStub.openLoadGate()
+            await mixed.shutdown()
+        }
+
+        await localStub.closeLoadGate()
+        let hold = try XCTUnwrap(mixed.beginLocalModelHold(language: "en"))
+        var deadline = Date().addingTimeInterval(15)
+        while await localStub.loadCallCount < 1, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let preloads = await localStub.loadCallCount
+        XCTAssertEqual(preloads, 1, "setup: the dictation's preload is inside its load")
+
+        remote.backend = .remote
+        let fixture = try TestRecordingFixture.make(in: store, title: "Remote", language: "he")
+        mixed.enqueue(fixture.recording)
+        deadline = Date().addingTimeInterval(10)
+        while await remoteEngine.calls < 1, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let remoteCalls = await remoteEngine.calls
+        let requests = await localStub.loadRequestCount
+        XCTAssertEqual(remoteCalls, 1, "the remote job ran while the preload was still loading")
+        XCTAssertEqual(requests, 1, "only the preload has asked the local engine for a model")
+
+        await localStub.openLoadGate()
+        await mixed.waitForIdle()
+        await mixed.endLocalModelHold(hold)?.value
+        await mixed.shutdown()
     }
 
     /// A job enqueued in the same turn the dictation starts: its worker has
@@ -906,3 +965,17 @@ final class ModelLifecycleTests: XCTestCase {
 }
 
 private struct LifecycleBoom: Error {}
+
+/// Counts whole-recording remote requests; no network.
+private actor CountingRemoteEngine: RemoteTranscribing {
+    private(set) var calls = 0
+    func shutdown() async {}
+    func transcribe(samples: [Float], language: String, config: RemoteTranscriptionConfig,
+                    progress: (@Sendable (Float) -> Void)?,
+                    isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
+        calls += 1
+        // Empty keeps the job clear of the post-success audio compression,
+        // which has nothing to do with admission.
+        return []
+    }
+}
