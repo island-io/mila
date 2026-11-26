@@ -40,18 +40,20 @@ final class DictationController: ObservableObject {
     /// always has, and without this flag `toggle` would route a double-tap
     /// in that wait into a second stop.
     private var isStopping = false
-    /// How many `cancelInFlight` calls are waiting for the recorder to tear
-    /// down. The state still reads `.recording` then too, and a press must
-    /// not run a stop over the capture a cancel is about to drop. A count,
-    /// not a flag: closing the lid sends both the screen-lock and the sleep
-    /// guard here, and the second cancel finishing (its `stop()` returns at
-    /// once) must not reopen presses while the first is still waiting.
-    private var cancelsTearingDown = 0
+    /// The one cancel tearing the recorder down and dropping the capture.
+    /// The state still reads `.recording` while it runs, and a press must not
+    /// run a stop over the capture it is about to drop. Closing the lid sends
+    /// both the screen-lock and the sleep guard to `cancelInFlight`; the
+    /// second JOINS the first rather than running its own teardown, whose
+    /// `stop()` would return at once and reopen presses (and set `.idle`)
+    /// while the first was still waiting — after which the first's cleanup
+    /// would tear down whatever dictation had started meanwhile.
+    private let cancelTeardown = JoinedRun()
     /// A stop or a cancel is waiting for the recorder to tear down. Every
     /// press is ignored meanwhile (see `outcome(ofPress:state:isTearingDown:)`),
     /// and the wait is bounded by `recorderTeardownDeadline`, so this always
     /// clears.
-    private var isTearingDown: Bool { isStopping || cancelsTearingDown > 0 }
+    private var isTearingDown: Bool { isStopping || cancelTeardown.isRunning }
     /// Bumped by every `cancelInFlight` that acts. A stop compares it twice:
     ///  * across its recorder teardown — a sleep, screen-lock or quit cancel
     ///    can run in that wait (the state still reads `.recording`, and the
@@ -151,7 +153,7 @@ final class DictationController: ObservableObject {
             dictationLog.log("""
                 press of \(action.rawValue, privacy: .public) ignored: \
                 state=\(String(describing: self.state), privacy: .public) \
-                stopping=\(self.isStopping) cancelling=\(self.cancelsTearingDown, privacy: .public)
+                stopping=\(self.isStopping) cancelling=\(self.cancelTeardown.isRunning)
                 """)
             NSSound.beep()
         }
@@ -201,8 +203,9 @@ final class DictationController: ObservableObject {
         /// Capture is running: stop it and drop what it captured.
         case dropCapture
         /// The final pass is already running: let it finish but do not paste
-        /// its text. After a sleep or screen lock the dictation is still saved
-        /// to History; on quit the service's shutdown ends the pass.
+        /// its text. The dictation is still saved to History (on quit the
+        /// service's shutdown ends the pass early, so that row has no text,
+        /// as before).
         case suppressPaste
     }
 
@@ -221,8 +224,8 @@ final class DictationController: ObservableObject {
 
     /// What a stop does with its final pass's `text`. A cancel that arrived
     /// during the pass (sleep, screen lock, quit) means no paste; the stop
-    /// beeps instead, as for any dictation that pasted nothing, and still
-    /// saves the dictation to History (unless a quit ended the pass first).
+    /// still saves the dictation to History, and beeps if the screen is not
+    /// locked, as for any dictation that pasted nothing.
     static func finalPassOutcome(text: String, cancelledDuringPass: Bool) -> FinalPassOutcome {
         if cancelledDuringPass { return .keepWithoutPasting }
         return text.isEmpty ? .beep : .paste
@@ -265,6 +268,15 @@ final class DictationController: ObservableObject {
     /// During capture the dictation is dropped; during its final pass only
     /// the paste is (see `CancelEffect`).
     func cancelInFlight() async {
+        // A second cancel while the first is still tearing down (the state
+        // reads `.recording` throughout) waits for that one and returns with
+        // it: one teardown, one cleanup, and presses stay ignored until both
+        // are done.
+        if cancelTeardown.isRunning {
+            dictationLog.log("dictation cancel: joining the cancel already in progress")
+            await cancelTeardown.runOrJoin {}
+            return
+        }
         switch Self.cancelEffect(for: state) {
         case .none:
             return
@@ -275,24 +287,22 @@ final class DictationController: ObservableObject {
         case .dropCapture:
             break
         }
+        // Bumped before the first await, so a stop already waiting for its
+        // own teardown sees this cancel when it resumes.
         cancelGeneration += 1
-        let generation = cancelGeneration
-        cancelsTearingDown += 1
-        await stopRecorder(for: "cancel")
-        cancelsTearingDown -= 1
-        // Another cancel that ran during this wait has already dropped the
-        // dictation; this one must not clean up again.
-        guard generation == cancelGeneration else { return }
-        streamTask?.cancel(); streamTask = nil
-        liveTextObserver?.cancel(); liveTextObserver = nil
-        _ = liveTranscriber.stop()
-        samples.removeAll(keepingCapacity: true)
-        targetApp = nil
-        // Nothing will be transcribed: let batch-only mode release the model.
-        endModelHold()
-        DictationOverlayWindow.shared.hide()
-        state = .idle
-        level = 0
+        await cancelTeardown.runOrJoin {
+            await self.stopRecorder(for: "cancel")
+            self.streamTask?.cancel(); self.streamTask = nil
+            self.liveTextObserver?.cancel(); self.liveTextObserver = nil
+            _ = self.liveTranscriber.stop()
+            self.samples.removeAll(keepingCapacity: true)
+            self.targetApp = nil
+            // Nothing will be transcribed: let batch-only mode release the model.
+            self.endModelHold()
+            DictationOverlayWindow.shared.hide()
+            self.state = .idle
+            self.level = 0
+        }
     }
 
     /// End this dictation's model hold, if it has one. Safe to call more than
@@ -513,9 +523,10 @@ final class DictationController: ObservableObject {
         case .keepWithoutPasting:
             // The beep is the only sign that nothing was pasted: after a
             // sleep without a screen lock the user is back at the app they
-            // dictated into, and the text is only in History.
+            // dictated into, and the text is only in History. On a locked
+            // screen nobody is there to hear it.
             targetApp = nil
-            NSSound.beep()
+            if !Self.isScreenLocked { NSSound.beep() }
             dictationLog.log("dictation finished after a sleep, screen lock or quit: not pasted")
         }
 
@@ -629,13 +640,14 @@ final class DictationController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(120)) {
             // The state is `.idle` by now, so a screen lock in this delay
             // cancels nothing: check the lock itself before typing ⌘V, which
-            // would otherwise go to the lock screen. The transcript stays on
-            // the clipboard until the restore below, and in History.
-            if Self.isScreenLocked {
+            // would otherwise go to the lock screen. Skipped, the transcript
+            // stays on the clipboard for after the unlock, as when
+            // Accessibility is missing: no restore over it.
+            guard !Self.isScreenLocked else {
                 dictationLog.log("dictation paste skipped: the screen locked before it was typed")
-            } else {
-                Self.postCommandV()
+                return
             }
+            Self.postCommandV()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 if !priorContents.isEmpty {
                     Self.restorePasteboard(pasteboard, from: priorContents)
@@ -710,6 +722,34 @@ final class DictationController: ObservableObject {
         vDown?.post(tap: .cghidEventTap)
         vUp?.post(tap: .cghidEventTap)
         cmdUp?.post(tap: .cghidEventTap)
+    }
+}
+
+/// Runs one body at a time: a caller that arrives while a body is running
+/// waits for THAT body to finish and returns without running its own. The
+/// body runs inline, so everything before its first await happens in the
+/// caller's turn, and `isRunning` drops in the same turn as the body's last
+/// statement. Main-actor only, so no lock is needed.
+@MainActor
+final class JoinedRun {
+    private var joiners: [CheckedContinuation<Void, Never>]?
+
+    var isRunning: Bool { joiners != nil }
+
+    /// Run `body`, or join the run already in progress. Returns true when
+    /// `body` ran.
+    @discardableResult
+    func runOrJoin(_ body: @MainActor () async -> Void) async -> Bool {
+        if joiners != nil {
+            await withCheckedContinuation { joiners?.append($0) }
+            return false
+        }
+        joiners = []
+        await body()
+        let waiting = joiners ?? []
+        joiners = nil
+        waiting.forEach { $0.resume() }
+        return true
     }
 }
 

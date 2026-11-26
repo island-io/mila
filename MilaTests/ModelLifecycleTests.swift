@@ -797,7 +797,8 @@ final class ModelLifecycleTests: XCTestCase {
     /// The batch worker is counted before it knows its job's backend, so it
     /// must not be parked behind a dictation preload at admission: a job sent
     /// to the remote backend never calls the local engine and has nothing to
-    /// wait for. Only a local job waits, right before its own load.
+    /// wait for. Only a local job waits, at the top of `process`, before its
+    /// row reads `.running`.
     func test_aRemoteJobIsNotHeldBehindADictationPreload() async throws {
         let suiteName = "ModelLifecycleTests.remoteJob.\(UUID().uuidString)"
         let suite = try XCTUnwrap(UserDefaults(suiteName: suiteName))

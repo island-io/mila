@@ -118,6 +118,53 @@ final class DictationControllerTests: XCTestCase {
     /// returns cannot leave every later press ignored until relaunch. Its
     /// completion after the deadline must change nothing: in particular it
     /// must not resume the wait a second time, which would trap.
+    /// Closing the lid sends both the screen-lock and the sleep guard to
+    /// `cancelInFlight`. The second cancel's `stop()` returns at once, so
+    /// when it ran its own teardown it cleared the cancelling flag and set
+    /// `.idle` while the first was still waiting; a dictation started then
+    /// was torn down by the first cancel's cleanup when it resumed (#435
+    /// review). The second cancel must join the first: one teardown and one
+    /// cleanup, and presses stay ignored until that one is done.
+    func test_a_second_cancel_joins_the_first_instead_of_finishing_early() async {
+        let cancels = JoinedRun()
+        let teardown = HeldTeardown()
+        let bodies = RunCounter()
+
+        let first = Task { @MainActor in
+            await cancels.runOrJoin {
+                bodies.count += 1
+                await teardown.run()
+            }
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !teardown.isRunning, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(cancels.isRunning, "setup: the first cancel is tearing down")
+
+        let second = Task { @MainActor () -> Bool in
+            let ran = await cancels.runOrJoin { bodies.count += 1 }
+            bodies.secondReturned = true
+            return ran
+        }
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertFalse(bodies.secondReturned, "the second cancel waits for the first's teardown")
+        XCTAssertTrue(cancels.isRunning, "presses stay ignored while the first is still waiting")
+
+        teardown.finish()
+        let firstRan = await first.value
+        let secondRan = await second.value
+        XCTAssertTrue(firstRan)
+        XCTAssertFalse(secondRan, "the second cancel joined instead of running its own cleanup")
+        XCTAssertEqual(bodies.count, 1, "one teardown and one cleanup")
+        XCTAssertFalse(cancels.isRunning, "presses work again once that one is done")
+
+        // The next cancel (a later dictation's) runs its own body.
+        let ranAgain = await cancels.runOrJoin { bodies.count += 1 }
+        XCTAssertTrue(ranAgain)
+        XCTAssertEqual(bodies.count, 2)
+    }
+
     func test_a_teardown_that_overruns_the_deadline_is_left_behind() async {
         let teardown = HeldTeardown()
         let started = Date()
@@ -172,4 +219,11 @@ private final class HeldTeardown {
         release?.resume()
         release = nil
     }
+}
+
+/// What the cancel bodies in the join test did.
+@MainActor
+private final class RunCounter {
+    var count = 0
+    var secondReturned = false
 }
