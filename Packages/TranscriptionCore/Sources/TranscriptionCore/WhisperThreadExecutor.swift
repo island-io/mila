@@ -66,12 +66,17 @@ final class WhisperThreadExecutor: SerialExecutor, @unchecked Sendable {
     private var jobs: [UnownedJob] = []
     /// Written once, in `init`, before the thread starts.
     private var thread: Thread!
+    /// Set under `condition` once `thread.start()` has returned; see
+    /// `nameCurrentThread`.
+    private var started = false
 
     private init(name: String) {
         // Strong capture on purpose: `shared` is process-lifetime, and so is
         // the thread that serves it.
-        let thread = Thread { [self] in self.runJobs() }
-        thread.name = name
+        let thread = Thread { [self] in
+            self.nameCurrentThread(name)
+            self.runJobs()
+        }
         // Fixed, see "Order" above.
         thread.qualityOfService = .userInitiated
         // A secondary thread's default stack is 512 KiB, which is what the
@@ -80,12 +85,27 @@ final class WhisperThreadExecutor: SerialExecutor, @unchecked Sendable {
         thread.stackSize = 4 << 20
         self.thread = thread
         thread.start()
+        condition.lock()
+        started = true
+        condition.signal()
+        condition.unlock()
+    }
+
+    /// The thread names itself, so the name is the same on both platforms.
+    /// Setting `thread.name` before `start()` works on Darwin only:
+    /// swift-corelibs-foundation (Linux) drops a name set then, and its
+    /// setter reaches the OS thread only once `start()` has stored the
+    /// thread's handle, which it does after the thread is already running.
+    /// Hence waiting for `init` to say `start()` has returned.
+    private func nameCurrentThread(_ name: String) {
+        condition.lock()
+        while !started { condition.wait() }
+        condition.unlock()
+        Thread.current.name = name
     }
 
     /// True on the executor's thread. For tests and diagnostics.
     var isCurrentThread: Bool { Thread.current === thread }
-
-    var threadName: String? { thread.name }
 
     /// Jobs waiting to run (not counting the one running). For tests.
     var queuedJobCount: Int {

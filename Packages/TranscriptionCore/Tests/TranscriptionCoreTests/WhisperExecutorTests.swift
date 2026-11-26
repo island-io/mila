@@ -15,7 +15,11 @@ final class WhisperExecutorTests: XCTestCase {
         let other = WhisperEngine()
         let otherOnWhisperThread = await other.isOnWhisperThreadForTesting()
         XCTAssertTrue(otherOnWhisperThread)
-        XCTAssertEqual(WhisperThreadExecutor.shared.threadName, "mila.whisper")
+        // Read from inside: swift-corelibs-foundation answers `Thread.name`
+        // with the CALLING thread's name whatever thread it is asked about,
+        // so asking from the test thread would read the test thread's.
+        let name = await engine.currentThreadNameForTesting()
+        XCTAssertEqual(name, "mila.whisper")
     }
 
     func test_the_test_itself_is_not_on_the_whisper_thread() async {
@@ -130,6 +134,11 @@ extension WhisperEngine {
 
     func isOnWhisperThreadForTesting() -> Bool {
         WhisperThreadExecutor.shared.isCurrentThread
+    }
+
+    /// The name of the thread the engine's code runs on, read on that thread.
+    func currentThreadNameForTesting() -> String? {
+        Thread.current.name
     }
 }
 
