@@ -2378,8 +2378,10 @@ struct MilaApp: App {
         }
     }
 
-    /// Kick the engine's `loadIfNeeded` on the user's default model
-    /// once at launch. The first time whisper.cpp loads a model with
+    /// Kick the engine's `loadIfNeeded` on the user's default model: at
+    /// launch, and from `syncLocalModelRetention` whenever retention turns
+    /// back on (live transcription switched on, or a recording that runs
+    /// live starting while it was off). The first time whisper.cpp loads a model with
     /// a sibling `-encoder.mlmodelc` on a given device, CoreML
     /// compiles the mlmodelc for that hardware — ~13s peg on M-series
     /// the very first time, then fully cached. Doing this at launch
@@ -2454,7 +2456,10 @@ struct MilaApp: App {
     /// `session.start`, which can take seconds on a Bluetooth mic (#291)
     /// while `session.state` is still `.idle`. Without it, switching live
     /// transcription off in that window released the model the recording
-    /// was about to run live on.
+    /// was about to run live on. Pairing it with `recordingRunsLivePipeline`
+    /// is sound only because `beginStarting` refreshes that flag the moment
+    /// a start begins; before that refresh, the permission check would have
+    /// read the previous recording's decision.
     private var recordingCaptureActive: Bool {
         session.state == .recording || session.state == .paused
             || actions.isStartingRecording

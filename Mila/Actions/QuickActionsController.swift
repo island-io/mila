@@ -215,8 +215,10 @@ final class QuickActionsController: ObservableObject {
     /// settings: re-reading would let a toggle flipped mid-call swap the
     /// recording view under the user, or leave the view and the pipeline
     /// disagreeing about a recording the async state observer wired a moment
-    /// after the settings changed. Published once per recording start, so it
-    /// stays well clear of the App-level churn rule.
+    /// after the settings changed. `beginStarting` sets it provisionally from
+    /// the same settings so nothing reads the previous recording's answer
+    /// while a start waits on the permission check. Published at most twice
+    /// per recording start, so it stays well clear of the App-level churn rule.
     @Published private(set) var recordingRunsLivePipeline = false
 
     /// True while `stopRecording` OWNS THE LIVE SINGLETONS
@@ -874,6 +876,19 @@ final class QuickActionsController: ObservableObject {
         }
         pendingStartAbandonReason = nil
         startCancellation = CaptureStartCancellation()
+        // Provisional live decision for the recording being started.
+        // `prepareLivePipeline` takes the real snapshot after the permission
+        // check, which can wait on a system prompt; until then
+        // `recordingRunsLivePipeline` would still hold the PREVIOUS
+        // recording's answer, and MilaApp keeps or loads the local whisper
+        // model on it while a start is in flight (#393). Written only on a
+        // change, since `@Published` publishes on every write. The previous
+        // recording's stop read its own copy before releasing `activeJob`,
+        // so nothing still needs the old value.
+        let provisional = liveAISettings?.runsLivePipeline ?? true
+        if recordingRunsLivePipeline != provisional {
+            recordingRunsLivePipeline = provisional
+        }
         activeJob = .starting(source)
         return true
     }
