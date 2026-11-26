@@ -20,8 +20,8 @@ final class DiarizationBootstrap: ObservableObject {
     /// (3.3.x). Newer torch (>= 2.6) changes the `weights_only` default and
     /// breaks pyannote's checkpoint loading; we patch around it at import
     /// but the saner pin is to stay on 2.2.x until pyannote follows.
-    static let torchVersion = "2.2.2"
-    static let torchaudioVersion = "2.2.2"
+    static let torchVersion = DiarizationDependencyPins.torch
+    static let torchaudioVersion = DiarizationDependencyPins.torchaudio
 
     /// Wheel URLs on PyTorch's CPU index. Arm64-only for now (the app runs
     /// universally but the bundled Python is arm64; an x86_64 add is a
@@ -60,7 +60,7 @@ final class DiarizationBootstrap: ObservableObject {
     /// (The runtime self-heal still handles any *other* transitive dep
     /// that may surface later.)
     static let extraInstallSpecs: [String] = [
-        "numpy<2",
+        "numpy\(DiarizationDependencyPins.numpy)",
         "matplotlib",
         "Pillow",
         "pyparsing",

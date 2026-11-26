@@ -34,6 +34,11 @@ enum SpeakerDiarizer {
     enum Error: Swift.Error, LocalizedError {
         case pythonNotFound(String)
         case diarizationFailed(String)
+        /// The configured interpreter can't take the pinned stack
+        /// (`DiarizationDependencyPins.unsupportedPythonMessage`). Nothing
+        /// ran, so it is not a "diarization failed", and the message is built
+        /// from version numbers alone, so it is safe to log as is.
+        case unsupportedPython(String)
 
         var errorDescription: String? {
             switch self {
@@ -41,6 +46,8 @@ enum SpeakerDiarizer {
                 return "Python not found at \(path). Install Python 3 with pyannote.audio."
             case .diarizationFailed(let msg):
                 return "Speaker diarization failed: \(msg)"
+            case .unsupportedPython(let msg):
+                return msg
             }
         }
 
@@ -62,7 +69,7 @@ enum SpeakerDiarizer {
         /// it is the entire diagnostic.
         var logDescription: String {
             switch self {
-            case .pythonNotFound:
+            case .pythonNotFound, .unsupportedPython:
                 return errorDescription ?? "\(self)"
             case .diarizationFailed(let msg):
                 return "Speaker diarization failed (\(msg.utf8.count)B of subprocess output withheld)"
@@ -177,14 +184,34 @@ enum SpeakerDiarizer {
 
     // MARK: - Public API
 
+    /// `pip` arguments for the user-Python install. Pinned through
+    /// `DiarizationDependencyPins` (no `--upgrade`: an exact `==` requirement
+    /// already moves an older or newer install onto the tested version, while
+    /// `--upgrade` would also float every transitive dependency).
+    static var installDependencyArguments: [String] {
+        ["-m", "pip", "install"] + DiarizationDependencyPins.userPythonRequirements
+    }
+
     static func installDependencies(pythonPath: String) async throws -> String {
         // `soundfile` is required as an audio backend — pyannote.audio
         // crashes at import time with IndexError if torchaudio finds no
         // backend, and `soundfile` is the most reliable one on macOS.
+        //
+        // The pins only resolve on Python 3.9–3.12; say so up front rather
+        // than surface pip's "No matching distribution found for torch".
+        // A failed probe falls through and lets pip report.
+        let probe = try await runPython(
+            path: pythonPath,
+            arguments: ["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]
+        )
+        if probe.exitCode == 0,
+           let message = DiarizationDependencyPins.unsupportedPythonMessage(
+               version: String(data: probe.stdout, encoding: .utf8) ?? "") {
+            throw Error.unsupportedPython(message)
+        }
         let result = try await runPython(
             path: pythonPath,
-            arguments: ["-m", "pip", "install", "--upgrade",
-                        "pyannote.audio", "torch", "soundfile", "huggingface_hub<1.0"]
+            arguments: installDependencyArguments
         )
         let output = String(data: result.stdout, encoding: .utf8) ?? ""
         guard result.exitCode == 0 else {
