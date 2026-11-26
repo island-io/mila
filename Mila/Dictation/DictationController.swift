@@ -37,9 +37,14 @@ final class DictationController: ObservableObject {
     /// True from the moment `stopAndTranscribe` begins until the state has
     /// moved on to `.transcribing`. The state stays `.recording` while the
     /// recorder tears down, as it always has, and without this flag `toggle`
-    /// would route a double-tap in that wait into a second stop. (A sleep or
-    /// screen-lock `cancelInFlight` in the same wait still runs, but it does
-    /// not stop the stop's own transcription and paste; that predates #434.)
+    /// would route a double-tap in that wait into a second stop.
+    ///
+    /// A sleep or screen-lock `cancelInFlight` in the same wait still runs:
+    /// `MicrophoneRecorder.stop()` returns at once for it (the stop already
+    /// cleared `isRunning`), so it empties the capture and sets `.idle`
+    /// before the stop resumes. The stop then transcribes nothing, beeps and
+    /// pastes nothing. A press in that `.idle` is ignored too, so no new
+    /// dictation can start under a stop that has not finished.
     private var isStopping = false
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
@@ -132,10 +137,16 @@ final class DictationController: ObservableObject {
     /// a second final pass over empty audio, which beeped and set `.idle`
     /// while the first pass was still running — so a later press could start
     /// a new dictation that the first stop then knocked back to `.idle`.
+    /// For the same reason no press starts a dictation while a stop is still
+    /// tearing down, even if a sleep or screen-lock cancel set `.idle` under
+    /// it: the stop resumes into `.transcribing` and would take that new
+    /// dictation's stream and samples, and strand its model hold.
     static func outcome(ofPress action: HotkeyAction,
                         state: State,
                         isStopping: Bool) -> PressOutcome {
         switch state {
+        case .idle where isStopping:
+            return .ignore
         case .idle:
             return .start
         case .recording(let active) where active == action && !isStopping:

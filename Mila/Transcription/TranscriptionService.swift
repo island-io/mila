@@ -588,12 +588,12 @@ final class TranscriptionService: ObservableObject {
             serviceLog.log("dictation hold: none — no installed model for lang=\(language, privacy: .public)")
             return nil
         }
-        let displayName = model.displayName
         let observerTask: Task<Void, Never> = observerSetupTask
         let id = UUID()
         localModelUsers += 1
         activeModelHolds.insert(id)
-        serviceLog.log("dictation hold: preloading \(displayName, privacy: .public) for lang=\(language, privacy: .public)")
+        // No model name here: the preload resolves it again when it runs.
+        serviceLog.log("dictation hold: taken for lang=\(language, privacy: .public)")
         modelHoldTasks[id] = Task { [engine, cancellation] in
             await self.continueCountedLocalModelUse {
                 // Bugbot #3: the preparation observer must be installed
@@ -654,8 +654,9 @@ final class TranscriptionService: ObservableObject {
                     admitted.forEach { $0.resume() }
                 } else {
                     serviceLog.log("""
-                        dictation hold: skipping the preload of \(current?.displayName ?? displayName, privacy: .public) — \
-                        installed=\(current != nil) held=\(self.activeModelHolds.contains(id)) \
+                        dictation hold: skipping the preload for lang=\(language, privacy: .public) \
+                        (\(current?.displayName ?? "no installed model", privacy: .public)) — \
+                        held=\(self.activeModelHolds.contains(id)) \
                         stopped=\(cancellation.isStopped) retains=\(self.retainsLocalModel) \
                         remote=\(self.remoteSettings.isActive) users=\(self.localModelUsers, privacy: .public) \
                         queued=\(self.queue.count, privacy: .public) processing=\(self.processingID != nil)
