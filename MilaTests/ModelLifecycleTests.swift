@@ -377,6 +377,43 @@ final class ModelLifecycleTests: XCTestCase {
         XCTAssertFalse(finalLoaded)
     }
 
+    /// A prewarm that arrives while a release is still running waits for it,
+    /// and must check again before loading: if retention went back off while
+    /// it waited, nobody wants the model, and a load (up to a ~13 s CoreML
+    /// compile) would only be freed again straight away.
+    func test_prewarmThatWaitedOnAReleaseDoesNotLoadOnceRetentionIsOff() async throws {
+        service.retainsLocalModel = true
+        _ = await service.transcribeOnce(samples: noisySamples, language: "en")
+        await stub.closeUnloadGate()
+        let release = service.updateLocalModelRetention(false)
+        let deadline = Date().addingTimeInterval(10)
+        while await stub.unloadEnteredCount == 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let entered = await stub.unloadEnteredCount
+        XCTAssertEqual(entered, 1, "setup must hold an actual unload in flight")
+
+        // Retention back on: the prewarm passes its first check and queues
+        // behind the release in flight.
+        let on = service.updateLocalModelRetention(true)
+        service.prewarm(language: "he")
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let baselineRequests = await stub.loadRequestCount
+
+        // ...and off again before that release finishes.
+        let off = service.updateLocalModelRetention(false)
+        await stub.openUnloadGate()
+        await release.value
+        await on.value
+        await off.value
+        try? await Task.sleep(nanoseconds: 200_000_000)
+
+        let requests = await stub.loadRequestCount
+        let loaded = await stub.isModelLoaded
+        XCTAssertEqual(requests, baselineRequests, "the prewarm loaded a model nobody retains any more")
+        XCTAssertFalse(loaded)
+    }
+
     // MARK: - Failure and cancellation
 
     func test_failedUseReleasesTheModel() async {

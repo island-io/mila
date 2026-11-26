@@ -432,6 +432,12 @@ final class TranscriptionService: ObservableObject {
             // Stay a counted local user for the load so a retention flip
             // during the (possibly ~13s) CoreML compile cannot unload under it.
             await self.withLocalModelUse {
+                // Admission can wait for an in-flight release to finish, so
+                // check again before committing to a load that can take
+                // ~13 s: a shutdown, or retention switched back off, while
+                // this waited means nobody wants the model any more.
+                guard !cancellation.isStopped, !Task.isCancelled,
+                      self.retainsLocalModel, !self.remoteSettings.isActive else { return }
                 do {
                     try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
                     serviceLog.log("prewarm: completed for \(displayName, privacy: .public)")

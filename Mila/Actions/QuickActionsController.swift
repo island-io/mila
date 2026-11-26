@@ -206,8 +206,8 @@ final class QuickActionsController: ObservableObject {
     /// ordering note in `stopRecording` at `store.add`.
     var liveSidecarWriter: LiveTranscriptSidecarWriter?
 
-    /// Whether the recording in progress (or the last one) runs the live
-    /// pipeline — live whisper, live diarizer, Live AI. Decided ONCE per
+    /// Whether the recording in progress (or the one being started) runs the
+    /// live pipeline — live whisper, live diarizer, Live AI. Decided ONCE per
     /// recording by `prepareLivePipeline()`, synchronously and before capture
     /// starts, from `LiveAISettings.runsLivePipeline` (hardware gate AND the
     /// user's "Transcribe while recording" setting). `wireLiveAIPipeline` and
@@ -215,10 +215,16 @@ final class QuickActionsController: ObservableObject {
     /// settings: re-reading would let a toggle flipped mid-call swap the
     /// recording view under the user, or leave the view and the pipeline
     /// disagreeing about a recording the async state observer wired a moment
-    /// after the settings changed. `beginStarting` sets it provisionally from
-    /// the same settings so nothing reads the previous recording's answer
-    /// while a start waits on the permission check. Published at most twice
-    /// per recording start, so it stays well clear of the App-level churn rule.
+    /// after the settings changed.
+    ///
+    /// `beginStarting` sets it provisionally from the same settings, so
+    /// nothing reads the previous recording's answer while a start waits on
+    /// the permission check. A start that ends without recording leaves its
+    /// provisional value behind: with no recording active or starting, the
+    /// value describes the last ATTEMPTED start, and no reader consults it
+    /// then (every reader gates on a recording being up or starting). Both
+    /// writes happen only on a change, so this publishes at most twice per
+    /// start and usually not at all, well clear of the App-level churn rule.
     @Published private(set) var recordingRunsLivePipeline = false
 
     /// True while `stopRecording` OWNS THE LIVE SINGLETONS
@@ -597,7 +603,10 @@ final class QuickActionsController: ObservableObject {
         // value, so `false` here is not a harmless default: it would discard
         // the live transcript and speaker names of a recording whose pipeline
         // did run. In the app the settings are always injected.
-        recordingRunsLivePipeline = liveAISettings?.runsLivePipeline ?? true
+        let runsLivePipeline = liveAISettings?.runsLivePipeline ?? true
+        if recordingRunsLivePipeline != runsLivePipeline {
+            recordingRunsLivePipeline = runsLivePipeline
+        }
         liveAISessionStartedByRelease = false
         // The previous recording's drain is still reading these (issue #356):
         // clearing them now would hand it an empty transcript and pool to save

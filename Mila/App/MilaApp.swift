@@ -2421,10 +2421,12 @@ struct MilaApp: App {
     ///
     /// `stoppingOrFinalizing` retains on its own, even for a recording that
     /// never ran the live pipeline, on purpose: since #356 a new recording can
-    /// start during the previous one's drain, and `prepareLivePipeline` then
-    /// overwrites `recordingRunsLivePipeline` with the NEW recording's
-    /// decision while the old live drain still needs the model. The cost in
-    /// batch-only mode is only that a release waits for finalize to clear.
+    /// start during the previous one's drain, and the new start overwrites
+    /// `recordingRunsLivePipeline` with ITS decision (provisionally in
+    /// `beginStarting`, the moment the start is accepted, then for real in
+    /// `prepareLivePipeline`) while the old live drain still needs the model.
+    /// The cost in batch-only mode is only that a release waits for finalize
+    /// to clear.
     static func localModelRetentionRequired(
         livePipelineEnabled: Bool,
         recordingRunsLivePipeline: Bool,
