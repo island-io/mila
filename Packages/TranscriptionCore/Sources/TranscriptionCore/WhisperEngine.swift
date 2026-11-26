@@ -147,12 +147,9 @@ public actor WhisperEngine {
             }
             whisperNotice("Reloading \(displayName) — sibling .mlmodelc now available, was loaded without CoreML")
         }
-        if let ctx {
-            whisper_free(ctx)
-            self.ctx = nil
-            self.loadedPath = nil
-        }
-        self.coreMLStatus = .unavailable
+        // The same cleanup `unload()` does, so a reload that then fails
+        // leaves no field describing the model it just freed.
+        freeContext()
         var params = whisper_context_default_params()
         #if canImport(Metal)
         params.use_gpu = true
