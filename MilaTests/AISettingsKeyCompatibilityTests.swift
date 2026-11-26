@@ -65,6 +65,12 @@ final class AISettingsKeyCompatibilityTests: XCTestCase {
         XCTAssertEqual(llm.cliTimeout, 600.0)
     }
 
+    func test_provider_keys_adopt_agy_tool() {
+        defaults.set("agy", forKey: "llm.tool")
+        let llm = makeLLM()
+        XCTAssertEqual(llm.tool, .agy)
+    }
+
     func test_provider_edits_write_the_documented_keys() {
         let llm = makeLLM()
 

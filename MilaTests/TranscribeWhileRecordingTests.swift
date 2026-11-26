@@ -203,6 +203,35 @@ final class TranscribeWhileRecordingTests: XCTestCase {
         await service.waitForIdle()
     }
 
+    /// A start can sit in the microphone permission check, on a system prompt,
+    /// before `prepareLivePipeline` snapshots the decision. Whatever reads
+    /// `recordingRunsLivePipeline` in that window (MilaApp keeps or loads the
+    /// local whisper model on it, #393) must see THIS start's decision. Before
+    /// `beginStarting` refreshed it, a live recording followed by a start
+    /// with live transcription switched off read `true` there, and batch-only
+    /// mode loaded the whole model for a recording that would never use it.
+    func test_a_start_reads_its_own_live_decision_during_the_permission_check() async throws {
+        _ = try await startFakeRecording(named: "LiveMeeting")
+        XCTAssertTrue(controller.recordingRunsLivePipeline, "precondition: the previous recording ran live")
+        await controller.stopRecording()
+        await controller.awaitFinalizeTails()
+        await service.waitForIdle()
+
+        liveAISettings.transcribeWhileRecording = false
+        var seenDuringPermissionCheck: Bool?
+        controller.microphonePermissionOverride = { [unowned self] in
+            MainActor.assumeIsolated {
+                seenDuringPermissionCheck = self.controller.recordingRunsLivePipeline
+            }
+            return false   // end the start here; nothing needs capturing
+        }
+        await controller.toggleRecord(microphone: true, appAudio: false)
+
+        XCTAssertEqual(seenDuringPermissionCheck, false,
+                       "the permission check saw the previous recording's live decision")
+        XCTAssertEqual(controller.activeJob, .none)
+    }
+
     // MARK: - No leak across recordings
 
     /// A live recording, then a recording with live transcription switched

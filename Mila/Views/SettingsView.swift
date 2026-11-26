@@ -1612,11 +1612,11 @@ private struct AIProviderSettingsTab: View {
     // MARK: Tool
 
     private var toolRow: some View {
-        // A pop-up menu, not a full-width segmented control: five options of
+        // A pop-up menu, not a full-width segmented control: six options of
         // very uneven length stretched across the pane gave "Off" a segment
         // the size of a button.
         fieldRow("Tool",
-                 help: "Claude, Cursor and Gemini shell out to a CLI on this Mac, using the login you already set up. OpenAI Compatible calls any /chat/completions endpoint over HTTP, including a local Ollama.") {
+                 help: "Claude, Cursor, Gemini and Antigravity shell out to a CLI on this Mac, using the login you already set up. OpenAI Compatible calls any /chat/completions endpoint over HTTP, including a local Ollama.") {
             Picker("Tool", selection: $settings.tool) {
                 ForEach(LLMTool.allCases) { tool in
                     Text(tool.displayName).tag(tool)

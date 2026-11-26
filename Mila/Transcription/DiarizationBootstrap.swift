@@ -1,4 +1,8 @@
 import Foundation
+import os
+
+private let bootstrapLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                  category: "DiarizationBootstrap")
 
 /// Orchestrates the first-launch download + install of the torch wheel into a
 /// user-writable site-packages directory. Everything else needed for speaker
@@ -20,8 +24,8 @@ final class DiarizationBootstrap: ObservableObject {
     /// (3.3.x). Newer torch (>= 2.6) changes the `weights_only` default and
     /// breaks pyannote's checkpoint loading; we patch around it at import
     /// but the saner pin is to stay on 2.2.x until pyannote follows.
-    static let torchVersion = "2.2.2"
-    static let torchaudioVersion = "2.2.2"
+    static let torchVersion = DiarizationDependencyPins.torch
+    static let torchaudioVersion = DiarizationDependencyPins.torchaudio
 
     /// Wheel URLs on PyTorch's CPU index. Arm64-only for now (the app runs
     /// universally but the bundled Python is arm64; an x86_64 add is a
@@ -60,7 +64,7 @@ final class DiarizationBootstrap: ObservableObject {
     /// (The runtime self-heal still handles any *other* transitive dep
     /// that may surface later.)
     static let extraInstallSpecs: [String] = [
-        "numpy<2",
+        "numpy\(DiarizationDependencyPins.numpy)",
         "matplotlib",
         "Pillow",
         "pyparsing",
@@ -135,12 +139,7 @@ final class DiarizationBootstrap: ObservableObject {
     /// demand. Living under Application Support means upgrades don't lose
     /// the install — only an explicit reinstall clears it.
     nonisolated static var userSitePackages: URL {
-        let appSupport = try! FileManager.default.url(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
+        let appSupport = AppSupportLocation.directory()
         return appSupport
             .appendingPathComponent("Mila", isDirectory: true)
             .appendingPathComponent("torch-site-packages", isDirectory: true)
@@ -308,70 +307,81 @@ final class DiarizationBootstrap: ObservableObject {
     /// haven't planned for.
     private func runPipInstallSpec(python: String, spec: String) async throws {
         let targetPath = sitePackagesURL.path
-        try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: python)
-            process.arguments = [
+        // stdout is discarded (an unread Pipe() is a ~64 KB buffer pip's
+        // progress output can fill — the PR #15 deadlock class); stderr is
+        // kept for the error message. `SubprocessRunner` keeps the wait off
+        // the cooperative pool and bounds it.
+        let result = try await SubprocessRunner.run(
+            executable: URL(fileURLWithPath: python),
+            arguments: [
                 "-m", "pip", "install",
                 "--target", targetPath,
                 "--upgrade",
                 "--no-deps",
                 "--only-binary=:all:",
                 spec,
-            ]
-            let stderr = Pipe()
-            process.standardError = stderr
-            // Discard stdout via the null device — an assigned-but-never-read
-            // Pipe() is NOT a sink: it's a ~64 KB buffer, and pip's progress
-            // output can fill it, blocking pip on write() while we block in
-            // waitUntilExit() (the PR #15 deadlock class).
-            process.standardOutput = FileHandle.nullDevice
-            try process.run()
-            let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
-            process.waitUntilExit()
-            let stderrData = await stderrRead.value
-            if process.terminationStatus != 0 {
-                let msg = String(data: stderrData, encoding: .utf8) ?? "exit \(process.terminationStatus)"
-                throw NSError(domain: "DiarizationBootstrap", code: 4, userInfo: [
-                    NSLocalizedDescriptionKey: "pip install \(spec) failed: \(msg.prefix(500))"
-                ])
-            }
-        }.value
+            ],
+            stdout: .discard,
+            timeout: Self.pipInstallTimeout)
+        if result.timedOut {
+            discardKilledInstall()
+            throw NSError(domain: "DiarizationBootstrap", code: 5, userInfo: [
+                NSLocalizedDescriptionKey: "pip install \(spec) timed out"
+            ])
+        }
+        if result.exitCode != 0 {
+            let msg = String(data: result.stderr, encoding: .utf8) ?? "exit \(result.exitCode)"
+            throw NSError(domain: "DiarizationBootstrap", code: 4, userInfo: [
+                NSLocalizedDescriptionKey: "pip install \(spec) failed: \(msg.prefix(500))"
+            ])
+        }
     }
+
+    /// A `pip install --target` killed by the timeout can leave a half-moved
+    /// tree whose torch/torchaudio `__init__.py` makes `refreshReadyState`
+    /// report ready on the next launch (the hazard `reinstall()` names).
+    /// `SubprocessRunner` has killed pip's whole process group by the time it
+    /// returns, so nothing is writing here; wipe it so the next bootstrap
+    /// starts clean, as `reinstall()` does.
+    private func discardKilledInstall() {
+        try? fileManager.removeItem(at: sitePackagesURL)
+        isReady = false
+    }
+
+    /// Upper bound for a pip install of the diarization stack: a ~60 MB torch
+    /// wheel takes about a minute on a slow link, so this is for a hung pip,
+    /// not a slow one.
+    private static let pipInstallTimeout: TimeInterval = 30 * 60
 
     private func runPipInstall(python: String, wheels: [URL]) async throws {
         let targetPath = sitePackagesURL.path
         let wheelPaths = wheels.map(\.path)
-        // Detach the blocking subprocess work to a background task —
-        // pip-installing torch (~60 MB wheel, ~600 MB on-disk) can run for
-        // a minute and we're on @MainActor. `process.waitUntilExit()` on
-        // the main thread would freeze the entire UI. Same pattern
-        // SpeakerDiarizer.runPython uses.
-        try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: python)
-            process.arguments = [
+        // pip-installing torch (~60 MB wheel, ~600 MB on-disk) runs for a
+        // minute or more; `SubprocessRunner` waits without holding a
+        // cooperative-pool thread. stdout goes to the null device (see
+        // runPipInstallSpec).
+        let result = try await SubprocessRunner.run(
+            executable: URL(fileURLWithPath: python),
+            arguments: [
                 "-m", "pip", "install",
                 "--target", targetPath,
                 "--no-deps",
                 "--only-binary=:all:",
-            ] + wheelPaths
-            let stderr = Pipe()
-            process.standardError = stderr
-            // Null device, not Pipe(): an unread Pipe deadlocks past ~64 KB
-            // of pip stdout (see runPipInstallSpec).
-            process.standardOutput = FileHandle.nullDevice
-            try process.run()
-            let stderrRead = Task.detached { stderr.fileHandleForReading.readDataToEndOfFile() }
-            process.waitUntilExit()
-            let stderrData = await stderrRead.value
-            if process.terminationStatus != 0 {
-                let msg = String(data: stderrData, encoding: .utf8) ?? "exit \(process.terminationStatus)"
-                throw NSError(domain: "DiarizationBootstrap", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "pip install failed: \(msg.prefix(500))"
-                ])
-            }
-        }.value
+            ] + wheelPaths,
+            stdout: .discard,
+            timeout: Self.pipInstallTimeout)
+        if result.timedOut {
+            discardKilledInstall()
+            throw NSError(domain: "DiarizationBootstrap", code: 6, userInfo: [
+                NSLocalizedDescriptionKey: "pip install timed out"
+            ])
+        }
+        if result.exitCode != 0 {
+            let msg = String(data: result.stderr, encoding: .utf8) ?? "exit \(result.exitCode)"
+            throw NSError(domain: "DiarizationBootstrap", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "pip install failed: \(msg.prefix(500))"
+            ])
+        }
     }
 
     /// torch ships ~90 MB of un-signed dylibs in torch/lib/. We ad-hoc sign
@@ -392,25 +402,27 @@ final class DiarizationBootstrap: ObservableObject {
         guard !candidates.isEmpty else { return }
         let pathList = candidates.map { $0.shellEscaped }.joined(separator: " ")
         // codesign-find-xargs over ~hundreds of dylibs can take 10+ seconds.
-        // Detach to keep the main thread responsive.
-        try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/bin/sh")
-            process.arguments = ["-c", """
+        // Both streams go to the null device: nobody reads them, and
+        // codesign's per-dylib chatter can overflow an unread pipe. Bounded
+        // (it previously had no timeout at all); a timeout is non-fatal like
+        // any other signing failure.
+        let result = try await SubprocessRunner.run(
+            executable: URL(fileURLWithPath: "/bin/sh"),
+            arguments: ["-c", """
                 find \(pathList) \\( -name '*.so' -o -name '*.dylib' \\) -print0 \
                   | xargs -0 -n1 codesign -f -s - --timestamp=none
-                """]
-            // Null device, not Pipe(): nobody reads these, and codesign's
-            // per-dylib "replacing existing signature" chatter over hundreds
-            // of files can overflow an unread pipe's ~64 KB buffer — child
-            // blocks on write(), we block in waitUntilExit(), deadlock.
-            process.standardError = FileHandle.nullDevice
-            process.standardOutput = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
-            // Non-fatal: ad-hoc signing failures don't block functionality on
-            // current macOS. If it ever does, we'll catch it at the diarize call.
-        }.value
+                """],
+            stdout: .discard,
+            stderr: .discard,
+            timeout: 10 * 60)
+        // Non-fatal: ad-hoc signing failures don't block functionality on
+        // current macOS. If it ever does, we'll catch it at the diarize call.
+        // A timeout kills the whole `sh | find | xargs codesign` group
+        // (`SubprocessRunner` signals the process group), so nothing is
+        // still re-signing a dylib once this returns; leave a trace of it.
+        if result.timedOut {
+            bootstrapLog.error("ad-hoc signing of the torch dylibs timed out; continuing with whatever was signed")
+        }
     }
 }
 

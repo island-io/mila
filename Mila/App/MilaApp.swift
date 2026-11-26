@@ -1024,6 +1024,20 @@ struct MilaApp: App {
         dictationController.storageSettings = storage
         _dictation = StateObject(wrappedValue: dictationController)
 
+        // Seed the local-model retention BEFORE any `.task` can call
+        // `prewarm`. Live transcription needs the weights warm; a batch-only
+        // session must not load them at launch. A remote-backend user has no
+        // local model to keep either way. Later changes go through
+        // `syncLocalModelRetention()` (the `.onChange` modifiers in `body`),
+        // which releases a warm model when live transcription is switched
+        // off and re-warms when it is switched back on.
+        svc.retainsLocalModel = Self.localModelRetentionRequired(
+            livePipelineEnabled: liveAI.runsLivePipeline,
+            recordingRunsLivePipeline: false,
+            recordingActive: false,
+            stoppingOrFinalizing: false,
+            remoteActive: remoteSettings.isActive)
+
         #if DEBUG
         // Hand every App-level object to the churn probe by property name,
         // so `AppSceneChurnTests` can say WHICH object re-evaluated this App
@@ -1108,6 +1122,15 @@ struct MilaApp: App {
                 .frame(minWidth: 1000, minHeight: 640)
                 .task { ensureDefaultModelsInstalled() }
                 .task { prewarmDefaultModel() }
+                // Observe the combined decision once: six separate modifiers
+                // push this large window expression past Swift's type-check limit.
+                // `initial: true` re-syncs whenever this window (re)appears:
+                // the app keeps running with the window closed, and a value
+                // that changed meanwhile (live transcription toggled in
+                // Settings) would otherwise never fire `onChange` again.
+                .onChange(of: needsWarmLocalModel, initial: true) { _, _ in
+                    syncLocalModelRetention()
+                }
                 .task { await diarizationSettings.runHealthCheck() }
                 .task { await diarizationSettings.runStartupCheckDepsIfNeeded() }
                 .task { await diarizationSettings.startAutoBootstrapIfNeeded() }
@@ -1261,6 +1284,14 @@ struct MilaApp: App {
                 .environmentObject(mcpAccessSettings)
                 .environmentObject(claudeSetupSettings)
                 .environmentObject(obsidianExporter)
+                // The live-transcription toggle lives here, and this window
+                // can be open while the main window is closed (whose own
+                // `onChange` then isn't running). Syncing from both scenes is
+                // idempotent: `syncLocalModelRetention` only prewarms on a
+                // false → true change of `retainsLocalModel`.
+                .onChange(of: needsWarmLocalModel, initial: true) { _, _ in
+                    syncLocalModelRetention()
+                }
         }
         // Settings used to be pinned to 700×560 by a rigid `.frame` inside
         // `SettingsView`; since #177 it is a resizable sidebar window whose
@@ -2347,8 +2378,10 @@ struct MilaApp: App {
         }
     }
 
-    /// Kick the engine's `loadIfNeeded` on the user's default model
-    /// once at launch. The first time whisper.cpp loads a model with
+    /// Kick the engine's `loadIfNeeded` on the user's default model: at
+    /// launch, and from `syncLocalModelRetention` whenever retention turns
+    /// back on (live transcription switched on, or a recording that runs
+    /// live starting while it was off). The first time whisper.cpp loads a model with
     /// a sibling `-encoder.mlmodelc` on a given device, CoreML
     /// compiles the mlmodelc for that hardware — ~13s peg on M-series
     /// the very first time, then fully cached. Doing this at launch
@@ -2356,7 +2389,7 @@ struct MilaApp: App {
     /// preparation banner shows BEFORE the user reaches for the
     /// button, and any too-eager Record press during the window finds
     /// the model already loaded.
-    private func prewarmDefaultModel() {
+    private func prewarmDefaultModel(forLiveRecording: Bool = false) {
         // Skip prewarm under any XCTest hosting (UI or unit tests). No test
         // relies on a launch-time warm — the transcription E2E tests pass
         // `--ui-test-tiny-model-path=` and load on demand — so warming the
@@ -2371,7 +2404,80 @@ struct MilaApp: App {
         guard !isRunningUnderXCTest else { return }
         // No local weights to warm when the remote backend is selected.
         guard !remoteTranscriptionSettings.isActive else { return }
+        // Batch-only mode (live transcription OFF) must not preload the
+        // model at launch. The first real transcription after Stop loads it.
+        // The exception is a recording that already snapshotted the live
+        // pipeline: it runs live whatever the setting says now, so it needs
+        // the model warm even after the user switched live transcription off.
+        guard liveAISettings.runsLivePipeline || forLiveRecording else { return }
         transcription.prewarm(language: languageSettings.current.rawValue)
+    }
+
+    /// Pure decision behind `syncLocalModelRetention`. Factored out so the
+    /// settings/session transition matrix is unit-testable without a running
+    /// app: the case that matters most is live transcription ON at record
+    /// start and switched OFF mid-recording — the recording must keep its warm
+    /// model until it stops and its drain finishes, then release it.
+    ///
+    /// `stoppingOrFinalizing` retains on its own, even for a recording that
+    /// never ran the live pipeline, on purpose: since #356 a new recording can
+    /// start during the previous one's drain, and the new start overwrites
+    /// `recordingRunsLivePipeline` with ITS decision (provisionally in
+    /// `beginStarting`, the moment the start is accepted, then for real in
+    /// `prepareLivePipeline`) while the old live drain still needs the model.
+    /// The cost in batch-only mode is only that a release waits for finalize
+    /// to clear.
+    static func localModelRetentionRequired(
+        livePipelineEnabled: Bool,
+        recordingRunsLivePipeline: Bool,
+        recordingActive: Bool,
+        stoppingOrFinalizing: Bool,
+        remoteActive: Bool
+    ) -> Bool {
+        guard !remoteActive else { return false }
+        return livePipelineEnabled
+            || stoppingOrFinalizing
+            || (recordingRunsLivePipeline && recordingActive)
+    }
+
+    /// All inputs to residency participate in one observed decision. A live
+    /// recording keeps its snapshotted pipeline through Stop even when the
+    /// user changes the setting to OFF partway through the recording.
+    private var needsWarmLocalModel: Bool {
+        let postStop = actions.isStoppingRecording || actions.isFinalizingRecording
+        return Self.localModelRetentionRequired(
+            livePipelineEnabled: liveAISettings.runsLivePipeline,
+            recordingRunsLivePipeline: actions.recordingRunsLivePipeline,
+            recordingActive: recordingCaptureActive,
+            stoppingOrFinalizing: postStop,
+            remoteActive: remoteTranscriptionSettings.isActive)
+    }
+
+    /// A capture is up or being brought up. The bring-up counts:
+    /// `prepareLivePipeline` snapshots `recordingRunsLivePipeline` BEFORE
+    /// `session.start`, which can take seconds on a Bluetooth mic (#291)
+    /// while `session.state` is still `.idle`. Without it, switching live
+    /// transcription off in that window released the model the recording
+    /// was about to run live on. Pairing it with `recordingRunsLivePipeline`
+    /// is sound only because `beginStarting` refreshes that flag the moment
+    /// a start begins; before that refresh, the permission check would have
+    /// read the previous recording's decision.
+    private var recordingCaptureActive: Bool {
+        session.state == .recording || session.state == .paused
+            || actions.isStartingRecording
+    }
+
+    /// Apply preference changes synchronously. Turning retention back on also
+    /// warms the model for live transcription; cleanup rechecks the latest
+    /// decision so a queued OFF cleanup cannot undo a subsequent ON change.
+    private func syncLocalModelRetention() {
+        let retains = needsWarmLocalModel
+        let wasRetaining = transcription.retainsLocalModel
+        transcription.updateLocalModelRetention(retains)
+        if retains, !wasRetaining {
+            prewarmDefaultModel(
+                forLiveRecording: actions.recordingRunsLivePipeline && recordingCaptureActive)
+        }
     }
 
     /// True when the process is hosting an XCTest run — either an XCUITest

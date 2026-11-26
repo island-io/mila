@@ -40,12 +40,28 @@ public protocol TranscribingEngine: Sendable {
     ///     paths whose quality has not been validated against truncation
     ///     (dictation, imported-file batch transcription).
     ///   * any positive Int32 → explicit override (advanced / testing).
-    func transcribe(samples: [Float],
+    ///
+    /// `samples` is `consuming`: the engine owns the buffer for the call and
+    /// may write into it (`WhisperEngine`'s auto-gain scales it in place,
+    /// #403). Pass `consume buffer` when the caller is done with a large
+    /// recording, or the engine's first write copies it. A conformer that
+    /// only reads the samples may declare the parameter without `consuming`.
+    func transcribe(samples: consuming [Float],
                     language: String,
                     audioCtx: Int32?,
                     progress: (@Sendable (Float) -> Void)?,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment]
     func shutdown() async
+
+    /// Free the loaded model (if any) while keeping the engine usable: the
+    /// next `loadIfNeeded` loads it again. Unlike `shutdown`, which is the
+    /// one-way teardown for process exit, this is safe to call while idle so
+    /// a batch-only session can hand the model's memory back between uses.
+    ///
+    /// Implementations must be no-ops when nothing is loaded. The default
+    /// implementation is a no-op for engines that hold no reclaimable state
+    /// (test stubs, remote engines).
+    func unload() async
 
     /// CoreML status after the most recent successful `loadIfNeeded`. The
     /// default implementation returns `.unavailable` so non-whisper engines
@@ -73,6 +89,10 @@ extension TranscribingEngine {
     }
 
     public func setPreparationObserver(_ observer: (@Sendable (Bool, String?) -> Void)?) async {
+        // no-op default
+    }
+
+    public func unload() async {
         // no-op default
     }
 }

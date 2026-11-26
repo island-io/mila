@@ -20,13 +20,18 @@ private let remoteLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
 /// other's two steps, and send its audio to the wrong model — a Hebrew
 /// utterance to an English import's model, or a long recording to a live
 /// clip's, without the pass's `offlineDiarization`.
+///
+/// `samples` is `consuming`, as on `TranscribingEngine.transcribe` (#403):
+/// the batch pass hands a whole recording over with `consume samples`, so
+/// the caller keeps no second reference to it. `RemoteWhisperEngine` only
+/// reads the samples, so it declares the parameter without `consuming`.
 protocol RemoteTranscribing: Sendable {
     /// One short clip (a live utterance, a dictation, a missing span) with
     /// an explicit per-request idle timeout, sent as ONE request. A live
     /// clip must fail in seconds, or a connection that silently stops
     /// answering holds the live queue — and Stop's drain — for an hour
     /// (#355).
-    func transcribe(samples: [Float],
+    func transcribe(samples: consuming [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
                     requestTimeout: TimeInterval,
@@ -34,7 +39,7 @@ protocol RemoteTranscribing: Sendable {
 
     /// A whole recording: split into several requests where it is long
     /// (#376), each with a timeout sized to its piece.
-    func transcribe(samples: [Float],
+    func transcribe(samples: consuming [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
                     progress: (@Sendable (Float) -> Void)?,
@@ -46,12 +51,12 @@ protocol RemoteTranscribing: Sendable {
 extension RemoteTranscribing {
     /// Test doubles have no network, so the timeout means nothing to them.
     /// The config still reaches them: a double can check what it was handed.
-    func transcribe(samples: [Float],
+    func transcribe(samples: consuming [Float],
                     language: String,
                     config: RemoteTranscriptionConfig,
                     requestTimeout: TimeInterval,
                     isCancelled: (@Sendable () -> Bool)?) async throws -> [TranscriptSegment] {
-        try await transcribe(samples: samples, language: language, config: config,
+        try await transcribe(samples: consume samples, language: language, config: config,
                              progress: nil, isCancelled: isCancelled)
     }
 }
