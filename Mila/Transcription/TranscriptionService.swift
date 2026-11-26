@@ -541,6 +541,12 @@ final class TranscriptionService: ObservableObject {
     /// ended AND the preload's load has returned, so ending a hold mid-load
     /// can never put an unload beside that load. `shutdown` ends every hold.
     ///
+    /// The preload itself runs only while the hold is the sole local user;
+    /// with a batch job (or any other user) mid-flight it is skipped and the
+    /// final pass loads on demand, so a dictation start can never swap the
+    /// model out between that job's load and its transcribe. See the comment
+    /// at the check.
+    ///
     /// Returns nil — and takes nothing — when there is nothing to preload or
     /// nothing to change: live retention (`retainsLocalModel`) already keeps
     /// the model warm and must behave exactly as before, the remote backend
@@ -583,8 +589,20 @@ final class TranscriptionService: ObservableObject {
                 // cancelled or failed start), a shutdown, live retention
                 // switched on (live mode loads on demand, as before) or the
                 // remote backend selected all mean nobody needs this load.
+                //
+                // And preload only while this hold is the ONLY local user.
+                // The engine keeps one context, and a user's `loadIfNeeded`
+                // and `transcribe` are two engine calls: another model's load
+                // queued between them swaps the context, so a batch job could
+                // be transcribed by the dictation's model. That race predates
+                // this hold — the dictation's own final pass can hit it — but
+                // a preload must not add a second trigger. When anyone else
+                // is mid-flight, the final pass loads on demand as before,
+                // and the hold still keeps whatever is loaded from being
+                // released when they finish.
                 if self.activeModelHolds.contains(id), !cancellation.isStopped,
-                   !self.retainsLocalModel, !self.remoteSettings.isActive {
+                   !self.retainsLocalModel, !self.remoteSettings.isActive,
+                   self.localModelUsers == 1 {
                     do {
                         try await engine.loadIfNeeded(modelURL: modelURL, displayName: displayName)
                         serviceLog.log("dictation hold: preloaded \(displayName, privacy: .public)")
@@ -597,7 +615,12 @@ final class TranscriptionService: ObservableObject {
                             """)
                     }
                 } else {
-                    serviceLog.log("dictation hold: skipping the preload of \(displayName, privacy: .public) — no longer wanted")
+                    serviceLog.log("""
+                        dictation hold: skipping the preload of \(displayName, privacy: .public) — \
+                        held=\(self.activeModelHolds.contains(id)) stopped=\(cancellation.isStopped) \
+                        retains=\(self.retainsLocalModel) remote=\(self.remoteSettings.isActive) \
+                        users=\(self.localModelUsers, privacy: .public)
+                        """)
                 }
                 await self.waitForModelHoldToEnd(id)
             }

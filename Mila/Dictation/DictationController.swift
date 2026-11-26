@@ -37,8 +37,8 @@ final class DictationController: ObservableObject {
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
     /// mode releases an idle model (#393), so without it every dictation
-    /// loaded the model only once the user had finished speaking. Taken when
-    /// a start is accepted, so the load overlaps with the mic coming up and
+    /// loaded the model only once the user had finished speaking. Taken once
+    /// mic access is granted, so the load overlaps with the mic coming up and
     /// the user speaking; handed to this property once capture is running,
     /// and ended exactly once — after the final transcription, or on cancel.
     /// A start that fails ends its own hold before it returns. Nil in live
@@ -183,21 +183,25 @@ final class DictationController: ObservableObject {
             AccessibilityPermission.requestPromptIfNeeded()
         }
 
-        // Start loading the model the final pass will use now, before the
-        // first await, so the load overlaps with the mic coming up and the
-        // user speaking instead of following the second press (#434). This
-        // call owns the hold until capture is running; every return before
-        // that point ends it here, so a failed start cannot strand the model.
+        guard await recorder.requestAccess() else {
+            NSSound.beep()
+            return
+        }
+
+        // Start loading the model the final pass will use now, so the load
+        // overlaps with the mic coming up and the user speaking instead of
+        // following the second press (#434). After the permission check, not
+        // before it: on a first dictation the system prompt can stay up for a
+        // long time, and a denial would throw the whole load away. Once access
+        // is granted that check returns at once, so nothing is lost here.
+        // This call owns the hold until capture is running; every return
+        // before that point ends it, so a failed start cannot strand it.
         let hold = transcription.beginLocalModelHold(language: action.languageCode)
         var holdHandedOff = false
         defer {
             if !holdHandedOff, let hold { transcription.endLocalModelHold(hold) }
         }
 
-        guard await recorder.requestAccess() else {
-            NSSound.beep()
-            return
-        }
         samples.removeAll(keepingCapacity: true)
         do {
             try await recorder.start()
