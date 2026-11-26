@@ -1,4 +1,8 @@
 import Foundation
+import os
+
+private let bootstrapLog = Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                  category: "DiarizationBootstrap")
 
 /// Orchestrates the first-launch download + install of the torch wheel into a
 /// user-writable site-packages directory. Everything else needed for speaker
@@ -405,7 +409,12 @@ final class DiarizationBootstrap: ObservableObject {
             timeout: 10 * 60)
         // Non-fatal: ad-hoc signing failures don't block functionality on
         // current macOS. If it ever does, we'll catch it at the diarize call.
-        _ = result
+        // A timeout kills the whole `sh | find | xargs codesign` group
+        // (`SubprocessRunner` signals the process group), so nothing is
+        // still re-signing a dylib once this returns; leave a trace of it.
+        if result.timedOut {
+            bootstrapLog.error("ad-hoc signing of the torch dylibs timed out; continuing with whatever was signed")
+        }
     }
 }
 

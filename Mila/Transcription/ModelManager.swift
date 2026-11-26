@@ -553,14 +553,15 @@ extension ModelManager: URLSessionDownloadDelegate {
 
         do {
             // Bounded and cancellable (it was an unbounded `waitUntilExit()`
-            // on a cooperative-pool thread). An encoder archive is a few
-            // hundred MB; five minutes is for a hung `unzip`, not a slow disk.
+            // on a cooperative-pool thread). The largest encoder archive is
+            // ~1.1 GB and extracts in well under a minute on any supported
+            // Mac; fifteen minutes is for a hung `unzip`, not a slow disk.
             let unzip = try await SubprocessRunner.run(
                 executable: URL(fileURLWithPath: "/usr/bin/unzip"),
                 arguments: ["-q", tempCopy.path, "-d", extractRoot.path],
                 stdout: .discard,
                 stderr: .discard,
-                timeout: 5 * 60)
+                timeout: 15 * 60)
             if unzip.timedOut || unzip.exitCode != 0 {
                 throw NSError(domain: "ModelManager.CoreML", code: Int(unzip.exitCode),
                               userInfo: [NSLocalizedDescriptionKey:

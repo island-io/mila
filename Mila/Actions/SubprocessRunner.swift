@@ -1,6 +1,9 @@
 import Foundation
 import os
 
+private let subprocessLog = os.Logger(subsystem: "io.island.whisper.IslandWhisper",
+                                      category: "SubprocessRunner")
+
 /// One place that runs a child process and waits for it without parking
 /// threads of the Swift cooperative pool (improvement plan item 7).
 ///
@@ -21,6 +24,11 @@ import os
 /// 3. The `waitUntilExit()` backstop stays: macOS 26 has a reaping race where it
 ///    never returns even after SIGKILL, so the two paths fail independently and
 ///    whichever notices first signals. Every semaphore wait is bounded.
+///
+/// Signals go to the child's whole process group when it leads one
+/// (`LLMRunner.processGroup(ledBy:)`), so a timeout or cancel also reaches the
+/// processes it started: `sh -c "find | xargs codesign"` otherwise leaves
+/// `xargs` re-signing dylibs after `sh` is gone.
 ///
 /// Callers that can spawn children in a batch need their own concurrency limit;
 /// the thread count follows the number of concurrent child processes.
@@ -116,6 +124,9 @@ enum SubprocessRunner {
         private struct State {
             var cancelled = false
             var process: Process?
+            /// The process group the child leads, or nil when it does not
+            /// lead one (then only the child itself is signalled).
+            var group: pid_t?
         }
         private let state = OSAllocatedUnfairLock(initialState: State())
         /// Signalled by the exit observers and by a cancel. A semaphore is only
@@ -138,11 +149,13 @@ enum SubprocessRunner {
         var isCancelled: Bool { state.withLock { $0.cancelled } }
 
         func cancel() {
-            let process = state.withLock { s -> Process? in
+            let (process, group) = state.withLock { s -> (Process?, pid_t?) in
                 s.cancelled = true
-                return s.process
+                return (s.process, s.group)
             }
-            if let process, process.isRunning { process.terminate() }
+            // Only while the child is running (checked inside): once it is
+            // reaped its pid, and so its group id, can be reused.
+            if let process { LLMRunner.sendSignal(SIGTERM, to: process, group: group) }
             exited.signal()   // wake the coordinating wait now, not at the deadline
         }
 
@@ -169,13 +182,18 @@ enum SubprocessRunner {
             } catch {
                 throw Failure.launchFailed(error)
             }
-            // Close the narrow window where a cancel ran before `run()`: its
-            // terminate() hit a not-yet-launched process and did nothing.
+            // Read now: the child cannot have been reaped before `run()`
+            // returns unless it already exited, and then there is nothing to
+            // signal.
+            let group = LLMRunner.processGroup(ledBy: process.processIdentifier)
+            // Close the narrow window where a cancel ran before `run()`: it
+            // had no process to signal.
             let cancelledBeforeLaunch = state.withLock { s -> Bool in
                 s.process = process
+                s.group = group
                 return s.cancelled
             }
-            if cancelledBeforeLaunch { process.terminate() }
+            if cancelledBeforeLaunch { LLMRunner.sendSignal(SIGTERM, to: process, group: group) }
             onLaunch?(process)
 
             // Chunked reads into lock-guarded boxes, so a bounded drain can
@@ -205,10 +223,16 @@ enum SubprocessRunner {
 
             let timedOut = waitForExit(of: process)
             let killed = timedOut || isCancelled
-            if killed { terminate(process) }
+            if killed { terminate(process, group: group) }
 
             let grace = killed ? SubprocessRunner.drainGraceAfterKill : SubprocessRunner.drainGraceAfterExit
-            _ = drained.wait(timeout: .now() + grace)
+            if drained.wait(timeout: .now() + grace) == .timedOut, !killed {
+                // The child exited but something still holds its stdout or
+                // stderr open (a process it started). Its own output arrived
+                // before it exited, so what was read is complete unless a
+                // reader was starved for the whole grace; say so either way.
+                subprocessLog.error("\(self.executable.lastPathComponent, privacy: .public): pipe drain timed out after exit; returning the output read so far")
+            }
 
             // A SIGTERM'd run surfaces as cancellation, not as a failure
             // banner. Checked before the output is used.
@@ -238,21 +262,29 @@ enum SubprocessRunner {
             }
         }
 
-        /// SIGTERM was sent by the caller of this (or by `cancel()`); make sure
-        /// the child is really gone, escalating to SIGKILL.
-        private func terminate(_ process: Process) {
-            if process.isRunning { process.terminate() }
+        /// SIGTERM the child (and its group), give it `terminationGrace`, then
+        /// SIGKILL; finally sweep whatever it started that is still in the
+        /// group. A cancel may already have sent the first SIGTERM; a second
+        /// one is harmless.
+        private func terminate(_ process: Process, group: pid_t?) {
+            LLMRunner.sendSignal(SIGTERM, to: process, group: group)
             let graceEnd = DispatchTime.now() + SubprocessRunner.terminationGrace
             while process.isRunning && DispatchTime.now() < graceEnd {
                 _ = exited.wait(timeout: .now() + 0.05)
             }
-            if process.isRunning { kill(process.processIdentifier, SIGKILL) }
+            if process.isRunning { LLMRunner.sendSignal(SIGKILL, to: process, group: group) }
             // BOUNDED: `waitUntilExit` has been seen never returning after a
             // SIGKILL on macOS 26, so poll `isRunning` instead of waiting on it.
             let reapEnd = DispatchTime.now() + 5
             while process.isRunning && DispatchTime.now() < reapEnd {
                 _ = exited.wait(timeout: .now() + 0.05)
             }
+            if process.isRunning {
+                subprocessLog.error("\(self.executable.lastPathComponent, privacy: .public): pid \(process.processIdentifier, privacy: .public) still not reaped 5 s after SIGKILL; abandoning the wait")
+            }
+            // The child exiting inside the grace does nothing to a process it
+            // started that ignores SIGTERM; sweep the group once it is gone.
+            if let group { LLMRunner.terminateHelpers(of: group) }
         }
     }
 }

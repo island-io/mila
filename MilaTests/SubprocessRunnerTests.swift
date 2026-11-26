@@ -33,6 +33,26 @@ final class SubprocessRunnerTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(started), 10)
     }
 
+    /// A timeout reaches the processes the child started, not only the child:
+    /// `sh -c "find | xargs codesign"` must not leave `xargs` re-signing
+    /// dylibs after `sh` is gone. Pins that the runner signals the group.
+    func test_timeout_also_kills_the_processes_the_child_started() async throws {
+        let r = try await SubprocessRunner.run(
+            executable: sh,
+            arguments: ["-c", "sleep 30 & echo $!; wait"],
+            timeout: 1)
+        XCTAssertTrue(r.timedOut)
+        let pidText = String(decoding: r.stdout, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let pid = try XCTUnwrap(pid_t(pidText), "stdout: \(pidText)")
+        // The orphan is reaped by launchd, not by us; give that a moment.
+        let deadline = Date().addingTimeInterval(5)
+        while kill(pid, 0) == 0 && Date() < deadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        XCTAssertNotEqual(kill(pid, 0), 0, "the child's own child outlived the timeout")
+    }
+
     func test_a_child_that_ignores_sigterm_is_killed() async throws {
         let started = Date()
         let r = try await SubprocessRunner.run(
