@@ -2,7 +2,7 @@ import XCTest
 @testable import Mila
 
 /// `SubprocessRunner` replaces five hand-rolled `waitUntilExit()` sites that
-/// parked cooperative-pool threads (improvement plan item 7).
+/// parked cooperative-pool threads (#399).
 final class SubprocessRunnerTests: XCTestCase {
 
     private let sh = URL(fileURLWithPath: "/bin/sh")

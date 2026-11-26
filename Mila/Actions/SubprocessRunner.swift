@@ -5,7 +5,7 @@ private let subprocessLog = os.Logger(subsystem: "io.island.whisper.IslandWhispe
                                       category: "SubprocessRunner")
 
 /// One place that runs a child process and waits for it without parking
-/// threads of the Swift cooperative pool (improvement plan item 7).
+/// threads of the Swift cooperative pool (#399).
 ///
 /// The cooperative pool has one thread per core. A `Task.detached` that calls
 /// `Process.waitUntilExit()`, plus two more that sit in `readDataToEndOfFile`,
@@ -235,6 +235,12 @@ enum SubprocessRunner {
                 // before it exited, so what was read is complete unless a
                 // reader was starved for the whole grace; say so either way.
                 subprocessLog.error("\(self.executable.lastPathComponent, privacy: .public): pipe drain timed out after exit; returning the output read so far")
+                // Every caller runs a one-shot tool, so a process still in its
+                // group 30 s after it exited is a stray: stop it rather than
+                // leave it, and the two readers blocked on it, for the life of
+                // the app. Then give the readers the kill path's short bound.
+                if let group { LLMRunner.terminateHelpers(of: group) }
+                _ = drained.wait(timeout: .now() + SubprocessRunner.drainGraceAfterKill)
             }
 
             // A SIGTERM'd run surfaces as cancellation, not as a failure
@@ -271,8 +277,12 @@ enum SubprocessRunner {
         }
 
         /// Waits until the child exits, the task is cancelled or `timeout`
-        /// passes. Returns whether the timeout fired. Always bounded: the wait is
-        /// taken in one-second slices so a missed signal costs a second.
+        /// passes. Returns whether the timeout fired. Each semaphore wait is
+        /// bounded (one-second slices, so a missed signal costs a second). With
+        /// `timeout: nil` the loop itself is not: it ends only on the exit or a
+        /// cancel, so a nil-timeout caller must be cancellable (diarization is,
+        /// through Stop). The macOS 26 reaping race has been seen after a
+        /// SIGKILL, and that path (`terminate`) is bounded.
         private func waitForExit(of process: Process) -> Bool {
             let deadline = timeout.map { DispatchTime.now() + $0 }
             while true {
