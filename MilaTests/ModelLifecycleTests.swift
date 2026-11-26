@@ -61,6 +61,11 @@ final class ModelLifecycleTests: XCTestCase {
             await stub.openUnloadGate()
             await stub.openTranscribeGate(count: 10_000)
         }
+        // A test that fails between `beginLocalModelHold` and its end would
+        // leave the hold's task parked for good, retaining the service, store
+        // and stub for the rest of the bundle. Shutdown ends and drains every
+        // hold; it is idempotent for tests that already shut down.
+        await service?.shutdown()
         if let root = root { try? FileManager.default.removeItem(at: root) }
         try await super.tearDown()
     }

@@ -40,8 +40,9 @@ final class DictationController: ObservableObject {
     /// loaded the model only once the user had finished speaking. Taken once
     /// mic access is granted, so the load overlaps with the mic coming up and
     /// the user speaking; handed to this property once capture is running,
-    /// and ended exactly once — after the final transcription, or on cancel.
-    /// A start that fails ends its own hold before it returns. Nil in live
+    /// and ended exactly once — by the stop that takes it out of here (after
+    /// its final transcription), or on cancel. A start that fails ends its
+    /// own hold before it returns. Nil in live
     /// mode and on the remote backend (see
     /// `TranscriptionService.beginLocalModelHold`).
     private var modelHold: TranscriptionService.LocalModelHold?
@@ -249,9 +250,18 @@ final class DictationController: ObservableObject {
     }
 
     private func stopAndTranscribe(action: HotkeyAction) async {
+        // Take this dictation's model hold and leave `.recording` BEFORE the
+        // first await. `toggle` routes a press here for as long as the state
+        // reads `.recording`, so a double-tap during `recorder.stop()` used
+        // to run a second stop — a second final pass over empty audio — and
+        // that stop would have ended whatever hold `modelHold` carried by the
+        // time it finished, possibly the NEXT dictation's. Now the second
+        // press beeps, and each stop ends only the hold it took.
+        let hold = modelHold
+        modelHold = nil
+        state = .transcribing(action)
         await recorder.stop()
         streamTask?.cancel(); streamTask = nil
-        state = .transcribing(action)
         DictationOverlayWindow.shared.setBusy(true)
 
         let captured = samples
@@ -283,7 +293,7 @@ final class DictationController: ObservableObject {
                                                       audioCtx: 0)
         // The final pass has run, so this dictation no longer needs the
         // model: batch-only mode releases it once nothing else is using it.
-        endModelHold()
+        if let hold { transcription.endLocalModelHold(hold) }
 
         DictationOverlayWindow.shared.hide()
         state = .idle

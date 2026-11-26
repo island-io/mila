@@ -364,10 +364,12 @@ final class TranscriptionService: ObservableObject {
     /// True when nothing is using, queueing or expecting the local model.
     ///
     /// `retainsLocalModel` keeps it warm for live transcription; selecting
-    /// the remote backend releases it regardless, because nothing local is
-    /// going to call the engine. `queue`/`processingID` are what stop an
-    /// unload BETWEEN two queued recordings (the next job must not pay a
-    /// reload), and `activeRecordingID` covers the moment a stopped worker's
+    /// the remote backend releases it regardless of that preference, because
+    /// nothing local is going to call the engine. Not from under a counted
+    /// user, though: a batch job or a dictation's hold that began before the
+    /// switch keeps the model until it ends. `queue`/`processingID` are what
+    /// stop an unload BETWEEN two queued recordings (the next job must not pay
+    /// a reload), and `activeRecordingID` covers the moment a stopped worker's
     /// UI slot is still being cleared.
     private func canReleaseLocalModel() -> Bool {
         if retainsLocalModel && !remoteSettings.isActive { return false }
