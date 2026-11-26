@@ -18,7 +18,7 @@ final class MeetingStopPromptUITests: XCTestCase {
 
     func test_stop_prompt_appears_when_meeting_ends_while_recording() throws {
         let app = XCUIApplication()
-        app.launchArguments = ["--ui-test-simulate-meeting-ended"]
+        app.launchArguments = ["--ui-test-clean-store", "--ui-test-simulate-meeting-ended"]
         app.launch()
 
         // The stop prompt is a borderless NSPanel hosting the SwiftUI card.
