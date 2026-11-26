@@ -273,6 +273,24 @@ final class RecordingStoreCorruptLoadTests: XCTestCase {
         XCTAssertTrue(relaunched.consumePendingRecoveryIDs().isEmpty)
     }
 
+    /// The same leftover beside a DROPPED compressed row: the `.m4a` comes
+    /// back as that row, and the `.wav` is not added as a second recording
+    /// sharing its sidecars — nor, when the row was in Recently Deleted, as
+    /// a live one.
+    func test_a_dropped_m4a_rows_leftover_wav_is_not_recovered_too() throws {
+        try writeStoreWithDroppedRow(["audioFileName": "lost.m4a",
+                                      "deletedAt": "2026-01-02T03:04:05Z"])
+        try Data(count: 1024).write(to: recordingsDir.appendingPathComponent("lost.m4a"))
+        try Data(count: RecordingStore.emptyWAVByteCount + 1)
+            .write(to: recordingsDir.appendingPathComponent("lost.wav"))
+
+        let relaunched = RecordingStore(rootDirectory: tempRoot)
+
+        XCTAssertEqual(relaunched.recordings.map(\.audioFileName).sorted(), ["keep.wav", "lost.m4a"])
+        XCTAssertNotNil(relaunched.recordings.first { $0.audioFileName == "lost.m4a" }?.deletedAt)
+        XCTAssertTrue(relaunched.consumePendingRecoveryIDs().isEmpty)
+    }
+
     /// No transcription pass runs for a row settled from its saved
     /// transcript, so its length has to come from the audio file.
     func test_a_recovered_row_that_is_not_retranscribed_gets_its_duration() throws {

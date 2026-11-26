@@ -2100,36 +2100,52 @@ final class RecordingStore: ObservableObject {
     /// - Its source and Voice Memos identity come back with it, so the next
     ///   Voice Memos sync sees the memo as already imported.
     ///
-    /// A `.wav` whose base name a recording already uses with another
-    /// extension is skipped: it is the source a compression left behind when
-    /// the app quit between saving the `.m4a` and deleting the `.wav`, and
-    /// recovering it would add a duplicate sharing the live row's sidecars.
+    /// A `.wav` whose base name another recording uses with another
+    /// extension — a decoded row, or a dropped row recovered here — is
+    /// skipped: it is the source a compression left behind when the app quit
+    /// between saving the `.m4a` and deleting the `.wav`, and recovering it
+    /// would add a duplicate sharing that recording's sidecars.
     @discardableResult
     private func recoverOrphanRecordings(salvaged: [String: Salvage] = [:]) -> [Recording] {
         let referenced = Set(recordings.map { $0.audioFileName })
-        let referencedBases = Set(recordings.map { ($0.audioFileName as NSString).deletingPathExtension })
         guard let entries = try? fileManager.contentsOfDirectory(
             at: recordingsDirectory,
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
-        var added: [Recording] = []
-        for url in entries {
-            // `name` comes off disk, never from the JSON, so a salvaged
-            // `audioFileName` can only pick among files already in the folder.
+        // Skip captures that hold no audio. The threshold is a byte count
+        // rather than a decoded frame count on purpose: a genuinely crashed
+        // recording has an UNFINALIZED header claiming zero frames while
+        // its samples are on disk, so asking AVAudioFile how long it is
+        // would discard exactly the recordings this sweep exists to save.
+        func audioSize(_ url: URL) -> Int? {
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            return size > (url.pathExtension.lowercased() == "wav" ? Self.emptyWAVByteCount : 0) ? size : nil
+        }
+        // `name` comes off disk, never from the JSON, so a salvaged
+        // `audioFileName` can only pick among files already in the folder.
+        func isRecoverable(_ url: URL) -> Bool {
             let name = url.lastPathComponent
             let ext = url.pathExtension.lowercased()
+            guard ext == "wav" || (salvaged[name] != nil && AudioTrimmer.supportedExtensions.contains(ext))
+            else { return false }
+            return !referenced.contains(name) && audioSize(url) != nil
+        }
+        func baseName(_ name: String) -> String { (name as NSString).deletingPathExtension }
+        let referencedBases = Set(recordings.map { baseName($0.audioFileName) })
+        // The base names of the dropped rows whose own audio comes back below.
+        let salvagedBases = Set(entries
+            .filter { salvaged[$0.lastPathComponent] != nil && isRecoverable($0) }
+            .map { baseName($0.lastPathComponent) })
+        var added: [Recording] = []
+        for url in entries {
+            let name = url.lastPathComponent
             let salvage = salvaged[name]
-            guard ext == "wav" || (salvage != nil && AudioTrimmer.supportedExtensions.contains(ext)) else { continue }
-            if referenced.contains(name) { continue }
-            if referencedBases.contains((name as NSString).deletingPathExtension) { continue }
-            // Skip captures that hold no audio. The threshold is a byte count
-            // rather than a decoded frame count on purpose: a genuinely crashed
-            // recording has an UNFINALIZED header claiming zero frames while
-            // its samples are on disk, so asking AVAudioFile how long it is
-            // would discard exactly the recordings this sweep exists to save.
-            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
-            if size <= (ext == "wav" ? Self.emptyWAVByteCount : 0) { continue }
+            guard isRecoverable(url), let size = audioSize(url) else { continue }
+            if referencedBases.contains(baseName(name)) { continue }
+            // Same for a dropped row recovered here: the file it names takes
+            // the base name, and another file sharing it is a leftover.
+            if salvage == nil, salvagedBases.contains(baseName(name)) { continue }
             let mtime = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
             var recovered = Recording(
                 title: recoveryTitle(at: mtime),
