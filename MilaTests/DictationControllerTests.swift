@@ -95,8 +95,8 @@ final class DictationControllerTests: XCTestCase {
     /// A sleep, screen lock or quit during capture drops the dictation, as
     /// before. During the final pass it cannot stop whisper, but it must stop
     /// the paste: a synthesized Cmd-V into a locked screen types the
-    /// transcript into the password field. The dictation is still saved, so
-    /// nothing the user said is lost, and there is no beep either.
+    /// transcript into the password field. After a sleep or lock the
+    /// dictation is still saved to History, so the text is not lost.
     func test_a_cancel_during_the_final_pass_stops_only_the_paste() {
         let english = HotkeyAction.dictateEnglish
         XCTAssertEqual(DictationController.cancelEffect(for: .idle), .none)
