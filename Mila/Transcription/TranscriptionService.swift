@@ -654,7 +654,7 @@ final class TranscriptionService: ObservableObject {
                     admitted.forEach { $0.resume() }
                 } else {
                     serviceLog.log("""
-                        dictation hold: skipping the preload of \(displayName, privacy: .public) — \
+                        dictation hold: skipping the preload of \(current?.displayName ?? displayName, privacy: .public) — \
                         installed=\(current != nil) held=\(self.activeModelHolds.contains(id)) \
                         stopped=\(cancellation.isStopped) retains=\(self.retainsLocalModel) \
                         remote=\(self.remoteSettings.isActive) users=\(self.localModelUsers, privacy: .public) \

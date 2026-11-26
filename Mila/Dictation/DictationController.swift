@@ -36,10 +36,10 @@ final class DictationController: ObservableObject {
     private var isStarting = false
     /// True from the moment `stopAndTranscribe` begins until the state has
     /// moved on to `.transcribing`. The state stays `.recording` while the
-    /// recorder tears down — on purpose, so the sleep and screen-lock guards
-    /// (`cancelInFlight`, which acts only on `.recording`) still cover that
-    /// wait — and without this flag `toggle` would route a double-tap into a
-    /// second stop.
+    /// recorder tears down, as it always has, and without this flag `toggle`
+    /// would route a double-tap in that wait into a second stop. (A sleep or
+    /// screen-lock `cancelInFlight` in the same wait still runs, but it does
+    /// not stop the stop's own transcription and paste; that predates #434.)
     private var isStopping = false
 
     /// This dictation's claim on the local Whisper model (#434). Batch-only
@@ -282,11 +282,11 @@ final class DictationController: ObservableObject {
 
     private func stopAndTranscribe(action: HotkeyAction) async {
         // Mark the stop and take this dictation's model hold BEFORE the first
-        // await. The state reads `.recording` until `recorder.stop()` returns
-        // (so sleep and screen lock can still cancel), and `isStopping` is
-        // what turns a double-tap in that window away instead of running a
-        // second stop. The hold moves into a local so this stop ends exactly
-        // the hold it took, whatever `modelHold` carries by the time it does.
+        // await. The state reads `.recording` until `recorder.stop()` returns,
+        // and `isStopping` is what turns a double-tap in that window away
+        // instead of running a second stop. The hold moves into a local so
+        // this stop ends exactly the hold it took, whatever `modelHold`
+        // carries by the time it does.
         isStopping = true
         let hold = modelHold
         modelHold = nil

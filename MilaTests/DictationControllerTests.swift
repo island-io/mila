@@ -70,9 +70,9 @@ final class DictationControllerTests: XCTestCase {
 
     /// A hotkey press routes on the state AND on whether a stop is already
     /// tearing the recorder down. The state reads `.recording` through that
-    /// wait (so sleep and screen lock can still cancel), so a double-tap used
-    /// to run a second stop: a second final pass over empty audio that beeped
-    /// and set `.idle` under the first one (#435 review).
+    /// wait, so a double-tap used to run a second stop: a second final pass
+    /// over empty audio that beeped and set `.idle` under the first one
+    /// (#435 review).
     func test_a_second_press_while_the_stop_is_in_progress_is_ignored() {
         let english = HotkeyAction.dictateEnglish
         func press(_ state: DictationController.State, stopping: Bool = false) -> DictationController.PressOutcome {
