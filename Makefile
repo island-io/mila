@@ -59,7 +59,12 @@ build: project check-xcode
 	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Debug -derivedDataPath $(DERIVED) -destination 'platform=macOS' build
 
 release-build: project check-xcode
-	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Release -derivedDataPath $(RELEASE_DERIVED) -destination 'platform=macOS' build
+	@# -packageAuthorizationProvider netrc: never ask the login keychain for
+	@# credentials while resolving packages. Every dependency is public, and on a
+	@# headless build agent a keychain item the toolchain may not read makes
+	@# SwiftPM wait forever for an approval prompt nobody can click (the Sparkle
+	@# binary-artifact download hung the 1.9.9 signing job, #440).
+	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Release -derivedDataPath $(RELEASE_DERIVED) -destination 'platform=macOS' -packageAuthorizationProvider netrc build
 
 test: project check-xcode
 	xcodebuild -project $(XCODEPROJ) -scheme $(SCHEME) -configuration Debug -derivedDataPath $(DERIVED) -destination 'platform=macOS' test
